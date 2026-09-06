@@ -17,7 +17,7 @@ export SPARKPLANE_DATA_DIR="${SPARKPLANE_DATA_DIR:-$SPARKPLANE_DATA}"
 
 python3 /opt/sparkplane/docker/preflight.py || exit 1
 
-mkdir -p "$SPARKPLANE_DATA"/{deployments,recipes}
+mkdir -p "$SPARKPLANE_DATA"/{deployments,recipes,telemetry}
 
 # sparkrun keeps its job metadata under $HOME/.cache/sparkrun. Persist it in
 # the volume so a container restart can still find, check and stop the

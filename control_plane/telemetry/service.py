@@ -21,13 +21,14 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any
-
-from control_plane.deploy.events import EventBus
+from typing import TYPE_CHECKING, Any
 
 from . import config
 from .events import SOURCE_DEPLOY, GatewayEvents, journal_events
 from .records import NULL_SINK, TelemetrySink
+
+if TYPE_CHECKING:
+    from control_plane.deploy.events import EventBus
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +50,19 @@ class Telemetry:
         self.coordinator = coordinator
         self.reason = reason
         self.sink: TelemetrySink = journal or NULL_SINK
-        self.gateway_events = GatewayEvents(sink=self.sink)
+        self._gateway_events: GatewayEvents | None = None
         self._log_handler = None
+        self._started = False
+        self._registry: Any = None
+        self._providers: Any = None
+
+    @property
+    def gateway_events(self) -> GatewayEvents:
+        """Built on first use. A worker never asks, and so never imports the
+        deploy package that EventBus lives in."""
+        if self._gateway_events is None:
+            self._gateway_events = GatewayEvents(sink=self.sink)
+        return self._gateway_events
 
     @property
     def enabled(self) -> bool:
@@ -108,12 +120,37 @@ class Telemetry:
         node_id: str | None = None,
         providers: Any = None,
     ) -> None:
+        """Bring telemetry up, or wire more into an already-running one.
+
+        Called twice on a composed node: once by start_node(), before there is
+        a registry to collect peers from, and again by the gateway's lifespan
+        with the registry and providers attached. The second call must not
+        build a second collector -- that leaks the first one's task and runs
+        two drains against one journal -- and must not simply return either,
+        because then a coordinator would never learn how to reach its workers.
+        So it rewires what is already running.
+        """
         if not self.enabled:
             log.info("telemetry not recording: %s", self.reason)
             return
+        if registry is not None:
+            self._registry = registry
+        if providers is not None:
+            self._providers = providers
         if node_id and not self.journal.node_id:
             self.journal.node_id = node_id
-        self.capture_logs(_provider_redactor(providers))
+        self.capture_logs(_provider_redactor(self._providers))
+
+        if self._started:
+            if self.collector is not None:
+                self.collector.rewire(
+                    client=_agent_client(self._registry),
+                    agents=lambda: _agent_urls(self._registry),
+                )
+                log.debug("telemetry rewired to the registry")
+            return
+
+        self._started = True
         if self.archive is None:
             return
 
@@ -121,14 +158,16 @@ class Telemetry:
 
         self.collector = Collector(
             self.archive,
-            client=_agent_client(registry),
-            agents=lambda: _agent_urls(registry),
+            client=_agent_client(self._registry),
+            agents=lambda: _agent_urls(self._registry),
         )
         # Under the registry's own name for this node when there is one, so
         # the local journal and the roster agree and the coordinator does not
         # end up with a second cursor for itself.
         local_id = (
-            getattr(registry, "local_node_id", None) or self.journal.node_id or "local"
+            getattr(self._registry, "local_node_id", None)
+            or self.journal.node_id
+            or "local"
         )
         self.journal.node_id = self.journal.node_id or local_id
         self.collector.add_local(local_id, self.journal)
@@ -140,6 +179,7 @@ class Telemetry:
         )
 
     async def stop(self) -> None:
+        self._started = False
         if self._log_handler is not None:
             from .loghandler import uninstall
 
@@ -168,7 +208,7 @@ class Telemetry:
 
         self._log_handler = install(self.sink, redactor=redactor)
 
-    def watch_deployments(self, bus: EventBus) -> None:
+    def watch_deployments(self, bus: "EventBus") -> None:
         """Copy the deployment manager's events into the journal."""
         journal_events(bus, self.sink, SOURCE_DEPLOY)
 

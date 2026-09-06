@@ -203,6 +203,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     break
                 target = selection.target
                 tried.add(target.target_id)
+                # Which evidence set this target's strength -- measured decode
+                # rate, the fit calculator's prediction, raw bandwidth, or a
+                # default. It lives on the index, not on RouteTarget, and it is
+                # what makes a recorded strength interpretable later.
+                score = ctx.router.index().raw_strength.get(target.target_id)
+                trace.strength_source = getattr(score, "source", "") or ""
                 # No await between the selection above and this claim, which is
                 # what lets a single-token half-open probe be safe without a
                 # lock. Keep it that way.

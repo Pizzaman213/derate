@@ -107,6 +107,11 @@ AUTO_STEP_1M_MAX_S = 7 * DAY_S
 #: Cap on rows any single history query returns.
 QUERY_MAX_ROWS = 5000
 
+#: How far back the registry's in-RAM ring reaches, matching
+#: registry/config.py's TELEMETRY_RING_SAMPLES at 1 Hz. Asking it for more than
+#: it holds is not an error, but there is no point building the window larger.
+TELEMETRY_RING_S = 300
+
 # -- Log capture -------------------------------------------------------------
 
 #: Records below this level stay in the process's stderr and never reach the

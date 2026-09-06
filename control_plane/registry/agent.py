@@ -15,6 +15,7 @@ import time
 from typing import Callable
 
 from control_plane.contracts import NodeProfile
+from control_plane.telemetry import NULL_SINK, TelemetrySink
 
 from .config import ROLE_WORKER, TELEMETRY_INTERVAL_S
 from .discovery import Advertiser
@@ -35,6 +36,7 @@ class NodeAgent:
         port: int = 8081,
         clock: Callable[[], float] = time.time,
         advertiser: Advertiser | None = None,
+        sink: TelemetrySink = NULL_SINK,
     ) -> None:
         self.profile = profile
         self.role = role
@@ -46,6 +48,9 @@ class NodeAgent:
         self._task: asyncio.Task | None = None
         self._running = False
         self._advertiser = advertiser
+        # Defaults to the no-op sink, so a NodeAgent still constructs and
+        # tests on a machine with telemetry switched off.
+        self._sink = sink
 
     # ------------------------------------------------------------------
     # Payloads
@@ -77,6 +82,18 @@ class NodeAgent:
     def history(self, seconds: float = 60.0) -> list[dict]:
         return [s.as_dict() for s in self._ring.window(seconds, now=self._clock())]
 
+    def journal_payload(self, since: int = 0, limit: int = 2000) -> dict:
+        """Journal rows after *since*, for the coordinator's collector.
+
+        Answers an empty payload rather than 404ing when telemetry is off, so
+        a coordinator polling a node that has it disabled sees "nothing to
+        collect" instead of a node that looks broken.
+        """
+        read = getattr(self._sink, "read", None)
+        if read is None:
+            return {"node_id": self.node_id, "rows": [], "next": since, "head": 0}
+        return read(since, limit)
+
     # ------------------------------------------------------------------
     # Sampling
     # ------------------------------------------------------------------
@@ -85,6 +102,9 @@ class NodeAgent:
         sample = await read_telemetry(self.profile, now=self._clock())
         if sample is not None:
             self._ring.add(sample)
+            # The ring is unchanged: it still answers /agent/telemetry and the
+            # UI's 60-second graph. This is the copy that outlives the process.
+            self._sink.sample(self.node_id, sample)
         return sample
 
     async def _sample_loop(self, interval: float) -> None:
@@ -145,6 +165,15 @@ def create_agent_app(node_agent: NodeAgent):
     @app.get("/agent/health")
     async def get_health() -> dict:
         return node_agent.health_payload()
+
+    @app.get("/agent/journal")
+    async def get_journal(since: int = 0, limit: int = 2000) -> dict:
+        # Asking for rows after `since` is itself the acknowledgement that
+        # everything through `since` reached the coordinator, so the node is
+        # free to trim below it. There is no separate ack.
+        return await asyncio.to_thread(
+            node_agent.journal_payload, since, min(max(limit, 1), 5000)
+        )
 
     app.state.node_agent = node_agent
     return app

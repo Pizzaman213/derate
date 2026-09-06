@@ -101,6 +101,21 @@ class Collector:
     def add_local(self, node_id: str, journal: Journal) -> None:
         self._local[node_id] = LocalSource(node_id, journal)
 
+    def rewire(self, *, client: Any = None, agents: Any = None) -> None:
+        """Point a running collector at a client or roster it did not have.
+
+        The composed node starts telemetry twice: start_node() brings the
+        journal up before a registry exists, and the gateway's lifespan wires
+        one in afterwards. Replacing the collector at that point would leak the
+        first one's task; refusing the second call would leave the coordinator
+        with no way to reach its workers. So the running collector is retold
+        where to look, and the next poll picks it up.
+        """
+        if client is not None:
+            self._client = client
+        if agents is not None:
+            self._agents = agents
+
     def sources(self) -> list[JournalSource]:
         out: list[JournalSource] = list(self._local.values())
         if self._client is not None:

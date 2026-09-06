@@ -68,6 +68,12 @@ Every variable has a working default, so first run needs none.
 | `SPARKPLANE_VLLM_IMAGE` | see `flags.py` | container image for vLLM backends |
 | `SPARKPLANE_SGLANG_IMAGE` | see `flags.py` | container image for SGLang backends |
 | `SPARKPLANE_ALLOW_BRIDGE` | unset | bypass the host-networking check, unsupported |
+| `SPARKPLANE_LOG_LEVEL` | `INFO` | root log level |
+| `SPARKPLANE_TELEMETRY` | `1` | `0` records nothing, anywhere |
+| `SPARKPLANE_TELEMETRY_RETENTION_DAYS` | `30` | raw-sample horizon; rollups outlive it |
+| `SPARKPLANE_TELEMETRY_LOG_LEVEL` | `INFO` | floor for log lines that reach the journal |
+| `SPARKPLANE_TELEMETRY_MAX_BYTES` | 512 MiB | ceiling on a node's own journal |
+| `SPARKPLANE_TELEMETRY_SHIP_INTERVAL_S` | `5` | how often the coordinator collects |
 
 Host networking ignores published ports, so a port collision here is a
 collision with something already on the machine. The container says which
@@ -79,6 +85,17 @@ Cluster token, node registry, link measurements, deployment records, the
 resolved-shape cache, the recipes we synthesize per launch, and a symlink
 that puts sparkrun's job metadata inside the volume too -- so a restarted
 container can still find, check and stop the workloads this node launched.
+
+Also `telemetry/`. Every node writes `journal.db`, an append-only record of
+its own samples, requests, events and logs; the coordinator additionally
+keeps `archive.db`, where the whole cluster's history is assembled and rolled
+into 1-minute and 1-hour buckets. Sizing, at the defaults: about 250 MB per
+node for thirty days of 1 Hz samples, and rollups small enough not to matter.
+
+A worker journals whether or not the coordinator is up. That is the point --
+there is no coordinator failover, so a worker that recorded nothing would
+lose everything the coordinator was down for. The coordinator collects the
+backlog when it returns.
 
 ## Health
 

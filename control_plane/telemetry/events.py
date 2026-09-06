@@ -13,11 +13,14 @@ column says which one an event came from.
 from __future__ import annotations
 
 import logging
-from typing import Any
-
-from control_plane.deploy.events import EventBus
+from typing import TYPE_CHECKING, Any
 
 from .records import NULL_SINK, TelemetrySink
+
+if TYPE_CHECKING:  # importing deploy at module scope would put the whole
+    from control_plane.deploy.events import EventBus  # deployment manager in
+    # every worker process. A worker has no deployments and no gateway; it
+    # runs a node agent and a journal. See _new_bus below.
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +44,14 @@ ROUTING_SOURCE_FAILED = "routing_source_failed"
 STARTUP_DEGRADED = "startup_degraded"
 
 
-def journal_events(bus: EventBus, sink: TelemetrySink, source: str) -> None:
+def _new_bus():
+    """Deferred, so importing this module does not import the deploy package."""
+    from control_plane.deploy.events import EventBus
+
+    return EventBus()
+
+
+def journal_events(bus: "EventBus", sink: TelemetrySink, source: str) -> None:
     """Copy every event this bus emits into *sink*, tagged with *source*."""
     if sink is NULL_SINK or sink is None:
         return
@@ -56,8 +66,10 @@ class GatewayEvents:
     request. Emitting them makes them queryable next month instead.
     """
 
-    def __init__(self, bus: EventBus | None = None, sink: TelemetrySink = NULL_SINK) -> None:
-        self.bus = bus or EventBus()
+    def __init__(
+        self, bus: "EventBus | None" = None, sink: TelemetrySink = NULL_SINK
+    ) -> None:
+        self.bus = bus if bus is not None else _new_bus()
         journal_events(self.bus, sink, SOURCE_GATEWAY)
 
     def emit(self, type: str, **fields: Any) -> dict[str, Any]:

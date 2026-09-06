@@ -27,7 +27,8 @@ services:
 
     volumes:
       # Cluster token, node registry, link measurements, deployment records,
-      # resolved-shape cache, synthesized recipes.
+      # resolved-shape cache, synthesized recipes, telemetry journal and
+      # archive.
       - sparkplane:/data
       # The host's sparkrun config, read-only: registries, saved clusters,
       # container image defaults.
@@ -46,6 +47,14 @@ services:
       # Unset -> discover the coordinator over mDNS. Set to an address to skip
       # discovery when the other node is on a different subnet.
       SPARKPLANE_JOIN: ${SPARKPLANE_JOIN:-}
+      SPARKPLANE_LOG_LEVEL: ${SPARKPLANE_LOG_LEVEL:-INFO}
+      # Durable telemetry. Every node journals to /data and the coordinator
+      # collects it; these bound how much of it is kept and for how long.
+      SPARKPLANE_TELEMETRY: ${SPARKPLANE_TELEMETRY:-1}
+      SPARKPLANE_TELEMETRY_RETENTION_DAYS: ${SPARKPLANE_TELEMETRY_RETENTION_DAYS:-30}
+      SPARKPLANE_TELEMETRY_LOG_LEVEL: ${SPARKPLANE_TELEMETRY_LOG_LEVEL:-INFO}
+      SPARKPLANE_TELEMETRY_MAX_BYTES: ${SPARKPLANE_TELEMETRY_MAX_BYTES:-}
+      SPARKPLANE_TELEMETRY_SHIP_INTERVAL_S: ${SPARKPLANE_TELEMETRY_SHIP_INTERVAL_S:-5}
 
     healthcheck:
       # /agent/health exists in both roles. /api/cluster is coordinator-only

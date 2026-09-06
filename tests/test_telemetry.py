@@ -695,3 +695,237 @@ def test_a_worker_journal_reaches_the_coordinator_over_the_agent_api(tmp_path, a
     assert archive.status()["rows"]["samples"] == 120
     node = archive.status()["nodes"][0]
     assert node["behind"] == 0, "the coordinator caught up with the worker's head"
+
+
+def test_a_second_journal_on_one_file_says_so(tmp_path, caplog):
+    """The double-bundle hazard, made audible.
+
+    A composition root that lets start_node() and create_app() each build
+    their own Telemetry gets two writer threads and two collectors on one
+    SQLite file. It corrupts nothing and shows no error, which is exactly why
+    it needs to announce itself.
+    """
+    first = Journal(tmp_path / "j.db", node_id="n")
+    second = Journal(tmp_path / "j.db", node_id="n")
+    try:
+        with caplog.at_level(logging.WARNING):
+            first.start()
+            assert not caplog.records, "the first journal is not a warning"
+            second.start()
+        assert any("second telemetry journal" in r.message for r in caplog.records)
+        assert any("runtime.telemetry" in r.message for r in caplog.records), (
+            "the warning must name the fix, not just the symptom"
+        )
+    finally:
+        second.close()
+        first.close()
+
+    # Closing releases the claim, so a later restart on the same file is quiet.
+    caplog.clear()
+    third = Journal(tmp_path / "j.db", node_id="n")
+    with caplog.at_level(logging.WARNING):
+        third.start()
+    third.close()
+    assert not caplog.records, "a restart after a clean close is not a hazard"
+
+
+# ---------------------------------------------------------------------------
+# envelope honesty
+# ---------------------------------------------------------------------------
+
+
+def test_strength_source_is_recorded_not_left_blank(archive):
+    """It was a dead column: in the schema, on the record, never populated.
+
+    A column that always holds "" is worse than no column, because it implies
+    a fact that was never captured. The source says which evidence set a
+    target's strength -- and the strength number is uninterpretable without
+    it, since its unit changes with it.
+    """
+    trace = RequestTrace(request_id="r-1", served_name="m")
+    trace.strength_source = "measured"
+    record = trace.record(status=200, duration_s=0.1)
+    assert record.strength_source == "measured"
+
+    archive.ingest(
+        "spark-01",
+        {
+            "rows": [
+                {
+                    "seq": 1,
+                    "ts": 1_700_000_000.0,
+                    "kind": "request",
+                    "body": json.dumps(record.as_dict()),
+                }
+            ],
+            "next": 1,
+            "head": 1,
+        },
+    )
+    answer = q_requests(
+        archive, from_ts=1_699_999_000.0, to_ts=1_700_001_000.0, step="raw"
+    )
+    assert answer["requests"][0]["strength_source"] == "measured", (
+        "the column must survive the round trip and reach the query surface"
+    )
+
+
+def test_every_history_answer_says_whether_it_survives_a_restart(archive):
+    now = 1_700_000_000.0
+    for answer in (
+        q_nodes(archive, from_ts=now - 3600, to_ts=now, step="raw"),
+        q_requests(archive, from_ts=now - 3600, to_ts=now, step="raw"),
+    ):
+        assert answer["durable"] is True
+
+
+def test_the_ring_answers_node_history_when_there_is_no_archive():
+    """Telemetry off left 300 samples of per-node history stranded in RAM.
+
+    Registry.history() had no caller anywhere in the gateway, so the only
+    per-node history a node without telemetry keeps was unreachable over HTTP.
+    A fallback inside the same handler, labelled, rather than a second route:
+    two endpoints answering one question with different truthfulness is the
+    failure this avoids.
+    """
+    from fastapi.testclient import TestClient
+
+    from control_plane.gateway import create_app
+    from control_plane.registry.telemetry import TelemetrySample
+    import tests.test_gateway as gw
+
+    now = time.time()
+    rows = [
+        TelemetrySample(
+            ts=now - (60 - i),
+            memory_used=100 + i,
+            memory_total=1000,
+            power_watts=70.0 + i % 5,
+            temperature_c=61.0,
+            utilization_pct=50.0,
+        ).as_dict()
+        for i in range(60)
+    ]
+
+    class RingRegistry:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def history(self, node_id, seconds=60):
+            return [r for r in rows if r["ts"] >= time.time() - seconds]
+
+    deps = gw.build_deps()
+    deps.registry = RingRegistry(deps.registry)
+    with TestClient(create_app(deps)) as client:
+        reply = client.get("/api/history/nodes", params={"from": "-5m"})
+        assert reply.status_code == 200
+        body = reply.json()
+        assert body["resolution"] == "ring"
+        assert body["durable"] is False, "RAM history must not claim durability"
+        assert body["samples"], "the ring's samples must actually come back"
+        assert body["samples"] == sorted(body["samples"], key=lambda s: s["ts"])
+
+        scoped = client.get(
+            "/api/history/nodes", params={"from": "-5m", "node_id": "spark-01"}
+        ).json()
+        assert {s["node_id"] for s in scoped["samples"]} == {"spark-01"}
+
+        # The streams with no ring behind them still refuse, rather than
+        # inventing a fallback that would have nothing to answer from.
+        for path in ("/api/history/requests", "/api/history/events"):
+            assert client.get(path, params={"from": "-1h"}).status_code == 503
+
+
+def test_a_registry_without_a_ring_still_refuses_honestly():
+    from fastapi.testclient import TestClient
+
+    from control_plane.gateway import create_app
+    import tests.test_gateway as gw
+
+    with TestClient(create_app(gw.build_deps())) as client:
+        reply = client.get("/api/history/nodes", params={"from": "-5m"})
+        assert reply.status_code == 503
+        assert reply.json()["error"]["code"] == "history_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# composed-node lifecycle
+# ---------------------------------------------------------------------------
+
+
+class _WiredRegistry:
+    local_node_id = "spark-01"
+    _client = object()
+
+    def agent_urls(self, include_local: bool = False) -> dict[str, str]:
+        return {"spark-02": "http://10.0.0.2:8081"}
+
+
+def test_starting_twice_rewires_rather_than_building_a_second_collector(tmp_path):
+    """The composed node starts telemetry twice, and both halves matter.
+
+    start_node() brings the journal up before a registry exists; the gateway's
+    lifespan wires one in afterwards. Rebuilding on the second call leaks the
+    first collector's task and runs two drains against one journal. Returning
+    early on the second call is worse in a quieter way: the coordinator keeps
+    running, and silently never collects from any worker.
+    """
+
+    async def scenario():
+        telemetry = Telemetry.open(tmp_path, node_id="spark-01")
+        try:
+            await telemetry.start(node_id="spark-01")  # start_node(), no registry
+            first = telemetry.collector
+            assert [s.node_id for s in first.sources()] == ["spark-01"]
+
+            await telemetry.start(registry=_WiredRegistry())  # gateway lifespan
+            assert telemetry.collector is first, "a second collector was built"
+            assert len(_collector_tasks()) == 1, "the first collector's task leaked"
+            assert "spark-02" in [s.node_id for s in telemetry.collector.sources()], (
+                "rewiring must reach workers the first call could not see"
+            )
+        finally:
+            await telemetry.stop()
+        assert not _collector_tasks(), "stop() left a collector running"
+
+    asyncio.run(scenario())
+
+
+def _collector_tasks():
+    return [
+        t
+        for t in asyncio.all_tasks()
+        if t.get_name() == "telemetry-collector" and not t.done()
+    ]
+
+
+def test_a_worker_does_not_drag_in_the_deployment_manager():
+    """A worker runs a node agent and a journal. Nothing else.
+
+    telemetry.service reaches EventBus for the gateway's event bus, and
+    importing it at module scope put the whole deploy package -- manager,
+    sparkrun, recipes -- resident in every worker process.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import control_plane.telemetry.service; "
+        "print(sorted(m for m in sys.modules "
+        "if m.startswith('control_plane.deploy')))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "[]", f"worker imported deploy: {out.stdout.strip()}"
+
+
+def test_the_gateway_still_gets_its_event_bus():
+    """Deferring the import must not cost the gateway its bus."""
+    telemetry = Telemetry.disabled("test")
+    events = telemetry.gateway_events
+    assert events is telemetry.gateway_events, "built once, then cached"
+    events.breaker_opened("d-1", failures=3, cooldown_s=30.0)

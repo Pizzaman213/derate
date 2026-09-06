@@ -100,6 +100,7 @@ class RequestTrace:
     served_name: str
     started_at: float = field(default_factory=time.time)
     node_id: str = ""
+    strength_source: str = ""
     streaming: bool = False
     body_bytes: int = 0
     attempts: int = 0
@@ -156,6 +157,7 @@ class RequestTrace:
             provider_id=provider_id,
             deployment_id=deployment_id,
             policy=policy,
+            strength_source=self.strength_source,
             attempt_no=attempt_no,
             attempts=max(self.attempts, attempt_no + 1),
             retry_reason=retry_reason,

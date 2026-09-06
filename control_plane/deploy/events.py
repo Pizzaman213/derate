@@ -51,6 +51,22 @@ class EventBus:
         self._lock = threading.Lock()
         self._subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
         self._history: deque[dict[str, Any]] = deque(maxlen=history)
+        self._taps: list[Any] = []
+
+    def add_tap(self, fn: Any) -> None:
+        """Call *fn* synchronously inside emit(), for every event.
+
+        A subscriber is the right shape for a UI, which can miss an event and
+        redraw. It is the wrong shape for a durable record: the queue drops its
+        oldest under burst, and the burst is exactly when the events matter.
+        A tap runs on the producer's thread and cannot be outrun.
+
+        The contract is therefore strict: a tap must be non-blocking. The one
+        that exists appends to a bounded deque. A tap that raises is logged and
+        ignored, because recording an event must never break delivering it.
+        """
+        with self._lock:
+            self._taps.append(fn)
 
     # -- producer side, called from any thread ---------------------------
 
@@ -60,6 +76,12 @@ class EventBus:
         with self._lock:
             self._history.append(event)
             targets = list(self._subscribers)
+            taps = list(self._taps)
+        for tap in taps:
+            try:
+                tap(event)
+            except Exception:
+                logger.debug("event tap failed", exc_info=True)
         for loop, queue in targets:
             try:
                 loop.call_soon_threadsafe(self._offer, queue, event)

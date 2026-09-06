@@ -77,6 +77,11 @@ def _envelope(
         "from": from_ts,
         "to": to_ts,
         "resolution": step,
+        # Archive-backed answers survive a restart. The registry's in-RAM ring,
+        # which answers /api/history/nodes when telemetry is off, does not --
+        # and says so with durable: false. A caller charting both must be able
+        # to tell them apart without knowing how the node was configured.
+        "durable": True,
         "gaps": archive.gaps(from_ts, to_ts, node_id),
     }
 
@@ -156,7 +161,8 @@ def requests(
                 for r in archive.conn.execute(
                     "SELECT request_id, attempt_no, ts, node_id, served_name, "
                     "target_id, target_kind, provider_id, deployment_id, policy, "
-                    "attempts, retry_reason, status, error_code, error_class, "
+                    "strength_source, attempts, retry_reason, status, error_code, "
+                    "error_class, "
                     "prompt_tokens, completion_tokens, tokens, tokens_estimated, "
                     "ttft_ms, decode_ms, duration_ms, parked_ms, streaming, "
                     "cost_usd FROM requests WHERE ts >= ? AND ts < ?"

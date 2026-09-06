@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from control_plane.contracts import NodeProfile
 
@@ -38,6 +39,7 @@ class NodeRuntime:
     node_agent: NodeAgent
     advertiser: Advertiser
     registry: Registry | None = None
+    telemetry: "object | None" = None
     _stopped: bool = field(default=False, repr=False)
     _rejoin_task: "asyncio.Task | None" = field(default=None, repr=False)
 
@@ -91,10 +93,48 @@ class NodeRuntime:
         await self.node_agent.stop()  # also withdraws the advertisement
         if self.registry is not None:
             await self.registry.stop()
+        if self.telemetry is not None:
+            await self.telemetry.stop()
 
 
-async def start_node(config: RegistryConfig | None = None) -> NodeRuntime:
-    """Bring up this node. Raises BridgeNetworkError before doing any work."""
+def _open_telemetry(config: RegistryConfig, profile: NodeProfile, role: str):
+    """This node's telemetry.
+
+    A worker gets a journal and no archive: it has nothing to collect from
+    anyone, and the coordinator is where the cluster's history is assembled.
+    Its rows leave over /agent/journal. The journal still matters on a worker,
+    and matters most there -- there is no coordinator failover, so a worker
+    that recorded nothing loses everything the coordinator was down for.
+    """
+    from control_plane.telemetry.service import Telemetry
+
+    return Telemetry.from_env(
+        root=config.data_dir, node_id=profile.node_id
+    ) if role == ROLE_COORDINATOR else _journal_only(config, profile)
+
+
+def _journal_only(config: RegistryConfig, profile: NodeProfile):
+    from control_plane.telemetry import config as tconfig
+    from control_plane.telemetry.service import Telemetry
+
+    if not tconfig.enabled():
+        return Telemetry.disabled("SPARKPLANE_TELEMETRY is off")
+    root = Path(config.data_dir)
+    if not root.is_dir():
+        return Telemetry.disabled(f"{root} does not exist")
+    return Telemetry.open(root, node_id=profile.node_id, coordinator=False)
+
+
+async def start_node(
+    config: RegistryConfig | None = None, telemetry: "object" = None
+) -> NodeRuntime:
+    """Bring up this node. Raises BridgeNetworkError before doing any work.
+
+    *telemetry* is the node's Telemetry bundle. A worker builds its own if it
+    is not given one, because a worker is where most of the cluster's activity
+    happens and it is the only thing that remembers it while the coordinator
+    is down.
+    """
     config = config or RegistryConfig.from_env()
 
     require_host_networking(allow_bridge=config.allow_bridge)
@@ -129,14 +169,19 @@ async def start_node(config: RegistryConfig | None = None) -> NodeRuntime:
         address=profile.address,
         port=config.agent_port,
     )
+    if telemetry is None:
+        telemetry = _open_telemetry(config, profile, decision.role)
+
     node_agent = NodeAgent(
         profile=profile,
         role=decision.role,
         cluster_id=identity.cluster_id,
         port=config.agent_port,
         advertiser=advertiser,
+        sink=telemetry.sink,
     )
     await node_agent.start()
+    await telemetry.start(node_id=profile.node_id)
 
     registry: Registry | None = None
     if decision.role == ROLE_COORDINATOR:
@@ -164,6 +209,7 @@ async def start_node(config: RegistryConfig | None = None) -> NodeRuntime:
         node_agent=node_agent,
         advertiser=advertiser,
         registry=registry,
+        telemetry=telemetry,
     )
 
     if decision.role != ROLE_COORDINATOR and decision.status in ("candidate", "rejected"):

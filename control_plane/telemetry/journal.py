@@ -41,6 +41,17 @@ SCHEMA_VERSION = 1
 #: events table like any other event.
 GAP_EVENT = "telemetry_gap"
 
+#: Journals with a running writer, by absolute path. Two Journal objects on one
+#: file is not corruption -- WAL handles concurrent writers -- but within a
+#: single process it means two writer threads and, if both came from a Telemetry
+#: bundle, two collectors advancing the same cursors. That happens when a
+#: composition root lets registry.startup.start_node() and gateway.create_app()
+#: each build their own bundle instead of sharing one. It is invisible from the
+#: outside, so it is said out loud here rather than left to be inferred from a
+#: doubled CPU cost.
+_LIVE: dict[str, int] = {}
+_LIVE_LOCK = threading.Lock()
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS journal(
   seq  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,14 +188,41 @@ class Journal:
     def start(self) -> None:
         if self._running:
             return
+        self._warn_if_already_live()
         self._running = True
         self._thread = threading.Thread(
             target=self._run, name="telemetry-journal", daemon=True
         )
         self._thread.start()
 
+    def _warn_if_already_live(self) -> None:
+        key = str(self.path.resolve())
+        with _LIVE_LOCK:
+            existing = _LIVE.get(key, 0)
+            _LIVE[key] = existing + 1
+        if existing:
+            log.warning(
+                "a second telemetry journal is starting on %s in this process. "
+                "Two writer threads, and two collectors if both came from a "
+                "Telemetry bundle. A composition root should build one bundle "
+                "and pass it to both start_node() and create_app(), e.g. "
+                "create_app(deps, telemetry=runtime.telemetry).",
+                key,
+            )
+
+    def _release(self) -> None:
+        key = str(self.path.resolve())
+        with _LIVE_LOCK:
+            remaining = _LIVE.get(key, 1) - 1
+            if remaining > 0:
+                _LIVE[key] = remaining
+            else:
+                _LIVE.pop(key, None)
+
     def close(self, timeout: float = 5.0) -> None:
         """Stop the writer, flushing whatever is buffered."""
+        if self._running:
+            self._release()
         self._running = False
         self._wake.set()
         thread = self._thread

@@ -798,6 +798,48 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "history_failed",
             )
 
+    def _ring_history(node_id: str, from_ts: float, to_ts: float) -> dict | None:
+        """The registry's 300-sample ring, when there is no archive.
+
+        Without this, a node with telemetry switched off has five minutes of
+        per-node history in RAM that nothing can reach: Registry.history() has
+        no caller anywhere in the gateway. It is a fallback inside this handler
+        rather than a second route, because two endpoints answering the same
+        question with different truthfulness is worse than one that labels
+        which it gave you -- hence resolution "ring" and durable false.
+        """
+        registry = ctx.deps.registry
+        history = getattr(registry, "history", None)
+        if not callable(history):
+            return None
+        seconds = int(max(1.0, min(to_ts - from_ts, tquery.config.TELEMETRY_RING_S)))
+        if node_id:
+            node_ids = [node_id]
+        else:
+            try:
+                node_ids = [n.profile.node_id for n in registry.list_nodes()]
+            except Exception:
+                return None
+        samples: list[dict] = []
+        for nid in node_ids:
+            try:
+                rows = history(nid, seconds) or []
+            except Exception:
+                continue
+            for row in rows:
+                if from_ts <= row.get("ts", 0.0) <= to_ts:
+                    samples.append({"node_id": nid, **row})
+        samples.sort(key=lambda row: row.get("ts", 0.0))
+        return {
+            "from": from_ts,
+            "to": to_ts,
+            "resolution": "ring",
+            "durable": False,
+            "gaps": [],
+            "truncated": False,
+            "samples": samples,
+        }
+
     @router.get("/api/history/nodes")
     async def history_nodes(
         node_id: str = "",
@@ -806,6 +848,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         step: str = "auto",
         limit: int = tquery.config.QUERY_MAX_ROWS,
     ) -> Response:
+        if _archive() is None:
+            frm, to_ts = tquery.resolve_window(from_, to)
+            ring = await asyncio.to_thread(_ring_history, node_id, frm, to_ts)
+            if ring is not None:
+                return JSONResponse(ring)
+            return _no_history()
         return await _history(
             tquery.nodes,
             node_id=node_id,
