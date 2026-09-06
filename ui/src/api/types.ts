@@ -119,9 +119,11 @@ export interface NodeStateDTO {
   role: NodeRole
   last_seen: number
   memory_used: number
-  power_watts: number
-  temperature_c: number
-  utilization_pct: number
+  /** null when the node has never reported telemetry. A live-looking zero is
+   *  worse than an honest blank, so this is never defaulted on the way in. */
+  power_watts: number | null
+  temperature_c: number | null
+  utilization_pct: number | null
   last_error?: string | null
   /** false when this node cannot join the current serving pool */
   eligible?: boolean
@@ -162,10 +164,10 @@ export interface Candidate {
   address: string
   device_class: DeviceClass
   gpu_name: string
-  total_memory: number
-  discovered_at: number
-  /** set when the node is reachable but would not join the current pool */
-  note?: string | null
+  addressable_memory: number
+  /** false when this candidate is reachable but would not join the current pool */
+  eligible?: boolean
+  ineligible_reason?: string | null
 }
 
 // ── Plan and fit: POST /api/plan ─────────────────────────────────────────────
@@ -250,6 +252,8 @@ export interface DeploymentDTO {
 
 // ── Routing: GET /api/routing, PUT /api/routing/{served_name} ────────────────
 
+export type CircuitState = 'closed' | 'open' | 'half_open'
+
 export interface RouteTarget {
   target_id: string
   kind: TargetKind
@@ -264,8 +268,9 @@ export interface RouteTarget {
   /** set by G when a local target is held at zero weight */
   zero_weight_reason?: string | null
   node_ids?: string[]
-  provider_id?: string
-  display_name?: string
+  /** the failover breaker's view of this target. Absent targets read as
+   *  closed; G always emits it, this is just belt-and-suspenders. */
+  circuit?: CircuitState
 }
 
 export interface RoutingConfig {
@@ -305,8 +310,6 @@ export interface Provider {
   healthy: boolean
   last_error: string | null
   last_refreshed: number
-  /** USD, today, if G tracks it */
-  spend_today_usd?: number | null
 }
 
 // ── SSE: GET /api/metrics/stream ─────────────────────────────────────────────
@@ -336,6 +339,10 @@ export interface MetricsDeploymentFrame {
 export interface MetricsFrame {
   ts: number
   cluster: MetricsClusterFrame
-  nodes: MetricsNodeFrame[]
-  deployments: MetricsDeploymentFrame[]
+  /** null on the gateway's degraded path (registry/deployment list
+   *  unavailable) rather than an empty list, so the wire keeps that
+   *  distinction. useMetrics coalesces to `[]` in one place; nothing past it
+   *  should see the null. */
+  nodes: MetricsNodeFrame[] | null
+  deployments: MetricsDeploymentFrame[] | null
 }

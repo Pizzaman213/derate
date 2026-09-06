@@ -3,6 +3,17 @@ import type { RoutingConfig, RoutingPolicy, RouteTarget } from '../api/types'
 import { ProportionBar } from '../components/Bars'
 import { Readout } from '../components/Readout'
 import { Lamp } from '../components/Lamp'
+import { pct } from '../format'
+
+/** Local targets have no display name on the wire; the node(s) behind them
+ *  are the only honest label. Remote targets are named by their target id
+ *  (`{provider_id}:{upstream_id}`), which is already legible. */
+function targetLabel(t: RouteTarget): string {
+  if (t.kind === 'local' && t.node_ids && t.node_ids.length > 0) {
+    return t.node_ids.join(' + ')
+  }
+  return t.target_id
+}
 
 const POLICIES: { value: RoutingPolicy; label: string }[] = [
   { value: 'least_outstanding', label: 'Least outstanding' },
@@ -103,11 +114,13 @@ function RoutingEntry({
 
 function TargetRow({ target: t, policy }: { target: RouteTarget; policy: RoutingPolicy }) {
   const remote = t.kind === 'remote'
+  const label = targetLabel(t)
   // A target held at zero weight is shown, greyed, with the reason. Hiding it
   // would make the cluster look smaller than it is.
   const benched = !remote && t.weight === 0 && t.zero_weight_reason != null
   const blocked = !t.admitting || !t.healthy
-  const dim = benched || blocked
+  const circuitFlagged = t.circuit === 'open' || t.circuit === 'half_open'
+  const dim = benched || blocked || circuitFlagged
 
   return (
     <div style={{ display: 'grid', gap: 4, opacity: dim ? 0.62 : 1 }}>
@@ -120,8 +133,19 @@ function TargetRow({ target: t, policy }: { target: RouteTarget; policy: Routing
         }}
       >
         <span style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+          {circuitFlagged ? (
+            <Lamp
+              signal="idle"
+              hollow
+              label={
+                t.circuit === 'open'
+                  ? `${label} circuit open, benched after repeated failures`
+                  : `${label} circuit half-open, probing`
+              }
+            />
+          ) : null}
           <span className="label" style={{ fontWeight: 400 }}>
-            {t.display_name ?? t.target_id}
+            {label}
           </span>
           {remote ? <span className="unit">remote</span> : null}
         </span>
@@ -148,7 +172,7 @@ function TargetRow({ target: t, policy }: { target: RouteTarget; policy: Routing
         <ProportionBar
           value={t.weight}
           tone={dim ? 'muted' : 'ink'}
-          label={`${t.display_name ?? t.target_id} takes ${Math.round(t.weight * 100)} percent of traffic`}
+          label={`${label} takes ${pct(t.weight * 100)} percent of traffic`}
         />
       ) : null}
 

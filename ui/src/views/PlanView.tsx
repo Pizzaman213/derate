@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FitResult, PlanResponse } from '../api/types'
-import { CURATED_MODELS } from '../api/fixtures'
+import { CURATED_MODELS } from '../api/catalog'
 import { useBackend } from '../state/backend'
 import { Lamp } from '../components/Lamp'
 import { Readout } from '../components/Readout'
@@ -322,8 +322,13 @@ function FitBlock({
     .map((s) => ({ ...s, limiting: s.key === fit.limiting_term }))
 
   const canLaunch = fit.verdict !== 'wont_fit'
+  // 0 is the backend's old "nothing helps" sentinel; the corrected backend
+  // sends null for that case, but a stray 0 must never render a button that
+  // offers to launch at zero context.
   const canAdjust =
-    fit.max_context_that_fits != null && fit.max_context_that_fits !== context
+    fit.max_context_that_fits != null &&
+    fit.max_context_that_fits > 0 &&
+    fit.max_context_that_fits !== context
 
   return (
     <section style={{ display: 'grid', gap: 'var(--s2)' }}>

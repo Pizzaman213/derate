@@ -30,32 +30,6 @@ export function Section({
   )
 }
 
-/** A label/value line with the value right-aligned so digits form a column. */
-export function Field({
-  label,
-  children,
-}: {
-  label: string
-  children: ReactNode
-}) {
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'baseline',
-        justifyContent: 'space-between',
-        gap: 'var(--s1)',
-        padding: '2px 0',
-      }}
-    >
-      <span className="label muted" style={{ fontWeight: 400 }}>
-        {label}
-      </span>
-      <span>{children}</span>
-    </div>
-  )
-}
-
 /** A disclosure whose trigger is a plain line of text, not a button chrome.
  *  Used for the plan's reason, which is the most important expansion here. */
 export function Disclosure({

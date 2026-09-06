@@ -1,4 +1,5 @@
-import type { MetricsFrame, NodeStateDTO } from '../api/types'
+import type { NodeStateDTO } from '../api/types'
+import type { SafeMetricsFrame } from '../state/useMetrics'
 import { Lamp } from '../components/Lamp'
 import { Readout } from '../components/Readout'
 import { gbytes, shortGpu } from '../format'
@@ -20,7 +21,7 @@ export interface NodeLive {
  *  than current, so the caller greys them instead of passing them off as live. */
 export function nodeLive(
   node: NodeStateDTO,
-  frame: MetricsFrame | null,
+  frame: SafeMetricsFrame | null,
   streamStale: boolean,
 ): NodeLive & { fresh: boolean } {
   const f = frame?.nodes.find((n) => n.node_id === node.profile.node_id)
@@ -60,7 +61,7 @@ export function nodeSignal(
 
 interface Props {
   nodes: NodeStateDTO[]
-  frame: MetricsFrame | null
+  frame: SafeMetricsFrame | null
   streamStale: boolean
   onSelect: (nodeId: string) => void
   selected: string | null

@@ -37,14 +37,14 @@ export function Discovery({ candidates, coordinatorAddress, onAdmit }: Props) {
               {c.hostname}
             </div>
             <div className="unit">
-              {shortGpu(c.gpu_name)} · {gbytes(c.total_memory, 0)} GB · {c.address}
+              {shortGpu(c.gpu_name)} · {gbytes(c.addressable_memory, 0)} GB · {c.address}
             </div>
-            {c.note ? (
+            {c.eligible === false && c.ineligible_reason ? (
               <div
                 className="label"
                 style={{ fontWeight: 400, color: 'var(--ink-muted)' }}
               >
-                {c.note}
+                {c.ineligible_reason}
               </div>
             ) : null}
             <div>

@@ -1,19 +1,14 @@
-import type {
-  Cluster,
-  DeploymentDTO,
-  MetricsFrame,
-  Topology,
-} from '../api/types'
+import type { Cluster, DeploymentDTO, Topology } from '../api/types'
 import { Lamp } from '../components/Lamp'
 import { Readout } from '../components/Readout'
 import { Sparkline } from '../components/Sparkline'
-import { HISTORY_SECONDS } from '../state/useMetrics'
+import { HISTORY_SECONDS, type SafeMetricsFrame } from '../state/useMetrics'
 import { gbNum, gbytes, shortGpu } from '../format'
 
 interface Props {
   cluster: Cluster
   topology: Topology
-  frame: MetricsFrame | null
+  frame: SafeMetricsFrame | null
   history: { t: number; v: number }[]
   stale: boolean
   onPlanModel: () => void

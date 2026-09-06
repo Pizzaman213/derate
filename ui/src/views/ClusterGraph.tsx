@@ -1,11 +1,6 @@
 import { useMemo, useState } from 'react'
-import type {
-  MetricsFrame,
-  RoutingConfig,
-  Topology,
-  TopologyEdge,
-  TopologyNode,
-} from '../api/types'
+import type { RoutingConfig, Topology, TopologyEdge, TopologyNode } from '../api/types'
+import type { SafeMetricsFrame } from '../state/useMetrics'
 import {
   BAND_GAP,
   BAND_H,
@@ -17,11 +12,11 @@ import {
   layoutNodes,
   type Placed,
 } from './layout'
-import { fmt, gbytes, shortGpu } from '../format'
+import { fmt, gbytes, pct, shortGpu } from '../format'
 
 interface Props {
   topology: Topology
-  frame: MetricsFrame | null
+  frame: SafeMetricsFrame | null
   stale: boolean
   routing: RoutingConfig[]
   measuring: string | null
@@ -172,7 +167,7 @@ function NodeBox({
 }: {
   node: TopologyNode
   at: Placed
-  frame: MetricsFrame | null
+  frame: SafeMetricsFrame | null
   stale: boolean
   share: { served_name: string; weight: number } | null
   singleNodeDeployments: string[]
@@ -201,7 +196,7 @@ function NodeBox({
       }}
       tabIndex={0}
       role="button"
-      aria-label={`${node.hostname}, ${node.state}, ${Math.round(mem)} percent memory used`}
+      aria-label={`${node.hostname}, ${node.state}, ${pct(mem)} percent memory used`}
       style={{ cursor: 'pointer' }}
     >
       <rect width={BOX_W} height={BOX_H} fill="var(--panel)" />
@@ -303,9 +298,9 @@ function NodeBox({
             fontSize={11}
             style={{ fontVariantNumeric: 'tabular-nums' }}
           >
-            {Math.round(share.weight * 100)}%
+            {pct(share.weight * 100)}%
           </text>
-          <title>{`${share.served_name}: ${Math.round(share.weight * 100)} percent of traffic`}</title>
+          <title>{`${share.served_name}: ${pct(share.weight * 100)} percent of traffic`}</title>
         </g>
       ) : null}
     </g>

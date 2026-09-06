@@ -117,6 +117,8 @@ interface NodeWire {
   temp_c: number | null
   util_pct: number | null
   last_error?: string | null
+  eligible?: boolean
+  ineligible_reason?: string | null
 }
 
 /** The gateway reports node health as `healthy | unhealthy`; the UI's three-way
@@ -147,10 +149,14 @@ function toNodeState(n: NodeWire, coordinator: string | null): NodeStateDTO {
     role: n.node_id === coordinator ? 'coordinator' : 'worker',
     last_seen: n.last_seen,
     memory_used: n.memory_used,
-    power_watts: n.power_w ?? 0,
-    temperature_c: n.temp_c ?? 0,
-    utilization_pct: n.util_pct ?? 0,
+    // A missing reading stays missing. Defaulting to 0 would draw a live-
+    // looking zero for a node that has simply never reported telemetry.
+    power_watts: n.power_w,
+    temperature_c: n.temp_c,
+    utilization_pct: n.util_pct,
     last_error: n.last_error ?? null,
+    eligible: n.eligible,
+    ineligible_reason: n.ineligible_reason ?? null,
   }
 }
 

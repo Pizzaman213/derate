@@ -14,8 +14,6 @@ export const MARGIN = 28
 export const ARC_HEADROOM = 72
 export const BAND_H = 40
 export const BAND_GAP = 10
-/** Vertical run from a machine down to the band beneath it. */
-export const BAND_LEAD = 22
 
 export interface Placed {
   node_id: string

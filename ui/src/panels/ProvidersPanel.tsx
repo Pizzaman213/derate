@@ -1,9 +1,7 @@
 import type { Provider } from '../api/types'
 import { Lamp } from '../components/Lamp'
-import { Readout } from '../components/Readout'
 
-/** Configured upstreams: health, how many models they contribute, and what they
- *  have cost today.
+/** Configured upstreams: health and how many models they contribute.
  *
  *  The key is rendered as three asterisks and there is no control to reveal it.
  *  This is a tool people screenshot; a key on screen is unrecoverable. What is
@@ -47,16 +45,7 @@ export function ProvidersPanel({ providers }: { providers: Provider[] }) {
                   {p.display_name}
                 </span>
               </span>
-              {off ? (
-                <span className="unit">disabled</span>
-              ) : (
-                <Readout
-                  value={p.spend_today_usd ?? null}
-                  decimals={2}
-                  width={5}
-                  unit="USD today"
-                />
-              )}
+              {off ? <span className="unit">disabled</span> : null}
             </div>
 
             <div className="unit" style={{ paddingLeft: 16 }}>

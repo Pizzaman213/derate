@@ -24,6 +24,7 @@ import type {
   RoutingConfig,
   Topology,
 } from './types'
+import { CURATED_MODELS, type Scenario } from './catalog'
 
 const GiB = 1024 ** 3
 const gb = (n: number) => Math.round(n * GiB)
@@ -39,16 +40,6 @@ const USABLE_3090 = Math.trunc(Math.trunc(23.6 * GiB) * DEFAULT_GUARDRAIL)
 
 const CLUSTER_ID = 'c-8f21'
 const now = () => Date.now() / 1000
-
-/** Which fixture world to serve. The failure states are designed screens, so the
- *  stub has to be able to produce them on demand. Fixture mode only. */
-export type Scenario = 'nominal' | 'single-node' | 'node-down'
-
-export const SCENARIOS: { id: Scenario; label: string }[] = [
-  { id: 'nominal', label: 'Two Sparks serving' },
-  { id: 'single-node', label: 'One node, nothing running' },
-  { id: 'node-down', label: 'spark-02 unreachable' },
-]
 
 // ── Node profiles: tests/fixtures/nodes.py ───────────────────────────────────
 
@@ -390,38 +381,6 @@ const FIT_DEEPSEEK = {
   ],
 }
 
-/** The picker: the four frozen shapes, plus a free-text HuggingFace ID field. */
-export const CURATED_MODELS = [
-  {
-    model_id: 'openai/gpt-oss-120b',
-    label: 'gpt-oss-120b',
-    detail: 'MoE · mxfp4 · sliding window · 116.8B',
-    default_context: 32768,
-    default_concurrency: 16,
-  },
-  {
-    model_id: 'Qwen/Qwen3-30B-A3B',
-    label: 'qwen3-30b-a3b',
-    detail: 'MoE · bf16 · 30.5B, 3.3B active',
-    default_context: 32768,
-    default_concurrency: 8,
-  },
-  {
-    model_id: 'meta-llama/Llama-3.3-70B-Instruct',
-    label: 'llama-3.3-70b',
-    detail: 'dense · GQA 8:1 · bf16 · 70.6B',
-    default_context: 131072,
-    default_concurrency: 32,
-  },
-  {
-    model_id: 'deepseek-ai/DeepSeek-V3',
-    label: 'deepseek-v3',
-    detail: 'MoE · MLA · fp8 · 671.0B',
-    default_context: 32768,
-    default_concurrency: 16,
-  },
-]
-
 // ── Deployments ──────────────────────────────────────────────────────────────
 
 const ALL_DEPLOYMENTS: DeploymentDTO[] = [
@@ -514,7 +473,7 @@ function baseRouting(): RoutingConfig[] {
           strength: 1.0,
           cost_per_mtok: 0.0,
           node_ids: ['spark-01', 'spark-02'],
-          display_name: 'spark-01 + spark-02 · PP 2',
+          circuit: 'closed',
         },
         {
           target_id: 'openrouter:openai/gpt-oss-120b',
@@ -526,8 +485,9 @@ function baseRouting(): RoutingConfig[] {
           admitting: true,
           strength: 0.0,
           cost_per_mtok: 0.3,
-          provider_id: 'openrouter',
-          display_name: 'openai/gpt-oss-120b',
+          // Failed twice yesterday; the breaker is sending it one probe request
+          // at a time rather than trusting it back into the rotation outright.
+          circuit: 'half_open',
         },
       ],
     },
@@ -551,7 +511,7 @@ function baseRouting(): RoutingConfig[] {
           strength: 1.0,
           cost_per_mtok: 0.0,
           node_ids: ['spark-01'],
-          display_name: 'spark-01',
+          circuit: 'closed',
         },
         {
           target_id: 'd-3',
@@ -564,7 +524,7 @@ function baseRouting(): RoutingConfig[] {
           strength: 0.97,
           cost_per_mtok: 0.0,
           node_ids: ['spark-02'],
-          display_name: 'spark-02',
+          circuit: 'closed',
         },
         {
           target_id: 'd-4',
@@ -577,7 +537,7 @@ function baseRouting(): RoutingConfig[] {
           strength: 0.14,
           cost_per_mtok: 0.0,
           node_ids: ['ws-3090'],
-          display_name: 'ws-3090',
+          circuit: 'closed',
           zero_weight_reason:
             'Measured 8.2 tok/s sustained against 58.4 on the strongest target, 14 percent, below the 15 percent floor. Its 4096 context refuses most of this pool’s traffic, so it is held as failover only: a small share of requests here would still set the tail latency for the whole cluster.',
         },
@@ -603,7 +563,6 @@ function baseProviders(): Provider[] {
       healthy: true,
       last_error: null,
       last_refreshed: 1757193000.0,
-      spend_today_usd: 1.84,
       models: [
         {
           served_name: 'gpt-oss-120b',
@@ -636,7 +595,6 @@ function baseProviders(): Provider[] {
       healthy: false,
       last_error: 'connection refused after 3 attempts, last at 12:04:11',
       last_refreshed: 1757192400.0,
-      spend_today_usd: 0,
       models: [],
     },
     {
@@ -650,7 +608,6 @@ function baseProviders(): Provider[] {
       healthy: true,
       last_error: null,
       last_refreshed: 1757190000.0,
-      spend_today_usd: 0,
       models: [],
     },
   ]
@@ -666,9 +623,9 @@ function baseCandidates(): Candidate[] {
       address: '10.0.0.13',
       device_class: 'gb10',
       gpu_name: 'NVIDIA GB10',
-      total_memory: GB10_TOTAL_MEMORY,
-      discovered_at: 1757194400.0,
-      note: null,
+      addressable_memory: GB10_TOTAL_MEMORY,
+      eligible: true,
+      ineligible_reason: null,
     },
     {
       node_id: 'jetson-agx',
@@ -676,9 +633,10 @@ function baseCandidates(): Candidate[] {
       address: '10.0.0.61',
       device_class: 'unknown',
       gpu_name: 'Orin AGX 64GB',
-      total_memory: 64 * GiB,
-      discovered_at: 1757194460.0,
-      note: 'Joins as a member, but 64 GB and a 1.0 GB/s link keep it out of the current gpt-oss-120b pool.',
+      addressable_memory: 64 * GiB,
+      eligible: false,
+      ineligible_reason:
+        'Joins as a member, but 64 GB and a 1.0 GB/s link keep it out of the current gpt-oss-120b pool.',
     },
   ]
 }

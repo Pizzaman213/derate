@@ -20,6 +20,13 @@ export function gbNum(bytes: number): number {
   return bytes / GiB
 }
 
+/** Rounds a percentage for use inside a sentence (an aria-label or a title),
+ *  where `fmt`'s em dash would read strangely. A non-finite input never
+ *  leaks into copy as "NaN percent" or "Infinity percent". */
+export function pct(v: number | null | undefined): string {
+  return typeof v === 'number' && Number.isFinite(v) ? String(Math.round(v)) : '—'
+}
+
 /** "GB10", "RTX 3090" — the marketing prefix wastes width in a 200px column. */
 export function shortGpu(name: string): string {
   return name.replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '')

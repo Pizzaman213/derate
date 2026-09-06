@@ -1,16 +1,17 @@
-import type { Cluster, MetricsFrame, Topology } from '../api/types'
+import type { Cluster, Topology } from '../api/types'
+import type { SafeMetricsFrame } from '../state/useMetrics'
 import { Lamp } from '../components/Lamp'
 import { Readout } from '../components/Readout'
 import { ProportionBar } from '../components/Bars'
 import { Verbatim } from '../components/Verbatim'
-import { gbytes, relativeTime, shortGpu } from '../format'
+import { gbytes, pct, relativeTime, shortGpu } from '../format'
 import { nodeLive, nodeSignal } from '../panels/NodeRoster'
 
 interface Props {
   nodeId: string
   cluster: Cluster
   topology: Topology
-  frame: MetricsFrame | null
+  frame: SafeMetricsFrame | null
   stale: boolean
   onBack: () => void
   onMeasure: (a: string, b: string) => void
@@ -100,7 +101,7 @@ export function NodeDetail({
           value={(live.memory_used_pct ?? 0) / 100}
           height={6}
           tone={grey ? 'muted' : 'ink'}
-          label={`${Math.round(live.memory_used_pct ?? 0)} percent of addressable memory in use`}
+          label={`${pct(live.memory_used_pct)} percent of addressable memory in use`}
         />
         {!live.fresh ? (
           <p className="unit" style={{ margin: 0 }}>

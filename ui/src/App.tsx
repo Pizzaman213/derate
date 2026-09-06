@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { RoutingPolicy } from './api/types'
-import { SCENARIOS, getScenario, setScenario, type Scenario } from './api/fixtures'
+import { getScenario, setScenario } from './api/fixtures'
+import { SCENARIOS, type Scenario } from './api/catalog'
 import { useBackend } from './state/backend'
 import {
   useCandidates,
@@ -333,7 +334,12 @@ function FixtureControls() {
   const [current, setCurrent] = useState<Scenario>(getScenario())
   return (
     <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-      <span className="unit">fixture data</span>
+      {/* Demo numbers that look live are worse than demo numbers that say what
+          they are, so this reads a little stronger than a quiet unit label --
+          the existing warn token as text colour, not a new hue. */}
+      <span className="unit" style={{ color: 'var(--warn)' }}>
+        fixture data
+      </span>
       <label>
         <span className="sr-only">Fixture scenario</span>
         <select

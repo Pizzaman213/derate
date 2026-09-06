@@ -83,7 +83,10 @@ function MeasurePrompt({
   measuring: string | null
   onMeasure: (a: string, b: string) => void
 }) {
-  const key = pair.join('~')
+  // Sorted to match the key App builds when it starts the measurement
+  // (`[a, b].sort().join('~')`) -- otherwise a pair arriving here in
+  // src/dst order never matches and the button never shows "Measuring…".
+  const key = [...pair].sort().join('~')
   const busy = measuring === key
   return (
     <div
