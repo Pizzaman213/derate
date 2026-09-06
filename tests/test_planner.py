@@ -626,9 +626,12 @@ def test_impossible_capacity_at_any_node_count_is_never_reported_as_a_fit():
     assert "fits within" not in plan.reason
     assert "no node count in the search range fits this model" in plan.reason
     assert "Warning" in plan.reason
-    assert any(
-        "no node count in the search range fits this model" in r
-        for r in plan.rejected
+    # The impossibility lives in the REASON. It must NOT also appear as a
+    # rejected entry for the plan's own chosen shape -- a plan that lists
+    # itself as illegal contradicts itself (WF-5 finding); the multi-node
+    # alternatives in `rejected` still carry their own honest lines.
+    assert not any(
+        r.startswith("single node: illegal") for r in plan.rejected
     ), plan.rejected
 
 
@@ -701,3 +704,19 @@ def test_illegal_tensor_degrees_appear_in_the_rejected_list():
 
     assert any("TP=4: illegal" in r and "num_kv_heads=6" in r for r in plan.rejected)
     assert plan.tensor_parallel in (1, 2)
+
+
+def test_best_available_single_node_reason_never_claims_a_fit():
+    """WF-5 finding: when the model needs more nodes than the group has, the
+    single-node best-available plan's lead clause claimed 'the model fits
+    within N GiB' and listed its own shape in rejected."""
+    plan = Planner().plan(
+        LLAMA_3_3_70B, [SPARK_01], LINK_SPARK_10G, "throughput", 16,
+        context_length=131072,
+    )
+    assert plan.kind is ParallelismKind.SINGLE_NODE
+    assert "fits within" not in plan.reason
+    assert "cannot hold" in plan.reason and "closest available shape" in plan.reason
+    assert not any(r.startswith("single node: illegal") for r in plan.rejected), (
+        "a plan must not reject its own chosen shape"
+    )

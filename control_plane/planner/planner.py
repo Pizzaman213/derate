@@ -329,7 +329,12 @@ class Planner:
 
         plans: list[ParallelismPlan] = []
         for index, chosen in enumerate(scored):
-            rejected = preamble + [
+            pre = preamble
+            if chosen.kind is ParallelismKind.SINGLE_NODE:
+                # A plan must not list its own chosen shape in its rejected
+                # list; the reason carries the capacity caveat instead.
+                pre = [l for l in preamble if not l.startswith("single node: illegal")]
+            rejected = pre + [
                 line for other, line in enumerate(lines) if other != index
             ]
             plans.append(
@@ -518,6 +523,21 @@ class Planner:
                     f"{facts.context} context and concurrency {c}; this is "
                     f"offered as the closest available shape, not a working "
                     f"plan, and the fit check will refuse it"
+                )
+
+            if facts.min_nodes > 1:
+                # Chosen only as the best available shape: the model does NOT
+                # fit here, and the lead clause must never claim it does
+                # (WF-5 finding: "fits within N GiB" on a model needing more
+                # nodes than the group has, or with no legal multi-node shape).
+                return (
+                    f"one node cannot hold this model: capacity needs "
+                    f"{facts.min_nodes} nodes at {facts.context} context and "
+                    f"concurrency {c}, and no legal shape in this "
+                    f"{facts.group.size}-node group covers it; offered as the "
+                    f"closest available shape, not a working plan -- the fit "
+                    f"check will refuse it until context, concurrency, or "
+                    f"quantization changes"
                 )
 
             usable = facts.group.exemplar.usable_memory() / 1024**3

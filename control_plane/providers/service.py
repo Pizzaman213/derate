@@ -60,6 +60,21 @@ from .usage import UsageSniffer
 
 log = logging.getLogger(__name__)
 
+
+def _screen_free_text(value: str, field: str) -> None:
+    """Refuse key-shaped material in a field that is echoed and persisted.
+
+    display_name and aliases appear verbatim in every provider listing and
+    in providers.json; the reference/URL fields already get this screen and
+    these must not be the two that dodge it.
+    """
+    if looks_like_secret(value):
+        raise ValueError(
+            f"{field} looks like it contains key material; provider names and "
+            "aliases are displayed and persisted verbatim, so paste the key's "
+            "REFERENCE (an env var or secrets.json name), never the key"
+        )
+
 _ID_SAFE = re.compile(r"[^a-z0-9._-]+")
 
 
@@ -327,12 +342,21 @@ class ProviderService:
         if provider_id in self._entries:
             raise ValueError(f"provider {provider_id!r} already exists")
 
+        display_name = str(spec.get("display_name") or kind_spec.display_name)
         aliases = {str(k): str(v) for k, v in (spec.get("aliases") or {}).items()}
+        # Same screen the ref and URL get: these two fields are echoed in
+        # every provider listing and persisted verbatim, so a pasted key
+        # here would leak everywhere a reference safely displays (WF-5 /
+        # audit follow-up L1 — the screen existed, these fields dodged it).
+        _screen_free_text(display_name, "display_name")
+        for alias_key, alias_value in aliases.items():
+            _screen_free_text(alias_key, "aliases key")
+            _screen_free_text(alias_value, f"aliases[{alias_key!r}]")
         budget = spec.get("daily_budget_usd")
         provider = Provider(
             provider_id=provider_id,
             kind=kind,
-            display_name=str(spec.get("display_name") or kind_spec.display_name),
+            display_name=display_name,
             base_url=base_url,
             api_key_ref=api_key_ref,
             enabled=bool(spec.get("enabled", True)),
@@ -372,7 +396,9 @@ class ProviderService:
         if "priority" in patch:
             entry.provider.priority = int(patch["priority"])
         if "display_name" in patch:
-            entry.provider.display_name = str(patch["display_name"])
+            display_name = str(patch["display_name"])
+            _screen_free_text(display_name, "display_name")
+            entry.provider.display_name = display_name
         if "daily_budget_usd" in patch:
             value = patch["daily_budget_usd"]
             entry.runtime.daily_budget_usd = None if value is None else float(value)
@@ -387,7 +413,11 @@ class ProviderService:
                 raise ValueError("api_key_ref must be a reference, not a key")
             entry.provider.api_key_ref = ref
         if "aliases" in patch:
-            entry.runtime.aliases = {str(k): str(v) for k, v in (patch["aliases"] or {}).items()}
+            aliases = {str(k): str(v) for k, v in (patch["aliases"] or {}).items()}
+            for alias_key, alias_value in aliases.items():
+                _screen_free_text(alias_key, "aliases key")
+                _screen_free_text(alias_value, f"aliases[{alias_key!r}]")
+            entry.runtime.aliases = aliases
             self._apply_aliases(entry)
         if entry.provider.enabled:
             self._check_key(entry)

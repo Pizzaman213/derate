@@ -1350,3 +1350,24 @@ def test_retry_after_dos_guard_boundary_values(tmp_path):
         with pytest.raises(UpstreamError) as excinfo:
             run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
         assert excinfo.value.retry_after_s == pytest.approx(expected)
+
+
+def test_key_shaped_display_name_and_aliases_are_refused(tmp_path):
+    """WF-5 finding: the looks_like_secret screen guarded api_key_ref and
+    base_url while display_name and aliases were echoed and persisted
+    verbatim -- the one place a pasted key could still leak."""
+    key_shaped = "sk-or-v1-aaaabbbbccccdddd1234"
+    service = make_service(tmp_path, Upstream())
+    with pytest.raises(ValueError, match="key material"):
+        service.add({"kind": "openrouter", "api_key_ref": KEY_REF, "display_name": key_shaped})
+    with pytest.raises(ValueError, match="key material"):
+        service.add({"kind": "openrouter", "api_key_ref": KEY_REF, "aliases": {"m": key_shaped}})
+    add_openrouter(service)
+    provider_id = service.list()[0].provider_id
+    with pytest.raises(ValueError, match="key material"):
+        service.update(provider_id, {"display_name": key_shaped})
+    with pytest.raises(ValueError, match="key material"):
+        service.update(provider_id, {"aliases": {key_shaped: "x"}})
+    # Ordinary names still pass both paths.
+    service.update(provider_id, {"display_name": "OpenRouter (primary)"})
+    service.update(provider_id, {"aliases": {"anthropic/claude-sonnet-4.5": "sonnet"}})
