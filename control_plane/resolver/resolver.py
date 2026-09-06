@@ -21,13 +21,7 @@ from . import gguf as gguf_mod
 from . import quant_detect, support
 from .cache import ShapeCache
 from .config_map import Mapped, map_config, vision_config
-from .hf import (
-    SAFETENSORS_ELEMENT_BYTES,
-    HubClient,
-    ModelInfo,
-    count_safetensors_params,
-    safetensors_header,
-)
+from .hf import HubClient, ModelInfo, count_safetensors_params, safetensors_header
 from .params import ParamBreakdown, analytic_breakdown, reconcile
 from .types import (
     MetadataUnavailable,

@@ -97,12 +97,17 @@ async def run_nvidia_smi_async(
     query: str,
     timeout: float = TELEMETRY_TIMEOUT_S,
     flag: str = "--query-gpu",
+    allow_empty: bool = False,
 ) -> list[list[str]] | None:
     """Async nvidia-smi query under a hard timeout. Returns None on any failure.
 
     ``flag`` selects the query family: --query-gpu for per-device fields,
     --query-compute-apps for per-process ones. They are not interchangeable and
     passing a compute-apps field list to --query-gpu is simply rejected.
+
+    ``allow_empty`` distinguishes "ran fine, printed nothing" from "failed". An
+    empty --query-gpu is a broken probe; an empty --query-compute-apps is an
+    idle GPU, which is a real answer and must not be read as a failure.
 
     A slow nvidia-smi is killed rather than awaited. The poll loop keeps its
     cadence and the previous sample stays on screen, which is the correct
@@ -138,7 +143,9 @@ async def run_nvidia_smi_async(
         for line in stdout.decode(errors="replace").splitlines()
         if line.strip()
     ]
-    return rows or None
+    if rows:
+        return rows
+    return [] if allow_empty else None
 
 
 @dataclass(frozen=True)
@@ -202,11 +209,10 @@ async def read_compute_apps(
     """
     if rows is None:
         rows = await run_nvidia_smi_async(
-            COMPUTE_APPS_QUERY, flag="--query-compute-apps"
+            COMPUTE_APPS_QUERY, flag="--query-compute-apps", allow_empty=True
         )
     if rows is None:
-        # No compute contexts at all is an empty list, not a failure; only a
-        # broken or absent nvidia-smi gets here.
+        # Only a broken or absent nvidia-smi gets here. An idle GPU returns [].
         return None
     total = 0
     count = 0

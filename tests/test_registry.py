@@ -679,14 +679,15 @@ def test_telemetry_aggregates_multiple_gpus():
 def test_gb10_telemetry_falls_back_to_the_unified_pool(monkeypatch):
     """A real Spark reports [N/A] for memory.used. Zero would read as idle."""
     profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
-    monkeypatch.setattr(
-        "control_plane.registry.telemetry.read_unified_memory",
-        lambda: (80 * 1024**3, 121 * 1024**3),
-    )
+    fake_host_memory(monkeypatch, total=121 * GIB, available=41 * GIB)
     sample = run(
-        read_telemetry(profile, now=5.0, rows=[["[N/A]", "[N/A]", "59.15", "76", "96"]])
+        read_telemetry(
+            profile, now=5.0,
+            rows=[["[N/A]", "[N/A]", "59.15", "76", "96"]],
+            apps_rows=[["1234", "70000"]],
+        )
     )
-    assert sample.memory_used == 80 * 1024**3
+    assert sample.memory_used == 80 * GIB  # the pool, OS included
     assert sample.power_watts == 59.15
     assert sample.temperature_c == 76.0
     assert sample.utilization_pct == 96.0

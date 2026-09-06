@@ -526,6 +526,86 @@ class TestGGUF:
         assert len(header.metadata["tokenizer.ggml.tokens"]) == 5000
 
 
+class TestLocalDirectory:
+    """A directory of weights on disk: read the headers, not a formula."""
+
+    def _model_dir(self, tmp_path: Path, tensors: dict) -> Path:
+        directory = tmp_path / "model"
+        directory.mkdir()
+        (directory / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                    "num_hidden_layers": 2, "hidden_size": 64,
+                    "num_attention_heads": 4, "num_key_value_heads": 2,
+                    "intermediate_size": 128, "vocab_size": 1000,
+                    "torch_dtype": "bfloat16", "tie_word_embeddings": False,
+                    "hidden_act": "silu",
+                }
+            )
+        )
+        header = json.dumps(tensors).encode()
+        payload = max(
+            (entry["data_offsets"][1] for entry in tensors.values()), default=0
+        )
+        (directory / "model.safetensors").write_bytes(
+            struct.pack("<Q", len(header)) + header + b"\0" * payload
+        )
+        return directory
+
+    def test_counts_parameters_from_the_headers(self, tmp_path, resolver):
+        directory = self._model_dir(
+            tmp_path,
+            {
+                "model.embed_tokens.weight": {
+                    "dtype": "BF16", "shape": [1000, 64], "data_offsets": [0, 128000]
+                },
+                "lm_head.weight": {
+                    "dtype": "BF16", "shape": [1000, 64], "data_offsets": [128000, 256000]
+                },
+            },
+        )
+        res = resolver.resolve_full(str(directory))
+        assert res.shape.total_params == 2 * 1000 * 64
+        assert res.weight_bytes == 256000
+        assert res.param_source is ParamSource.SAFETENSORS_HEADERS
+
+    def test_packed_four_bit_weights_are_unpacked(self, tmp_path, resolver):
+        """An int32 holds eight 4-bit weights; counting elements loses 8x."""
+        from control_plane.resolver.hf import count_safetensors_params
+
+        params, nbytes = count_safetensors_params(
+            {
+                "model.layers.0.mlp.down_proj.qweight": {
+                    "dtype": "I32", "shape": [512, 64], "data_offsets": [0, 131072]
+                },
+                "model.layers.0.mlp.down_proj.qzeros": {
+                    "dtype": "I32", "shape": [4, 64], "data_offsets": [131072, 132096]
+                },
+                "model.layers.0.mlp.down_proj.scales": {
+                    "dtype": "F16", "shape": [4, 512], "data_offsets": [132096, 136192]
+                },
+            }
+        )
+        assert params == 512 * 64 * 8
+        assert nbytes == 136192
+
+    def test_mxfp4_blocks_count_two_weights_per_byte(self):
+        from control_plane.resolver.hf import count_safetensors_params
+
+        params, _ = count_safetensors_params(
+            {
+                "model.layers.0.mlp.experts.gate_up_proj_blocks": {
+                    "dtype": "U8", "shape": [128, 2880, 90, 16], "data_offsets": [0, 530841600]
+                },
+                "model.layers.0.mlp.experts.gate_up_proj_scales": {
+                    "dtype": "U8", "shape": [128, 2880, 90], "data_offsets": [530841600, 564019200]
+                },
+            }
+        )
+        assert params == 128 * 2880 * 90 * 16 * 2
+
+
 # --------------------------------------------------------------------------
 # Runtime support. Fitting and loading are different questions.
 # --------------------------------------------------------------------------
