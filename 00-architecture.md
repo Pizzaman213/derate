@@ -674,3 +674,13 @@ Every agent ships a stub of their port on day 0 so downstream agents are never b
 **Provider API keys are the one unrecoverable mistake here.** This is a tool people screenshot. Keys are stored as references, resolved only at request time, and rendered as `***` everywhere. Agent I owns a test asserting no key material appears in any serialized output; if that test is missing, the feature is not done.
 
 **Fits and usable are different questions.** A dense 70B loads on two Sparks and decodes at a few tokens per second. `FITS_DEGRADED` exists so the UI can say that out loud instead of letting someone discover it after a five-minute load.
+
+## Appendix: section 4 amendments (integration, 2026-09-06)
+
+Section 4 above is frozen and unmodified; the following are additive deviations adopted during integration, transcribed into the contracts and pinned by tests.
+
+- **`FitRequest.weight_bytes: int | None = None`** (4.3, additive field) — carries the resolver's measured on-disk safetensors/GGUF byte count so the fit calculator can prefer real bytes over `total_params * bytes_per_param` when both are available; `None` preserves every existing call site.
+- **`ModelShape.mla_rope_dim: int | None = None`** (4.2, additive field) — the decoupled RoPE width cached per token alongside the MLA latent (config key `qk_rope_head_dim`); true cached width per layer per token is `mla_latent_dim + mla_rope_dim`. `None` for non-MLA models or when the config key is absent.
+- **`LinkPort.measure` returns `LinkMeasurement | None`** (4.7, was `LinkMeasurement`) — every measurement rung can fail (no NCCL, no SSH, no loopback estimate); `None` is an honest absence rather than a fabricated bandwidth figure that the planner would otherwise act on.
+- **`DEGRADED -> FAILED` transition** (4.6, deviation) — the frozen diagram's branch out of `DEGRADED` goes to `-> STOPPING`, alongside the `DEGRADED -> READY` recovery edge on the top line; `control_plane/deploy/fsm.py`'s `LEGAL` table additionally allows `DEGRADED -> FAILED` because a degraded deployment can die outright (e.g. the surviving node also goes unhealthy) and forcing a `STOPPING` detour first would misrecord a crash as an operator-requested stop.
+- **`fp4` alias re-pointed to `nvfp4`** (quant table alias, was `mxfp4`) — a bare `fp4` tag names no packer; NVFP4 (4.5 bpw) is the more plausible read than MXFP4 (4.25 bpw) on Blackwell-class hardware, so it now wins the ambiguous spelling.

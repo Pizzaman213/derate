@@ -27,13 +27,15 @@ from control_plane.contracts import (
     BYTES_PER_PARAM,
     DeploymentState,
     DeviceClass,
+    FitRequest,
     MemoryBreakdown,
+    ModelShape,
     ParallelismKind,
     RoutingPolicy,
     TargetKind,
     Verdict,
 )
-from control_plane.contracts.quant import bytes_per_param, is_known_dtype
+from control_plane.contracts.quant import bytes_per_param, is_known_dtype, normalize_dtype
 from tests.fixtures import (
     DEEPSEEK_V3,
     GPT_OSS_120B,
@@ -108,6 +110,13 @@ def test_q4_k_m_is_real_bytes_not_nominal_bit_width():
 def test_blackwell_formats_carry_their_scales():
     assert BYTES_PER_PARAM["mxfp4"] == 0.53125  # 4.25 bpw
     assert BYTES_PER_PARAM["nvfp4"] == 0.5625   # 4.50 bpw
+
+
+def test_bare_fp4_alias_resolves_to_nvfp4_not_mxfp4():
+    """A bare 'fp4' tag names no packer; NVFP4 is the more plausible read on
+    this hardware than MXFP4, so it wins the ambiguous alias."""
+    assert normalize_dtype("fp4") == "nvfp4"
+    assert bytes_per_param("fp4") == 0.5625
 
 
 def test_no_nominal_int4_entry():
@@ -190,6 +199,33 @@ def test_deepseek_uses_multi_head_latent_attention():
 def test_dense_shape_has_no_mla_or_window():
     assert LLAMA_3_3_70B.mla_latent_dim is None
     assert LLAMA_3_3_70B.sliding_window is None
+
+
+def test_model_shape_constructs_without_mla_rope_dim_and_defaults_none():
+    # A fresh construction, not a fixture: fixtures may later opt into the field,
+    # but code that predates it must keep working without passing it.
+    bare = ModelShape(
+        model_id="test/bare",
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_kv_heads=4,
+        vocab_size=1000,
+        total_params=1_000_000,
+        dtype="bf16",
+    )
+    assert bare.mla_rope_dim is None
+
+
+def test_model_shape_carries_mla_rope_dim_when_passed():
+    import dataclasses
+
+    shaped = dataclasses.replace(DEEPSEEK_V3, mla_rope_dim=64)
+    assert shaped.mla_rope_dim == 64
+    assert shaped.mla_latent_dim == 512
+    assert shaped.mla_latent_dim + shaped.mla_rope_dim == 576, (
+        "true cached width per layer per token is latent + rope"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +315,31 @@ def test_memory_breakdown_total_is_the_sum_of_its_terms():
         comm_buffers=40, replicated=50, framework_overhead=60,
     )
     assert b.total == 210
+
+
+def _fit_request(shape=LLAMA_3_3_70B, **kwargs) -> FitRequest:
+    return FitRequest(
+        shape=shape,
+        context_length=8192,
+        max_concurrent_seqs=16,
+        kv_dtype="auto",
+        plan=pp2_plan(),
+        **kwargs,
+    )
+
+
+def test_fit_request_constructs_without_weight_bytes_and_defaults_none():
+    req = _fit_request()
+    assert req.weight_bytes is None, (
+        "weight_bytes is additive; every existing FitRequest() call site must "
+        "keep working without naming it"
+    )
+
+
+def test_fit_request_carries_weight_bytes_when_passed():
+    measured = 141_107_412_992
+    req = _fit_request(weight_bytes=measured)
+    assert req.weight_bytes == measured
 
 
 def test_degraded_is_not_failure():

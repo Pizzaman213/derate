@@ -87,3 +87,8 @@ class FitRequest:
     max_concurrent_seqs: int
     kv_dtype: str
     plan: ParallelismPlan
+    # Measured on-disk weight bytes from the resolver's safetensors/GGUF
+    # accounting; when present the fit calculator must prefer it over
+    # total_params * bytes_per_param (that consumption lands in a later
+    # package).
+    weight_bytes: int | None = None

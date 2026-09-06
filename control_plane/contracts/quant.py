@@ -85,7 +85,10 @@ _ALIASES: dict[str, str] = {
     "q3kl": "q3_k_m",
     "q2k": "q2_k",
     "mxfp4moe": "mxfp4",
-    "fp4": "mxfp4",
+    # A bare "fp4" tag names no packer; NVFP4 (4.5 bpw) is the more
+    # plausible read on this hardware than MXFP4 (4.25 bpw), so it wins
+    # the ambiguous alias.
+    "fp4": "nvfp4",
     "nvfp4a16": "nvfp4",
     "awq": "awq_int4",
     "awqint4": "awq_int4",

@@ -34,6 +34,11 @@ class ModelShape:
 
     # Multi-head latent attention (DeepSeek family)
     mla_latent_dim: int | None = None
+    # Width of the decoupled RoPE component cached per token alongside the
+    # MLA latent (config key qk_rope_head_dim); true cached width per layer
+    # per token is mla_latent_dim + mla_rope_dim; None for non-MLA models or
+    # when the config key is absent.
+    mla_rope_dim: int | None = None
 
     # Replicated per node when sharding, never split
     vision_params: int = 0
