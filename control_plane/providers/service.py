@@ -133,16 +133,42 @@ class ProviderService:
         self._refresh_task: asyncio.Task | None = None
         self._spend_dirty = False
         self._spend_persisted_at = 0.0
-        # One filter per package logger, replaced rather than stacked, so
-        # constructing several services does not accumulate filters.
-        package_logger = logging.getLogger(__package__)
-        for existing in list(package_logger.filters):
-            if isinstance(existing, SecretRedactingFilter):
-                package_logger.removeFilter(existing)
-        package_logger.addFilter(SecretRedactingFilter(self.redactor))
+        self._install_redacting_filter()
         self._load()
 
     # -- construction helpers ---------------------------------------------
+
+    def _install_redacting_filter(self) -> None:
+        """Attach the redaction backstop to every logger in this package.
+
+        A :class:`logging.Filter` attached to a ``Logger`` only runs for
+        records logged directly through *that* logger object — it is never
+        consulted for children in the hierarchy, only for handlers walked
+        during propagation. Every module here logs via
+        ``logging.getLogger(__name__)``, i.e. a *child* of the package
+        logger, so attaching the filter to ``logging.getLogger(__package__)``
+        alone leaves it inert for every one of those records. Fix: walk the
+        logger manager's registry for every logger already created under
+        this package's prefix (all submodules are imported by the time a
+        service is constructed) and attach directly to each.
+        Idempotent — replaces rather than stacks, so constructing several
+        services does not accumulate filters — and safe to call again later
+        if a submodule logger were somehow created after the fact.
+        """
+        package_prefix = __package__ or ""
+        redacting_filter = SecretRedactingFilter(self.redactor)
+        loggers: dict[str, logging.Logger] = {package_prefix: logging.getLogger(package_prefix)}
+        # Snapshot: another thread's getLogger() mutates this dict mid-walk.
+        for name, candidate in list(logging.Logger.manager.loggerDict.items()):
+            if not isinstance(candidate, logging.Logger):
+                continue  # a logging.PlaceHolder, not a real logger
+            if name == package_prefix or name.startswith(package_prefix + "."):
+                loggers[name] = candidate
+        for logger_obj in loggers.values():
+            for existing in list(logger_obj.filters):
+                if isinstance(existing, SecretRedactingFilter):
+                    logger_obj.removeFilter(existing)
+            logger_obj.addFilter(redacting_filter)
 
     @staticmethod
     def _default_client_factory() -> httpx.AsyncClient:

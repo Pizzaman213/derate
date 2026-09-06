@@ -83,12 +83,5 @@ def kinds_public() -> list[dict]:
     return out
 
 
-def checked_dump(payload: object, redactor: Redactor, where: str) -> str:
-    """Serialize, then refuse to hand back anything containing key material."""
-    text = json.dumps(payload, default=str)
-    redactor.assert_clean(text, where)
-    return text
-
-
 def assert_no_key_material(payload: object, redactor: Redactor, where: str) -> None:
     redactor.assert_clean(json.dumps(payload, default=str), where)

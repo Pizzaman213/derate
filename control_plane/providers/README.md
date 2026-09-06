@@ -97,9 +97,10 @@ is not misread as free.
 - **Missing key reference**: provider is disabled with a `last_error` naming the
   reference. Startup is never blocked. It re-enables itself when the reference
   resolves again.
-- **429**: `Retry-After` when present, otherwise exponential from 1s to a 60s
-  cap. `admitting` goes false for the window; `healthy` stays true, because rate
-  limited is busy, not broken.
+- **429**: `Retry-After` when present, honoured up to a 300s DoS guard
+  (`RETRY_AFTER_MAX_S`); otherwise exponential from 1s to a 60s cap
+  (`BACKOFF_MAX_S`). `admitting` goes false for the window; `healthy` stays
+  true, because rate limited is busy, not broken.
 - **5xx**: one jittered retry, then unhealthy until a request succeeds.
 - **401/403**: unhealthy immediately, no retry, `last_error` names the reference.
 - **Failed model refresh**: keeps the cached list and sets `last_error`. Stays

@@ -18,10 +18,18 @@ SECRETS_FILE = "secrets.json"
 # Model lists refresh on add, on demand, and on this timer.
 PROVIDER_REFRESH_S = 6 * 3600
 
-# 429 backoff, exponential between these bounds. A rate-limited provider is
-# temporarily unavailable, not unhealthy.
+# 429 backoff, exponential between these bounds, when the upstream sends no
+# Retry-After of its own. A rate-limited provider is temporarily unavailable,
+# not unhealthy.
 BACKOFF_MIN_S = 1.0
 BACKOFF_MAX_S = 60.0
+
+# Separate, larger cap on an upstream-*sent* Retry-After. The exponential
+# backoff above is ours to bound tightly, but re-admitting earlier than an
+# upstream explicitly asked for risks tripping its limiter again; this is a
+# DoS guard against an upstream (or a spoofed header) asking us to back off
+# for an unreasonable length of time, not a substitute for honoring the ask.
+RETRY_AFTER_MAX_S = 300.0
 
 # 5xx: one retry, jittered, then unhealthy until a request succeeds.
 SERVER_ERROR_RETRIES = 1

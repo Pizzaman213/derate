@@ -40,6 +40,7 @@ from control_plane.providers import (
     build_stub_service,
     looks_like_secret,
 )
+from control_plane.providers.config import BACKOFF_MAX_S, RETRY_AFTER_MAX_S
 from control_plane.providers.discovery import parse_models
 from control_plane.providers.kinds import spec_for
 from control_plane.providers.stub import sse_chunks
@@ -426,6 +427,32 @@ def test_environment_beats_the_secrets_file(tmp_path):
     assert store.get(KEY_REF) == "from-env-value-长"
 
 
+@pytest.mark.parametrize("bad_shape", [[], "nonsense"], ids=["list", "string"])
+def test_non_dict_secrets_file_is_treated_as_empty_not_a_crash(tmp_path, bad_shape, caplog):
+    """Valid JSON, wrong top-level shape. Optional file: never fail startup over it.
+
+    ``raw.items()`` used to raise ``AttributeError`` on a list or string
+    before the isinstance guard ever ran, and that propagated straight
+    through ``ProviderService.__init__`` — an optional file with the wrong
+    shape took the whole service down.
+    """
+    path = tmp_path / "secrets.json"
+    path.write_text(json.dumps(bad_shape))
+    store = SecretStore(path, env={})
+    with caplog.at_level(logging.WARNING):
+        assert store.get(KEY_REF) is None
+        assert store.refs() == []
+    # Warn that the file is unusable, but never log its content.
+    warnings = [r.getMessage() for r in caplog.records]
+    assert any("secrets.json" in message for message in warnings)
+    assert not any("nonsense" in message for message in warnings)
+
+    # And the failure mode a real user hits: constructing the whole service
+    # over a malformed-but-valid secrets.json must not raise.
+    service = ProviderService(data_path=tmp_path, secrets=store)
+    assert service.list() == []
+
+
 def test_request_bodies_are_never_logged(tmp_path, caplog):
     """Prompts are private and sometimes carry credentials of their own."""
     service = make_service(tmp_path)
@@ -442,6 +469,37 @@ def test_request_bodies_are_never_logged(tmp_path, caplog):
             )
         )
     assert prompt not in caplog.text
+
+
+def test_redaction_filter_reaches_child_loggers_not_just_the_package_logger(tmp_path, caplog):
+    """M-18 regression.
+
+    A ``logging.Filter`` attached to a ``Logger`` only runs for records
+    logged directly through *that* logger object — never for a child in the
+    hierarchy. Every module in this package logs via
+    ``logging.getLogger(__name__)``, which is a child of the package logger
+    (``control_plane.providers``), not the package logger itself. A filter
+    installed only on ``logging.getLogger(__package__)`` would therefore
+    never see a single real log record from this package: this test logs
+    through ``control_plane.providers.runtime`` directly, bypassing
+    ``ProviderService`` entirely, and would fail if the filter were attached
+    only to the parent.
+    """
+    secret = "unprefixed-remembered-upstream-secret-42"
+    service = make_service(tmp_path)
+    # Remembered, not merely regex-shaped: this value matches none of the
+    # vendor key patterns, so redaction here can only be working because the
+    # filter is live on this exact child logger.
+    service.redactor.remember(secret)
+
+    child_log = logging.getLogger("control_plane.providers.runtime")
+    with caplog.at_level(logging.DEBUG):
+        child_log.debug("upstream said: %s", secret)
+
+    assert secret not in caplog.text
+    for record in caplog.records:
+        assert secret not in record.getMessage()
+    assert "upstream said: ***" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +735,53 @@ def test_retry_after_header_is_honoured(tmp_path):
     assert excinfo.value.retry_after_s == pytest.approx(30.0)
 
     clock.advance(29)
+    assert not any(t.admitting for t in service.route_targets())
+    clock.advance(2)
+    assert all(t.admitting for t in service.route_targets())
+
+
+def test_retry_after_beyond_the_backoff_cap_is_still_honoured(tmp_path):
+    """An upstream-sent Retry-After is not our exponential backoff.
+
+    ``BACKOFF_MAX_S`` (60s) bounds *our* exponential curve when the upstream
+    sends nothing. It must not silently reinterpret an upstream's explicit,
+    larger request as a request to re-admit at 60s instead — that is
+    re-admitting earlier than the upstream asked.
+    """
+    clock = Clock()
+    upstream = Upstream()
+    upstream.chat_responses.append(
+        httpx.Response(429, headers={"retry-after": "200"}, json={"error": {"message": "slow"}})
+    )
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+
+    assert 200.0 > BACKOFF_MAX_S  # the case only means something if this holds
+    with pytest.raises(UpstreamError) as excinfo:
+        run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
+    assert excinfo.value.retry_after_s == pytest.approx(200.0)
+
+    clock.advance(61)  # past our own backoff cap...
+    assert not any(t.admitting for t in service.route_targets())  # ...but not admitting yet
+    clock.advance(140)
+    assert all(t.admitting for t in service.route_targets())
+
+
+def test_retry_after_above_the_dos_guard_is_clamped(tmp_path):
+    """An upstream (or a spoofed header) asking for an unreasonable wait is capped."""
+    clock = Clock()
+    upstream = Upstream()
+    upstream.chat_responses.append(
+        httpx.Response(429, headers={"retry-after": "10000"}, json={"error": {"message": "slow"}})
+    )
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+
+    with pytest.raises(UpstreamError) as excinfo:
+        run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
+    assert excinfo.value.retry_after_s == pytest.approx(RETRY_AFTER_MAX_S)
+
+    clock.advance(RETRY_AFTER_MAX_S - 1)
     assert not any(t.admitting for t in service.route_targets())
     clock.advance(2)
     assert all(t.admitting for t in service.route_targets())
@@ -1228,3 +1333,20 @@ def test_list_reflects_live_health_without_a_persist(tmp_path):
         run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
     assert service.list()[0].healthy is False
     assert service.get("openrouter").last_error is not None
+
+
+def test_retry_after_dos_guard_boundary_values(tmp_path):
+    """Exactly 300 is honoured; 301 is clamped to the guard."""
+    for header, expected in (("300", 300.0), ("301", RETRY_AFTER_MAX_S)):
+        clock = Clock()
+        upstream = Upstream()
+        upstream.chat_responses.append(
+            httpx.Response(
+                429, headers={"retry-after": header}, json={"error": {"message": "slow"}}
+            )
+        )
+        service = make_service(tmp_path / header, upstream, now=clock)
+        add_openrouter(service)
+        with pytest.raises(UpstreamError) as excinfo:
+            run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
+        assert excinfo.value.retry_after_s == pytest.approx(expected)

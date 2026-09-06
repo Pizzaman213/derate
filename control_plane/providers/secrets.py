@@ -179,7 +179,18 @@ class SecretStore:
             # offending line, and that line is a secret.
             log.error("could not read %s (%s); treating as empty", self.path, type(exc).__name__)
             raw = {}
-        values = {str(k): str(v) for k, v in raw.items() if isinstance(raw, dict)}
+        if not isinstance(raw, dict):
+            # Valid JSON, wrong shape (a list, a string, a number...). This
+            # file is optional and best-effort: never fail startup over it,
+            # and never log its content — the whole point of the file is
+            # that its content is secret, well-formed or not.
+            log.warning(
+                "%s is valid JSON but not an object (got %s); treating as empty",
+                self.path,
+                type(raw).__name__,
+            )
+            raw = {}
+        values = {str(k): str(v) for k, v in raw.items()}
         for value in values.values():
             self.redactor.remember(value)
         self._cache, self._cache_mtime = values, st.st_mtime

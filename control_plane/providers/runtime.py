@@ -15,7 +15,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .config import BACKOFF_MAX_S, BACKOFF_MIN_S, RETRY_JITTER_S
+from .config import BACKOFF_MAX_S, BACKOFF_MIN_S, RETRY_AFTER_MAX_S, RETRY_JITTER_S
 
 log = logging.getLogger(__name__)
 
@@ -85,8 +85,11 @@ class ProviderRuntime:
     def note_rate_limit(self, now: float, retry_after: str | None, message: str) -> float:
         """429. Temporarily not admitting; still healthy.
 
-        Honours ``Retry-After`` when the provider sends one, otherwise backs
-        off exponentially from one second to a sixty second cap.
+        Honours ``Retry-After`` when the provider sends one, up to
+        ``RETRY_AFTER_MAX_S`` (a DoS guard, not a real-world expectation —
+        clamping to our own short exponential cap instead would re-admit
+        earlier than the upstream asked). Absent a header, backs off
+        exponentially from one second to ``BACKOFF_MAX_S``.
         """
         seconds = parse_retry_after(retry_after, now)
         if seconds is None:
@@ -94,7 +97,8 @@ class ProviderRuntime:
                 BACKOFF_MAX_S,
                 BACKOFF_MIN_S * (2**self.consecutive_rate_limits),
             )
-        seconds = min(seconds, BACKOFF_MAX_S)
+        else:
+            seconds = min(seconds, RETRY_AFTER_MAX_S)
         self.consecutive_rate_limits += 1
         self.backoff_until = now + seconds
         self.last_error = f"rate limited, retrying in {seconds:.0f}s: {message}"
