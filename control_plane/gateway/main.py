@@ -20,6 +20,12 @@ def main() -> None:
     # during app startup and wants records the root logger would otherwise
     # filter out before any handler sees them.
     logging.getLogger().setLevel(os.environ.get("SPARKPLANE_LOG_LEVEL", "INFO"))
+    print(
+        "=" * 72 + "\n"
+        "STUB SURFACE -- fixture data; the real system is "
+        "python3 -m control_plane.node\n" + "=" * 72,
+        flush=True,
+    )
     settings = GatewaySettings(
         host=os.environ.get("SPARKPLANE_HOST", "0.0.0.0"),
         port=int(os.environ.get("SPARKPLANE_PORT", "8080")),
