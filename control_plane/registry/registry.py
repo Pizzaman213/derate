@@ -144,6 +144,20 @@ class Registry:
     def agent_url(self, node_id: str) -> str | None:
         return self._agent_urls.get(node_id)
 
+    def agent_urls(self, include_local: bool = False) -> dict[str, str]:
+        """node_id -> agent URL, for every member with one.
+
+        The telemetry collector uses this to find journals to drain. The local
+        node is excluded by default: the coordinator reads its own journal
+        directly rather than over HTTP, and collecting it twice would give it
+        two cursors.
+        """
+        return {
+            node_id: url
+            for node_id, url in self._agent_urls.items()
+            if url and (include_local or node_id != self.local_node_id)
+        }
+
     # ------------------------------------------------------------------
     # Roster persistence (M-12)
     # ------------------------------------------------------------------
@@ -394,9 +408,15 @@ class Registry:
         return self.admit(profile.node_id)
 
     def remove_node(self, node_id: str) -> None:
-        """Forget a node entirely. The only path that drops telemetry."""
-        self._members.pop(node_id, None)
-        self._candidates.pop(node_id, None)
+        """Forget a node entirely. The only path that drops telemetry.
+
+        Raises NodeNotFound for an unknown id so the gateway's 404 branch is
+        reachable; silently 200-ing a typo'd delete hides the operator error.
+        """
+        was_member = self._members.pop(node_id, None) is not None
+        was_candidate = self._candidates.pop(node_id, None) is not None
+        if not was_member and not was_candidate:
+            raise NodeNotFound(f"no member or candidate {node_id!r}")
         self._agent_urls.pop(node_id, None)
         self._misses.pop(node_id, None)
         self._telemetry.drop(node_id)

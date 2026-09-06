@@ -36,7 +36,13 @@ class StubPlanner:
         link: LinkMeasurement | None,
         target: str,
         concurrency: int,
+        *,
+        context_length: int | None = None,
+        kv_dtype: str = "auto",
     ) -> ParallelismPlan:
+        # The keyword-only extras mirror the real Planner (accepted, unused
+        # here): the gateway passes them, and a stub that rejects them would
+        # 502 /api/plan the moment it was wired.
         node_ids = [n.node_id for n in nodes[:2]] or ["node-1", "node-2"]
         return ParallelismPlan(
             kind=ParallelismKind.PIPELINE,

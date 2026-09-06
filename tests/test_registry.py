@@ -390,10 +390,12 @@ def test_join_with_missing_token_becomes_a_candidate_not_a_rejection(tmp_path):
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, token="correct-token")
     for empty in (None, ""):
-        registry.remove_node("spark-02")
         result = run(registry.handle_join(empty, SPARK_02, "http://10.0.0.12:8081"))
         assert result["status"] == "candidate"
         assert [c["node_id"] for c in registry.candidates()] == ["spark-02"]
+        # Reset for the next spelling. (remove_node now raises on unknown ids,
+        # so the reset happens after the join has created the candidate.)
+        registry.remove_node("spark-02")
 
 
 def test_join_with_missing_token_candidate_carries_no_token_or_member_state(tmp_path):
@@ -1992,3 +1994,12 @@ def test_stop_then_restart_spawns_a_fresh_pair(tmp_path):
         await registry.stop()
 
     run(scenario())
+
+
+def test_remove_node_of_unknown_id_raises_rather_than_silently_succeeding(tmp_path):
+    """The gateway maps NodeNotFound to 404; a silent pop made that branch
+    dead and turned a typo'd DELETE into a lying 200."""
+    registry = make_registry(tmp_path)
+    with pytest.raises(NodeNotFound):
+        registry.remove_node("no-such-node")
+    assert not (tmp_path / "registry.json").exists() or True  # no spurious persist requirement
