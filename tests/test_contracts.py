@@ -11,6 +11,7 @@ make it pass.
 
 from __future__ import annotations
 
+import dataclasses
 import pytest
 
 from control_plane.contracts import (
@@ -403,3 +404,10 @@ def test_node_states_cover_every_profile_and_are_healthy():
     assert set(NODE_STATES) == set(NODE_PROFILES)
     assert all(s.healthy for s in NODE_STATES.values())
     assert all(s.memory_used <= s.profile.total_memory for s in NODE_STATES.values())
+
+
+def test_effective_mla_rope_dim_charges_only_mla_shapes():
+    assert LLAMA_3_3_70B.effective_mla_rope_dim == 0, "non-MLA shapes charge no rope"
+    assert DEEPSEEK_V3.effective_mla_rope_dim == 64, "MLA without the config key falls back to 64"
+    explicit = dataclasses.replace(DEEPSEEK_V3, mla_rope_dim=32)
+    assert explicit.effective_mla_rope_dim == 32

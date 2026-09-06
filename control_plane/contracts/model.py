@@ -54,6 +54,22 @@ class ModelShape:
         return self.hidden_size // self.num_attention_heads
 
     @property
+    def effective_mla_rope_dim(self) -> int:
+        """Decoupled-RoPE width to charge per token alongside the MLA latent.
+
+        0 for non-MLA shapes. When the shape is MLA but the config did not
+        carry qk_rope_head_dim, fall back to 64 -- the width every known
+        DeepSeek-family checkpoint uses; charging it errs in the OOM-safe
+        direction. All KV-cache math must charge
+        mla_latent_dim + effective_mla_rope_dim, never the latent alone.
+        """
+        if self.mla_latent_dim is None:
+            return 0
+        if self.mla_rope_dim is not None:
+            return self.mla_rope_dim
+        return 64
+
+    @property
     def effective_active_params(self) -> int:
         if self.active_params is not None:
             return self.active_params
