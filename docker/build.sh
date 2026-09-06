@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Multi-arch build for sparkplane/node.
+#
+# Both architectures, always. GB10 is arm64 and the workstation is usually
+# amd64; an amd64-only image means the heterogeneous case does not work at
+# all, which is half the demo.
+set -euo pipefail
+
+IMAGE="${IMAGE:-sparkplane/node}"
+TAG="${TAG:-latest}"
+PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
+BUILDER="${BUILDER:-sparkplane}"
+SPARKRUN_VERSION="${SPARKRUN_VERSION:-0.2.40}"
+# Release builds leave this at 0: a UI that does not compile must fail the image.
+SKIP_UI="${SKIP_UI:-0}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'USAGE'
+usage: docker/build.sh [--push | --load] [--tag TAG]
+
+  --push   push the multi-arch manifest to the registry
+  --load   build for this machine's architecture only and load it into the
+           local docker daemon. buildx cannot load a multi-arch manifest.
+  (neither) build both architectures and discard, i.e. verify the build
+
+env: IMAGE, TAG, PLATFORMS, BUILDER, SPARKRUN_VERSION, SKIP_UI
+USAGE
+}
+
+OUTPUT=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --push) OUTPUT=(--push); shift ;;
+        --load) OUTPUT=(--load); PLATFORMS="linux/$(docker version -f '{{.Server.Arch}}')"; shift ;;
+        --tag) TAG="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
+    esac
+done
+
+if ! docker buildx version >/dev/null 2>&1; then
+    echo "docker buildx is required for the multi-arch build." >&2
+    echo "Install the buildx plugin, or build one architecture with:" >&2
+    echo "    docker build -t ${IMAGE}:${TAG} ." >&2
+    exit 1
+fi
+
+if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+    echo "==> creating buildx builder '${BUILDER}'"
+    docker buildx create --name "$BUILDER" --driver docker-container --bootstrap
+fi
+
+echo "==> building ${IMAGE}:${TAG} for ${PLATFORMS}"
+docker buildx build \
+    --builder "$BUILDER" \
+    --platform "$PLATFORMS" \
+    --build-arg "SPARKRUN_VERSION=${SPARKRUN_VERSION}" \
+    --build-arg "SKIP_UI=${SKIP_UI}" \
+    --tag "${IMAGE}:${TAG}" \
+    "${OUTPUT[@]}" \
+    "$ROOT"
+
+if [ "${#OUTPUT[@]}" -eq 0 ]; then
+    echo "==> build verified for ${PLATFORMS} (nothing exported; pass --load or --push)"
+fi

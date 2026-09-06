@@ -1,0 +1,755 @@
+"""The blocking pre-launch out-of-memory gate.
+
+Per rank:
+
+    weights + kv_cache + activations + comm_buffers + replicated
+        + framework_overhead  <=  usable_memory
+
+Everything else in this space estimates and then lets you launch anyway. This
+refuses, and when it refuses it names the term that blew the budget and the
+specific change that would work. A reason string that says only "does not fit"
+is a bug in this file.
+"""
+
+from __future__ import annotations
+
+import math
+
+from control_plane.contracts import (
+    BYTES_PER_PARAM,
+    COMM_BUFFER_BYTES,
+    DEFAULT_GUARDRAIL,
+    DEGRADED_TPS_THRESHOLD,
+    EP_EXTRA_BUFFER_BYTES,
+    FRAMEWORK_OVERHEAD,
+    FitRequest,
+    FitResult,
+    MemoryBreakdown,
+    ModelShape,
+    NodeProfile,
+    ParallelismKind,
+    ParallelismPlan,
+    Verdict,
+)
+
+from .constants import (
+    ACTIVATION_CHUNK_TOKENS,
+    CONTEXT_ROUNDING,
+    DECODE_EFFICIENCY,
+    MAX_CONTEXT_SEARCH,
+    MAX_SEARCH_NODES,
+    QUANT_SUGGESTION_ORDER,
+)
+from .kv import (
+    is_known_kv_dtype,
+    kv_bytes_per_token,
+    kv_cache_bytes,
+    kv_divisor,
+    kv_elem_bytes,
+    stage_fraction,
+)
+
+GIB = 1024**3
+
+
+# --------------------------------------------------------------------------
+# formatting
+# --------------------------------------------------------------------------
+
+
+def _gib(n: float) -> str:
+    return f"{n / GIB:.1f} GiB"
+
+
+def _options(fixes: list[str], *, capitalize: bool = False) -> str:
+    """Join fixes as a sentence: "a", "a or b", "a, b, or c"."""
+    if len(fixes) == 1:
+        joined = fixes[0]
+    else:
+        head = ", ".join(fixes[:-1])
+        joined = (
+            f"{head}, or {fixes[-1]}" if len(fixes) > 2 else f"{head} or {fixes[-1]}"
+        )
+    return joined[0].upper() + joined[1:] if capitalize else joined
+
+
+def _dedup(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+# --------------------------------------------------------------------------
+# exported helpers, called by Agent E
+# --------------------------------------------------------------------------
+
+
+def predict_decode_tps(
+    shape: ModelShape, bandwidth_gbps: float, kv_read_bytes: float
+) -> float:
+    """Decode tokens per second, single stream, memory-bandwidth bound.
+
+    Decoding one token reads every active weight plus the whole cache for that
+    sequence. **Active** parameters, not total: GPT-OSS-120B moves 2.7 GB per
+    token off 5.1B active params, a dense 70B moves 140 GB. That difference is
+    an order of magnitude of decode speed on identical hardware, and it is the
+    most useful thing we can say before someone waits five minutes for a load.
+
+    ``kv_read_bytes`` is the unsharded cache for one sequence, matching the
+    unsharded weight term: tensor parallel divides both the bytes and multiplies
+    the aggregate bandwidth, so the ratio holds.
+    """
+    if bandwidth_gbps <= 0:
+        return 0.0
+    weight_bytes_per_token = shape.effective_active_params * shape.bytes_per_param()
+    bytes_per_token = weight_bytes_per_token + max(0.0, kv_read_bytes)
+    if bytes_per_token <= 0:
+        return 0.0
+    ceiling = (bandwidth_gbps * 1e9) / bytes_per_token
+    return ceiling * DECODE_EFFICIENCY
+
+
+def _candidate_shards(n: int, shape: ModelShape) -> list[ParallelismPlan]:
+    """Every way to split a model across n ranks, as synthetic plans.
+
+    Both degrees have to be tried. Tensor parallel cannot shard the cache past
+    ``num_kv_heads``, so on a model with 8 KV heads a pure TP split stops
+    helping at TP=8 no matter how many nodes are added; pipeline parallel keeps
+    shedding cache by layer past that point. Searching only TP reports
+    "impossible" for configurations that a pipeline split holds comfortably.
+    """
+    plans: list[ParallelismPlan] = []
+    for tp in range(1, n + 1):
+        if n % tp:
+            continue
+        pp = n // tp
+        if pp > shape.num_layers:
+            continue
+        if tp == 1 and pp == 1:
+            kind = ParallelismKind.SINGLE_NODE
+        elif pp == 1:
+            kind = ParallelismKind.TENSOR
+        elif tp == 1:
+            kind = ParallelismKind.PIPELINE
+        else:
+            kind = ParallelismKind.HYBRID
+        plans.append(
+            ParallelismPlan(
+                kind=kind,
+                tensor_parallel=tp,
+                pipeline_parallel=pp,
+                expert_parallel=1,
+                data_parallel=1,
+                node_ids=[],
+                reason="synthetic plan for a node-count search",
+                measured_link_gbps=0.0,
+                rejected=[],
+            )
+        )
+    return plans
+
+
+def min_nodes_required(
+    shape: ModelShape,
+    node_profile: NodeProfile,
+    context: int,
+    max_seqs: int,
+    kv_dtype: str = "auto",
+    guardrail: float = DEFAULT_GUARDRAIL,
+) -> int:
+    """Fewest nodes of this kind that hold the model at this context and
+    concurrency, under the most memory-efficient shard available at each size.
+
+    A memory question only. Whether that shard is a *good* plan at the measured
+    link bandwidth is Agent E's call, not this function's.
+
+    Returns -1 when no configuration up to ``MAX_SEARCH_NODES`` fits, which
+    means the answer is a different machine or a smaller quantization, not more
+    Sparks.
+
+    Exported for Agent E.
+    """
+    usable = node_profile.usable_memory(guardrail)
+    for n in range(1, MAX_SEARCH_NODES + 1):
+        for plan in _candidate_shards(n, shape):
+            breakdown, _ = memory_breakdown(
+                shape, plan, context, max_seqs, kv_dtype
+            )
+            if breakdown.total <= usable:
+                return n
+    return -1
+
+
+# --------------------------------------------------------------------------
+# the budget
+# --------------------------------------------------------------------------
+
+
+def weight_bytes_per_rank(shape: ModelShape, plan: ParallelismPlan) -> float:
+    """Shardable weights carried by the busiest rank.
+
+    Vision towers are replicated on every rank and are charged separately, so
+    they come out of the shardable pool here.
+    """
+    bpp = shape.bytes_per_param()
+    vision = min(max(0, shape.vision_params), shape.total_params)
+    shardable_bytes = (shape.total_params - vision) * bpp
+    tp = max(1, plan.tensor_parallel)
+    return shardable_bytes * stage_fraction(shape, plan.pipeline_parallel) / tp
+
+
+def replicated_bytes_per_rank(shape: ModelShape) -> float:
+    """Never split, held whole by every rank."""
+    vision = min(max(0, shape.vision_params), shape.total_params)
+    return vision * shape.bytes_per_param()
+
+
+def activation_bytes(
+    shape: ModelShape,
+    max_seqs: int,
+    context: int,
+    chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
+) -> float:
+    """Logits buffer plus compute scratch.
+
+    The logits term is charged for tokens actually emitted per step, one per
+    sequence in flight, not for the full context. It still dominates on a large
+    vocabulary: GPT-OSS's 201k vocab is 12.9 MB per emitted token in fp32.
+    """
+    batch = max(1, int(max_seqs))
+    chunk = min(max(1, int(chunk_tokens)), max(1, int(context)))
+    logits = shape.vocab_size * batch * 4
+    scratch = chunk * shape.hidden_size * 4 * 6
+    return float(logits + scratch)
+
+
+def comm_buffer_bytes(plan: ParallelismPlan) -> float:
+    """NCCL staging. Expert parallel is the term other planners forget, and
+    forgetting it is what produces a configuration that passes a fit check and
+    then OOMs on the first batch. Conservative on purpose.
+    """
+    ep_active = plan.expert_parallel > 1
+    if plan.world_size <= 1 and not ep_active:
+        return 0.0
+    total = float(COMM_BUFFER_BYTES)
+    if ep_active:
+        total += EP_EXTRA_BUFFER_BYTES
+    return total
+
+
+def memory_breakdown(
+    shape: ModelShape,
+    plan: ParallelismPlan,
+    context: int,
+    max_seqs: int,
+    kv_dtype: str,
+    chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
+) -> tuple[MemoryBreakdown, list[str]]:
+    """Per-rank memory, and everything worth warning about while computing it."""
+    warnings: list[str] = []
+
+    if not is_known_kv_dtype(kv_dtype):
+        warnings.append(
+            f"unknown KV cache dtype {kv_dtype!r}; charging "
+            f"{kv_elem_bytes(kv_dtype, shape):.0f} bytes per element"
+        )
+
+    tp = max(1, plan.tensor_parallel)
+    pp = max(1, plan.pipeline_parallel)
+
+    if pp > shape.num_layers:
+        warnings.append(
+            f"PP={pp} exceeds {shape.num_layers} layers; stages will be empty"
+        )
+    if pp > 1 and shape.num_layers % pp:
+        busiest = math.ceil(shape.num_layers / pp)
+        warnings.append(
+            f"pipeline stages are uneven: {shape.num_layers} layers over {pp} "
+            f"stages puts {busiest} on the busiest rank; budgeting against that one"
+        )
+    if not shape.mla_latent_dim and tp > shape.num_kv_heads:
+        warnings.append(
+            f"TP={tp} exceeds {shape.num_kv_heads} KV heads; the runtime "
+            f"replicates KV heads rather than splitting them, so the cache "
+            f"shards only {shape.num_kv_heads}x"
+        )
+    if shape.mla_latent_dim and tp > 1:
+        warnings.append(
+            "MLA caches one latent per token, so there is nothing to shard by "
+            "head: every TP rank holds the whole cache"
+        )
+    if plan.expert_parallel > 1:
+        warnings.append(
+            f"expert parallel is active: charging an extra "
+            f"{_gib(EP_EXTRA_BUFFER_BYTES)} of expert-staging buffers on top of "
+            f"the {_gib(COMM_BUFFER_BYTES)} collective buffers"
+        )
+
+    kv_total = kv_cache_bytes(shape, context, max_seqs, kv_dtype)
+    breakdown = MemoryBreakdown(
+        weights=int(weight_bytes_per_rank(shape, plan)),
+        kv_cache=int(kv_total / kv_divisor(shape, plan)),
+        activations=int(activation_bytes(shape, max_seqs, context, chunk_tokens)),
+        comm_buffers=int(comm_buffer_bytes(plan)),
+        replicated=int(replicated_bytes_per_rank(shape)),
+        framework_overhead=int(FRAMEWORK_OVERHEAD),
+    )
+    return breakdown, warnings
+
+
+# --------------------------------------------------------------------------
+# the gate
+# --------------------------------------------------------------------------
+
+
+class FitCalculator:
+    """Implements ``FitPort``.
+
+    ``check`` is the blocking gate: Agent F refuses to launch on its verdict,
+    Agent G refuses to admit on its numbers. ``FITS_DEGRADED`` is not a
+    failure — the model loads, and sometimes that is exactly what someone
+    wants. Callers must branch on ``FitResult.ok``, not on ``verdict is FITS``.
+
+    ``max_context_that_fits`` is populated on every verdict, not only on
+    refusals, so the UI can offer a headroom figure without a second call. It
+    is always a context we have actually checked, never an extrapolation.
+    """
+
+    def __init__(
+        self,
+        guardrail: float = DEFAULT_GUARDRAIL,
+        chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
+    ) -> None:
+        self.guardrail = guardrail
+        self.chunk_tokens = chunk_tokens
+
+    # -- FitPort ----------------------------------------------------------
+
+    def check(self, req: FitRequest, nodes: list[NodeProfile]) -> FitResult:
+        shape, plan = req.shape, req.plan
+        used, warnings = self._participating(plan, nodes)
+        node = min(used, key=lambda n: n.usable_memory(self.guardrail))
+        usable = node.usable_memory(self.guardrail)
+        bandwidth = min(n.memory_bandwidth_gbps for n in used)
+
+        if len({(n.addressable_memory, n.gpu_name) for n in used}) > 1:
+            warnings.append(
+                f"nodes are not identical; budgeting against the smallest, "
+                f"{node.node_id} at {_gib(node.addressable_memory)} addressable"
+            )
+        if any(n.gpu_count > 1 for n in used):
+            warnings.append(
+                "a node reports more than one GPU; the budget is per rank and "
+                "assumes one rank per GPU with the full addressable pool each"
+            )
+
+        breakdown, budget_warnings = memory_breakdown(
+            shape,
+            plan,
+            req.context_length,
+            req.max_concurrent_seqs,
+            req.kv_dtype,
+            self.chunk_tokens,
+        )
+        warnings.extend(budget_warnings)
+        headroom = usable - breakdown.total
+
+        kv_read = kv_cache_bytes(shape, req.context_length, 1, req.kv_dtype)
+        tps = predict_decode_tps(shape, bandwidth, kv_read)
+        max_ctx = self._largest_context(
+            shape, plan, usable, req.max_concurrent_seqs, req.kv_dtype
+        )
+
+        ranks = sum(max(1, n.gpu_count) for n in used)
+        if plan.world_size > ranks:
+            return FitResult(
+                verdict=Verdict.WONT_FIT,
+                breakdown=breakdown,
+                usable_per_node=usable,
+                headroom=headroom,
+                reason=(
+                    f"Won't fit: the plan wants {plan.world_size} ranks "
+                    f"(TP {plan.tensor_parallel} x PP {plan.pipeline_parallel} "
+                    f"x DP {plan.data_parallel}) but only {ranks} GPU"
+                    f"{'s' if ranks != 1 else ''} were supplied. Add "
+                    f"{plan.world_size - ranks} more, or replan for {ranks}."
+                ),
+                limiting_term="combined",
+                max_context_that_fits=max_ctx,
+                predicted_decode_tps=tps,
+                warnings=_dedup(warnings),
+            )
+
+        if headroom < 0:
+            term, reason = self._diagnose(req, breakdown, usable, node, max_ctx)
+            return FitResult(
+                verdict=Verdict.WONT_FIT,
+                breakdown=breakdown,
+                usable_per_node=usable,
+                headroom=headroom,
+                reason=reason,
+                limiting_term=term,
+                max_context_that_fits=max_ctx,
+                predicted_decode_tps=tps,
+                warnings=_dedup(warnings),
+            )
+
+        if tps < DEGRADED_TPS_THRESHOLD:
+            bytes_per_token = (
+                shape.effective_active_params * shape.bytes_per_param() + kv_read
+            )
+            return FitResult(
+                verdict=Verdict.FITS_DEGRADED,
+                breakdown=breakdown,
+                usable_per_node=usable,
+                headroom=headroom,
+                reason=(
+                    f"Loads with {_gib(headroom)} to spare, but predicted decode "
+                    f"is {tps:.1f} tok/s, under the "
+                    f"{DEGRADED_TPS_THRESHOLD:.0f} tok/s usability threshold. "
+                    f"Bandwidth bound: {bytes_per_token / 1e9:.1f} GB moves per "
+                    f"decoded token at {bandwidth:.0f} GB/s. Adding nodes will "
+                    f"not fix this — a smaller quantization, a smaller model, or "
+                    f"an MoE with fewer active parameters will."
+                ),
+                limiting_term="bandwidth",
+                max_context_that_fits=max_ctx,
+                predicted_decode_tps=tps,
+                warnings=_dedup(warnings),
+            )
+
+        ceiling = "at least " if max_ctx >= MAX_CONTEXT_SEARCH else ""
+        return FitResult(
+            verdict=Verdict.FITS,
+            breakdown=breakdown,
+            usable_per_node=usable,
+            headroom=headroom,
+            reason=(
+                f"Fits: {_gib(breakdown.total)} of {_gib(usable)} usable per "
+                f"rank, {_gib(headroom)} headroom. Predicted decode "
+                f"{tps:.0f} tok/s. Context could go to {ceiling}"
+                f"{max_ctx} tokens at {req.max_concurrent_seqs} sequences."
+            ),
+            limiting_term="none",
+            max_context_that_fits=max_ctx,
+            predicted_decode_tps=tps,
+            warnings=_dedup(warnings),
+        )
+
+    def max_context(
+        self,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        nodes: list[NodeProfile],
+        max_seqs: int,
+        kv_dtype: str,
+    ) -> int:
+        """Largest context that fits this plan on these nodes, on a
+        ``CONTEXT_ROUNDING`` grain. Verified, never extrapolated. 0 means not
+        even one page of cache fits."""
+        used, _ = self._participating(plan, nodes)
+        usable = min(n.usable_memory(self.guardrail) for n in used)
+        return self._largest_context(shape, plan, usable, max_seqs, kv_dtype)
+
+    # -- internals --------------------------------------------------------
+
+    def _participating(
+        self, plan: ParallelismPlan, nodes: list[NodeProfile]
+    ) -> tuple[list[NodeProfile], list[str]]:
+        if not nodes:
+            raise ValueError("fit check needs at least one NodeProfile")
+        warnings: list[str] = []
+        if not plan.node_ids:
+            return list(nodes), warnings
+        by_id = {n.node_id: n for n in nodes}
+        chosen = [by_id[i] for i in plan.node_ids if i in by_id]
+        missing = [i for i in plan.node_ids if i not in by_id]
+        if missing:
+            warnings.append(
+                f"plan names node(s) with no profile supplied "
+                f"({', '.join(missing)}); budgeting against the rest"
+            )
+        if not chosen:
+            warnings.append(
+                "no profile matched any node in the plan; budgeting against "
+                "every node supplied"
+            )
+            return list(nodes), warnings
+        return chosen, warnings
+
+    def _fits_at(
+        self,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        context: int,
+        max_seqs: int,
+        kv_dtype: str,
+        usable: int,
+    ) -> bool:
+        breakdown, _ = memory_breakdown(
+            shape, plan, context, max_seqs, kv_dtype, self.chunk_tokens
+        )
+        return breakdown.total <= usable
+
+    def _largest_max_seqs(
+        self,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        usable: int,
+        context: int,
+        kv_dtype: str,
+        ceiling: int,
+    ) -> int:
+        """Most concurrent sequences that fit at this context. Verified, like
+        the context search: both KV and the logits buffer scale with it."""
+
+        def fits(seqs: int) -> bool:
+            breakdown, _ = memory_breakdown(
+                shape, plan, context, seqs, kv_dtype, self.chunk_tokens
+            )
+            return breakdown.total <= usable
+
+        if ceiling < 1 or not fits(1):
+            return 0
+        lo, hi = 1, max(1, ceiling)
+        if fits(hi):
+            return hi
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _largest_context(
+        self,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        usable: int,
+        max_seqs: int,
+        kv_dtype: str,
+    ) -> int:
+        step = CONTEXT_ROUNDING
+
+        def fits(units: int) -> bool:
+            return self._fits_at(
+                shape, plan, units * step, max_seqs, kv_dtype, usable
+            )
+
+        if not fits(1):
+            return 0
+        hi = MAX_CONTEXT_SEARCH // step
+        if fits(hi):
+            return hi * step
+        lo = 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        result = lo * step
+        # Never report a context we have not verified. The search is monotonic
+        # so this loop should not run, and it costs nothing if it does not.
+        while result > 0 and not self._fits_at(
+            shape, plan, result, max_seqs, kv_dtype, usable
+        ):
+            result -= step
+        return max(0, result)
+
+    # -- diagnosis --------------------------------------------------------
+    #
+    # When the verdict is WONT_FIT the reason string is the product. Work out
+    # which term is responsible and say what to change.
+
+    def _diagnose(
+        self,
+        req: FitRequest,
+        breakdown: MemoryBreakdown,
+        usable: int,
+        node: NodeProfile,
+        max_ctx: int,
+    ) -> tuple[str, str]:
+        over = breakdown.total - usable
+        weights_held = breakdown.weights + breakdown.replicated
+
+        if weights_held > usable:
+            return "weights", self._weights_reason(req, breakdown, usable, node, over)
+
+        without_kv = breakdown.total - breakdown.kv_cache
+        if without_kv <= usable and breakdown.kv_cache > 0:
+            # Everything else fits. Context, concurrency, or cache dtype closes
+            # the gap, and we can say by how much.
+            return "kv_cache", self._kv_reason(
+                req, breakdown, usable, node, max_ctx, over
+            )
+
+        return "combined", self._combined_reason(req, breakdown, usable, node, over)
+
+    def _nodes_phrase(self, req: FitRequest, node: NodeProfile) -> str:
+        n = min_nodes_required(
+            req.shape,
+            node,
+            req.context_length,
+            req.max_concurrent_seqs,
+            req.kv_dtype,
+            self.guardrail,
+        )
+        if n < 0:
+            return f"more than {MAX_SEARCH_NODES} nodes"
+        return f"{n} node{'s' if n != 1 else ''}"
+
+    def _suggest_quant(
+        self, req: FitRequest, breakdown: MemoryBreakdown, usable: int
+    ) -> tuple[str, float] | None:
+        """The best-quality quantization whose weights would fit this plan,
+        holding every other term fixed. None when no supported scheme is small
+        enough."""
+        shape, plan = req.shape, req.plan
+        budget = usable - (breakdown.total - breakdown.weights)
+        if budget <= 0:
+            return None
+        vision = min(max(0, shape.vision_params), shape.total_params)
+        params_per_rank = (
+            (shape.total_params - vision)
+            * stage_fraction(shape, plan.pipeline_parallel)
+            / max(1, plan.tensor_parallel)
+        )
+        if params_per_rank <= 0:
+            return None
+        allowed_bpp = budget / params_per_rank
+        current = shape.bytes_per_param()
+        for name in QUANT_SUGGESTION_ORDER:
+            bpp = BYTES_PER_PARAM[name]
+            if bpp < current and bpp <= allowed_bpp:
+                return name, params_per_rank * bpp
+        return None
+
+    def _weights_reason(
+        self,
+        req: FitRequest,
+        breakdown: MemoryBreakdown,
+        usable: int,
+        node: NodeProfile,
+        over: int,
+    ) -> str:
+        shape = req.shape
+        ranks = req.plan.world_size
+        held = breakdown.weights + breakdown.replicated
+        replicated_note = (
+            f" (including {_gib(breakdown.replicated)} of replicated vision "
+            f"weights)"
+            if breakdown.replicated
+            else ""
+        )
+        fixes = [self._nodes_phrase(req, node)]
+        suggestion = self._suggest_quant(req, breakdown, usable)
+        if suggestion:
+            name, size = suggestion
+            fixes.append(f"requantize to {name} ({_gib(size)} per rank)")
+        return (
+            f"Won't fit: weights alone are {_gib(held)} per rank{replicated_note} "
+            f"against {_gib(usable)} usable "
+            f"({self.guardrail:.0%} of {_gib(node.addressable_memory)} "
+            f"addressable on {node.gpu_name}). Over budget by {_gib(over)} in "
+            f"total. Context and concurrency cannot fix this at "
+            f"{shape.dtype} on {ranks} rank{'s' if ranks != 1 else ''} — it "
+            f"needs {_options(fixes)}."
+        )
+
+    def _kv_reason(
+        self,
+        req: FitRequest,
+        breakdown: MemoryBreakdown,
+        usable: int,
+        node: NodeProfile,
+        max_ctx: int,
+        over: int,
+    ) -> str:
+        shape, plan = req.shape, req.plan
+        divisor = kv_divisor(shape, plan)
+        per_seq = kv_cache_bytes(shape, req.context_length, 1, req.kv_dtype) / divisor
+        kv_budget = usable - (breakdown.total - breakdown.kv_cache)
+
+        fixes: list[str] = []
+        if max_ctx >= CONTEXT_ROUNDING:
+            fixes.append(f"drop context to {max_ctx} tokens")
+        seqs = self._largest_max_seqs(
+            shape, plan, usable, req.context_length, req.kv_dtype,
+            req.max_concurrent_seqs - 1,
+        )
+        if seqs >= 1:
+            fixes.append(f"reduce concurrency to {seqs} sequences")
+        elem = kv_elem_bytes(req.kv_dtype, shape)
+        if elem > 1.0:
+            kv_fp8 = breakdown.kv_cache * (1.0 / elem)
+            if (breakdown.total - breakdown.kv_cache) + kv_fp8 <= usable:
+                fixes.append(
+                    f"quantize the KV cache to fp8 ({_gib(kv_fp8)}, which fits)"
+                )
+            else:
+                fixes.append(
+                    f"quantize the KV cache to fp8 ({_gib(kv_fp8)}, still short)"
+                )
+        fixes.append(f"spread it over {self._nodes_phrase(req, node)}")
+
+        return (
+            f"Over budget by {_gib(over)}. KV cache is the problem: "
+            f"{_gib(breakdown.kv_cache)} per rank at {req.context_length} tokens "
+            f"x {req.max_concurrent_seqs} sequences, against {_gib(kv_budget)} "
+            f"left after weights, activations and overhead. "
+            f"{_options(fixes, capitalize=True)}."
+        )
+
+    def _combined_reason(
+        self,
+        req: FitRequest,
+        breakdown: MemoryBreakdown,
+        usable: int,
+        node: NodeProfile,
+        over: int,
+    ) -> str:
+        named = [
+            ("weights", breakdown.weights),
+            ("KV", breakdown.kv_cache),
+            ("activations", breakdown.activations),
+            ("comm buffers", breakdown.comm_buffers),
+            ("replicated", breakdown.replicated),
+            ("framework", breakdown.framework_overhead),
+        ]
+        terms = ", ".join(f"{name} {_gib(size)}" for name, size in named)
+        biggest, biggest_size = max(named, key=lambda item: item[1])
+        share = biggest_size / breakdown.total if breakdown.total else 0.0
+
+        if share > 0.5:
+            lead = (
+                f"{biggest} is the biggest term at {_gib(biggest_size)}, "
+                f"{share:.0%} of the budget, but the rest still needs "
+                f"{_gib(breakdown.total - biggest_size)} against "
+                f"{_gib(usable)} usable, so shedding it alone will not close "
+                f"the gap"
+            )
+        else:
+            lead = "no single term dominates"
+
+        fixes = [self._nodes_phrase(req, node)]
+        seqs = self._largest_max_seqs(
+            req.shape, req.plan, usable, req.context_length, req.kv_dtype,
+            req.max_concurrent_seqs - 1,
+        )
+        if seqs >= 1:
+            fixes.append(f"reduce concurrency to {seqs} sequences")
+        suggestion = self._suggest_quant(req, breakdown, usable)
+        if suggestion:
+            name, size = suggestion
+            fixes.append(f"requantize to {name} ({_gib(size)} per rank)")
+        return (
+            f"Won't fit: {_gib(breakdown.total)} needed per rank against "
+            f"{_gib(usable)} usable, over budget by {_gib(over)}. Every term: "
+            f"{terms}. Here {lead} — it needs {_options(fixes)}."
+        )

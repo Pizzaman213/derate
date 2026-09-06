@@ -1,0 +1,143 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--panel);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  line-height: 1.5;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Every numeral in this interface updates in place. Tabular figures are the
+   reason the panel does not shudder once a second. */
+.mono,
+.readout,
+.readout-xl {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1, 'zero' 1;
+  letter-spacing: 0;
+}
+
+.readout-xl {
+  font-size: var(--size-readout-xl);
+  line-height: 1;
+  font-weight: 500;
+}
+
+.readout {
+  font-size: var(--size-readout);
+  line-height: 1.1;
+  font-weight: 500;
+}
+
+.label {
+  font-size: var(--size-label);
+  line-height: 1.3;
+  font-weight: 500;
+}
+
+.unit {
+  font-size: var(--size-unit);
+  line-height: 1;
+  font-weight: 400;
+  color: var(--ink-muted);
+}
+
+.muted {
+  color: var(--ink-muted);
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 500;
+  margin: 0;
+}
+
+hr,
+.rule {
+  border: 0;
+  border-top: 1px solid var(--rule);
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: var(--s-half) var(--s1);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+button:active:not(:disabled) {
+  background: var(--pressed);
+}
+
+button:disabled {
+  color: var(--ink-muted);
+  cursor: not-allowed;
+}
+
+select,
+input {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: var(--s-half) var(--s1);
+}
+
+/* Focus is always visible. Not a nicety — this panel is usable by keyboard. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--ink) 18%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

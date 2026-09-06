@@ -1,0 +1,16 @@
+[project]
+name = "sparkplane"
+version = "0.1.0"
+description = "Planning and orchestration for DGX Spark clusters"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+# Every agent runs pytest from the repo root. Without this, `control_plane`
+# and `tests.fixtures` do not import and the T+8h checkpoint fails for
+# reasons that have nothing to do with anyone's code.
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

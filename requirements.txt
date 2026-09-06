@@ -1,0 +1,8 @@
+# Runtime dependencies for the sparkplane node image.
+# sparkrun is installed separately and pinned by build arg; see Dockerfile.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+pydantic==2.10.4
+zeroconf==0.136.2
+PyYAML==6.0.3

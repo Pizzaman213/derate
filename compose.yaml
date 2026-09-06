@@ -1,0 +1,64 @@
+# Optional. `docker run` works standalone and is the documented path:
+#
+#     docker run -d --name sparkplane --network host --restart unless-stopped \
+#       -v sparkplane:/data \
+#       -v "$HOME/.config/sparkrun:/root/.config/sparkrun:ro" \
+#       -v "$HOME/.ssh:/root/.ssh:ro" \
+#       sparkplane/node
+#
+# This file exists for the single-node case and for people who prefer compose.
+# It is never required: a compose file you must have is a configuration step,
+# and the pitch is that there are none.
+
+services:
+  node:
+    image: sparkplane/node:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sparkplane
+
+    # Not optional. mDNS is multicast and does not cross a bridge, and the
+    # agent needs the real interfaces to report ConnectX-7 topology. The
+    # container refuses to start without it.
+    network_mode: host
+
+    restart: unless-stopped
+
+    volumes:
+      # Cluster token, node registry, link measurements, deployment records,
+      # resolved-shape cache, synthesized recipes.
+      - sparkplane:/data
+      # The host's sparkrun config, read-only: registries, saved clusters,
+      # container image defaults.
+      - ${HOME}/.config/sparkrun:/root/.config/sparkrun:ro
+      # sparkrun drives the cluster over SSH.
+      - ${HOME}/.ssh:/root/.ssh:ro
+
+    environment:
+      # Every one has a working default; they are listed so they are
+      # discoverable, not because they need setting.
+      SPARKPLANE_ROLE: ${SPARKPLANE_ROLE:-auto}
+      SPARKPLANE_PORT: ${SPARKPLANE_PORT:-8080}
+      SPARKPLANE_AGENT_PORT: ${SPARKPLANE_AGENT_PORT:-8081}
+      # Unset -> the coordinator generates a token on first run and prints it.
+      SPARKPLANE_TOKEN: ${SPARKPLANE_TOKEN:-}
+      # Unset -> discover the coordinator over mDNS. Set to an address to skip
+      # discovery when the other node is on a different subnet.
+      SPARKPLANE_JOIN: ${SPARKPLANE_JOIN:-}
+
+    healthcheck:
+      # /agent/health exists in both roles. /api/cluster is coordinator-only
+      # and would mark every worker unhealthy.
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://127.0.0.1:${SPARKPLANE_AGENT_PORT:-8081}/agent/health ||
+          curl -fsS http://127.0.0.1:${SPARKPLANE_PORT:-8080}/agent/health
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  sparkplane:

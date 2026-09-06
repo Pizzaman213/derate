@@ -1,0 +1,68 @@
+"""Dependency injection.
+
+Every dependency is injected. Constructing a gateway with all stubs must work
+and is how the tests run, so the gateway is never blocked on another agent.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from control_plane.contracts import (
+    DeploymentPort,
+    FitPort,
+    LinkPort,
+    PlannerPort,
+    ProviderPort,
+    RegistryPort,
+    ResolverPort,
+)
+
+from .settings import GatewaySettings
+
+
+@dataclass
+class GatewayDeps:
+    """The ports the gateway composes. Defaults are the day-0 stubs."""
+
+    registry: RegistryPort = None  # type: ignore[assignment]
+    links: LinkPort = None  # type: ignore[assignment]
+    resolver: ResolverPort = None  # type: ignore[assignment]
+    fit: FitPort = None  # type: ignore[assignment]
+    planner: PlannerPort = None  # type: ignore[assignment]
+    deployments: DeploymentPort = None  # type: ignore[assignment]
+    providers: ProviderPort = None  # type: ignore[assignment]
+    settings: GatewaySettings = field(default_factory=GatewaySettings)
+
+    def __post_init__(self) -> None:
+        from . import stubs
+
+        if self.registry is None:
+            self.registry = stubs.StubRegistry()
+        if self.links is None:
+            self.links = stubs.StubLinks()
+        if self.resolver is None:
+            self.resolver = stubs.StubResolver()
+        if self.fit is None:
+            self.fit = stubs.StubFit()
+        if self.planner is None:
+            self.planner = stubs.StubPlanner()
+        if self.deployments is None:
+            self.deployments = stubs.StubDeployments()
+        if self.providers is None:
+            self.providers = stubs.StubProviders()
+
+
+@dataclass
+class GatewayContext:
+    """Runtime services, built from the deps at startup."""
+
+    deps: GatewayDeps
+    settings: GatewaySettings
+    stats: "object"
+    admission: "object"
+    router: "object"
+    proxy: "object"
+    metrics: "object"
+    started_at: float = 0.0
+    degraded_startup: list[str] = field(default_factory=list)

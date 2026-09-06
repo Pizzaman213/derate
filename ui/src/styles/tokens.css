@@ -1,0 +1,62 @@
+/* The entire palette. Components reference these names and never a literal
+   colour. Dark mode redefines exactly five of them and nothing else, which is
+   what keeps dark mode a token swap instead of a second set of components. */
+
+:root {
+  /* Panel — light. The enamel. */
+  --panel: #EDE9E0;
+  --panel-recessed: #E3DED3;
+  --ink: #1A1917;
+  --ink-muted: #6E6A62;
+  --rule: #C9C2B4;
+
+  /* Signal. Identical in both modes. Three colours and no others.
+     If something carries colour, it is reporting a state. */
+  --live: #3D8B4A;
+  --warn: #B8862C;
+  --fault: #A93A2E;
+
+  /* Type */
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+
+  --size-readout-xl: 48px;
+  --size-readout: 28px;
+  --size-body: 15px;
+  --size-label: 13px;
+  --size-unit: 12px;
+
+  /* Space — 12px base unit */
+  --s1: 12px;
+  --s2: 24px;
+  --s3: 36px;
+  --s4: 48px;
+  --s-half: 6px;
+
+  --radius: 3px;
+
+  /* Derived surfaces. Kept as tokens so dark mode inherits them for free. */
+  --hover: color-mix(in srgb, var(--ink) 5%, transparent);
+  --pressed: color-mix(in srgb, var(--ink) 9%, transparent);
+  --focus: var(--ink);
+}
+
+/* Dark. Only the five panel tokens move. Signal colours are untouched, which is
+   the point: green means serving in both modes, at the same green. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --panel: #1A1917;
+    --panel-recessed: #232120;
+    --ink: #EDE9E0;
+    --ink-muted: #8A8479;
+    --rule: #38352F;
+  }
+}
+
+:root[data-theme='dark'] {
+  --panel: #1A1917;
+  --panel-recessed: #232120;
+  --ink: #EDE9E0;
+  --ink-muted: #8A8479;
+  --rule: #38352F;
+}
