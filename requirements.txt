@@ -6,3 +6,4 @@ httpx==0.28.1
 pydantic==2.10.4
 zeroconf==0.136.2
 PyYAML==6.0.3
+requests==2.34.2

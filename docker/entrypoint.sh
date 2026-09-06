@@ -10,6 +10,8 @@ export SPARKPLANE_ROLE="${SPARKPLANE_ROLE:-auto}"
 export SPARKPLANE_PORT="${SPARKPLANE_PORT:-8080}"
 export SPARKPLANE_AGENT_PORT="${SPARKPLANE_AGENT_PORT:-8081}"
 export SPARKPLANE_DATA="${SPARKPLANE_DATA:-/data}"
+# Python components read SPARKPLANE_DATA_DIR
+export SPARKPLANE_DATA_DIR="${SPARKPLANE_DATA_DIR:-$SPARKPLANE_DATA}"
 # SPARKPLANE_TOKEN unset means the coordinator generates one on first run and
 # persists it under /data. SPARKPLANE_JOIN unset means discover over mDNS.
 

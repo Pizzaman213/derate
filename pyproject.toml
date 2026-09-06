@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Planning and orchestration for DGX Spark clusters"
 requires-python = ">=3.12"
 
+[project.optional-dependencies]
+dev = ["pytest>=9", "ruff"]
+
 [tool.pytest.ini_options]
 # Every agent runs pytest from the repo root. Without this, `control_plane`
 # and `tests.fixtures` do not import and the T+8h checkpoint fails for
