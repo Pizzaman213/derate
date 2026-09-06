@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -31,11 +32,20 @@ from control_plane.contracts import (
     Verdict,
 )
 
-from .fsm import PERSISTED
+from .fsm import PERSISTED, TERMINAL
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
+
+#: Low-severity finding: delete() had no caller, so FAILED/STOPPED records
+#: accumulated on disk forever and were reloaded into memory on every
+#: restart. A week is long enough to still have the record around while
+#: debugging a launch failure after the fact, short enough that a control
+#: plane that has been up for months is not carrying years of dead
+#: deployments. reconcile() sweeps for this once per restart -- see
+#: DeploymentManager.reconcile.
+TERMINAL_RETENTION_S = 7 * 24 * 3600.0
 
 
 class DeploymentStore:
@@ -63,6 +73,37 @@ class DeploymentStore:
 
     def delete(self, deployment_id: str) -> None:
         self._path(deployment_id).unlink(missing_ok=True)
+
+    def purge_expired(
+        self, retention_s: float = TERMINAL_RETENTION_S, *, now: float | None = None
+    ) -> int:
+        """Delete terminal (FAILED/STOPPED) records untouched for *retention_s*.
+
+        A record's file is rewritten on every state change (``save``), so its
+        mtime is exactly when it settled into whatever state it is currently
+        in -- a reliable enough clock without adding a field to the frozen
+        Deployment contract. Best-effort like load_all: a record we cannot
+        read is left alone rather than guessed at. Returns the count removed.
+        """
+        if not self.root.is_dir():
+            return 0
+        cutoff = (now if now is not None else time.time()) - retention_s
+        removed = 0
+        for path in sorted(self.root.glob("*.json")):
+            try:
+                if path.stat().st_mtime > cutoff:
+                    continue
+                payload = json.loads(path.read_text())
+                state = DeploymentState(payload["deployment"]["state"])
+                deployment_id = payload["deployment"]["deployment_id"]
+            except Exception:
+                logger.warning("could not evaluate %s for GC, leaving it", path, exc_info=True)
+                continue
+            if state not in TERMINAL:
+                continue
+            self.delete(deployment_id)
+            removed += 1
+        return removed
 
     # -- read -------------------------------------------------------------
 

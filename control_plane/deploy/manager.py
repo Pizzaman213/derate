@@ -39,7 +39,8 @@ from control_plane.contracts import (
 from . import events as ev
 from .events import EventBus
 from .fsm import SERVING, TERMINAL, check as fsm_check
-from .health import probe
+from .health import HEALTH_PATHS, probe
+from .recipes import check_recipe_identifiers
 from .sparkrun import LaunchError, SparkrunAdapter, default_served_name, is_oom
 from .store import DeploymentStore
 
@@ -52,6 +53,56 @@ HEALTH_FAIL_THRESHOLD = 2
 READY_TIMEOUT_S = 1800.0
 READY_POLL_INTERVAL_S = 3.0
 STOP_CONFIRM_TIMEOUT_S = 30.0
+
+#: M-15: the acceptance bar above assumed an instant probe. health.probe()
+#: tries up to len(HEALTH_PATHS) URLs, each able to block for its own
+#: timeout -- a HANGING (not merely refused) health endpoint can blow the bar
+#: even though the threshold*poll_interval arithmetic still looks fine on
+#: paper. We derive the per-path probe timeout every tick from the poll
+#: cycle: with n = health_fail_threshold misses needed, the watch loop's own
+#: wait contributes n*poll_interval_s before the bound is reached, which
+#: leaves (DEATH_BOUND_S - n*poll_interval_s) of probing time per miss;
+#: dividing that by the URLs probe() tries per deployment yields a per-path
+#: timeout, and PROBE_OVERHEAD_S is shaved off first so the non-probe work
+#: tick() does every pass (a registry list, a store save per settled record)
+#: has room too -- the bound is meant to be an upper bound, not a value the
+#: arithmetic lands on exactly with no slack.
+#:
+#: watched_count does NOT divide this budget. It used to: an earlier version
+#: divided the per-tick probe budget by the number of SERVING deployments,
+#: on the theory that tick() probes them one at a time so their timeouts sum.
+#: MIN_PROBE_TIMEOUT_S then floored that per-deployment share, which meant
+#: past watched_count = budget_per_tick / MIN_PROBE_TIMEOUT_S (6 deployments
+#: at the shipped constants) the floor won and the *sum* over all deployments
+#: grew without bound -- 16s at 6 watched deployments, 30s at 20, worse than
+#: the ~22s this fix was meant to close. tick() instead probes every
+#: deployment's backend concurrently (see _probe_backends) so watched_count
+#: no longer lengthens a tick at all: the whole probing phase costs about
+#: one deployment's worth of probing, however many are watched, up to
+#: MAX_PROBE_WORKERS.
+#:
+#: One honest limit even with that fix: a probe's *timeout* argument bounds
+#: each individual socket operation (connect, one recv), not the call's
+#: total wall time -- a "slow drip" responder that sends a trickle of bytes
+#: just inside the timeout window, or a blocking DNS lookup, can in
+#: principle keep resetting it forever. _probe_backends puts a hard deadline
+#: on *joining* each probe thread for exactly this reason: that stops the
+#: tick from waiting past the intended budget, though the thread itself is
+#: only reaped once its underlying socket call eventually does return --
+#: it is a daemon thread so a still-stuck one cannot block process exit.
+DEATH_BOUND_S = 15.0
+#: Never so small a real, merely-slow-but-alive backend starts flapping.
+MIN_PROBE_TIMEOUT_S = 0.25
+#: Headroom subtracted from the per-tick probe budget for the non-probe work
+#: tick() does every pass -- see DEATH_BOUND_S above.
+PROBE_OVERHEAD_S = 0.3
+#: Caps the thread pool _probe_backends spins up per tick. Past this many
+#: concurrently-watched deployments, probing partially serializes again and
+#: DEATH_BOUND_S is no longer provable by construction -- an accepted,
+#: documented limit rather than an unbounded thread pool, since a single
+#: control plane watching this many deployments at once is already far
+#: outside today's expected scale.
+MAX_PROBE_WORKERS = 64
 
 
 class LaunchRefused(RuntimeError):
@@ -147,6 +198,10 @@ class DeploymentManager:
         self.ready_poll_interval_s = ready_poll_interval_s
         self.stop_confirm_timeout_s = stop_confirm_timeout_s
         self._clock = clock
+        # Rotation cursor for _probe_backends when the fleet exceeds
+        # MAX_PROBE_WORKERS: which window of SERVING deployments gets probed
+        # this tick. Watch-thread only; no lock needed.
+        self._probe_offset = 0
         self._id_factory = id_factory or (lambda: "d-%s" % uuid.uuid4().hex[:8])
         self._probe = probe_fn
 
@@ -193,6 +248,15 @@ class DeploymentManager:
 
         self.adapter.require()
         name = served_name or default_served_name(shape)
+        # M-22: run the same model_id/served_name safety check synthesize()
+        # runs, but here -- synchronously, before any record or launch
+        # worker thread exists. Without this, a hostile (or merely
+        # malformed) model_id or served_name still produced a LAUNCHING
+        # deployment: the launch worker only discovers the ValueError when
+        # it calls synthesize() on its own thread, several steps later, and
+        # reports it as an ordinary launch failure rather than refusing the
+        # request up front the way the WONT_FIT check above does.
+        check_recipe_identifiers(shape.model_id, name)
 
         with self._lock:
             existing = self._find_conflict(name, plan.node_ids)
@@ -273,10 +337,14 @@ class DeploymentManager:
         if cluster_id:
             ok, output = self.adapter.stop(cluster_id, hosts=hosts)
             deadline = self._clock() + self.stop_confirm_timeout_s
-            confirmed = ok and not self.adapter.is_running(cluster_id, hosts=hosts)
+            # M-16: is_running() is three-valued. "confirmed" means we have
+            # positive evidence of a stop -- an explicit False -- not merely
+            # the absence of a True. An unknown (sparkrun could not answer)
+            # must keep us in the retry loop rather than declaring victory.
+            confirmed = ok and self.adapter.is_running(cluster_id, hosts=hosts) is False
             while not confirmed and self._clock() < deadline:
                 time.sleep(1.0)
-                confirmed = not self.adapter.is_running(cluster_id, hosts=hosts)
+                confirmed = self.adapter.is_running(cluster_id, hosts=hosts) is False
             if not confirmed:
                 left_behind = (
                     "sparkrun stop did not confirm within %.0fs. Workload %s may still be "
@@ -339,6 +407,12 @@ class DeploymentManager:
         governs everything after that. This is the only place a state is set
         without an FSM check, and it happens once per record.
         """
+        removed = self.store.purge_expired()
+        if removed:
+            logger.info(
+                "garbage collected %d terminal deployment record(s) past the retention window",
+                removed,
+            )
         adopted: list[Deployment] = []
         for deployment, handle in self.store.load_all():
             record = _Record(deployment=deployment, handle=handle)
@@ -487,9 +561,13 @@ class DeploymentManager:
             last_reason = reason or last_reason
             # The container dying during load is the common failure. Catch it
             # here rather than waiting out the full ready timeout.
-            if record.cluster_id and not self.adapter.is_running(
+            # M-16: only a definite False is death. None (sparkrun could not
+            # answer -- e.g. check-job timed out on a wedged host) is a miss
+            # at most; fall through and keep polling instead of failing the
+            # launch out from under a host that may still come back.
+            if record.cluster_id and self.adapter.is_running(
                 record.cluster_id, hosts=record.hosts, timeout=10.0
-            ):
+            ) is False:
                 self._fail_launch(
                     record,
                     LaunchError(
@@ -621,10 +699,118 @@ class DeploymentManager:
             records = [
                 r for r in self._records.values() if r.deployment.state in SERVING
             ]
+        probe_timeout = self._backend_probe_timeout(len(records))
+        # M-15: probe every deployment's backend concurrently, not serially
+        # in this loop. Gathering results first keeps every state mutation
+        # below (memory severity, health_failures, transitions) on this one
+        # thread under the usual lock discipline -- only the network I/O
+        # runs off of it. See _probe_backends and the module comment by
+        # DEATH_BOUND_S for why this is what keeps the bound independent of
+        # how many deployments are watched.
+        probe_results = self._probe_backends(records, probe_timeout)
         for record in records:
             self._check_memory(record, nodes)
-            self._check_backend(record)
+            self._apply_backend_probe(record, probe_results.get(record.deployment.deployment_id))
             self._settle_state(record)
+
+    def _backend_probe_timeout(self, watched_count: int) -> float:
+        """Per-path health-probe timeout that keeps DEATH_BOUND_S honest.
+
+        See the module-level comment by DEATH_BOUND_S for the derivation.
+        *watched_count* is accepted (and used by _probe_backends to size its
+        thread pool) but deliberately does not shrink this timeout: probing
+        happens concurrently across deployments now, so the number watched
+        no longer lengthens a tick, and dividing the budget by it would only
+        make individual probes flap on real, merely-slow backends for no
+        bound-safety reason.
+        """
+        misses = max(1, self.health_fail_threshold)
+        budget_per_tick = DEATH_BOUND_S / misses - self.poll_interval_s - PROBE_OVERHEAD_S
+        per_path = budget_per_tick / max(1, len(HEALTH_PATHS))
+        return max(MIN_PROBE_TIMEOUT_S, per_path)
+
+    def _probe_backends(
+        self, records: list[_Record], probe_timeout: float
+    ) -> dict[str, tuple[bool, str | None]]:
+        """Probe every record's backend_url concurrently.
+
+        Serial probing here is exactly what let a hang on one deployment
+        push every deployment probed after it later and later within the
+        same tick, which is why the old per-deployment timeout had to shrink
+        as watched_count grew -- see the module comment by DEATH_BOUND_S.
+        Run concurrently, the whole phase costs about one deployment's worth
+        of probing (~probe_timeout * len(HEALTH_PATHS)) no matter how many
+        are watched, up to MAX_PROBE_WORKERS threads at once.
+
+        Plain daemon threads rather than ThreadPoolExecutor deliberately:
+        a pool's context manager (and plain .shutdown()) default to
+        wait=True, which blocks on a genuinely-stuck worker regardless of
+        any per-future timeout passed to .result() -- exactly the hang this
+        method exists to bound. A daemon thread that is still stuck when we
+        give up on it cannot block this method, tick(), or process exit; it
+        is reaped whenever its underlying socket call eventually returns.
+
+        Each thread also gets a hard join deadline on top of *probe_timeout*
+        itself: the timeout a probe is given bounds each individual socket
+        operation, not the call's total wall time, so without this a
+        slow-drip responder could in principle keep resetting it and never
+        return, even though no single recv() ever exceeded its own timeout.
+        Hitting the hard deadline reports that record as unhealthy for this
+        tick and moves on.
+        """
+        targets = [r for r in records if r.deployment.backend_url]
+        if not targets:
+            return {}
+        hard_deadline = probe_timeout * max(1, len(HEALTH_PATHS))
+        results: dict[str, tuple[bool, str | None]] = {}
+        results_lock = threading.Lock()
+
+        def run(record: _Record) -> None:
+            try:
+                outcome = self._probe(record.deployment.backend_url, timeout=probe_timeout)
+            except Exception as exc:  # a probe_fn must never crash the watch thread
+                outcome = (False, "probe raised %s: %s" % (type(exc).__name__, exc))
+            with results_lock:
+                results[record.deployment.deployment_id] = outcome
+
+        # Past the worker cap, rotate which window gets probed each tick so
+        # no deployment is *permanently* unprobed: every backend is reached
+        # within ceil(n / MAX_PROBE_WORKERS) ticks, stretching the death
+        # bound by that factor rather than making it infinite for the tail.
+        # Deployments outside this tick's window get no result, which
+        # _apply_backend_probe treats as "nothing learned this tick".
+        cap = max(1, MAX_PROBE_WORKERS)
+        if len(targets) > cap:
+            n = len(targets)
+            start = self._probe_offset % n
+            targets = (targets[start:] + targets[:start])[:cap]
+            self._probe_offset = (start + cap) % n
+
+        threads = []
+        for record in targets:
+            thread = threading.Thread(
+                target=run,
+                args=(record,),
+                name="sparkplane-probe-%s" % record.deployment.deployment_id,
+                daemon=True,
+            )
+            thread.start()
+            threads.append((thread, record))
+
+        # One ABSOLUTE deadline for the whole phase, not a fresh allowance
+        # per thread: joining serially with a per-thread timeout would let
+        # k concurrent hangs cost k * hard_deadline in a single tick.
+        deadline = time.monotonic() + hard_deadline
+        for thread, record in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            with results_lock:
+                if record.deployment.deployment_id not in results:
+                    results[record.deployment.deployment_id] = (
+                        False,
+                        "probe did not return within %.2fs (possible slow-drip "
+                        "response or a blocked hostname lookup)" % hard_deadline,
+                    )
+        return results
 
     def _node_states(self) -> dict[str, NodeState]:
         if self.registry is None:
@@ -655,7 +841,16 @@ class DeploymentManager:
             else:
                 record.unhealthy_nodes.discard(node_id)
 
-            total = state.profile.total_memory or 1
+            # M-13: this must share Agent G's admission-controller denominator
+            # (gateway/admission.py), not the nameplate total. addressable_memory
+            # is the GPU-reachable ceiling the fit calculator's usable_memory()
+            # budget was computed against; total_memory is bytes the GPU can
+            # never actually address. On GB10, addressable (119.7 GiB) is ~7%
+            # below total (128 GiB), so dividing by total under-reads pressure
+            # by that much and the two 95% watches would trip at different
+            # real occupancy -- one denominator per fraction, shared everywhere
+            # a fraction of "how full is this GPU" is computed.
+            total = state.profile.addressable_memory or 1
             fraction = state.memory_used / total
             severity = (
                 "critical"
@@ -674,7 +869,9 @@ class DeploymentManager:
                 "served_name": deployment.served_name,
                 "node_id": node_id,
                 "memory_used": state.memory_used,
-                "total_memory": state.profile.total_memory,
+                # Same denominator the pct was computed against (M-13): the
+                # GPU-reachable ceiling, not the nameplate total.
+                "addressable_memory": state.profile.addressable_memory,
                 "memory_used_pct": round(fraction * 100.0, 1),
             }
             if severity == "critical":
@@ -703,11 +900,22 @@ class DeploymentManager:
                     **common,
                 )
 
-    def _check_backend(self, record: _Record) -> None:
+    def _apply_backend_probe(
+        self, record: _Record, result: tuple[bool, str | None] | None
+    ) -> None:
+        """React to a backend probe _probe_backends already gathered.
+
+        Split from the probe itself (see tick() and _probe_backends) so the
+        network call can run concurrently across deployments while every
+        state mutation here still happens on the manager's single tick
+        thread, under the same lock discipline as before -- concurrency was
+        added to the I/O that used to make deployments wait on each other,
+        not to the state transitions.
+        """
         deployment = record.deployment
-        if not deployment.backend_url:
-            return
-        healthy, reason = self._probe(deployment.backend_url)
+        if result is None:
+            return  # no backend_url yet (or nothing to probe this tick)
+        healthy, reason = result
         if healthy:
             record.health_failures = 0
             return
@@ -814,11 +1022,26 @@ class DeploymentManager:
                 return S.READY, None
 
         cluster_id = record.cluster_id
-        if cluster_id and self.adapter.is_running(cluster_id, hosts=record.hosts):
+        running = self.adapter.is_running(cluster_id, hosts=record.hosts) if cluster_id else False
+        if running:
             if deployment.state is S.STOPPING:
                 return S.STOPPING, "stop was in flight when the control plane restarted"
             # Container up, backend silent: still loading, or just restarted.
             return S.LAUNCHING, "adopted mid-startup after a control plane restart"
+        if running is None:
+            # M-16: sparkrun could not confirm liveness either way (e.g.
+            # check-job timed out on a wedged host). That is absence of
+            # evidence, not evidence of death -- unlike a definite False it
+            # must not retire what may still be a live deployment. Adopt as
+            # LAUNCHING so a ready-waiter keeps asking instead of declaring
+            # it gone on the strength of one unanswered check.
+            if deployment.state is S.STOPPING:
+                return S.STOPPING, "stop was in flight when the control plane restarted"
+            return (
+                S.LAUNCHING,
+                "sparkrun could not confirm liveness after a control plane "
+                "restart (check-job did not answer); treating as still starting",
+            )
 
         if deployment.state is S.LAUNCHING:
             return S.FAILED, "launch did not survive the control plane restart"

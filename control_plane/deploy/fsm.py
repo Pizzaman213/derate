@@ -20,6 +20,13 @@ LEGAL: dict[S, frozenset[S]] = {
     S.PLANNED: frozenset({S.LAUNCHING}),
     S.LAUNCHING: frozenset({S.READY, S.FAILED}),
     S.READY: frozenset({S.DEGRADED, S.FAILED, S.STOPPING}),
+    # DEGRADED -> FAILED is not in the frozen diagram at the top of this file
+    # (it only draws DEGRADED -> READY and DEGRADED -> STOPPING); it is a
+    # documented deviation adopted at integration -- see 00-architecture.md,
+    # "Appendix: section 4 amendments", the "DEGRADED -> FAILED transition"
+    # entry: forcing a STOPPING detour before a degraded deployment that died
+    # outright reaches FAILED would misrecord a crash as an operator-requested
+    # stop.
     S.DEGRADED: frozenset({S.READY, S.FAILED, S.STOPPING}),
     S.STOPPING: frozenset({S.STOPPED}),
     S.FAILED: frozenset(),

@@ -334,19 +334,39 @@ class SparkrunAdapter:
     ) -> dict[str, Any]:
         """`sparkrun cluster check-job --json`. The reconcile primitive.
 
-        Returns at least {"running": bool}. A sparkrun that cannot be reached
-        reports not-running with the reason, rather than raising: reconcile
-        must survive a sparkrun that is missing or broken.
+        Returns at least {"running": bool | None}: True or False when
+        sparkrun actually answered, None when it could not be asked at all
+        (M-16). Reconcile must survive a sparkrun that is missing or broken
+        rather than raising -- but "we could not check" is not the same
+        fact as "confirmed not running", and callers (is_running(), and
+        everything downstream of it) must not collapse the two. A sparkrun
+        that is not installed or not on PATH right now is exactly the same
+        kind of absent evidence as the TIMEOUT case just below: the control
+        plane's own environment can temporarily lack the binary (a PATH not
+        yet mounted, an image mid-upgrade) while a deployment it launched
+        earlier, under a different environment, is still running --
+        reporting a hard False here retired live deployments through this
+        branch exactly as TIMEOUT used to through that one.
         """
         if not self.available():
-            return {"running": False, "cluster_id": cluster_id, "error": NOT_INSTALLED}
+            return {"running": None, "cluster_id": cluster_id, "error": NOT_INSTALLED}
         argv = [self.binary, "cluster", "check-job", cluster_id, "--json"]
         if hosts:
             argv += KNOBS_BY_NAME["hosts"].emit(list(hosts))
         try:
             proc = self._run(argv, timeout=timeout)
         except subprocess.TimeoutExpired:
-            return {"running": False, "cluster_id": cluster_id, "error": "check-job timed out"}
+            # M-16: a timeout means sparkrun could not answer, not that the
+            # workload is confirmed absent. "running": False here used to
+            # read as a definite negative to every caller, which let
+            # reconcile() retire a deployment that might still be alive on a
+            # wedged host. None is the honest "we do not know" -- callers
+            # must not collapse it back into False.
+            return {
+                "running": None,
+                "cluster_id": cluster_id,
+                "error": "check-job timed out",
+            }
         payload = _first_json_object(proc.stdout)
         if payload is None:
             # Exit code alone still answers the question: 0 = running.
@@ -364,8 +384,12 @@ class SparkrunAdapter:
         *,
         hosts: Sequence[str] | None = None,
         timeout: float = 60.0,
-    ) -> bool:
-        return bool(self.check_job(cluster_id, hosts=hosts, timeout=timeout).get("running"))
+    ) -> bool | None:
+        """Three-valued: True/False when sparkrun answered, None when it
+        could not be asked (M-16). None is absence of evidence, not evidence
+        of death -- callers must treat it as "unknown", never as False."""
+        running = self.check_job(cluster_id, hosts=hosts, timeout=timeout).get("running")
+        return running if running is None else bool(running)
 
     def logs(
         self,

