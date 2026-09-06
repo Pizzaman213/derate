@@ -24,8 +24,10 @@ try:  # the day-0 constant if it exists, so we never drift from the rest of the 
 except ImportError:  # pragma: no cover - the window is specified in Agent B's brief
     STALE_AFTER_S = 7 * 24 * 60 * 60
 
-# Ratio of NCCL-effective bandwidth to raw RDMA bandwidth on the GDR-disabled
-# path, where GPU tensors transit system memory before reaching the NIC.
+# Ratio of NCCL-effective bandwidth to raw RDMA bandwidth, derived from the
+# GDR-disabled path where GPU tensors transit system memory before reaching the NIC.
+# This ratio is applied regardless of whether GDR is enabled on the actual link;
+# when GDR is enabled, the scaled figure may understate true NCCL bandwidth.
 # Reporting raw RDMA as if it were NCCL bandwidth is the exact error that makes
 # the ecosystem's defaults wrong; this factor is the correction, and the record
 # says out loud that it was applied.

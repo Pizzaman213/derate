@@ -74,9 +74,9 @@ def detect_gdr(nccl_output: str | None = None, runner: CommandRunner | None = No
         peer = _peer_memory_module(runner)
         if peer is not None:
             return GdrEvidence(
-                enabled=True,
+                enabled=False,
                 source="peer-memory-module",
-                detail=f"{peer} present; NCCL did not report, so this is inferred",
+                detail=f"{peer} present, but kernel module presence alone is insufficient to confirm GDR is active",
             )
         return GdrEvidence(
             enabled=False,

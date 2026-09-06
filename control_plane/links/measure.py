@@ -271,10 +271,22 @@ class IbWriteBwMeasurer(_ClientSideMixin):
             return None
 
         evidence = detect_gdr(None, self._runner)
+        # The 0.42 scale always applies (raw RDMA is never NCCL bandwidth),
+        # but the note must not claim a GDR-disabled path when the evidence
+        # says GDR is active.
+        if evidence.enabled:
+            path_clause = (
+                "to approximate NCCL all-reduce throughput. Raw RDMA "
+                "is not NCCL bandwidth and is not reported as such"
+            )
+        else:
+            path_clause = (
+                "to approximate the NCCL path staged through system memory. "
+                "Raw RDMA is not NCCL bandwidth and is not reported as such"
+            )
         notes = [
             f"derived from ib_write_bw: {raw_gbps:.2f} GB/s raw RDMA scaled by "
-            f"{IB_TO_NCCL_RATIO} to approximate the GDR-disabled NCCL path. Raw RDMA "
-            "is not NCCL bandwidth and is not reported as such",
+            f"{IB_TO_NCCL_RATIO} " + path_clause,
             "ib_write_bw cannot tell all-reduce from sendrecv, so both figures are the "
             "same estimate; re-measure with nccl-tests before trusting the difference",
         ]

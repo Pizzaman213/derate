@@ -333,7 +333,11 @@ def test_gdr_enabled_when_nccl_picks_a_gdrdma_transport():
 
 def test_gdr_falls_back_to_the_peer_memory_module_when_nccl_is_silent():
     loaded = FakeRunner(files={"/proc/modules": "nvidia_peermem 16384 0 - Live 0x0\n"})
-    assert detect_gdr(None, loaded).enabled is True
+    evidence = detect_gdr(None, loaded)
+    # Module presence is necessary but not sufficient to confirm GDR is active
+    assert evidence.enabled is False
+    assert "nvidia_peermem" in (evidence.detail or "")
+    assert "insufficient" in (evidence.detail or "")
     absent = FakeRunner(files={"/proc/modules": "nvidia 1000 0 - Live 0x0\n"})
     assert detect_gdr(None, absent).enabled is False
 
@@ -500,6 +504,40 @@ def test_the_ib_estimate_admits_it_cannot_tell_the_collectives_apart():
     )
     assert result.all_reduce_gbps == result.sendrecv_gbps
     assert any("cannot tell all-reduce from sendrecv" in note for note in result.annotation.notes)
+
+
+def test_ib_scaling_note_is_honest_when_gdr_is_disabled():
+    """When GDR is off, the scaling note must mention system memory buffering."""
+    # Default FakeRunner has no peer-memory module, so GDR evidence is disabled
+    result = IbWriteBwMeasurer(ib_runner(), clock=lambda: T0).measure(
+        Endpoint("a", "h1"), Endpoint("b", "h2")
+    )
+    assert result.gpudirect_rdma is False
+    scaling_note = next(n for n in result.annotation.notes if "scaled by" in n)
+    assert "system memory" in scaling_note
+    assert "not NCCL bandwidth" in scaling_note
+
+
+def test_ib_scaling_note_is_honest_when_gdr_is_enabled(monkeypatch):
+    """When GDR is on, the scaling note must not falsely claim a GDR-disabled path."""
+    # When GDR enabled=True, the scaling note must be honest: it must not claim
+    # to approximate "the GDR-disabled NCCL path" since we have evidence GDR is active.
+    import control_plane.links.measure as measure_module
+    from control_plane.links.gdr import GdrEvidence
+
+    def mock_detect_gdr(nccl_output, runner):
+        return GdrEvidence(enabled=True, source="test", detail="GDR enabled for test")
+
+    monkeypatch.setattr(measure_module, "detect_gdr", mock_detect_gdr)
+    runner = ib_runner()
+    result = IbWriteBwMeasurer(runner, clock=lambda: T0).measure(
+        Endpoint("a", "h1"), Endpoint("b", "h2")
+    )
+    assert result.gpudirect_rdma is True
+    scaling_note = next(n for n in result.annotation.notes if "scaled by" in n)
+    assert "not NCCL bandwidth" in scaling_note
+    # Pin the fix: when GDR is enabled, the note must not falsely claim GDR-disabled path
+    assert "GDR-disabled" not in scaling_note
 
 
 def test_ib_latency_comes_from_ib_write_lat_when_present():
