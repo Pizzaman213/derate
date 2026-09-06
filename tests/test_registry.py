@@ -379,14 +379,120 @@ def test_join_with_wrong_token_is_rejected_and_leaves_no_trace(tmp_path):
     assert registry.get_node("spark-02") is None
 
 
-def test_join_with_missing_token_is_rejected(tmp_path):
+def test_join_with_missing_token_becomes_a_candidate_not_a_rejection(tmp_path):
+    """H-4a: the README's zero-config demo. No token is not a wrong token.
+
+    An absent token used to raise JoinRejected -- the joiner's only path was
+    to start its own cluster. Now it is routed into the candidate flow
+    instead, same as an mDNS sighting, so a human can admit it.
+    """
     client = FakeClient()
     client.serve("http://10.0.0.12:8081", SPARK_02)
-    registry = make_registry(tmp_path, client=client)
+    registry = make_registry(tmp_path, client=client, token="correct-token")
     for empty in (None, ""):
-        with pytest.raises(JoinRejected):
-            run(registry.handle_join(empty, SPARK_02, "http://10.0.0.12:8081"))
+        registry.remove_node("spark-02")
+        result = run(registry.handle_join(empty, SPARK_02, "http://10.0.0.12:8081"))
+        assert result["status"] == "candidate"
+        assert [c["node_id"] for c in registry.candidates()] == ["spark-02"]
+
+
+def test_join_with_missing_token_candidate_carries_no_token_or_member_state(tmp_path):
+    """The distinct candidate response must not leak the cluster token or
+    imply membership: no cluster_id, no token, nothing a bystander could use.
+    """
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="correct-token")
+
+    result = run(registry.handle_join(None, SPARK_02, "http://10.0.0.12:8081"))
+
+    assert result == {"node_id": "spark-02", "status": "candidate"}
+    assert "cluster_id" not in result
+    assert "token" not in result
+    assert registry.get_node("spark-02") is None
+    candidate = registry.candidates()[0]
+    assert candidate["source"] == "join"
+
+
+def test_join_with_wrong_nonempty_token_still_rejected_no_candidate(tmp_path):
+    """A wrong token is not the same as no token: still a flat rejection,
+    still leaves no trace -- 403 must stay meaningful (brief A #4)."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="correct-token")
+
+    with pytest.raises(JoinRejected):
+        run(registry.handle_join("definitely-wrong", SPARK_02, "http://10.0.0.12:8081"))
+
     assert registry.candidates() == []
+    assert registry.list_nodes() == []
+
+
+def test_candidate_then_admit_then_rejoin_with_no_token_returns_member(tmp_path):
+    """H-4c, the full loop: join(no token) -> candidate -> admit -> re-join
+    with the same absent-token flow -> member, with cluster_id learned."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="correct-token")
+
+    first = run(registry.handle_join(None, SPARK_02, "http://10.0.0.12:8081"))
+    assert first["status"] == "candidate"
+
+    registry.admit("spark-02")
+    assert registry.get_node("spark-02") is not None
+
+    second = run(registry.handle_join(None, SPARK_02, "http://10.0.0.12:8081"))
+
+    assert second["status"] == "member"
+    assert second["cluster_id"] == registry.cluster_id()
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["spark-02"]
+    assert registry.candidates() == []
+
+
+def test_tokenless_join_to_existing_member_cannot_hijack_routing_state(tmp_path):
+    """Revision fix, H-4a/H-4c: the admitted-set check that lets a
+    no-token-admitted worker learn its cluster_id on re-join must not
+    become an unauthenticated write into the roster.
+
+    node_ids are slugified hostnames, advertised in the clear over mDNS --
+    not a secret. Before this fix, anyone who could answer a probe as
+    "spark-02" (i.e. anyone who stood up a server claiming that node_id)
+    could re-point registry.agent_url("spark-02") and overwrite the stored
+    profile just by calling handle_join with no token, and the coordinator
+    would persist the hijack to registry.json and route every future health
+    probe, telemetry poll and planner decision at the attacker. A tokenless
+    join to an existing member must be a pure status check.
+    """
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="correct-token")
+
+    run(registry.handle_join(None, SPARK_02, "http://10.0.0.12:8081"))
+    registry.admit("spark-02")
+    assert registry.agent_url("spark-02") == "http://10.0.0.12:8081"
+
+    evil_profile = make_profile("spark-02", address="10.6.6.6", gpu_count=99)
+    client.serve("http://10.6.6.6:8081", evil_profile)
+
+    attack = run(registry.handle_join(None, evil_profile, "http://10.6.6.6:8081"))
+
+    # It gets a truthful member confirmation -- that much is by design --
+    # but nothing it said is believed.
+    assert attack == {
+        "node_id": "spark-02",
+        "cluster_id": registry.cluster_id(),
+        "status": "member",
+    }
+    assert registry.agent_url("spark-02") == "http://10.0.0.12:8081"
+    node = registry.get_node("spark-02")
+    assert node.profile.address == "192.168.11.14"
+    assert node.profile.gpu_count == 1
+
+    # And the hijack must not even transiently reach disk.
+    reloaded = make_registry(tmp_path, client=client, token="correct-token")
+    assert reloaded.agent_url("spark-02") == "http://10.0.0.12:8081"
+    reloaded_node = reloaded.get_node("spark-02")
+    assert reloaded_node.profile.address == "192.168.11.14"
 
 
 def test_join_is_rejected_when_probe_back_fails(tmp_path):
@@ -904,7 +1010,12 @@ def test_workers_are_ignored_when_browsing_for_a_coordinator():
     assert decision.role == "coordinator"
 
 
-def test_token_mismatch_starts_our_own_cluster_rather_than_joining_theirs():
+def test_token_mismatch_never_self_coordinates_stays_a_waiting_worker():
+    """H-4b: the old bug. A coordinator exists on the subnet (it answered,
+    just with a rejection) -- forming a second one next to it would split the
+    network, so this must come back a worker, not a coordinator, and must
+    keep the rejecting coordinator's url so the caller can keep retrying it.
+    """
     async def one_peer(*a, **k):
         return [DiscoveredPeer("other", "coordinator", "c-other", "10.0.0.99", 8081)]
 
@@ -914,8 +1025,129 @@ def test_token_mismatch_starts_our_own_cluster_rather_than_joining_theirs():
     decision = run(
         resolve_role(RegistryConfig(), SPARK_02, "http://10.0.0.12:8081", browse=one_peer, join=reject)
     )
-    assert decision.role == "coordinator"
+    assert decision.role == "worker"
+    assert not decision.joined
+    assert decision.status == "rejected"
+    assert decision.coordinator_url == "http://10.0.0.99:8080"
     assert "token did not match" in decision.reason
+
+
+def test_discovered_coordinator_candidate_status_never_self_coordinates():
+    """A join that succeeds but only as far as 'candidate' (H-4a's no-token
+    path) must also come back a worker -- it already has, this pins it."""
+    async def one_peer(*a, **k):
+        return [DiscoveredPeer("spark-01", "coordinator", "c-1", "10.0.0.11", 8081)]
+
+    async def join_as_candidate(*a, **k):
+        return {"node_id": "spark-02", "status": "candidate"}
+
+    decision = run(
+        resolve_role(
+            RegistryConfig(), SPARK_02, "http://10.0.0.12:8081",
+            browse=one_peer, join=join_as_candidate,
+        )
+    )
+    assert decision.role == "worker"
+    assert decision.joined
+    assert decision.status == "candidate"
+    # cluster_id here comes from the peer's public mDNS TXT record, which
+    # already advertises it in the clear -- not from the join response,
+    # which carries none for a candidate. See the dedicated response-shape
+    # test for that half.
+    assert decision.cluster_id == "c-1"
+
+
+def test_rejoin_until_admitted_retries_candidate_then_succeeds_on_admission():
+    """The worker-in-waiting loop: candidate, then candidate again, then a
+    human admits it and the next poll returns member."""
+    from control_plane.registry.bootstrap import rejoin_until_admitted, RoleDecision
+
+    attempts = []
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def join(url, token, profile, agent_url, **k):
+        attempts.append(url)
+        if len(attempts) < 3:
+            return {"node_id": profile.node_id, "status": "candidate"}
+        return {"node_id": profile.node_id, "cluster_id": "c-1", "status": "member"}
+
+    decision = RoleDecision(
+        role="worker", coordinator_url="http://10.0.0.11:8080", joined=True,
+        reason="candidate", status="candidate",
+    )
+    result = run(
+        rejoin_until_admitted(
+            decision, RegistryConfig(), SPARK_02, "http://10.0.0.12:8081",
+            join=join, sleep=fake_sleep, jitter=lambda: 0.0,
+        )
+    )
+    assert len(attempts) == 3
+    assert result["status"] == "member"
+    assert result["cluster_id"] == "c-1"
+    # Normal cadence, no wrong-token backoff.
+    assert all(s == pytest.approx(15.0) for s in sleeps)
+
+
+def test_rejoin_until_admitted_backs_off_slower_on_wrong_token_but_never_gives_up():
+    from control_plane.registry.bootstrap import rejoin_until_admitted, RoleDecision
+
+    calls = {"n": 0}
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def join(url, token, profile, agent_url, **k):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise JoinRejected("bad token")
+        return {"node_id": profile.node_id, "cluster_id": "c-1", "status": "member"}
+
+    decision = RoleDecision(
+        role="worker", coordinator_url="http://10.0.0.99:8080", joined=False,
+        reason="rejected", status="rejected",
+    )
+    result = run(
+        rejoin_until_admitted(
+            decision, RegistryConfig(), SPARK_02, "http://10.0.0.12:8081",
+            join=join, sleep=fake_sleep, jitter=lambda: 0.0,
+        )
+    )
+    assert calls["n"] == 2
+    assert result["status"] == "member"
+    assert sleeps == [60.0]  # the slow, loud backoff -- not the 15s candidate cadence
+
+
+def test_rejoin_until_admitted_stops_when_told_to():
+    from control_plane.registry.bootstrap import rejoin_until_admitted, RoleDecision
+
+    async def fake_sleep(seconds):
+        pass
+
+    async def join(url, token, profile, agent_url, **k):
+        return {"node_id": profile.node_id, "status": "candidate"}
+
+    calls = {"n": 0}
+
+    def should_continue():
+        calls["n"] += 1
+        return calls["n"] <= 2
+
+    decision = RoleDecision(
+        role="worker", coordinator_url="http://10.0.0.11:8080", joined=True,
+        reason="candidate", status="candidate",
+    )
+    result = run(
+        rejoin_until_admitted(
+            decision, RegistryConfig(), SPARK_02, "http://10.0.0.12:8081",
+            join=join, sleep=fake_sleep, jitter=lambda: 0.0,
+            should_continue=should_continue,
+        )
+    )
+    assert result is None
 
 
 def test_explicit_join_address_skips_discovery():
@@ -985,10 +1217,14 @@ def test_config_reads_the_environment():
 
 
 def test_two_nodes_form_a_cluster_with_no_configuration(tmp_path):
-    """Acceptance: first becomes coordinator, second appears as a candidate.
+    """Acceptance: first becomes coordinator, second appears as a candidate --
+    genuinely with no token passed anywhere. This is the README's own demo:
+    two containers, same command, no shared secret between them yet.
 
     mDNS itself is not exercised here; the browse result is injected. What is
-    exercised is everything the two containers do with it.
+    exercised is everything the two containers do with it, including the
+    other half of the loop: admission, then the waiting node's next poll
+    turning into a real member with the coordinator's cluster id.
     """
     client = FakeClient()
     client.serve("http://10.0.0.11:8081", SPARK_01)
@@ -1002,9 +1238,9 @@ def test_two_nodes_form_a_cluster_with_no_configuration(tmp_path):
         local_profile=SPARK_01,
         client=client,
     )
-    token = coordinator.cluster_token()
 
-    # Node 2: same command, finds node 1, joins with the shared token.
+    # Node 2: same command as node 1, no token, no config of any kind --
+    # finds node 1 over (simulated) mDNS.
     async def browse_finds_first(*a, **k):
         return [DiscoveredPeer("spark-01", "coordinator", coordinator.cluster_id(), "10.0.0.11", 8081)]
 
@@ -1013,14 +1249,21 @@ def test_two_nodes_form_a_cluster_with_no_configuration(tmp_path):
 
     second = run(
         resolve_role(
-            RegistryConfig(token=token), SPARK_02, "http://10.0.0.12:8081",
+            RegistryConfig(), SPARK_02, "http://10.0.0.12:8081",
             browse=browse_finds_first, join=join,
         )
     )
 
+    # A candidate, not a member, and above all not a second coordinator.
+    # cluster_id is populated here from the peer's public mDNS TXT record
+    # (browse_finds_first put it there); the join response itself -- checked
+    # directly below -- carries none of that, which is the actual guarantee.
     assert second.role == "worker"
     assert second.joined
+    assert second.status == "candidate"
     assert second.cluster_id == coordinator.cluster_id()
+    raw = run(join("http://10.0.0.11:8080", None, SPARK_02, "http://10.0.0.12:8081"))
+    assert raw == {"node_id": "spark-02", "status": "candidate"}
     # Found on your network, not yet a member.
     assert [c["node_id"] for c in coordinator.candidates()] == ["spark-02"]
     assert [s.profile.node_id for s in coordinator.list_nodes()] == ["spark-01"]
@@ -1028,6 +1271,12 @@ def test_two_nodes_form_a_cluster_with_no_configuration(tmp_path):
     coordinator.admit("spark-02")
     assert sorted(s.profile.node_id for s in coordinator.list_nodes()) == ["spark-01", "spark-02"]
     assert coordinator.candidates() == []
+
+    # The waiting node's next poll -- still passing no token, exactly as
+    # before -- now succeeds as a member and learns the real cluster id.
+    third = run(join("http://10.0.0.11:8080", None, SPARK_02, "http://10.0.0.12:8081"))
+    assert third["status"] == "member"
+    assert third["cluster_id"] == coordinator.cluster_id()
 
 
 # ----------------------------------------------------------------------
@@ -1536,3 +1785,210 @@ def test_the_binding_limit_switches_with_load():
     expected = profile.usable_memory(0.90) - 100 * GIB
     assert allocatable_bytes(profile, gpu_bound, host_reserve=8 * GIB) == expected
     assert expected < 13 * GIB
+
+
+# ----------------------------------------------------------------------
+# 15. M-25: memory_used_pct never exceeds 100
+# ----------------------------------------------------------------------
+
+
+def test_memory_used_pct_clamps_at_100_when_pool_exceeds_addressable(tmp_path):
+    """On a real GB10 the pool total (121 GiB) is larger than the addressable
+    ceiling (119.7 GiB) this package uses as the denominator, so memory_used
+    can legitimately exceed addressable_memory. The reported percentage must
+    still read as a percentage.
+    """
+    registry = make_registry(tmp_path, local=SPARK_01)
+    over_addressable = SPARK_01.addressable_memory + int(5 * GIB)
+    registry.apply_sample(
+        "spark-01",
+        TelemetrySample(ts=1.0, memory_used=over_addressable, memory_total=SPARK_01.total_memory,
+                        power_watts=71.0, temperature_c=62.0, utilization_pct=94.0),
+    )
+    snap = registry.snapshot()
+    assert snap["nodes"][0]["memory_used_pct"] == 100.0
+
+
+def test_memory_used_pct_below_the_ceiling_is_unaffected():
+    from control_plane.registry.serde import memory_used_pct
+
+    state = NodeState(
+        profile=SPARK_01, healthy=True, last_seen=0.0,
+        memory_used=int(SPARK_01.addressable_memory * 0.5),
+        power_watts=0.0, temperature_c=0.0, utilization_pct=0.0,
+    )
+    assert memory_used_pct(state) == pytest.approx(50.0, abs=0.1)
+
+
+# ----------------------------------------------------------------------
+# 16. M-12: roster persistence across a restart
+# ----------------------------------------------------------------------
+
+
+def test_admitted_member_survives_a_coordinator_restart(tmp_path):
+    """Acceptance: a coordinator restart must not forget an admitted worker."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    first_run = Registry(
+        config=RegistryConfig(data_dir=tmp_path, token="tok", agent_port=8081),
+        local_profile=SPARK_01,
+        client=client,
+    )
+    run(first_run.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    first_run.admit("spark-02")
+    assert sorted(s.profile.node_id for s in first_run.list_nodes()) == ["spark-01", "spark-02"]
+
+    # New process, same data dir: restart in every sense that matters here.
+    second_run = Registry(
+        config=RegistryConfig(data_dir=tmp_path, token="tok", agent_port=8081),
+        local_profile=SPARK_01,
+        client=client,
+    )
+
+    ids = sorted(s.profile.node_id for s in second_run.list_nodes())
+    assert ids == ["spark-01", "spark-02"]
+    restored = second_run.get_node("spark-02")
+    assert restored.profile == SPARK_02
+    assert restored.healthy  # optimistic until the health loop says otherwise
+    assert second_run.agent_url("spark-02") == "http://10.0.0.12:8081"
+    # Telemetry is not durable state -- a fresh restart has none of it yet.
+    assert restored.memory_used == 0
+
+
+def test_candidate_survives_a_coordinator_restart(tmp_path):
+    """Not just members -- a pending candidate should not vanish either."""
+    first_run = make_registry(tmp_path, local=SPARK_01, token="tok")
+    first_run.offer_candidate(SPARK_02, "http://10.0.0.12:8081")
+    assert [c["node_id"] for c in first_run.candidates()] == ["spark-02"]
+
+    second_run = make_registry(tmp_path, local=SPARK_01, token="tok")
+    assert [c["node_id"] for c in second_run.candidates()] == ["spark-02"]
+    assert second_run.list_nodes()[0].profile.node_id == "spark-01"  # not re-admitted
+
+
+def test_removed_node_stays_gone_after_restart(tmp_path):
+    """remove_node persists too: a forgotten node must not come back."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    first_run = Registry(
+        config=RegistryConfig(data_dir=tmp_path, token="tok", agent_port=8081),
+        local_profile=SPARK_01,
+        client=client,
+    )
+    run(first_run.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    first_run.admit("spark-02")
+    first_run.remove_node("spark-02")
+
+    second_run = Registry(
+        config=RegistryConfig(data_dir=tmp_path, token="tok", agent_port=8081),
+        local_profile=SPARK_01,
+        client=client,
+    )
+    assert [s.profile.node_id for s in second_run.list_nodes()] == ["spark-01"]
+    assert second_run.candidates() == []
+
+
+def test_dismissed_candidate_stays_gone_after_restart(tmp_path):
+    first_run = make_registry(tmp_path, local=SPARK_01, token="tok")
+    first_run.offer_candidate(SPARK_02, "http://10.0.0.12:8081")
+    first_run.dismiss_candidate("spark-02")
+
+    second_run = make_registry(tmp_path, local=SPARK_01, token="tok")
+    assert second_run.candidates() == []
+
+
+def test_corrupt_roster_file_warns_and_starts_empty(tmp_path):
+    (tmp_path / "registry.json").write_text("{not valid json")
+    registry = make_registry(tmp_path, local=SPARK_01)
+    assert registry.candidates() == []
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["spark-01"]
+
+
+def test_missing_roster_file_starts_empty(tmp_path):
+    assert not (tmp_path / "registry.json").exists()
+    registry = make_registry(tmp_path, local=SPARK_01)
+    assert registry.candidates() == []
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["spark-01"]
+
+
+def test_roster_file_written_atomically_no_leftover_tmp_files(tmp_path):
+    """The tempfile+fsync+os.replace pattern should never leave a .tmp file
+    behind on the success path."""
+    registry = make_registry(tmp_path, local=SPARK_01, token="tok")
+    registry.offer_candidate(SPARK_02, "http://10.0.0.12:8081")
+    leftovers = list(tmp_path.glob(".registry-*.tmp"))
+    assert leftovers == []
+    assert (tmp_path / "registry.json").exists()
+
+
+def test_roster_persists_profile_and_url_not_telemetry(tmp_path):
+    """Persist profiles + agent_urls, NOT live telemetry (M-12's own text)."""
+    import json
+
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = Registry(
+        config=RegistryConfig(data_dir=tmp_path, token="tok", agent_port=8081),
+        local_profile=SPARK_01,
+        client=client,
+    )
+    run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    registry.admit("spark-02")
+    registry.apply_sample(
+        "spark-02",
+        TelemetrySample(ts=1.0, memory_used=12345, memory_total=SPARK_02.total_memory,
+                        power_watts=99.0, temperature_c=88.0, utilization_pct=77.0),
+    )
+
+    raw = json.loads((tmp_path / "registry.json").read_text())
+    member = raw["members"]["spark-02"]
+    assert set(member) == {"profile", "agent_url"}
+    assert "power_watts" not in member and "memory_used" not in member
+
+
+# ----------------------------------------------------------------------
+# 17. Enabler: Registry.start() is idempotent
+# ----------------------------------------------------------------------
+
+
+def test_start_called_twice_does_not_double_spawn_tasks(tmp_path):
+    registry = make_registry(tmp_path, local=SPARK_01)
+
+    async def scenario():
+        await registry.start()
+        first_tasks = list(registry._tasks)
+        await registry.start()
+        second_tasks = list(registry._tasks)
+        assert first_tasks == second_tasks
+        assert len(second_tasks) == 2
+        assert all(not t.done() for t in second_tasks)
+        await registry.stop()
+
+    run(scenario())
+
+
+def test_start_twice_concurrently_still_spawns_once(tmp_path):
+    """Two overlapping start() calls (e.g. two request handlers racing the
+    composition root) must not each spawn their own pair of loops."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+
+    async def scenario():
+        await asyncio.gather(registry.start(), registry.start())
+        assert len(registry._tasks) == 2
+        await registry.stop()
+
+    run(scenario())
+
+
+def test_stop_then_restart_spawns_a_fresh_pair(tmp_path):
+    registry = make_registry(tmp_path, local=SPARK_01)
+
+    async def scenario():
+        await registry.start()
+        await registry.stop()
+        assert registry._tasks == []
+        await registry.start()
+        assert len(registry._tasks) == 2
+        await registry.stop()
+
+    run(scenario())

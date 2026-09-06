@@ -45,7 +45,8 @@ def memory_used_pct(state: NodeState) -> float:
     addressable = state.profile.addressable_memory
     if addressable <= 0:
         return 0.0
-    return round(100.0 * state.memory_used / addressable, 1)
+    pct = 100.0 * state.memory_used / addressable
+    return round(min(pct, 100.0), 1)  # GB10: pool total can exceed addressable, so cap the reported figure at 100
 
 
 def state_to_dict(state: NodeState) -> dict:

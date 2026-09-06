@@ -5,7 +5,13 @@ they are alive, and what they are doing right now.
 """
 
 from .agent import NodeAgent, create_agent_app
-from .bootstrap import RoleDecision, post_join, resolve_role, resolve_role_sync
+from .bootstrap import (
+    RoleDecision,
+    post_join,
+    rejoin_until_admitted,
+    resolve_role,
+    resolve_role_sync,
+)
 from .client import AgentClient, HttpAgentClient
 from .config import RegistryConfig
 from .discovery import Advertiser, DiscoveredPeer, browse, browse_async
@@ -68,6 +74,7 @@ __all__ = [
     "read_compute_apps",
     "read_host_memory",
     "read_telemetry",
+    "rejoin_until_admitted",
     "require_host_networking",
     "resolve_role",
     "resolve_role_sync",

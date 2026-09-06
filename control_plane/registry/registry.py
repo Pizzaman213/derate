@@ -38,6 +38,7 @@ from .errors import JoinRejected, NodeNotFound, ProbeFailed
 from .identity import ClusterIdentity, load_or_create_identity
 from .net import normalize_agent_url
 from .probe import probe_local
+from .roster import load_roster, save_roster
 from .serde import memory_used_pct, profile_from_dict, profile_to_dict, state_to_dict
 from .telemetry import (
     TelemetryStore,
@@ -88,6 +89,8 @@ class Registry:
         self._telemetry = TelemetryStore()
         self._tasks: list[asyncio.Task] = []
         self._running = False
+
+        self._load_roster()
 
         self.local_profile = local_profile
         self.local_node_id = local_profile.node_id if local_profile else None
@@ -142,6 +145,60 @@ class Registry:
         return self._agent_urls.get(node_id)
 
     # ------------------------------------------------------------------
+    # Roster persistence (M-12)
+    # ------------------------------------------------------------------
+
+    def _load_roster(self) -> None:
+        """Restore members and candidates from the last run, if any.
+
+        Only static facts (profile, agent URL) come back this way. Health and
+        telemetry are live questions the health/telemetry loops answer fresh
+        within one round of restarting, so a restored member starts healthy
+        and unmeasured rather than carrying a stale number as if it were current.
+        """
+        data = load_roster(self.config.data_dir)
+        for node_id, entry in data["members"].items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                profile = profile_from_dict(entry["profile"])
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("dropping unreadable persisted member %s: %s", node_id, exc)
+                continue
+            self._members[node_id] = NodeState(
+                profile=profile,
+                healthy=True,
+                last_seen=self._clock(),
+                memory_used=0,
+                power_watts=0.0,
+                temperature_c=0.0,
+                utilization_pct=0.0,
+            )
+            self._agent_urls[node_id] = str(entry.get("agent_url", ""))
+        self._candidates = {
+            node_id: record
+            for node_id, record in data["candidates"].items()
+            if isinstance(record, dict)
+        }
+        if self._members or self._candidates:
+            log.info(
+                "restored %d member(s) and %d candidate(s) from %s",
+                len(self._members),
+                len(self._candidates),
+                self.config.data_dir,
+            )
+
+    def _persist_roster(self) -> None:
+        members = {
+            node_id: {
+                "profile": profile_to_dict(state.profile),
+                "agent_url": self._agent_urls.get(node_id, ""),
+            }
+            for node_id, state in self._members.items()
+        }
+        save_roster(self.config.data_dir, members, self._candidates)
+
+    # ------------------------------------------------------------------
     # Admission
     # ------------------------------------------------------------------
 
@@ -174,20 +231,40 @@ class Registry:
     ) -> dict:
         """Coordinator side of the join protocol. Async: it probes back.
 
-        Rejects a wrong or missing token before touching any state, so a bad
-        joiner leaves no trace anywhere. Agent G maps JoinRejected to 403.
+        A wrong, non-empty token is rejected before touching any state, so a
+        bad joiner leaves no trace anywhere (Agent G maps JoinRejected to
+        403). An absent token is different on purpose: with nothing to check
+        it against, there is nothing to reject -- the joiner is routed into
+        ``offer_candidate``, the same "discovered, not yet admitted" path
+        mDNS uses. That is the whole mechanism behind the README's zero-config
+        demo: two containers, same command, no shared secret between them
+        yet, and the second one shows up for a human to admit instead of
+        either being turned away or founding a second cluster.
+
+        The admitted set is consulted before any of that: a node already a
+        member gets "member" status back (with the cluster id) whether or
+        not it presented a token, because that is how a node admitted with
+        no token learns its cluster identity on its next poll. But a
+        tokenless caller claiming to already be a member never gets to
+        rewrite where that member's traffic is routed -- node_ids are
+        slugified hostnames, advertised in the clear over mDNS, so they are
+        not a secret an unauthenticated prober can be assumed not to know.
+        Only a token holder can move the agent_url / profile on file for an
+        existing member; a tokenless "re-join" is a status check, not a
+        write.
         """
         expected = self.cluster_token()
-        if not token or not hmac.compare_digest(str(token), expected):
+        has_token = bool(token)
+        if has_token and not hmac.compare_digest(str(token), expected):
             log.warning(
-                "rejected join from %s (%s): bad or missing token",
+                "rejected join from %s (%s): wrong cluster token",
                 profile.node_id,
                 agent_url,
             )
             raise JoinRejected("invalid cluster token")
 
-        # Believe the profile only after the far side answers as itself. A
-        # joiner can claim any hardware it likes in the request body.
+        # Believe the profile only after the far side answers as itself,
+        # token or not. A joiner can claim any hardware it likes in the body.
         try:
             confirmed = await self.probe_remote(agent_url)
         except ProbeFailed as exc:
@@ -204,22 +281,57 @@ class Registry:
             raise JoinRejected("node_id mismatch on probe-back")
 
         if confirmed.node_id in self._members:
-            # A restarted member re-joining. Refresh what it told us, keep it.
+            if not has_token:
+                # Confirming membership is fine -- that is the mechanism a
+                # no-token-admitted worker uses to learn its cluster id --
+                # but nothing here proves this caller IS that member, only
+                # that it can answer a probe at the node_id it claims (which
+                # anyone on the subnet can do once they have sniffed the
+                # mDNS advertisement). Do not touch routing state: no
+                # agent_url rewrite, no profile overwrite, no persistence.
+                log.info(
+                    "member %s re-confirmed with no token from %s "
+                    "(routing state unchanged, valid token required to move it)",
+                    confirmed.node_id,
+                    agent_url,
+                )
+                return {
+                    "node_id": confirmed.node_id,
+                    "cluster_id": self.cluster_id(),
+                    "status": "member",
+                }
+            # A restarted member, or a waiting candidate that was just
+            # admitted, re-joining with the real token. Refresh what it
+            # told us, keep it.
             self._agent_urls[confirmed.node_id] = agent_url
             state = self._members[confirmed.node_id]
             state.profile = confirmed
             state.last_seen = self._clock()
             state.healthy = True
             self._misses[confirmed.node_id] = 0
+            self._persist_roster()
             return {
                 "node_id": confirmed.node_id,
                 "cluster_id": self.cluster_id(),
                 "status": "member",
             }
 
+        if not has_token:
+            # No token at all: never a rejection, only a candidate -- and a
+            # deliberately thin response. No cluster id, no member state:
+            # a machine nobody has looked at yet cannot infer either.
+            self.offer_candidate(confirmed, agent_url, source=SOURCE_JOIN)
+            log.info(
+                "candidate %s joined from %s with no token, awaiting admission",
+                confirmed.node_id,
+                agent_url,
+            )
+            return {"node_id": confirmed.node_id, "status": "candidate"}
+
         self._candidates[confirmed.node_id] = self._candidate_record(
             confirmed, agent_url, SOURCE_JOIN
         )
+        self._persist_roster()
         log.info("candidate %s joined from %s, awaiting admission", confirmed.node_id, agent_url)
         return {
             "node_id": confirmed.node_id,
@@ -227,15 +339,20 @@ class Registry:
             "status": "candidate",
         }
 
-    def offer_candidate(self, profile: NodeProfile, agent_url: str) -> dict:
-        """Record a peer seen over mDNS as a candidate. Never a member.
+    def offer_candidate(
+        self, profile: NodeProfile, agent_url: str, source: str = SOURCE_MDNS
+    ) -> dict:
+        """Record a peer as a candidate. Never a member.
 
         This is the "discovery proposes" half. Nothing calls admit for us.
+        Used both for mDNS sightings and for a tokenless join (source="join"),
+        which is the other production caller this used to be missing.
         """
         if profile.node_id in self._members:
             return self._candidates.get(profile.node_id, {})
-        record = self._candidate_record(profile, agent_url, SOURCE_MDNS)
+        record = self._candidate_record(profile, agent_url, source)
         self._candidates[profile.node_id] = record
+        self._persist_roster()
         return record
 
     def admit(self, node_id: str) -> NodeState:
@@ -258,6 +375,7 @@ class Registry:
         self._members[node_id] = state
         self._agent_urls[node_id] = record["agent_url"]
         self._misses[node_id] = 0
+        self._persist_roster()
         log.info("admitted %s as a member", node_id)
         return state
 
@@ -282,10 +400,12 @@ class Registry:
         self._agent_urls.pop(node_id, None)
         self._misses.pop(node_id, None)
         self._telemetry.drop(node_id)
+        self._persist_roster()
 
     def dismiss_candidate(self, node_id: str) -> None:
         """Reject a proposal without admitting it."""
-        self._candidates.pop(node_id, None)
+        if self._candidates.pop(node_id, None) is not None:
+            self._persist_roster()
 
     # ------------------------------------------------------------------
     # Probing
