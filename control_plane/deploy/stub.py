@@ -123,6 +123,15 @@ class StubDeploymentManager:
                 raise KeyError("no such deployment: %s" % deployment_id)
             if record.deployment.state in TERMINAL:
                 return
+            if record.deployment.state is S.LAUNCHING:
+                # Same as the real manager: no LAUNCHING -> STOPPING edge
+                # exists, so a cancelled launch lands in FAILED saying so.
+                record.deployment.last_error = (
+                    "stop requested while the backend was still loading; "
+                    "the launch was torn down"
+                )
+                self._transition(record, S.FAILED, reason="stopped during launch")
+                return
             self._transition(record, S.STOPPING)
             self._transition(record, S.STOPPED)
 

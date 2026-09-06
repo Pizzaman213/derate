@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -42,7 +42,7 @@ from control_plane.deploy import (  # noqa: E402
     backend_origin,
 )
 from control_plane.deploy import events as ev  # noqa: E402
-from control_plane.deploy.flags import KNOBS_BY_NAME, runtime_spec  # noqa: E402
+from control_plane.deploy.flags import KNOBS_BY_NAME  # noqa: E402
 from control_plane.deploy.fsm import LEGAL, SERVING, TERMINAL  # noqa: E402
 from control_plane.deploy.recipes import materialize, synthesize  # noqa: E402
 from control_plane.deploy.sparkrun import default_served_name, is_oom  # noqa: E402
@@ -913,6 +913,24 @@ def test_an_unconfirmed_stop_escalates_and_says_what_was_left_behind(tmp_path):
     manager.close()
 
 
+def test_stopping_a_launch_in_flight_tears_it_down_rather_than_orphaning_it(tmp_path):
+    """The lifecycle has no LAUNCHING -> STOPPING edge. Leaving the container
+    running because the diagram has no arrow for it would orphan a workload."""
+    probe = FakeProbe(healthy_by_default=False)  # never becomes ready
+    manager = make_manager(tmp_path, probe=probe)
+    deployment = manager.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    assert wait_for(lambda: manager.adapter.running)
+
+    manager.stop(deployment.deployment_id)
+
+    live = manager.get(deployment.deployment_id)
+    assert live.state is S.FAILED
+    assert "stop requested" in live.last_error
+    assert manager.adapter.stops  # torn down, not orphaned
+    assert not manager.adapter.running
+    manager.close()
+
+
 def test_stopping_an_unknown_deployment_raises(tmp_path):
     manager = make_manager(tmp_path)
     with pytest.raises(KeyError):
@@ -1034,6 +1052,17 @@ def test_stub_drives_admission_for_agent_g():
     stub.close()
 
 
+def test_stub_matches_the_real_manager_on_stopping_a_launch():
+    stub = StubDeploymentManager(launch_seconds=30.0)
+    deployment = stub.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    assert deployment.state is S.LAUNCHING
+    stub.stop(deployment.deployment_id)
+    live = stub.get(deployment.deployment_id)
+    assert live.state is S.FAILED
+    assert "stop requested" in live.last_error
+    stub.close()
+
+
 def test_stub_renders_the_real_command():
     """The UI must not be developed against a fictional command line."""
     stub = StubDeploymentManager()
@@ -1148,6 +1177,26 @@ def test_check_job_survives_a_missing_sparkrun(tmp_path):
 # ==========================================================================
 # Docker. Host networking is the one that silently ruins the demo.
 # ==========================================================================
+
+
+def _free_ports(count: int) -> list[int]:
+    """Ports nothing is listening on right now.
+
+    Host networking shares the host's ports, so a hardcoded one can collide
+    with anything else on the machine -- including another agent's tests.
+    """
+    import socket as _socket
+
+    sockets = []
+    try:
+        for _ in range(count):
+            sock = _socket.socket()
+            sock.bind(("0.0.0.0", 0))
+            sockets.append(sock)
+        return [s.getsockname()[1] for s in sockets]
+    finally:
+        for sock in sockets:
+            sock.close()
 
 
 def _preflight_module():
@@ -1284,14 +1333,18 @@ def test_image_starts_on_host_networking_and_answers_agent_health():
     ).returncode != 0:
         pytest.skip("build sparkplane/node:test first: docker build -t sparkplane/node:test .")
 
-    name = "sparkplane-acceptance-%d" % int(time.time())
-    # Distinct ports, so the two-port path is what gets exercised, and high
-    # ones because host networking shares the host's ports.
-    ui_port, agent_port = 18080, 18081
+    name = "sparkplane-acceptance-%d-%d" % (os.getpid(), int(time.time()))
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
+    # Two distinct ports, so the two-port path is what gets exercised, and
+    # free ones because host networking shares the host's ports -- a fixed
+    # port would probe whatever else happens to be listening on it.
+    ui_port, agent_port = _free_ports(2)
     started = subprocess.run(
         [
-            # --restart is exercised via compose; it conflicts with --rm.
-            "docker", "run", "-d", "--rm", "--name", name,
+            # No --rm: the container's log is the evidence when this fails,
+            # and --rm throws it away. Cleaned up in the finally below.
+            # --restart is exercised through compose; it conflicts with --rm.
+            "docker", "run", "-d", "--name", name,
             "--network", "host",
             "-e", "SPARKPLANE_PORT=%d" % ui_port,
             "-e", "SPARKPLANE_AGENT_PORT=%d" % agent_port,
@@ -1305,7 +1358,19 @@ def test_image_starts_on_host_networking_and_answers_agent_health():
         proc = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
         return proc.stdout + proc.stderr
 
+    def running() -> bool:
+        proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", name],
+            capture_output=True, text=True,
+        )
+        return proc.stdout.strip() == "true"
+
     try:
+        # Our container, not something else that happens to answer. Without
+        # this the probe below can pass against an unrelated listener while
+        # our own container has already exited.
+        assert wait_for(running, timeout=30.0), logs()
+
         import urllib.request
 
         from control_plane.deploy.health import probe as real_probe
@@ -1340,6 +1405,38 @@ def test_image_starts_on_host_networking_and_answers_agent_health():
 
 
 @needs_docker
+@pytest.mark.slow
+def test_image_builds_for_both_architectures():
+    """GB10 is arm64, the workstation is usually amd64. An image missing one
+    means the heterogeneous case does not work at all.
+
+    Slow: a cold buildx run is minutes. Deselect with -m 'not slow'.
+    """
+    if subprocess.run(
+        ["docker", "buildx", "version"], capture_output=True
+    ).returncode != 0:
+        pytest.skip("docker buildx not available")
+
+    # Through the shipped script, so this covers the builder it creates too:
+    # the default docker driver cannot do multi-platform at all.
+    proc = subprocess.run(
+        ["bash", str(REPO / "docker" / "build.sh")],
+        capture_output=True, text=True, timeout=3600,
+        env={**os.environ, "SKIP_UI": "1", "TAG": "arch-test"},
+        cwd=str(REPO),
+    )
+    output = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        if "exec format error" in output or "binfmt" in output.lower():
+            pytest.skip(
+                "no QEMU emulation on this host; run "
+                "`docker run --privileged --rm tonistiigi/binfmt --install all`"
+            )
+        pytest.fail(output[-4000:])
+    assert "linux/amd64" in output and "linux/arm64" in output
+
+
+@needs_docker
 def test_image_says_which_variable_moves_a_port_collision():
     """Host networking shares the host's ports. A collision must not be a
     traceback."""
@@ -1355,10 +1452,14 @@ def test_image_says_which_variable_moves_a_port_collision():
     holder.bind(("0.0.0.0", 0))
     holder.listen(1)
     taken = holder.getsockname()[1]
+    # An unrelated listener on the UI port would make the container exit for
+    # the wrong reason, so give it a free one.
+    (ui_port,) = _free_ports(1)
     try:
         proc = subprocess.run(
             [
                 "docker", "run", "--rm", "--network", "host",
+                "-e", "SPARKPLANE_PORT=%d" % ui_port,
                 "-e", "SPARKPLANE_AGENT_PORT=%d" % taken,
                 "sparkplane/node:test",
             ],

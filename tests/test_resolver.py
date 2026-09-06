@@ -21,6 +21,8 @@ from control_plane.contracts.quant import (
     BYTES_PER_PARAM,
     DEFAULT_DTYPE,
     bytes_per_param,
+    bytes_per_param_or_default,
+    is_known_dtype,
     normalize_dtype,
     quant_info,
 )
@@ -86,10 +88,22 @@ class TestQuantTable:
         for key in ("q4_k_m", "q4_0", "mxfp4", "nvfp4", "awq_int4", "gptq_int4", "nf4"):
             assert BYTES_PER_PARAM[key] > 0.5, key
 
-    def test_unknown_dtype_costs_bf16_never_less(self):
-        assert bytes_per_param("something-new") == BYTES_PER_PARAM[DEFAULT_DTYPE]
-        assert bytes_per_param(None) == 2.0
-        assert normalize_dtype("something-new") is None
+    def test_unknown_dtype_raises_rather_than_being_priced(self):
+        """The table refuses to price what it does not know."""
+        with pytest.raises(KeyError):
+            bytes_per_param("fp3_secret_sauce")
+        assert normalize_dtype("fp3_secret_sauce") is None
+        assert not is_known_dtype("fp3_secret_sauce")
+
+    def test_the_defaulting_variant_never_guesses_below_bf16(self):
+        """The paths that must return a number charge the larger figure."""
+        assert bytes_per_param_or_default("fp3_secret_sauce") == BYTES_PER_PARAM[DEFAULT_DTYPE]
+        assert bytes_per_param_or_default(None) == 2.0
+
+    def test_no_bare_int4_entry(self):
+        """Name the scheme, so its scales and zero points get charged."""
+        assert "int4" not in BYTES_PER_PARAM
+        assert normalize_dtype("w4a16") == "gptq_int4"
 
     @pytest.mark.parametrize(
         ("spelling", "expected"),
@@ -97,7 +111,7 @@ class TestQuantTable:
             ("Q4_K_M", "q4_k_m"), ("q4km", "q4_k_m"), ("Q4_K_S", "q4_k_m"),
             ("bfloat16", "bf16"), ("torch.float16", "fp16"), ("F8_E4M3", "fp8"),
             ("MXFP4", "mxfp4"), ("AWQ", "awq_int4"), ("gptq", "gptq_int4"),
-            ("W4A16", "int4"), ("Q8_0", "q8_0"),
+            ("W4A16", "gptq_int4"), ("Q8_0", "q8_0"),
         ],
     )
     def test_spelling_variants(self, spelling, expected):
@@ -369,6 +383,11 @@ class TestQuantDetection:
         assert res.shape.bytes_per_param() == 2.0
         assert any("brand-new" in w for w in res.warnings)
 
+    def test_every_resolved_dtype_is_a_table_key(self, resolver):
+        """The invariant that lets the table be strict."""
+        for name in ("gpt-oss-120b", "deepseek-v3", "llama-3.1-8b-awq", "gpt2"):
+            assert is_known_dtype(offline(resolver, name, name).shape.dtype)
+
     def test_repo_name_is_the_last_resort(self, resolver):
         res = resolver.resolve_config(
             {"num_hidden_layers": 4, "hidden_size": 64, "num_attention_heads": 4,
@@ -524,6 +543,105 @@ class TestGGUF:
         )
         header = read_gguf_file(str(path))
         assert len(header.metadata["tokenizer.ggml.tokens"]) == 5000
+
+
+class TestWeightIndexArbitration:
+    """When the hub's tally and the config disagree, the bytes decide."""
+
+    class FakeClient:
+        def __init__(self, config: dict, info):
+            self._config = config
+            self._info = info
+
+        def model_info(self, model_id, revision="main"):
+            return self._info
+
+        def config(self, model_id, revision="main"):
+            return self._config
+
+        def file_json(self, model_id, filename, revision="main"):
+            return None
+
+    def _info(self, model_id: str, tally: int | None, files: dict[str, int]):
+        from control_plane.resolver.hf import ModelInfo
+
+        return ModelInfo(
+            model_id=model_id,
+            sha="a" * 40,
+            siblings=tuple(files),
+            safetensors={"total": tally} if tally else None,
+            gguf=None,
+            tags=(),
+            file_sizes=files,
+        )
+
+    def _resolve(self, tmp_path, name, model_id, tally, files, dtype=None):
+        config = load_config(name)
+        info = self._info(model_id, tally, files)
+        resolver = ModelResolver(
+            client=self.FakeClient(config, info),
+            cache=ShapeCache(directory=tmp_path / "cache"),
+        )
+        return resolver.resolve_full(model_id, dtype)
+
+    def test_duplicate_full_copies_are_not_double_counted(self, tmp_path):
+        """Mistral ships consolidated.safetensors beside the sharded copy."""
+        res = self._resolve(
+            tmp_path, "llama-3.3-70b", "mistralai/Mistral-7B-Instruct-v0.3",
+            7_248_023_552,
+            {
+                "consolidated.safetensors": 14_496_078_512,
+                "model-00001-of-00002.safetensors": 7_248_039_256,
+                "model-00002-of-00002.safetensors": 7_248_039_256,
+            },
+        )
+        assert res.weight_bytes == 2 * 7_248_039_256
+
+    def test_shard_bytes_ignore_subdirectory_copies(self, tmp_path):
+        res = self._resolve(
+            tmp_path, "llama-3.3-70b", "openai/gpt-oss-120b", 70_553_706_496,
+            {
+                "model-00001-of-00001.safetensors": 1_000,
+                "original/model.safetensors": 999_999,
+            },
+        )
+        assert res.weight_bytes == 1_000
+
+    def test_bytes_backing_the_hub_beat_a_config_that_cannot_describe_the_model(
+        self, tmp_path
+    ):
+        """Nemotron's layers differ from each other, so the formula over-counts."""
+        params = 49_867_145_216
+        res = self._resolve(
+            tmp_path, "llama-3.3-70b", "nvidia/Nemotron-like", params,
+            {"model-00001-of-00001.safetensors": params * 2},
+        )
+        assert res.shape.total_params == params
+        assert res.param_source is ParamSource.HUB_SAFETENSORS_INDEX
+        assert any("shards" in w and "back the hub" in w for w in res.warnings)
+
+    def test_bytes_backing_the_config_reject_a_packed_element_tally(self, tmp_path):
+        """A 4-bit repo whose hub tally counts storage elements, not weights."""
+        res = self._resolve(
+            tmp_path, "llama-3.3-70b", "nvidia/Llama-3.3-70B-Instruct-FP4",
+            40_606_376_096,
+            {"model-00001-of-00001.safetensors": 42_700_000_000},
+            dtype="nvfp4",
+        )
+        assert res.shape.total_params == pytest.approx(70.55e9, rel=0.01)
+        assert res.param_source is ParamSource.CONFIG_ESTIMATE
+        assert any("back the config" in w for w in res.warnings)
+
+    def test_without_bytes_the_larger_figure_wins(self, tmp_path):
+        """Over-stating costs a refusal; under-stating costs an out-of-memory."""
+        res = self._resolve(
+            tmp_path, "llama-3.3-70b", "someone/odd", 40_000_000_000, {}
+        )
+        assert res.shape.total_params == pytest.approx(70.55e9, rel=0.01)
+        res = self._resolve(
+            tmp_path, "llama-3.3-70b", "someone/odd2", 140_000_000_000, {}
+        )
+        assert res.shape.total_params == 140_000_000_000
 
 
 class TestLocalDirectory:

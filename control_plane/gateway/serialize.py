@@ -42,7 +42,11 @@ def plain(value: Any) -> Any:
 
 def node_payload(state: NodeState) -> dict:
     profile = state.profile
-    addressable = profile.addressable_memory or 0
+    # Reported against physical memory, which is the basis Agent A's telemetry
+    # and the topology payload in the architecture doc both use. Admission
+    # control deliberately uses addressable memory instead: that is the slice
+    # the GPU can actually reach and the one Agent D budgets a fit against.
+    total = profile.total_memory or 0
     return {
         "node_id": profile.node_id,
         "hostname": profile.hostname,
@@ -58,8 +62,8 @@ def node_payload(state: NodeState) -> dict:
         "healthy": state.healthy,
         "last_seen": state.last_seen,
         "memory_used": state.memory_used,
-        "memory_used_pct": round(state.memory_used / addressable * 100.0, 1)
-        if addressable
+        "memory_used_pct": round(state.memory_used / total * 100.0, 1)
+        if total
         else None,
         "power_w": state.power_watts,
         "temp_c": state.temperature_c,

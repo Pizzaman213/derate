@@ -37,13 +37,6 @@ export function planShortFromDegrees(p: {
   return parts.length ? parts.join(' · ') : 'single node'
 }
 
-/** Sentence case for enum-ish strings coming off the wire. Applied only to our
- *  own enums, never to a planner or fit reason. */
-export function humanEnum(s: string): string {
-  const t = s.replace(/_/g, ' ')
-  return t.charAt(0).toUpperCase() + t.slice(1)
-}
-
 export function relativeTime(unixSeconds: number, now = Date.now() / 1000): string {
   const d = Math.max(0, Math.round(now - unixSeconds))
   if (d < 60) return `${d}s ago`

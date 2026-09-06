@@ -11,6 +11,9 @@ import { scrub } from './redact'
 import type {
   Candidate,
   Cluster,
+  NodeHealth,
+  NodeProfile,
+  NodeStateDTO,
   DeploymentDTO,
   LaunchRequest,
   LinkMeasurement,
@@ -77,10 +80,120 @@ export class ApiError extends Error {
   }
 }
 
+// ── Wire adaptation ──────────────────────────────────────────────────────────
+//
+// §4.8 is owned by Agent G and says the UI codes against exactly that surface,
+// so where the wire and the view models differ the adaptation happens here.
+// This file is the only place that knows the wire format; everything above
+// `Backend` sees the shapes in `types.ts`.
+
+/** `GET /api/cluster` as Agent G emits it: identity at the top level, a
+ *  counters-only `summary`, flat node rows, and no deployments — those come
+ *  from `/api/deployments`. */
+interface ClusterWire {
+  cluster_id: string
+  coordinator: string | null
+  nodes: NodeWire[]
+  links: LinkMeasurement[]
+  summary: { node_count: number; healthy_nodes: number }
+}
+
+interface NodeWire {
+  node_id: string
+  hostname: string
+  address: string
+  device_class: NodeProfile['device_class']
+  gpu_name: string
+  gpu_count: number
+  total_memory: number
+  addressable_memory: number
+  memory_bandwidth_gbps: number
+  compute_capability: string
+  driver_version: string
+  healthy: boolean
+  last_seen: number
+  memory_used: number
+  power_w: number | null
+  temp_c: number | null
+  util_pct: number | null
+  last_error?: string | null
+}
+
+/** The gateway reports node health as `healthy | unhealthy`; the UI's three-way
+ *  `NodeHealth` reserves `degraded` for a node that is up but impaired, which
+ *  the wire cannot express. An unhealthy node is one we cannot reach. */
+function nodeHealth(state: string | undefined, healthy: boolean): NodeHealth {
+  if (state === 'degraded' || state === 'unreachable' || state === 'healthy') return state
+  return healthy ? 'healthy' : 'unreachable'
+}
+
+function toNodeState(n: NodeWire, coordinator: string | null): NodeStateDTO {
+  return {
+    profile: {
+      node_id: n.node_id,
+      hostname: n.hostname,
+      address: n.address,
+      device_class: n.device_class,
+      gpu_name: n.gpu_name,
+      gpu_count: n.gpu_count,
+      total_memory: n.total_memory,
+      addressable_memory: n.addressable_memory,
+      memory_bandwidth_gbps: n.memory_bandwidth_gbps,
+      compute_capability: n.compute_capability,
+      driver_version: n.driver_version,
+    },
+    healthy: n.healthy,
+    state: nodeHealth(undefined, n.healthy),
+    role: n.node_id === coordinator ? 'coordinator' : 'worker',
+    last_seen: n.last_seen,
+    memory_used: n.memory_used,
+    power_watts: n.power_w ?? 0,
+    temperature_c: n.temp_c ?? 0,
+    utilization_pct: n.util_pct ?? 0,
+    last_error: n.last_error ?? null,
+  }
+}
+
 const httpBackend: Backend = {
   mode: 'live',
-  cluster: () => req<Cluster>('/api/cluster'),
-  topology: () => req<Topology>('/api/topology'),
+  async cluster(): Promise<Cluster> {
+    // Two calls because the wire splits what the instrument reads as one thing.
+    const [wire, deployments] = await Promise.all([
+      req<ClusterWire>('/api/cluster'),
+      req<DeploymentDTO[]>('/api/deployments'),
+    ])
+    const nodes = wire.nodes.map((n) => toNodeState(n, wire.coordinator))
+    return {
+      summary: {
+        cluster_id: wire.cluster_id,
+        coordinator: wire.coordinator ?? '',
+        node_count: wire.summary?.node_count ?? nodes.length,
+        healthy_count:
+          wire.summary?.healthy_nodes ?? nodes.filter((n) => n.healthy).length,
+        // The wire's `total_memory` is physical. Every figure the UI puts next
+        // to a fit is addressable, so it is summed from the nodes instead.
+        total_addressable_memory: nodes.reduce(
+          (a, n) => a + n.profile.addressable_memory,
+          0,
+        ),
+      },
+      nodes,
+      links: wire.links ?? [],
+      deployments,
+    }
+  },
+  async topology(): Promise<Topology> {
+    const t = await req<Topology>('/api/topology')
+    // Same `unhealthy` spelling as above. Left unmapped, a node that is down
+    // draws in the graph as if it were live.
+    return {
+      ...t,
+      nodes: t.nodes.map((n) => ({
+        ...n,
+        state: nodeHealth(n.state, n.state === 'healthy'),
+      })),
+    }
+  },
   deployments: () => req<DeploymentDTO[]>('/api/deployments'),
   candidates: () => req<Candidate[]>('/api/nodes/candidates'),
   routing: () => req<RoutingConfig[]>('/api/routing'),
@@ -184,9 +297,14 @@ const fixtureBackend: Backend = {
 
   subscribe(onFrame, onState) {
     onState({ status: 'open' })
-    onFrame(fixtureFrame(Date.now() / 1000))
+    // fixtureFrame is a pure function of the timestamp, so the last minute can
+    // be replayed rather than invented: the trace is populated on open instead
+    // of taking a minute to fill. A live stream gets no backfill, because there
+    // is no history endpoint to get it from.
+    const now = Math.floor(Date.now() / 1000)
+    for (let t = now - 60; t <= now; t++) onFrame(fixtureFrame(t))
     const id = window.setInterval(
-      () => onFrame(fixtureFrame(Date.now() / 1000)),
+      () => onFrame(fixtureFrame(Math.floor(Date.now() / 1000))),
       1000,
     )
     return () => window.clearInterval(id)

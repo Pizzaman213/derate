@@ -209,7 +209,7 @@ class ModelResolver:
 
         breakdown = analytic_breakdown(mapped, vision_config(config))
         measured, param_source, measure_warnings = self._measure_params(
-            model_id, info, mapped, breakdown, dtype, revision, measured_total
+            model_id, info, mapped, breakdown, dtype, measured_total
         )
         warnings.extend(measure_warnings)
 
@@ -280,7 +280,6 @@ class ModelResolver:
         mapped: Mapped,
         breakdown: ParamBreakdown,
         dtype: str,
-        revision: str,
         measured_total: int | None,
     ) -> tuple[int | None, ParamSource, list[str]]:
         """Get the real parameter count. Never a formula when a weight file can say."""
@@ -295,10 +294,43 @@ class ModelResolver:
             drift = abs(tally - analytic) / analytic if analytic else 0.0
             if drift <= _TALLY_DISAGREEMENT_LIMIT:
                 return tally, ParamSource.HUB_SAFETENSORS_INDEX, warnings
+
+            # The two disagree. Shard bytes are the tie-breaker: they are a
+            # measurement neither figure can argue with. The hub's tally counts
+            # packed storage elements on some 4-bit formats, and the analytic
+            # model cannot describe a network whose layers differ from each
+            # other, so either one can be the wrong one.
+            shard_bytes = _shard_bytes(info)
+            implied = shard_bytes / bytes_per_param(dtype) if shard_bytes else None
+            if implied:
+                if abs(tally - implied) <= abs(analytic - implied):
+                    warnings.append(
+                        f"the config-derived estimate of {analytic / 1e9:.1f}B "
+                        f"parameters disagrees with the hub's {tally / 1e9:.1f}B; "
+                        f"{shard_bytes / 1024**3:.0f} GiB of shards at {dtype} back "
+                        "the hub, which was used"
+                    )
+                    return tally, ParamSource.HUB_SAFETENSORS_INDEX, warnings
+                warnings.append(
+                    f"the hub counts {tally / 1e9:.1f}B parameters where the config "
+                    f"describes {analytic / 1e9:.1f}B; {shard_bytes / 1024**3:.0f} GiB "
+                    f"of shards at {dtype} back the config, which was used"
+                )
+                return None, ParamSource.CONFIG_ESTIMATE, warnings
+
+            # No bytes to arbitrate with. Take the larger: over-stating the
+            # footprint costs a refusal, under-stating it costs an OOM.
+            if tally > analytic:
+                warnings.append(
+                    f"the hub counts {tally / 1e9:.1f}B parameters where the config "
+                    f"describes {analytic / 1e9:.1f}B, and nothing could arbitrate; "
+                    "took the larger"
+                )
+                return tally, ParamSource.HUB_SAFETENSORS_INDEX, warnings
             warnings.append(
                 f"the hub counts {tally / 1e9:.1f}B parameters where the config "
-                f"describes {analytic / 1e9:.1f}B; that tally counts packed storage "
-                "elements on some 4-bit formats, so the config figure was used"
+                f"describes {analytic / 1e9:.1f}B, and nothing could arbitrate; "
+                "took the larger, which is the config figure"
             )
 
         # No usable tally. Try the index's byte total before giving up on

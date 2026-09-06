@@ -158,7 +158,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         node_payloads = []
         for node in nodes:
             node_id = node.profile.node_id
-            addressable = node.profile.addressable_memory or 0
+            total_mem = node.profile.total_memory or 0
             strength = strength_by_node.get(node_id)
             if strength is None:
                 strength = raw_hw.get(node_id, 0.0) / top_hw if top_hw else 0.0
@@ -172,8 +172,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "role": "coordinator"
                     if node_id == settings.coordinator_node_id
                     else "worker",
-                    "memory_used_pct": round(node.memory_used / addressable * 100.0, 1)
-                    if addressable
+                    "memory_used_pct": round(node.memory_used / total_mem * 100.0, 1)
+                    if total_mem
                     else None,
                     "power_w": node.power_watts,
                     "temp_c": node.temperature_c,

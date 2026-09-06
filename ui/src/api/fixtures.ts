@@ -767,14 +767,21 @@ function activeLinks(): StubLink[] {
 function activeRouting(): RoutingConfig[] {
   if (scenario === 'single-node') return []
   if (scenario === 'node-down') {
-    return state.routing.map((cfg) => ({
-      ...cfg,
-      targets: cfg.targets.map((t) =>
+    return state.routing.map((cfg) => {
+      const targets = cfg.targets.map((t) =>
         t.node_ids?.includes('spark-02')
           ? { ...t, healthy: false, admitting: false, weight: 0, outstanding: 0 }
           : t,
-      ),
-    }))
+      )
+      // Under local first, losing the last admitting local target is exactly
+      // when traffic spills. The panel has to say so, not keep claiming local.
+      const localUp = targets.some(
+        (t) => t.kind === 'local' && t.admitting && t.healthy,
+      )
+      const flow =
+        cfg.policy === 'local_first' ? (localUp ? 'local' : 'spilled') : cfg.flow
+      return { ...cfg, targets, flow }
+    })
   }
   return state.routing
 }

@@ -247,7 +247,9 @@ def reconcile(
 
     active: int | None = None
     if m.is_moe:
-        routed = min(breakdown.routed_experts, int(total * 0.98))
+        # Kimi K2 is 98.9 percent routed experts, so the cap that stops a
+        # nonsense split has to sit above that.
+        routed = min(breakdown.routed_experts, int(total * 0.995))
         if routed <= 0:
             warnings.append(
                 "MoE model whose expert parameters could not be sized; active "

@@ -243,9 +243,31 @@ class DeploymentManager:
                 raise KeyError("no such deployment: %s" % deployment_id)
             if record.deployment.state in TERMINAL:
                 return
-            self._transition(record, S.STOPPING)
+            launching = record.deployment.state is S.LAUNCHING
+            if not launching:
+                self._transition(record, S.STOPPING)
             cluster_id = record.cluster_id
             hosts = record.hosts
+
+        if launching:
+            # The lifecycle has no LAUNCHING -> STOPPING edge; a launch is not
+            # cancellable in the model. But leaving the container running
+            # because the diagram has no arrow for it would orphan a workload,
+            # which is worse than any labelling question. So tear it down and
+            # land in FAILED, which is legal, with a last_error that says this
+            # was a request rather than a crash.
+            if cluster_id:
+                self.adapter.stop(cluster_id, hosts=hosts)
+            with self._lock:
+                if record.deployment.state is S.LAUNCHING:
+                    record.deployment.last_error = (
+                        "stop requested while the backend was still loading; "
+                        "the launch was torn down"
+                    )
+                    self._transition(
+                        record, S.FAILED, reason="stopped during launch"
+                    )
+            return
 
         left_behind: str | None = None
         if cluster_id:

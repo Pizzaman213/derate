@@ -52,17 +52,21 @@ class ModelInfo:
         return name in self.siblings
 
     def shard_bytes(self) -> int | None:
-        """On-disk bytes of the top-level safetensors shards.
+        """On-disk bytes of the shards a runtime actually loads.
 
-        Repos often carry a second copy of the weights in a subdirectory --
-        GPT-OSS ships an ``original/`` tree twice the size of the shards a
-        runtime loads -- so only files in the repo root count.
+        Repos carry duplicate copies of the same weights: GPT-OSS ships an
+        ``original/`` tree, Mistral ships ``consolidated.safetensors`` beside
+        the sharded files. Counting either doubles the weight footprint, so
+        only root-level files following the ``model*.safetensors`` convention
+        count, with everything in the root as the fallback.
         """
-        total = sum(
-            size
+        root = {
+            name: size
             for name, size in self.file_sizes.items()
             if name.endswith(".safetensors") and "/" not in name
-        )
+        }
+        canonical = {n: s for n, s in root.items() if n.startswith("model")}
+        total = sum((canonical or root).values())
         return total or None
 
     def file_size(self, name: str) -> int | None:

@@ -10,6 +10,9 @@ requires-python = ">=3.12"
 # reasons that have nothing to do with anyone's code.
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "slow: minutes, not seconds. Deselect with -m 'not slow'.",
+]
 
 [tool.ruff]
 line-length = 100

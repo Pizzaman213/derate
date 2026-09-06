@@ -34,9 +34,9 @@ _NAME_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bawq\b", "awq_int4"),
     (r"\bgptq\b", "gptq_int4"),
     (r"\bnf4\b|\bbnb[._-]?4bit\b", "nf4"),
-    # A bare "4bit" says nothing about the packer, so it is priced at the
-    # generic 4-bit figure rather than at nf4, which is the cheapest of them.
-    (r"\bint4\b|\bw4a16\b|\b4[._-]?bit\b", "int4"),
+    # A bare "4bit" says nothing about the packer, so it is charged at the
+    # AWQ/GPTQ figure rather than at nf4, which is the cheapest of them.
+    (r"\bint4\b|\bw4a16\b|\b4[._-]?bit\b", "gptq_int4"),
     (r"\bint8\b|\bw8a8\b|\b8bit\b", "int8"),
     (r"\bfp16\b|\bf16\b", "fp16"),
     (r"\bbf16\b", "bf16"),

@@ -117,6 +117,7 @@ export function MainView({
         <Sparkline
           points={history}
           windowSeconds={HISTORY_SECONDS}
+          height={132}
           stale={stale}
           label={`Cluster throughput over the last ${HISTORY_SECONDS} seconds`}
         />

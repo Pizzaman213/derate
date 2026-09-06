@@ -54,6 +54,9 @@ from control_plane.registry.telemetry import (
     RingBuffer,
     TelemetrySample,
     TelemetryStore,
+    allocatable_bytes,
+    read_compute_apps,
+    read_host_memory,
     read_telemetry,
 )
 
@@ -71,6 +74,22 @@ def run(coro):
 
 GB10_ROWS = [["NVIDIA GB10", "[N/A]", "580.173.02", "12.1"]]
 RTX3090_ROWS = [["NVIDIA GeForce RTX 3090", "24576", "550.54.14", "8.6"]]
+GIB = 1024**3
+
+# Measured on a real DGX Spark under load: llama-server resident on the GPU,
+# a desktop session in the same pool, and the kernel already swapping.
+REAL_SPARK_POOL_TOTAL = 121 * GIB
+REAL_SPARK_AVAILABLE = int(24.3 * GIB)
+REAL_SPARK_GPU_MIB = 70331  # what --query-compute-apps reports
+
+
+def fake_host_memory(monkeypatch, total, available, swap_used=0):
+    from control_plane.registry.telemetry import HostMemory
+
+    monkeypatch.setattr(
+        "control_plane.registry.telemetry.read_host_memory",
+        lambda: HostMemory(total=total, available=available, swap_used=swap_used),
+    )
 
 
 def make_profile(node_id: str = "spark-01", **overrides) -> NodeProfile:
@@ -1181,3 +1200,339 @@ def test_join_admit_health_and_telemetry_over_real_http(tmp_path, monkeypatch):
         await http.aclose()
 
     run(scenario())
+
+
+# ----------------------------------------------------------------------
+# 14. Unified memory: what a Spark can actually give a model
+# ----------------------------------------------------------------------
+
+
+def test_compute_apps_query_sums_and_counts():
+    """The one memory number nvidia-smi still answers on GB10."""
+    total, count = run(read_compute_apps(rows=[["111", "70331"], ["222", "1024"]]))
+    assert total == (70331 + 1024) * 1024**2
+    assert count == 2
+
+
+def test_compute_apps_with_no_processes_is_zero_not_a_failure():
+    """An idle GPU is a real answer. None would mean 'could not read'."""
+    assert run(read_compute_apps(rows=[])) == (0, 0)
+
+
+def test_compute_apps_uses_the_right_nvidia_smi_flag(monkeypatch):
+    """--query-gpu rejects a compute-apps field list. They are not the same query.
+
+    This is a regression guard: the first version of this reader asked
+    --query-gpu for a per-process field, which nvidia-smi refuses, so GPU
+    attribution silently read as zero on a machine holding 68 GiB of model.
+    """
+    seen = {}
+
+    async def spy(query, timeout=2.0, flag="--query-gpu", allow_empty=False):
+        seen["query"] = query
+        seen["flag"] = flag
+        seen["allow_empty"] = allow_empty
+        return [["1", "1024"]]
+
+    monkeypatch.setattr("control_plane.registry.telemetry.run_nvidia_smi_async", spy)
+    run(read_compute_apps())
+
+    assert seen["flag"] == "--query-compute-apps"
+    assert "used_gpu_memory" in seen["query"]
+    assert seen["allow_empty"] is True, "an idle GPU must not read as a failure"
+
+
+def test_host_memory_reads_the_pool_and_swap(monkeypatch, tmp_path):
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       127600524 kB\n"
+        "MemFree:          4024100 kB\n"
+        "MemAvailable:    28904408 kB\n"
+        "Buffers:          4726312 kB\n"
+        "SwapTotal:       16777212 kB\n"
+        "SwapFree:        10853772 kB\n"
+    )
+    monkeypatch.setattr("control_plane.registry.telemetry.MEMINFO", meminfo)
+    host = read_host_memory()
+    assert host.total == 127600524 * 1024
+    assert host.available == 28904408 * 1024
+    assert host.used == (127600524 - 28904408) * 1024
+    assert host.swap_used == (16777212 - 10853772) * 1024
+
+
+def test_host_memory_survives_a_missing_meminfo(monkeypatch, tmp_path):
+    monkeypatch.setattr("control_plane.registry.telemetry.MEMINFO", tmp_path / "gone")
+    assert read_host_memory() is None
+
+
+def test_gb10_separates_model_memory_from_operating_system(monkeypatch):
+    """The gap between the pool and the GPU figure is the OS, and it matters."""
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    fake_host_memory(
+        monkeypatch,
+        total=REAL_SPARK_POOL_TOTAL,
+        available=REAL_SPARK_AVAILABLE,
+        swap_used=int(5.6 * GIB),
+    )
+    sample = run(
+        read_telemetry(
+            profile, now=1.0,
+            rows=[["[N/A]", "[N/A]", "84", "81", "96"]],
+            apps_rows=[["3591741", str(REAL_SPARK_GPU_MIB)]],
+        )
+    )
+    assert sample.gpu_memory_used == REAL_SPARK_GPU_MIB * 1024**2
+    assert sample.gpu_process_count == 1
+    # The pool is what the node plans against, operating system included.
+    assert sample.memory_used == REAL_SPARK_POOL_TOTAL - REAL_SPARK_AVAILABLE
+    # And the remainder is attributable to the OS, not to any model.
+    assert sample.host_memory_used == sample.memory_used - sample.gpu_memory_used
+    assert sample.host_memory_used > 20 * GIB
+    assert sample.swap_used == int(5.6 * GIB)
+
+
+def test_discrete_card_does_not_pay_for_host_memory():
+    """VRAM is its own pool. Host RAM must not constrain a 3090."""
+    profile = probe_local(address="10.0.0.50", rows=RTX3090_ROWS)
+    sample = TelemetrySample(
+        ts=1.0, memory_used=8 * GIB, memory_total=24 * GIB,
+        power_watts=210.0, temperature_c=68.0, utilization_pct=22.0,
+        gpu_memory_used=8 * GIB,
+        # Even with the host pool nearly exhausted, VRAM is unaffected.
+        host_memory_total=64 * GIB, host_memory_available=1 * GIB,
+    )
+    assert allocatable_bytes(profile, sample) == profile.usable_memory() - 8 * GIB
+
+
+def test_gb10_allocatable_is_bounded_by_the_shared_pool():
+    """Acceptance for this fix: the static ceiling is not what you can launch.
+
+    The numbers are the ones measured on a real Spark: a 68.7 GiB model
+    resident, a desktop in the same pool, 24.3 GiB left. usable_memory(0.90)
+    says 107.7 GiB is spendable. About 11 GiB actually is.
+
+    Both limits are checked, because which one binds is not fixed: here the
+    addressable ceiling is the tighter of the two, but a node with a big page
+    cache and little resident model hits the pool limit first.
+    """
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    sample = TelemetrySample(
+        ts=1.0,
+        memory_used=REAL_SPARK_POOL_TOTAL - REAL_SPARK_AVAILABLE,
+        memory_total=REAL_SPARK_POOL_TOTAL,
+        power_watts=84.0, temperature_c=81.0, utilization_pct=96.0,
+        gpu_memory_used=REAL_SPARK_GPU_MIB * 1024**2,
+        gpu_process_count=1,
+        host_memory_total=REAL_SPARK_POOL_TOTAL,
+        host_memory_available=REAL_SPARK_AVAILABLE,
+    )
+    static = profile.usable_memory(0.90)
+    live = allocatable_bytes(profile, sample, host_reserve=8 * GIB)
+
+    gpu_bound = (static - sample.memory_used) / GIB
+    host_bound = (sample.host_memory_available - 8 * GIB) / GIB
+    assert gpu_bound == pytest.approx(11.0, abs=0.2)
+    assert host_bound == pytest.approx(16.3, abs=0.2)
+
+    assert static / GIB == pytest.approx(107.7, abs=0.1)
+    assert live / GIB == pytest.approx(min(gpu_bound, host_bound), abs=0.1)
+    assert live / GIB == pytest.approx(11.0, abs=0.2)
+    assert live < static / 5, "the static ceiling must not be treated as launchable"
+
+
+def test_gb10_allocatable_never_goes_negative():
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    sample = TelemetrySample(
+        ts=1.0, memory_used=119 * GIB, memory_total=121 * GIB,
+        power_watts=0.0, temperature_c=0.0, utilization_pct=0.0,
+        gpu_memory_used=119 * GIB,
+        host_memory_total=121 * GIB, host_memory_available=1 * GIB,
+    )
+    assert allocatable_bytes(profile, sample) == 0
+
+
+def test_allocatable_without_a_sample_is_the_static_ceiling():
+    """Before the first poll, the ceiling is all we know. Say so, do not say 0."""
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    assert allocatable_bytes(profile, None) == profile.usable_memory()
+
+
+def test_allocatable_falls_back_when_the_pool_is_unreadable():
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    sample = TelemetrySample(
+        ts=1.0, memory_used=40 * GIB, memory_total=0,
+        power_watts=0.0, temperature_c=0.0, utilization_pct=0.0,
+        host_memory_available=0,  # /proc/meminfo unreadable
+    )
+    assert allocatable_bytes(profile, sample) == profile.usable_memory() - 40 * GIB
+
+
+def test_host_reserve_is_configurable():
+    """Chosen so the pool is the binding limit, which is what the reserve moves."""
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    sample = TelemetrySample(
+        ts=1.0, memory_used=30 * GIB, memory_total=121 * GIB,
+        power_watts=0.0, temperature_c=0.0, utilization_pct=0.0,
+        host_memory_total=121 * GIB, host_memory_available=60 * GIB,
+    )
+    assert profile.usable_memory() - 30 * GIB > 60 * GIB  # the pool binds
+    assert allocatable_bytes(profile, sample, host_reserve=8 * GIB) == 52 * GIB
+    assert allocatable_bytes(profile, sample, host_reserve=0) == 60 * GIB
+
+
+def test_config_reads_the_host_reserve_from_the_environment():
+    config = RegistryConfig.from_env({"SPARKPLANE_HOST_RESERVE_MIB": "4096"})
+    assert config.host_memory_reserve == 4 * GIB
+
+
+def test_registry_reports_live_allocatable_memory(tmp_path):
+    registry = make_registry(tmp_path, local=SPARK_01)
+    registry.apply_sample(
+        "spark-01",
+        TelemetrySample(
+            ts=time.time(),
+            memory_used=REAL_SPARK_POOL_TOTAL - REAL_SPARK_AVAILABLE,
+            memory_total=REAL_SPARK_POOL_TOTAL,
+            power_watts=84.0, temperature_c=81.0, utilization_pct=96.0,
+            gpu_memory_used=REAL_SPARK_GPU_MIB * 1024**2, gpu_process_count=1,
+            host_memory_total=REAL_SPARK_POOL_TOTAL,
+            host_memory_available=REAL_SPARK_AVAILABLE,
+        ),
+    )
+    live = registry.available_memory("spark-01")
+    assert 0 < live < SPARK_01.usable_memory() / 5
+    assert registry.available_memory("nope") == 0
+
+
+def test_memory_report_shows_where_the_memory_went(tmp_path):
+    """A refusal has to name the desktop, not just say 'will not fit'."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+    registry.apply_sample(
+        "spark-01",
+        TelemetrySample(
+            ts=time.time(),
+            memory_used=REAL_SPARK_POOL_TOTAL - REAL_SPARK_AVAILABLE,
+            memory_total=REAL_SPARK_POOL_TOTAL,
+            power_watts=84.0, temperature_c=81.0, utilization_pct=96.0,
+            gpu_memory_used=REAL_SPARK_GPU_MIB * 1024**2, gpu_process_count=1,
+            host_memory_total=REAL_SPARK_POOL_TOTAL,
+            host_memory_available=REAL_SPARK_AVAILABLE,
+            swap_used=int(5.6 * GIB),
+        ),
+    )
+    report = registry.memory_report("spark-01")
+    assert report["unified_memory"] is True
+    assert report["static_ceiling"] > report["allocatable"] * 5
+    assert report["gpu_used"] + report["host_used"] == report["pool_used"]
+    assert report["host_used"] > 20 * GIB
+    assert report["swap_used"] > 0
+    assert registry.memory_report("nope") is None
+
+
+def test_swap_growth_is_warned_about(tmp_path, caplog):
+    """Swapping a model is not slow, it is fatal. Say so once, loudly."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+    base = dict(
+        memory_total=REAL_SPARK_POOL_TOTAL, power_watts=0.0, temperature_c=0.0,
+        utilization_pct=0.0, host_memory_total=REAL_SPARK_POOL_TOTAL,
+        host_memory_available=REAL_SPARK_AVAILABLE,
+    )
+    registry.apply_sample("spark-01", TelemetrySample(ts=1.0, memory_used=90 * GIB, swap_used=0, **base))
+    with caplog.at_level("WARNING"):
+        registry.apply_sample(
+            "spark-01", TelemetrySample(ts=2.0, memory_used=95 * GIB, swap_used=2 * GIB, **base)
+        )
+    assert "swapping" in caplog.text
+    assert "overcommitted" in caplog.text
+
+
+def test_snapshot_carries_the_unified_memory_numbers(tmp_path):
+    registry = make_registry(tmp_path, local=SPARK_01)
+    registry.apply_sample(
+        "spark-01",
+        TelemetrySample(
+            ts=time.time(),
+            memory_used=REAL_SPARK_POOL_TOTAL - REAL_SPARK_AVAILABLE,
+            memory_total=REAL_SPARK_POOL_TOTAL,
+            power_watts=84.0, temperature_c=81.0, utilization_pct=96.0,
+            gpu_memory_used=REAL_SPARK_GPU_MIB * 1024**2,
+            host_memory_total=REAL_SPARK_POOL_TOTAL,
+            host_memory_available=REAL_SPARK_AVAILABLE,
+            swap_used=int(5.6 * GIB),
+        ),
+    )
+    node = registry.snapshot()["nodes"][0]
+    assert node["gpu_used"] == REAL_SPARK_GPU_MIB * 1024**2
+    assert 0 < node["allocatable"] < SPARK_01.usable_memory()
+    assert node["swap_used"] > 0
+
+
+def test_unified_memory_fields_survive_the_wire(tmp_path):
+    """A coordinator polling a remote Spark must get the pool numbers too."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client)
+    run(registry.add_node("10.0.0.12"))
+    client.telemetry["http://10.0.0.12:8081"] = TelemetrySample(
+        ts=10.0,
+        memory_used=REAL_SPARK_POOL_TOTAL - REAL_SPARK_AVAILABLE,
+        memory_total=REAL_SPARK_POOL_TOTAL,
+        power_watts=84.0, temperature_c=81.0, utilization_pct=96.0,
+        gpu_memory_used=REAL_SPARK_GPU_MIB * 1024**2, gpu_process_count=1,
+        host_memory_total=REAL_SPARK_POOL_TOTAL,
+        host_memory_available=REAL_SPARK_AVAILABLE,
+        swap_used=int(5.6 * GIB),
+    ).as_dict() | {"available": True}
+
+    run(registry.telemetry_round())
+
+    report = registry.memory_report("spark-02")
+    assert report["gpu_used"] == REAL_SPARK_GPU_MIB * 1024**2
+    assert report["host_used"] > 20 * GIB
+    assert 0 < report["allocatable"] < SPARK_02.usable_memory() / 5
+
+
+def test_a_headless_spark_still_gets_essentially_the_whole_ceiling():
+    """The fix must not punish the machine it is actually aimed at.
+
+    A dedicated node runs no desktop: the OS holds a couple of GiB, the pool is
+    almost entirely free, and the addressable ceiling becomes the binding limit
+    again. The host reserve only bites when the host is genuinely spending.
+    """
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    sample = TelemetrySample(
+        ts=1.0, memory_used=3 * GIB, memory_total=REAL_SPARK_POOL_TOTAL,
+        power_watts=20.0, temperature_c=40.0, utilization_pct=0.0,
+        gpu_memory_used=0, gpu_process_count=0,
+        host_memory_total=REAL_SPARK_POOL_TOTAL,
+        host_memory_available=REAL_SPARK_POOL_TOTAL - 3 * GIB,
+    )
+    live = allocatable_bytes(profile, sample, host_reserve=8 * GIB)
+    ceiling = profile.usable_memory(0.90)
+
+    assert live == ceiling - 3 * GIB, "the addressable ceiling should bind, not the pool"
+    assert live / GIB == pytest.approx(104.7, abs=0.2)
+    assert live > 0.95 * ceiling
+
+
+def test_the_binding_limit_switches_with_load():
+    """Which of the two limits binds is a property of the node, not a constant."""
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    common = dict(
+        ts=1.0, memory_total=REAL_SPARK_POOL_TOTAL, power_watts=0.0,
+        temperature_c=0.0, utilization_pct=0.0,
+        host_memory_total=REAL_SPARK_POOL_TOTAL,
+    )
+    # Busy desktop, little model: the shared pool runs out first.
+    pool_bound = TelemetrySample(
+        memory_used=40 * GIB, host_memory_available=20 * GIB, **common
+    )
+    assert allocatable_bytes(profile, pool_bound, host_reserve=8 * GIB) == 12 * GIB
+
+    # Big model, quiet desktop: the GPU's addressable slice runs out first.
+    gpu_bound = TelemetrySample(
+        memory_used=100 * GIB, host_memory_available=21 * GIB, **common
+    )
+    expected = profile.usable_memory(0.90) - 100 * GIB
+    assert allocatable_bytes(profile, gpu_bound, host_reserve=8 * GIB) == expected
+    assert expected < 13 * GIB

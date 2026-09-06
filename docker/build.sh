@@ -52,7 +52,7 @@ if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
 fi
 
 echo "==> building ${IMAGE}:${TAG} for ${PLATFORMS}"
-docker buildx build \
+if ! docker buildx build \
     --builder "$BUILDER" \
     --platform "$PLATFORMS" \
     --build-arg "SPARKRUN_VERSION=${SPARKRUN_VERSION}" \
@@ -60,6 +60,31 @@ docker buildx build \
     --tag "${IMAGE}:${TAG}" \
     "${OUTPUT[@]}" \
     "$ROOT"
+then
+    rc=$?
+    # Building for an architecture this machine cannot execute needs QEMU
+    # binfmt handlers on the host kernel. Without them the failure surfaces
+    # somewhere deep in apt and reads like a broken Dockerfile, so name the
+    # real cause. Not checked up front: buildx reports only the native
+    # platform on some setups that cross-build perfectly well.
+    if [ "$PLATFORMS" != "linux/$(docker version -f '{{.Server.Arch}}')" ]; then
+        cat >&2 <<'EOF'
+
+If that failed while installing packages for the non-native architecture,
+this host has no QEMU emulation registered. Install it once (reversible
+with --uninstall):
+
+    docker run --privileged --rm tonistiigi/binfmt --install all
+
+Both architectures are required: GB10 is arm64, the workstation is usually
+amd64, and an image missing one means the heterogeneous case does not work
+at all. To build only what this machine can execute while iterating:
+
+    PLATFORMS="linux/$(docker version -f '{{.Server.Arch}}')" docker/build.sh --load
+EOF
+    fi
+    exit "$rc"
+fi
 
 if [ "${#OUTPUT[@]}" -eq 0 ]; then
     echo "==> build verified for ${PLATFORMS} (nothing exported; pass --load or --push)"

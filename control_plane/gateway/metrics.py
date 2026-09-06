@@ -104,11 +104,11 @@ class MetricsHub:
             nodes_payload = []
             total_power = 0.0
             for node in nodes:
-                addressable = node.profile.addressable_memory or 0
+                # Against physical memory, matching the architecture doc's
+                # topology payload. See serialize.node_payload.
+                total = node.profile.total_memory or 0
                 used_pct = (
-                    round(node.memory_used / addressable * 100.0, 1)
-                    if addressable
-                    else None
+                    round(node.memory_used / total * 100.0, 1) if total else None
                 )
                 nodes_payload.append(
                     {

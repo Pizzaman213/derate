@@ -51,6 +51,9 @@ GIB = 1024**3
 # The one string that must never appear in a response or a log line.
 SECRET_KEY = "sk-do-not-leak-me-0123456789"
 
+# A request carrying this is held open by FakeBackend until released.
+HOLD_MARKER = "please-hold-this-request"
+
 
 # ---------------------------------------------------------------------------
 # fakes
@@ -240,7 +243,10 @@ class FakeBackend:
         self.error_body = error_body
         self.requests: list[dict] = []
         self.headers: list[dict] = []
-        self.hold = None  # set to a threading.Event to block responses
+        # Set to a threading.Event to block responses. Only requests whose
+        # body carries HOLD_MARKER wait on it, so a test can hold one request
+        # open while still probing the gateway with others.
+        self.hold = None
         self.app = Starlette(
             routes=[
                 Route("/v1/chat/completions", self._chat, methods=["POST"]),
@@ -257,7 +263,7 @@ class FakeBackend:
 
     async def _chat(self, request):
         body = await self._record(request)
-        if self.hold is not None:
+        if self.hold is not None and HOLD_MARKER in json.dumps(body):
             await _await_event(self.hold)
         if self.status != 200:
             return JSONResponse(self.error_body or {"error": "backend said no"},
@@ -304,6 +310,8 @@ class FakeBackend:
             payload = {
                 "id": "chatcmpl-1",
                 "object": "chat.completion.chunk",
+                "created": 1757193600,
+                "model": "llama-3.3-70b",
                 "choices": [{"index": 0, "delta": {"content": f"tok{i}"}}],
             }
             yield f"data: {json.dumps(payload)}\n\n".encode()
@@ -1272,8 +1280,13 @@ def test_memory_pressure_never_kills_in_flight_work():
         )
         payload = {"model": "llama-3.3-70b", "messages": [{"role": "user", "content": "x"}]}
         with TestClient(create_app(deps)) as client:
+            held = {
+                "model": "llama-3.3-70b",
+                "messages": [{"role": "user", "content": HOLD_MARKER}],
+            }
+
             def in_flight():
-                results.append(client.post("/v1/chat/completions", json=payload).status_code)
+                results.append(client.post("/v1/chat/completions", json=held).status_code)
 
             worker = threading.Thread(target=in_flight)
             worker.start()
@@ -1292,3 +1305,383 @@ def test_memory_pressure_never_kills_in_flight_work():
             worker.join(timeout=15)
 
     assert results == [200], "an in-flight request was killed by memory pressure"
+
+
+# ---------------------------------------------------------------------------
+# remote providers
+# ---------------------------------------------------------------------------
+
+
+def test_a_model_served_locally_and_remotely_appears_once_with_both_targets():
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [make_deployment("d-local", "qwen3-30b-a3b", backend_url="http://a/v1")]
+        ),
+        providers=FakeProviders([make_provider()]),
+    )
+    with TestClient(create_app(deps)) as client:
+        models = client.get("/v1/models").json()["data"]
+        routing = client.get("/api/routing").json()
+
+    entries = [m for m in models if m["id"] == "qwen3-30b-a3b"]
+    assert len(entries) == 1
+    assert entries[0]["target_count"] == 2
+    assert sorted(entries[0]["target_kinds"]) == ["local", "remote"]
+
+    config = next(c for c in routing if c["served_name"] == "qwen3-30b-a3b")
+    assert {t["kind"] for t in config["targets"]} == {"local", "remote"}
+
+
+def test_a_remote_request_is_rewritten_to_the_upstream_id_and_carries_the_key():
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        providers = FakeProviders(
+            [make_provider(base_url=running.base_url, served_name="remote-only-model")]
+        )
+        deps = build_deps(providers=providers)
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "remote-only-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+    assert reply.status_code == 200
+    # The client's served_name is translated to what the provider calls it.
+    assert backend.requests[0]["model"] == "qwen/qwen3-30b-a3b"
+    # The key is resolved at request time and sent upstream, and only upstream.
+    assert backend.headers[0]["authorization"] == f"Bearer {SECRET_KEY}"
+    assert providers.key_requests == ["openrouter"]
+    assert SECRET_KEY not in reply.text
+    assert SECRET_KEY not in json.dumps(dict(reply.headers))
+
+
+def test_no_provider_api_key_appears_in_any_response_or_log_line(caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    providers = FakeProviders([make_provider()])
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [make_deployment("d-local", "qwen3-30b-a3b", backend_url="http://a/v1")]
+        ),
+        providers=providers,
+    )
+    with TestClient(create_app(deps)) as client:
+        bodies = []
+        for path in (
+            "/v1/models",
+            "/api/cluster",
+            "/api/topology",
+            "/api/nodes",
+            "/api/links",
+            "/api/routing",
+            "/api/providers",
+            "/api/providers/openrouter/models",
+            "/api/deployments",
+            "/healthz",
+        ):
+            reply = client.get(path)
+            assert reply.status_code == 200, path
+            bodies.append(reply.text)
+        bodies.append(client.post("/api/providers/openrouter/refresh").text)
+
+    blob = "".join(bodies)
+    assert SECRET_KEY not in blob
+    assert SECRET_KEY not in caplog.text
+    # The reference is shown -- it is what tells a user which variable to set --
+    # and any key material is rendered as *** and nothing else.
+    provider = json.loads(bodies[6])[0]
+    assert provider["api_key_ref"] == "OPENROUTER_API_KEY"
+    assert provider["api_key"] == "***"
+    assert providers.key_requests == []  # never resolved for a read
+
+
+def test_a_disabled_provider_is_not_served():
+    deps = build_deps(providers=FakeProviders([make_provider(enabled=False)]))
+    with TestClient(create_app(deps)) as client:
+        assert client.get("/v1/models").json()["data"] == []
+
+
+def test_an_unhealthy_provider_is_not_admitting():
+    router, _, _ = make_router(
+        providers=FakeProviders([make_provider(healthy=False)])
+    )
+    assert router.select("qwen3-30b-a3b") is None
+
+
+def test_an_unreachable_upstream_returns_502_without_inventing_a_status():
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [
+                make_deployment(
+                    "d-a", "llama-3.3-70b",
+                    backend_url=f"http://127.0.0.1:{_free_port()}/v1",
+                )
+            ]
+        )
+    )
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/v1/chat/completions",
+            json={"model": "llama-3.3-70b", "messages": [{"role": "user", "content": "x"}]},
+        )
+    assert reply.status_code == 502
+    assert reply.json()["error"]["code"] == "upstream_unreachable"
+
+
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+
+
+def test_plan_returns_a_plan_and_a_fit_and_launches_nothing():
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "context": 32768,
+                "concurrency": 8,
+                "target": "throughput",
+            },
+        )
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["plan"]["kind"] == "pipeline"
+    assert body["plan"]["reason"]
+    assert body["plan"]["measured_link_gbps"] == 10.2  # from the measurement, not a default
+    assert body["fit"]["verdict"] in ("fits", "fits_degraded", "wont_fit")
+    assert body["shape"]["model_id"] == "meta-llama/Llama-3.3-70B-Instruct"
+    assert deployments.launched == []
+    assert deployments.list() == []
+
+
+def test_plan_requires_a_model_id():
+    with TestClient(create_app()) as client:
+        assert client.post("/api/plan", json={}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# topology and metrics
+# ---------------------------------------------------------------------------
+
+
+def test_topology_never_emits_an_unmeasured_bandwidth_figure():
+    with TestClient(create_app()) as client:
+        edges = client.get("/api/topology").json()["edges"]
+
+    by_pair = {(e["src"], e["dst"]): e for e in edges}
+    measured = by_pair[("spark-01", "spark-02")]
+    assert measured["measured"] is True
+    assert measured["all_reduce_gbps"] == 10.2
+    assert measured["medium"] == "connectx-7"
+
+    unmeasured = by_pair[("spark-02", "ws-3090")]
+    assert unmeasured["measured"] is False
+    assert "all_reduce_gbps" not in unmeasured
+
+
+def test_metrics_stream_sustains_its_cadence_to_multiple_subscribers():
+    interval = 0.25
+    settings = GatewaySettings(metrics_interval_s=interval)
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")]
+        ),
+        settings=settings,
+    )
+    collected: dict[int, list] = {}
+
+    def subscribe(index: int, wanted: int = 4):
+        events = []
+        with httpx.Client(timeout=30) as client:
+            with client.stream("GET", f"{gateway.url}/api/metrics/stream") as response:
+                assert response.headers["content-type"].startswith("text/event-stream")
+                for line in response.iter_lines():
+                    if line.startswith("data:"):
+                        events.append((time.monotonic(), json.loads(line[5:])))
+                        if len(events) >= wanted:
+                            break
+        collected[index] = events
+
+    with RunningServer(create_app(deps, settings=settings)) as gateway:
+        threads = [threading.Thread(target=subscribe, args=(i,)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+    assert len(collected) == 3, "not every subscriber received its events"
+    for index, events in collected.items():
+        assert len(events) >= 4
+        gaps = [b[0] - a[0] for a, b in zip(events, events[1:])]
+        assert all(g < interval * 3 for g in gaps), (index, gaps)
+        payload = events[-1][1]
+        assert set(payload) == {"ts", "cluster", "nodes", "deployments"}
+        assert payload["deployments"][0]["deployment_id"] == "d-a"
+        assert payload["nodes"][0]["node_id"] == "spark-01"
+
+
+def test_the_default_metrics_cadence_is_one_hertz():
+    assert GatewaySettings().metrics_interval_s == 1.0
+
+
+def test_an_unavailable_source_nulls_its_field_rather_than_dropping_the_event():
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+
+    class BrokenRegistry:
+        def list_nodes(self):
+            raise RuntimeError("node agent unreachable")
+
+    hub = MetricsHub(
+        registry=BrokenRegistry(),
+        deployments=FakeDeployments(
+            [make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")]
+        ),
+        stats=StatsRegistry(),
+        settings=GatewaySettings(),
+    )
+    event = hub.snapshot()
+    assert event["nodes"] is None
+    assert event["cluster"]["total_power_w"] is None
+    # The event still goes out, and the panels that do have data still fill.
+    assert event["ts"] > 0
+    assert event["deployments"][0]["deployment_id"] == "d-a"
+
+
+# ---------------------------------------------------------------------------
+# the headline acceptance: a real, unmodified OpenAI client
+# ---------------------------------------------------------------------------
+
+
+def test_an_unmodified_openai_client_lists_models_and_completes_a_chat():
+    """Given only the base URL, using the real openai package."""
+    openai = pytest.importorskip("openai")
+
+    backend = FakeBackend(chunks=4)
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-1", "llama-3.3-70b", backend_url=running.base_url)]
+            )
+        )
+        with RunningServer(create_app(deps)) as gateway:
+            client = openai.OpenAI(
+                base_url=f"{gateway.url}/v1", api_key="anything", max_retries=0
+            )
+
+            assert "llama-3.3-70b" in [m.id for m in client.models.list()]
+
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+            assert completion.choices[0].message.content == "hello"
+
+            stream = client.chat.completions.create(
+                model="llama-3.3-70b",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+            )
+            deltas = [
+                chunk.choices[0].delta.content
+                for chunk in stream
+                if chunk.choices and chunk.choices[0].delta.content
+            ]
+            assert deltas == ["tok0", "tok1", "tok2", "tok3"]
+
+            with pytest.raises(openai.NotFoundError):
+                client.chat.completions.create(
+                    model="not-a-model", messages=[{"role": "user", "content": "x"}]
+                )
+
+
+def test_weights_are_recomputed_on_their_own_so_a_throttling_node_sheds_share():
+    """No request has to arrive for the split to change."""
+    settings = GatewaySettings(
+        weight_refresh_interval_s=0.15, measured_strength_min_requests=10
+    )
+    deps = build_deps(deployments=two_unequal_replicas(42.0, 40.0), settings=settings)
+    app = create_app(deps, settings=settings)
+    with TestClient(app) as client:
+        stats = app.state.ctx.stats
+        # The Spark starts to throttle: measured throughput collapses.
+        slow = stats.get("d-spark")
+        slow.completed = 50
+        slow.decode_tps = 8.0
+        fast = stats.get("d-3090")
+        fast.completed = 50
+        fast.decode_tps = 40.0
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            config = next(
+                c for c in client.get("/api/routing").json()
+                if c["served_name"] == "llama-3.3-70b"
+            )
+            weights = {t["target_id"]: t["weight"] for t in config["targets"]}
+            if weights["d-spark"] < weights["d-3090"]:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("weights never adjusted to measured throughput")
+
+    assert {t["strength_source"] for t in config["targets"]} == {"measured"}
+
+
+def test_an_unmeasured_remote_is_weighted_neutrally_not_starved():
+    """A remote's placeholder score is not in tok/s, so it must not be
+    compared against local throughput as if it were."""
+    router, _, _ = make_router(
+        deployments=FakeDeployments(
+            [
+                make_deployment(
+                    "d-a", "qwen3-30b-a3b", backend_url="http://a/v1",
+                    predicted_tps=42.0,
+                )
+            ]
+        ),
+        providers=FakeProviders([make_provider()]),
+    )
+    config = router.config_for("qwen3-30b-a3b")
+    weights = {t.target_id: t.weight for t in config.targets}
+    assert weights["openrouter:qwen/qwen3-30b-a3b"] == pytest.approx(0.5)
+    assert weights["d-a"] == pytest.approx(0.5)
+
+
+def test_a_wont_fit_verdict_refuses_the_launch_and_starts_nothing():
+    from tests.fixtures import wont_fit
+
+    class RefusingFit(StubFit):
+        def check(self, req, nodes):
+            return wont_fit()
+
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    deps.fit = RefusingFit()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct", "context": 131072},
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "wont_fit"
+    assert "Drop context" in reply.json()["error"]["message"]
+    assert deployments.launched == []
+
+
+def test_memory_percentages_match_the_architecture_docs_topology_example():
+    """The doc's worked example puts spark-01 at 78 percent."""
+    registry = FakeRegistry(
+        [node_state(NODE_PROFILES["spark-01"], memory_used_pct=78.0)]
+    )
+    deps = build_deps(registry=registry)
+    with TestClient(create_app(deps)) as client:
+        assert client.get("/api/topology").json()["nodes"][0]["memory_used_pct"] == 78.0
+        assert client.get("/api/nodes").json()[0]["memory_used_pct"] == 78.0

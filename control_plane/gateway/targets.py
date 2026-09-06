@@ -170,18 +170,36 @@ def build_index(
 
 
 def apply_scores(index: TargetIndex, settings: GatewaySettings) -> None:
-    """Fill in ``strength`` (relative to the strongest) and ``weight``
-    (traffic share summing to 1) on every target."""
-    from .strength import compute_weights
+    """Fill in ``strength`` (relative to the strongest target anywhere in the
+    cluster, which is what the topology view draws) and ``weight`` (traffic
+    share within one served_name, summing to 1)."""
+    from .strength import SOURCE_DEFAULT, compute_weights
 
     raw = {k: v.raw for k, v in index.raw_strength.items()}
-    kinds = index.kinds()
     strengths = normalize_strength(raw)
 
-    for served_name, targets in index.targets.items():
-        local_raw = {t.target_id: raw.get(t.target_id, 0.0) for t in targets}
-        local_kinds = {t.target_id: t.kind for t in targets}
-        weights = compute_weights(local_raw, local_kinds, settings)
+    for targets in index.targets.values():
+        group_raw = {t.target_id: raw.get(t.target_id, 0.0) for t in targets}
+        group_kinds = {t.target_id: t.kind for t in targets}
+
+        # An unmeasured remote has no comparable score: its placeholder is not
+        # in the same units as a local target's tok/s. Weighting it against
+        # them would starve or flood it for no reason, so it is treated as
+        # neutral -- the average of the local targets serving the same model --
+        # until enough requests complete to measure it.
+        local_values = [
+            v
+            for tid, v in group_raw.items()
+            if group_kinds[tid] is TargetKind.LOCAL and v > 0
+        ]
+        if local_values:
+            neutral = sum(local_values) / len(local_values)
+            for t in targets:
+                score = index.raw_strength.get(t.target_id)
+                if t.kind is TargetKind.REMOTE and score and score.source == SOURCE_DEFAULT:
+                    group_raw[t.target_id] = neutral
+
+        weights = compute_weights(group_raw, group_kinds, settings)
         for t in targets:
             t.strength = strengths.get(t.target_id, 0.0)
             t.weight = weights.get(t.target_id, 0.0)

@@ -38,11 +38,6 @@ BYTES_PER_PARAM: dict[str, float] = {
     "awq_int4": 0.5625,
     "gptq_int4": 0.5625,
     "nf4": 0.5163,
-    # Agent C extension, not in the frozen list: a generic 4-bit integer key for
-    # callers that do not know which packer produced the weights. Priced at the
-    # AWQ/GPTQ figure, since group scales and zero points are what 4-bit integer
-    # quantization always costs.
-    "int4": 0.5625,
 }
 
 #: What we fall back to when quantization cannot be determined. Never guess low:
@@ -98,7 +93,7 @@ _ALIASES: dict[str, str] = {
     "gptq": "gptq_int4",
     "gptqint4": "gptq_int4",
     "gptqmarlin": "gptq_int4",
-    "w4a16": "int4",
+    "w4a16": "gptq_int4",
     "bnbnf4": "nf4",
 }
 
@@ -143,7 +138,6 @@ QUANT_INFO: dict[str, QuantInfo] = {
     "awq_int4": QuantInfo("awq_int4", 4.5, "int", 7.5, False, "Marlin and GEMM kernels from Turing"),
     "gptq_int4": QuantInfo("gptq_int4", 4.5, "int", 7.5, False, "Marlin and GEMM kernels from Turing"),
     "nf4": QuantInfo("nf4", 4.13, "int", 7.5, False, "bitsandbytes"),
-    "int4": QuantInfo("int4", 4.5, "int", 7.5, False, "generic 4-bit integer packing"),
 }
 
 
@@ -166,21 +160,40 @@ def normalize_dtype(name: str | None) -> str | None:
     return _ALIASES.get(squashed)
 
 
-def bytes_per_param(dtype: str | None) -> float:
-    """Bytes per parameter for a dtype, defaulting to bf16 when unknown.
+def is_known_dtype(dtype: str | None) -> bool:
+    """Whether this dtype can be priced. ``ModelShape.dtype`` must satisfy it."""
+    return normalize_dtype(dtype) is not None
 
-    Defaulting up rather than down is deliberate. Under-counting weights is the
-    failure that gets discovered as an OOM five minutes into a load.
+
+def bytes_per_param(dtype: str | None) -> float:
+    """Bytes per parameter for a dtype.
+
+    Raises rather than defaulting. A dtype that reached this table without being
+    in it is a bug upstream, and pricing it silently at bf16 would under-count a
+    32-bit model by half. Deciding what an *undeclared* quantization costs is the
+    resolver's job, not the table's: it charges bf16 and says so in a warning.
     """
     key = normalize_dtype(dtype)
     if key is None:
-        return BYTES_PER_PARAM[DEFAULT_DTYPE]
+        raise KeyError(
+            f"unknown dtype {dtype!r}; expected one of: {', '.join(sorted(BYTES_PER_PARAM))}"
+        )
     return BYTES_PER_PARAM[key]
+
+
+def bytes_per_param_or_default(dtype: str | None) -> float:
+    """As ``bytes_per_param``, but bf16 for anything unrecognised.
+
+    For the paths that have to produce a number rather than an exception. Never
+    guesses low among the common formats.
+    """
+    key = normalize_dtype(dtype)
+    return BYTES_PER_PARAM[key or DEFAULT_DTYPE]
 
 
 def weight_bytes(params: int, dtype: str | None) -> int:
     """Storage for ``params`` parameters at ``dtype``."""
-    return int(params * bytes_per_param(dtype))
+    return int(params * bytes_per_param_or_default(dtype))
 
 
 def quant_info(dtype: str | None) -> QuantInfo:

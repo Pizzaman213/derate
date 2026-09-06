@@ -11,7 +11,7 @@ export const BOX_H = 112
 export const GAP_X = 116
 export const MARGIN = 28
 /** Space above the row for arcs between non-adjacent machines. */
-export const ARC_HEADROOM = 56
+export const ARC_HEADROOM = 72
 export const BAND_H = 40
 export const BAND_GAP = 10
 /** Vertical run from a machine down to the band beneath it. */
@@ -88,7 +88,16 @@ export function edgeGeometry(a: Placed, b: Placed, kind: 'row' | 'ring') {
   const [l, r] = a.x <= b.x ? [a, b] : [b, a]
   const adjacent = Math.abs(a.index - b.index) === 1
 
-  if (kind === 'row' && adjacent) {
+  if (kind === 'ring') {
+    const c1 = centerOf(l)
+    const c2 = centerOf(r)
+    return {
+      d: `M${c1.x} ${c1.y} L${c2.x} ${c2.y}`,
+      mid: { x: (c1.x + c2.x) / 2, y: (c1.y + c2.y) / 2 },
+    }
+  }
+
+  if (adjacent) {
     const y = l.y + BOX_H / 2
     const x1 = l.x + BOX_W
     const x2 = r.x
@@ -98,16 +107,21 @@ export function edgeGeometry(a: Placed, b: Placed, kind: 'row' | 'ring') {
     }
   }
 
-  const c1 = centerOf(l)
-  const c2 = centerOf(r)
-  const span = Math.hypot(c2.x - c1.x, c2.y - c1.y)
-  const lift = Math.min(ARC_HEADROOM - 8, 18 + span * 0.16)
-  const mx = (c1.x + c2.x) / 2
-  const my = (c1.y + c2.y) / 2 - lift
+  // Non-adjacent machines arc over the top of everything between them, leaving
+  // from the top edge of each box rather than its centre. Routing through the
+  // row would draw a link straight across a machine it does not touch.
+  const ax = l.x + BOX_W / 2
+  const ay = l.y
+  const bx = r.x + BOX_W / 2
+  const by = r.y
+  const span = Math.abs(bx - ax)
+  const lift = Math.min(ARC_HEADROOM * 1.25, 34 + span * 0.075)
+  const mx = (ax + bx) / 2
+  const cy = Math.min(ay, by) - lift
   return {
-    d: `M${c1.x} ${c1.y} Q${mx} ${my - lift * 0.35} ${c2.x} ${c2.y}`,
-    // Quadratic midpoint, so the label sits on the curve rather than beside it.
-    mid: { x: mx, y: (c1.y + c2.y) / 4 + (my - lift * 0.35) / 2 },
+    d: `M${ax} ${ay} Q${mx} ${cy} ${bx} ${by}`,
+    // Apex of the quadratic, so the label sits on the curve.
+    mid: { x: mx, y: (ay + 2 * cy + by) / 4 },
   }
 }
 

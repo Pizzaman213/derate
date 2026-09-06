@@ -242,9 +242,12 @@ function NodeBox({
       </text>
 
       <circle cx={16} cy={62} r={4} fill={dim && !down ? 'none' : signal} stroke={signal} strokeWidth={1.5} />
+      {/* Values are right-anchored against a fixed x, so a reading going from
+          two digits to three moves the digits and never the unit. */}
       <text
-        x={30}
+        x={62}
         y={66}
+        textAnchor="end"
         fill={inkTone}
         fontFamily="var(--font-mono)"
         fontSize={13}
@@ -252,12 +255,13 @@ function NodeBox({
       >
         {fmt(mem, 0)}
       </text>
-      <text x={54} y={66} fill="var(--ink-muted)" fontFamily="var(--font-sans)" fontSize={11}>
+      <text x={66} y={66} fill="var(--ink-muted)" fontFamily="var(--font-sans)" fontSize={11}>
         %
       </text>
       <text
-        x={86}
+        x={124}
         y={66}
+        textAnchor="end"
         fill={inkTone}
         fontFamily="var(--font-mono)"
         fontSize={13}
@@ -265,7 +269,7 @@ function NodeBox({
       >
         {fmt(power, 0)}
       </text>
-      <text x={118} y={66} fill="var(--ink-muted)" fontFamily="var(--font-sans)" fontSize={11}>
+      <text x={128} y={66} fill="var(--ink-muted)" fontFamily="var(--font-sans)" fontSize={11}>
         W
       </text>
 
