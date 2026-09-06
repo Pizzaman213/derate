@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any
 from urllib.parse import quote
@@ -69,9 +68,6 @@ class ModelInfo:
         total = sum((canonical or root).values())
         return total or None
 
-    def file_size(self, name: str) -> int | None:
-        return self.file_sizes.get(name)
-
     def gguf_files(self) -> list[str]:
         return [f for f in self.siblings if f.lower().endswith(".gguf")]
 
@@ -87,12 +83,6 @@ class ModelInfo:
             summed = sum(v for v in params.values() if isinstance(v, int))
             return summed or None
         return None
-
-    def safetensors_dtypes(self) -> dict[str, int]:
-        if not self.safetensors:
-            return {}
-        params = self.safetensors.get("parameters")
-        return dict(params) if isinstance(params, dict) else {}
 
 
 class HubClient:
@@ -298,7 +288,3 @@ SAFETENSORS_ELEMENT_BYTES: dict[str, float] = {
     "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
     "F4": 0.5, "U4": 0.5, "I4": 0.5,
 }
-
-
-def elapsed_ms(started: float) -> float:
-    return (time.perf_counter() - started) * 1000.0

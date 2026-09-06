@@ -388,8 +388,11 @@ def _map_mla(cfg: dict[str, Any], m: Mapped) -> None:
 
     ``mla_latent_dim`` is the config's KV compression dimension, ``kv_lora_rank``.
     The runtime also stores a decoupled RoPE component of ``qk_rope_head_dim``
-    per layer per token on top of it, which is an eighth again on DeepSeek-V3, so
-    that is called out in a warning rather than folded in silently.
+    per layer per token on top of it. That width is carried through to
+    ``ModelShape.mla_rope_dim`` (via ``Mapped.qk_rope_head_dim``), so KV
+    arithmetic reads ``effective_mla_rope_dim`` rather than assuming anything;
+    a warning fires only when the config leaves the key out and the property's
+    64-wide fallback will be doing the guessing instead.
 
     ``head_dim`` is the value head dimension. DeepSeek's query heads are wider
     than its value heads (192 against 128) and neither equals
@@ -408,14 +411,10 @@ def _map_mla(cfg: dict[str, Any], m: Mapped) -> None:
     m.mla_latent_dim = kv_lora
     if m.head_dim is None:
         m.head_dim = m.v_head_dim or ((m.qk_nope_head_dim or 0) + qk_rope) or None
-    if qk_rope:
+    if not qk_rope:
         m.warnings.append(
-            f"MLA latent width is the {kv_lora}-wide KV LoRA rank; the runtime also "
-            f"caches a {qk_rope}-wide decoupled RoPE component per layer per token, "
-            f"so the true cached width is {kv_lora + qk_rope}"
-        )
-    else:
-        m.warnings.append(
-            "MLA config has kv_lora_rank but no qk_rope_head_dim; latent width may "
-            "under-count the decoupled RoPE component"
+            "MLA config has kv_lora_rank but no qk_rope_head_dim; the resolver "
+            f"cannot carry the decoupled RoPE width and falls back to charging "
+            f"64, the width every known DeepSeek-family checkpoint uses, so the "
+            f"true cached width is charged as {kv_lora + 64}"
         )

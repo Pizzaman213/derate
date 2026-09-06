@@ -73,10 +73,21 @@ class ModelResolver:
         started = time.perf_counter()
 
         local = Path(model_id).expanduser()
-        if local.suffix.lower() == ".gguf" or model_id.startswith("hf://"):
-            return self.resolve_gguf_full(model_id, dtype=dtype)
         if local.is_dir() and (local / "config.json").is_file():
             return self._resolve_local_dir(local, dtype, started)
+
+        is_remote_gguf = model_id.startswith("hf://")
+        if is_remote_gguf or local.suffix.lower() == ".gguf":
+            # An ``hf://`` reference reads the file over the network, so it is
+            # gated and cached exactly like a hub config resolution below. A
+            # local file needs no network, is exempt from the offline gate,
+            # and -- like ``_resolve_local_dir`` -- is never cached: caching a
+            # path on disk would go stale the moment that file was replaced or
+            # deleted, and every read is already as cheap as a cache hit.
+            return self._resolve_gguf_cached(
+                model_id, dtype, revision, started,
+                refresh=refresh, needs_network=is_remote_gguf,
+            )
 
         if not refresh:
             hit = self.cache.get(model_id, revision, dtype)
@@ -356,14 +367,72 @@ class ModelResolver:
 
     # ---- GGUF -----------------------------------------------------------
 
+    def _resolve_gguf_cached(
+        self,
+        model_id: str,
+        dtype: str | None,
+        revision: str,
+        started: float,
+        *,
+        refresh: bool,
+        needs_network: bool,
+    ) -> Resolution:
+        """``resolve_gguf_full`` behind the same cache and offline gate as a
+        hub config resolution, so a repeat ``hf://`` resolve is a cache hit
+        rather than a fresh Range-read, and offline mode never reaches the
+        network for one that is not already cached.
+
+        A local file takes neither the cache nor the offline gate: it needs no
+        network, and unlike an ``hf://`` blob (immutable once fetched -- the
+        whole reason it is safe to cache), a path on disk can be replaced or
+        deleted out from under a long-lived resolver. Caching it would serve a
+        stale shape for up to the TTL after a replacement, or silently keep
+        "resolving" a file that no longer exists; re-reading the header is the
+        exact behavior ``_resolve_local_dir`` already keeps for a config
+        directory, and a header-only read is cheap enough that there is
+        nothing to save by memoizing it.
+        """
+        if not needs_network:
+            res = self.resolve_gguf_full(model_id, dtype=dtype)
+            res.elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return res
+
+        if not refresh:
+            hit = self.cache.get(model_id, revision, dtype)
+            if hit is not None:
+                hit.elapsed_ms = (time.perf_counter() - started) * 1000.0
+                return hit
+
+        if self.offline:
+            raise MetadataUnavailable(
+                f"{model_id!r} is not cached and the resolver is in offline mode"
+            )
+
+        res = self.resolve_gguf_full(model_id, dtype=dtype)
+        res.elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.cache.put(model_id, revision, dtype, res)
+        return res
+
     def resolve_gguf(self, path: str) -> ModelShape:
         return self.resolve_gguf_full(path).shape
 
     def resolve_gguf_full(self, path: str, dtype: str | None = None) -> Resolution:
-        """Read a GGUF header, local or on the hub as ``hf://repo/file.gguf``."""
+        """Read a GGUF header, local or on the hub as ``hf://repo/file.gguf``.
+
+        This is the public entry point below ``resolve_full``'s cache and
+        offline gate, so a caller reaching it directly for a remote blob gets
+        the same offline honesty rather than a bypass: an uncached ``hf://``
+        path still raises instead of opening a socket. ``resolve_full`` already
+        checks this before it ever calls in here; the check is repeated so a
+        direct call carries the same guarantee.
+        """
         started = time.perf_counter()
         name = path
         if path.startswith("hf://"):
+            if self.offline:
+                raise MetadataUnavailable(
+                    f"{path!r} is not cached and the resolver is in offline mode"
+                )
             repo_file = path[len("hf://") :]
             parts = repo_file.split("/")
             if len(parts) < 3:
@@ -564,6 +633,7 @@ def _shape_from(model_id: str, mapped: Mapped, accounting, dtype: str) -> ModelS
         sliding_window=mapped.sliding_window,
         layers_with_full_attention=mapped.layers_with_full_attention,
         mla_latent_dim=mapped.mla_latent_dim,
+        mla_rope_dim=mapped.qk_rope_head_dim,
         vision_params=accounting.vision_params,
     )
 

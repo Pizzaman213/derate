@@ -16,7 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from control_plane.contracts import ModelShape
+from control_plane.contracts import (
+    FitRequest,
+    ModelShape,
+    ParallelismKind,
+    ParallelismPlan,
+)
 from control_plane.contracts.quant import (
     BYTES_PER_PARAM,
     DEFAULT_DTYPE,
@@ -27,6 +32,7 @@ from control_plane.contracts.quant import (
     quant_info,
 )
 from control_plane.resolver import (
+    MetadataUnavailable,
     ModelNotFound,
     ModelResolver,
     ShapeCache,
@@ -275,7 +281,31 @@ class TestAttentionVariants:
         )
         assert res.shape.mla_latent_dim == 512
         assert res.shape.mla_latent_dim == DEEPSEEK_V3.mla_latent_dim
-        assert any("RoPE" in w for w in res.warnings)
+
+    def test_deepseek_populates_the_rope_component_from_the_config(self, resolver):
+        """M-10: qk_rope_head_dim=64 in the fixture must reach mla_rope_dim.
+
+        With the field carried, KV math reads it through
+        ``effective_mla_rope_dim`` rather than a hardcoded 64, and no warning
+        is needed since nothing was guessed.
+        """
+        res = offline(
+            resolver, "deepseek-v3", "deepseek-ai/DeepSeek-V3",
+            measured_total=684_531_386_000,
+        )
+        assert res.shape.mla_rope_dim == 64
+        assert res.shape.effective_mla_rope_dim == 64
+        assert not any("RoPE" in w for w in res.warnings)
+
+    def test_missing_rope_head_dim_warns_and_leaves_the_field_empty(self, resolver):
+        """The 64 fallback only applies when the config truly has nothing to say."""
+        config = dict(load_config("deepseek-v3"))
+        config.pop("qk_rope_head_dim", None)
+        res = resolver.resolve_config(config, "deepseek-ai/DeepSeek-V3-no-rope-key")
+        assert res.shape.mla_latent_dim == 512
+        assert res.shape.mla_rope_dim is None
+        assert res.shape.effective_mla_rope_dim == 64  # the property's fallback
+        assert any("qk_rope_head_dim" in w for w in res.warnings)
 
     def test_deepseek_head_dim_is_read_not_derived(self, resolver):
         """7168 / 128 is 56, which is not this model's head dimension."""
@@ -284,7 +314,10 @@ class TestAttentionVariants:
         assert shape.hidden_size // shape.num_attention_heads == 56
 
     def test_non_mla_models_leave_the_field_empty(self, resolver):
-        assert offline(resolver, "llama-3.3-70b", "llama").shape.mla_latent_dim is None
+        shape = offline(resolver, "llama-3.3-70b", "llama").shape
+        assert shape.mla_latent_dim is None
+        assert shape.mla_rope_dim is None
+        assert shape.effective_mla_rope_dim == 0
 
 
 # --------------------------------------------------------------------------
@@ -418,6 +451,21 @@ def _gguf_string(text: str) -> bytes:
     return struct.pack("<Q", len(raw)) + raw
 
 
+def _dummy_plan() -> ParallelismPlan:
+    """A minimal legal plan, for tests that only care about FitRequest wiring."""
+    return ParallelismPlan(
+        kind=ParallelismKind.SINGLE_NODE,
+        tensor_parallel=1,
+        pipeline_parallel=1,
+        expert_parallel=1,
+        data_parallel=1,
+        node_ids=["n0"],
+        reason="test plan",
+        measured_link_gbps=0.0,
+        rejected=[],
+    )
+
+
 def write_gguf(path: Path, metadata: dict, tensors: list[tuple[str, tuple[int, ...], int]]) -> None:
     """Write a header-only GGUF file. Enough to exercise the reader."""
     out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata)))
@@ -495,6 +543,22 @@ class TestGGUF:
         assert res.param_source is ParamSource.GGUF_TENSORS
         assert res.weight_bytes != int(expected_params * BYTES_PER_PARAM["q4_k_m"])
 
+    def test_measured_gguf_bytes_feed_a_fit_request(self, tmp_path, resolver):
+        """H-10: a caller must be able to hand the measured bytes to FitRequest."""
+        res = resolver.resolve_gguf_full(str(self._moe_file(tmp_path)))
+        assert res.weight_bytes and res.weight_bytes > 0
+        effective = res.effective_weight_bytes()
+        assert effective >= res.weight_bytes
+        request = FitRequest(
+            shape=res.shape,
+            context_length=4096,
+            max_concurrent_seqs=1,
+            kv_dtype="bf16",
+            plan=_dummy_plan(),
+            weight_bytes=effective,
+        )
+        assert request.weight_bytes == effective
+
     def test_expert_tensors_drive_the_active_count(self, tmp_path, resolver):
         shape = resolver.resolve_gguf(str(self._moe_file(tmp_path)))
         assert shape.active_params < shape.total_params / 2
@@ -543,6 +607,199 @@ class TestGGUF:
         )
         header = read_gguf_file(str(path))
         assert len(header.metadata["tokenizer.ggml.tokens"]) == 5000
+
+
+def _small_gguf(path: Path) -> None:
+    write_gguf(
+        path,
+        {
+            "general.architecture": "llama",
+            "general.file_type": 1,
+            "llama.block_count": 2,
+            "llama.embedding_length": 64,
+            "llama.attention.head_count": 4,
+            "llama.attention.head_count_kv": 2,
+            "llama.vocab_size": 32,
+        },
+        [("token_embd.weight", (64, 32), 1)],
+    )
+
+
+class _CountingRangeClient:
+    """Serves a GGUF blob through ``read_range``, counting calls.
+
+    Standing in for ``HubClient`` so a test can prove a resolve did -- or did
+    not -- reach the network, without any real HTTP.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.calls = 0
+
+    def read_range(self, model_id: str, filename: str, start: int, length: int) -> bytes:
+        self.calls += 1
+        return self._data[start : start + length]
+
+    def model_info(self, model_id: str, revision: str = "main"):
+        raise AssertionError("GGUF resolution must not call model_info")
+
+    def config(self, model_id: str, revision: str = "main"):
+        raise AssertionError("GGUF resolution must not fetch config.json")
+
+
+class TestGGUFResolveFullRouting:
+    """M-24: resolve_full's .gguf/hf:// routing must respect offline and cache.
+
+    Before this fix, the GGUF branch returned before the offline gate and
+    before any cache lookup, so offline mode still performed Range reads and
+    every resolve of the same file re-read it.
+    """
+
+    def test_local_gguf_is_never_cached(self, tmp_path):
+        """A local path can be replaced or deleted out from under a
+        long-lived resolver, unlike an ``hf://`` blob, so it goes through
+        neither the cache nor the offline gate -- see ``_resolve_local_dir``,
+        which extends the same courtesy to a config directory.
+        """
+        path = tmp_path / "local.gguf"
+        _small_gguf(path)
+        resolver = ModelResolver(cache=ShapeCache(directory=tmp_path / "cache"))
+
+        first = resolver.resolve_full(str(path))
+        assert not first.from_cache
+        second = resolver.resolve_full(str(path))
+        assert not second.from_cache
+        assert second.shape == first.shape
+
+    def test_local_gguf_reflects_a_file_replaced_in_place(self, tmp_path):
+        """A stale cache entry would keep reporting the old shape; there must
+        be no cache entry to go stale.
+        """
+        path = tmp_path / "local.gguf"
+        _small_gguf(path)
+        resolver = ModelResolver(cache=ShapeCache(directory=tmp_path / "cache"))
+        first = resolver.resolve_full(str(path))
+        assert first.shape.num_layers == 2
+
+        write_gguf(
+            path,
+            {
+                "general.architecture": "llama",
+                "general.file_type": 1,
+                "llama.block_count": 40,
+                "llama.embedding_length": 128,
+                "llama.attention.head_count": 8,
+                "llama.attention.head_count_kv": 8,
+                "llama.vocab_size": 32,
+            },
+            [("token_embd.weight", (128, 32), 1)],
+        )
+        second = resolver.resolve_full(str(path))
+        assert second.shape.num_layers == 40
+        assert second.shape.hidden_size == 128
+
+    def test_local_gguf_deleted_after_a_resolve_raises(self, tmp_path):
+        """A cached entry would keep 'resolving' a file that no longer exists."""
+        path = tmp_path / "local.gguf"
+        _small_gguf(path)
+        resolver = ModelResolver(cache=ShapeCache(directory=tmp_path / "cache"))
+        resolver.resolve_full(str(path))
+
+        path.unlink()
+        with pytest.raises(ModelNotFound):
+            resolver.resolve_full(str(path))
+
+    def test_local_gguf_ignores_offline_mode(self, tmp_path):
+        """A local file touches no network, so offline must not refuse it."""
+        path = tmp_path / "local.gguf"
+        _small_gguf(path)
+        resolver = ModelResolver(
+            cache=ShapeCache(directory=tmp_path / "cache"), offline=True
+        )
+        res = resolver.resolve_full(str(path))
+        assert res.shape.num_layers == 2
+
+    def test_offline_remote_gguf_raises_without_touching_the_network(self, tmp_path):
+        path = tmp_path / "src.gguf"
+        _small_gguf(path)
+        client = _CountingRangeClient(path.read_bytes())
+        resolver = ModelResolver(
+            client=client, cache=ShapeCache(directory=tmp_path / "cache"), offline=True
+        )
+        with pytest.raises(MetadataUnavailable, match="offline"):
+            resolver.resolve_full("hf://someone/repo/model.gguf")
+        assert client.calls == 0
+
+    def test_offline_direct_resolve_gguf_full_also_raises(self, tmp_path):
+        """The public ``resolve_gguf_full`` is a door below ``resolve_full``'s
+        cache and offline gate; a caller reaching it directly for a remote
+        blob must get the same offline honesty rather than a bypass.
+        """
+        path = tmp_path / "src.gguf"
+        _small_gguf(path)
+        client = _CountingRangeClient(path.read_bytes())
+        resolver = ModelResolver(client=client, offline=True)
+        with pytest.raises(MetadataUnavailable, match="offline"):
+            resolver.resolve_gguf_full("hf://someone/repo/model.gguf")
+        assert client.calls == 0
+
+    def test_remote_gguf_resolve_full_is_cached_not_refetched(self, tmp_path):
+        path = tmp_path / "src.gguf"
+        _small_gguf(path)
+        client = _CountingRangeClient(path.read_bytes())
+        cache = ShapeCache(directory=tmp_path / "cache")
+        resolver = ModelResolver(client=client, cache=cache)
+
+        first = resolver.resolve_full("hf://someone/repo/model.gguf")
+        assert not first.from_cache
+        calls_after_first = client.calls
+        assert calls_after_first > 0
+
+        second = resolver.resolve_full("hf://someone/repo/model.gguf")
+        assert second.from_cache
+        assert second.shape == first.shape
+        assert second.weight_bytes == first.weight_bytes  # H-10: survives the cache round trip
+        assert client.calls == calls_after_first  # no further Range reads
+
+    def test_resolve_full_gguf_weight_bytes_feed_a_fit_request(self, tmp_path):
+        """H-10, on the actual ``resolve_full`` path rather than
+        ``resolve_gguf_full`` directly: the measured bytes must still reach a
+        ``FitRequest`` after going through the cached GGUF route.
+        """
+        path = tmp_path / "src.gguf"
+        _small_gguf(path)
+        client = _CountingRangeClient(path.read_bytes())
+        resolver = ModelResolver(client=client, cache=ShapeCache(directory=tmp_path / "cache"))
+
+        res = resolver.resolve_full("hf://someone/repo/model.gguf")
+        assert res.weight_bytes and res.weight_bytes > 0
+        effective = res.effective_weight_bytes()
+        request = FitRequest(
+            shape=res.shape,
+            context_length=4096,
+            max_concurrent_seqs=1,
+            kv_dtype="bf16",
+            plan=_dummy_plan(),
+            weight_bytes=effective,
+        )
+        assert request.weight_bytes == effective
+
+    def test_once_cached_a_remote_gguf_serves_offline_too(self, tmp_path):
+        path = tmp_path / "src.gguf"
+        _small_gguf(path)
+        client = _CountingRangeClient(path.read_bytes())
+        cache_dir = tmp_path / "cache"
+        warm = ModelResolver(client=client, cache=ShapeCache(directory=cache_dir))
+        warm.resolve_full("hf://someone/repo/model.gguf")
+        calls_after_warm = client.calls
+
+        cold = ModelResolver(
+            client=client, cache=ShapeCache(directory=cache_dir), offline=True
+        )
+        res = cold.resolve_full("hf://someone/repo/model.gguf")
+        assert res.from_cache
+        assert res.shape.num_layers == 2
+        assert client.calls == calls_after_warm
 
 
 class TestWeightIndexArbitration:
@@ -596,6 +853,25 @@ class TestWeightIndexArbitration:
             },
         )
         assert res.weight_bytes == 2 * 7_248_039_256
+
+    def test_index_measured_bytes_feed_a_fit_request(self, tmp_path):
+        """H-10: shard-index bytes must survive into effective_weight_bytes."""
+        res = self._resolve(
+            tmp_path, "llama-3.3-70b", "mistralai/Mistral-7B-Instruct-v0.3",
+            7_248_023_552,
+            {
+                "model-00001-of-00002.safetensors": 7_248_039_256,
+                "model-00002-of-00002.safetensors": 7_248_039_256,
+            },
+        )
+        assert res.weight_bytes == 2 * 7_248_039_256
+        effective = res.effective_weight_bytes()
+        assert effective >= res.weight_bytes
+        request = FitRequest(
+            shape=res.shape, context_length=4096, max_concurrent_seqs=1,
+            kv_dtype="bf16", plan=_dummy_plan(), weight_bytes=effective,
+        )
+        assert request.weight_bytes == effective
 
     def test_shard_bytes_ignore_subdirectory_copies(self, tmp_path):
         res = self._resolve(
@@ -812,6 +1088,53 @@ class TestCache:
         res.resolved_at = 0.0
         sha = "b5c939de8f754692c1647ca79fbf85e8c1e70f8a"
         cache = ShapeCache(directory=tmp_path / "c", ttl_seconds=60)
+        cache.put("llama", sha, None, res)
+        cache._memory.clear()
+        assert cache.get("llama", sha, None) is not None
+
+    def test_a_long_branch_name_is_not_treated_as_pinned(self, tmp_path, resolver):
+        """Low fix: only a full 40-char commit sha is immortal.
+
+        Before the fix, any revision spelling that was not literally ``main``
+        and at least 32 characters long was treated as pinned, which made a
+        long-lived branch name immortal in the cache.
+        """
+        branch = "feature/a-rather-long-branch-name-worth-more-than-32-chars"
+        assert len(branch) >= 32
+        res = offline(resolver, "llama-3.3-70b", "llama")
+        res.resolved_at = time.time() - 10_000
+        cache = ShapeCache(directory=tmp_path / "c", ttl_seconds=60)
+        cache.put("llama", branch, None, res)
+        cache._memory.clear()
+        assert cache.get("llama", branch, None) is None
+
+    def test_an_uppercase_commit_sha_still_counts_as_pinned(self, tmp_path, resolver):
+        res = offline(resolver, "llama-3.3-70b", "llama")
+        res.resolved_at = 0.0
+        sha = "B5C939DE8F754692C1647CA79FBF85E8C1E70F8A"
+        cache = ShapeCache(directory=tmp_path / "c", ttl_seconds=60)
+        cache.put("llama", sha, None, res)
+        cache._memory.clear()
+        assert cache.get("llama", sha, None) is not None
+
+    def test_non_positive_ttl_disables_the_cache_for_floating_refs(self, tmp_path, resolver):
+        """Low fix: TTL<=0 means the cache is disabled, not that it never expires.
+
+        0 meaning infinite is a trap a caller reaches for when they actually
+        want "no TTL configured, so do not cache."
+        """
+        res = offline(resolver, "llama-3.3-70b", "llama")
+        for ttl in (0, -1):
+            cache = ShapeCache(directory=tmp_path / f"c{ttl}", ttl_seconds=ttl)
+            cache.put("llama", "main", None, res)
+            cache._memory.clear()  # force the on-disk read path too
+            assert cache.get("llama", "main", None) is None
+
+    def test_non_positive_ttl_still_exempts_a_pinned_commit(self, tmp_path, resolver):
+        """The disable-switch is about floating refs; pinned content still holds."""
+        res = offline(resolver, "llama-3.3-70b", "llama")
+        sha = "b5c939de8f754692c1647ca79fbf85e8c1e70f8a"
+        cache = ShapeCache(directory=tmp_path / "c", ttl_seconds=0)
         cache.put("llama", sha, None, res)
         cache._memory.clear()
         assert cache.get("llama", sha, None) is not None

@@ -2,8 +2,13 @@
 
 Resolution sits in a UI request path, so the second lookup of a model must not
 touch the network. Entries are keyed by model id, revision and any dtype
-override. An entry pinned to a commit sha never expires -- that content cannot
-change. An entry for a floating ref like ``main`` expires on a TTL.
+override. An entry pinned to an exact commit sha (40 hex characters, the only
+revision spelling git guarantees is immutable) never expires -- that content
+cannot change. An entry for a floating ref -- ``main``, a branch name, a tag --
+expires on a TTL. A non-positive TTL does not mean "cache forever": it means
+the cache is disabled for floating refs, so every read counts as stale. 0
+meaning infinite is the kind of trap a caller reaches for by mistake when they
+mean "no TTL configured, so do not cache."
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from collections import OrderedDict
@@ -36,6 +42,15 @@ from .types import (
 SCHEMA_VERSION = 3
 
 DEFAULT_TTL_SECONDS = float(os.environ.get("SPARKPLANE_RESOLVER_TTL", 24 * 3600))
+
+#: A revision only counts as pinned when it is exactly a full commit sha.
+#: Anything shorter or differently shaped -- a long branch name included --
+#: is a floating ref and must still expire on the TTL.
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def _is_pinned_commit(revision: str) -> bool:
+    return bool(revision) and _COMMIT_SHA.fullmatch(revision) is not None
 
 
 def default_cache_dir() -> Path:
@@ -124,10 +139,10 @@ class ShapeCache:
         return self.directory / f"{key}.json"
 
     def _expired(self, res: Resolution, revision: str) -> bool:
-        if revision and revision != "main" and len(revision) >= 32:
+        if _is_pinned_commit(revision):
             return False  # pinned to a commit; content cannot change
         if self.ttl_seconds <= 0:
-            return False
+            return True  # no positive TTL configured: cache disabled, always stale
         return (time.time() - res.resolved_at) > self.ttl_seconds
 
     def get(self, model_id: str, revision: str, dtype: str | None) -> Resolution | None:

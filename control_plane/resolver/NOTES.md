@@ -33,12 +33,16 @@ counts the embedding. Expect us to sit within a few percent of either.
 
 `effective_active_params` is `total_params` for dense models.
 
-**4. `mla_latent_dim` is `kv_lora_rank` alone, per the frozen fixture.**
+**4. `mla_latent_dim` is `kv_lora_rank` alone; use `effective_mla_rope_dim` for the rest.**
 
-DeepSeek-V3 reports 512. The runtime also caches a 64-wide decoupled RoPE
-component per layer per token, so the true cached width is 576. If your KV
-arithmetic uses `mla_latent_dim` directly, it under-counts by an eighth. The
-resolution carries a warning saying so on every MLA model.
+DeepSeek-V3 reports 512 for `mla_latent_dim`, and the config's `qk_rope_head_dim`
+(64 on every current DeepSeek checkpoint) is carried into `mla_rope_dim`, so the
+true cached width per layer per token is `mla_latent_dim +
+shape.effective_mla_rope_dim` -- never `mla_latent_dim` alone. Read the property
+rather than `mla_rope_dim` directly: it is `0` for non-MLA shapes and falls back
+to 64 when a config has `kv_lora_rank` but left `qk_rope_head_dim` out, which is
+the one case that still carries a warning, since that width is then a guess
+rather than something the config said.
 
 **5. `layers_with_full_attention` is `None`, not `num_layers`, when there is no window.**
 
