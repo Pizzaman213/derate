@@ -8,11 +8,12 @@ so the UI can be built against the full shape from day 0.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from control_plane.contracts import (
@@ -21,6 +22,11 @@ from control_plane.contracts import (
     RoutingPolicy,
     Verdict,
 )
+from control_plane.providers import UnknownProviderError
+from control_plane.registry import JoinRejected, NodeNotFound
+from control_plane.registry.serde import profile_from_dict
+
+from control_plane.telemetry import query as tquery
 
 from . import errors, serialize
 from .deps import GatewayContext
@@ -222,7 +228,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if not callable(candidates):
             return JSONResponse([])
         try:
-            return JSONResponse([serialize.plain(c) for c in candidates()])
+            return JSONResponse([serialize.candidate_payload(c) for c in candidates()])
         except Exception:
             log.exception("candidate listing failed")
             return JSONResponse([])
@@ -242,8 +248,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.post("/api/nodes/join")
     async def join_node(request: Request) -> Response:
-        join = getattr(ctx.deps.registry, "join", None)
-        if not callable(join):
+        handle_join = getattr(ctx.deps.registry, "handle_join", None)
+        if not callable(handle_join):
             return _not_implemented("Node join", "registry")
         try:
             payload = await request.json()
@@ -252,18 +258,34 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, "Join body must be JSON.", "invalid_request_error", "invalid_json"
             )
         try:
-            return JSONResponse(serialize.plain(join(payload)))
-        except PermissionError:
-            # A join with a wrong or missing token is rejected.
+            token = payload.get("token")
+            profile = profile_from_dict(payload["profile"])
+            agent_url = str(payload["agent_url"])
+        except (KeyError, TypeError, ValueError) as exc:
             return errors.error_response(
-                403, "Cluster token rejected.", "invalid_request_error", "bad_token"
+                400, f"Join body malformed: {exc}.",
+                "invalid_request_error", "invalid_join_body",
             )
-        except Exception as exc:
-            log.exception("join failed")
+        try:
+            result = await handle_join(token, profile, agent_url)
+        except JoinRejected as exc:
+            # Registry.handle_join raises this for three distinct causes --
+            # a wrong token, a failed probe-back (e.g. unreachable agent_url,
+            # bridge networking), or a node_id mismatch on probe-back -- and
+            # carries which one as str(exc). Surface it rather than assuming
+            # "bad token": an operator chasing a probe/network failure with a
+            # token-rejected message goes looking for a fault that isn't
+            # there. A missing token is not a rejection at all -- it comes
+            # back as a "candidate" status below, see Registry.handle_join.
             return errors.error_response(
-                400, f"Join failed: {type(exc).__name__}.",
-                "invalid_request_error", "join_failed",
+                403, f"Cluster join rejected: {exc}.",
+                "invalid_request_error", "join_rejected",
             )
+        except NotImplementedError:
+            return _not_implemented("Node join", "registry")
+        # Passes through with whatever status handle_join decided -- "member"
+        # or "candidate" -- rather than the gateway interpreting it.
+        return JSONResponse(serialize.plain(result))
 
     @router.post("/api/nodes/{node_id}/admit")
     async def admit_node(node_id: str) -> Response:
@@ -272,7 +294,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return _not_implemented("Node admission", "registry")
         try:
             return JSONResponse(serialize.plain(admit(node_id)))
-        except KeyError:
+        except NodeNotFound:
             return errors.error_response(
                 404, f"No candidate '{node_id}'.",
                 "invalid_request_error", "node_not_found",
@@ -280,12 +302,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.delete("/api/nodes/{node_id}")
     async def remove_node(node_id: str) -> Response:
-        remove = getattr(ctx.deps.registry, "remove", None)
+        remove = getattr(ctx.deps.registry, "remove_node", None)
         if not callable(remove):
             return _not_implemented("Node removal", "registry")
         try:
             remove(node_id)
-        except KeyError:
+        except NodeNotFound:
             return errors.error_response(
                 404, f"No node '{node_id}'.", "invalid_request_error", "node_not_found"
             )
@@ -308,23 +330,47 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "invalid_request",
             )
         try:
-            measurement = ctx.deps.links.measure(a, b)
+            measurement = await asyncio.to_thread(ctx.deps.links.measure, a, b)
         except Exception as exc:
             log.exception("link measurement failed")
             return errors.error_response(
                 502, f"Measurement failed: {type(exc).__name__}.",
                 "server_error", "measure_failed",
             )
+        if measurement is None:
+            # Every rung of the measurement ladder failed. Never fabricate a
+            # bandwidth figure -- say plainly that nothing came back.
+            return errors.error_response(
+                503,
+                f"Measurement between '{a}' and '{b}' failed: every "
+                "measurement method (NCCL, RDMA probe, manual estimate) "
+                "came back empty.",
+                "server_error", "measurement_failed",
+            )
         return JSONResponse(serialize.link_payload(measurement))
 
     # -- routing -----------------------------------------------------------
 
+    def _routing_payload(index, config) -> dict:
+        sources = {k: v.source for k, v in index.raw_strength.items()}
+        circuits = ctx.breaker.opened_targets() if ctx.breaker else {}
+        node_ids = {tid: index.node_ids_for(tid) for tid in index.deployments}
+        return serialize.routing_payload(
+            config,
+            sources,
+            circuits,
+            auto_selected=ctx.router.auto_selected(config.served_name),
+            auto_reason=ctx.router.auto_reason(config.served_name),
+            flow=ctx.router.flow(config.served_name, config.policy),
+            zero_weight_reasons=index.zero_weight_reason,
+            node_ids=node_ids,
+        )
+
     @router.get("/api/routing")
     async def list_routing() -> JSONResponse:
         index = ctx.router.index()
-        sources = {k: v.source for k, v in index.raw_strength.items()}
         return JSONResponse(
-            [serialize.routing_payload(c, sources) for c in ctx.router.configs()]
+            [_routing_payload(index, c) for c in ctx.router.configs()]
         )
 
     @router.put("/api/routing/{served_name}")
@@ -358,8 +404,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "model_not_found",
             )
         index = ctx.router.index()
-        sources = {k: v.source for k, v in index.raw_strength.items()}
-        return JSONResponse(serialize.routing_payload(config, sources))
+        return JSONResponse(_routing_payload(index, config))
 
     # -- providers ---------------------------------------------------------
 
@@ -380,8 +425,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
+        add_async = getattr(ctx.deps.providers, "add_async", None)
         try:
-            provider = ctx.deps.providers.add(spec)
+            if callable(add_async):
+                provider = await add_async(spec)
+            else:
+                provider = await asyncio.to_thread(ctx.deps.providers.add, spec)
         except Exception as exc:
             log.exception("provider add failed")
             return errors.error_response(
@@ -404,7 +453,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         try:
             provider = update(provider_id, patch)
-        except KeyError:
+        except UnknownProviderError:
             return errors.error_response(
                 404, f"No provider '{provider_id}'.",
                 "invalid_request_error", "provider_not_found",
@@ -419,7 +468,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return _not_implemented("Provider removal", "provider store")
         try:
             remove(provider_id)
-        except KeyError:
+        except UnknownProviderError:
             return errors.error_response(
                 404, f"No provider '{provider_id}'.",
                 "invalid_request_error", "provider_not_found",
@@ -429,9 +478,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.post("/api/providers/{provider_id}/refresh")
     async def refresh_provider(provider_id: str) -> Response:
+        refresh_async = getattr(ctx.deps.providers, "refresh_async", None)
         try:
-            provider = ctx.deps.providers.refresh(provider_id)
-        except KeyError:
+            if callable(refresh_async):
+                provider = await refresh_async(provider_id)
+            else:
+                provider = await asyncio.to_thread(ctx.deps.providers.refresh, provider_id)
+        except UnknownProviderError:
             return errors.error_response(
                 404, f"No provider '{provider_id}'.",
                 "invalid_request_error", "provider_not_found",
@@ -466,8 +519,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     # -- plan and deployments ---------------------------------------------
 
-    def _plan_and_fit(payload: dict):
-        """Resolve, plan, check fit. Launches nothing."""
+    async def _plan_and_fit(payload: dict):
+        """Resolve, plan, check fit. Launches nothing.
+
+        Every port call here is potentially slow (network resolution, a
+        planner search, a fit calculation) and this runs inside an async
+        route, so each one is pushed to a worker thread rather than blocking
+        the event loop -- and with it every other in-flight request and
+        stream (M-14).
+        """
         model_id = payload.get("model_id")
         if not isinstance(model_id, str) or not model_id:
             raise ValueError("model_id is required")
@@ -475,8 +535,21 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         concurrency = int(payload.get("concurrency") or 1)
         target = payload.get("target") or "throughput"
         kv_dtype = payload.get("kv_dtype") or settings.default_kv_dtype
+        dtype = payload.get("dtype")
 
-        shape = ctx.deps.resolver.resolve(model_id, payload.get("dtype"))
+        # Prefer resolve_full when the port exposes it: it carries warnings
+        # worth showing and, on mixed-precision repos, real measured weight
+        # bytes that beat total_params * bytes_per_param (H-10).
+        resolve_full = getattr(ctx.deps.resolver, "resolve_full", None)
+        resolver_warnings: list[str] = []
+        weight_bytes: int | None = None
+        if callable(resolve_full):
+            resolution = await asyncio.to_thread(resolve_full, model_id, dtype)
+            shape = resolution.shape
+            resolver_warnings = list(resolution.warnings)
+            weight_bytes = resolution.effective_weight_bytes()
+        else:
+            shape = await asyncio.to_thread(ctx.deps.resolver.resolve, model_id, dtype)
 
         try:
             nodes = [n.profile for n in ctx.deps.registry.healthy_nodes()]
@@ -491,20 +564,31 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             except Exception:
                 log.exception("link lookup failed while planning")
 
-        plan = ctx.deps.planner.plan(shape, nodes, link, target, concurrency)
+        plan = await asyncio.to_thread(
+            ctx.deps.planner.plan,
+            shape,
+            nodes,
+            link,
+            target,
+            concurrency,
+            context_length=context_length,
+            kv_dtype=kv_dtype,
+        )
 
         plan_nodes = [n for n in nodes if n.node_id in set(plan.node_ids)] or nodes
-        fit = ctx.deps.fit.check(
+        fit = await asyncio.to_thread(
+            ctx.deps.fit.check,
             FitRequest(
                 shape=shape,
                 context_length=context_length,
                 max_concurrent_seqs=concurrency,
                 kv_dtype=kv_dtype,
                 plan=plan,
+                weight_bytes=weight_bytes,
             ),
             plan_nodes,
         )
-        return shape, plan, fit, context_length, concurrency
+        return shape, plan, fit, context_length, concurrency, resolver_warnings
 
     @router.post("/api/plan")
     async def plan_endpoint(request: Request) -> Response:
@@ -515,7 +599,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
         try:
-            shape, plan, fit, _, _ = _plan_and_fit(payload)
+            shape, plan, fit, _, _, resolver_warnings = await _plan_and_fit(payload)
         except ValueError as exc:
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
@@ -531,6 +615,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "shape": serialize.shape_payload(shape),
                 "plan": serialize.plan_payload(plan),
                 "fit": serialize.fit_payload(fit) if fit else None,
+                "resolver_warnings": resolver_warnings,
             }
         )
 
@@ -552,7 +637,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
         try:
-            shape, plan, fit, context_length, concurrency = _plan_and_fit(payload)
+            shape, plan, fit, context_length, concurrency, _ = await _plan_and_fit(
+                payload
+            )
         except ValueError as exc:
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
@@ -564,9 +651,27 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "plan_failed",
             )
 
+        # No verdict at all is never a launch, checked or not: fail loud
+        # rather than let a missing fit port silently mean "assume it fits".
+        if fit is None:
+            return errors.error_response(
+                503,
+                "the fit calculator is not wired; refusing to launch unchecked",
+                "server_error", "fit_unavailable",
+            )
+
+        runtime = payload.get("runtime") or "vllm"
+        supported_by = getattr(ctx.deps.resolver, "supported_by", None)
+        if callable(supported_by):
+            ok, reason = await asyncio.to_thread(supported_by, shape, runtime)
+            if not ok:
+                return errors.error_response(
+                    400, reason, "invalid_request_error", "runtime_unsupported"
+                )
+
         # If the verdict is WONT_FIT the launch is refused with the reason.
         # Nothing is started.
-        if fit is not None and fit.verdict is Verdict.WONT_FIT:
+        if fit.verdict is Verdict.WONT_FIT:
             return JSONResponse(
                 status_code=400,
                 content={
@@ -582,13 +687,20 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
 
         try:
-            deployment = ctx.deps.deployments.launch(
+            deployment = await asyncio.to_thread(
+                ctx.deps.deployments.launch,
                 shape,
                 plan,
                 fit,
-                payload.get("runtime") or "vllm",
+                runtime,
                 context_length,
                 concurrency,
+            )
+        except ValueError as exc:
+            # An input validation error -- e.g. a command-unsafe model id --
+            # not a launch that genuinely failed.
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "invalid_request"
             )
         except Exception as exc:
             log.exception("launch failed")
@@ -616,7 +728,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # Stop admitting immediately; in-flight requests finish on their own.
         ctx.admission.set_draining(deployment_id, True)
         try:
-            ctx.deps.deployments.stop(deployment_id)
+            await asyncio.to_thread(ctx.deps.deployments.stop, deployment_id)
         except Exception as exc:
             log.exception("stop failed")
             return errors.error_response(
@@ -649,5 +761,124 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # -- history -----------------------------------------------------------
+    #
+    # New endpoints, never a widened frame. Section 4.8 fixes the SSE payload
+    # and Agent H codes against it; a history surface belongs beside it, not
+    # inside it. Every answer says which resolution it used and which parts of
+    # the window were trimmed rather than quiet.
+
+    def _archive():
+        telemetry = getattr(ctx, "telemetry", None)
+        return getattr(telemetry, "archive", None) if telemetry else None
+
+    def _no_history() -> JSONResponse:
+        telemetry = getattr(ctx, "telemetry", None)
+        reason = getattr(telemetry, "reason", "") or "no archive on this node"
+        return errors.error_response(
+            503,
+            f"No telemetry history is being kept: {reason}.",
+            "server_error",
+            "history_unavailable",
+        )
+
+    async def _history(fn, **kwargs) -> Response:
+        archive = _archive()
+        if archive is None:
+            return _no_history()
+        try:
+            return JSONResponse(await asyncio.to_thread(fn, archive, **kwargs))
+        except Exception as exc:
+            log.exception("history query failed")
+            return errors.error_response(
+                502,
+                f"Could not read history: {type(exc).__name__}.",
+                "server_error",
+                "history_failed",
+            )
+
+    @router.get("/api/history/nodes")
+    async def history_nodes(
+        node_id: str = "",
+        from_: str = Query("", alias="from"),
+        to: str = "",
+        step: str = "auto",
+        limit: int = tquery.config.QUERY_MAX_ROWS,
+    ) -> Response:
+        return await _history(
+            tquery.nodes,
+            node_id=node_id,
+            from_ts=from_,
+            to_ts=to,
+            step=step,
+            limit=limit,
+        )
+
+    @router.get("/api/history/requests")
+    async def history_requests(
+        served_name: str = "",
+        target_id: str = "",
+        from_: str = Query("", alias="from"),
+        to: str = "",
+        step: str = "auto",
+        limit: int = tquery.config.QUERY_MAX_ROWS,
+    ) -> Response:
+        return await _history(
+            tquery.requests,
+            served_name=served_name,
+            target_id=target_id,
+            from_ts=from_,
+            to_ts=to,
+            step=step,
+            limit=limit,
+        )
+
+    @router.get("/api/history/events")
+    async def history_events(
+        type: str = "",
+        deployment_id: str = "",
+        source: str = "",
+        from_: str = Query("", alias="from"),
+        to: str = "",
+        limit: int = 500,
+    ) -> Response:
+        return await _history(
+            tquery.events,
+            type=type,
+            deployment_id=deployment_id,
+            source=source,
+            from_ts=from_,
+            to_ts=to,
+            limit=limit,
+        )
+
+    @router.get("/api/history/logs")
+    async def history_logs(
+        level: str = "",
+        logger: str = "",
+        q: str = "",
+        node_id: str = "",
+        from_: str = Query("", alias="from"),
+        to: str = "",
+        limit: int = 500,
+    ) -> Response:
+        return await _history(
+            tquery.logs,
+            level=level,
+            logger=logger,
+            q=q,
+            node_id=node_id,
+            from_ts=from_,
+            to_ts=to,
+            limit=limit,
+        )
+
+    @router.get("/api/history/status")
+    async def history_status() -> Response:
+        telemetry = getattr(ctx, "telemetry", None)
+        if telemetry is None:
+            return JSONResponse({"enabled": False, "reason": "not configured"})
+        return JSONResponse(await asyncio.to_thread(telemetry.status))
 
     return router

@@ -24,6 +24,8 @@ from starlette.routing import Route
 from control_plane.contracts import (
     Deployment,
     DeploymentState,
+    DeviceClass,
+    NodeProfile,
     Provider,
     ProviderKind,
     ProviderModel,
@@ -37,7 +39,10 @@ from control_plane.gateway.stubs import (
     StubPlanner,
     StubResolver,
 )
+from control_plane.providers import UnknownProviderError
+from control_plane.registry import JoinRejected, NodeNotFound
 from tests.fixtures import (
+    LINKS,
     MODEL_SHAPES,
     NODE_PROFILES,
     fits,
@@ -83,6 +88,77 @@ class FakeRegistry:
                 n.memory_used = int(n.profile.addressable_memory * pct / 100.0)
 
 
+class FakeJoinableRegistry(FakeRegistry):
+    """A FakeRegistry that also implements the admission surface (H-5), with
+    the same method names and exception types as the real Registry for
+    handle_join and admit.
+
+    remove_node is the one place this fake is aspirational rather than
+    mirroring production: today's control_plane.registry.Registry.remove_node
+    (line ~396) pops every dict with a default and never raises NodeNotFound
+    for an unknown node_id -- it silently no-ops (confirmed against the real
+    Registry: DELETE on an unknown node currently returns 200, not 404). This
+    fake raises NodeNotFound anyway so the *route's* contract (call
+    remove_node, map NodeNotFound to 404, per this package's H-5 task) is
+    exercised end to end. Closing the real gap means Registry.remove_node
+    raising NodeNotFound for an absent node -- that is registry.py, outside
+    this package's ownership, and is called out as a cross-team follow-up
+    rather than silently masked here.
+    """
+
+    def __init__(self, *, states=None, reject_join=False):
+        super().__init__(states)
+        self.reject_join = reject_join
+        self.joins = []
+        self.admitted = []
+        self.removed = []
+
+    async def handle_join(self, token, profile, agent_url):
+        self.joins.append((token, profile, agent_url))
+        if self.reject_join:
+            raise JoinRejected("invalid cluster token")
+        if token:
+            return {
+                "node_id": profile.node_id,
+                "cluster_id": "c-test",
+                "status": "member",
+            }
+        return {"node_id": profile.node_id, "status": "candidate"}
+
+    def admit(self, node_id):
+        node = self.get_node(node_id)
+        if node is None:
+            raise NodeNotFound(node_id)
+        self.admitted.append(node_id)
+        return node
+
+    def remove_node(self, node_id):
+        node = self.get_node(node_id)
+        if node is None:
+            raise NodeNotFound(node_id)
+        self.removed.append(node_id)
+        self.states = [n for n in self.states if n.profile.node_id != node_id]
+
+    def candidates(self):
+        return []
+
+
+def make_node_profile(node_id="spark-99", device_class=DeviceClass.GB10):
+    return NodeProfile(
+        node_id=node_id,
+        hostname=node_id,
+        address="192.168.11.99",
+        device_class=device_class,
+        gpu_name="NVIDIA GB10",
+        gpu_count=1,
+        total_memory=GIB * 128,
+        addressable_memory=GIB * 119,
+        memory_bandwidth_gbps=273.0,
+        compute_capability="12.1",
+        driver_version="580.95.05",
+    )
+
+
 class FakeDeployments:
     def __init__(self, deployments=None):
         self.deployments = list(deployments or [])
@@ -126,8 +202,28 @@ class FakeProviders:
     def add(self, spec):
         raise NotImplementedError
 
+    def _find(self, provider_id):
+        provider = next(
+            (p for p in self.providers if p.provider_id == provider_id), None
+        )
+        if provider is None:
+            raise UnknownProviderError(provider_id)
+        return provider
+
     def refresh(self, provider_id):
-        return next(p for p in self.providers if p.provider_id == provider_id)
+        return self._find(provider_id)
+
+    def update(self, provider_id, patch):
+        provider = self._find(provider_id)
+        if "priority" in patch:
+            provider.priority = int(patch["priority"])
+        if "enabled" in patch:
+            provider.enabled = bool(patch["enabled"])
+        return provider
+
+    def remove(self, provider_id):
+        provider = self._find(provider_id)
+        self.providers.remove(provider)
 
     def models(self):
         return [(p.provider_id, m) for p in self.providers for m in p.models]
@@ -236,11 +332,30 @@ def build_deps(*, registry=None, deployments=None, providers=None, settings=None
 class FakeBackend:
     """An OpenAI-compatible runtime. Records what it was asked for."""
 
-    def __init__(self, *, chunk_delay=0.0, chunks=5, status=200, error_body=None):
+    def __init__(
+        self,
+        *,
+        chunk_delay=0.0,
+        chunks=5,
+        status=200,
+        error_body=None,
+        fail_first=0,
+        die_before_first_chunk=False,
+        first_chunk_delay=None,
+    ):
         self.chunk_delay = chunk_delay
         self.chunks = chunks
         self.status = status
         self.error_body = error_body
+        # Answer 500 to this many requests, then behave. A node that is coming
+        # back, rather than one that is simply broken.
+        self.fail_first = fail_first
+        # Send 200 and the headers, then drop the connection before the first
+        # SSE frame -- a node dying during prefill.
+        self.die_before_first_chunk = die_before_first_chunk
+        # Stall before the first frame only, to outlast the header hold budget
+        # without slowing the rest of the stream.
+        self.first_chunk_delay = first_chunk_delay
         self.requests: list[dict] = []
         self.headers: list[dict] = []
         # Set to a threading.Event to block responses. Only requests whose
@@ -265,6 +380,11 @@ class FakeBackend:
         body = await self._record(request)
         if self.hold is not None and HOLD_MARKER in json.dumps(body):
             await _await_event(self.hold)
+        if self.fail_first > 0:
+            self.fail_first -= 1
+            return JSONResponse(
+                self.error_body or {"error": "still starting up"}, status_code=500
+            )
         if self.status != 200:
             return JSONResponse(self.error_body or {"error": "backend said no"},
                                 status_code=self.status)
@@ -304,6 +424,12 @@ class FakeBackend:
     async def _sse(self):
         import asyncio
 
+        if self.die_before_first_chunk:
+            # Headers are already on the wire; dropping here is what a node
+            # that dies during prefill looks like from the gateway's side.
+            raise RuntimeError("backend died during prefill")
+        if self.first_chunk_delay:
+            await asyncio.sleep(self.first_chunk_delay)
         for i in range(self.chunks):
             if self.chunk_delay:
                 await asyncio.sleep(self.chunk_delay)
@@ -660,7 +786,9 @@ def test_streaming_response_is_not_buffered_into_content_length():
 # ---------------------------------------------------------------------------
 
 
-def make_router(*, deployments=None, providers=None, registry=None, settings=None):
+def make_router(
+    *, deployments=None, providers=None, registry=None, settings=None, breaker=None
+):
     """A router with no HTTP around it, for policy semantics."""
     from control_plane.gateway.admission import AdmissionController
     from control_plane.gateway.router import Router
@@ -687,6 +815,7 @@ def make_router(*, deployments=None, providers=None, registry=None, settings=Non
         stats=stats,
         admission=admission,
         settings=settings,
+        breaker=breaker,
     )
     router.rebuild(force_scores=True)
     return router, stats, admission
@@ -1424,12 +1553,18 @@ def test_an_unreachable_upstream_returns_502_without_inventing_a_status():
         )
     )
     with TestClient(create_app(deps)) as client:
+        began = time.monotonic()
         reply = client.post(
             "/v1/chat/completions",
             json={"model": "llama-3.3-70b", "messages": [{"role": "user", "content": "x"}]},
         )
+        elapsed = time.monotonic() - began
     assert reply.status_code == 502
     assert reply.json()["error"]["code"] == "upstream_unreachable"
+    # The canary for the retry loop's exclusion set: with only one target there
+    # is nowhere to fail over to, and retrying the same dead port would show up
+    # here as latency rather than as a wrong answer.
+    assert elapsed < 1.0, f"retried a target it had already tried ({elapsed:.2f}s)"
 
 
 # ---------------------------------------------------------------------------
@@ -1685,3 +1820,1091 @@ def test_memory_percentages_match_the_architecture_docs_topology_example():
     with TestClient(create_app(deps)) as client:
         assert client.get("/api/topology").json()["nodes"][0]["memory_used_pct"] == 78.0
         assert client.get("/api/nodes").json()[0]["memory_used_pct"] == 78.0
+
+
+# ---------------------------------------------------------------------------
+# failover: a node that dies mid-request is somebody else's to answer
+# ---------------------------------------------------------------------------
+
+
+def two_replicas(url_a, url_b, served="llama-3.3-70b"):
+    return FakeDeployments(
+        [
+            make_deployment("d-a", served, backend_url=url_a),
+            make_deployment("d-b", served, backend_url=url_b),
+        ]
+    )
+
+
+CHAT = {"model": "llama-3.3-70b", "messages": [{"role": "user", "content": "x"}]}
+
+
+def test_a_dead_replica_is_retried_on_a_live_one_and_the_client_never_learns():
+    """The promise is that a client never learns which node answered. A node
+    dying has to be held to the same promise."""
+    live = FakeBackend()
+    with RunningBackend(live) as running_live:
+        dead_port = _free_port()  # nothing is listening here
+        deps = build_deps(
+            deployments=two_replicas(f"http://127.0.0.1:{dead_port}/v1", running_live.base_url)
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post("/v1/chat/completions", json=CHAT)
+
+    assert reply.status_code == 200
+    assert reply.json()["choices"][0]["message"]["content"] == "hello"
+    assert len(live.requests) == 1
+    # Nothing in the answer hints that a node died.
+    assert "d-a" not in reply.text and "unreachable" not in reply.text
+
+
+def test_a_5xx_is_retried_on_another_target_but_a_4xx_is_not():
+    broken = FakeBackend(status=500, error_body={"error": "cuda oom"})
+    good = FakeBackend()
+    with RunningBackend(broken) as a, RunningBackend(good) as b:
+        deps = build_deps(deployments=two_replicas(a.base_url, b.base_url))
+        with TestClient(create_app(deps)) as client:
+            assert client.post("/v1/chat/completions", json=CHAT).status_code == 200
+    assert len(broken.requests) == 1 and len(good.requests) == 1
+
+    refusing = FakeBackend(status=422, error_body={"error": "bad request"})
+    spare = FakeBackend()
+    with RunningBackend(refusing) as a, RunningBackend(spare) as b:
+        deps = build_deps(deployments=two_replicas(a.base_url, b.base_url))
+        with TestClient(create_app(deps)) as client:
+            reply = client.post("/v1/chat/completions", json=CHAT)
+    assert reply.status_code == 422
+    # A 4xx is the backend working correctly. Asking somebody else is wrong.
+    assert len(spare.requests) == 0
+
+
+def test_an_exhausted_chain_returns_the_last_upstream_5xx_verbatim():
+    """Rule 2 has to survive the end of the chain, not just the first hop."""
+    first = FakeBackend(status=500, error_body={"error": "first node"})
+    second = FakeBackend(status=503, error_body={"object": "error", "message": "second node"})
+    with RunningBackend(first) as a, RunningBackend(second) as b:
+        deps = build_deps(deployments=two_replicas(a.base_url, b.base_url))
+        with TestClient(create_app(deps)) as client:
+            reply = client.post("/v1/chat/completions", json=CHAT)
+    assert reply.status_code == 503
+    assert reply.json() == {"object": "error", "message": "second node"}
+    # Nothing of ours is bolted onto a preserved backend error.
+    assert "retry-after" not in {k.lower() for k in reply.headers}
+
+
+def test_an_exhausted_transport_chain_returns_502_naming_how_many_were_tried():
+    ports = [_free_port(), _free_port()]
+    deps = build_deps(
+        deployments=two_replicas(*[f"http://127.0.0.1:{p}/v1" for p in ports])
+    )
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/v1/chat/completions", json=CHAT)
+    assert reply.status_code == 502
+    body = reply.json()["error"]
+    assert body["code"] == "upstream_unreachable"
+    assert "2 targets" in body["message"]
+
+
+def test_kv_commitments_are_released_after_every_failed_attempt():
+    """A chain that commits per attempt and releases none would 429 the one
+    healthy node it was trying to reach."""
+    live = FakeBackend()
+    with RunningBackend(live) as running:
+        deps = build_deps(
+            deployments=two_replicas(f"http://127.0.0.1:{_free_port()}/v1", running.base_url)
+        )
+        app = create_app(deps)
+        with TestClient(app) as client:
+            assert client.post("/v1/chat/completions", json=CHAT).status_code == 200
+            admission = app.state.ctx.admission
+            assert admission.committed("d-a") == 0
+            assert admission.committed("d-b") == 0
+
+
+def test_a_provider_key_is_never_carried_into_a_retry_against_a_local_backend():
+    """The remote branch rewrites the body and sets a bearer token. Neither may
+    survive into the next target's turn."""
+    local = FakeBackend()
+    with RunningBackend(local) as running:
+        provider = make_provider(
+            base_url=f"http://127.0.0.1:{_free_port()}/v1",  # dead, so it fails over
+            served_name="llama-3.3-70b",
+            upstream_id="meta/llama-3.3-70b-instruct",
+        )
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url)]
+            ),
+            providers=FakeProviders([provider]),
+        )
+        app = create_app(deps)
+        with TestClient(app) as client:
+            app.state.ctx.router.set_policy("llama-3.3-70b", RoutingPolicy.COST_AWARE)
+            reply = client.post("/v1/chat/completions", json=CHAT)
+
+    assert reply.status_code == 200
+    seen = json.dumps(local.headers) + json.dumps(local.requests)
+    assert SECRET_KEY not in seen
+    assert "Bearer" not in json.dumps(local.headers)
+    # The provider's name for the model must not reach a vLLM either.
+    assert local.requests[0]["model"] == "llama-3.3-70b"
+
+
+def test_a_backend_that_dies_before_its_first_chunk_is_retried():
+    """Holding the response line until the first byte is what makes a node
+    dying during prefill recoverable."""
+    dying = FakeBackend(die_before_first_chunk=True)
+    live = FakeBackend()
+    with RunningBackend(dying) as a, RunningBackend(live) as b:
+        deps = build_deps(deployments=two_replicas(a.base_url, b.base_url))
+        with RunningServer(create_app(deps)) as gateway, httpx.Client(timeout=30) as client:
+            reply = client.post(
+                f"{gateway.url}/v1/chat/completions", json={**CHAT, "stream": True}
+            )
+    assert reply.status_code == 200
+    assert b"tok0" in reply.content
+    assert len(dying.requests) == 1 and len(live.requests) == 1
+
+
+def test_headers_are_released_when_the_first_chunk_outlasts_the_hold_budget():
+    """A long prefill is not a failure. Past the budget the status goes out and
+    the stream still completes -- the timeout must not cancel the read."""
+    settings = GatewaySettings()
+    settings.upstream_header_hold_s = 0.2
+    slow = FakeBackend(chunks=3, first_chunk_delay=0.8)
+    with RunningBackend(slow) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-1", "llama-3.3-70b", backend_url=running.base_url)]
+            ),
+            settings=settings,
+        )
+        with RunningServer(create_app(deps, settings=settings)) as gateway, httpx.Client(
+            timeout=30
+        ) as client:
+            began = time.monotonic()
+            with client.stream(
+                "POST", f"{gateway.url}/v1/chat/completions", json={**CHAT, "stream": True}
+            ) as response:
+                headers_at = time.monotonic() - began
+                assert response.status_code == 200
+                payload = b"".join(response.iter_raw())
+
+    assert headers_at < 0.7, f"headers held for {headers_at:.2f}s past the budget"
+    assert payload.count(b"data:") == 4  # three frames plus [DONE]
+
+
+def test_a_disconnected_stream_settles_its_outstanding_count():
+    """Audit H-1. GeneratorExit and CancelledError derive from BaseException,
+    so a client hanging up used to skip settle() entirely: the in-flight count
+    never came down and the KV commitment was never released."""
+    backend = FakeBackend(chunk_delay=0.3, chunks=20)
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-1", "llama-3.3-70b", backend_url=running.base_url)]
+            )
+        )
+        app = create_app(deps)
+        with RunningServer(app) as gateway, httpx.Client(timeout=30) as client:
+            with client.stream(
+                "POST", f"{gateway.url}/v1/chat/completions", json={**CHAT, "stream": True}
+            ) as response:
+                next(response.iter_raw())  # one chunk, then walk away
+            deadline = time.monotonic() + 5
+            ctx = app.state.ctx
+            while time.monotonic() < deadline:
+                if ctx.stats.outstanding("d-1") == 0 and ctx.admission.committed("d-1") == 0:
+                    break
+                time.sleep(0.05)
+
+    assert ctx.stats.outstanding("d-1") == 0, "in-flight count leaked on disconnect"
+    assert ctx.admission.committed("d-1") == 0, "KV commitment leaked on disconnect"
+
+
+# ---------------------------------------------------------------------------
+# circuit breaker: stop feeding a target the gateway watched fail
+# ---------------------------------------------------------------------------
+
+
+class Clock:
+    """A hand-cranked clock, so cooldowns are tested without sleeping."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def test_consecutive_transport_failures_bench_a_target_and_a_probe_brings_it_back():
+    from control_plane.gateway.breaker import CLOSED, HALF_OPEN, OPEN, CircuitBreaker
+
+    clock = Clock()
+    breaker = CircuitBreaker(failure_threshold=3, cooldown_s=30.0, clock=clock)
+
+    breaker.record_transport_failure("d-a")
+    breaker.record_transport_failure("d-a")
+    assert breaker.state("d-a") == CLOSED, "one failure is a coincidence"
+
+    breaker.record_transport_failure("d-a")
+    assert breaker.state("d-a") == OPEN and breaker.is_open("d-a")
+
+    clock.advance(30.1)
+    assert breaker.state("d-a") == HALF_OPEN
+    assert not breaker.is_open("d-a"), "half open stays selectable, to be probed"
+    assert breaker.begin("d-a") is True
+    assert breaker.begin("d-a") is False, "exactly one probe, however many ask"
+
+    breaker.record_success("d-a")
+    assert breaker.state("d-a") == CLOSED
+
+
+def test_a_failed_probe_buys_another_full_cooldown():
+    from control_plane.gateway.breaker import HALF_OPEN, OPEN, CircuitBreaker
+
+    clock = Clock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=10.0, clock=clock)
+    breaker.record_transport_failure("d-a")
+    clock.advance(10.1)
+    assert breaker.state("d-a") == HALF_OPEN
+    breaker.begin("d-a")
+    breaker.record_transport_failure("d-a")
+    assert breaker.state("d-a") == OPEN
+    clock.advance(9.0)
+    assert breaker.state("d-a") == OPEN, "a flapping node is not retried every tick"
+
+
+def test_a_benched_target_is_excluded_from_selection_and_returns_on_recovery():
+    from control_plane.gateway.breaker import CircuitBreaker
+
+    clock = Clock()
+    breaker = CircuitBreaker(failure_threshold=2, cooldown_s=30.0, clock=clock)
+    router, _, _ = make_router(
+        deployments=two_replicas("http://a/v1", "http://b/v1"), breaker=breaker
+    )
+    breaker.record_transport_failure("d-a")
+    breaker.record_transport_failure("d-a")
+    for _ in range(5):
+        assert router.select("llama-3.3-70b").target.target_id == "d-b"
+
+    breaker.record_success("d-a")
+    # Nothing is in flight, so least-outstanding breaks the tie on target_id:
+    # d-a winning again is exactly the proof that it is back in the running.
+    assert router.select("llama-3.3-70b").target.target_id == "d-a"
+
+
+def test_polling_the_routing_api_does_not_consume_the_half_open_probe():
+    """Router._refresh_live serves GET /api/routing as well as real requests.
+    A breaker read there that claimed the probe would let an open UI eat every
+    one of them, and no benched target would ever come back."""
+    from control_plane.gateway.breaker import CircuitBreaker
+
+    clock = Clock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=10.0, clock=clock)
+    deps = build_deps(deployments=two_replicas("http://a/v1", "http://b/v1"))
+    app = create_app(deps)
+    with TestClient(app) as client:
+        app.state.ctx.router._breaker = breaker
+        breaker.record_transport_failure("d-a")
+        clock.advance(10.1)
+        for _ in range(20):
+            assert client.get("/api/routing").status_code == 200
+        assert breaker.begin("d-a") is True, "the UI ate the probe"
+
+
+def test_a_5xx_does_not_bench_a_target():
+    """One malformed request that every node rejects with a 500 must not take
+    the whole cluster out of rotation."""
+    broken = FakeBackend(status=500)
+    spare = FakeBackend(status=500)
+    with RunningBackend(broken) as a, RunningBackend(spare) as b:
+        deps = build_deps(deployments=two_replicas(a.base_url, b.base_url))
+        app = create_app(deps)
+        with TestClient(app) as client:
+            for _ in range(6):
+                client.post("/v1/chat/completions", json=CHAT)
+            assert app.state.ctx.breaker.opened_targets() == {}
+
+
+def test_a_benched_target_that_leaves_the_index_does_not_come_back_benched():
+    """Stopping and relaunching a deployment under the same id would otherwise
+    return it permanently benched, with nothing left to clear it."""
+    from control_plane.gateway.breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=300.0)
+    deployments = two_replicas("http://a/v1", "http://b/v1")
+    router, _, _ = make_router(deployments=deployments, breaker=breaker)
+    breaker.record_transport_failure("d-a")
+    assert breaker.is_open("d-a")
+
+    deployments.deployments[0].state = DeploymentState.FAILED
+    router.rebuild(force_scores=True)
+    deployments.deployments[0].state = DeploymentState.READY
+    router.rebuild(force_scores=True)
+
+    assert not breaker.is_open("d-a")
+    assert router.select("llama-3.3-70b").target.target_id == "d-a"
+
+
+def test_the_routing_api_says_why_a_target_is_benched():
+    from control_plane.gateway.breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=300.0)
+    deps = build_deps(deployments=two_replicas("http://a/v1", "http://b/v1"))
+    app = create_app(deps)
+    with TestClient(app) as client:
+        app.state.ctx.router._breaker = breaker
+        app.state.ctx.breaker = breaker
+        breaker.record_transport_failure("d-a")
+        targets = {t["target_id"]: t for t in client.get("/api/routing").json()[0]["targets"]}
+    assert targets["d-a"]["circuit"] == "open"
+    assert targets["d-b"]["circuit"] == "closed"
+    assert targets["d-a"]["healthy"] is False
+
+
+def test_the_retry_budget_caps_amplification_under_a_deterministic_500():
+    """A 500 the backend will give every node -- because the request is what it
+    objects to -- must not fan out across the fleet indefinitely."""
+    first = FakeBackend(status=500)
+    second = FakeBackend(status=500)
+    with RunningBackend(first) as a, RunningBackend(second) as b:
+        deps = build_deps(deployments=two_replicas(a.base_url, b.base_url))
+        app = create_app(deps)
+        with TestClient(app) as client:
+            for _ in range(20):
+                assert client.post("/v1/chat/completions", json=CHAT).status_code == 500
+            budget = app.state.ctx.retry_budget.snapshot()
+
+    upstream_calls = len(first.requests) + len(second.requests)
+    assert upstream_calls < 20 * 1.5, f"{upstream_calls} upstream calls for 20 requests"
+    assert budget["refused"] > 0
+
+
+# ---------------------------------------------------------------------------
+# parking: hold a request briefly when its node has just gone
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reason", ["memory_critical", "draining", "rate_limited"]
+)
+def test_a_blocked_target_is_refused_instantly_rather_than_parked(reason):
+    """Load shedding is a decision, not an outage. Queueing behind one hides
+    exactly what the operator needs to see."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url)]
+            )
+        )
+        app = create_app(deps)
+        with TestClient(app) as client:
+            assert client.post("/v1/chat/completions", json=CHAT).status_code == 200
+            app.state.ctx.admission.block("d-a", reason)
+            began = time.monotonic()
+            reply = client.post("/v1/chat/completions", json=CHAT)
+            elapsed = time.monotonic() - began
+
+    assert reply.status_code == 503
+    assert reply.json()["error"]["code"] == "no_target_admitting"
+    assert elapsed < 1.0, f"parked a deliberate refusal for {elapsed:.2f}s"
+
+
+def test_a_parked_request_is_dispatched_when_its_replica_recovers():
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deployments = FakeDeployments(
+            [make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url)]
+        )
+        deps = build_deps(deployments=deployments)
+        with TestClient(create_app(deps)) as client:
+            assert client.post("/v1/chat/completions", json=CHAT).status_code == 200
+
+            deployments.deployments[0].state = DeploymentState.FAILED
+            recover = threading.Timer(
+                0.6,
+                lambda: setattr(deployments.deployments[0], "state", DeploymentState.READY),
+            )
+            recover.start()
+            began = time.monotonic()
+            reply = client.post("/v1/chat/completions", json=CHAT)
+            elapsed = time.monotonic() - began
+            recover.join()
+
+    assert reply.status_code == 200, "a request held over a restart should be answered"
+    assert 0.5 < elapsed < 5.0
+    assert len(backend.requests) == 2
+
+
+def test_a_parked_request_gives_up_at_the_deadline_rather_than_hanging():
+    settings = GatewaySettings()
+    settings.park_grace_s = 1.0
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deployments = FakeDeployments(
+            [make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url)]
+        )
+        deps = build_deps(deployments=deployments, settings=settings)
+        with TestClient(create_app(deps, settings=settings)) as client:
+            assert client.post("/v1/chat/completions", json=CHAT).status_code == 200
+            deployments.deployments[0].state = DeploymentState.FAILED
+            began = time.monotonic()
+            reply = client.post("/v1/chat/completions", json=CHAT)
+            elapsed = time.monotonic() - began
+
+    assert reply.status_code == 503
+    assert reply.json()["error"]["code"] == "no_target_admitting"
+    assert 0.9 < elapsed < 4.0, f"gave up after {elapsed:.2f}s"
+
+
+def test_parking_is_bounded_and_a_full_lot_refuses_immediately():
+    from control_plane.gateway.parking import ParkingLot
+
+    settings = GatewaySettings()
+    settings.park_max_waiters = 2
+    settings.park_max_per_model = 1
+    settings.park_max_body_bytes = 100
+    lot = ParkingLot(settings)
+
+    assert lot.accepts("llama-3.3-70b", 50)
+    assert not lot.accepts("llama-3.3-70b", 101), "an enormous prompt is not held"
+
+    settings.park_grace_s = 0.0
+    assert not ParkingLot(settings).accepts("llama-3.3-70b", 1), "zero grace disables it"
+
+
+def test_parking_never_applies_to_a_model_that_never_served():
+    """Unknown and still-launching both already have an honest answer."""
+    deps = build_deps(deployments=FakeDeployments([]))
+    with TestClient(create_app(deps)) as client:
+        began = time.monotonic()
+        reply = client.post("/v1/chat/completions", json={"model": "nope", "messages": []})
+        elapsed = time.monotonic() - began
+    assert reply.status_code == 404
+    assert elapsed < 1.0
+
+
+# ---------------------------------------------------------------------------
+# node admission: join, admit, remove (H-5)
+# ---------------------------------------------------------------------------
+
+
+def test_join_with_a_bad_token_is_rejected_with_403():
+    registry = FakeJoinableRegistry(reject_join=True)
+    deps = build_deps(registry=registry)
+    profile = make_node_profile()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/nodes/join",
+            json={
+                "token": "wrong-token",
+                "profile": {
+                    "node_id": profile.node_id,
+                    "hostname": profile.hostname,
+                    "address": profile.address,
+                    "device_class": profile.device_class.value,
+                    "gpu_name": profile.gpu_name,
+                    "gpu_count": profile.gpu_count,
+                    "total_memory": profile.total_memory,
+                    "addressable_memory": profile.addressable_memory,
+                    "memory_bandwidth_gbps": profile.memory_bandwidth_gbps,
+                    "compute_capability": profile.compute_capability,
+                    "driver_version": profile.driver_version,
+                },
+                "agent_url": "http://192.168.11.99:8770",
+            },
+        )
+    assert reply.status_code == 403
+    assert reply.json()["error"]["code"] == "join_rejected"
+
+
+def test_join_with_no_token_passes_through_the_candidate_status():
+    registry = FakeJoinableRegistry()
+    deps = build_deps(registry=registry)
+    profile = make_node_profile()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/nodes/join",
+            json={
+                "profile": {
+                    "node_id": profile.node_id,
+                    "hostname": profile.hostname,
+                    "address": profile.address,
+                    "device_class": profile.device_class.value,
+                    "gpu_name": profile.gpu_name,
+                    "gpu_count": profile.gpu_count,
+                    "total_memory": profile.total_memory,
+                    "addressable_memory": profile.addressable_memory,
+                    "memory_bandwidth_gbps": profile.memory_bandwidth_gbps,
+                    "compute_capability": profile.compute_capability,
+                    "driver_version": profile.driver_version,
+                },
+                "agent_url": "http://192.168.11.99:8770",
+            },
+        )
+    # Passed through as-is: 200, no cluster_id, "candidate" -- never rejected.
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["status"] == "candidate"
+    assert body["node_id"] == profile.node_id
+    token, sent_profile, agent_url = registry.joins[0]
+    assert token is None
+    assert sent_profile.node_id == profile.node_id
+    assert agent_url == "http://192.168.11.99:8770"
+
+
+def test_join_with_a_malformed_body_is_a_400_not_a_500():
+    deps = build_deps(registry=FakeJoinableRegistry())
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/api/nodes/join", json={"agent_url": "http://x"})
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_join_body"
+
+
+def test_join_gracefully_degrades_when_the_registry_has_no_handle_join():
+    deps = build_deps(registry=FakeRegistry())  # no handle_join at all
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/nodes/join",
+            json={"profile": {"node_id": "x"}, "agent_url": "http://x"},
+        )
+    assert reply.status_code == 501
+    assert reply.json()["error"]["code"] == "not_implemented"
+
+
+def test_admit_unknown_candidate_is_404():
+    deps = build_deps(registry=FakeJoinableRegistry())
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/api/nodes/no-such-node/admit")
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "node_not_found"
+
+
+def test_admit_a_known_candidate_succeeds():
+    registry = FakeJoinableRegistry()
+    deps = build_deps(registry=registry)
+    node_id = registry.states[0].profile.node_id
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(f"/api/nodes/{node_id}/admit")
+    assert reply.status_code == 200
+    assert reply.json()["profile"]["node_id"] == node_id
+    assert registry.admitted == [node_id]
+
+
+def test_remove_unknown_node_is_404():
+    # Exercises the route's own contract (remove_node -> NodeNotFound -> 404).
+    # See FakeJoinableRegistry's docstring: the real Registry.remove_node does
+    # not raise this today (it pops silently and the route would 200), which
+    # is a registry.py gap outside this package's ownership, not a claim that
+    # this test proves 404 against the real Registry as it stands.
+    deps = build_deps(registry=FakeJoinableRegistry())
+    with TestClient(create_app(deps)) as client:
+        reply = client.delete("/api/nodes/no-such-node")
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "node_not_found"
+
+
+def test_remove_a_known_node_succeeds():
+    registry = FakeJoinableRegistry()
+    deps = build_deps(registry=registry)
+    node_id = registry.states[0].profile.node_id
+    with TestClient(create_app(deps)) as client:
+        reply = client.delete(f"/api/nodes/{node_id}")
+    assert reply.status_code == 200
+    assert reply.json() == {"removed": node_id}
+    assert registry.removed == [node_id]
+
+
+def test_the_default_stub_registry_wires_the_same_admission_surface():
+    """gateway/stubs.py's StubRegistry must expose the real method names and
+    exceptions, not just the RegistryPort trio (H-5)."""
+    with TestClient(create_app()) as client:
+        assert client.get("/api/nodes/candidates").json() == []
+        admit_reply = client.post("/api/nodes/spark-01/admit")
+        assert admit_reply.status_code == 200
+        missing = client.post("/api/nodes/does-not-exist/admit")
+        assert missing.status_code == 404
+        removed = client.delete("/api/nodes/spark-01")
+        assert removed.status_code == 200
+        join_reply = client.post(
+            "/api/nodes/join",
+            json={"profile": {"node_id": "x"}, "agent_url": "http://x"},
+        )
+        # The stub genuinely cannot accept a join; degrades to 501 rather
+        # than crashing with an unhandled NotImplementedError.
+        assert join_reply.status_code == 501
+
+
+# ---------------------------------------------------------------------------
+# provider admin: PATCH, DELETE, refresh of an unknown provider (M-21)
+# ---------------------------------------------------------------------------
+
+
+def test_patch_unknown_provider_is_404_not_501():
+    deps = build_deps(providers=FakeProviders([make_provider()]))
+    with TestClient(create_app(deps)) as client:
+        reply = client.patch("/api/providers/no-such-provider", json={"priority": 1})
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "provider_not_found"
+
+
+def test_patch_a_known_provider_updates_it():
+    providers = FakeProviders([make_provider(priority=10)])
+    deps = build_deps(providers=providers)
+    with TestClient(create_app(deps)) as client:
+        reply = client.patch("/api/providers/openrouter", json={"priority": 5})
+    assert reply.status_code == 200
+    assert reply.json()["priority"] == 5
+
+
+def test_delete_unknown_provider_is_404_not_501():
+    deps = build_deps(providers=FakeProviders([make_provider()]))
+    with TestClient(create_app(deps)) as client:
+        reply = client.delete("/api/providers/no-such-provider")
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "provider_not_found"
+
+
+def test_delete_a_known_provider_removes_it():
+    providers = FakeProviders([make_provider()])
+    deps = build_deps(providers=providers)
+    with TestClient(create_app(deps)) as client:
+        reply = client.delete("/api/providers/openrouter")
+    assert reply.status_code == 200
+    assert client.get("/api/providers").json() == []
+
+
+def test_refresh_unknown_provider_is_404():
+    deps = build_deps(providers=FakeProviders([make_provider()]))
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/api/providers/no-such-provider/refresh")
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "provider_not_found"
+
+
+def test_the_default_stub_providers_support_patch_and_delete():
+    with TestClient(create_app()) as client:
+        assert client.patch(
+            "/api/providers/openrouter", json={"priority": 1}
+        ).status_code == 200
+        assert client.delete("/api/providers/openrouter").status_code == 200
+        assert client.delete("/api/providers/openrouter").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# plan and deployments: fit_unavailable, runtime_unsupported, launch ValueError
+# ---------------------------------------------------------------------------
+
+
+def test_create_deployment_refuses_to_launch_unchecked_when_fit_is_unavailable():
+    """H-3: no fit port answer is never treated as an implicit pass."""
+
+    class NoFit:
+        def check(self, req, nodes):
+            return None
+
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    deps.fit = NoFit()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+        )
+    assert reply.status_code == 503
+    assert reply.json()["error"]["code"] == "fit_unavailable"
+    assert deployments.launched == []
+
+
+def test_plan_endpoint_tolerates_fit_being_unavailable():
+    """/api/plan may still answer with fit: null (H-3 only guards launch)."""
+
+    class NoFit:
+        def check(self, req, nodes):
+            return None
+
+    deps = build_deps()
+    deps.fit = NoFit()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+        )
+    assert reply.status_code == 200
+    assert reply.json()["fit"] is None
+
+
+def test_create_deployment_refuses_an_unsupported_runtime():
+    """M-11: resolver.supported_by is consulted when the port exposes it."""
+
+    class UnsupportingResolver(StubResolver):
+        def supported_by(self, shape, runtime):
+            return False, f"{runtime} has no adapter for this architecture"
+
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    deps.resolver = UnsupportingResolver()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "runtime": "sglang",
+            },
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "runtime_unsupported"
+    assert reply.json()["error"]["message"] == "sglang has no adapter for this architecture"
+    assert deployments.launched == []
+
+
+def test_create_deployment_maps_a_launch_value_error_to_400():
+    """M-11: a launch-time input validation error is a 400, not a 502."""
+
+    class RejectingDeployments(FakeDeployments):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs):
+            raise ValueError("model id is not a safe command argument")
+
+    deployments = RejectingDeployments()
+    deps = build_deps(deployments=deployments)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_request"
+    assert "not a safe command argument" in reply.json()["error"]["message"]
+    assert deployments.launched == []
+
+
+def test_plan_and_deployment_use_resolve_full_when_the_resolver_exposes_it():
+    """M-9/H-10: resolve_full wins, carries its warnings, and its measured
+    weight bytes reach the fit request."""
+    from control_plane.resolver.support import build_verdict
+    from control_plane.resolver.types import ParamSource, QuantSource, Resolution
+
+    shape = MODEL_SHAPES["llama-3.3-70b"]
+    resolution = Resolution(
+        shape=shape,
+        revision="main",
+        param_source=ParamSource.SAFETENSORS_HEADERS,
+        quant_source=QuantSource.QUANT_CONFIG,
+        support=build_verdict((), shape.dtype),
+        warnings=["least reliable source: config estimate"],
+        weight_bytes=int(shape.total_params * shape.bytes_per_param()) + 3 * GIB,
+    )
+
+    class ResolveFullResolver(StubResolver):
+        def __init__(self):
+            self.seen_weight_bytes = None
+
+        def resolve_full(self, model_id, dtype=None):
+            return resolution
+
+    seen_fit_requests = []
+
+    class RecordingFit(StubFit):
+        def check(self, req, nodes):
+            seen_fit_requests.append(req)
+            return fits()
+
+    deps = build_deps()
+    deps.resolver = ResolveFullResolver()
+    deps.fit = RecordingFit()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan", json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"}
+        )
+    assert reply.status_code == 200
+    assert reply.json()["resolver_warnings"] == ["least reliable source: config estimate"]
+    assert seen_fit_requests[0].weight_bytes == resolution.weight_bytes
+
+
+def test_plan_reports_no_resolver_warnings_when_the_port_lacks_resolve_full():
+    deps = build_deps()  # StubResolver has no resolve_full
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan", json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"}
+        )
+    assert reply.status_code == 200
+    assert reply.json()["resolver_warnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# _plan_and_fit extras reach the ports (M-1), and the ports run off the event
+# loop (M-14). A design-review probe found both genuinely implemented but
+# unguarded by any test in this file -- close that gap directly.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_forwards_context_length_and_kv_dtype_to_the_planner():
+    seen_calls = []
+
+    class RecordingPlanner(StubPlanner):
+        def plan(self, shape, nodes, link, target, concurrency, *,
+                  context_length=None, kv_dtype=None):
+            seen_calls.append((context_length, kv_dtype))
+            return super().plan(
+                shape, nodes, link, target, concurrency,
+                context_length=context_length, kv_dtype=kv_dtype,
+            )
+
+    deps = build_deps()
+    deps.planner = RecordingPlanner()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "context": 32768,
+                "kv_dtype": "fp8",
+            },
+        )
+    assert reply.status_code == 200
+    assert seen_calls == [(32768, "fp8")]
+
+
+def test_plan_and_fit_port_calls_run_off_the_event_loop():
+    # asyncio.to_thread's default executor names its workers "asyncio_N"
+    # (thread_name_prefix='asyncio' in BaseEventLoop.run_in_executor) --
+    # distinct from both pytest's MainThread and the event-loop thread
+    # TestClient/anyio runs the ASGI app on. Recording the thread name from
+    # inside each port call is a direct check that M-14 wrapped it in
+    # to_thread, not just a check that it avoided one specific thread.
+    seen_threads = {}
+
+    class RecordingResolver(StubResolver):
+        def resolve(self, model_id, dtype=None):
+            seen_threads["resolver"] = threading.current_thread().name
+            return super().resolve(model_id, dtype)
+
+    class RecordingPlanner(StubPlanner):
+        def plan(self, shape, nodes, link, target, concurrency, **kw):
+            seen_threads["planner"] = threading.current_thread().name
+            return super().plan(shape, nodes, link, target, concurrency, **kw)
+
+    class RecordingFit(StubFit):
+        def check(self, req, nodes):
+            seen_threads["fit"] = threading.current_thread().name
+            return super().check(req, nodes)
+
+    deps = build_deps()
+    deps.resolver = RecordingResolver()
+    deps.planner = RecordingPlanner()
+    deps.fit = RecordingFit()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan", json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"}
+        )
+    assert reply.status_code == 200
+    assert seen_threads.keys() == {"resolver", "planner", "fit"}
+    for name in seen_threads.values():
+        assert name.startswith("asyncio_"), seen_threads
+
+
+# ---------------------------------------------------------------------------
+# routing payload extras: flow, auto_selected, auto_reason, zero_weight_reason,
+# node_ids (H-8)
+# ---------------------------------------------------------------------------
+
+
+def test_routing_payload_reports_auto_selection_and_its_reason():
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [
+                make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1"),
+                make_deployment("d-b", "llama-3.3-70b", backend_url="http://b/v1"),
+            ]
+        )
+    )
+    with TestClient(create_app(deps)) as client:
+        config = next(
+            c for c in client.get("/api/routing").json()
+            if c["served_name"] == "llama-3.3-70b"
+        )
+        assert config["auto_selected"] is True
+        assert config["policy"] == "least_outstanding"
+        assert config["auto_reason"]
+        assert config["flow"] is None  # not LOCAL_FIRST
+
+        put = client.put(
+            "/api/routing/llama-3.3-70b", json={"policy": "round_robin"}
+        ).json()
+        assert put["auto_selected"] is False
+        assert put["auto_reason"] is None
+
+
+def test_routing_payload_reports_flow_for_local_first_after_a_selection():
+    router, stats, _ = make_router(
+        deployments=FakeDeployments(
+            [
+                make_deployment(
+                    "d-a", "qwen3-30b-a3b", backend_url="http://a/v1",
+                    max_concurrent_seqs=2,
+                ),
+            ]
+        ),
+        providers=FakeProviders([make_provider()]),
+    )
+    assert router.config_for("qwen3-30b-a3b").policy is RoutingPolicy.LOCAL_FIRST
+    # No selection made yet: flow is null even under LOCAL_FIRST.
+    assert router.flow("qwen3-30b-a3b", RoutingPolicy.LOCAL_FIRST) is None
+
+    selection = router.select("qwen3-30b-a3b")
+    assert selection.target.kind is TargetKind.LOCAL
+    assert router.flow("qwen3-30b-a3b", RoutingPolicy.LOCAL_FIRST) == "local"
+
+    stats.get("d-a").outstanding = 2  # saturate the only local target
+    selection = router.select("qwen3-30b-a3b")
+    assert selection.target.kind is TargetKind.REMOTE
+    assert router.flow("qwen3-30b-a3b", RoutingPolicy.LOCAL_FIRST) == "spilled"
+    # Reading /api/routing must never itself change the tracker (pure read).
+    for _ in range(3):
+        router.config_for("qwen3-30b-a3b")
+    assert router.flow("qwen3-30b-a3b", RoutingPolicy.LOCAL_FIRST) == "spilled"
+
+
+def test_routing_target_carries_node_ids_and_zero_weight_reason():
+    deps = build_deps(
+        deployments=two_unequal_replicas(strong_tps=100.0, weak_tps=1.0),
+    )
+    with TestClient(create_app(deps)) as client:
+        config = next(
+            c for c in client.get("/api/routing").json()
+            if c["served_name"] == "llama-3.3-70b"
+        )
+    targets = {t["target_id"]: t for t in config["targets"]}
+    assert targets["d-spark"]["node_ids"] == ["spark-01", "spark-02"]
+    assert targets["d-3090"]["node_ids"] == ["ws-3090"]
+    # The 3090 replica is far enough below the strong pair to be floored.
+    assert targets["d-3090"]["weight"] == 0.0
+    assert targets["d-3090"]["zero_weight_reason"] is not None
+    assert "15%" in targets["d-3090"]["zero_weight_reason"]
+    assert targets["d-spark"]["zero_weight_reason"] is None
+
+
+def test_remote_targets_never_carry_a_zero_weight_reason_or_node_ids():
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [make_deployment("d-local", "qwen3-30b-a3b", backend_url="http://a/v1")]
+        ),
+        providers=FakeProviders([make_provider()]),
+    )
+    with TestClient(create_app(deps)) as client:
+        config = next(
+            c for c in client.get("/api/routing").json()
+            if c["served_name"] == "qwen3-30b-a3b"
+        )
+    remote = next(t for t in config["targets"] if t["kind"] == "remote")
+    assert remote["zero_weight_reason"] is None
+    assert remote["node_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# node eligibility (H-8)
+# ---------------------------------------------------------------------------
+
+
+def test_node_payload_reports_eligible_when_healthy_and_identified():
+    with TestClient(create_app()) as client:
+        node = client.get("/api/nodes").json()[0]
+    assert node["eligible"] is True
+    assert node["ineligible_reason"] is None
+
+
+def test_node_payload_is_ineligible_when_unhealthy():
+    from tests.fixtures import node_state, NODE_PROFILES
+
+    unhealthy = node_state(NODE_PROFILES["spark-01"], healthy=False)
+    deps = build_deps(registry=FakeRegistry([unhealthy]))
+    with TestClient(create_app(deps)) as client:
+        node = client.get("/api/nodes").json()[0]
+    assert node["eligible"] is False
+    assert node["ineligible_reason"] == "node is unhealthy"
+
+
+def test_node_payload_is_ineligible_when_device_class_is_unrecognized():
+    from tests.fixtures import node_state
+
+    unknown_hw = make_node_profile(device_class=DeviceClass.UNKNOWN)
+    deps = build_deps(registry=FakeRegistry([node_state(unknown_hw)]))
+    with TestClient(create_app(deps)) as client:
+        node = client.get("/api/nodes").json()[0]
+    assert node["eligible"] is False
+    assert node["ineligible_reason"] == (
+        "device class is not recognized; cannot confirm this hardware is "
+        "eligible to join the pool"
+    )
+
+
+def test_candidate_payload_reports_eligibility_by_device_class():
+    from control_plane.gateway import serialize
+
+    eligible = serialize.candidate_payload(
+        {"node_id": "spark-05", "device_class": "gb10"}
+    )
+    assert eligible["eligible"] is True
+    assert eligible["ineligible_reason"] is None
+
+    ineligible = serialize.candidate_payload(
+        {"node_id": "mystery-box", "device_class": "unknown"}
+    )
+    assert ineligible["eligible"] is False
+    assert ineligible["ineligible_reason"]
+
+
+# ---------------------------------------------------------------------------
+# link honesty metadata (M-7) and measurement failure (M-8)
+# ---------------------------------------------------------------------------
+
+
+def test_link_payload_carries_honesty_metadata_when_annotated():
+    from control_plane.gateway import serialize
+    from control_plane.links.record import LinkAnnotation, annotate
+
+    bare = LINKS[("spark-01", "spark-02")]
+    annotated = annotate(
+        bare,
+        LinkAnnotation(
+            estimated=True,
+            raw_gbps=24.3,
+            scale_factor=0.42,
+            notes=("scaled from ib_write_bw",),
+        ),
+    )
+    payload = serialize.link_payload(annotated)
+    assert payload["estimated"] is True
+    assert payload["raw_gbps"] == 24.3
+    assert payload["scale_factor"] == 0.42
+    assert payload["notes"] == ["scaled from ib_write_bw"]
+
+
+def test_link_payload_omits_honesty_fields_for_a_bare_measurement():
+    from control_plane.gateway import serialize
+
+    payload = serialize.link_payload(LINKS[("spark-01", "spark-02")])
+    for key in ("estimated", "raw_gbps", "scale_factor", "notes"):
+        assert key not in payload
+
+
+def test_link_measure_returns_503_when_every_rung_fails():
+    class AlwaysFailsLinks(StubLinks):
+        def measure(self, a, b):
+            return None
+
+    deps = build_deps()
+    deps.links = AlwaysFailsLinks()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/links/measure", json={"a": "spark-01", "b": "spark-02"}
+        )
+    assert reply.status_code == 503
+    assert reply.json()["error"]["code"] == "measurement_failed"
+    assert "spark-01" in reply.json()["error"]["message"]
+    assert "spark-02" in reply.json()["error"]["message"]

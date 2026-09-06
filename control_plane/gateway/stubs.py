@@ -25,6 +25,8 @@ from control_plane.contracts import (
     ProviderKind,
     ProviderModel,
 )
+from control_plane.providers import UnknownProviderError
+from control_plane.registry import NodeNotFound
 
 try:  # shared day-0 fixtures: the same numbers every other agent tests against
     from tests.fixtures import (  # type: ignore[import-not-found]
@@ -60,7 +62,13 @@ def _fallback_shape(model_id: str) -> ModelShape:
 
 
 class StubRegistry:
-    """Two Sparks and a 3090, all healthy."""
+    """Two Sparks and a 3090, all healthy.
+
+    Method names and exception types mirror the real
+    :class:`control_plane.registry.Registry` (and its own day-0 stub,
+    :class:`control_plane.registry.StubRegistry`) exactly, so the gateway's
+    HTTP layer needs no stub-specific branch to degrade gracefully.
+    """
 
     def __init__(self) -> None:
         self._nodes = list(NODE_STATES.values()) if _HAVE_FIXTURES else []
@@ -73,6 +81,22 @@ class StubRegistry:
 
     def healthy_nodes(self):
         return [n for n in self._nodes if n.healthy]
+
+    # Beyond the port, mirroring control_plane.registry.Registry
+    def admit(self, node_id: str):
+        node = self.get_node(node_id)
+        if node is None:
+            raise NodeNotFound(node_id)
+        return node
+
+    def remove_node(self, node_id: str) -> None:
+        self._nodes = [n for n in self._nodes if n.profile.node_id != node_id]
+
+    def candidates(self) -> list[dict]:
+        return []
+
+    async def handle_join(self, token, profile, agent_url) -> dict:
+        raise NotImplementedError("stub registry does not accept joins")
 
 
 class StubLinks:
@@ -129,7 +153,20 @@ class StubFit:
 
 
 class StubPlanner:
-    def plan(self, shape, nodes, link, target, concurrency) -> ParallelismPlan:
+    def plan(
+        self,
+        shape,
+        nodes,
+        link,
+        target,
+        concurrency,
+        *,
+        context_length: int | None = None,
+        kv_dtype: str | None = None,
+    ) -> ParallelismPlan:
+        # context_length/kv_dtype are the real PlannerPort's keyword-only
+        # extras (00-architecture.md 4.7); this fixed-shape stub has no use
+        # for them but must not choke when a caller passes them.
         node_ids = [n.node_id for n in nodes] if nodes else ["spark-01"]
         if _HAVE_FIXTURES:
             if len(node_ids) >= 2:
@@ -323,14 +360,36 @@ class StubProviders:
         self._providers.append(provider)
         return provider
 
-    def refresh(self, provider_id: str) -> Provider:
+    def _find(self, provider_id: str) -> Provider:
         provider = next(
             (p for p in self._providers if p.provider_id == provider_id), None
         )
         if provider is None:
-            raise KeyError(provider_id)
+            raise UnknownProviderError(provider_id)
+        return provider
+
+    def refresh(self, provider_id: str) -> Provider:
+        provider = self._find(provider_id)
         provider.last_refreshed = time.time()
         return provider
+
+    def update(self, provider_id: str, patch: dict) -> Provider:
+        provider = self._find(provider_id)
+        if "enabled" in patch:
+            provider.enabled = bool(patch["enabled"])
+        if "priority" in patch:
+            provider.priority = int(patch["priority"])
+        if "display_name" in patch:
+            provider.display_name = str(patch["display_name"])
+        if "base_url" in patch:
+            provider.base_url = str(patch["base_url"])
+        if "api_key_ref" in patch:
+            provider.api_key_ref = str(patch["api_key_ref"])
+        return provider
+
+    def remove(self, provider_id: str) -> None:
+        provider = self._find(provider_id)
+        self._providers.remove(provider)
 
     def models(self) -> list[tuple[str, ProviderModel]]:
         return [(p.provider_id, m) for p in self._providers for m in p.models]

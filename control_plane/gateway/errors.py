@@ -69,3 +69,19 @@ def no_target_admitting(model: str) -> JSONResponse:
         "no_target_admitting",
         headers={"Retry-After": "5"},
     )
+
+
+def upstream_unreachable(model: str, detail: str, tried: int) -> JSONResponse:
+    """502 when no target for this model could be reached at all.
+
+    There is no backend error to preserve here: we never got one. Say that
+    plainly, and say how many targets were tried, rather than inventing an
+    upstream status.
+    """
+    attempts = "1 target" if tried == 1 else f"{tried} targets"
+    return error_response(
+        502,
+        f"No upstream for '{model}' is reachable: {detail} after trying {attempts}.",
+        "server_error",
+        "upstream_unreachable",
+    )

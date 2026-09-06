@@ -32,9 +32,33 @@ class GatewayDeps:
     planner: PlannerPort = None  # type: ignore[assignment]
     deployments: DeploymentPort = None  # type: ignore[assignment]
     providers: ProviderPort = None  # type: ignore[assignment]
+    # When True, a missing port is a startup error rather than a stub. For a
+    # deployment that means to run for real: silently falling back to fixture
+    # data is exactly the C-1 failure mode (a day-0 stub wearing a real
+    # gateway's clothes), and strict mode is how a composition root asserts
+    # "every port really is wired" instead of hoping it noticed.
+    strict: bool = False
     settings: GatewaySettings = field(default_factory=GatewaySettings)
 
     def __post_init__(self) -> None:
+        ports = {
+            "registry": self.registry,
+            "links": self.links,
+            "resolver": self.resolver,
+            "fit": self.fit,
+            "planner": self.planner,
+            "deployments": self.deployments,
+            "providers": self.providers,
+        }
+        if self.strict:
+            missing = [name for name, value in ports.items() if value is None]
+            if missing:
+                raise RuntimeError(
+                    "GatewayDeps(strict=True) requires every port to be "
+                    "supplied; missing: " + ", ".join(missing)
+                )
+            return
+
         from . import stubs
 
         if self.registry is None:
@@ -64,5 +88,19 @@ class GatewayContext:
     router: "object"
     proxy: "object"
     metrics: "object"
+    breaker: "object" = None
+    parking: "object" = None
+    retry_budget: "object" = None
+    # Durable telemetry. Defaults to the no-op sink so every existing
+    # construction of a GatewayContext keeps working unchanged.
+    sink: "object" = None
+    events: "object" = None
+    telemetry: "object" = None
     started_at: float = 0.0
     degraded_startup: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        from control_plane.telemetry import NULL_SINK
+
+        if self.sink is None:
+            self.sink = NULL_SINK

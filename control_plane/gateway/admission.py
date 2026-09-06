@@ -62,8 +62,15 @@ def kv_bytes_per_token_fallback(shape: ModelShape, kv_dtype: str) -> float:
     """
     elem = _KV_ELEMENT_BYTES.get(kv_dtype.lower(), 2.0)
     if shape.mla_latent_dim:
-        # MLA stores one compressed latent per layer, not separate K and V.
-        return shape.num_layers * shape.mla_latent_dim * elem
+        # MLA stores one compressed latent per layer, plus the decoupled RoPE
+        # component cached alongside it -- never the latent alone. Dropping
+        # the RoPE half under-counts a DeepSeek-family cache by about 11
+        # percent, in the OOM direction (M-10).
+        return (
+            shape.num_layers
+            * (shape.mla_latent_dim + shape.effective_mla_rope_dim)
+            * elem
+        )
     return 2.0 * shape.num_layers * shape.num_kv_heads * shape.effective_head_dim * elem
 
 
@@ -75,11 +82,13 @@ class AdmissionController:
         fit,
         deployments,
         settings: GatewaySettings,
+        events=None,
     ) -> None:
         self._registry = registry
         self._fit = fit
         self._deployments = deployments
         self._settings = settings
+        self._events = events
         # target_id -> set of reasons it is not admitting
         self._blocks: dict[str, set[str]] = {}
         # deployment_id -> outstanding KV commitment in bytes
@@ -122,6 +131,10 @@ class AdmissionController:
     def block(self, target_id: str, reason: str) -> None:
         if reason not in self._blocks.setdefault(target_id, set()):
             log.warning("no longer admitting to %s: %s", target_id, reason)
+            if self._events is not None:
+                self._events.admission_blocked(
+                    target_id, sorted(self._blocks[target_id] | {reason})
+                )
         self._blocks[target_id].add(reason)
 
     def unblock(self, target_id: str, reason: str) -> None:
@@ -131,6 +144,8 @@ class AdmissionController:
         reasons.discard(reason)
         if not reasons:
             self._blocks.pop(target_id, None)
+            if self._events is not None:
+                self._events.admission_cleared(target_id)
             log.info("admitting to %s again", target_id)
 
     def set_memory_critical(self, deployment_id: str, critical: bool) -> None:

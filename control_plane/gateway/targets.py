@@ -81,6 +81,10 @@ class TargetIndex:
     context_length: dict[str, int] = field(default_factory=dict)
     # served_name -> deployments that exist but cannot serve yet, for 503 bodies
     pending: dict[str, list[Deployment]] = field(default_factory=dict)
+    # target_id -> why the 15% weak-target floor benched it, None otherwise.
+    # Local targets only; a remote is never floored. Filled in by
+    # ``apply_scores`` alongside strength/weight.
+    zero_weight_reason: dict[str, str | None] = field(default_factory=dict)
 
     def served_names(self) -> list[str]:
         return sorted(set(self.targets) | set(self.pending))
@@ -91,6 +95,13 @@ class TargetIndex:
             for targets in self.targets.values()
             for t in targets
         }
+
+    def node_ids_for(self, target_id: str) -> list[str]:
+        """The deployment's plan node_ids for a local target, else []."""
+        dep = self.deployments.get(target_id)
+        if dep is None or dep.plan is None:
+            return []
+        return list(dep.plan.node_ids)
 
 
 def build_index(
@@ -125,6 +136,7 @@ def build_index(
         index.deployments[tid] = dep
         index.raw_strength[tid] = score
         index.capacity[tid] = dep.max_concurrent_seqs
+        index.zero_weight_reason[tid] = None  # filled in by apply_scores
         index.context_length.setdefault(dep.served_name, dep.context_length)
         index.targets.setdefault(dep.served_name, []).append(
             RouteTarget(
@@ -151,6 +163,7 @@ def build_index(
             index.remotes[tid] = (provider, model)
             index.raw_strength[tid] = remote_strength(tid, stats, settings)
             index.remote_priority[tid] = provider.priority
+            index.zero_weight_reason[tid] = None  # remotes are never floored
             index.context_length.setdefault(model.served_name, model.context_length)
             index.targets.setdefault(model.served_name, []).append(
                 RouteTarget(
@@ -200,6 +213,30 @@ def apply_scores(index: TargetIndex, settings: GatewaySettings) -> None:
                     group_raw[t.target_id] = neutral
 
         weights = compute_weights(group_raw, group_kinds, settings)
+
+        # Mirrors the floor condition inside compute_weights exactly (same
+        # group_raw, same group_kinds, same weak_target_floor), so that a
+        # target this determines was floored is always the same target that
+        # actually landed at weight 0.0 above. Kept here rather than in
+        # strength.py so compute_weights stays a pure weights-only function.
+        local_group_raw = [
+            v for tid, v in group_raw.items() if group_kinds[tid] is TargetKind.LOCAL
+        ]
+        strongest_local = max(local_group_raw) if local_group_raw else 0.0
+        floor = strongest_local * settings.weak_target_floor
+
         for t in targets:
             t.strength = strengths.get(t.target_id, 0.0)
             t.weight = weights.get(t.target_id, 0.0)
+            if (
+                t.kind is TargetKind.LOCAL
+                and strongest_local > 0
+                and group_raw.get(t.target_id, 0.0) < floor
+            ):
+                index.zero_weight_reason[t.target_id] = (
+                    f"strength is below {settings.weak_target_floor:.0%} of the "
+                    "strongest local replica serving this model; held as "
+                    "failover only"
+                )
+            else:
+                index.zero_weight_reason[t.target_id] = None
