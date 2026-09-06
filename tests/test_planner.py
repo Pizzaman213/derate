@@ -67,7 +67,7 @@ class FixedFit:
     def __init__(self, min_nodes: int) -> None:
         self._n = min_nodes
 
-    def min_nodes_required(self, shape, profile, context, max_seqs) -> int:
+    def min_nodes_required(self, shape, profile, context, max_seqs, kv_dtype="auto") -> int:
         return self._n
 
     def kv_bytes_per_token(self, shape, kv_dtype) -> float:
@@ -518,6 +518,45 @@ def test_a_multi_gpu_node_is_one_host_even_though_its_world_size_is_not_one():
     assert plan.expert_parallel == 2, "MoE shards experts across the GPUs in the box"
 
 
+def test_multi_gpu_single_node_override_only_emits_legal_degrees():
+    """M-2 repro: a 6-GPU node with a 64-head/8-KV-head dense model.
+
+    The override used to build ``Candidate(tp=gpus, ...)`` directly, outside
+    ``legality.py``. On this shape TP=6 is illegal (64 % 6 != 0, 8 % 6 != 0)
+    and would fail at load. The override must route through the same
+    divisibility rule as every other candidate, land on the largest legal
+    degree instead (4, here), and say so when GPUs are left idle by it.
+    """
+    six_gpu = dataclasses.replace(WS_3090, gpu_count=6, node_id="ws-six")
+    plans = Planner(fit=FixedFit(1)).alternatives(
+        LLAMA_3_3_70B, [six_gpu], None, "throughput", 8, context_length=4096
+    )
+
+    assert plans
+    for plan in plans:
+        tp = max(plan.tensor_parallel, 1)
+        assert LLAMA_3_3_70B.num_attention_heads % tp == 0, plan.reason
+        assert LLAMA_3_3_70B.num_kv_heads % tp == 0, plan.reason
+
+    chosen = plans[0]
+    assert chosen.kind is ParallelismKind.SINGLE_NODE
+    assert chosen.tensor_parallel == 4, "largest TP <= 6 dividing 64 and 8 is 4"
+    assert "idle" in chosen.reason
+
+
+def test_multi_gpu_single_node_override_uses_every_gpu_when_it_divides_evenly():
+    """The override is not just conservative -- when the degree does divide
+    every GPU, none of them sit idle and the reason says nothing about it."""
+    four_gpu = dataclasses.replace(WS_3090, gpu_count=4, node_id="ws-four")
+    plan = Planner(fit=FixedFit(1)).plan(
+        LLAMA_3_3_70B, [four_gpu], None, "throughput", 8, context_length=4096
+    )
+
+    assert plan.kind is ParallelismKind.SINGLE_NODE
+    assert plan.tensor_parallel == 4
+    assert "idle" not in plan.reason
+
+
 def test_hybrid_splits_are_considered_rather_than_assumed_away():
     """Published sweeps found TP2/PP8 beating TP4/PP4 for one model and the
     reverse for another. Symmetry is not automatically optimal, so the ranking
@@ -555,20 +594,67 @@ def test_capacity_shortfall_is_stated_rather_than_silently_planned_around():
     assert "fit check will refuse" in plan.reason
 
 
+def test_impossible_capacity_at_any_node_count_is_never_reported_as_a_fit():
+    """H-2 repro: ``min_nodes_required`` returns -1, meaning impossible at any
+    node count in the fit calculator's search range -- a different fact than
+    "needs more nodes than this cluster has" (a merely-large positive count,
+    covered above). The planner used to clamp -1 into a floor of 1, let a
+    single-node candidate through unchallenged, and hand it a reason that lied:
+    "the model fits within 107.7 GiB of usable memory on one node." The fit
+    gate still refused the launch, but the explanation shown to a user was
+    exactly backwards in the one case it exists to catch.
+
+    1 layer, 1 KV head, 10 trillion bf16 params, two Sparks: nothing fits this
+    at any node count up to the search ceiling. The reason must never claim a
+    fit, and the impossible-capacity warning must fire.
+    """
+    impossible = ModelShape(
+        model_id="test/impossible",
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        vocab_size=32000,
+        total_params=10_000_000_000_000,
+        dtype="bf16",
+    )
+    plan = Planner().plan(
+        impossible, SPARKS, LINK_SPARK_10G, "throughput", 1, context_length=4096
+    )
+
+    assert "the model fits" not in plan.reason
+    assert "fits within" not in plan.reason
+    assert "no node count in the search range fits this model" in plan.reason
+    assert "Warning" in plan.reason
+    assert any(
+        "no node count in the search range fits this model" in r
+        for r in plan.rejected
+    ), plan.rejected
+
+
 def test_planning_with_no_nodes_is_an_error_not_an_empty_plan():
     with pytest.raises(ValueError, match="no nodes"):
         Planner().plan(GPT_OSS_120B, [], LINK_SPARK_10G, "throughput", 16)
 
 
 def test_no_bandwidth_is_hardcoded_in_the_planner():
-    """The measured link is read every time. Never 10.2, never 25.
+    """The measured link is read every time. Never 10.2, never 25 -- and never
+    any other two-digit-GB/s-shaped literal smuggled in later, such as 40.0 or
+    12.0 typed in place of importing ``TP_VIABLE_THRESHOLD``.
 
     If a driver update enables GPUDirect RDMA the bandwidth roughly doubles and
     the answer must flip on its own. A literal anywhere in this package would
     silently freeze the decision at whatever the link was the day it was typed.
+
+    The pattern is deliberately shaped like a measured bandwidth or a
+    threshold (one or two digits, a decimal point, one or two more digits) so
+    it does not fire on the package's legitimate small constants -- byte
+    widths (``2.0``, ``4.0``), ratios (``0.99``), fractions of one -- which
+    never fall in that range. Contract imports (``TP_VIABLE_THRESHOLD``, a
+    name, not a number) and docstrings/comments are unaffected either way.
     """
     package = pathlib.Path(__file__).resolve().parent.parent / "control_plane" / "planner"
-    banned = re.compile(r"(?<![\w.])(10\.2|25\.0|9\.0|43\.0)(?![\w])")
+    banned = re.compile(r"(?<![\w.])([1-9]\d\.\d{1,2}|9\.0)(?![\w])")
 
     for path in sorted(package.glob("*.py")):
         for number, line in enumerate(path.read_text().splitlines(), start=1):

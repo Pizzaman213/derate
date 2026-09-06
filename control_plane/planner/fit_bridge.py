@@ -21,6 +21,7 @@ wins; nothing here is edited.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Protocol
 
@@ -33,6 +34,8 @@ from control_plane.contracts import (
 )
 
 from .constants import DEFAULT_KV_DTYPE, MAX_NODES_CONSIDERED
+
+log = logging.getLogger(__name__)
 
 # Bytes per KV element. Agent C owns the weight quantization table; KV cache
 # dtype is a separate axis and a much shorter list.
@@ -53,7 +56,12 @@ class FitHelpers(Protocol):
     """The slice of Agent D the planner depends on."""
 
     def min_nodes_required(
-        self, shape: ModelShape, profile: NodeProfile, context: int, max_seqs: int
+        self,
+        shape: ModelShape,
+        profile: NodeProfile,
+        context: int,
+        max_seqs: int,
+        kv_dtype: str = DEFAULT_KV_DTYPE,
     ) -> int: ...
 
     def kv_bytes_per_token(self, shape: ModelShape, kv_dtype: str) -> float: ...
@@ -79,8 +87,14 @@ def kv_bytes_per_token(shape: ModelShape, kv_dtype: str = DEFAULT_KV_DTYPE) -> f
 
     if shape.mla_latent_dim:
         # Multi-head latent attention caches one compressed vector per layer per
-        # token rather than per-head K and V.
-        return shape.num_layers * shape.mla_latent_dim * elem
+        # token, plus the decoupled RoPE component cached alongside it -- never
+        # the latent alone. Dropping the RoPE half under-counts a DeepSeek-family
+        # cache by roughly 11 percent, in the OOM direction.
+        return (
+            shape.num_layers
+            * (shape.mla_latent_dim + shape.effective_mla_rope_dim)
+            * elem
+        )
 
     per_layer = 2 * shape.num_kv_heads * shape.effective_head_dim * elem
     if shape.sliding_window and shape.layers_with_full_attention is not None:
@@ -95,7 +109,13 @@ def kv_total_bytes(
     elem = kv_elem_bytes(kv_dtype)
 
     if shape.mla_latent_dim:
-        per_token = shape.num_layers * shape.mla_latent_dim * elem
+        # Same correction as kv_bytes_per_token: latent plus decoupled RoPE,
+        # never the latent alone.
+        per_token = (
+            shape.num_layers
+            * (shape.mla_latent_dim + shape.effective_mla_rope_dim)
+            * elem
+        )
         return per_token * context * batch
 
     per_layer_per_token = 2 * shape.num_kv_heads * shape.effective_head_dim * elem
@@ -128,20 +148,30 @@ def min_nodes_required(
     """Fewest nodes of this profile that can hold the model at this workload.
 
     Walks the node count upward and charges the same budget the fit calculator
-    charges: weights and KV shard with the world size, activations and framework
-    overhead are replicated, and communication buffers only appear once anything
-    is sharded at all. Returns ``MAX_NODES_CONSIDERED`` when nothing in range
-    works, which the caller surfaces rather than silently truncating.
+    charges, with one deliberate simplification: rather than searching TP and PP
+    shards separately the way the real calculator does, every candidate ``n`` is
+    charged as the real calculator charges its *busiest pipeline stage* --
+    ``ceil(num_layers / n) / num_layers`` of the shardable weights and KV,
+    never a flat ``1/n``. An even divide is optimistic whenever the layer count
+    does not divide evenly by ``n`` (80 layers over 3 nodes is 27/27/26, and the
+    node holding 27 is the one that OOMs); charging the ceil'd fraction is what
+    keeps this fallback's own docstring promise -- it may ask for one node more
+    than strictly necessary, never one fewer. Activations and framework
+    overhead are replicated, and communication buffers only appear once
+    anything is sharded at all. Returns ``MAX_NODES_CONSIDERED`` when nothing in
+    range works, which the caller surfaces rather than silently truncating.
     """
     usable = profile.usable_memory()
     weights = shape.total_params * shape.bytes_per_param()
     replicated = shape.vision_params * shape.bytes_per_param()
     kv = kv_total_bytes(shape, kv_dtype, context, max_seqs)
     activations = activation_bytes(shape, max_seqs)
+    layers = max(1, shape.num_layers)
 
     for n in range(1, MAX_NODES_CONSIDERED + 1):
         if n == 1:
             comm = 0.0
+            stage_fraction = 1.0
         else:
             comm = float(COMM_BUFFER_BYTES)
             # Expert-parallel staging is the term other planners forget, and
@@ -150,41 +180,19 @@ def min_nodes_required(
             # is sharded at all.
             if shape.is_moe:
                 comm += float(EP_EXTRA_BUFFER_BYTES)
+            stage_fraction = math.ceil(layers / n) / layers
 
-        needed = (weights + kv) / n + activations + replicated + comm + FRAMEWORK_OVERHEAD
+        needed = (
+            (weights + kv) * stage_fraction
+            + activations
+            + replicated
+            + comm
+            + FRAMEWORK_OVERHEAD
+        )
         if needed <= usable:
             return n
 
     return MAX_NODES_CONSIDERED
-
-
-def context_that_fits_on(
-    shape: ModelShape, profile: NodeProfile, nodes: int, max_seqs: int, kv_dtype: str
-) -> int:
-    """Largest context that fits on ``nodes`` of this profile, rounded down to 512.
-
-    Used only to make a reason string specific ("drop context to 18944") rather
-    than vague. Agent D owns the authoritative version.
-    """
-    usable = profile.usable_memory()
-    weights = shape.total_params * shape.bytes_per_param()
-    replicated = shape.vision_params * shape.bytes_per_param()
-    activations = activation_bytes(shape, max_seqs)
-    comm = 0.0
-    if nodes > 1:
-        comm = float(COMM_BUFFER_BYTES)
-        if shape.is_moe:
-            comm += float(EP_EXTRA_BUFFER_BYTES)
-
-    fixed = weights / nodes + activations + replicated + comm + FRAMEWORK_OVERHEAD
-    budget = usable - fixed
-    if budget <= 0:
-        return 0
-
-    per_token = kv_bytes_per_token(shape, kv_dtype) * max_seqs / nodes
-    if per_token <= 0:
-        return 0
-    return int(math.floor(budget / per_token / 512) * 512)
 
 
 class _FallbackFit:
@@ -201,13 +209,29 @@ def default_fit_helpers() -> FitHelpers:
 
     Imported lazily and by name so that the planner does not hard-depend on a
     module that may land after it, and so that a partially written fit package
-    does not take the planner down with it.
+    does not take the planner down with it. Either way, swapping in the
+    fallback changes the capacity arithmetic a plan's reason and warnings rest
+    on, so it is never silent: falling back logs a warning naming why, at
+    import time, once per process -- not buried behind a passed exception a
+    reader would have to go looking for.
     """
     try:
         from control_plane import fit as _fit  # noqa: PLC0415
 
         if hasattr(_fit, "min_nodes_required") and hasattr(_fit, "kv_bytes_per_token"):
             return _fit  # type: ignore[return-value]
-    except Exception:  # pragma: no cover - depends on another agent's progress
-        pass
+        log.warning(
+            "control_plane.fit is importable but does not export "
+            "min_nodes_required/kv_bytes_per_token; planner falling back to "
+            "its own conservative capacity arithmetic (source=%r)",
+            _FallbackFit.source,
+        )
+    except Exception:
+        log.warning(
+            "control_plane.fit is not importable; planner falling back to its "
+            "own conservative capacity arithmetic (source=%r) instead of "
+            "Agent D's calculator",
+            _FallbackFit.source,
+            exc_info=True,
+        )
     return _FallbackFit()

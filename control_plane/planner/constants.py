@@ -46,8 +46,17 @@ MIN_NODES_FOR_CROSS_NODE_EP = 4
 # planner accepts it as an optional keyword and falls back to this.
 DEFAULT_PLAN_CONTEXT = 32768
 
-# Default KV cache element type when the caller does not name one.
-DEFAULT_KV_DTYPE = "fp16"
+# Default KV cache element type when the caller does not name one. "auto"
+# defers to the fit calculator's own per-model resolution (it follows the
+# model's own dtype when that dtype is cacheable, bf16 otherwise) rather than
+# the planner silently pinning a byte width of its own. Pinning a literal here
+# used to be cosmetic: kv_dtype was accepted and stored but never forwarded to
+# the capacity question, so this default -- and anything a caller passed --
+# had no effect on min_nodes_required at all. Now that it is forwarded
+# (``_facts``), "auto" keeps that historical no-op behavior for callers that
+# do not care, while a caller that does name a dtype finally reaches the
+# arithmetic it was meant to change.
+DEFAULT_KV_DTYPE = "auto"
 
 # Upper bound on the node count the capacity search will consider. A cluster
 # larger than this is not a thing we plan for.

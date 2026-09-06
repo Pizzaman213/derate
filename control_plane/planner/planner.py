@@ -41,7 +41,7 @@ from .constants import (
     PIPELINE_INFLIGHT_PER_STAGE,
 )
 from .fit_bridge import FitHelpers, default_fit_helpers
-from .legality import Candidate, enumerate_candidates, valid_tp_degrees
+from .legality import Candidate, enumerate_candidates, valid_ep_degrees, valid_tp_degrees
 from .topology import NodeGroup, exclusion_note, homogeneous_groups
 
 LATENCY_TARGET = "latency"
@@ -129,6 +129,35 @@ class _Facts:
         return self.link_gbps >= TP_VIABLE_THRESHOLD or self.latency_override
 
     @property
+    def capacity_impossible(self) -> bool:
+        """True when no node count in the fit calculator's search range works.
+
+        The real fit calculator returns ``-1`` for "impossible at any node
+        count up to its ceiling" -- a different fact than "needs more nodes
+        than this cluster has" (which returns a positive, merely large,
+        ``min_nodes``). Reading ``-1`` as a normal count and clamping it into
+        a floor produces a floor of 1, which makes a single-node plan look
+        legal and lets its reason claim the model fits when the honest answer
+        is that nothing was found to fit it anywhere.
+        """
+        return self.min_nodes < 1
+
+    @property
+    def capacity_floor(self) -> int:
+        """The node-count floor a legal candidate must meet.
+
+        Equal to ``min_nodes`` in the ordinary case. When capacity is
+        impossible at any count, that sentinel must never clamp down to a
+        permissive floor of 1 -- it is replaced with the whole group, which
+        forces the widest split available rather than silently degrading to a
+        single-node candidate wearing a fits-on-one-node reason it has not
+        earned.
+        """
+        if self.capacity_impossible:
+            return self.group.size
+        return self.min_nodes
+
+    @property
     def second_replica_possible(self) -> bool:
         """Whether the nodes this plan does not use could host another replica.
 
@@ -137,7 +166,11 @@ class _Facts:
         ranks paying interconnect cost on every token -- but only if there is
         actually enough of it for a whole second copy. When there is not, the
         spare nodes are just idle, and spreading wider is the better answer.
+        Impossible capacity is not "spare": there is no legitimate node count to
+        double against, so the wide-split answer applies here too.
         """
+        if self.capacity_impossible:
+            return False
         return self.min_nodes * 2 <= self.group.size
 
     @property
@@ -347,7 +380,7 @@ class Planner:
         group = groups[0]
         context = context_length or DEFAULT_PLAN_CONTEXT
         min_nodes = self._fit.min_nodes_required(
-            shape, group.exemplar, context, max(1, concurrency)
+            shape, group.exemplar, context, max(1, concurrency), kv_dtype=kv_dtype
         )
         return _Facts(
             shape=shape,
@@ -365,7 +398,7 @@ class Planner:
         cands = enumerate_candidates(
             facts.shape,
             facts.group.size,
-            facts.min_nodes,
+            facts.capacity_floor,
             facts.cross_node_ep_allowed,
         )
         if not cands:
@@ -402,8 +435,18 @@ class Planner:
         if head.kind is ParallelismKind.SINGLE_NODE:
             gpus = max(1, facts.group.exemplar.gpu_count)
             if gpus > 1:
-                ep = gpus if facts.shape.is_moe else 1
-                tp = 1 if facts.shape.is_moe else gpus
+                # Route through the same legality rules as every other
+                # candidate rather than assuming ``gpus`` itself divides the
+                # model: a 6-GPU node with a 64-head/8-KV-head dense model
+                # cannot run TP=6 (neither count is divisible by 6) and would
+                # fail at load. Use the largest degree that actually divides,
+                # and note the idle GPUs when that degree falls short.
+                if facts.shape.is_moe:
+                    ep = max(valid_ep_degrees(facts.shape, gpus))
+                    tp = 1
+                else:
+                    tp = max(valid_tp_degrees(facts.shape, gpus))
+                    ep = 1
                 scored[0] = _Scored(
                     candidate=Candidate(tp=tp, pp=1, ep=ep, dp=1),
                     kind=ParallelismKind.SINGLE_NODE,
@@ -469,13 +512,32 @@ class Planner:
         thresh = f"{TP_VIABLE_THRESHOLD:.0f} GB/s"
 
         if chosen.kind is ParallelismKind.SINGLE_NODE:
+            if facts.capacity_impossible:
+                return (
+                    f"no node count in the search range fits this model at "
+                    f"{facts.context} context and concurrency {c}; this is "
+                    f"offered as the closest available shape, not a working "
+                    f"plan, and the fit check will refuse it"
+                )
+
             usable = facts.group.exemplar.usable_memory() / 1024**3
             spare = facts.group.size - 1
+            gpus = max(1, facts.group.exemplar.gpu_count)
+            degree = max(cand.tp, cand.ep, 1)
+            idle_note = ""
+            if degree < gpus:
+                what = "expert count" if facts.shape.is_moe else "head counts"
+                idle_note = (
+                    f"; only {degree} of {gpus} GPUs on this node divide the "
+                    f"{what} evenly, so {_plural(gpus - degree, 'GPU')} "
+                    f"{'sits' if gpus - degree == 1 else 'sit'} idle"
+                )
             tail = (
-                f", so nothing crosses the interconnect; run a second replica on "
-                f"{facts.group.node_ids[1]} and let the gateway load balance"
+                f", so nothing crosses the interconnect{idle_note}; run a "
+                f"second replica on {facts.group.node_ids[1]} and let the "
+                f"gateway load balance"
                 if spare >= 1
-                else ", so nothing crosses an interconnect"
+                else f", so nothing crosses an interconnect{idle_note}"
             )
             return (
                 f"the model fits within {usable:.1f} GiB of usable memory on one node "
@@ -543,6 +605,14 @@ class Planner:
         )
 
     def _capacity_warning(self, facts: _Facts) -> str:
+        if facts.capacity_impossible:
+            return (
+                f"Warning: no node count in the search range fits this model "
+                f"at {facts.context} context and concurrency {facts.concurrency}, "
+                f"so no plan on this cluster will pass the fit check no matter "
+                f"how many nodes are used; reduce context, concurrency, or "
+                f"quantization."
+            )
         if facts.min_nodes <= facts.group.size:
             return ""
         if facts.min_nodes >= MAX_NODES_CONSIDERED:
@@ -581,7 +651,13 @@ class Planner:
                     + " for this model"
                 )
 
-        if facts.min_nodes > 1:
+        if facts.capacity_impossible:
+            out.append(
+                f"single node: illegal, no node count in the search range fits "
+                f"this model at {facts.context} context and concurrency "
+                f"{facts.concurrency}"
+            )
+        elif facts.min_nodes > 1:
             out.append(
                 f"single node: illegal, the model needs {facts.min_nodes} nodes at "
                 f"{facts.context} context and concurrency {facts.concurrency}, so one "

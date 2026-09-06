@@ -36,6 +36,23 @@ def valid_tp_degrees(shape: ModelShape, max_nodes: int) -> set[int]:
     return degrees
 
 
+def valid_ep_degrees(shape: ModelShape, max_nodes: int) -> set[int]:
+    """Expert-parallel degrees this MoE model can legally run at, up to ``max_nodes``.
+
+    ``num_experts % ep == 0`` -- an uneven split leaves one rank holding an
+    extra expert, and every all-to-all waits on the slowest rank. 1 is always
+    present: not sharding experts is always legal, including for a dense model
+    (``num_experts == 0``), for which no wider degree ever divides evenly.
+    """
+    degrees = {1}
+    if max_nodes < 2 or not shape.num_experts:
+        return degrees
+    for ep in range(2, max_nodes + 1):
+        if shape.num_experts % ep == 0:
+            degrees.add(ep)
+    return degrees
+
+
 def valid_pp_degrees(shape: ModelShape, max_nodes: int) -> set[int]:
     """Pipeline-parallel degrees this model can legally run at.
 
