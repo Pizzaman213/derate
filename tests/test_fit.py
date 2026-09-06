@@ -72,7 +72,7 @@ def make_plan(tp=1, pp=1, ep=1, dp=1, node_ids=()) -> ParallelismPlan:
 
 
 def request(
-    shape, context=8192, seqs=16, kv_dtype="auto", plan=None
+    shape, context=8192, seqs=16, kv_dtype="auto", plan=None, weight_bytes=None
 ) -> FitRequest:
     return FitRequest(
         shape=shape,
@@ -80,6 +80,7 @@ def request(
         max_concurrent_seqs=seqs,
         kv_dtype=kv_dtype,
         plan=plan or make_plan(),
+        weight_bytes=weight_bytes,
     )
 
 
@@ -179,6 +180,34 @@ def test_mla_kv_is_an_order_of_magnitude_below_the_head_wise_equivalent():
     )
 
     assert head_wise / mla >= 10, "MLA should be at least an order of magnitude cheaper"
+
+
+def test_mla_kv_charges_the_decoupled_rope_component_alongside_the_latent():
+    """The latent alone under-counts DeepSeek-family caches by about 11
+    percent, in the OOM direction: ``qk_rope_head_dim`` (64 here, via
+    ``mla_rope_dim``) is cached per token alongside the 512-wide latent, not
+    folded into it. Before this fix, per-token-per-layer bytes were
+    ``512 * elem`` (1024 bytes at bf16); charging the latent plus the RoPE
+    component makes it ``576 * elem`` (1152 bytes), a 12.5% increase -- the
+    complementary 512/576 = 88.9% is the ~11% under-count the audit found.
+    The head-wise-versus-MLA order-of-magnitude margin still comfortably
+    holds: 65536 / 1152 is about 56x, not the roughly 64x it would be against
+    the latent alone."""
+    assert DEEPSEEK_V3.mla_rope_dim == 64
+    assert DEEPSEEK_V3.effective_mla_rope_dim == 64
+
+    per_layer_per_token = kv_bytes_per_token(DEEPSEEK_V3, "bf16") / DEEPSEEK_V3.num_layers
+    assert per_layer_per_token == pytest.approx((512 + 64) * 2)  # bf16 = 2 bytes/elem
+
+    latent_alone = 512 * 2
+    assert per_layer_per_token / latent_alone == pytest.approx(576 / 512)
+
+    head_wise = kv_bytes_per_token(
+        dataclasses.replace(DEEPSEEK_V3, mla_latent_dim=None), "bf16"
+    ) / DEEPSEEK_V3.num_layers
+    assert head_wise == pytest.approx(65536)
+    assert head_wise / per_layer_per_token == pytest.approx(65536 / 1152)
+    assert head_wise / per_layer_per_token >= 10
 
 
 # --------------------------------------------------------------------------
@@ -325,6 +354,37 @@ def test_combined_refusal_lists_every_term(fit):
     assert "reduce concurrency" in result.reason
 
 
+def test_deepseek_two_sparks_guardrail_derivation_is_not_a_literal(fit):
+    """Brief D acceptance #2: DeepSeek-V3 at fp8 on two Sparks is WONT_FIT on
+    weights, needing a minimum of 7 nodes. The overflow figure has to be
+    derived from ``GB10_ADDRESSABLE * guardrail``, never a copy-pasted
+    literal -- so changing the guardrail on a fresh calculator must move the
+    percentage and the usable-GiB figure the reason names, and the reason
+    string as a whole must change with it."""
+    req = request(DEEPSEEK_V3, context=8192, seqs=16)
+
+    result = fit.check(req, TWO_SPARKS)
+    assert result.verdict is Verdict.WONT_FIT
+    assert result.limiting_term == "weights"
+    assert min_nodes_required(DEEPSEEK_V3, SPARK_01, 8192, 16) == 7
+    assert "7 nodes" in result.reason
+
+    stricter = FitCalculator(guardrail=0.80)  # 80% is a smaller usable pool than 90%
+    changed = stricter.check(req, TWO_SPARKS)
+
+    assert changed.verdict is Verdict.WONT_FIT
+    assert changed.limiting_term == "weights"
+    assert changed.reason != result.reason
+    assert result.usable_per_node != changed.usable_per_node
+    # The percentage named in the reason moves with the guardrail...
+    assert "90%" in result.reason
+    assert "80%" in changed.reason
+    # ...and so does the usable-GiB figure it is derived from, computed the
+    # same way the reason string computes it (never re-typed as a literal).
+    assert f"{result.usable_per_node / GIB:.1f} GiB" in result.reason
+    assert f"{changed.usable_per_node / GIB:.1f} GiB" in changed.reason
+
+
 def test_max_context_is_the_largest_that_fits(fit):
     """One rounding step past the suggestion must fail, or we are being
     needlessly conservative."""
@@ -340,6 +400,72 @@ def test_max_context_is_the_largest_that_fits(fit):
 
 def test_max_context_is_zero_when_the_weights_alone_do_not_fit(fit):
     assert fit.max_context(LLAMA_3_3_70B, make_plan(), ONE_SPARK, 16, "bf16") == 0
+
+
+def test_max_context_that_fits_is_none_not_zero_when_weights_alone_wont_fit(fit):
+    """0 is a context we verified fits. When weights alone (plus anything
+    replicated) already blow the budget -- the "context and concurrency
+    cannot fix this" refusal -- there is no such context, and the contract
+    sentinel for that is ``None``, never 0."""
+    result = fit.check(request(LLAMA_3_3_70B, context=8192, seqs=16), ONE_SPARK)
+
+    assert result.verdict is Verdict.WONT_FIT
+    assert result.limiting_term == "weights"
+    assert result.max_context_that_fits is None
+    assert "context and concurrency cannot fix this" in result.reason.lower()
+
+
+@pytest.mark.parametrize(
+    "label,req,nodes", REFUSAL_CASES, ids=[c[0] for c in REFUSAL_CASES]
+)
+def test_refusals_report_none_not_zero_when_no_context_helps(fit, label, req, nodes):
+    """0 is a context we verified fits. Every refusal's
+    ``max_context_that_fits`` must therefore be either ``None`` (no context,
+    not even zero tokens of cache, was found to fit) or a positive, verified
+    context -- never a bare 0 -- and this has to hold regardless of which
+    term the diagnosis names. A ``combined`` refusal where nothing fits is
+    exactly as unhelpful a "try 0 tokens" suggestion as a ``weights`` one, so
+    unlike the narrower predecessor of this test, nothing here is skipped."""
+    result = fit.check(req, nodes)
+    assert result.verdict is Verdict.WONT_FIT, f"{label} was expected to refuse"
+    assert result.max_context_that_fits != 0, (
+        f"{label} ({result.limiting_term}): max_context_that_fits must be "
+        f"None, not 0, when no context is being verified to fit"
+    )
+    if result.max_context_that_fits is not None:
+        assert result.max_context_that_fits > 0
+
+
+def test_weights_limited_refusals_report_none_not_zero(fit):
+    """The narrow case the earlier version of this test covered, kept as a
+    direct regression check: weights alone (plus anything replicated) blow
+    the budget, so no context -- not even zero tokens -- can help."""
+    result = fit.check(request(LLAMA_3_3_70B, context=8192, seqs=16), ONE_SPARK)
+    assert result.limiting_term == "weights"
+    assert result.max_context_that_fits is None
+
+
+def test_combined_limited_refusal_also_reports_none_not_zero(fit):
+    """The instance of this defect that survived the first pass: a refusal
+    diagnosed as ``combined`` (not ``weights``) where nothing fits still has
+    to report ``None``, not 0. 'deepseek tp6 at 8192 sequences' from
+    REFUSAL_CASES is exactly this case."""
+    result = fit.check(
+        request(DEEPSEEK_V3, context=4096, seqs=8192, plan=make_plan(tp=6)),
+        [SPARK_01, SPARK_02, SPARK_01, SPARK_02, SPARK_01, SPARK_02],
+    )
+    assert result.verdict is Verdict.WONT_FIT
+    assert result.limiting_term == "combined"
+    assert result.max_context_that_fits is None
+    assert result.headroom < 0
+    original_req = request(DEEPSEEK_V3, context=4096, seqs=8192, plan=make_plan(tp=6))
+    replay_at_zero = fit.check(
+        dataclasses.replace(original_req, context_length=0),
+        [SPARK_01, SPARK_02, SPARK_01, SPARK_02, SPARK_01, SPARK_02],
+    )
+    # Proof the 0 that used to be reported here was a lie: replaying at the
+    # context it would have suggested does NOT fit.
+    assert not replay_at_zero.ok
 
 
 # --------------------------------------------------------------------------
@@ -454,6 +580,154 @@ def test_vision_towers_are_replicated_not_split():
     assert breakdown.weights == int(70_000_000_000 * 2 / 4)
 
 
+def test_vision_towers_with_measured_weight_bytes_still_split_correctly():
+    """The one branch the H-10 spec explicitly called out as needing a
+    guard -- ``max(0.0, total_weight_bytes - vision_bytes)`` -- exercised
+    with a real vision-bearing shape, not just probed by hand. The vision
+    share is still priced from ``vision_params * bytes_per_param()`` and
+    subtracted out of the measured total; only the shardable remainder
+    should move."""
+    vision = dataclasses.replace(
+        LLAMA_3_3_70B, total_params=90_000_000_000, vision_params=20_000_000_000
+    )
+    plan = make_plan(tp=4)
+    vision_bytes = 20_000_000_000 * 2  # bf16
+
+    formula, _ = memory_breakdown(vision, plan, 8192, 8, "auto")
+    measured_total = int(weight_bytes_per_rank(vision, plan)) * 4 + vision_bytes
+    measured_total += 3 * GIB  # the resolver's on-disk gap, distributed over tp
+    measured, _ = memory_breakdown(
+        vision, plan, 8192, 8, "auto", weight_bytes=measured_total
+    )
+
+    # Replicated (vision) share is untouched -- it is priced from
+    # vision_params, never from the measured total.
+    assert measured.replicated == formula.replicated == int(20_000_000_000 * 2)
+    # Only the shardable remainder absorbs the +3 GiB, divided by tp.
+    assert measured.weights - formula.weights == 3 * GIB // 4
+
+    # The guard: a measured total at or below the vision share alone must
+    # floor the shardable part at zero rather than go negative.
+    starved = weight_bytes_per_rank(vision, plan, total_weight_bytes=1)
+    assert starved == 0.0
+    at_vision_share = weight_bytes_per_rank(
+        vision, plan, total_weight_bytes=vision_bytes - 1
+    )
+    assert at_vision_share == 0.0
+
+
+def test_min_nodes_required_and_nodes_phrase_use_the_measured_basis():
+    """H-10: a refusal's "it needs N nodes" fix has to be computed on the
+    same weight basis as the refusal itself, or the suggested node count can
+    be one that does not actually hold the measured checkpoint. LLAMA_3_3_70B
+    plus 60 GiB of measured overhead needs a 3rd node; the formula-only
+    search would (wrongly) still say 2."""
+    full_formula_bytes = weight_bytes_per_rank(LLAMA_3_3_70B, make_plan(tp=1, pp=1))
+    measured_bytes = int(full_formula_bytes) + 60 * GIB
+
+    formula_n = min_nodes_required(LLAMA_3_3_70B, SPARK_01, 8192, 16)
+    measured_n = min_nodes_required(
+        LLAMA_3_3_70B, SPARK_01, 8192, 16, weight_bytes=measured_bytes
+    )
+    assert formula_n == 2
+    assert measured_n == 3
+    assert measured_n != formula_n
+
+    # And the reason string threads the same basis through _nodes_phrase:
+    # the suggested node count must actually hold the measured checkpoint,
+    # not the (smaller, formula-only) count that would be wrong here.
+    fit = FitCalculator()
+    req = request(LLAMA_3_3_70B, context=8192, seqs=16, weight_bytes=measured_bytes)
+    result = fit.check(req, ONE_SPARK)
+    assert result.verdict is Verdict.WONT_FIT
+    assert f"{measured_n} nodes" in result.reason
+    assert f"{formula_n} nodes" not in result.reason
+
+
+# --------------------------------------------------------------------------
+# H-10: the resolver's measured weight_bytes beats the dtype formula
+# --------------------------------------------------------------------------
+
+
+def test_weight_bytes_shifts_the_breakdown_by_exactly_the_measured_gap():
+    """NOTES.md: the resolver's measured on-disk figure beats
+    ``total_params * bytes_per_param()`` -- on GPT-OSS-120B that gap is
+    close to 3 GiB, "the difference between fitting and not". Every other
+    term must be untouched."""
+    plan = make_plan()
+    formula, _ = memory_breakdown(GPT_OSS_120B, plan, 32768, 16, "auto")
+    measured_bytes = int(weight_bytes_per_rank(GPT_OSS_120B, plan)) + 3 * GIB
+    measured, _ = memory_breakdown(
+        GPT_OSS_120B, plan, 32768, 16, "auto", weight_bytes=measured_bytes
+    )
+
+    assert measured.weights - formula.weights == 3 * GIB
+    assert measured.total - formula.total == 3 * GIB
+    assert measured.kv_cache == formula.kv_cache
+    assert measured.activations == formula.activations
+    assert measured.comm_buffers == formula.comm_buffers
+    assert measured.replicated == formula.replicated
+    assert measured.framework_overhead == formula.framework_overhead
+
+
+def test_weight_bytes_none_or_non_positive_behaves_exactly_as_before(fit):
+    """``None`` -- and anything <= 0 -- must be pure no-ops: the formula
+    path, unchanged."""
+    plan = make_plan()
+    explicit_none, _ = memory_breakdown(
+        GPT_OSS_120B, plan, 32768, 16, "auto", weight_bytes=None
+    )
+    omitted, _ = memory_breakdown(GPT_OSS_120B, plan, 32768, 16, "auto")
+    zero, _ = memory_breakdown(GPT_OSS_120B, plan, 32768, 16, "auto", weight_bytes=0)
+    negative, _ = memory_breakdown(
+        GPT_OSS_120B, plan, 32768, 16, "auto", weight_bytes=-5
+    )
+    assert explicit_none == omitted == zero == negative
+
+    baseline = fit.check(request(GPT_OSS_120B, 32768, 16, plan=plan), ONE_SPARK)
+    with_none = fit.check(
+        request(GPT_OSS_120B, 32768, 16, plan=plan, weight_bytes=None), ONE_SPARK
+    )
+    assert with_none.breakdown == baseline.breakdown
+    assert with_none.verdict == baseline.verdict
+    assert with_none.reason == baseline.reason
+
+
+def test_weight_bytes_can_flip_a_near_boundary_verdict(fit):
+    """Not a paper 3 GiB shift somewhere with headroom to spare -- close
+    enough to the budget that the measured figure alone moves the verdict,
+    exactly the GPT-OSS-120B scenario NOTES.md warns about."""
+    plan = make_plan()
+    formula_weights = weight_bytes_per_rank(GPT_OSS_120B, plan)
+    baseline, _ = memory_breakdown(GPT_OSS_120B, plan, 32768, 16, "auto")
+    # A node with 1.5 GiB of headroom over the formula total: the formula
+    # fits comfortably, and the +3 GiB measured figure alone is enough to
+    # push it over.
+    usable_target = baseline.total + int(1.5 * GIB)
+    node = dataclasses.replace(
+        SPARK_01, addressable_memory=int(usable_target / fit.guardrail)
+    )
+
+    formula_result = fit.check(request(GPT_OSS_120B, 32768, 16, plan=plan), [node])
+    assert formula_result.verdict is Verdict.FITS
+    assert formula_result.headroom > 0
+
+    measured_result = fit.check(
+        request(
+            GPT_OSS_120B,
+            32768,
+            16,
+            plan=plan,
+            weight_bytes=int(formula_weights) + 3 * GIB,
+        ),
+        [node],
+    )
+    assert measured_result.verdict is Verdict.WONT_FIT
+    assert measured_result.headroom < 0
+    assert measured_result.limiting_term
+    assert measured_result.reason != formula_result.reason
+
+
 def test_usable_memory_is_the_guardrail_not_the_nameplate(fit):
     """107.7 GiB of the 119.7 addressable, not 128."""
     result = fit.check(request(QWEN3_30B_A3B, 4096, 8), ONE_SPARK)
@@ -504,6 +778,29 @@ def test_min_nodes_required_reports_impossible_rather_than_lying():
     assert min_nodes_required(DEEPSEEK_V3, tiny, 131072, 64) == -1
 
 
+def test_min_nodes_required_never_counts_an_illegal_tp_shard():
+    """The candidate search used to try every TP degree that divides the node
+    count, with no check that the shard is legal. On a 1-KV-head model that
+    reported min_nodes=4 via an impossible TP=4 shard (num_kv_heads % tp !=
+    0, replicated in the runtime, not split -- exactly what
+    ``planner/legality.py``'s ``valid_tp_degrees`` exists to forbid). With
+    the head-divisibility check, this shape has no legal shard at any node
+    count up to ``MAX_SEARCH_NODES`` -- 1 layer caps pipeline parallel at
+    PP=1, and 1 KV head caps tensor parallel at TP=1 -- so the honest answer
+    is -1, not a count reached by cheating the shard."""
+    no_legal_shard = ModelShape(
+        model_id="test/no-legal-shard",
+        num_layers=1,
+        hidden_size=4096,
+        num_attention_heads=4,
+        num_kv_heads=1,
+        vocab_size=32000,
+        total_params=200_000_000_000,
+        dtype="bf16",
+    )
+    assert min_nodes_required(no_legal_shard, SPARK_01, 4096, 8) == -1
+
+
 def test_predict_decode_tps_uses_active_params():
     """5.1B active is why GPT-OSS-120B outruns a dense 70B on the same box."""
     moe = predict_decode_tps(GPT_OSS_120B, 273.0, kv_read_bytes=0)
@@ -537,6 +834,11 @@ def test_stub_returns_valid_contract_types():
 
     big = stub.check(request(LLAMA_3_3_70B, 4096, 8), ONE_SPARK)
     assert big.verdict is Verdict.WONT_FIT
+    # The stub has to exercise the None sentinel too, or every consumer
+    # tested against it gets zero coverage of the branch the real
+    # calculator's contract just gained.
+    assert big.max_context_that_fits is None
+    assert result.max_context_that_fits is not None and result.max_context_that_fits > 0
 
 
 # --------------------------------------------------------------------------

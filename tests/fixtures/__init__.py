@@ -95,6 +95,7 @@ DEEPSEEK_V3 = ModelShape(
     num_experts_per_token=8,
     active_params=37_000_000_000,
     mla_latent_dim=512,
+    mla_rope_dim=64,  # qk_rope_head_dim in the published config
 )
 
 MODEL_SHAPES: dict[str, ModelShape] = {
@@ -268,7 +269,10 @@ def wont_fit(
         usable_per_node=int(GB10_ADDRESSABLE * 0.90),
         headroom=-(35 * GIB),
         reason=reason,
-        limiting_term="weights",
+        # "combined": weights plus KV together blow the budget, so the 16384
+        # context suggestion is meaningful. (A pure weights-limited refusal
+        # carries max_context_that_fits=None — no context change can fix it.)
+        limiting_term="combined",
         max_context_that_fits=16384,
         predicted_decode_tps=None,
         warnings=["MoE expert buffers are the dominant term"],

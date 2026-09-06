@@ -66,7 +66,11 @@ class StubFit:
                 else "stub fit: over the 100 GiB stub threshold"
             ),
             limiting_term="none" if fits else "weights",
-            max_context_that_fits=req.context_length if fits else 4096,
+            # The real calculator's contract sentinel for "no context helps"
+            # is None, never 0 or a made-up number -- exercise that branch
+            # here too, or every consumer tested against the stub gets zero
+            # coverage of it.
+            max_context_that_fits=req.context_length if fits else None,
             predicted_decode_tps=25.0,
             warnings=["stub fit calculator: these numbers are not a real gate"],
         )

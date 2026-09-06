@@ -73,6 +73,20 @@ def _options(fixes: list[str], *, capitalize: bool = False) -> str:
     return joined[0].upper() + joined[1:] if capitalize else joined
 
 
+def _reported_context(max_ctx: int) -> int | None:
+    """The contract sentinel for ``max_context_that_fits``.
+
+    ``max_ctx`` comes from ``_largest_context``, which returns 0 to mean
+    "not even one rounding step of cache fits" -- never "zero tokens of
+    context fits", which is not a claim we have verified. 0 must never cross
+    the port boundary: the sentinel for "there is no such context" is
+    ``None``. This applies to every refusal alike, regardless of which term
+    the diagnosis names -- a ``combined`` refusal where nothing at all fits
+    is exactly as unhelpful a "try 0 tokens" as a ``weights`` one.
+    """
+    return None if max_ctx == 0 else max_ctx
+
+
 def _dedup(items: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -126,6 +140,11 @@ def _candidate_shards(n: int, shape: ModelShape) -> list[ParallelismPlan]:
     for tp in range(1, n + 1):
         if n % tp:
             continue
+        if shape.num_attention_heads % tp or shape.num_kv_heads % tp:
+            # Mirrors planner/legality.py's valid_tp_degrees: a TP degree
+            # that does not divide both head counts fails at model load, so
+            # it is never a legal shard here either.
+            continue
         pp = n // tp
         if pp > shape.num_layers:
             continue
@@ -160,12 +179,19 @@ def min_nodes_required(
     max_seqs: int,
     kv_dtype: str = "auto",
     guardrail: float = DEFAULT_GUARDRAIL,
+    weight_bytes: int | None = None,
 ) -> int:
     """Fewest nodes of this kind that hold the model at this context and
     concurrency, under the most memory-efficient shard available at each size.
 
     A memory question only. Whether that shard is a *good* plan at the measured
     link bandwidth is Agent E's call, not this function's.
+
+    ``weight_bytes``, when given, is the resolver's measured on-disk total
+    (``FitRequest.weight_bytes``) -- forwarded to :func:`memory_breakdown` so
+    the search is run on the same basis the caller will actually launch
+    against, never a formula estimate that names a node count the measured
+    checkpoint would not actually fit into.
 
     Returns -1 when no configuration up to ``MAX_SEARCH_NODES`` fits, which
     means the answer is a different machine or a smaller quantization, not more
@@ -177,7 +203,7 @@ def min_nodes_required(
     for n in range(1, MAX_SEARCH_NODES + 1):
         for plan in _candidate_shards(n, shape):
             breakdown, _ = memory_breakdown(
-                shape, plan, context, max_seqs, kv_dtype
+                shape, plan, context, max_seqs, kv_dtype, weight_bytes=weight_bytes
             )
             if breakdown.total <= usable:
                 return n
@@ -189,15 +215,34 @@ def min_nodes_required(
 # --------------------------------------------------------------------------
 
 
-def weight_bytes_per_rank(shape: ModelShape, plan: ParallelismPlan) -> float:
+def weight_bytes_per_rank(
+    shape: ModelShape,
+    plan: ParallelismPlan,
+    total_weight_bytes: float | None = None,
+) -> float:
     """Shardable weights carried by the busiest rank.
 
     Vision towers are replicated on every rank and are charged separately, so
     they come out of the shardable pool here.
+
+    ``total_weight_bytes`` is the resolver's measured on-disk figure
+    (``FitRequest.weight_bytes``), preferred over ``total_params *
+    bytes_per_param()`` whenever it is a positive number: dtype formulas miss
+    padding, tied embeddings, and packing overhead the actual checkpoint
+    carries, and on GPT-OSS-120B that gap is close to 3 GiB -- the difference
+    between fitting and not. A ``None`` or non-positive value falls back to
+    the formula unchanged. Vision bytes are still priced from
+    ``vision_params * bytes_per_param()`` and subtracted out of the measured
+    total to get the shardable remainder, floored at zero so a measured total
+    smaller than the computed vision share cannot go negative.
     """
     bpp = shape.bytes_per_param()
     vision = min(max(0, shape.vision_params), shape.total_params)
-    shardable_bytes = (shape.total_params - vision) * bpp
+    vision_bytes = vision * bpp
+    if total_weight_bytes is not None and total_weight_bytes > 0:
+        shardable_bytes = max(0.0, total_weight_bytes - vision_bytes)
+    else:
+        shardable_bytes = (shape.total_params - vision) * bpp
     tp = max(1, plan.tensor_parallel)
     return shardable_bytes * stage_fraction(shape, plan.pipeline_parallel) / tp
 
@@ -248,8 +293,14 @@ def memory_breakdown(
     max_seqs: int,
     kv_dtype: str,
     chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
+    weight_bytes: int | None = None,
 ) -> tuple[MemoryBreakdown, list[str]]:
-    """Per-rank memory, and everything worth warning about while computing it."""
+    """Per-rank memory, and everything worth warning about while computing it.
+
+    ``weight_bytes`` is the resolver's measured total, forwarded to
+    :func:`weight_bytes_per_rank`; ``None`` (the default) prices weights from
+    the dtype formula instead.
+    """
     warnings: list[str] = []
 
     if not is_known_kv_dtype(kv_dtype):
@@ -291,7 +342,7 @@ def memory_breakdown(
 
     kv_total = kv_cache_bytes(shape, context, max_seqs, kv_dtype)
     breakdown = MemoryBreakdown(
-        weights=int(weight_bytes_per_rank(shape, plan)),
+        weights=int(weight_bytes_per_rank(shape, plan, weight_bytes)),
         kv_cache=int(kv_total / kv_divisor(shape, plan)),
         activations=int(activation_bytes(shape, max_seqs, context, chunk_tokens)),
         comm_buffers=int(comm_buffer_bytes(plan)),
@@ -316,7 +367,12 @@ class FitCalculator:
 
     ``max_context_that_fits`` is populated on every verdict, not only on
     refusals, so the UI can offer a headroom figure without a second call. It
-    is always a context we have actually checked, never an extrapolation.
+    is always a context we have actually checked, never an extrapolation --
+    except when no context at all was found to fit (not even zero tokens of
+    cache), where it is ``None`` regardless of which term the refusal names.
+    0 is a context we verified fits; when the search finds none, reporting 0
+    would claim the opposite, so every code path that reports
+    ``max_context_that_fits`` on a refusal goes through ``_reported_context``.
     """
 
     def __init__(
@@ -354,6 +410,7 @@ class FitCalculator:
             req.max_concurrent_seqs,
             req.kv_dtype,
             self.chunk_tokens,
+            req.weight_bytes,
         )
         warnings.extend(budget_warnings)
         headroom = usable - breakdown.total
@@ -361,7 +418,12 @@ class FitCalculator:
         kv_read = kv_cache_bytes(shape, req.context_length, 1, req.kv_dtype)
         tps = predict_decode_tps(shape, bandwidth, kv_read)
         max_ctx = self._largest_context(
-            shape, plan, usable, req.max_concurrent_seqs, req.kv_dtype
+            shape,
+            plan,
+            usable,
+            req.max_concurrent_seqs,
+            req.kv_dtype,
+            weight_bytes=req.weight_bytes,
         )
 
         ranks = sum(max(1, n.gpu_count) for n in used)
@@ -379,13 +441,22 @@ class FitCalculator:
                     f"{plan.world_size - ranks} more, or replan for {ranks}."
                 ),
                 limiting_term="combined",
-                max_context_that_fits=max_ctx,
+                # A plan that cannot be placed on the supplied ranks has no
+                # meaningful context suggestion: max_ctx was computed under a
+                # sharding that does not exist here and would not round-trip.
+                max_context_that_fits=None,
                 predicted_decode_tps=tps,
                 warnings=_dedup(warnings),
             )
 
         if headroom < 0:
             term, reason = self._diagnose(req, breakdown, usable, node, max_ctx)
+            # The sentinel keys on whether any context at all was found to
+            # fit (max_ctx == 0), not on which term the diagnosis names: a
+            # "combined" refusal where nothing fits is exactly as unhelpful a
+            # "0 tokens" suggestion as a "weights" one. See
+            # _reported_context.
+            reported_ctx = _reported_context(max_ctx)
             return FitResult(
                 verdict=Verdict.WONT_FIT,
                 breakdown=breakdown,
@@ -393,7 +464,7 @@ class FitCalculator:
                 headroom=headroom,
                 reason=reason,
                 limiting_term=term,
-                max_context_that_fits=max_ctx,
+                max_context_that_fits=reported_ctx,
                 predicted_decode_tps=tps,
                 warnings=_dedup(warnings),
             )
@@ -447,13 +518,22 @@ class FitCalculator:
         nodes: list[NodeProfile],
         max_seqs: int,
         kv_dtype: str,
+        weight_bytes: int | None = None,
     ) -> int:
         """Largest context that fits this plan on these nodes, on a
         ``CONTEXT_ROUNDING`` grain. Verified, never extrapolated. 0 means not
-        even one page of cache fits."""
+        even one page of cache fits.
+
+        ``weight_bytes``, when given, prices the weights term from the
+        resolver's measured total instead of the dtype formula -- see
+        :func:`weight_bytes_per_rank`. Optional and additive: every existing
+        caller that omits it gets the formula basis unchanged.
+        """
         used, _ = self._participating(plan, nodes)
         usable = min(n.usable_memory(self.guardrail) for n in used)
-        return self._largest_context(shape, plan, usable, max_seqs, kv_dtype)
+        return self._largest_context(
+            shape, plan, usable, max_seqs, kv_dtype, weight_bytes=weight_bytes
+        )
 
     # -- internals --------------------------------------------------------
 
@@ -489,9 +569,10 @@ class FitCalculator:
         max_seqs: int,
         kv_dtype: str,
         usable: int,
+        weight_bytes: int | None = None,
     ) -> bool:
         breakdown, _ = memory_breakdown(
-            shape, plan, context, max_seqs, kv_dtype, self.chunk_tokens
+            shape, plan, context, max_seqs, kv_dtype, self.chunk_tokens, weight_bytes
         )
         return breakdown.total <= usable
 
@@ -503,13 +584,14 @@ class FitCalculator:
         context: int,
         kv_dtype: str,
         ceiling: int,
+        weight_bytes: int | None = None,
     ) -> int:
         """Most concurrent sequences that fit at this context. Verified, like
         the context search: both KV and the logits buffer scale with it."""
 
         def fits(seqs: int) -> bool:
             breakdown, _ = memory_breakdown(
-                shape, plan, context, seqs, kv_dtype, self.chunk_tokens
+                shape, plan, context, seqs, kv_dtype, self.chunk_tokens, weight_bytes
             )
             return breakdown.total <= usable
 
@@ -533,12 +615,13 @@ class FitCalculator:
         usable: int,
         max_seqs: int,
         kv_dtype: str,
+        weight_bytes: int | None = None,
     ) -> int:
         step = CONTEXT_ROUNDING
 
         def fits(units: int) -> bool:
             return self._fits_at(
-                shape, plan, units * step, max_seqs, kv_dtype, usable
+                shape, plan, units * step, max_seqs, kv_dtype, usable, weight_bytes
             )
 
         if not fits(1):
@@ -557,7 +640,7 @@ class FitCalculator:
         # Never report a context we have not verified. The search is monotonic
         # so this loop should not run, and it costs nothing if it does not.
         while result > 0 and not self._fits_at(
-            shape, plan, result, max_seqs, kv_dtype, usable
+            shape, plan, result, max_seqs, kv_dtype, usable, weight_bytes
         ):
             result -= step
         return max(0, result)
@@ -599,6 +682,7 @@ class FitCalculator:
             req.max_concurrent_seqs,
             req.kv_dtype,
             self.guardrail,
+            req.weight_bytes,
         )
         if n < 0:
             return f"more than {MAX_SEARCH_NODES} nodes"
@@ -681,7 +765,7 @@ class FitCalculator:
             fixes.append(f"drop context to {max_ctx} tokens")
         seqs = self._largest_max_seqs(
             shape, plan, usable, req.context_length, req.kv_dtype,
-            req.max_concurrent_seqs - 1,
+            req.max_concurrent_seqs - 1, req.weight_bytes,
         )
         if seqs >= 1:
             fixes.append(f"reduce concurrency to {seqs} sequences")
@@ -740,7 +824,7 @@ class FitCalculator:
         fixes = [self._nodes_phrase(req, node)]
         seqs = self._largest_max_seqs(
             req.shape, req.plan, usable, req.context_length, req.kv_dtype,
-            req.max_concurrent_seqs - 1,
+            req.max_concurrent_seqs - 1, req.weight_bytes,
         )
         if seqs >= 1:
             fixes.append(f"reduce concurrency to {seqs} sequences")

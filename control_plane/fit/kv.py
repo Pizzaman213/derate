@@ -47,8 +47,11 @@ def per_layer_per_token_bytes(shape: ModelShape, kv_dtype: str) -> float:
     """One layer, one token, one sequence, before sharding."""
     elem = kv_elem_bytes(kv_dtype, shape)
     if shape.mla_latent_dim:
-        # One compressed latent, not per-head K and V.
-        return shape.mla_latent_dim * elem
+        # One compressed latent plus the decoupled RoPE component cached
+        # alongside it, not per-head K and V. The RoPE half is not optional:
+        # dropping it under-counts DeepSeek-family caches by about 11 percent,
+        # in the OOM direction.
+        return (shape.mla_latent_dim + shape.effective_mla_rope_dim) * elem
     return 2 * shape.num_kv_heads * shape.effective_head_dim * elem
 
 
