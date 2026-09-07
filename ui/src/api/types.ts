@@ -833,6 +833,12 @@ export interface ProviderSpec {
   daily_budget_usd?: number | null
   enabled?: boolean
   priority?: number
+  /** the key itself. The one field in this API that carries key material, and
+   *  it travels one way: the coordinator writes it to secrets.json at 0600 and
+   *  persists only the reference. It is on no record and in no response. Sent
+   *  alone it mints a reference; sent with `api_key_ref` it is stored under
+   *  that name. */
+  api_key?: string
 }
 
 /** `PATCH /api/providers/{id}` body (providers/service.py `update`). */

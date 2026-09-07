@@ -463,11 +463,13 @@ function ModelStep({
 
   useEffect(() => {
     let live = true
-    // Every argument null: that asks the coordinator to choose a context per
+    // Both arguments null: that asks the coordinator to choose a context per
     // model from what actually fits, which is the default path and the only one
     // that gives honest verdicts on a fresh install with nothing configured.
+    // No machine list -- the default is the coordinator's own host, which is
+    // the machine this screen is about.
     backend
-      .capacity(null, null, null)
+      .capacity(null, null)
       .then((report) => {
         if (!live) return
         const picked = rowsOf(report)
