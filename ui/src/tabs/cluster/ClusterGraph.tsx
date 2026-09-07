@@ -16,7 +16,7 @@ import type {
 } from '../../api/types'
 import { useSelection } from '../../state/selection'
 import { useMetrics } from '../../state/metrics'
-import { nodeLive, nodeSignal } from '../../state/live'
+import { nodeLive, nodeSignal, utilKind } from '../../state/live'
 import { PROPORTIONAL } from '../../state/policy'
 import { fmt, gbytes, pct, shortGpu } from '../../format'
 import { nodeName, nodeSubtitle } from '../../state/names'
@@ -1044,7 +1044,7 @@ function MachinePlate({
       {tier === 'full' ? (
         <>
           <text x={card.x + 11} y={card.y + 61 + dy} className="m" fontSize={9} fill="var(--on-fill-dim)">
-            {`GPU ${fmt(live?.util_pct ?? topo?.util_pct, 0)}% · ${pct(mem)}% memory`}
+            {`${utilKind(state?.profile ?? topo)} ${fmt(live?.util_pct ?? topo?.util_pct, 0)}% · ${pct(mem)}% memory`}
           </text>
           {shareOf ? (
             <ShareBar card={card} trackW={trackW} dy={dy} share={shareOf} />

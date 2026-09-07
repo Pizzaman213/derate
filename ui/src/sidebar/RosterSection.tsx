@@ -1,7 +1,7 @@
 import { useCluster, useTopology } from '../state/resources'
 import { useMetrics } from '../state/metrics'
 import { useSelection } from '../state/selection'
-import { nodeLive, nodeSignal } from '../state/live'
+import { nodeLive, nodeSignal, utilKind } from '../state/live'
 import { fromState, nodeName } from '../state/names'
 import { Lamp } from '../components/Lamp'
 import { Readout } from '../components/Readout'
@@ -101,7 +101,7 @@ export function RosterSection() {
               <div className="unit">{names.length > 0 ? names.join(' · ') : 'no deployments'}</div>
 
               <div className="unit" style={{ marginTop: 2 }}>
-                GPU {pct(live.util_pct)}%{n.profile.device_class === 'gb10' ? ' · shared' : ''}
+                {utilKind(n.profile)} {pct(live.util_pct)}%{n.profile.device_class === 'gb10' ? ' · shared' : ''}
               </div>
             </div>
           )

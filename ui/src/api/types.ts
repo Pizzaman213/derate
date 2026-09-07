@@ -153,12 +153,34 @@ export interface TopologyDeployment {
   tokens_per_sec: number
 }
 
+/** One model served by a provider rather than by a deployment.
+ *
+ *  `node_id` is the interesting field and the reason this exists: a provider
+ *  can BE a machine on the roster -- the Pi enrols as a GPU-less node and is
+ *  also registered as an Ollama provider -- and in that case a model served
+ *  "remotely" is running on a box already drawn on the cluster screen. `null`
+ *  is the ordinary case, somebody else's hardware, and is matched exactly
+ *  server-side: never inferred from a subnet and never reverse-resolved. */
+export interface TopologyRemote {
+  target_id: string
+  provider_id: string
+  served_name: string
+  upstream_id: string
+  /** The roster node hosting this provider, or null for somebody else's. */
+  node_id: string | null
+  state: 'healthy' | 'unhealthy'
+  admitting: boolean | null
+  tokens_per_sec: number
+}
+
 export interface Topology {
   cluster_id: string
   coordinator: string
   nodes: TopologyNode[]
   edges: TopologyEdge[]
   deployments: TopologyDeployment[]
+  /** Absent on a coordinator older than this key; treat as []. */
+  remotes?: TopologyRemote[]
 }
 
 // ── GET /api/cluster ─────────────────────────────────────────────────────────
@@ -1573,4 +1595,19 @@ export interface HistoryLog {
 
 export interface LogHistory extends HistoryEnvelope {
   logs: HistoryLog[]
+}
+
+/** `GET /api/shell/status`. Answers whether a terminal can be opened at all.
+ *
+ *  Deliberately says nothing about whether a key is configured. That is a fact
+ *  about a secret, and this route is as unauthenticated as everything else on
+ *  `/api` -- so reporting it would tell an anonymous caller how close they are
+ *  without helping the operator, who can read the node's own log. */
+export interface ShellStatus {
+  enabled: boolean
+  /** Present and non-empty when `enabled` is false: the sentence to render,
+   *  naming the variable that turns it on. */
+  reason: string
+  /** Seconds of inactivity before a session closes itself. */
+  idle_timeout_s: number
 }

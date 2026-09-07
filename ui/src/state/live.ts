@@ -28,7 +28,18 @@ export const SAMPLE_STALE_S = 30
  *  permanent 0%. Naming that "GPU utilisation" would label hardware the node
  *  does not have, which is worse than the zero it replaced. */
 export function utilLabel(profile: { gpu_count: number }): string {
-  return profile.gpu_count === 0 ? 'CPU utilisation' : 'GPU utilisation'
+  return `${utilKind(profile)} utilisation`
+}
+
+/** The same fact in the width the roster line and the cluster plate have --
+ *  "GPU utilisation 6%" does not fit where "GPU 6%" does, and those two call
+ *  sites hardcoded the noun rather than shrink the phrase.
+ *
+ *  Undefined means the payload predates `gpu_count` on it, not that the
+ *  machine has no GPU: unknown keeps the old label rather than asserting a
+ *  CPU. `0` is the only thing that says there is nothing to draw on. */
+export function utilKind(profile: { gpu_count?: number } | undefined): 'CPU' | 'GPU' {
+  return profile?.gpu_count === 0 ? 'CPU' : 'GPU'
 }
 
 export interface NodeLive {

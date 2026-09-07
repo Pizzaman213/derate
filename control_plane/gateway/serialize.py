@@ -72,6 +72,36 @@ def _eligibility(healthy: bool, device_class: DeviceClass) -> tuple[bool, str | 
     return True, None
 
 
+def power_reading(state: NodeState) -> float | None:
+    """GPU power draw, or unknown on a machine that has no GPU to draw it.
+
+    A machine the probe found no GPU on reports host facts (memory from
+    /proc/meminfo, temperature from /sys/class/thermal, utilisation from
+    /proc/stat) and has no GPU power draw to read at all. Emitting 0 W there
+    would read as a measurement of an idle GPU rather than as the absence of
+    one, so it goes out as unknown.
+
+    Shared rather than inlined because it was inlined here and nowhere else:
+    the 1 Hz metrics frame and the topology payload each sent `power_watts`
+    straight through, so one node answered `null` on /api/nodes and `0 W` on
+    /api/metrics/stream -- and the UI prefers the frame while it is fresh, so
+    the roster showed the reading this rule exists to suppress.
+    """
+    return None if state.profile.gpu_count == 0 else state.power_watts
+
+
+def temp_reading(state: NodeState) -> float | None:
+    """Board temperature, unknown only when nothing exposed a thermal zone.
+
+    Deliberately weaker than the power rule: a GPU-less board usually does have
+    /sys/class/thermal, and a running machine does not sit at exactly 0.0 C, so
+    a real host reading survives as itself.
+    """
+    if state.profile.gpu_count == 0 and not state.temperature_c:
+        return None
+    return state.temperature_c
+
+
 def node_payload(state: NodeState, label: str | None = None) -> dict:
     """One node row.
 
@@ -91,7 +121,6 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
     # total its own sample carries -- without a denominator its memory readout
     # is a permanent em dash, which reads as broken rather than as absent.
     total = profile.total_memory or state.memory_total or 0
-    no_gpu = profile.gpu_count == 0
     eligible, ineligible_reason = _eligibility(state.healthy, profile.device_class)
     return {
         "node_id": profile.node_id,
@@ -124,16 +153,11 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
         "memory_used_pct": round(state.memory_used / total * 100.0, 1)
         if total
         else None,
-        # A machine the probe found no GPU on reports host facts (memory from
-        # /proc/meminfo, temperature from /sys/class/thermal, utilisation from
-        # /proc/stat) and has no GPU power draw to read at all. Emitting 0 W
-        # there would read as a measurement of an idle GPU rather than as the
-        # absence of one, so it goes out as unknown. Temperature is unknown by
-        # the same rule only when the board exposed no thermal zone: a running
-        # machine does not sit at exactly 0.0 C. Utilisation is left alone --
-        # an idle Pi really is at 0%.
-        "power_w": None if no_gpu else state.power_watts,
-        "temp_c": None if (no_gpu and not state.temperature_c) else state.temperature_c,
+        # See power_reading/temp_reading: a machine with no GPU has no GPU
+        # power draw to read, and 0 W would read as an idle one. Utilisation is
+        # left alone -- an idle Pi really is at 0%.
+        "power_w": power_reading(state),
+        "temp_c": temp_reading(state),
         "util_pct": state.utilization_pct,
         "eligible": eligible,
         "ineligible_reason": ineligible_reason,

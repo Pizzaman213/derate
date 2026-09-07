@@ -11,6 +11,7 @@ import logging
 import time
 from typing import Any
 
+from . import serialize
 from .settings import GatewaySettings
 from .stats import StatsRegistry
 
@@ -113,8 +114,13 @@ class MetricsHub:
                 nodes_payload.append(
                     {
                         "node_id": node.profile.node_id,
-                        "power_w": node.power_watts,
-                        "temp_c": node.temperature_c,
+                        # Through serialize, not straight off the state: a node
+                        # with no GPU reports 0.0 W, and this frame is what the
+                        # UI prefers while it is fresh. Sending the raw figure
+                        # here put a measured-looking 0 W beside the null that
+                        # /api/nodes sends for the same machine.
+                        "power_w": serialize.power_reading(node),
+                        "temp_c": serialize.temp_reading(node),
                         "memory_used_pct": used_pct,
                         "util_pct": node.utilization_pct,
                         # When these four were measured. The UI greys a node
@@ -123,7 +129,7 @@ class MetricsHub:
                         "sample_ts": node.sample_ts or None,
                     }
                 )
-                total_power += node.power_watts or 0.0
+                total_power += serialize.power_reading(node) or 0.0
         except Exception:
             log.exception("registry unavailable for metrics")
             nodes_payload = None
