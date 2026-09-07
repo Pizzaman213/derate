@@ -1169,13 +1169,20 @@ def test_explicit_join_address_skips_discovery():
 
 
 def test_explicit_join_address_failure_is_not_swallowed():
-    """A named coordinator that rejects us is a config error, not a new cluster."""
-    async def reject(*a, **k):
-        raise JoinRejected("bad token")
+    """A named coordinator that does not ANSWER is a config error, loudly.
+
+    (A named coordinator that answers-and-rejects is the opposite case:
+    it exists, so we stay a worker-in-waiting and retry -- see
+    test_explicit_join_rejection_stays_worker_in_waiting_not_fatal. The
+    original version of this test demanded a crash on rejection, which is
+    what killed the first containerized join: the probe-back raced the
+    joiner's own agent app and a correct setup 403'd once at boot.)"""
+    async def unreachable(*a, **k):
+        raise ProbeFailed("connect refused")
 
     config = RegistryConfig(join_address="10.9.9.9", token="wrong")
-    with pytest.raises(JoinRejected):
-        run(resolve_role(config, SPARK_02, "http://10.0.0.12:8081", join=reject))
+    with pytest.raises(ProbeFailed):
+        run(resolve_role(config, SPARK_02, "http://10.0.0.12:8081", join=unreachable))
 
 
 def test_forced_worker_with_no_coordinator_waits_to_be_found():
@@ -2003,3 +2010,26 @@ def test_remove_node_of_unknown_id_raises_rather_than_silently_succeeding(tmp_pa
     with pytest.raises(NodeNotFound):
         registry.remove_node("no-such-node")
     assert not (tmp_path / "registry.json").exists() or True  # no spurious persist requirement
+
+
+def test_explicit_join_rejection_stays_worker_in_waiting_not_fatal(tmp_path):
+    """Containerized-join defect: SPARKPLANE_JOIN's branch let JoinRejected
+    propagate and kill the process, while the discovered path became a
+    worker-in-waiting. A rejection proves the NAMED coordinator exists, and
+    on first boot the join races our own agent app (the probe-back lands
+    before /agent/* listens), so even a correct setup 403s once."""
+
+    async def rejecting_join(url, token, profile, agent_url):
+        raise JoinRejected("probe-back failed")
+
+    config = RegistryConfig(
+        data_dir=tmp_path, join_address="http://10.0.0.5:8088", role="worker"
+    )
+    decision = run(
+        resolve_role(config, SPARK_02, "http://10.0.0.12:8091", join=rejecting_join)
+    )
+    assert decision.role == "worker"
+    assert decision.joined is False
+    assert decision.status == "rejected"
+    assert decision.coordinator_url == "http://10.0.0.5:8088"
+    assert "retrying" in decision.reason

@@ -108,7 +108,29 @@ async def resolve_role(
     # second cluster next to the one the operator named.
     if config.join_address:
         url = normalize_agent_url(config.join_address, config.coordinator_port)
-        result = await join(url, config.token, profile, agent_url)
+        try:
+            result = await join(url, config.token, profile, agent_url)
+        except JoinRejected as exc:
+            # A rejection proves the NAMED coordinator exists and answered --
+            # the same fact the discovered path treats as "stay a worker and
+            # keep retrying", and it must be treated the same way here.
+            # Crashing instead is not the loud failure the comment above
+            # wants: on first boot the join races our own agent app (the
+            # coordinator's probe-back lands before /agent/* is listening),
+            # so even a perfectly configured node 403s once. The rejoin loop
+            # retries after the agent is up; a wrong token stays visible in
+            # the log on every retry. ProbeFailed (the named address not
+            # answering at all) still fails loudly -- that is a typo, not a
+            # cluster.
+            reason = (
+                f"SPARKPLANE_JOIN={config.join_address} answered but rejected "
+                f"the join ({exc}); staying a worker and retrying rather than "
+                "dying -- the agent app was not yet listening for the "
+                "probe-back on a first boot, and admission or a token fix "
+                "makes the next attempt succeed"
+            )
+            log.warning("role resolution: %s", reason)
+            return RoleDecision(ROLE_WORKER, url, False, reason, status="rejected")
         return RoleDecision(
             ROLE_WORKER,
             url,
