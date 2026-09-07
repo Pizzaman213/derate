@@ -6,6 +6,12 @@
 # workstation is usually amd64, and an image missing one means the
 # heterogeneous case does not work at all.
 #
+# Nothing used to run between checkout and push. A broken commit on
+# `integration` became the :latest image every node pulls, on machines nobody
+# is watching, and the first sign of it was an install failing in somebody
+# else's house. The `verify` job below is that missing gate: publish `needs` it,
+# so a red suite or a red typecheck stops the push instead of shipping.
+#
 # GITHUB_TOKEN carries packages:write through the permissions block below, so
 # this needs no PAT and no repository secret. Package *visibility* is the one
 # thing it cannot set: after the first successful run, flip the package to
@@ -27,7 +33,105 @@ env:
   IMAGE: ghcr.io/pizzaman213/derate/node
 
 jobs:
+  # Everything that can fail without hardware. Cheap relative to a two-arch
+  # buildx run, and it fails in about three minutes instead of twelve.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pytest>=9"
+
+      # From the repo root, always: pyproject sets pythonpath = ["."], so
+      # anywhere else nothing imports and every test errors identically.
+      - name: Tests
+        run: python -m pytest -q -m "not slow"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI
+        working-directory: ui
+        run: npm ci
+
+      # `tsc -b`. A bare `npx tsc --noEmit` typechecks NOTHING here -- the root
+      # tsconfig is {"files": [], "references": [...]} and exits 0 on any tree,
+      # which is a gate that always passes.
+      - name: Typecheck
+        working-directory: ui
+        run: npm run typecheck
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      # There is no UI test runner. These verifiers ARE the UI's test suite,
+      # and each exists because a class of bug is invisible to types: the URL
+      # scheme, the graph layout, the quantization ladder, the QR encoder.
+      #
+      # Only the ones that need nothing but this checkout.
+      #
+      # Left out, each for a reason that is not "it is flaky":
+      #   tabs/{chat,models,spend}/rows.check.mjs, tabs/settings/allowlist -- they
+      #     drive themselves from a live coordinator on :8088, deliberately,
+      #     because checking a type against the real wire is the whole point of
+      #     them. There is no cluster on a runner to answer.
+      #   state/history.check.mjs -- its fixtures are real payloads captured
+      #     from a coordinator's archive and are not in the repo; it prints the
+      #     curl lines to recapture them.
+      # keyfield.check.mjs shells out to the Python, not to a server, so it runs.
+      - name: Verifiers
+        working-directory: ui
+        run: |
+          set -eu
+          # Discovered, not listed. The verifiers ARE this UI's test suite --
+          # there is no runner -- and each exists because a class of bug is
+          # invisible to types. A hard-coded list silently stops covering a
+          # verifier the moment somebody renames or adds one, which is the same
+          # failure as not having it at all.
+          #
+          # Skipped, each for a reason that is not flakiness:
+          #   */rows.check.mjs (chat, models, spend) and settings/allowlist --
+          #     they drive themselves from a live coordinator on :8088,
+          #     deliberately, because checking a type against the real wire is
+          #     the whole point of them. No runner has a cluster to answer.
+          #   state/history -- its fixtures are real payloads captured from a
+          #     coordinator's archive and are not in the repo; running it prints
+          #     the curl lines to recapture them.
+          # settings/keyfield shells out to the Python, not to a server, so it
+          # runs here.
+          ran=0
+          for f in $(find src -name '*.check.mjs' | sort); do
+            case "$f" in
+              */chat/rows.check.mjs|*/models/rows.check.mjs|*/spend/rows.check.mjs) skip=live ;;
+              */settings/allowlist.check.mjs)                                      skip=live ;;
+              */state/history.check.mjs)                                           skip=fixtures ;;
+              *)                                                                   skip= ;;
+            esac
+            if [ -n "$skip" ]; then echo "-- skip ($skip) $f"; continue; fi
+            echo "== $f"
+            node "$f"
+            ran=$((ran + 1))
+          done
+          # A glob that matched nothing would otherwise pass silently, which is
+          # the one way this step could lie about having run.
+          [ "$ran" -gt 0 ] || { echo "no verifiers ran"; exit 1; }
+          echo "$ran verifier(s) passed"
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -779,7 +779,7 @@ def test_every_history_answer_says_whether_it_survives_a_restart(archive):
         assert answer["durable"] is True
 
 
-def test_the_ring_answers_node_history_when_there_is_no_archive():
+def test_the_ring_answers_node_history_when_there_is_no_archive(no_telemetry):
     """Telemetry off left 300 samples of per-node history stranded in RAM.
 
     Registry.history() had no caller anywhere in the gateway, so the only
@@ -839,7 +839,28 @@ def test_the_ring_answers_node_history_when_there_is_no_archive():
             assert client.get(path, params={"from": "-1h"}).status_code == 503
 
 
-def test_a_registry_without_a_ring_still_refuses_honestly():
+@pytest.fixture
+def no_telemetry(monkeypatch, tmp_path):
+    """Pin "this coordinator keeps no history" instead of inheriting it.
+
+    These two tests assert a 503, and they used to pass for a reason that had
+    nothing to do with them: `data_dir()` returned `/data`, which is not
+    writable on a developer box, so telemetry disabled itself and there was no
+    archive to answer from. Consolidating onto `control_plane/paths.py` fixed
+    that fallback -- telemetry now resolves a writable application-state
+    directory, initialises for real, and the refusal these tests exist to check
+    is never reached.
+
+    So the condition is stated rather than assumed. Same spirit as
+    `test_links.py::_clean_env`: nothing here should depend on the developer's
+    shell, or on which directories happen to be writable on the machine that
+    ran it.
+    """
+    monkeypatch.setenv("DERATE_TELEMETRY", "0")
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+
+
+def test_a_registry_without_a_ring_still_refuses_honestly(no_telemetry):
     from fastapi.testclient import TestClient
 
     from control_plane.gateway import create_app
