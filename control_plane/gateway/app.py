@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,6 +29,8 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException
 
 from . import capacity_api, enroll_api, internal_api, openai_api, ui_api
 from .admission import AdmissionController
@@ -154,7 +157,59 @@ class _UIStatics(StaticFiles):
     The document is therefore never stored and the hashed assets are immutable,
     which is what a content hash means and the pair the naming scheme was
     designed for.
+
+    It also answers a deep path with the document, which is what makes a UI URL
+    shareable. The UI puts its screen in the path (``/cluster``,
+    ``/models/meta-llama/Llama-3.1-8B``; see ui/src/state/routes.ts), and no
+    such file exists on disk -- there is one ``index.html`` and the router in
+    the page reads the path itself. Without the fallback below, every one of
+    those URLs works while you click to it and 404s the moment anyone reloads
+    or opens the link you sent them, which is the failure that teaches people
+    the links do not work.
     """
+
+    #: Prefixes that must 404 rather than fall back to the document. Every
+    #: router is registered above this mount, so nothing here reaches a *live*
+    #: API route -- these are the misspelled and the retired ones, and a
+    #: ``/api/settngs`` that answers 200 with HTML surfaces to the caller as a
+    #: JSON parse error with no hint of the cause. ``/assets`` is here for the
+    #: same reason in the other direction: a hashed bundle that no longer
+    #: exists must fail as a missing script, not load an HTML document into a
+    #: ``<script type="module">``.
+    _NO_FALLBACK = frozenset({"api", "v1", "assets", "healthz", "install.sh"})
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except HTTPException as exc:
+            if exc.status_code != 404 or not self._is_ui_route(path, scope):
+                raise
+        # 200, not 404: the path is a real screen in the app, and the document
+        # that renders it is the correct answer to a request for it.
+        return await super().get_response("index.html", scope)
+
+    def _is_ui_route(self, path: str, scope) -> bool:
+        """Whether a missing *path* is a screen in the UI rather than a miss.
+
+        *path* is already relative to the mount and normalised by Starlette, so
+        the first component is the whole test for the reserved prefixes.
+
+        The second test is for everything else that 404s: a request for a file
+        the deploy forgot must stay a 404, or a broken build looks like a
+        working one serving a blank page. A navigation is a request whose last
+        component has no extension (``/cluster``) or which says outright that it
+        wants a document -- and it has to be both tests, because a model id is
+        allowed a dot in it (``/models/meta-llama/Llama-3.1-8B``) and a browser
+        asking for that one is only distinguishable by its Accept header.
+        """
+        first, _, _ = path.replace(os.sep, "/").lstrip("/").partition("/")
+        if first in self._NO_FALLBACK:
+            return False
+        last = path.rsplit("/", 1)[-1]
+        if "." not in last:
+            return True
+        accept = Headers(scope=scope).get("accept", "")
+        return "text/html" in accept
 
     def file_response(self, full_path, stat_result, scope, status_code=200):
         response = super().file_response(full_path, stat_result, scope, status_code)

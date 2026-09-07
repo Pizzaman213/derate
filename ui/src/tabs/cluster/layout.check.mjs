@@ -371,16 +371,20 @@ ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
       deployment('gpt-oss-120b', [id(2)], 'd-b'),
     ],
   })
-  ok(l.paths['gpt-oss-120b#L0'] != null && l.paths['gpt-oss-120b#L1'] != null, 'a path per routing target')
-  // cfg.targets order is d-b then d-a, so #L0 must be the SOLO one.
-  // cfg.targets order is d-b then d-a, so #L0 must be the SOLO one -- shorter,
-  // because it has no inter-machine hop, but it still starts at the endpoint.
-  ok(l.paths['gpt-oss-120b#L0'].length === 6, '#L0 follows cfg.targets order, not deployment order')
-  ok(l.paths['gpt-oss-120b#L1'].length > 6, '#L1 walks the whole pipeline')
-  ok(l.paths['gpt-oss-120b#L0'][0].x === 132, 'a flight starts at the entry box')
+  ok(l.paths['gpt-oss-120b#L:d-a'] != null && l.paths['gpt-oss-120b#L:d-b'] != null, 'a path per routing target')
+  // Keyed by target id, so a path is bound to its target no matter what order
+  // cfg.targets lists them in or which deployments happen to be drawable:
+  // d-b is the SOLO one -- shorter, because it has no inter-machine hop, but
+  // it still starts at the endpoint.
+  ok(l.paths['gpt-oss-120b#L:d-b'].length === 6, "a solo target's path is keyed to that target")
+  ok(l.paths['gpt-oss-120b#L:d-a'].length > 6, 'the two-machine target walks the whole pipeline')
+  ok(l.paths['gpt-oss-120b#L:d-b'][0].x === 132, 'a flight starts at the entry box')
+  // A path keyed by position would follow whatever else got drawn; keyed by id
+  // it cannot, so the ordinal keys must be gone entirely.
+  ok(l.paths['gpt-oss-120b#L0'] == null, 'no ordinal flight keys survive')
   // The flight has to end on the last stage, not wherever the geometry happened
   // to point.
-  const pipeline = l.paths['gpt-oss-120b#L1']
+  const pipeline = l.paths['gpt-oss-120b#L:d-a']
   const last = pipeline[pipeline.length - 1]
   const target = l.cards.find((c) => c.nodeId === id(1))
   ok(

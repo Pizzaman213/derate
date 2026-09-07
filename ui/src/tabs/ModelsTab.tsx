@@ -8,6 +8,7 @@ import {
   useStorage,
 } from '../state/resources'
 import { useBackend } from '../state/backend'
+import { DEFAULT_CONCURRENCY, DEFAULT_CONTEXT, useRouter } from '../state/router'
 import type { ModelSearchResponse } from '../api/types'
 import { QuantTableCard } from './models/QuantTableCard'
 import { CatalogList } from './models/CatalogList'
@@ -68,26 +69,42 @@ export function ModelsTab() {
   const providers = useProviders()
   const storage = useStorage()
 
+  const { route, navigate } = useRouter()
+
   const [source, setSource] = useState<Origin>('catalog')
   const [query, setQuery] = useState('')
   // 8192/1 matches what `GET /api/capacity` and the client's own fallback use.
   // The three surfaces asking this question used to default differently, which
   // meant the list and the dashboard could disagree about a model's fit while
   // both were right about their own numbers.
-  const [context, setContext] = useState(8192)
-  const [concurrency, setConcurrency] = useState(1)
+  //
+  // In the URL rather than in component state, because the question this screen
+  // answers is "does it fit *at these numbers*" -- a link to a model at 8k that
+  // opens at 128k for the person you sent it to is a link to a different
+  // answer. `?ctx=`/`?seq=` are omitted while they are at the default, so the
+  // ordinary URL stays `/models`.
+  const context = route.context ?? DEFAULT_CONTEXT
+  const concurrency = route.concurrency ?? DEFAULT_CONCURRENCY
+  // Replace, not push: this is typing. Back must leave the models tab, not
+  // walk back through 1, 16, 163, 1638, 16384.
+  const setContext = (n: number) => navigate({ context: n }, { replace: true })
+  const setConcurrency = (n: number) => navigate({ concurrency: n }, { replace: true })
   const [sort, setSort] = useState<Sort>('fit')
   const [format, setFormat] = useState<Format>('all')
-  /** The model in the detail pane. Held here, not in the shell's sheet: it is
-   *  this screen's own selection and it has to survive every list change
-   *  around it.
+  /** The model in the detail pane. Not the shell's sheet: it is this screen's
+   *  own selection and it has to survive every list change around it.
+   *
+   *  It is the path -- `/models/meta-llama/Llama-3.1-8B` -- because it is the
+   *  subject of the screen rather than a setting on it, and because that URL
+   *  plus the two numbers above is the whole of what somebody means when they
+   *  send you a model.
    *
    *  The id only. It used to snapshot context and concurrency at the moment of
    *  opening, which meant editing either field afterwards rebanded the list
    *  while the pane beside it went on answering the old question -- the caption
    *  saying 32,768 and the ladder under it saying 8,192, both correct, on one
    *  screen. The numbers now come from one place for both. */
-  const [selected, setSelected] = useState<string | null>(null)
+  const selected = route.model
   // Cards to browse, rows to compare. Remembered, because which one somebody
   // wants depends on what they came here to do and that does not change
   // between visits.
@@ -99,8 +116,8 @@ export function ModelsTab() {
   // Debounced before it becomes a request: the capacity walk resolves every
   // catalogue model against the hub, and firing one per keystroke while
   // somebody types "16384" would cost five of them.
-  const [capContext, setCapContext] = useState(8192)
-  const [capConcurrency, setCapConcurrency] = useState(1)
+  const [capContext, setCapContext] = useState(context)
+  const [capConcurrency, setCapConcurrency] = useState(concurrency)
   useEffect(() => {
     const id = window.setTimeout(() => {
       setCapContext(context)
@@ -226,9 +243,15 @@ export function ModelsTab() {
    *  next -- and a modal that covers the list makes you hold the previous
    *  answer in your head. */
   const open = (row: ModelRow) => {
-    if (row.default_context) setContext(row.default_context)
-    if (row.default_concurrency) setConcurrency(row.default_concurrency)
-    setSelected(row.model_id)
+    // One navigation, not three: the model and the numbers it is being judged
+    // at are one state, and pushing them separately would put two intermediate
+    // URLs in the history for a single click.
+    navigate({
+      dest: 'models',
+      model: row.model_id,
+      ...(row.default_context ? { context: row.default_context } : {}),
+      ...(row.default_concurrency ? { concurrency: row.default_concurrency } : {}),
+    })
   }
 
   return (
@@ -466,7 +489,11 @@ export function ModelsTab() {
                 modelId={selected}
                 context={capContext}
                 concurrency={capConcurrency}
-                onClose={() => setSelected(null)}
+                // Replace, for the reason the sheet closes with a replace
+                // (state/selection.tsx): the entry that opened this pane
+                // becomes a pane-less one, so Back leaves the tab rather
+                // than reopening what you just closed.
+                onClose={() => navigate({ model: null }, { replace: true })}
               />
             </div>
           </div>

@@ -22,16 +22,18 @@ import { fmt, gbytes, pct, shortGpu } from '../../format'
 import { nodeName, nodeSubtitle } from '../../state/names'
 import {
   layoutCluster,
+  localFlightKey,
   moveToSlot,
   nearestSlot,
   plateWidth,
+  providerFlightKey,
   type ClusterBand,
   type ClusterEdge,
   type ClusterLayout,
   type PlacedCard,
   type Point,
 } from './layout'
-import { useParticleField } from './particles'
+import { useParticleField, type TargetFlow } from './particles'
 
 /** Zoom range, RELATIVE TO THE FIT: 0.4x to 4x the framing that fills the
  *  floor. Absolute limits would be useless now that the resting view is itself
@@ -525,12 +527,7 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
             {layout.provider ? <ProviderBus provider={layout.provider} /> : null}
           </g>
         </g>
-        <ParticleField
-          layerRef={particleLayerRef}
-          deployments={deployments}
-          routing={routing}
-          paths={layout.paths}
-        />
+        <ParticleField layerRef={particleLayerRef} routing={routing} paths={layout.paths} />
       </svg>
     </div>
   )
@@ -1100,18 +1097,20 @@ function ShareBar({
   )
 }
 
-/** The particle emitter for the selected deployment, gated on real traffic
- *  (frame tokens/sec or wire-reported outstanding requests). Its own component
- *  because it subscribes to the metrics stream, and nothing else in the graph
- *  should re-render because it did. Renders nothing itself. */
+/** The particle emitter for the selected deployment. Its whole job is to turn
+ *  measured per-target request counts into the `TargetFlow` list particles.ts
+ *  draws -- one block per request in flight, on the path of the target that is
+ *  actually serving it. Nothing is emitted for an idle target and nothing is
+ *  synthesised for a busy one.
+ *
+ *  Its own component because it subscribes to the metrics stream, and nothing
+ *  else in the graph should re-render because it did. Renders nothing itself. */
 function ParticleField({
   layerRef,
-  deployments,
   routing,
   paths,
 }: {
   layerRef: RefObject<SVGGElement>
-  deployments: DeploymentDTO[]
   routing: RoutingConfig[]
   paths: ClusterLayout['paths']
 }) {
@@ -1119,13 +1118,27 @@ function ParticleField({
   const { frame, stale } = useMetrics()
 
   const cfg = routing.find((c) => c.served_name === selDep) ?? null
-  const depIds = deployments.filter((d) => d.served_name === selDep).map((d) => d.deployment_id)
-  const tps = (frame?.deployments ?? [])
-    .filter((d) => depIds.includes(d.deployment_id))
-    .reduce((a, d) => a + (d.tokens_per_sec ?? 0), 0)
-  const outstanding = cfg?.targets.reduce((a, t) => a + (t.outstanding || 0), 0) ?? 0
-  const hasTraffic = !stale && (tps > 0 || outstanding > 0)
+  const deploymentFrames = frame?.deployments
+  const flows = useMemo<TargetFlow[]>(() => {
+    if (!selDep || !cfg) return []
+    return cfg.targets.map((t) => {
+      // Two reads of the same counter at two cadences. The 1 Hz stream carries
+      // it for local targets as `queue_depth`; the 5s routing poll carries it
+      // for every target as `outstanding`. Prefer the fresher one where it
+      // exists, and drop back to the slower one the moment the stream goes
+      // stale rather than freezing on a count that has stopped arriving.
+      const live =
+        t.kind === 'local' && !stale
+          ? (deploymentFrames ?? []).find((d) => d.deployment_id === t.target_id)?.queue_depth
+          : null
+      return {
+        pathKey: t.kind === 'remote' ? providerFlightKey(selDep) : localFlightKey(selDep, t.target_id),
+        inflight: Math.max(0, live ?? t.outstanding ?? 0),
+        meanDurationS: t.counters?.mean_duration_s ?? null,
+      }
+    })
+  }, [selDep, cfg, deploymentFrames, stale])
 
-  useParticleField({ layerRef, hasTraffic, servedName: selDep, cfg, paths })
+  useParticleField({ layerRef, flows, paths })
   return null
 }

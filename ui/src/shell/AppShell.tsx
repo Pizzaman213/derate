@@ -1,5 +1,6 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { SelectionProvider } from '../state/selection'
+import { useRouter, type Dest } from '../state/router'
 import { Header } from './Header'
 import { Sheet } from './Sheet'
 import { DashboardTab } from '../tabs/DashboardTab'
@@ -11,14 +12,9 @@ import { SpendTab } from '../tabs/SpendTab'
 import { SettingsTab } from '../tabs/SettingsTab'
 import { Sidebar } from '../sidebar/Sidebar'
 
-export type Dest =
-  | 'dash'
-  | 'models'
-  | 'cluster'
-  | 'storage'
-  | 'chat'
-  | 'spend'
-  | 'settings'
+// `Dest` is the router's -- the set of destinations and the set of path
+// segments are the same set, and defining it twice is how they drift apart.
+export type { Dest }
 
 /** The chrome: header, the four destinations, the collapsible sidebar, and the
  *  one sheet. What each destination and each sidebar section actually shows is
@@ -38,27 +34,39 @@ export type Dest =
 const WIDE: ReadonlySet<Dest> = new Set<Dest>(['models'])
 
 export function AppShell() {
-  const [dest, setDest] = useState<Dest>('dash')
+  const { route } = useRouter()
+  const dest = route.dest
   const [sidebarOpen, setSidebarOpen] = useState(true)
   // What the sidebar was before a wide destination collapsed it, so leaving
   // one restores the choice rather than silently reopening a rail somebody had
   // deliberately closed.
   const restore = useRef<boolean | null>(null)
+  // Mirrors the state so the effect below can read the current value without
+  // taking it as a dependency -- it must run when the destination changes and
+  // not when somebody toggles the rail.
+  const openRef = useRef(true)
+  const setSidebar = (open: boolean) => {
+    openRef.current = open
+    setSidebarOpen(open)
+  }
 
-  const go = (next: Dest) => {
-    setDest(next)
-    if (WIDE.has(next)) {
-      if (restore.current === null) restore.current = sidebarOpen
-      setSidebarOpen(false)
+  // Keyed on the destination rather than on the click that caused it: a
+  // destination now also arrives from the Back button and from a pasted link,
+  // and a rail that only collapsed when you clicked the tab yourself would
+  // leave a shared /models link rendering its split in two thirds of the width.
+  useEffect(() => {
+    if (WIDE.has(dest)) {
+      if (restore.current === null) restore.current = openRef.current
+      setSidebar(false)
     } else if (restore.current !== null) {
-      setSidebarOpen(restore.current)
+      setSidebar(restore.current)
       restore.current = null
     }
-  }
+  }, [dest])
 
   return (
     <SelectionProvider>
-      <Header dest={dest} onSelectDest={go} />
+      <Header dest={dest} />
 
       <div className={sidebarOpen ? 'wrap' : 'wrap narrow'}>
         <div className="rail">
@@ -73,7 +81,7 @@ export function AppShell() {
               // on the way back out: once somebody has said what they want the
               // rail to do here, restoring an older value would fight them.
               restore.current = null
-              setSidebarOpen((v) => !v)
+              setSidebar(!openRef.current)
             }}
           >
             <svg
@@ -91,26 +99,31 @@ export function AppShell() {
           </button>
         </div>
 
+        {/* Sections rather than tabpanels: the header's destinations are links
+            to their own URLs now, not tabs, and a tabpanel with no tab pointing
+            at it is a promise to a screen reader that nothing keeps. Each one
+            still stays mounted while hidden, which is what keeps a destination's
+            in-flight polls and scroll position across a visit elsewhere. */}
         <main>
-          <section role="tabpanel" hidden={dest !== 'dash'}>
+          <section aria-label="Dashboard" hidden={dest !== 'dash'}>
             <DashboardTab />
           </section>
-          <section role="tabpanel" hidden={dest !== 'models'}>
+          <section aria-label="Models" hidden={dest !== 'models'}>
             <ModelsTab />
           </section>
-          <section role="tabpanel" hidden={dest !== 'cluster'}>
+          <section aria-label="Cluster" hidden={dest !== 'cluster'}>
             <ClusterTab />
           </section>
-          <section role="tabpanel" hidden={dest !== 'storage'}>
+          <section aria-label="Storage" hidden={dest !== 'storage'}>
             <StorageTab />
           </section>
-          <section role="tabpanel" hidden={dest !== 'chat'}>
+          <section aria-label="Chat" hidden={dest !== 'chat'}>
             <ChatTab />
           </section>
-          <section role="tabpanel" hidden={dest !== 'spend'}>
+          <section aria-label="Spend" hidden={dest !== 'spend'}>
             <SpendTab />
           </section>
-          <section role="tabpanel" hidden={dest !== 'settings'}>
+          <section aria-label="Settings" hidden={dest !== 'settings'}>
             <SettingsTab />
           </section>
         </main>

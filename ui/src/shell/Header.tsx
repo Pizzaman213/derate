@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { Dest } from './AppShell'
+import { plainClick, useRouter, type Dest } from '../state/router'
 import { useCluster, useSettings } from '../state/resources'
 import { useMetrics } from '../state/metrics'
 import { Lamp } from '../components/Lamp'
@@ -16,14 +16,14 @@ const DESTS: { id: Dest; label: string }[] = [
 
 interface Props {
   dest: Dest
-  onSelectDest: (dest: Dest) => void
 }
 
 /** The wordmark, the roster pill, the destination tabs, the theme control, and
  *  the one lamp that says whether the metrics stream is actually connected --
  *  everything mockups-next/derate.html puts in `<header>`. */
-export function Header({ dest, onSelectDest }: Props) {
+export function Header({ dest }: Props) {
   useTheme()
+  const { linkTo, navigate } = useRouter()
   const cluster = useCluster()
   const settings = useSettings()
   const { stream } = useMetrics()
@@ -66,18 +66,29 @@ export function Header({ dest, onSelectDest }: Props) {
       ) : null}
       {settings.data?.local_only ? <span className="pill mono">cloud off</span> : null}
 
-      <div className="dest" role="tablist" aria-label="Destination">
+      {/* Anchors, not buttons. Each destination has a real URL now, and a real
+          URL is only worth having if the browser's own affordances reach it:
+          right-click to copy the link to the Cluster view, middle-click to open
+          Models in a second tab, hover to see where a tab goes. The click
+          handler takes plain clicks so the app navigates without a reload; a
+          modified click falls through to the browser, which is the whole
+          point. */}
+      <nav className="dest" aria-label="Destination">
         {DESTS.map((d) => (
-          <button
+          <a
             key={d.id}
-            role="tab"
-            aria-selected={dest === d.id}
-            onClick={() => onSelectDest(d.id)}
+            href={linkTo({ dest: d.id })}
+            aria-current={dest === d.id ? 'page' : undefined}
+            onClick={(e) => {
+              if (!plainClick(e)) return
+              e.preventDefault()
+              navigate({ dest: d.id })
+            }}
           >
             {d.label}
-          </button>
+          </a>
         ))}
-      </div>
+      </nav>
 
       <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <Lamp

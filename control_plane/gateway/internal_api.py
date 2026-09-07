@@ -1053,6 +1053,33 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     # -- providers ---------------------------------------------------------
 
+    @router.get("/api/providers/kinds")
+    async def provider_kinds() -> JSONResponse:
+        """What each kind needs before anyone configures one.
+
+        ``kinds_public()`` has said it carries "what the UI needs to render an
+        add-provider form with sane defaults" since it was written, and nothing
+        called it -- so the form hardcoded its own list and offered neither the
+        defaults nor the constraints. Two consequences worth naming, because
+        they are why this route exists:
+
+        Ollama's default base_url is ``http://localhost:11434/v1``. Left blank
+        in the form, that resolves on the *coordinator*, not on the machine the
+        operator had in mind, and fails as a connection timeout with nothing to
+        explain it. Showing the default is what makes it editable.
+
+        And a kind can be unsupported with a reason (Anthropic's Messages API
+        is not OpenAI-compatible here). Offering it in a select that cannot
+        explain itself turns a documented limitation into a failed POST.
+
+        Static: no key material, nothing per-cluster, so it is cacheable.
+        """
+        from control_plane.providers.serialization import kinds_public
+
+        return JSONResponse(
+            kinds_public(), headers={"cache-control": "public, max-age=300"}
+        )
+
     @router.get("/api/providers")
     async def list_providers() -> JSONResponse:
         try:

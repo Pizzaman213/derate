@@ -62,15 +62,21 @@ header {
   gap: 2px;
   margin-left: auto;
 }
-.dest button {
-  border: none;
-  background: none;
+/* The destinations are anchors (shell/Header.tsx: each one has a real URL, so
+   copy-link and open-in-new-tab work on them). Same look as the buttons they
+   replaced -- an underline under the current screen, nothing else. */
+.dest a {
+  display: inline-flex;
+  align-items: center;
   border-bottom: 2px solid transparent;
-  border-radius: 0;
   padding: 6px 13px;
   color: var(--ink-muted);
+  text-decoration: none;
 }
-.dest button[aria-selected='true'] {
+.dest a:hover {
+  background: var(--hover);
+}
+.dest a[aria-current='page'] {
   color: var(--ink);
   border-bottom-color: var(--ink);
 }
@@ -717,6 +723,32 @@ svg text.m {
   color: var(--ink);
   border-bottom-color: var(--ink);
 }
+/* Settings -> Connection: the address you type, beside the identity it
+   resolves to. Not `.chartgrid` -- the two are not peers, the coordinator
+   card carries a form and the cluster card is five read-only rows, so the
+   columns are weighted rather than equal. One column below 900px, where a
+   Cluster card that narrow would wrap every value onto its own line.
+
+   `.card2` carries its own bottom margin for the stacked case; inside a grid
+   the gap already does that work and the margin only unlevels the row. */
+.settingsgrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr);
+  gap: var(--s-4);
+  align-items: start;
+}
+.settingsgrid > .card2 {
+  margin-bottom: 0;
+}
+@media (max-width: 900px) {
+  .settingsgrid {
+    grid-template-columns: 1fr;
+  }
+  .settingsgrid > .card2 {
+    margin-bottom: 14px;
+  }
+}
+
 .chartgrid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

@@ -1200,6 +1200,83 @@ def test_static_ui_is_served_when_ui_dir_exists_and_api_routes_still_work(tmp_pa
         )
 
 
+def _ui_dir(tmp_path):
+    """A built UI: the document, and one hashed asset beside it."""
+    (tmp_path / "index.html").write_text("<h1>hello derate</h1>")
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "index-abc123.js").write_text("console.log(1)")
+    return tmp_path
+
+
+def test_a_ui_deep_path_answers_with_the_document(tmp_path):
+    """The UI puts its screen in the path, and those paths are the whole point
+    of the URL scheme: they get pasted into messages and reloaded. Nothing is
+    on disk under any of them, so the mount has to answer with index.html or a
+    shared link works exactly once, for the person who never reloads."""
+    settings = GatewaySettings(ui_dir=str(_ui_dir(tmp_path)))
+
+    with TestClient(create_app(GatewayDeps(registry=_EmptyRegistry(), settings=settings))) as client:
+        for path in ("/cluster", "/models", "/dashboard?dep=qwen3-30b-a3b", "/settings"):
+            page = client.get(path)
+            assert page.status_code == 200, path
+            assert "hello derate" in page.text, path
+            # Same rule as the document itself: it is the entry point to a
+            # content-hashed bundle, and a cached copy of it outlives the
+            # assets it names.
+            assert page.headers["cache-control"] == "no-store, must-revalidate"
+
+
+def test_a_model_deep_path_with_dots_in_it_answers_a_browser_with_the_document(tmp_path):
+    """`/models/meta-llama/Llama-3.1-8B` is a screen, not a file, and the dots
+    in the last segment are part of a model id. A browser navigating to it says
+    it wants a document; that is what separates it from a missing asset."""
+    settings = GatewaySettings(ui_dir=str(_ui_dir(tmp_path)))
+
+    with TestClient(create_app(GatewayDeps(registry=_EmptyRegistry(), settings=settings))) as client:
+        page = client.get(
+            "/models/meta-llama/Llama-3.1-8B",
+            headers={"accept": "text/html,application/xhtml+xml"},
+        )
+        assert page.status_code == 200
+        assert "hello derate" in page.text
+
+
+def test_the_deep_path_fallback_does_not_swallow_a_missing_asset(tmp_path):
+    """A stale tab asking for a hash the last build deleted must get a 404. If
+    it got index.html instead, the browser would refuse an HTML body in a
+    `<script type=module>` and the page would be blank with no failed request
+    to point at -- the exact silent failure the cache headers above exist to
+    prevent, reintroduced from the other side."""
+    settings = GatewaySettings(ui_dir=str(_ui_dir(tmp_path)))
+
+    with TestClient(create_app(GatewayDeps(registry=_EmptyRegistry(), settings=settings))) as client:
+        assert client.get("/assets/index-abc123.js").status_code == 200
+        gone = client.get(
+            "/assets/index-deleted.js", headers={"accept": "text/html,*/*"}
+        )
+        assert gone.status_code == 404
+        # Nor for a file outside /assets that a script went looking for.
+        assert client.get("/sw.js").status_code == 404
+
+
+def test_the_deep_path_fallback_leaves_the_api_surface_answering_404(tmp_path):
+    """A mistyped API path must stay a 404. Answering it with the document
+    turns every such call into a JSON parse error three layers from the cause
+    -- the same hazard the router registration order guards against, and the
+    fallback is the second way to walk into it."""
+    settings = GatewaySettings(ui_dir=str(_ui_dir(tmp_path)))
+
+    with TestClient(create_app(GatewayDeps(registry=_EmptyRegistry(), settings=settings))) as client:
+        for path in ("/api/settngs", "/api/nodes/spark-01/nope", "/v1/chat/completons"):
+            miss = client.get(path, headers={"accept": "text/html,*/*"})
+            assert miss.status_code == 404, path
+            assert "hello derate" not in miss.text, path
+
+        # And the live ones still win, with the mount registered under them.
+        assert client.get("/api/nodes").status_code == 200
+        assert client.get("/healthz").status_code == 200
+
+
 def test_missing_ui_dir_warns_and_does_not_crash_the_gateway(tmp_path, caplog):
     missing = tmp_path / "does-not-exist"
     settings = GatewaySettings(ui_dir=str(missing))

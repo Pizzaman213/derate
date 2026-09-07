@@ -567,6 +567,48 @@ def test_gateway_constructs_and_serves_with_every_dependency_stubbed():
             assert client.get(path).status_code == 200, path
 
 
+def test_provider_kinds_tell_the_form_what_each_kind_needs():
+    """The add-provider form restated this table and drifted from it.
+
+    Two ways, both of which reached an operator as an unexplained failure: it
+    offered Anthropic, which this build has no adapter for and rejects at POST
+    time, and it could not say that Ollama needs no key or where its default
+    base_url points.
+    """
+    with TestClient(create_app(build_deps())) as client:
+        reply = client.get("/api/providers/kinds")
+    assert reply.status_code == 200
+    by_kind = {k["kind"]: k for k in reply.json()}
+
+    ollama = by_kind["ollama"]
+    assert ollama["requires_key"] is False
+    # Shown so it can be corrected. Dialled from the coordinator, this default
+    # is the coordinator itself -- almost never the machine that was meant.
+    assert ollama["base_url"] == "http://localhost:11434/v1"
+
+    assert by_kind["openrouter"]["requires_key"] is True
+    assert by_kind["custom"]["requires_base_url"] is True
+    # A kind this build cannot talk to says so, in its own words.
+    assert by_kind["anthropic"]["unsupported_reason"]
+
+
+def test_provider_kinds_needs_no_ports_and_is_cacheable():
+    """A static table compiled into the server. It must answer with nothing
+    wired, and must not be re-fetched on every render of the settings page."""
+    with TestClient(create_app(GatewayDeps())) as bare:
+        reply = bare.get("/api/providers/kinds")
+    assert reply.status_code == 200
+    assert len(reply.json()) >= 5
+    assert "max-age" in reply.headers.get("cache-control", "")
+
+
+def test_provider_kinds_carries_no_key_material():
+    """It is served to every browser that opens Settings."""
+    with TestClient(create_app(build_deps())) as client:
+        body = client.get("/api/providers/kinds").text
+    assert "api_key" not in body and "sk-" not in body
+
+
 def test_startup_does_not_block_on_a_slow_node():
     """A registry that hangs must degrade startup, not prevent it."""
 

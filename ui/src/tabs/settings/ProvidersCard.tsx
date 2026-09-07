@@ -10,19 +10,25 @@ import { relativeTime } from '../../format'
 // there is no honest single $/Mtok for a provider serving many models at
 // different prices; that column is dashed unless there is exactly one model
 // to be unambiguous about.
-const KINDS: ProviderKind[] = [
-  'openrouter',
-  'openai',
-  'anthropic',
-  'together',
-  'groq',
-  'ollama',
-  'custom',
-]
+// The kind list is the server's, fetched from /api/providers/kinds rather than
+// restated here. A local copy went stale in both directions: it offered
+// Anthropic, which this build cannot talk to and rejects at POST time, and it
+// could not say that Ollama needs no key or that its default base_url resolves
+// on the coordinator -- so "leave blank for the default" pointed at the wrong
+// machine and failed as a bare connection timeout.
+
+/** True for an address that resolves on whatever machine dials it.
+ *
+ *  Not a security check -- it decides whether to warn that "localhost" means
+ *  the coordinator rather than the box the operator is picturing. */
+function isLocalUrl(url: string): boolean {
+  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(url.trim())
+}
 
 export function ProvidersCard() {
   const providers = useProviders()
   const { backend, invalidate } = useBackend()
+  const kinds = useProviderKinds()
   const [kind, setKind] = useState<ProviderKind>('openrouter')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKeyRef, setApiKeyRef] = useState('')
@@ -30,6 +36,20 @@ export function ProvidersCard() {
   const [error, setError] = useState<string | null>(null)
 
   const list = providers.data ?? []
+  const specs = kinds.data ?? []
+  const spec = specs.find((k) => k.kind === kind)
+  const offered = specs.filter((k) => !k.unsupported_reason)
+
+  // Changing the kind carries its default into the field rather than leaving a
+  // blank the server fills in silently. The operator can see the address that
+  // is about to be dialled, and edit it -- which for a LAN box like Ollama on
+  // another machine is the whole job.
+  const chooseKind = (next: ProviderKind) => {
+    setKind(next)
+    const target = specs.find((k) => k.kind === next)
+    setBaseUrl(target?.base_url ?? '')
+    if (target && !target.requires_key) setApiKeyRef('')
+  }
 
   const remove = async (id: string) => {
     setBusy(id)
@@ -137,18 +157,22 @@ export function ProvidersCard() {
         className="unit"
         style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--rule)' }}
       >
-        The key reference is the name of an environment variable, not a key. It is resolved at
-        request time and never displayed, logged, or exported — there is no reveal control and
-        adding one would be the bug.
+        {spec && !spec.requires_key
+          ? `${spec.display_name} takes no key — it is a server you run, reached over the network. Only the address matters.`
+          : `The key reference is the name of an environment variable, not a key. It is resolved at request time and never displayed, logged, or exported — there is no reveal control and adding one would be the bug.`}
       </div>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginTop: 12, flexWrap: 'wrap' }}>
         <div className="fld">
           <label htmlFor="pkind">Provider</label>
-          <select id="pkind" value={kind} onChange={(e) => setKind(e.target.value as ProviderKind)}>
-            {KINDS.map((k) => (
-              <option key={k} value={k}>
-                {k}
+          <select
+            id="pkind"
+            value={kind}
+            onChange={(e) => chooseKind(e.target.value as ProviderKind)}
+          >
+            {offered.map((k) => (
+              <option key={k.kind} value={k.kind}>
+                {k.display_name}
               </option>
             ))}
           </select>
@@ -159,11 +183,20 @@ export function ProvidersCard() {
             id="pbase"
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder="leave blank for the default"
+            placeholder={spec?.base_url || 'https://…/v1'}
             spellCheck={false}
           />
+          {spec && isLocalUrl(baseUrl || spec.base_url) ? (
+            <div className="unit" style={{ marginTop: 4 }}>
+              This address is dialled from the coordinator, so localhost means the
+              coordinator itself. For a server on another machine, use its address.
+            </div>
+          ) : null}
         </div>
-        <div className="fld" style={{ flex: 1, minWidth: 180 }}>
+        <div
+          className="fld"
+          style={{ flex: 1, minWidth: 180, display: spec && !spec.requires_key ? 'none' : undefined }}
+        >
           {/* Labelled "Key reference", not "API key" -- the mockup's label
               and "sk-..." placeholder (derate.html) steer toward pasting a
               real key into a field that is POSTed as api_key_ref, the name

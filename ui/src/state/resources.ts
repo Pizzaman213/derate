@@ -9,6 +9,11 @@ export const useTopology = () => useResource((b) => b.topology(), 5000)
 export const useCandidates = () => useResource((b) => b.candidates(), 3000)
 export const useRouting = () => useResource((b) => b.routing(), 5000)
 export const useProviders = () => useResource((b) => b.providers(), 15000)
+// A static table compiled into the server, not cluster state. Polled at the
+// laziest interval the hook offers rather than fetched once, because that is
+// the only shape useResource has -- the server marks it cacheable and the
+// browser will not re-ask on most of these ticks.
+export const useProviderKinds = () => useResource((b) => b.providerKinds(), 300000)
 export const useSettings = () => useResource((b) => b.getSettings(), 5000)
 // Only ever a row or two, and only while somebody is mid-install. Polled
 // rather than held in the card's own state so a second browser -- or a

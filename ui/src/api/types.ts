@@ -174,6 +174,25 @@ export interface NodeProfile {
   driver_version: string
 }
 
+/** What one provider kind needs before anyone configures it. `GET
+ *  /api/providers/kinds`, straight from the server's own KindSpec table, so
+ *  the add form cannot drift from what the server will accept. */
+export interface ProviderKindSpec {
+  kind: ProviderKind
+  display_name: string
+  /** The default the server applies when base_url is left blank. Shown rather
+   *  than implied: Ollama's is `http://localhost:11434/v1`, which resolves on
+   *  the coordinator and is almost never the box the operator meant. */
+  base_url: string
+  requires_key: boolean
+  requires_base_url: boolean
+  publishes_pricing: boolean
+  forwardable: boolean
+  /** Set when this build cannot talk to the kind at all. The server's own
+   *  sentence; render it verbatim and do not offer the kind. */
+  unsupported_reason: string | null
+}
+
 export interface NodeStateDTO {
   profile: NodeProfile
   /** See `TopologyNode.label`. Deliberately not on `profile`: that is the

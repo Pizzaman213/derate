@@ -14,6 +14,7 @@ import type {
   NodeHealth,
   NodeProfile,
   NodeStateDTO,
+  ProviderKindSpec,
   DeploymentDTO,
   Enrollment,
   EnrollmentRow,
@@ -180,6 +181,7 @@ export interface Backend {
   /** 501, with a message naming why, when the patch includes a daily spend
    *  cap and no provider port can be measured against. */
   patchSettings(patch: SettingsPatch): Promise<Settings>
+  providerKinds(): Promise<ProviderKindSpec[]>
   addProvider(spec: ProviderSpec): Promise<Provider>
   removeProvider(providerId: string): Promise<void>
   patchProvider(providerId: string, patch: ProviderPatch): Promise<Provider>
@@ -699,6 +701,7 @@ export const httpBackend: Backend = {
   getSettings: () => req<Settings>('/api/settings'),
   patchSettings: (patch) =>
     req<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
+  providerKinds: () => req<ProviderKindSpec[]>('/api/providers/kinds'),
   addProvider: (spec) =>
     req<Provider>('/api/providers', { method: 'POST', body: JSON.stringify(spec) }),
   removeProvider: (providerId) =>

@@ -287,8 +287,11 @@ export interface ClusterLayout {
   /** Top-left of every slot, in slot order. Drop targeting reads this. */
   slots: Point[]
   arrangement: string[]
-  /** Keyed exactly as particles.ts looks them up: `${servedName}#L${i}` for
-   *  the i'th ROUTING TARGET of that served name, in `cfg.targets` order. */
+  /** Keyed by `localFlightKey`/`providerFlightKey` -- by the ROUTING TARGET
+   *  that serves the flight, not by its position in any list. particles.ts
+   *  binds one flight to one target's live request count, so an ordinal key
+   *  would silently misattribute the moment a target has no drawable
+   *  deployment and the indices shift under it. */
   paths: Record<string, Point[]>
   emptyMessage: string | null
   suppressedPairs: number
@@ -296,6 +299,22 @@ export interface ClusterLayout {
 
 export function edgeKey(a: string, b: string): string {
   return [a, b].sort().join('~')
+}
+
+/** The flight path a LOCAL routing target's requests walk. `targetId` is the
+ *  deployment id -- the gateway builds a local target's id from it (see
+ *  gateway/targets.py), which is what lets a live per-deployment metric and a
+ *  routing target address the same path. */
+export function localFlightKey(servedName: string, targetId: string): string {
+  return `${servedName}#L:${targetId}`
+}
+
+/** The flight path every REMOTE target of a served name shares. There is one
+ *  provider rail on the floor, not one per upstream model, so several remote
+ *  targets legitimately collapse onto this single key and their live request
+ *  counts add up on it. */
+export function providerFlightKey(servedName: string): string {
+  return `${servedName}#P`
 }
 
 /** The one definition of "measured" a link, chip or tally is allowed to use:
@@ -758,7 +777,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
       })
       if (t) {
         junctions.push({ x: GUTTER_RAIL, y: band.ny, r: 3, opacity: active ? 1 : 0.5 })
-        paths[`${band.servedName}#P`] = [
+        paths[providerFlightKey(band.servedName)] = [
           { x: ENTRY_W, y: ey },
           { x: GUTTER_ENTRY, y: ey },
           { x: GUTTER_ENTRY, y: band.ny },
@@ -803,12 +822,12 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
 
   // ── Particle flight paths ────────────────────────────────────────────────
   //
-  // One path per ROUTING TARGET of a served name, in cfg.targets order, so
-  // particles.ts's pickPath can line its wire weights up with them one for one
-  // and never has to guess. A flight enters at the endpoint, reaches the
-  // served name, then walks the deployment's pipeline in node_ids order --
-  // which is stage order, not a set -- so a token visibly crosses the link the
-  // plan turned on.
+  // One path per ROUTING TARGET of a served name, keyed BY that target's id,
+  // so particles.ts can bind a flight to the target whose live request count
+  // it is drawing rather than to a position in a list. A flight enters at the
+  // endpoint, reaches the served name, then walks the deployment's pipeline in
+  // node_ids order -- which is stage order, not a set -- so a request visibly
+  // crosses the link the plan turned on.
   const bandOf = new Map(bands.map((b) => [b.deploymentId, b]))
   const byName = new Map<string, DeploymentDTO[]>()
   for (const dep of drawable) {
@@ -818,19 +837,10 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
   }
 
   for (const [servedName, deps] of byName) {
-    const cfg = input.routing.find((c) => c.served_name === servedName)
-    const targetOrder = cfg ? cfg.targets.filter((t) => t.kind === 'local').map((t) => t.target_id) : []
-    const ordered = [...deps].sort((a, b) => {
-      const ia = targetOrder.indexOf(a.deployment_id)
-      const ib = targetOrder.indexOf(b.deployment_id)
-      if (ia !== ib) return (ia < 0 ? Number.MAX_SAFE_INTEGER : ia) - (ib < 0 ? Number.MAX_SAFE_INTEGER : ib)
-      return a.deployment_id.localeCompare(b.deployment_id)
-    })
-
-    ordered.forEach((dep, i) => {
+    for (const dep of deps) {
       const band = bandOf.get(dep.deployment_id)
       const hops = dep.node_ids.map((id) => placed.get(id)).filter((c): c is PlacedCard => c != null)
-      if (!band || hops.length === 0) return
+      if (!band || hops.length === 0) continue
 
       const first = hops[0]!
       const leadX = first.x + first.w / 2
@@ -850,8 +860,8 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
           Math.hypot(last.x - next.x, last.y - next.y) <= Math.hypot(seg[0]!.x - next.x, seg[0]!.y - next.y)
         pts.push(...(forward ? seg : [...seg].reverse()), next)
       }
-      paths[`${servedName}#L${i}`] = pts
-    })
+      paths[localFlightKey(servedName, dep.deployment_id)] = pts
+    }
   }
 
   // Centre the ink. The extremes are the boxes, not the connectors: a

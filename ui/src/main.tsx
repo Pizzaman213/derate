@@ -9,17 +9,22 @@ import './styles/base.css'
 import './styles/derate.css'
 import { AppShell } from './shell/AppShell'
 import { BackendProvider } from './state/backend'
+import { RouterProvider } from './state/router'
 import { MetricsProvider } from './state/metrics'
 import { TelemetryProvider } from './state/telemetry'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <BackendProvider>
-      <MetricsProvider>
-        <TelemetryProvider>
-          <AppShell />
-        </TelemetryProvider>
-      </MetricsProvider>
-    </BackendProvider>
+    {/* Outermost: the URL decides which screen mounts and what is selected on
+        it, so everything below is downstream of the address bar. */}
+    <RouterProvider>
+      <BackendProvider>
+        <MetricsProvider>
+          <TelemetryProvider>
+            <AppShell />
+          </TelemetryProvider>
+        </MetricsProvider>
+      </BackendProvider>
+    </RouterProvider>
   </StrictMode>,
 )

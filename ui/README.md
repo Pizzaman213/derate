@@ -36,6 +36,14 @@ needs neither a browser nor a cluster:
 node src/tabs/cluster/layout.check.mjs   # assertions, plus layout-preview.svg
 ```
 
+The URL scheme has one too, for the reason under **URLs** below -- a URL is the
+only part of this UI that leaves the machine, so both directions of it are
+checked:
+
+```bash
+node src/state/router.check.mjs
+```
+
 The history adapters have their own verifier, for a different reason: one route
 answers with raw per-second columns under six hours and bucket aggregates
 beyond, and reading the wrong shape yields an empty chart rather than an error.
@@ -58,12 +66,62 @@ HISTORY_FIXTURES=$FX node src/state/history.check.mjs
 It asserts the fixtures really are the two shapes it thinks they are, so a
 schema change fails the check rather than quietly passing it.
 
+## URLs
+
+Every screen has one, and so does most of what you can select on it. The rule
+for which half of a URL a thing goes in:
+
+```
+the PATH names the screen         /dashboard  /models  /cluster  /storage
+                                  /chat  /spend  /settings
+...and the screen's own subject   /models/meta-llama/Llama-3.1-8B
+the QUERY names what is selected  ?node=spark-01        a machine
+                                  ?link=spark-01~spark-02   a link
+                                  ?dep=qwen3-30b-a3b    the deployment in the sidebar
+                                  ?open=node:spark-01   the sheet, over any screen
+                                  ?ctx=32768&seq=4      what the fit verdicts are taken at
+```
+
+Selections are query parameters rather than path segments because they are not
+owned by a destination: the same machine is selectable on the cluster floor, in
+the dashboard's telemetry strip and in the sidebar roster, and the sheet is a
+modal that sits over whichever screen is showing. A model id is a path, because
+it is the subject of the screen and because `/models/meta-llama/Llama-3.1-8B`
+is the URL somebody would guess.
+
+`state/routes.ts` is the scheme -- `parse` and `href`, pure, no React.
+`state/router.tsx` is the provider, the `useRouter` hook, and the push/replace
+policy. `state/selection.tsx` reads and writes the four selections through it;
+every caller still just says `selectNode(id)` and does not know a URL was
+involved.
+
+**Selecting replaces, opening pushes.** Clicking across a machine floor is
+scrubbing, not navigating, and a history entry per click would make Back a
+hundred-press undo of something nobody thinks of as an action -- the URL still
+updates, so it is still shareable. Opening the sheet or a model's detail pane
+pushes, because those are screens and Back is how people close screens. Closing
+either one replaces, so Back from a closed sheet goes where you were before you
+opened it rather than reopening it.
+
+**A URL has one spelling.** `?ctx=8192` is the default and is never written;
+neither is a model id on a destination that has no models on it. Both would be
+a second URL for one screen, and two spellings of a shared link is how you end
+up unable to tell whether two people are looking at the same thing.
+
+**The coordinator has to answer a deep path with `index.html`.** Nothing exists
+on disk under `/models/meta-llama/Llama-3.1-8B`; the router in the page reads
+the path itself. `_UIStatics.get_response` in `control_plane/gateway/app.py`
+does that, and deliberately does *not* do it for `/api`, `/v1` or a missing
+hashed asset. Break that and the links work exactly once -- for the person who
+never reloads. Vite's dev server does the same by default.
+
 ## Layout
 
 ```
 src/api/        types mirrored from the frozen contracts, the HTTP client,
                 and a defensive credential scrub
-src/state/      polled resources, the 1 Hz metrics stream, selection
+src/state/      polled resources, the 1 Hz metrics stream, the URL scheme
+                (routes.ts, router.tsx) and selection
 src/styles/     the token layer; dark mode redefines five variables
 src/components/ Readout, Lamp, Bars, Panel, Verbatim
 src/shell/      header, app shell, the one sheet

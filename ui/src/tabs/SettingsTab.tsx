@@ -47,7 +47,9 @@ export function SettingsTab() {
         {SUBS.map((s) => (
           <button
             key={s.id}
+            id={`st-tab-${s.id}`}
             role="tab"
+            type="button"
             aria-selected={sub === s.id}
             aria-controls={`st-${s.id}`}
             onClick={() => setSub(s.id)}
@@ -60,30 +62,49 @@ export function SettingsTab() {
       {/* Where requests go, beside what answers them. Two cards, and the
           second is the proof the first is right: an address that resolves
           reports a cluster id back. */}
-      <div id="st-connection" role="tabpanel" hidden={sub !== 'connection'}>
+      <div
+        id="st-connection"
+        role="tabpanel"
+        aria-labelledby="st-tab-connection"
+        hidden={sub !== 'connection'}
+      >
         <div className="settingsgrid">
           <CoordinatorCard />
           <ClusterCard />
         </div>
       </div>
 
-      <div id="st-nodes" role="tabpanel" hidden={sub !== 'nodes'}>
+      <div id="st-nodes" role="tabpanel" aria-labelledby="st-tab-nodes" hidden={sub !== 'nodes'}>
         <AddNodeCard />
         <NodesCard />
       </div>
 
-      <div id="st-providers" role="tabpanel" hidden={sub !== 'providers'}>
+      <div
+        id="st-providers"
+        role="tabpanel"
+        aria-labelledby="st-tab-providers"
+        hidden={sub !== 'providers'}
+      >
         <ProvidersCard />
       </div>
 
-      <div id="st-policy" role="tabpanel" hidden={sub !== 'policy'}>
+      <div id="st-policy" role="tabpanel" aria-labelledby="st-tab-policy" hidden={sub !== 'policy'}>
         <ContainmentCard />
       </div>
 
       {/* Not settings. Nothing here writes anything; they are the project's
           own record of what it has and has not built, which is why they sit
           behind their own tab instead of below the controls. */}
-      <div id="st-about" role="tabpanel" hidden={sub !== 'about'}>
+      <div
+        id="st-about"
+        role="tabpanel"
+        aria-labelledby="st-tab-about"
+        // Nothing in About is focusable, so the panel itself has to be, or a
+        // keyboard lands on the tab with nowhere to go. Every other panel
+        // holds a control and must not add a redundant stop.
+        tabIndex={0}
+        hidden={sub !== 'about'}
+      >
         <ScopeCards />
       </div>
     </div>
