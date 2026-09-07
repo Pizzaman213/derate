@@ -28,7 +28,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import internal_api, openai_api
+from . import internal_api, openai_api, ui_api
 from .admission import AdmissionController
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
@@ -326,6 +326,10 @@ def create_app(
     app.state.ctx = ctx
     app.include_router(openai_api.create_router(ctx))
     app.include_router(internal_api.create_router(ctx))
+    # Above the StaticFiles mount below, and it must stay there: a Starlette
+    # mount at "/" catches every path not matched by an EARLIER route, so a
+    # router registered after it never sees a request.
+    app.include_router(ui_api.create_router(ctx))
 
     @app.get("/healthz")
     async def healthz():

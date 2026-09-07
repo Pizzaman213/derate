@@ -52,6 +52,15 @@ class GatewaySettings:
     # Local targets price from measured power draw against this rate.
     # Zero by default, which makes local free and therefore always cheapest.
     electricity_rate_usd_per_kwh: float = 0.0
+    # Operator-set, persisted to $SPARKPLANE_DATA_DIR/settings.json and applied
+    # through the existing `admitting` gate rather than a new mechanism.
+    # local_only is a HARD block, not a routing preference: policies.eligible()
+    # filters on admitting before any of the seven selectors run, so it outranks
+    # them all -- whereas local_first is merely a policy.
+    local_only: bool = False
+    # None means no cap; 0.0 means spend nothing. Two different instructions,
+    # and a form whose empty field yields 0.0 would silently swap them.
+    daily_spend_cap_usd: float | None = None
 
     # --- admission control ---
     admission_reconcile_interval_s: float = 0.5

@@ -1,20 +1,63 @@
 /* The entire palette. Components reference these names and never a literal
-   colour. Dark mode redefines exactly five of them and nothing else, which is
-   what keeps dark mode a token swap instead of a second set of components. */
+   colour, so dark mode is a token swap rather than a second set of components.
+
+   Three things here are load-bearing and were added deliberately:
+
+   1. --fill is SPLIT FROM --ink. They used to be the same value, which made
+      every selection indicator in the flow graph invisible: an outline drawn
+      stroke:var(--ink) on a fill:var(--fill) rect is 1.00:1 in light and
+      1.13:1 in dark. Selection is now drawn OUTSIDE the plate against the
+      page with --select-on-panel, or inside it with --select-on-fill.
+
+   2. The surface ramp runs BOTH directions. There was no token for "above the
+      page", so a dialog painted --panel over a dimmed page was invisible in
+      dark mode -- 1.07:1 against its own scrim. --panel-raised fixes it, and
+      --panel-sunk gives meter tracks something to be, since a track that
+      cannot be seen is a proportion with no denominator.
+
+   3. Status colours are PER THEME. They render as text (Readout tone="fault"),
+      and #A93A2E on #191817 is 2.81:1 -- the failure state was the least
+      readable thing in dark mode. Values below are tuned for text on --panel;
+      the heavier originals live on as -solid for fills and dots. */
 
 :root {
-  /* Panel — light. The enamel. */
-  --panel: #EDE9E0;
-  --panel-recessed: #E3DED3;
-  --ink: #1A1917;
-  --ink-muted: #6E6A62;
-  --rule: #C9C2B4;
+  /* Surfaces, sunk -> raised. */
+  --panel-sunk: #D6D0C2;      /* meter tracks, wells */
+  --panel-recessed: #E3DED3;  /* sidebar, cards on the page */
+  --panel: #EDE9E0;           /* the page */
+  --panel-raised: #F7F4EE;    /* dialog, popover */
+  --panel-overlay: rgba(26, 25, 23, 0.35);
+  --shadow-raised: 0 6px 24px rgba(26, 25, 23, 0.16);
 
-  /* Signal. Identical in both modes. Three colours and no others.
-     If something carries colour, it is reporting a state. */
-  --live: #3D8B4A;
-  --warn: #B8862C;
-  --fault: #A93A2E;
+  --ink: #1A1917;
+  --ink-muted: #5C5851;       /* was #6E6A62: 4.44:1 failed AA on 12px text */
+  --rule: #C9C2B4;
+  --rule-strong: #B4AC9A;     /* soft dividers, 1.86:1 -- decorative only */
+  /* Boundaries that must be PERCEIVABLE: control borders and meter-track
+     keylines. A bar whose track cannot be seen is a proportion with no
+     denominator, and a luminance step alone never survives a warm palette --
+     --panel-sunk is only 1.47:1 against the page, so the keyline does the work. */
+  --edge: #82796B;            /* 3.54:1 light, 3.85:1 dark */
+
+  /* The inverted plate, distinct from text ink. */
+  --fill: #33302B;
+  --on-fill: #EDE9E0;
+  --on-fill-dim: #A8A398;
+  --select-on-panel: var(--ink);
+  --select-on-fill: var(--on-fill);
+
+  /* Signal. Tuned for TEXT on --panel; -solid for fills and dots. */
+  --live: #2F6E3A;            /* 5.08:1 */
+  --warn: #7F5C14;            /* 5.03:1 -- #8A6318 measured 4.47 and missed AA */
+  --fault: #9A3327;           /* 6.02:1 */
+  --live-solid: #3D8B4A;
+  --warn-solid: #B8862C;
+  --fault-solid: #A93A2E;
+  --on-signal: #EDE9E0;
+
+  /* A request in flight. An accent, not a grey: it is a real measured event
+     and the least salient mark on the drawing was the wrong call. */
+  --flow: #4A6FA5;
 
   /* Type */
   --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
@@ -25,37 +68,105 @@
   --size-body: 15px;
   --size-label: 13px;
   --size-unit: 12px;
+  --size-micro: 11px;
 
-  /* Space — 12px base unit */
+  /* Plex Mono renders optically larger than Plex Sans at the same px, so a
+     mono readout beside a sans label sits high. Each mono step is one notch
+     tighter than its sans partner. */
+  --size-mono-readout-xl: 46px;
+  --size-mono-readout: 27px;
+  --size-mono-body: 14px;
+  --size-mono-label: 12px;
+  --size-mono-unit: 11px;
+
+  /* Space. The 12px-base names are kept because the six shared components
+     read them; the 4px grid is added alongside for everything new. */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+  --s-half: 6px;
   --s1: 12px;
   --s2: 24px;
   --s3: 36px;
-  --s-half: 6px;
+
+  --gutter: 20px;
+  --sidebar-w: 300px;
+  --control-h: 32px;
 
   --radius: 3px;
+  --radius-lg: 6px;
 
-  /* Derived surfaces. Kept as tokens so dark mode inherits them for free. */
   --hover: color-mix(in srgb, var(--ink) 5%, transparent);
   --pressed: color-mix(in srgb, var(--ink) 9%, transparent);
   --focus: var(--ink);
+
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
 }
 
-/* Dark. Only the five panel tokens move. Signal colours are untouched, which is
-   the point: green means serving in both modes, at the same green. */
+/* Dark. The ramp inverts as a whole so "raised" still means lighter-than-page
+   and one mental model covers both themes. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --panel: #1A1917;
-    --panel-recessed: #232120;
+    --panel-sunk: #0E0D0C;
+    --panel-recessed: #141312;
+    --panel: #191817;
+    --panel-raised: #232120;
+    --panel-overlay: rgba(0, 0, 0, 0.55);
+    --shadow-raised: 0 6px 24px rgba(0, 0, 0, 0.5);
+
     --ink: #EDE9E0;
-    --ink-muted: #8A8479;
-    --rule: #38352F;
+    --ink-muted: #979186;
+    --rule: #423D37;
+    --rule-strong: #5A544C;
+    --edge: #7C746A;
+
+    --fill: #E2DCD0;
+    --on-fill: #191817;
+    --on-fill-dim: #5A5750;
+
+    --live: #72C182;
+    --warn: #D6A64A;
+    --fault: #E58273;
+    --live-solid: #4E9E5C;
+    --warn-solid: #C4922F;
+    --fault-solid: #BC4A3B;
+    --on-signal: #191817;
+
+    --flow: #7FA3D4;
   }
 }
 
 :root[data-theme='dark'] {
-  --panel: #1A1917;
-  --panel-recessed: #232120;
+  --panel-sunk: #0E0D0C;
+  --panel-recessed: #141312;
+  --panel: #191817;
+  --panel-raised: #232120;
+  --panel-overlay: rgba(0, 0, 0, 0.55);
+  --shadow-raised: 0 6px 24px rgba(0, 0, 0, 0.5);
+
   --ink: #EDE9E0;
-  --ink-muted: #8A8479;
-  --rule: #38352F;
+  --ink-muted: #979186;
+  --rule: #423D37;
+  --rule-strong: #5A544C;
+  --edge: #7C746A;
+
+  --fill: #E2DCD0;
+  --on-fill: #191817;
+  --on-fill-dim: #5A5750;
+
+  --live: #72C182;
+  --warn: #D6A64A;
+  --fault: #E58273;
+  --live-solid: #4E9E5C;
+  --warn-solid: #C4922F;
+  --fault-solid: #BC4A3B;
+  --on-signal: #191817;
+
+  --flow: #7FA3D4;
 }
