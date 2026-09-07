@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { ProviderKindSpec } from '../../api/types'
-import { useProviderKinds, useProviders } from '../../state/resources'
+import { useCluster, useProviderKinds, useProviders } from '../../state/resources'
 import { useBackend } from '../../state/backend'
 import { ApiError } from '../../api/client'
 import { Verbatim } from '../../components/Verbatim'
@@ -23,6 +23,7 @@ import { gbytes } from '../../format'
 export function PullCard() {
   const providers = useProviders()
   const kinds = useProviderKinds()
+  const cluster = useCluster()
   const { backend, invalidate } = useBackend()
   const [providerId, setProviderId] = useState('')
   const [model, setModel] = useState('')
@@ -39,11 +40,35 @@ export function PullCard() {
   )
   const targets = (providers.data ?? []).filter((p) => pullable.has(p.kind))
 
-  // Nothing to say when no provider can host weights. A control that cannot
-  // act is worse than an absent one -- it reads as a broken feature rather
-  // than an unconfigured one.
+  // With no provider configured this used to render nothing at all, on the
+  // reasoning that a control which cannot act is worse than an absent one.
+  // That was wrong in the way that matters: a machine with no GPU is told, on
+  // the board directly above this, that it cannot carry a rank -- and the one
+  // path that does work was invisible, so the screen read as "this machine is
+  // useless" with nothing to disagree with it. An empty state that names the
+  // machines this is for, and where to enable it, is not a dead control.
   const first = targets[0]
-  if (!first) return null
+  if (!first) {
+    const gpuless = (cluster.data?.nodes ?? []).filter(
+      (n) => n.profile.gpu_count === 0,
+    )
+    return (
+      <div className="card2">
+        <h3>Run on a provider</h3>
+        <div className="unit">
+          {gpuless.length
+            ? `${gpuless
+                .map((n) => n.profile.node_id)
+                .join(', ')} ${gpuless.length === 1 ? 'has' : 'have'} no GPU, so ${
+                gpuless.length === 1 ? 'it cannot' : 'they cannot'
+              } carry a rank — but a machine like that can still serve a small model over
+               the network, and this cluster can route to it. Run a server on it, add it
+               under Settings → Providers, and it becomes a target here.`
+            : 'A machine that cannot carry a rank can still serve a small model over the network. Add it under Settings → Providers and it becomes a target here.'}
+        </div>
+      </div>
+    )
+  }
 
   const chosen = providerId || first.provider_id
 
