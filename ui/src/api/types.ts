@@ -118,8 +118,16 @@ export interface ReachLeg {
   error?: string | null
   /** The node_id the far side called itself. A mismatch is its own fault. */
   answered_as?: string | null
-  /** Set only on a leg that was never dialled, saying why. */
+  /** Set only on a leg that was never dialled, saying why. Two kinds, told
+   *  apart by `ok`: the coordinator's leg to itself (ok — nothing to dial) and
+   *  a direction that could not be tested at all (not ok, and not a failure
+   *  either). */
   note?: string | null
+  /** True when this leg tests a direction BETWEEN the two nodes asked about.
+   *  False for the coordinator's probe of an endpoint when the coordinator is
+   *  neither of them — reaching two machines from a third says nothing about
+   *  whether those two can reach each other. */
+  pair?: boolean
 }
 
 export interface ReachReport {
@@ -1047,6 +1055,9 @@ export interface ModelHit {
   downloads?: number | null
   likes?: number | null
   pipeline_tag?: string | null
+  /** Unix seconds from the hub listing. On the wire since the search endpoint
+   *  shipped (`resolver.py` selects it); it was simply missing from this type. */
+  last_modified?: number | null
   gated?: boolean | string | null
   tags?: string[]
   /** Guessed from the name and offered as a guess. */
@@ -1224,4 +1235,180 @@ export interface StorageReport {
 export interface CacheClearResult {
   cleared: boolean
   bytes_freed: number
+}
+
+// ── History ──────────────────────────────────────────────────────────────────
+//
+// `GET /api/history/{nodes,requests,events,logs}`. These routes shipped with
+// the durable-telemetry package and had no client at all until the node sheet
+// grew charts; `control_plane/telemetry/query.py` is the shape below.
+//
+// Two things about them drive every type here. First, the SAME route answers
+// with raw columns or rolled-up columns depending on how wide the window is
+// (`step=auto`: raw under 6 hours, 1-minute buckets under 7 days, hourly
+// beyond), so every column that only one of the two branches selects is
+// optional and a reader must check rather than assume. Second, every answer
+// carries its own provenance -- which resolution it used, whether it survives
+// a restart, and which parts of the window are known-missing -- because a flat
+// line has two causes and the product already refuses to blur that
+// distinction for a link it has never measured.
+
+/** A stretch the archive knows it does not have. Rendered as the sentence it
+ *  is, never smoothed over: trimmed and quiet are different answers. */
+export interface HistoryGap {
+  node_id: string
+  from_ts: number
+  to_ts: number
+  reason: string
+}
+
+export interface HistoryEnvelope {
+  from: number
+  to: number
+  /** `'raw' | '1m' | '1h'` from the archive, or `'ring'` when there is no
+   *  archive and the answer came from the registry's 300-sample in-RAM
+   *  buffer instead. */
+  resolution: 'raw' | '1m' | '1h' | 'ring'
+  /** False for `'ring'`: it does not survive a restart. A durable and a
+   *  non-durable series must never be charted as if they were the same
+   *  claim about the world. */
+  durable: boolean
+  gaps: HistoryGap[]
+  /** The window was wider than the row budget, so the FAR end was dropped.
+   *  Say so; a truncated window that reads as a complete one is a lie about
+   *  when something started. */
+  truncated: boolean
+}
+
+/** One node sample. Raw rows carry the instantaneous columns; rolled rows
+ *  carry `_avg`/`_max` over the bucket and an `n`. Never both. */
+export interface NodeHistorySample {
+  node_id: string
+  /** The sample time, or the bucket's left edge when rolled. */
+  ts: number
+
+  // raw
+  memory_used?: number
+  memory_total?: number
+  power_w?: number | null
+  temp_c?: number | null
+  util_pct?: number | null
+  gpu_memory_used?: number | null
+  gpu_process_count?: number | null
+  host_memory_total?: number | null
+  host_memory_available?: number | null
+  swap_used?: number | null
+
+  // rolled
+  n?: number
+  power_w_avg?: number | null
+  power_w_max?: number | null
+  temp_c_avg?: number | null
+  temp_c_max?: number | null
+  util_pct_avg?: number | null
+  util_pct_max?: number | null
+  memory_used_avg?: number | null
+  memory_used_max?: number | null
+  gpu_memory_used_avg?: number | null
+  gpu_memory_used_max?: number | null
+  host_memory_available_min?: number | null
+  swap_used_max?: number | null
+}
+
+export interface NodeHistory extends HistoryEnvelope {
+  samples: NodeHistorySample[]
+}
+
+/** A merged log-spaced histogram's summary. These are REAL percentiles: the
+ *  buckets merge exactly, so an hourly p99 is the p99 of that hour and not a
+ *  mean of sixty percentiles. Nothing else in the product has them -- the live
+ *  frame's TTFT and mean duration are exponential moving averages. */
+export interface HistSummary {
+  n: number
+  mean_ms: number | null
+  p50_ms: number | null
+  p90_ms: number | null
+  p99_ms: number | null
+  p999_ms: number | null
+  max_ms: number | null
+}
+
+/** One request attempt (raw) or one bucket of them (rolled). A retried
+ *  request is several raw rows sharing a `request_id` and differing in
+ *  `attempt_no`. */
+export interface RequestHistoryRow {
+  ts: number
+
+  // raw
+  request_id?: string
+  attempt_no?: number
+  node_id?: string
+  served_name?: string
+  target_id?: string
+  target_kind?: string
+  provider_id?: string
+  deployment_id?: string
+  policy?: string
+  strength_source?: string
+  attempts?: number
+  retry_reason?: string
+  status?: number | null
+  error_code?: string
+  error_class?: string
+  prompt_tokens?: number
+  completion_tokens?: number
+  tokens?: number
+  /** 1 when the token count was counted from SSE frames rather than read
+   *  from an upstream `usage` block. A counted frame presented as a measured
+   *  token is the same fabrication in a nicer font. */
+  tokens_estimated?: number
+  ttft_ms?: number | null
+  decode_ms?: number | null
+  duration_ms?: number | null
+  parked_ms?: number | null
+  streaming?: number
+  cost_usd?: number | null
+
+  // rolled
+  bucket?: number
+  n?: number
+  ok?: number
+  failed?: number
+  ttft?: HistSummary
+  duration?: HistSummary
+}
+
+export interface RequestHistory extends HistoryEnvelope {
+  requests: RequestHistoryRow[]
+}
+
+/** A lifecycle event as the bus emitted it. `body`'s keys are merged up into
+ *  the row by the query layer, so an event carries whatever its emitter put
+ *  there beyond the typed columns. */
+export interface HistoryEvent {
+  node_id: string
+  ts: number
+  source: string
+  type: string
+  deployment_id?: string
+  served_name?: string
+  [key: string]: unknown
+}
+
+export interface EventHistory extends HistoryEnvelope {
+  events: HistoryEvent[]
+}
+
+/** One log record, already redacted at the handler that shipped it. */
+export interface HistoryLog {
+  node_id: string
+  ts: number
+  level: string
+  logger: string
+  message: string
+  [key: string]: unknown
+}
+
+export interface LogHistory extends HistoryEnvelope {
+  logs: HistoryLog[]
 }

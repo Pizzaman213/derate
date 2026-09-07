@@ -167,15 +167,25 @@ def serve_decision(
     unavailable_reason: str | None,
     *,
     override_param: str = "allow_over_live_memory",
+    extra_gates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """What the button is allowed to do, decided here rather than in the UI.
 
     The UI reads exactly one field. Handing it two verdicts and asking it to
     pick would put the choice of which budget governs a launch in the client,
     which is how the two answers drift apart again.
+
+    ``extra_gates`` are permissions that are not about memory at all -- pooling
+    unlike hardware is the first. They are why ``overrides`` exists alongside
+    the older ``override_required``/``override_param`` pair: a launch can need a
+    tick while the fit itself passes, and ``allowed: false`` cannot express
+    that. ``overrides`` is the complete list when present, the live-memory gate
+    included; the two legacy fields stay as a mirror of its first entry so a
+    client that predates them still reads a correct single gate.
     """
     governing = live if live is not None else static
     basis = BASIS_LIVE if live is not None else BASIS_STATIC
+    extra_gates = list(extra_gates or [])
 
     if governing is None:
         return {
@@ -187,6 +197,9 @@ def serve_decision(
             "override_required": False,
             "override_param": None,
             "unavailable_reason": unavailable_reason,
+            # No verdict means no launch, and no tick can produce one. An empty
+            # list here is the honest answer, not the absent field.
+            "overrides": [],
         }
 
     refused = governing.verdict is Verdict.WONT_FIT
@@ -194,12 +207,31 @@ def serve_decision(
     # model does not fit this hardware at all, and no amount of waiting or
     # operator insistence changes that.
     overridable = refused and live is not None
+
+    gates: list[dict[str, Any]] = []
+    if overridable:
+        gates.append({"param": override_param, "reason": governing.reason})
+    gates.extend(extra_gates)
+
+    # A static refusal is not overridable, so a launch that is refused outright
+    # must not advertise gates that could never unblock it.
+    if refused and not overridable:
+        gates = []
+
     return {
+        # `allowed` keeps its old meaning exactly: the fit gate passed. It is
+        # no longer sufficient on its own -- a caller must also satisfy every
+        # entry in `overrides` -- which is why the extra gates do not touch it.
         "allowed": not refused,
         "verdict": governing.verdict.value,
         "basis": basis,
         "reason": governing.reason,
-        "override_required": overridable,
-        "override_param": override_param if overridable else None,
+        "override_required": bool(gates) and gates[0]["param"] == override_param,
+        "override_param": (
+            override_param
+            if gates and gates[0]["param"] == override_param
+            else None
+        ),
         "unavailable_reason": unavailable_reason,
+        "overrides": gates,
     }

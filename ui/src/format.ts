@@ -10,6 +10,21 @@ export function fmt(v: number | null | undefined, decimals = 0): string {
   return v.toFixed(decimals)
 }
 
+/** `fmt` plus its unit, dropped together -- a missing reading must not render
+ *  as an em dash still wearing a unit it was never measured in ("— GB/s").
+ *
+ *  Lifted here from the two inspectors that each had their own copy: a third
+ *  caller made it a convention rather than a local helper, and three copies of
+ *  a rule is how one of them quietly stops following it. */
+export function fmtUnit(
+  v: number | null | undefined,
+  decimals: number,
+  unit: string,
+): string {
+  const s = fmt(v, decimals)
+  return s === '—' ? s : `${s} ${unit}`
+}
+
 /** Bytes to GB, binary, matching the contract's use of 1024**3 throughout. */
 export function gbytes(bytes: number | null | undefined, decimals = 1): string {
   if (bytes == null || !Number.isFinite(bytes)) return '—'

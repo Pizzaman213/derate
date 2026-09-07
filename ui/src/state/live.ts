@@ -21,6 +21,16 @@ export const MEMORY_PRESSURE_PCT = 92
  *  nvidia-smi was last reachable. */
 export const SAMPLE_STALE_S = 30
 
+/** What the utilisation readout is actually measuring on this machine.
+ *
+ *  A node the probe found no GPU on reports CPU utilisation from /proc/stat --
+ *  the gateway sends the host figure rather than leaving the tile at a
+ *  permanent 0%. Naming that "GPU utilisation" would label hardware the node
+ *  does not have, which is worse than the zero it replaced. */
+export function utilLabel(profile: { gpu_count: number }): string {
+  return profile.gpu_count === 0 ? 'CPU utilisation' : 'GPU utilisation'
+}
+
 export interface NodeLive {
   power_w: number | null
   temp_c: number | null

@@ -92,6 +92,15 @@ def fake_host_memory(monkeypatch, total, available, swap_used=0):
     )
 
 
+def _async_value(value):
+    """A stand-in for an async reader that always answers the same thing."""
+
+    async def reader():
+        return value
+
+    return reader
+
+
 def make_profile(node_id: str = "spark-01", **overrides) -> NodeProfile:
     base = dict(
         node_id=node_id,
@@ -851,6 +860,116 @@ def test_gb10_telemetry_falls_back_to_the_unified_pool(monkeypatch):
 def test_telemetry_returns_none_when_nothing_can_be_read():
     profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
     assert run(read_telemetry(profile, rows=[])) is None
+
+
+def test_a_machine_with_no_gpu_reports_host_facts_instead_of_nothing(monkeypatch):
+    """A Raspberry Pi joined the roster and sat at 0W / 0C / 0% forever.
+
+    nvidia-smi is absent, so the sampler returned None and the agent never
+    recorded anything -- every readout stayed at its zero default, which reads
+    as broken telemetry rather than as absent hardware. There is nothing to say
+    about a GPU on that machine, but /proc/meminfo, /sys/class/thermal and
+    /proc/stat all answer.
+    """
+    profile = probe_local(address="192.168.0.45", rows=[])
+    assert profile.gpu_count == 0  # the precondition the fallback is gated on
+    fake_host_memory(monkeypatch, total=8 * GIB, available=6 * GIB)
+    monkeypatch.setattr(
+        "control_plane.registry.telemetry.read_host_temperature", lambda: 47.5
+    )
+    monkeypatch.setattr(
+        "control_plane.registry.telemetry.read_cpu_utilization",
+        _async_value(12.5),
+    )
+
+    sample = run(read_telemetry(profile, now=5.0, rows=[]))
+
+    assert sample is not None
+    assert sample.memory_used == 2 * GIB
+    assert sample.memory_total == 8 * GIB
+    assert sample.host_memory_available == 6 * GIB
+    assert sample.temperature_c == 47.5
+    assert sample.utilization_pct == 12.5
+    # No GPU means no GPU power draw to read. Zero is not a measurement here,
+    # and the gateway is what turns it into an unknown for display.
+    assert sample.power_watts == 0.0
+
+
+def test_a_gpu_node_with_a_wedged_nvidia_smi_reports_nothing(monkeypatch):
+    """The fallback must not fire for hardware that HAS a GPU.
+
+    Host RAM standing in for VRAM would be a wrong number rather than a missing
+    one, and a wrong number outlives the outage that produced it.
+    """
+    profile = probe_local(address="10.0.0.50", rows=RTX3090_ROWS)
+    fake_host_memory(monkeypatch, total=64 * GIB, available=8 * GIB)
+    assert run(read_telemetry(profile, rows=[])) is None
+
+
+def test_host_temperature_takes_the_hottest_zone_and_drops_sentinels(monkeypatch, tmp_path):
+    from control_plane.registry import telemetry as tel
+
+    for name, milli in (("thermal_zone0", "41200"), ("thermal_zone1", "58700"),
+                        ("thermal_zone2", "-274000")):
+        zone = tmp_path / name
+        zone.mkdir()
+        (zone / "temp").write_text(milli + "\n")
+    monkeypatch.setattr(tel, "THERMAL_ZONES", tmp_path)
+
+    # 58.7 and not 41.2 (an average would hide the hot one) and not -274, which
+    # is an unpopulated sensor's sentinel rather than a temperature.
+    assert tel.read_host_temperature() == 58.7
+
+
+def test_host_temperature_is_unknown_when_the_board_exposes_no_zones(monkeypatch, tmp_path):
+    from control_plane.registry import telemetry as tel
+
+    monkeypatch.setattr(tel, "THERMAL_ZONES", tmp_path / "absent")
+    assert tel.read_host_temperature() is None
+
+
+def test_cpu_times_splits_proc_stat_into_busy_and_idle(monkeypatch, tmp_path):
+    from control_plane.registry import telemetry as tel
+
+    stat = tmp_path / "stat"
+    # user nice system idle iowait irq softirq steal
+    stat.write_text("cpu  100 0 50 800 40 0 10 0\ncpu0 1 2 3 4 5 6 7 8\n")
+    monkeypatch.setattr(tel, "PROC_STAT", stat)
+
+    times = tel.read_cpu_times()
+    assert times.total == 1000
+    assert times.busy == 160  # everything that is not idle(800) + iowait(40)
+
+
+def test_cpu_utilisation_is_a_delta_between_polls(monkeypatch):
+    """/proc/stat is cumulative, so one reading carries no rate at all."""
+    from control_plane.registry import telemetry as tel
+
+    readings = iter([
+        tel._CpuTimes(busy=100, total=1000),  # first call: nothing to compare to
+        tel._CpuTimes(busy=100, total=1012),  # after its own short delta: all idle
+        tel._CpuTimes(busy=175, total=1312),  # the next poll: 75 busy jiffies of 300
+    ])
+    monkeypatch.setattr(tel, "read_cpu_times", lambda: next(readings))
+    monkeypatch.setattr(tel, "_last_cpu_times", None)
+
+    assert run(tel.read_cpu_utilization()) == 0.0
+    assert run(tel.read_cpu_utilization()) == pytest.approx(25.0)
+
+
+def test_cpu_utilisation_is_unknown_when_the_counters_have_not_moved(monkeypatch):
+    """Two polls inside the same jiffy measure nothing.
+
+    Returning 0% there would be indistinguishable from a genuinely idle
+    machine, so it reports unknown and the next poll answers properly.
+    """
+    from control_plane.registry import telemetry as tel
+
+    frozen = tel._CpuTimes(busy=100, total=1000)
+    monkeypatch.setattr(tel, "read_cpu_times", lambda: frozen)
+    monkeypatch.setattr(tel, "_last_cpu_times", None)
+
+    assert run(tel.read_cpu_utilization()) is None
 
 
 def test_snapshot_shape(tmp_path):
@@ -2251,10 +2370,10 @@ def test_reach_never_reports_a_millisecond_figure_for_a_leg_that_failed(tmp_path
             assert leg["error"]
 
 
-def test_being_unable_to_ask_a_node_is_not_a_finding_about_its_peer(tmp_path):
+def test_being_unable_to_ask_a_node_is_unchecked_not_a_finding_about_its_peer(tmp_path):
     """If we cannot reach spark-02 to ask it anything, whether spark-02 can
-    reach spark-01 is unknown -- reporting it as 'spark-02 cannot reach
-    spark-01' would be inventing a result."""
+    reach spark-01 is UNKNOWN. Reporting it as 'spark-02 cannot reach spark-01'
+    invents a result; dropping the leg claims we tested what we did not."""
     client = FakeClient()
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, local=SPARK_01)
@@ -2264,14 +2383,42 @@ def test_being_unable_to_ask_a_node_is_not_a_finding_about_its_peer(tmp_path):
 
     result = run(registry.check_reach("spark-01", "spark-02"))
 
-    peer_legs = [leg for leg in result["legs"] if leg["source"] == "spark-02"]
-    assert peer_legs == []
-    blamed = [leg for leg in result["legs"] if not leg["ok"]]
-    assert all(leg["target"] == "spark-02" for leg in blamed)
-    assert any("still unknown" in (leg["error"] or "") for leg in blamed)
+    peer = next(leg for leg in result["legs"] if leg["source"] == "spark-02")
+    assert peer["note"] and "never tested" in peer["note"]
+    assert peer["ms"] is None
+    # And no two legs claim the same direction with opposite verdicts -- the
+    # coordinator's own probe of spark-02 is the only place that failure is
+    # reported.
+    directions = [(leg["source"], leg["target"]) for leg in result["legs"]]
+    assert len(directions) == len(set(directions))
+    assert "could not be checked" in result["summary"]
 
 
 def test_reach_of_an_unknown_node_raises(tmp_path):
     registry, _ = named_registry(tmp_path)
     with pytest.raises(NodeNotFound):
         run(registry.check_reach("spark-01", "spark-99"))
+
+
+def test_a_check_between_two_workers_does_not_pass_on_the_coordinator_legs(tmp_path):
+    """Acceptance for the same trap, through the real registry: with neither
+    endpoint being this process, both coordinator probes are prerequisites and
+    the pair's own two directions are the answer."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    client.serve("http://10.0.0.13:8081", WS_3090)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    client.serve(registry.agent_url("spark-01"), SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    run(registry.add_node("10.0.0.13"))
+
+    result = run(registry.check_reach("spark-02", WS_3090.node_id))
+
+    legs = {(leg["source"], leg["target"]): leg for leg in result["legs"]}
+    assert legs[("coordinator", "spark-02")]["pair"] is False
+    assert legs[("coordinator", WS_3090.node_id)]["pair"] is False
+    assert legs[("spark-02", WS_3090.node_id)]["pair"] is True
+    assert legs[(WS_3090.node_id, "spark-02")]["pair"] is True
+    # Both peer legs really were run here, so this pair IS verified both ways.
+    assert result["ok"] is True
+    assert "Reachable both ways" in result["summary"]

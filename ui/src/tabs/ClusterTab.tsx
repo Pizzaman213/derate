@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReachReport } from '../api/types'
 import { useCluster, useRouting, useTopology } from '../state/resources'
 import { useBackend } from '../state/backend'
+import { nameIndex } from '../state/names'
 import { ClusterGraph, type ClusterGraphHandle } from './cluster/ClusterGraph'
 import { GraphToolbar } from './cluster/GraphToolbar'
 import { SelectionRail } from './cluster/SelectionRail'
@@ -21,6 +23,12 @@ export function ClusterTab() {
 
   const [measuring, setMeasuring] = useState<string | null>(null)
   const [measureError, setMeasureError] = useState<{ key: string; message: string } | null>(null)
+  // The reachability check is separate state from the measurement above, and
+  // deliberately so: they are different questions at different prices, and one
+  // running must not grey out the other's button.
+  const [checking, setChecking] = useState<string | null>(null)
+  const [reachReport, setReachReport] = useState<{ key: string; value: ReachReport } | null>(null)
+  const [reachError, setReachError] = useState<{ key: string; message: string } | null>(null)
   const graphRef = useRef<ClusterGraphHandle>(null)
   const zoomLabelRef = useRef<HTMLSpanElement>(null)
 
@@ -65,6 +73,27 @@ export function ClusterTab() {
     }
   }
 
+  const checkReach = async (a: string, b: string) => {
+    const key = [a, b].sort().join('~')
+    setChecking(key)
+    setReachError(null)
+    try {
+      setReachReport({ key, value: await backend.checkReach(a, b) })
+    } catch (err) {
+      // A refused check has to say so where the button is. The alternative --
+      // the button re-enabling with nothing new on screen -- reads as "checked,
+      // and everything is fine", which is the one thing it does not mean.
+      setReachReport(null)
+      setReachError({ key, message: err instanceof Error ? err.message : 'The check failed.' })
+    } finally {
+      setChecking(null)
+    }
+  }
+
+  // One naming rule for the whole destination, so a plate and the chip naming
+  // the same machine cannot disagree.
+  const name = useMemo(() => nameIndex(topology.data?.nodes ?? []), [topology.data])
+
   const nodeCount = topology.data?.nodes.length ?? 0
 
   return (
@@ -106,6 +135,13 @@ export function ClusterTab() {
           measuring={measuring}
           measureError={measureError}
           onMeasure={(a, b) => void measure(a, b)}
+          name={name}
+          reach={{
+            checking,
+            report: reachReport,
+            error: reachError,
+            onCheck: (a, b) => void checkReach(a, b),
+          }}
           crowded={nodeCount > 4}
         />
       </div>

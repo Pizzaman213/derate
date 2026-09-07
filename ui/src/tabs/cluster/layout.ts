@@ -40,6 +40,7 @@
 
 import type { DeploymentDTO, RoutingConfig, TopologyEdge, TopologyNode } from '../../api/types'
 import { planShortFromDegrees } from '../../format'
+import { nodeSubtitle } from '../../state/names'
 
 export interface Point {
   x: number
@@ -65,6 +66,18 @@ export const CARD: Record<Tier, { w: number; h: number }> = {
   compact: { w: 102, h: 54 },
   chip: { w: 78, h: 38 },
 }
+
+/** Extra plate height reserved for the identity line under a machine's name.
+ *  Paid for by the whole floor or by none of it: a row is as tall as its
+ *  tallest plate, so letting only the renamed machines grow would leave the
+ *  others with the same height and their meters at a different y -- one row of
+ *  plates whose innards do not line up reads as a rendering fault.
+ *
+ *  Full tier only. A compact plate's last row already sits 7 units off its
+ *  bottom edge and a chip has no rows at all below the meter, so the line has
+ *  nowhere to go there; those tiers carry the identity in the plate's tooltip
+ *  and in the node sheet instead. */
+export const SUBLINE_H = 12
 
 /** 64 at full tier is the mockup's hard span gap: it is the bandwidth
  *  bracket's channel, and every bracket constant is measured from it. */
@@ -257,6 +270,10 @@ export interface ClusterLayout {
    *  it. */
   offsetX: number
   card: { w: number; h: number }
+  /** SUBLINE_H when some machine on this floor is named something other than
+   *  its node_id and the tier has room to say so, 0 otherwise. The renderer
+   *  shifts every full-tier plate's rows down by it. */
+  subline: number
   cards: PlacedCard[]
   edges: ClusterEdge[]
   bands: ClusterBand[]
@@ -420,7 +437,15 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
   const arrangement = reconcileOrder(input.nodes, input.order)
   const n = arrangement.length
   const tier = tierFor(n)
-  const card = CARD[tier]
+  // Only full-tier plates have room for the identity line, and only a floor
+  // that actually needs one pays for it -- a cluster where every machine goes
+  // by its node_id looks exactly as it did before this existed.
+  const subline =
+    tier === 'full' && input.nodes.some((node) => nodeSubtitle(node, node.hostname))
+      ? SUBLINE_H
+      : 0
+  const heightOf = (t: Tier) => CARD[t].h + (t === 'full' ? subline : 0)
+  const card = { w: CARD[tier].w, h: heightOf(tier) }
   const kind: FloorKind = n > RING_ABOVE ? 'ring' : 'grid'
 
   const cards: PlacedCard[] = []
@@ -434,7 +459,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
   if (n === 0) {
     return {
       // No ink to frame: this path renders the message as a <p>, not the SVG.
-      tier, kind, width: GW, height: GH, ink: { x: 0, y: 0, w: GW, h: GH }, offsetX: 0, card,
+      tier, kind, width: GW, height: GH, ink: { x: 0, y: 0, w: GW, h: GH }, offsetX: 0, card, subline,
       cards, edges, bands, conns, junctions, slots, paths,
       entry: null, boundaryY: null, provider: null,
       arrangement,
@@ -497,7 +522,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
       Math.max(
         ...arrangement
           .slice(r * cols, r * cols + cols)
-          .map((nodeId) => CARD[bodyTierOf(nodeId)].h),
+          .map((nodeId) => heightOf(bodyTierOf(nodeId))),
       ),
     )
     const rowTop = (r: number) =>
@@ -513,7 +538,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
       cards.push({
         nodeId, x, y,
         w: card.w,
-        h: CARD[bodyTier].h,
+        h: heightOf(bodyTier),
         slot: i, row, col,
         selected: nodeId === input.selection.selNode,
         bodyTier,
@@ -848,7 +873,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
   const offsetX = Math.max(0, Math.round(GW / 2 - (inkL + inkR) / 2))
 
   return {
-    tier, kind, width: GW, height: GH, ink, offsetX, card,
+    tier, kind, width: GW, height: GH, ink, offsetX, card, subline,
     cards, edges, bands, conns, junctions, slots, paths,
     entry, boundaryY, provider,
     arrangement,

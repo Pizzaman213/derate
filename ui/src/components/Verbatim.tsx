@@ -11,11 +11,14 @@ export function Verbatim({
   size = 'body',
 }: {
   text: string
-  size?: 'body' | 'label'
+  /** Scale only. Every size keeps `--ink`, including `unit`: a `.unit` is
+   *  muted because it is chrome, and a sentence the server wrote is content
+   *  no matter how small it is set. */
+  size?: 'body' | 'label' | 'unit'
 }) {
   return (
     <p
-      className={size === 'label' ? 'label' : undefined}
+      className={size === 'body' ? undefined : size}
       style={{
         margin: 0,
         fontWeight: 400,

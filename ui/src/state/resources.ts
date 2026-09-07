@@ -1,4 +1,4 @@
-import { useResource } from './backend'
+import { useKeyedResource, useResource } from './backend'
 
 // Poll intervals. Structure changes slowly; discovery is the one thing a person
 // is actively waiting on, so it is checked most often. Live numbers do not come
@@ -29,7 +29,11 @@ export const useMemoryReport = () => useResource((b) => b.memory(), 2000)
 // node is open; the hook still has to be called unconditionally, so it fetches
 // an empty list instead of being skipped.
 export const useNodeProcesses = (nodeId: string) =>
-  useResource(
+  useKeyedResource(
+    // Keyed, not plain: opening a second node while the sheet stays open used
+    // to leave the FIRST node's process list on screen under the second node's
+    // heading until the next 5s tick, and nothing about it looked stale.
+    nodeId,
     (b) =>
       nodeId
         ? b.nodeProcesses(nodeId)
@@ -46,8 +50,16 @@ export const useStorage = () => useResource((b) => b.storage(), 30000)
 
 // The capacity walk resolves models against the hub and is memoised server
 // side; polling it hard would buy nothing and cost the hub.
+//
+// Keyed on the numbers it was asked for. `useResource` holds its read function
+// in a ref and keys only on the coordinator, so a caller that changes context
+// or concurrency would otherwise keep the previous answer on screen for up to
+// a full interval -- with the new numbers in the caption above it. Keyed, the
+// stale answer is dropped the moment the question changes, exactly as the
+// keyed form already does for a node id. Callers that pass constants are
+// unaffected.
 export const useCapacity = (context: number, concurrency: number) =>
-  useResource((b) => b.capacity(context, concurrency), 20000)
+  useKeyedResource(`${context}/${concurrency}`, (b) => b.capacity(context, concurrency), 20000)
 
 // Static for the life of the process: it is the contract's own table, and it
 // answers with no ports wired. Fetched once, effectively.

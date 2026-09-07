@@ -140,3 +140,125 @@ def enumerate_candidates(
                 out.append(Candidate(tp=1, pp=1, ep=world, dp=world))
 
     return out
+
+
+# ---------------------------------------------------------------- refusals
+#
+# The sentences below are the planner's own. They were lifted verbatim out of
+# `Planner._structural_rejections`, which now calls into them, so a degree the
+# operator asked for by hand is refused in exactly the words the planner uses
+# when it rules the same degree out on its own. Two spellings of one refusal is
+# how a vocabulary drifts; one function is how it cannot.
+
+
+def tp_rejection(shape: ModelShape, tp: int) -> str | None:
+    """Why this tensor-parallel degree is illegal, or None when it is legal."""
+    if tp < 1:
+        return f"TP={tp}: illegal, a parallelism degree is at least 1"
+    bad = []
+    if shape.num_attention_heads % tp:
+        bad.append(f"num_attention_heads={shape.num_attention_heads}")
+    if shape.num_kv_heads % tp:
+        bad.append(f"num_kv_heads={shape.num_kv_heads}")
+    if not bad:
+        return None
+    return (
+        f"TP={tp}: illegal, "
+        + " and ".join(f"{b} is not divisible by {tp}" for b in bad)
+        + " for this model"
+    )
+
+
+def pp_rejection(shape: ModelShape, pp: int) -> str | None:
+    """Why this pipeline-parallel degree is illegal, or None when it is legal.
+
+    The only structural bound is that a stage must own at least one layer;
+    uneven splits are fine (an 80-layer model over 3 stages is 27/27/26).
+    """
+    if pp < 1:
+        return f"PP={pp}: illegal, a parallelism degree is at least 1"
+    if pp > shape.num_layers:
+        return (
+            f"PP={pp}: illegal, the model has {shape.num_layers} layers and a "
+            f"stage must own at least one"
+        )
+    return None
+
+
+def ep_rejection(shape: ModelShape, ep: int, dp: int) -> str | None:
+    """Why this expert-parallel degree is illegal, or None when it is legal."""
+    if ep < 1:
+        return f"EP={ep}: illegal, a parallelism degree is at least 1"
+    if ep == 1:
+        return None
+    if not shape.num_experts:
+        return f"EP={ep}: illegal, this is a dense model and has no experts to shard"
+    if shape.num_experts % ep:
+        return (
+            f"EP={ep}: illegal, num_experts={shape.num_experts} is not divisible "
+            f"by {ep}; an uneven split leaves one rank holding an extra expert, "
+            f"and every all-to-all waits on the slowest rank"
+        )
+    if dp != ep:
+        return (
+            f"EP={ep} requires DP={ep}: expert parallel here means DP attention "
+            f"ranks with the experts sharded across all of them, and no other "
+            f"shape is emitted"
+        )
+    return None
+
+
+def dp_rejection(shape: ModelShape, dp: int) -> str | None:
+    """Why this data-parallel degree is illegal, or None when it is legal."""
+    if dp < 1:
+        return f"DP={dp}: illegal, a parallelism degree is at least 1"
+    return None
+
+
+@dataclass(frozen=True)
+class DegreeRefusal:
+    """One illegal degree, named by the wire field that carried it.
+
+    ``axis`` is the request field (``tensor_parallel``, ...) rather than the
+    short label, so a 400 can point at the exact key the operator sent while
+    ``message`` still speaks the planner's own vocabulary.
+    """
+
+    axis: str
+    degree: int
+    message: str
+
+
+class IllegalDegrees(ValueError):
+    """Degrees that cannot run at all, with the planner's reason for each.
+
+    Raised rather than returned because there is no plan to hand back: a shape
+    that fails head divisibility does not load, so there is nothing for the fit
+    gate to have an opinion about.
+    """
+
+    def __init__(self, refusals: list[DegreeRefusal]) -> None:
+        self.refusals = refusals
+        super().__init__("; ".join(r.message for r in refusals))
+
+
+def check_degrees(shape: ModelShape, cand: Candidate) -> list[DegreeRefusal]:
+    """Every reason this configuration cannot run, in axis order.
+
+    Deliberately does NOT check that the world size fits the supplied ranks.
+    ``fit.calculator.check`` already refuses that with a better sentence -- it
+    knows how many GPUs were actually offered and says how many more are needed
+    -- and two authorities on one fact is worse than one. Legality here means
+    "this shape cannot load", not "this shape does not fit".
+    """
+    checks = (
+        ("tensor_parallel", cand.tp, tp_rejection(shape, cand.tp)),
+        ("pipeline_parallel", cand.pp, pp_rejection(shape, cand.pp)),
+        ("expert_parallel", cand.ep, ep_rejection(shape, cand.ep, cand.dp)),
+        ("data_parallel", cand.dp, dp_rejection(shape, cand.dp)),
+    )
+    return [
+        DegreeRefusal(axis=axis, degree=degree, message=message)
+        for axis, degree, message in checks
+        if message is not None
+    ]

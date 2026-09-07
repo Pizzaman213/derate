@@ -10,12 +10,15 @@ import './styles/derate.css'
 import { AppShell } from './shell/AppShell'
 import { BackendProvider } from './state/backend'
 import { MetricsProvider } from './state/metrics'
+import { TelemetryProvider } from './state/telemetry'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <BackendProvider>
       <MetricsProvider>
-        <AppShell />
+        <TelemetryProvider>
+          <AppShell />
+        </TelemetryProvider>
       </MetricsProvider>
     </BackendProvider>
   </StrictMode>,

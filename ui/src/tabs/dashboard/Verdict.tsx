@@ -3,6 +3,7 @@ import { Lamp } from '../../components/Lamp'
 import { Readout } from '../../components/Readout'
 import { SegmentBar, type Segment } from '../../components/Bars'
 import { Verbatim, VerbatimList } from '../../components/Verbatim'
+import { OverrideGate } from '../../components/OverrideGate'
 import { gbNum, gbytes, planShortFromDegrees } from '../../format'
 
 interface Props {
@@ -228,7 +229,7 @@ export function Verdict({
             ) : null}
           </div>
         ) : needsOverride ? (
-          <OverrideGate
+          <LiveMemoryOverride
             serve={serve}
             live={live}
             staticCeiling={fit?.usable_per_node ?? null}
@@ -315,7 +316,13 @@ function VerdictRow({
  *  and the honest shape for one is a sentence you have to read to reach the
  *  button. Every figure in it comes off the wire, so it changes as the
  *  machine does. */
-function OverrideGate({
+/** The live-memory refusal, with the sentence this screen can write.
+ *
+ *  The dry run knows both budgets before anything is sent, so it can name the
+ *  measured figure and the ceiling that is not reachable right now. The
+ *  rendering is the shared gate's; only this sentence is local, because it is
+ *  the part that depends on having a plan in hand. */
+function LiveMemoryOverride({
   serve, live, staticCeiling, checked, onChange, onLaunch, launching,
 }: {
   serve: ServeDecision
@@ -336,29 +343,14 @@ function OverrideGate({
       `whether this fits on the machine as it is right now — only on idle hardware.`
 
   return (
-    <div style={{ display: 'grid', gap: 8 }}>
-      <p className="label" style={{ margin: 0, fontWeight: 400, color: 'var(--fault)', whiteSpace: 'pre-wrap' }}>
-        {serve.reason}
-      </p>
-      <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={(e) => onChange(e.target.checked)}
-          style={{ marginTop: 3 }}
-        />
-        <span className="label" style={{ fontWeight: 400 }}>
-          {sentence}
-        </span>
-      </label>
-      {checked ? (
-        <div>
-          <button onClick={onLaunch} disabled={launching}>
-            {launching ? 'Launching…' : 'Serve anyway'}
-          </button>
-        </div>
-      ) : null}
-    </div>
+    <OverrideGate
+      reason={serve.reason}
+      sentence={sentence}
+      checked={checked}
+      onChange={onChange}
+      onLaunch={onLaunch}
+      launching={launching}
+    />
   )
 }
 

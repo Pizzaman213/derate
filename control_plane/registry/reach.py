@@ -64,8 +64,19 @@ class ReachLeg:
     answered_as: str | None = None
     """The node_id the far side called itself. A mismatch is its own fault."""
 
+    pair: bool = True
+    """True when this leg tests a direction BETWEEN the two nodes asked about.
+
+    False for the coordinator's own probe of an endpoint when the coordinator
+    is neither of them: reaching two machines from a third says nothing about
+    whether those two can reach each other, and counting it as if it did is how
+    "reachable both ways" ends up printed under two untested directions."""
+
     note: str | None = None
-    """Why this leg was not dialled, for the legs that never are."""
+    """Set on a leg that was not dialled, saying why. Two kinds, told apart by
+    `ok`: the coordinator's leg to itself (ok, nothing to dial) and a direction
+    that could not be tested at all (not ok, and not a failure either -- see
+    `unknown_leg`)."""
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -83,7 +94,24 @@ def self_leg(node_id: str, url: str) -> ReachLeg:
         target=node_id,
         url=url,
         ok=True,
+        pair=False,
         note="this is the process answering, so nothing was dialled",
+    )
+
+
+def unknown_leg(
+    source: str, target: str, url: str, why: str, error: str, pair: bool = True
+) -> ReachLeg:
+    """A direction that could not be tested. Not the same as one that failed.
+
+    If we cannot reach node A to ask it anything, whether A can reach B is
+    unknown, and reporting it as "A cannot reach B" invents a result -- one
+    that would send an operator to look at a cable that is fine. It is equally
+    not a pass, so `ok` is false and the verdict says the direction was never
+    checked rather than counting it as reachable.
+    """
+    return ReachLeg(
+        source=source, target=target, url=url, ok=False, error=error, note=why, pair=pair
     )
 
 
@@ -112,6 +140,7 @@ async def dial(
     url: str,
     timeout: float = REACH_TIMEOUT_S,
     clock=time.monotonic,
+    pair: bool = True,
 ) -> ReachLeg:
     """GET {url}/agent/health and time it. Never raises.
 
@@ -122,7 +151,9 @@ async def dial(
     try:
         base = validate_target(url)
     except UnusableTarget as exc:
-        return ReachLeg(source=source, target=target, url=url, ok=False, error=str(exc))
+        return ReachLeg(
+            source=source, target=target, url=url, ok=False, error=str(exc), pair=pair
+        )
 
     started = clock()
     try:
@@ -132,7 +163,7 @@ async def dial(
         # the failure took: it is a timeout, and a number beside "unreachable"
         # invites reading it as latency.
         return ReachLeg(
-            source=source, target=target, url=base, ok=False, error=str(exc)
+            source=source, target=target, url=base, ok=False, error=str(exc), pair=pair
         )
     elapsed_ms = round((clock() - started) * 1000, 1)
     answered_as = None
@@ -146,29 +177,61 @@ async def dial(
         ok=True,
         ms=elapsed_ms,
         answered_as=answered_as,
+        pair=pair,
     )
+
+
+def _directions(legs: list[ReachLeg]) -> str:
+    return ", ".join(f"{leg.source} → {leg.target}" for leg in legs)
 
 
 def summarize(legs: list[ReachLeg]) -> tuple[bool, str]:
-    """The one-sentence verdict, and whether every leg answered.
+    """The one-sentence verdict, and whether every dialled leg answered.
 
-    The sentence names the failing direction. "Not connected" without a
-    direction sends an operator to check both machines when one of them is
-    demonstrably fine.
+    Three outcomes, not two. A direction that FAILED and a direction that could
+    not be CHECKED are different findings, and collapsing them loses the one
+    piece of information an operator acts on. So:
+
+      - any failure  -> not ok, and the sentence names the failing direction.
+        "Not connected" without a direction sends someone to check both
+        machines when one of them is demonstrably fine.
+      - no failure, some unchecked -> ok, because nothing that was tested came
+        back bad, but the sentence never claims "both ways" for a direction
+        nobody dialled.
+      - everything answered -> ok, and said plainly.
+
+    Only legs BETWEEN the two nodes count toward "reachable". Reaching each of
+    them from a third machine is a prerequisite, not an answer.
     """
     dialled = [leg for leg in legs if leg.note is None]
     failed = [leg for leg in dialled if not leg.ok]
-    if not dialled:
+    between = [leg for leg in dialled if leg.pair]
+    unchecked = [leg for leg in legs if leg.note is not None and not leg.ok]
+
+    tail = f" {_directions(unchecked)} could not be checked." if unchecked else ""
+
+    if failed:
+        if len(failed) == len(dialled) and len(dialled) > 1:
+            return False, f"Neither direction answered.{tail}"
+        if len(failed) == len(dialled):
+            return False, f"{_directions(failed)} did not answer.{tail}"
+        return False, (
+            f"One-way: {_directions(failed)} did not answer, the other direction "
+            f"did. The machine that cannot be dialled is the one to look at.{tail}"
+        )
+    if not between:
+        if unchecked:
+            reached = (
+                " The coordinator reached both machines, which does not "
+                "establish that they can reach each other."
+                if dialled
+                else ""
+            )
+            return True, (
+                f"No direction between them could be tested.{tail}{reached}"
+            )
         return True, "Both endpoints are this machine; there is nothing to dial."
-    if not failed:
-        if len(dialled) == 1:
-            leg = dialled[0]
-            return True, f"{leg.source} → {leg.target} answered."
-        return True, f"Reachable both ways. All {len(dialled)} probes answered."
-    if len(failed) == len(dialled):
-        return False, "Neither direction answered."
-    directions = ", ".join(f"{leg.source} → {leg.target}" for leg in failed)
-    return False, (
-        f"One-way: {directions} did not answer, the other direction did. "
-        "The machine that cannot be dialled is the one to look at."
-    )
+    if len(between) == 1:
+        leg = between[0]
+        return True, f"{leg.source} → {leg.target} answered.{tail}"
+    return True, f"Reachable both ways. All {len(between)} probes answered.{tail}"

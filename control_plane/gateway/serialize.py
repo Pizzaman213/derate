@@ -45,7 +45,7 @@ def plain(value: Any) -> Any:
 
 
 _INELIGIBLE_UNHEALTHY = "node is unhealthy"
-_INELIGIBLE_DEVICE_CLASS = (
+INELIGIBLE_DEVICE_CLASS = (
     "device class is not recognized; cannot confirm this hardware is "
     "eligible to join the pool"
 )
@@ -68,7 +68,7 @@ def _eligibility(healthy: bool, device_class: DeviceClass) -> tuple[bool, str | 
     if not healthy:
         return False, _INELIGIBLE_UNHEALTHY
     if device_class is DeviceClass.UNKNOWN:
-        return False, _INELIGIBLE_DEVICE_CLASS
+        return False, INELIGIBLE_DEVICE_CLASS
     return True, None
 
 
@@ -87,6 +87,7 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
     # control deliberately uses addressable memory instead: that is the slice
     # the GPU can actually reach and the one Agent D budgets a fit against.
     total = profile.total_memory or 0
+    no_gpu = profile.gpu_count == 0
     eligible, ineligible_reason = _eligibility(state.healthy, profile.device_class)
     return {
         "node_id": profile.node_id,
@@ -114,8 +115,16 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
         "memory_used_pct": round(state.memory_used / total * 100.0, 1)
         if total
         else None,
-        "power_w": state.power_watts,
-        "temp_c": state.temperature_c,
+        # A machine the probe found no GPU on reports host facts (memory from
+        # /proc/meminfo, temperature from /sys/class/thermal, utilisation from
+        # /proc/stat) and has no GPU power draw to read at all. Emitting 0 W
+        # there would read as a measurement of an idle GPU rather than as the
+        # absence of one, so it goes out as unknown. Temperature is unknown by
+        # the same rule only when the board exposed no thermal zone: a running
+        # machine does not sit at exactly 0.0 C. Utilisation is left alone --
+        # an idle Pi really is at 0%.
+        "power_w": None if no_gpu else state.power_watts,
+        "temp_c": None if (no_gpu and not state.temperature_c) else state.temperature_c,
         "util_pct": state.utilization_pct,
         "eligible": eligible,
         "ineligible_reason": ineligible_reason,
@@ -409,6 +418,26 @@ def resolution_payload(res: Any) -> dict:
     payload["effective_mla_rope_dim"] = getattr(shape, "effective_mla_rope_dim", None)
 
     return payload
+
+
+def plan_degrees_payload(plan) -> dict:
+    """One legal shape, degrees and hosts only -- no prose.
+
+    The compact form of a plan, for the list of alternatives. Deliberately
+    carries neither `reason` nor `rejected`: shipping a rejection list for every
+    legal shape on a wide cluster is kilobytes of text to populate a hint, and
+    the moment one is actually chosen a re-plan returns that shape's full
+    planner prose anyway.
+    """
+    return {
+        "kind": plan.kind.value,
+        "world_size": plan.world_size,
+        "tensor_parallel": plan.tensor_parallel,
+        "pipeline_parallel": plan.pipeline_parallel,
+        "expert_parallel": plan.expert_parallel,
+        "data_parallel": plan.data_parallel,
+        "node_ids": list(plan.node_ids),
+    }
 
 
 def plan_payload(plan: ParallelismPlan) -> dict:

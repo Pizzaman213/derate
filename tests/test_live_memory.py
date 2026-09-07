@@ -20,6 +20,7 @@ from control_plane.contracts import (
     Verdict,
 )
 from control_plane.fit import FitCalculator
+from control_plane.planner import Planner
 from control_plane.fit.capacity import largest_runnable
 from control_plane.gateway import livefit
 from control_plane.gateway.app import create_app
@@ -376,3 +377,157 @@ def test_detail_falls_back_to_the_class_name(empty):
     from control_plane.gateway import errors
 
     assert errors.detail(empty) == type(empty).__name__
+
+
+# -- manual placement meets the live gate -----------------------------------
+#
+# The feature's central safety property: naming the machines narrows what gets
+# checked, it never skips the check.
+
+
+#: A second Spark with a smaller addressable slice. A different hardware group
+#: -- `topology._shape_key` includes addressable memory, and its docstring says
+#: why: "two GB10s with different addressable memory cannot hold equal shards"
+#: -- while still being large enough that the model fits on an idle machine.
+#: That is what lets these tests reach the pooling gate at all: a 3090 is so
+#: much smaller that the static fit refuses first, and a launch that cannot fit
+#: any budget is correctly reported as unfittable rather than as un-pooled.
+SPARK_LITE = dataclasses.replace(
+    SPARK_01,
+    node_id="spark-lite",
+    hostname="spark-lite",
+    addressable_memory=int(SPARK_01.addressable_memory * 0.8),
+)
+
+
+def _mixed_deps(allocatable):
+    """Two unlike Sparks, both live, planned by the real planner."""
+    reg = LiveRegistry(
+        [
+            node_state(SPARK_01, memory_used_pct=78.0),
+            node_state(SPARK_LITE, memory_used_pct=10.0),
+        ],
+        allocatable,
+    )
+    deps = dataclasses.replace(build_deps(registry=reg), fit=FitCalculator())
+    deps.planner = Planner()
+    return deps
+
+
+def test_manual_placement_does_not_bypass_the_live_fit_gate():
+    """Choosing the machine by hand still meets the same refusal."""
+    deps = _deps({SPARK_01.node_id: 15 * GIB})
+    deps.planner = Planner()
+    with TestClient(create_app(deps)) as client:
+        refused = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "openai/gpt-oss-120b",
+                "context": 4096,
+                "concurrency": 4,
+                "node_ids": [SPARK_01.node_id],
+            },
+        )
+        allowed = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "openai/gpt-oss-120b",
+                "context": 4096,
+                "concurrency": 4,
+                "node_ids": [SPARK_01.node_id],
+                "allow_over_live_memory": True,
+            },
+        )
+
+    assert refused.status_code == 409
+    assert refused.json()["error"]["code"] == "live_memory_insufficient"
+    assert allowed.status_code == 201
+
+
+def test_the_two_overrides_are_independent():
+    """Neither permission implies the other.
+
+    The most important test in this feature. `allow_mixed_hardware` says
+    nothing about whether the memory is there, and `allow_over_live_memory`
+    says nothing about whether the machines belong in one pool. If either ever
+    starts unlocking the other, a launch can get through on a permission its
+    operator never granted.
+    """
+    # A context wide enough that the plan genuinely spans both machines. At a
+    # small context the model fits on one, only one machine is occupied, and
+    # nothing is pooled -- correctly, since the gate reports what will actually
+    # run rather than what was ticked.
+    body = {
+        "model_id": "openai/gpt-oss-120b",
+        "context": 131072,
+        "concurrency": 8,
+        "node_ids": [SPARK_01.node_id, SPARK_LITE.node_id],
+    }
+    alloc = {SPARK_01.node_id: 15 * GIB, SPARK_LITE.node_id: 15 * GIB}
+
+    with TestClient(create_app(_mixed_deps(alloc))) as client:
+        # The memory override alone must not permit the pool.
+        memory_only = client.post(
+            "/api/deployments", json={**body, "allow_over_live_memory": True}
+        )
+        # The pooling override alone must not permit the memory.
+        pool_only = client.post(
+            "/api/deployments", json={**body, "allow_mixed_hardware": True}
+        )
+
+    assert memory_only.status_code == 400
+    assert memory_only.json()["error"]["code"] == "mixed_hardware_not_allowed"
+
+    assert pool_only.status_code == 409
+    assert pool_only.json()["error"]["code"] == "live_memory_insufficient"
+
+
+def test_the_live_budget_is_taken_against_the_machines_that_were_named():
+    """A machine that was ticked but carries no rank must not set the budget."""
+    alloc = {SPARK_01.node_id: 15 * GIB, SPARK_LITE.node_id: 1 * GIB}
+    with TestClient(create_app(_mixed_deps(alloc))) as client:
+        body = client.post(
+            "/api/plan",
+            json={
+                "model_id": "openai/gpt-oss-120b",
+                "context": 4096,
+                "concurrency": 4,
+                "node_ids": [SPARK_01.node_id],
+            },
+        ).json()
+
+    assert body["capacity"]["binding_node"] == SPARK_01.node_id
+    assert [n["node_id"] for n in body["capacity"]["nodes"]] == [SPARK_01.node_id]
+
+
+def test_the_operators_choice_is_recorded_on_the_persisted_fit():
+    """`plan.reason` stays planner prose even for a shape a human forced, so
+    the attribution has to live somewhere the deployment keeps."""
+    recorded = {}
+    deps = _deps({SPARK_01.node_id: 15 * GIB})
+    deps.planner = Planner()
+    original = deps.deployments.launch
+
+    def spy(shape, plan, fit, runtime, context_length, concurrency, **kwargs):
+        recorded["fit"] = fit
+        return original(shape, plan, fit, runtime, context_length, concurrency, **kwargs)
+
+    deps.deployments.launch = spy  # type: ignore[method-assign]
+
+    with TestClient(create_app(deps)) as client:
+        r = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "openai/gpt-oss-120b",
+                "context": 4096,
+                "concurrency": 4,
+                "node_ids": [SPARK_01.node_id],
+                "allow_over_live_memory": True,
+            },
+        )
+
+    assert r.status_code == 201
+    assert any(
+        "placed and shaped at the operator's instruction" in w
+        for w in recorded["fit"].warnings
+    )

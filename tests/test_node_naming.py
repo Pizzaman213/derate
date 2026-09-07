@@ -27,6 +27,7 @@ from control_plane.registry.reach import (
     UnusableTarget,
     dial,
     summarize,
+    unknown_leg,
     validate_target,
 )
 from control_plane.registry.stub import StubRegistry
@@ -343,3 +344,52 @@ def _run(coro):
     import asyncio
 
     return asyncio.run(coro)
+
+
+def test_a_direction_that_could_not_be_tested_is_neither_a_pass_nor_a_failure():
+    """The third outcome. A worker running an older build has no /agent/reach,
+    so the coordinator cannot ask it to dial back -- that is not the worker
+    failing to answer, and it is not a clean bill of health either."""
+    good = ReachLeg(source="coordinator", target="spark-02", url="u", ok=True, ms=1.0)
+    unchecked = unknown_leg("spark-02", "spark-01", "u", why="never tested", error="404")
+
+    ok, sentence = summarize([good, unchecked])
+
+    # Nothing that was tested came back bad...
+    assert ok is True
+    # ...but the sentence must never claim "both ways" for a direction nobody
+    # dialled.
+    assert "both ways" not in sentence
+    assert "spark-02 → spark-01 could not be checked" in sentence
+
+
+def test_an_unchecked_direction_does_not_hide_a_real_failure():
+    bad = ReachLeg(source="coordinator", target="spark-02", url="u", ok=False, error="x")
+    unchecked = unknown_leg("spark-02", "spark-01", "u", why="never tested", error="404")
+
+    ok, sentence = summarize([bad, unchecked])
+
+    assert ok is False
+    assert "coordinator → spark-02 did not answer" in sentence
+    assert "spark-02 → spark-01 could not be checked" in sentence
+
+
+def test_reaching_two_workers_from_the_coordinator_is_not_reaching_each_other():
+    """The trap this guards: a check between two workers dials each of them
+    from the coordinator, both answer, and a naive count prints "reachable both
+    ways" over two directions nobody tested."""
+    from_coordinator = [
+        ReachLeg(source="coordinator", target="w1", url="u", ok=True, ms=1.0, pair=False),
+        ReachLeg(source="coordinator", target="w2", url="u", ok=True, ms=1.0, pair=False),
+    ]
+    untested = [
+        unknown_leg("w1", "w2", "u", why="never tested", error="404"),
+        unknown_leg("w2", "w1", "u", why="never tested", error="404"),
+    ]
+
+    ok, sentence = summarize([*from_coordinator, *untested])
+
+    assert ok is True
+    assert "both ways" not in sentence
+    assert "No direction between them could be tested" in sentence
+    assert "does not establish that they can reach each other" in sentence

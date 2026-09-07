@@ -64,13 +64,20 @@ interface ChartProps {
   unit: string
   points: TelemetryPoint[]
   decimals?: number
+  /** What sits between the min and max labels. Defaults to `${n}s`, which is
+   *  right only at 1 Hz: a series read back from the archive at 1-minute or
+   *  1-hour buckets has the same point count and a completely different span,
+   *  and "60s" under an hourly chart is simply false. Callers drawing history
+   *  pass `resolutionNote()`. Two labels and a middle note is what the axis
+   *  already was -- no chrome is added here. */
+  note?: string
 }
 
 /** A titled chart: its own min/max, a visible baseline, and the count of
  *  actual samples behind it (not a fixed "60s" -- the window starts empty and
  *  fills in). An all-null or empty series renders "no samples yet" rather
  *  than a flat line at zero. */
-export function Chart({ title, unit, points, decimals = 0 }: ChartProps) {
+export function Chart({ title, unit, points, decimals = 0, note }: ChartProps) {
   const b = bounds(points)
   if (!b || points.length === 0) {
     return (
@@ -115,7 +122,7 @@ export function Chart({ title, unit, points, decimals = 0 }: ChartProps) {
       </svg>
       <div className="ax">
         <span>min {b.mn.toFixed(decimals)}</span>
-        <span>{b.values.length}s</span>
+        <span>{note ?? `${b.values.length}s`}</span>
         <span>max {b.mx.toFixed(decimals)}</span>
       </div>
     </div>

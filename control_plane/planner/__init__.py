@@ -25,12 +25,36 @@ from .constants import (
     MIN_NODES_FOR_CROSS_NODE_EP,
     PIPELINE_INFLIGHT_PER_STAGE,
 )
-from .legality import Candidate, enumerate_candidates, valid_pp_degrees, valid_tp_degrees
+from .legality import (
+    Candidate,
+    DegreeRefusal,
+    IllegalDegrees,
+    check_degrees,
+    enumerate_candidates,
+    valid_ep_degrees,
+    valid_pp_degrees,
+    valid_tp_degrees,
+)
 from .planner import Planner
 from .stub import StubPlanner
-from .topology import NodeGroup, homogeneous_groups
+from .topology import (
+    POOLING_HAZARD,
+    NodeGroup,
+    exclusion_note,
+    homogeneous_groups,
+    pooled_group,
+    pooling_note,
+)
 
 __all__ = [
+    "valid_ep_degrees",
+    "pooling_note",
+    "pooled_group",
+    "exclusion_note",
+    "check_degrees",
+    "POOLING_HAZARD",
+    "IllegalDegrees",
+    "DegreeRefusal",
     "Candidate",
     "DEFAULT_KV_DTYPE",
     "DEFAULT_PLAN_CONTEXT",

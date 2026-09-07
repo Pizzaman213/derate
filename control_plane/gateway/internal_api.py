@@ -20,6 +20,7 @@ from fastapi import APIRouter, Query, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from control_plane.contracts import (
+    DeviceClass,
     DeploymentState,
     FitRequest,
     Modality,
@@ -27,6 +28,14 @@ from control_plane.contracts import (
     Verdict,
 )
 from control_plane.providers import UnknownProviderError
+from control_plane.planner import (
+    IllegalDegrees,
+    homogeneous_groups,
+    pooling_note,
+    valid_ep_degrees,
+    valid_pp_degrees,
+    valid_tp_degrees,
+)
 from control_plane.registry import JoinRejected, NodeNotFound
 from control_plane.registry import modelcache, storage as registry_storage
 from control_plane.registry.serde import profile_from_dict
@@ -41,6 +50,63 @@ log = logging.getLogger("gateway.api")
 
 #: Named for exactly what it overrides, so the request body says it.
 _OVERRIDE_PARAM = "allow_over_live_memory"
+
+#: The second override, same rule: named for exactly what it overrides. The two
+#: are independent and neither implies the other -- pooling unlike hardware says
+#: nothing about whether the memory is there, and free memory says nothing about
+#: whether the machines belong in one pool.
+_MIXED_HW_PARAM = "allow_mixed_hardware"
+
+#: Request keys that make placement the operator's rather than the planner's.
+_PLACEMENT_PARAM = "node_ids"
+_DEGREES_PARAM = "parallelism"
+
+#: The four axes a caller may name. A key omitted from `parallelism` means 1,
+#: never "whatever the planner would have picked": defaulting to the
+#: recommendation would make the launched shape depend on a recommendation the
+#: operator never saw, and which can change between the preview round trip and
+#: the launch round trip.
+_DEGREE_AXES = (
+    "tensor_parallel",
+    "pipeline_parallel",
+    "expert_parallel",
+    "data_parallel",
+)
+
+
+class _PlacementRefused(Exception):
+    """A placement the gateway will not plan, with the sentence saying why.
+
+    Deliberately not a ValueError: the generic `except ValueError` in both
+    routes turns anything it catches into a bare 400 `invalid_request`, which
+    would strip the code, the param and the override block that make these
+    refusals actionable.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        code: str,
+        *,
+        param: str | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.code = code
+        self.param = param
+        self.extra = extra or {}
+
+    def response(self) -> JSONResponse:
+        body = errors.error_body(
+            self.message, "invalid_request_error", self.code, param=self.param
+        )
+        # Siblings of `error`, not children of it -- the same body shape the
+        # live-memory 409 uses, so one client branch reads both.
+        body.update(self.extra)
+        return JSONResponse(status_code=self.status, content=body)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,6 +129,219 @@ class _PlanOutcome:
     #: speech model as text, and the gateway would then refuse the very
     #: requests the deployment exists to serve.
     modality: object = Modality.TEXT
+    #: What was placed where, and whose choice it was. Always present; `mode`
+    #: is "planner" for a request that named no nodes.
+    placement: dict = dataclasses.field(default_factory=dict)
+    #: The effective degrees and whether the operator or the planner set them.
+    degrees: dict = dataclasses.field(default_factory=dict)
+    #: The planner's own pick over the same node set, with its reason and
+    #: rejected list intact, so an overruled recommendation is still on screen.
+    recommended: object | None = None
+    #: Every legal shape on this node set, compact (degrees and kind only, no
+    #: prose): enough to say what is legal without shipping a rejection list
+    #: per entry.
+    alternatives: list = dataclasses.field(default_factory=list)
+
+def _parse_node_ids(payload: dict) -> list[str] | None:
+    """The machines the operator named, or None when they named none.
+
+    None and `[]` are different requests. Absent means "the planner picks",
+    which is what every request sent before this field existed meant. An
+    explicit empty list means "plan on nothing", which has no honest answer --
+    quietly treating it as absent would substitute a placement the caller did
+    not ask for, which is the whole failure this feature exists to remove.
+    """
+    if _PLACEMENT_PARAM not in payload:
+        return None
+    raw = payload.get(_PLACEMENT_PARAM)
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(x, str) and x for x in raw):
+        raise ValueError(f"{_PLACEMENT_PARAM} must be a list of node id strings")
+    if not raw:
+        raise ValueError(
+            f"{_PLACEMENT_PARAM} is empty. Name at least one machine, or omit "
+            f"the field to let the planner choose."
+        )
+    seen: set[str] = set()
+    for node_id in raw:
+        if node_id in seen:
+            raise ValueError(f"{_PLACEMENT_PARAM} names {node_id} more than once")
+        seen.add(node_id)
+    # Order is preserved deliberately: the first node is the pipeline head that
+    # sparkrun SSHes to first, so sorting here would silently move it.
+    return list(raw)
+
+
+def _parse_degrees(payload: dict) -> dict[str, int] | None:
+    """The degrees the operator set, or None when they set none.
+
+    A key omitted from the object means 1, never "whatever the planner would
+    have picked". Defaulting to the recommendation would make the launched
+    shape depend on a recommendation the operator never saw, and one that can
+    change between the preview round trip and the launch round trip.
+    """
+    if _DEGREES_PARAM not in payload:
+        return None
+    raw = payload.get(_DEGREES_PARAM)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{_DEGREES_PARAM} must be an object of degree names to integers")
+    unknown = sorted(set(raw) - set(_DEGREE_AXES))
+    if unknown:
+        raise ValueError(
+            f"{_DEGREES_PARAM} has no axis {', '.join(unknown)}. "
+            f"Valid axes: {', '.join(_DEGREE_AXES)}."
+        )
+    out: dict[str, int] = {}
+    for axis in _DEGREE_AXES:
+        value = raw.get(axis, 1)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{_DEGREES_PARAM}.{axis} must be an integer")
+        out[axis] = value
+    return out
+
+
+def _legal_degrees(shape, node_count: int) -> dict[str, list[int]]:
+    """What each axis could legally have been, so a refusal is actionable."""
+    return {
+        "tensor_parallel": sorted(valid_tp_degrees(shape, node_count)),
+        "pipeline_parallel": sorted(valid_pp_degrees(shape, node_count)),
+        "expert_parallel": sorted(valid_ep_degrees(shape, node_count)),
+    }
+
+
+def _rank_plans(
+    planner,
+    shape,
+    nodes,
+    link,
+    target,
+    concurrency,
+    *,
+    context_length,
+    kv_dtype,
+    allow_mixed_hardware,
+):
+    """The ranked plans, best first, from whichever surface this planner has.
+
+    `alternatives` is the planner's own extra API and is what `plan` calls
+    internally, so asking for the whole list costs nothing beyond the one call
+    that was already happening. A planner exposing only the frozen port still
+    works; it just cannot say what it ranked second.
+    """
+    kwargs = {"context_length": context_length, "kv_dtype": kv_dtype}
+    alternatives = getattr(planner, "alternatives", None)
+    if callable(alternatives):
+        return alternatives(
+            shape,
+            nodes,
+            link,
+            target,
+            concurrency,
+            allow_mixed_hardware=allow_mixed_hardware,
+            **kwargs,
+        )
+    try:
+        return [planner.plan(shape, nodes, link, target, concurrency, **kwargs)]
+    except TypeError:
+        # A port implementation that takes only the frozen five.
+        return [planner.plan(shape, nodes, link, target, concurrency)]
+
+
+def _select_nodes(registry, nodes, requested, warnings: list[str]):
+    """The named machines, in the order named, or a refusal saying why not.
+
+    Three cases, told apart with `registry.get_node` so the reason is the real
+    one rather than a guess:
+
+      not enrolled  -> 400, naming the machines that are.
+      not healthy   -> 409. The request is well formed and legal; the conflict
+                       is with machine state, and an unchanged retry succeeds
+                       once the machine comes back. Silently dropping it would
+                       serve on fewer machines than were asked for.
+      device class
+      unrecognised  -> allowed, with a warning. `serialize._eligibility` says
+                       in as many words that nothing downstream filters
+                       placement on device class, and turning that advisory
+                       flag into an enforcement point here would block machines
+                       whose profile is entirely real -- the registry's parse
+                       fallback produces UNKNOWN for a profile it could not
+                       label, not for one it could not read.
+    """
+    healthy = {n.node_id: n for n in nodes}
+    chosen = []
+    for node_id in requested:
+        profile = healthy.get(node_id)
+        if profile is None:
+            state = None
+            try:
+                state = registry.get_node(node_id)
+            except Exception:
+                log.exception("registry lookup failed for %s while planning", node_id)
+            if state is None:
+                raise _PlacementRefused(
+                    400,
+                    errors.unknown_node_message(node_id, sorted(healthy)),
+                    "unknown_node",
+                    param=_PLACEMENT_PARAM,
+                    extra={"available_node_ids": sorted(healthy)},
+                )
+            raise _PlacementRefused(
+                409,
+                f"The machine '{node_id}' is enrolled but not healthy right "
+                f"now, so nothing can be placed on it. Wait for it to come "
+                f"back, or deselect it.",
+                "node_unhealthy",
+                param=_PLACEMENT_PARAM,
+                extra={"unhealthy_node_ids": [node_id]},
+            )
+        if profile.device_class is DeviceClass.UNKNOWN:
+            warnings.append(serialize.INELIGIBLE_DEVICE_CLASS)
+        chosen.append(profile)
+    return chosen
+
+
+def _check_every_node_used(plan, nodes, requested_nodes, requested_degrees) -> None:
+    """Refuse a selection the chosen degrees cannot fill.
+
+    Only when the operator specified BOTH halves. Naming the machines alone
+    leaves the planner's opinion about how many ranks to run on them as advice,
+    and it explains itself in its own reason; the shortfall is then reported in
+    `placement.unused_node_ids` rather than refused. Naming both and leaving a
+    machine rankless is a contradiction inside one request, and sparkrun will
+    not catch it -- it launches the degrees it is given against the hosts it is
+    given, without complaint.
+    """
+    if requested_nodes is None or requested_degrees is None:
+        return
+    used = set(plan.node_ids)
+    idle = [n.node_id for n in nodes if n.node_id not in used]
+    if not idle:
+        return
+    degrees = " x ".join(
+        f"{label} {value}"
+        for label, value in (
+            ("TP", plan.tensor_parallel),
+            ("PP", plan.pipeline_parallel),
+            ("DP", plan.data_parallel),
+        )
+    )
+    raise _PlacementRefused(
+        400,
+        f"{_PLACEMENT_PARAM} names {len(nodes)} "
+        f"{'machine' if len(nodes) == 1 else 'machines'} but the chosen degrees "
+        f"are {degrees} = {plan.world_size} "
+        f"{'rank' if plan.world_size == 1 else 'ranks'}, so "
+        f"{', '.join(idle)} would carry no rank while still being named as a "
+        f"serving node. Deselect it, or raise a degree so every named machine "
+        f"is used.",
+        "placement_underfilled",
+        param=_PLACEMENT_PARAM,
+        extra={"unused_node_ids": idle},
+    )
+
 
 def _modality_of(architectures) -> Modality:
     """The endpoint family these architectures answer on.
@@ -983,6 +1262,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         target = payload.get("target") or "throughput"
         kv_dtype = payload.get("kv_dtype") or settings.default_kv_dtype
         dtype = payload.get("dtype")
+        requested_nodes = _parse_node_ids(payload)
+        requested_degrees = _parse_degrees(payload)
 
         # Prefer resolve_full when the port exposes it: it carries warnings
         # worth showing and, on mixed-precision repos, real measured weight
@@ -1006,6 +1287,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             log.exception("registry unavailable while planning")
             nodes = []
 
+        # Narrow here, before the link lookup, so `worst_all_reduce` measures
+        # only the path this deployment will actually cross. Filtering later
+        # would leave `plan.measured_link_gbps` describing a link the plan
+        # never uses.
+        placement_warnings: list[str] = []
+        if requested_nodes is not None:
+            nodes = _select_nodes(
+                ctx.deps.registry, nodes, requested_nodes, placement_warnings
+            )
+
         link = None
         if len(nodes) > 1:
             try:
@@ -1013,16 +1304,75 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             except Exception:
                 log.exception("link lookup failed while planning")
 
-        plan = await asyncio.to_thread(
-            ctx.deps.planner.plan,
-            shape,
-            nodes,
-            link,
-            target,
-            concurrency,
-            context_length=context_length,
-            kv_dtype=kv_dtype,
+        # The operator named the set, so the set is the request: plan across it
+        # as given rather than narrowing to the strongest homogeneous group.
+        # Whether pooling unlike hardware is *allowed to launch* is a separate
+        # question, answered by the serve gate below -- a dry run starts
+        # nothing, so it owes an honest answer about the set it was handed.
+        pool = requested_nodes is not None
+        ranked = await asyncio.to_thread(
+            partial(
+                _rank_plans,
+                ctx.deps.planner,
+                shape,
+                nodes,
+                link,
+                target,
+                concurrency,
+                context_length=context_length,
+                kv_dtype=kv_dtype,
+                allow_mixed_hardware=pool,
+            )
         )
+        recommended = ranked[0]
+
+        if requested_degrees is None:
+            plan = recommended
+        else:
+            plan_for = getattr(ctx.deps.planner, "plan_for", None)
+            if not callable(plan_for):
+                # The honest degrade. This planner cannot author a reason for
+                # the operator's shape, and a gateway-written `reason` would be
+                # rendered verbatim and persisted on the deployment forever.
+                raise _PlacementRefused(
+                    501,
+                    "this planner cannot plan operator-chosen degrees: it "
+                    "exposes only the recommendation. Remove `parallelism` to "
+                    "plan with the degrees it chooses.",
+                    "manual_degrees_unsupported",
+                    param=_DEGREES_PARAM,
+                )
+            try:
+                plan = await asyncio.to_thread(
+                    partial(
+                        plan_for,
+                        shape,
+                        nodes,
+                        link,
+                        target,
+                        concurrency,
+                        context_length=context_length,
+                        kv_dtype=kv_dtype,
+                        **requested_degrees,
+                    )
+                )
+            except IllegalDegrees as exc:
+                first = exc.refusals[0]
+                raise _PlacementRefused(
+                    400,
+                    str(exc),
+                    "illegal_parallelism",
+                    param=f"{_DEGREES_PARAM}.{first.axis}",
+                    extra={
+                        # The planner's own sentences, one per line, so the UI
+                        # renders them through the same list it renders every
+                        # other rejection through.
+                        "rejected": [r.message for r in exc.refusals],
+                        "legal_degrees": _legal_degrees(shape, len(nodes)),
+                    },
+                ) from exc
+
+        _check_every_node_used(plan, nodes, requested_nodes, requested_degrees)
 
         plan_nodes = [n for n in nodes if n.node_id in set(plan.node_ids)] or nodes
         req = FitRequest(
@@ -1049,10 +1399,45 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         fit, fit_live, unavailable = await asyncio.to_thread(
             livefit.dual_check, ctx.deps.fit, req, plan_nodes, budgets
         )
+        # Pooling unlike hardware is a permission, not a fit failure: the
+        # memory can be there and the machines still not belong in one pool.
+        # It therefore rides as a serve gate rather than as `allowed: false`,
+        # and the plan above was computed across the set as given so the
+        # operator can see what they are agreeing to before agreeing to it.
+        groups = homogeneous_groups(plan_nodes)
+        mixed = requested_nodes is not None and len(groups) > 1
+        gates = []
+        if mixed:
+            gates.append(
+                {"param": _MIXED_HW_PARAM, "reason": pooling_note(groups)}
+            )
+
         serve = livefit.serve_decision(
-            fit, fit_live, unavailable or live_reason
+            fit, fit_live, unavailable or live_reason, extra_gates=gates
         )
         capacity = _capacity_block(plan_nodes, budgets, excluded, fit, fit_live)
+
+        used = set(plan.node_ids)
+        placement = {
+            "mode": "operator" if requested_nodes is not None else "planner",
+            "requested_node_ids": requested_nodes,
+            "node_ids": list(plan.node_ids),
+            # Named but carrying no rank. Only reachable when the operator left
+            # the degrees to the planner -- naming both and under-filling is
+            # refused outright by `_check_every_node_used`.
+            "unused_node_ids": [
+                n.node_id for n in nodes if n.node_id not in used
+            ],
+            "mixed_hardware": mixed,
+            "warnings": placement_warnings,
+        }
+        degrees = {
+            "source": "operator" if requested_degrees is not None else "planner",
+            "tensor_parallel": plan.tensor_parallel,
+            "pipeline_parallel": plan.pipeline_parallel,
+            "expert_parallel": plan.expert_parallel,
+            "data_parallel": plan.data_parallel,
+        }
 
         return _PlanOutcome(
             shape=shape,
@@ -1065,6 +1450,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             concurrency=concurrency,
             resolver_warnings=resolver_warnings,
             modality=modality,
+            placement=placement,
+            degrees=degrees,
+            recommended=recommended,
+            alternatives=[serialize.plan_degrees_payload(p) for p in ranked],
         )
 
     @router.post("/api/plan")
@@ -1078,6 +1467,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         model_id = payload.get("model_id") if isinstance(payload, dict) else None
         try:
             out = await _plan_and_fit(payload)
+        except _PlacementRefused as exc:
+            return exc.response()
         except ValueError as exc:
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
@@ -1101,6 +1492,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # governs is decided here, not in the client.
                 "serve": out.serve,
                 "resolver_warnings": out.resolver_warnings,
+                # Whose choice the machines and the degrees were.
+                "placement": out.placement,
+                "degrees": out.degrees,
+                # The planner's own pick over the same node set, reason and
+                # rejected list intact. Always present, so a client never has
+                # to infer what was recommended from what was returned.
+                "recommended_plan": (
+                    serialize.plan_payload(out.recommended)
+                    if out.recommended is not None
+                    else None
+                ),
+                "alternatives": out.alternatives,
             }
         )
 
@@ -1147,6 +1550,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         try:
             out = await _plan_and_fit(payload)
+        except _PlacementRefused as exc:
+            return exc.response()
         except ValueError as exc:
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
@@ -1190,6 +1595,53 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     },
                     "plan": serialize.plan_payload(plan),
                     "fit": serialize.fit_payload(fit),
+                },
+            )
+
+        # Pooling unlike hardware. Refused here rather than at /api/plan: the
+        # dry run has to be able to show what the pooled plan looks like, or
+        # this permission would be one nobody could see the consequence of
+        # before granting. 400 rather than 409 because nothing about the
+        # machines will change to make an unchanged retry succeed -- this is a
+        # policy question about the request, and only the operator can answer
+        # it. Independent of the live-memory override: neither implies the
+        # other, and both must be satisfied when both apply.
+        if out.placement.get("mixed_hardware") and not bool(
+            payload.get(_MIXED_HW_PARAM)
+        ):
+            gate = next(
+                (
+                    g
+                    for g in out.serve.get("overrides", [])
+                    if g.get("param") == _MIXED_HW_PARAM
+                ),
+                None,
+            )
+            reason = gate["reason"] if gate else "the named machines are not alike"
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": (
+                            f"{reason} Resend with {_MIXED_HW_PARAM}: true to "
+                            f"pool them anyway; the fit gate still budgets "
+                            f"against the smallest machine."
+                        ),
+                        "type": "invalid_request_error",
+                        "param": _MIXED_HW_PARAM,
+                        "code": "mixed_hardware_not_allowed",
+                    },
+                    "plan": serialize.plan_payload(plan),
+                    "fit": serialize.fit_payload(fit),
+                    "placement": out.placement,
+                    "serve": out.serve,
+                    "override": {
+                        "param": _MIXED_HW_PARAM,
+                        "value_required": True,
+                        "overrides": (
+                            "the refusal to pool machines unlike each other"
+                        ),
+                    },
                 },
             )
 
@@ -1242,6 +1694,54 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 f"instruction ({_OVERRIDE_PARAM}): "
                 f"{live.usable_per_node / 1024 ** 3:.1f} GiB allocatable "
                 f"against {live.breakdown.total / 1024 ** 3:.1f} GiB needed"
+            )
+
+        # Who chose this shape, recorded on the thing that outlives the
+        # request. `plan.reason` is planner prose and is persisted on the
+        # deployment and rendered verbatim from then on -- without this line an
+        # operator-forced shape wears a planner-voiced sentence forever, and
+        # nothing on screen connects it to the person who chose it.
+        # `FitResult.warnings` is already the channel for exactly this and is
+        # already persisted, so it needs no contract change.
+        chose = [
+            name
+            for name, value in (
+                (_PLACEMENT_PARAM, out.placement.get("mode") == "operator"),
+                (_DEGREES_PARAM, out.degrees.get("source") == "operator"),
+            )
+            if value
+        ]
+        if chose:
+            note = (
+                f"placed and shaped at the operator's instruction "
+                f"({', '.join(chose)}): {_plan_label(plan)} on "
+                f"{', '.join(plan.node_ids)}"
+            )
+            if out.recommended is not None and (
+                out.recommended.tensor_parallel,
+                out.recommended.pipeline_parallel,
+                out.recommended.expert_parallel,
+                out.recommended.data_parallel,
+                tuple(out.recommended.node_ids),
+            ) != (
+                plan.tensor_parallel,
+                plan.pipeline_parallel,
+                plan.expert_parallel,
+                plan.data_parallel,
+                tuple(plan.node_ids),
+            ):
+                note += (
+                    f"; the planner ranked {_plan_label(out.recommended)} on "
+                    f"{', '.join(out.recommended.node_ids)} first for this "
+                    f"node set"
+                )
+            gating_fit.warnings.append(note)
+
+        if out.placement.get("mixed_hardware"):
+            gating_fit.warnings.append(
+                f"pooled machines unlike each other at the operator's "
+                f"instruction ({_MIXED_HW_PARAM}); the fit budget is the "
+                f"smallest machine's"
             )
 
         try:
@@ -1448,6 +1948,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         type: str = "",
         deployment_id: str = "",
         source: str = "",
+        node_id: str = "",
         from_: str = Query("", alias="from"),
         to: str = "",
         limit: int = 500,
@@ -1457,6 +1958,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             type=type,
             deployment_id=deployment_id,
             source=source,
+            node_id=node_id,
             from_ts=from_,
             to_ts=to,
             limit=limit,

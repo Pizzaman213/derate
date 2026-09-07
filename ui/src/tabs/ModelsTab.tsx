@@ -1,25 +1,49 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useCatalog, useCluster, useProviders } from '../state/resources'
+import { useCapacity, useCatalog, useCluster, useProviders, useStorage } from '../state/resources'
 import { useBackend } from '../state/backend'
 import type { ModelSearchResponse } from '../api/types'
 import { useSelection } from '../state/selection'
 import { QuantTableCard } from './models/QuantTableCard'
-import { CatalogList, type CatalogEntry } from './models/CatalogList'
+import { CatalogList } from './models/CatalogList'
+import {
+  cacheIndex,
+  capacityIndex,
+  catalogRows,
+  groupRows,
+  hubRows,
+  matches,
+  onDeviceRows,
+  providerRows,
+  runningRows,
+  SORTS,
+  type ModelRow,
+  type Origin,
+  type Sort,
+} from './models/rows'
 
-type Origin = 'catalog' | 'hub' | 'running' | 'providers'
-
-const ORIGINS: { id: Origin; label: string }[] = [
-  { id: 'catalog', label: 'Catalog' },
+const SOURCES: { id: Origin; label: string }[] = [
+  { id: 'catalog', label: 'Recommended' },
+  { id: 'ondevice', label: 'On device' },
   { id: 'hub', label: 'Hub' },
   { id: 'running', label: 'Running' },
   { id: 'providers', label: 'Providers' },
 ]
 
+const SOURCE_KEY = 'derate.models.source'
+
 /** Models: what you could run here, and what each quantization of it costs.
  *
- *  Opens on a populated list rather than an empty search box -- the curated
- *  shortlist comes from `GET /api/catalog`, which is the same list the capacity
- *  answer walks, so the picker and the verdict cannot drift apart.
+ *  Five sources, not one firehose, and each opens on a populated list rather
+ *  than an empty search box. Inside a source the rows are banded by the fit
+ *  gate's verdict -- fits, then loads-but-slow, then unchecked, then won't --
+ *  so the top of the screen is the part that actually runs. The bands are read
+ *  from `GET /api/capacity`; nothing here recomputes a fit.
+ *
+ *  Two sources deliberately carry no verdict. Hub rows come from
+ *  `GET /api/models/search`, which never resolves anything, so guessing a size
+ *  from the repository name would be inventing the one number this screen is
+ *  not allowed to invent -- they draw a hollow lamp and say "not checked"
+ *  instead. Provider rows are somebody else's hardware and open nothing.
  *
  *  Picking a model opens the one sheet, where the quantization ladder lives.
  *  That costs the ability to compare a variant against the list behind it,
@@ -28,12 +52,33 @@ export function ModelsTab() {
   const catalog = useCatalog()
   const cluster = useCluster()
   const providers = useProviders()
+  const storage = useStorage()
   const { openSheet } = useSelection()
 
-  const [origin, setOrigin] = useState<Origin>('catalog')
+  const [source, setSource] = useState<Origin>('catalog')
   const [query, setQuery] = useState('')
+  // 8192/1 matches what `GET /api/capacity` and the client's own fallback use.
+  // The three surfaces asking this question used to default differently, which
+  // meant the list and the dashboard could disagree about a model's fit while
+  // both were right about their own numbers.
   const [context, setContext] = useState(8192)
-  const [concurrency, setConcurrency] = useState(4)
+  const [concurrency, setConcurrency] = useState(1)
+  const [sort, setSort] = useState<Sort>('fit')
+
+  // Debounced before it becomes a request: the capacity walk resolves every
+  // catalogue model against the hub, and firing one per keystroke while
+  // somebody types "16384" would cost five of them.
+  const [capContext, setCapContext] = useState(8192)
+  const [capConcurrency, setCapConcurrency] = useState(1)
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      setCapContext(context)
+      setCapConcurrency(concurrency)
+    }, 450)
+    return () => window.clearTimeout(id)
+  }, [context, concurrency])
+
+  const capacity = useCapacity(capContext, capConcurrency)
 
   const { backend } = useBackend()
   const [hits, setHits] = useState<ModelSearchResponse | null>(null)
@@ -44,8 +89,37 @@ export function ModelsTab() {
   // land. Same pattern, and same reason, as PlannerBar.
   const seq = useRef(0)
 
+  const cache = useMemo(() => cacheIndex(storage.data), [storage.data])
+  const cap = useMemo(() => capacityIndex(capacity.data), [capacity.data])
+
+  // First run opens on whichever source has something in it: On device when
+  // the cluster has already pulled weights, the curated list otherwise. After
+  // that the last-used source wins, because the source someone chose is a
+  // stronger signal than anything this can infer.
+  const restored = useRef(false)
   useEffect(() => {
-    if (origin !== 'hub') return
+    if (restored.current) return
+    const saved = window.localStorage.getItem(SOURCE_KEY)
+    if (saved && SOURCES.some((s) => s.id === saved)) {
+      setSource(saved as Origin)
+      restored.current = true
+      return
+    }
+    // Wait for the first storage answer before deciding; guessing before it
+    // lands would flip the tab out from under someone a second after opening.
+    if (storage.loading || !storage.data) return
+    if (cache.all().length) setSource('ondevice')
+    restored.current = true
+  }, [storage.loading, storage.data, cache])
+
+  const pick = (next: Origin) => {
+    setSource(next)
+    restored.current = true
+    window.localStorage.setItem(SOURCE_KEY, next)
+  }
+
+  useEffect(() => {
+    if (source !== 'hub') return
     const mine = ++seq.current
     const needle = query.trim()
     if (!needle) {
@@ -75,79 +149,43 @@ export function ModelsTab() {
         })
     }, 450)
     return () => window.clearTimeout(timer)
-  }, [backend, origin, query])
+  }, [backend, source, query])
 
-  const entries = useMemo<CatalogEntry[]>(() => {
-    if (origin === 'hub') {
-      return (hits?.results ?? []).map((h) => ({
-        model_id: h.model_id,
-        label: h.model_id,
-        detail: [
-          h.quant_hint ?? undefined,
-          h.downloads != null ? `${h.downloads.toLocaleString()} downloads` : undefined,
-          h.pipeline_tag ?? undefined,
-        ]
-          .filter(Boolean)
-          .join(' \u00b7 '),
-        group: h.model_id.split('/')[0] ?? 'HuggingFace',
-      }))
+  const rows = useMemo<ModelRow[]>(() => {
+    switch (source) {
+      case 'hub':
+        return hubRows(hits, cache)
+      case 'ondevice':
+        return onDeviceRows(cap, cache)
+      case 'running':
+        return runningRows(cluster.data, cache)
+      case 'providers':
+        return providerRows(providers.data)
+      default:
+        return catalogRows(catalog.data, cap, cache)
     }
-    if (origin === 'running') {
-      return (cluster.data?.deployments ?? []).map((d) => ({
-        model_id: d.model_id,
-        label: d.served_name,
-        detail: `${d.runtime} · ${d.state}`,
-        group: 'Running here',
-      }))
-    }
-    if (origin === 'providers') {
-      const out: CatalogEntry[] = []
-      for (const p of providers.data ?? []) {
-        for (const m of p.models ?? []) {
-          out.push({
-            model_id: m.upstream_id,
-            label: m.served_name,
-            detail: m.context_length ? `${m.context_length.toLocaleString()} ctx` : '',
-            group: p.display_name || p.provider_id,
-            // A remote model is served by somebody else's hardware; there is
-            // nothing here to resolve it against.
-            remote: true,
-          })
-        }
-      }
-      return out
-    }
-    return (catalog.data ?? []).map((m) => ({
-      model_id: m.model_id,
-      label: m.label,
-      detail: m.detail,
-      group: family(m.model_id),
-      default_context: m.default_context,
-      default_concurrency: m.default_concurrency,
-    }))
-  }, [origin, catalog.data, cluster.data, providers.data, hits])
+  }, [source, catalog.data, cluster.data, providers.data, hits, cap, cache])
 
-  const filtered = useMemo(() => {
+  const groups = useMemo(() => {
     // The hub search already applied the query; filtering again would drop
-    // rows the hub matched on a field the label does not show.
-    if (origin === 'hub') return entries
-    const needle = query.trim().toLowerCase()
-    if (!needle) return entries
-    return entries.filter(
-      (e) =>
-        e.model_id.toLowerCase().includes(needle) ||
-        e.label.toLowerCase().includes(needle),
+    // rows the hub matched on a field the row does not show.
+    const needle = source === 'hub' ? '' : query.trim()
+    return groupRows(
+      needle ? rows.filter((r) => matches(r, needle)) : rows,
+      sort,
     )
-  }, [entries, query, origin])
+  }, [rows, query, source, sort])
 
-  const source =
-    origin === 'catalog'
+  const status =
+    source === 'catalog'
       ? catalog
-      : origin === 'hub'
-        ? { loading: searching, error: searchError ? new Error(searchError) : null }
-        : origin === 'running'
-          ? cluster
-          : providers
+      : source === 'ondevice'
+        ? storage
+        : source === 'hub'
+          ? { loading: searching, error: searchError ? new Error(searchError) : null }
+          : source === 'running'
+            ? cluster
+            : providers
 
   return (
     <div style={{ display: 'grid', gap: 'var(--s-4)' }}>
@@ -160,15 +198,18 @@ export function ModelsTab() {
         </div>
 
         <div className="chips" role="tablist" aria-label="Model source" style={{ marginTop: 12 }}>
-          {ORIGINS.map((o) => (
+          {SOURCES.map((s) => (
             <button
-              key={o.id}
+              key={s.id}
+              id={`mt-tab-${s.id}`}
               role="tab"
-              aria-pressed={origin === o.id}
-              aria-selected={origin === o.id}
-              onClick={() => setOrigin(o.id)}
+              type="button"
+              aria-selected={source === s.id}
+              aria-pressed={source === s.id}
+              aria-controls="mt-panel"
+              onClick={() => pick(s.id)}
             >
-              {o.label}
+              {s.label}
             </button>
           ))}
         </div>
@@ -179,10 +220,20 @@ export function ModelsTab() {
             <input
               id="mt-q"
               value={query}
-              placeholder={origin === 'hub' ? 'search HuggingFace' : 'name or id'}
+              placeholder={source === 'hub' ? 'search HuggingFace' : 'name, id, quantization or tag'}
               spellCheck={false}
               onChange={(e) => setQuery(e.target.value)}
             />
+          </div>
+          <div className="fld">
+            <label htmlFor="mt-sort">Sort</label>
+            <select id="mt-sort" value={sort} onChange={(e) => setSort(e.target.value as Sort)}>
+              {SORTS.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
           </div>
           <div className="fld" style={{ width: 96 }}>
             <label htmlFor="mt-ctx">Context</label>
@@ -214,65 +265,75 @@ export function ModelsTab() {
           </div>
         </div>
 
-        {origin === 'hub' && hits ? (
-          <>
-            {/* The hub failing greys one source; it does not empty the screen,
-                and it says why in the resolver's own words. */}
-            {Object.entries(hits.sources)
-              .filter(([, v]) => !v.ok && v.note)
-              .map(([name, v]) => (
-                <p
-                  key={name}
-                  className="label"
-                  style={{
-                    fontWeight: 400,
-                    color: 'var(--warn)',
-                    whiteSpace: 'pre-wrap',
-                    margin: '0 0 6px',
-                  }}
-                >
-                  {name}: {v.note}
+        <div id="mt-panel" role="tabpanel" aria-labelledby={`mt-tab-${source}`}>
+          {/* Where the verdicts came from, said once at the top rather than
+              repeated on every row. */}
+          {source === 'catalog' || source === 'ondevice' ? (
+            // The numbers come from the report, not from the fields above it.
+            // A caption built from the inputs would name a context the verdicts
+            // beneath it were not taken at, every time one of them changed.
+            <p className="unit" style={{ margin: '0 0 6px' }}>
+              {capacity.data && cap.basis
+                ? `Fit at ${capacity.data.context.toLocaleString()} context and ` +
+                  `${capacity.data.concurrency} ` +
+                  `${capacity.data.concurrency === 1 ? 'sequence' : 'sequences'}, ` +
+                  (cap.basis === 'live'
+                    ? 'against what the nodes can hand out right now.'
+                    : 'against the idle-hardware ceiling — there is no live memory reading.')
+                : 'No capacity answer yet, so nothing here is banded by fit.'}
+            </p>
+          ) : null}
+
+          {/* The hub failing greys one source; it does not empty the screen,
+              and it says why in the resolver's own words. */}
+          {source === 'hub' && hits ? (
+            <>
+              {Object.entries(hits.sources)
+                .filter(([, v]) => !v.ok && v.note)
+                .map(([name, v]) => (
+                  <p
+                    key={name}
+                    className="label"
+                    style={{
+                      fontWeight: 400,
+                      color: 'var(--warn)',
+                      whiteSpace: 'pre-wrap',
+                      margin: '0 0 6px',
+                    }}
+                  >
+                    {name}: {v.note}
+                  </p>
+                ))}
+              {hits.notes.map((n) => (
+                <p key={n} className="unit" style={{ margin: '0 0 6px' }}>
+                  {n}
                 </p>
               ))}
-            {hits.notes.map((n) => (
-              <p key={n} className="unit" style={{ margin: '0 0 6px' }}>
-                {n}
-              </p>
-            ))}
-          </>
-        ) : null}
+            </>
+          ) : null}
 
-        <CatalogList
-          entries={filtered}
-          loading={source.loading}
-          error={source.error}
-          emptyNote={
-            origin === 'hub' && !query.trim()
-              ? 'Type to search HuggingFace.'
-              : query.trim()
-              ? `Nothing here matches ${query.trim()}.`
-              : origin === 'running'
-                ? 'Nothing is deployed yet.'
-                : origin === 'providers'
-                  ? 'No provider has published a model list.'
-                  : 'The catalog is empty.'
-          }
-          onOpen={(entry) => {
-            // A curated entry carries the numbers it is normally served at;
-            // adopt them so the ladder's verdicts are taken at something
-            // sensible rather than at whatever was last typed.
-            const ctx = entry.default_context ?? context
-            const seqs = entry.default_concurrency ?? concurrency
-            if (entry.default_context) setContext(ctx)
-            if (entry.default_concurrency) setConcurrency(seqs)
-            openSheet({
-              kind: 'model',
-              id: entry.model_id,
-              context: ctx,
-              concurrency: seqs,
-            })
-          }}
-        />
+          <CatalogList
+            groups={groups}
+            loading={status.loading}
+            error={status.error}
+            emptyNote={emptyNote(source, query)}
+            onOpen={(row) => {
+              // A curated entry carries the numbers it is normally served at;
+              // adopt them so the ladder's verdicts are taken at something
+              // sensible rather than at whatever was last typed.
+              const ctx = row.default_context ?? context
+              const seqs = row.default_concurrency ?? concurrency
+              if (row.default_context) setContext(ctx)
+              if (row.default_concurrency) setConcurrency(seqs)
+              openSheet({
+                kind: 'model',
+                id: row.model_id,
+                context: ctx,
+                concurrency: seqs,
+              })
+            }}
+          />
+        </div>
       </div>
 
       <QuantTableCard />
@@ -280,10 +341,17 @@ export function ModelsTab() {
   )
 }
 
-/** Group by publisher-ish family so the list reads as sections rather than a
- *  flat wall. Purely presentational -- nothing downstream depends on it. */
-function family(modelId: string): string {
-  const name = modelId.split('/').pop() ?? modelId
-  const first = name.split(/[-_.]/)[0] ?? name
-  return first.charAt(0).toUpperCase() + first.slice(1)
+function emptyNote(source: Origin, query: string): string {
+  if (source === 'hub' && !query.trim()) return 'Type to search HuggingFace.'
+  if (query.trim()) return `Nothing here matches ${query.trim()}.`
+  switch (source) {
+    case 'ondevice':
+      return 'No weights are cached on any node yet. A model downloads on its first launch.'
+    case 'running':
+      return 'Nothing is deployed yet.'
+    case 'providers':
+      return 'No provider has published a model list.'
+    default:
+      return 'The catalog is empty.'
+  }
 }

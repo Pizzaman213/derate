@@ -4,6 +4,7 @@ import { useBackend } from '../../state/backend'
 import { useCandidates, useCluster, useEnrollments } from '../../state/resources'
 import { Copyable } from '../../components/Copyable'
 import { gbytes, shortGpu } from '../../format'
+import { fromState, nodeName } from '../../state/names'
 
 /** Settings -> Add a node: the install command, and what turns up after it runs.
  *
@@ -237,7 +238,7 @@ export function AddNodeCard() {
               <span className="pill" style={{ color: 'var(--live)' }}>
                 joined
               </span>
-              <span className="mono">{n.profile.hostname}</span>
+              <span className="mono">{nodeName(fromState(n))}</span>
               <span className="unit">
                 {shortGpu(n.profile.gpu_name)} ·{' '}
                 {gbytes(n.profile.addressable_memory, 0)} GB · {n.profile.address}

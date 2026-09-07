@@ -541,6 +541,80 @@ function preview() {
   return path
 }
 
+// ── The identity line under a machine's name ────────────────────────────────
+//
+// A plate is captioned by node_id (or the operator's label), never by
+// hostname: a worker in a --network host container reports the HOST's
+// hostname, so two machines legitimately share one. When the name is hiding a
+// second identity the plate reserves a line for it -- and because a row is as
+// tall as its tallest plate, the whole floor pays for it or none of it does.
+
+/** Same fixture, but every machine reports the same hostname -- the real
+ *  two-containers-on-one-Spark case that started all this. */
+function sharedHostname(n) {
+  return nodes(n).map((node) => ({ ...node, hostname: 'spark-4d38' }))
+}
+
+function buildNodes(nodeList, opts = {}) {
+  return L.layoutCluster({
+    nodes: nodeList,
+    links: links(nodeList.length, opts.measuredPairs ?? 1),
+    deployments: [],
+    routing: [],
+    selection: NO_SELECTION,
+    width: 1100,
+    height: 640,
+    order: null,
+  })
+}
+
+for (const n of [2, 3, 4]) {
+  const plain = buildNodes(nodes(n))
+  const shared = buildNodes(sharedHostname(n))
+
+  ok(plain.subline === 0, `n=${n} a floor where every name says it all reserves nothing`)
+  ok(shared.subline === L.SUBLINE_H, `n=${n} a shared hostname reserves the identity line`)
+  ok(
+    shared.cards.every((c) => c.h === plain.cards[0].h + L.SUBLINE_H),
+    `n=${n} EVERY plate grows, so the meters in a row still line up`,
+  )
+
+  // The line has to fit inside the plate it is drawn on: the renderer puts the
+  // name at y+15, the identity at y+26 and shifts the rows below by SUBLINE_H,
+  // ending at y+74+SUBLINE_H for a full-tier plate.
+  ok(
+    shared.cards.every((c) => 74 + L.SUBLINE_H < c.h),
+    `n=${n} the shifted rows still fit inside the taller plate`,
+  )
+
+  let collide = false
+  for (let i = 0; i < shared.cards.length; i++)
+    for (let j = i + 1; j < shared.cards.length; j++)
+      if (overlaps(shared.cards[i], shared.cards[j])) collide = true
+  ok(!collide, `n=${n} taller plates still do not overlap`)
+}
+
+// Compact and chip plates have no room below the meter, so they never reserve
+// it -- those tiers carry the identity in the tooltip and the node sheet.
+for (const n of [6, 10]) {
+  ok(
+    buildNodes(sharedHostname(n)).subline === 0,
+    `n=${n} tiers with no room reserve nothing`,
+  )
+}
+
+// A rename is the other reason a plate's name is not its id.
+{
+  const renamed = nodes(3).map((node, i) =>
+    i === 0 ? { ...node, label: 'Rack 2' } : node,
+  )
+  ok(buildNodes(renamed).subline === L.SUBLINE_H, 'a renamed machine reserves the line too')
+  ok(
+    buildNodes(nodes(3).map((node) => ({ ...node, label: node.node_id }))).subline === 0,
+    'a label equal to the node_id is not a second identity and reserves nothing',
+  )
+}
+
 const previewPath = preview()
 rmSync(out, { recursive: true, force: true })
 

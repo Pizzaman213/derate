@@ -1,6 +1,8 @@
 import type { NodeStateDTO } from '../../api/types'
 import type { SelectionApi } from '../../state/selection'
 import type { TelemetrySeries } from '../../state/useTelemetry'
+import { fromState, nodeName } from '../../state/names'
+import { utilLabel } from '../../state/live'
 import { Chart } from './Chart'
 
 interface Props {
@@ -12,9 +14,12 @@ interface Props {
 // The mockup's own line here ("the control plane stores no history") is no
 // longer true as of the telemetry package -- durable journals exist on the
 // coordinator now. This is the corrected sentence, not a paraphrase of the
-// old one.
+// old one. Corrected a second time when the node sheet started reading the
+// archive: percentiles DO exist, they were simply unreachable from the
+// browser, and saying otherwise on a screen next to one that shows them is
+// worse than saying nothing.
 const NOTE =
-  'Every series below comes from the 1 Hz metrics frame and is accumulated in this browser; this window is 60 seconds and starts empty on load. Durable history exists on the coordinator but is not charted here — there are no percentiles anywhere in the system; TTFT and mean duration are moving averages.'
+  'Every series below comes from the 1 Hz metrics frame and is accumulated in this browser; this window is 60 seconds and starts empty on load. The coordinator also keeps a durable archive, which a node\u2019s own page charts over longer windows and which carries real TTFT and duration percentiles. Nothing on this screen does: the frame\u2019s TTFT and mean duration are moving averages.'
 
 /** Drill-down, not a wall: cluster charts are always on, per-Spark and
  *  per-deployment charts render only for the current selection. Selection is
@@ -48,29 +53,29 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
               // Picking a Spark here selects it everywhere; it never toggles off.
               onClick={() => selection.pickNode(n.profile.node_id)}
             >
-              {n.profile.hostname}
+              {nodeName(fromState(n))}
             </button>
           ))}
         </div>
         {selectedNode ? (
           <div className="chartgrid">
             <Chart
-              title={`${selectedNode.profile.hostname} · power`}
+              title={`${nodeName(fromState(selectedNode))} · power`}
               unit="W"
               points={telemetry.nodePower[selectedNode.profile.node_id] ?? []}
             />
             <Chart
-              title={`${selectedNode.profile.hostname} · temperature`}
+              title={`${nodeName(fromState(selectedNode))} · temperature`}
               unit="°C"
               points={telemetry.nodeTemp[selectedNode.profile.node_id] ?? []}
             />
             <Chart
-              title={`${selectedNode.profile.hostname} · memory`}
+              title={`${nodeName(fromState(selectedNode))} · memory`}
               unit="%"
               points={telemetry.nodeMem[selectedNode.profile.node_id] ?? []}
             />
             <Chart
-              title={`${selectedNode.profile.hostname} · GPU utilisation`}
+              title={`${nodeName(fromState(selectedNode))} · ${utilLabel(selectedNode.profile)}`}
               unit="%"
               points={telemetry.nodeUtil[selectedNode.profile.node_id] ?? []}
             />

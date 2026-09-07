@@ -41,8 +41,22 @@ from .constants import (
     PIPELINE_INFLIGHT_PER_STAGE,
 )
 from .fit_bridge import FitHelpers, default_fit_helpers
-from .legality import Candidate, enumerate_candidates, valid_ep_degrees, valid_tp_degrees
-from .topology import NodeGroup, exclusion_note, homogeneous_groups
+from .legality import (
+    Candidate,
+    IllegalDegrees,
+    check_degrees,
+    enumerate_candidates,
+    tp_rejection,
+    valid_ep_degrees,
+    valid_tp_degrees,
+)
+from .topology import (
+    NodeGroup,
+    exclusion_note,
+    homogeneous_groups,
+    pooled_group,
+    pooling_note,
+)
 
 LATENCY_TARGET = "latency"
 
@@ -76,6 +90,10 @@ class _Facts:
     context: int
     kv_dtype: str
     min_nodes: int
+    #: True when the caller named the nodes and every one of them is in the
+    #: group, unlike hardware included. Suppresses the exclusion clause (nothing
+    #: was excluded) and arms the pooling warning instead.
+    pooled: bool = False
 
     @property
     def measured(self) -> bool:
@@ -277,6 +295,7 @@ class Planner:
         *,
         context_length: int | None = None,
         kv_dtype: str = DEFAULT_KV_DTYPE,
+        allow_mixed_hardware: bool = False,
     ) -> ParallelismPlan:
         """The recommended plan.
 
@@ -294,6 +313,7 @@ class Planner:
             concurrency,
             context_length=context_length,
             kv_dtype=kv_dtype,
+            allow_mixed_hardware=allow_mixed_hardware,
         )
         return ranked[0]
 
@@ -312,6 +332,7 @@ class Planner:
         *,
         context_length: int | None = None,
         kv_dtype: str = DEFAULT_KV_DTYPE,
+        allow_mixed_hardware: bool = False,
     ) -> list[ParallelismPlan]:
         """Every legal plan, ranked, best first.
 
@@ -322,8 +343,25 @@ class Planner:
         if not nodes:
             raise ValueError("cannot plan a deployment with no nodes")
 
-        facts = self._facts(shape, nodes, link, target, concurrency, context_length, kv_dtype)
-        scored = self._score(facts)
+        facts = self._facts(
+            shape,
+            nodes,
+            link,
+            target,
+            concurrency,
+            context_length,
+            kv_dtype,
+            allow_mixed_hardware=allow_mixed_hardware,
+        )
+        return self._render(self._score(facts), facts)
+
+    def _render(self, scored: list[_Scored], facts: _Facts) -> list[ParallelismPlan]:
+        """Ranked candidates to plans, each carrying the others as rejections.
+
+        Split out of `alternatives` so `plan_for` can render an operator's shape
+        through exactly this path -- same reason text, same rejected list, same
+        single-node filtering rule -- rather than assembling a parallel one.
+        """
         lines = [self._rejection_line(s, scored[0], facts) for s in scored]
         preamble = self._structural_rejections(facts)
 
@@ -351,6 +389,101 @@ class Planner:
                 )
             )
         return plans
+
+    def plan_for(
+        self,
+        shape: ModelShape,
+        nodes: list[NodeProfile],
+        link: LinkMeasurement | None,
+        target: str,
+        concurrency: int,
+        *,
+        tensor_parallel: int = 1,
+        pipeline_parallel: int = 1,
+        expert_parallel: int = 1,
+        data_parallel: int = 1,
+        context_length: int | None = None,
+        kv_dtype: str = DEFAULT_KV_DTYPE,
+    ) -> ParallelismPlan:
+        """The plan for degrees an operator chose, with the planner's own words.
+
+        `agents/E-planner.md` specifies this component as "a recommendation with
+        reasoning, not a lock". `alternatives` is the ranked recommendation;
+        this is the override it exists to allow.
+
+        Always pooled: the caller named the nodes, so the set and its order are
+        the request rather than a suggestion, and silently narrowing it to the
+        strongest homogeneous group would serve on fewer machines than were
+        asked for. `_reason`'s pooling warning still only fires when those nodes
+        are genuinely unlike, so naming a homogeneous set warns about nothing.
+
+        Raises `IllegalDegrees` for a shape that cannot load. Does *not* raise
+        for a shape that merely will not fit -- that is the fit gate's sentence
+        to say, and saying it here would be a second authority on one fact.
+        """
+        if not nodes:
+            raise ValueError("cannot plan a deployment with no nodes")
+
+        cand = Candidate(
+            tp=tensor_parallel,
+            pp=pipeline_parallel,
+            ep=expert_parallel,
+            dp=data_parallel,
+        )
+        refusals = check_degrees(shape, cand)
+        if refusals:
+            raise IllegalDegrees(refusals)
+
+        facts = self._facts(
+            shape,
+            nodes,
+            link,
+            target,
+            concurrency,
+            context_length,
+            kv_dtype,
+            allow_mixed_hardware=True,
+        )
+        scored = self._score(facts)
+
+        # A single-node plan names one host even when its world size is greater
+        # than one (`_nodes_for`), and `_score` may upgrade the winning
+        # single-node entry to intra-node TP/EP. So the kind has to be matched
+        # alongside the degrees: on a 4-node cluster of 4-GPU boxes, a
+        # single-node TP=4 and a cross-node TP=4 share a degree tuple and are
+        # not the same plan.
+        want_kind = (
+            ParallelismKind.SINGLE_NODE if len(nodes) == 1 else _kind_of(cand)
+        )
+        for index, entry in enumerate(scored):
+            if entry.candidate == cand and entry.kind is want_kind:
+                return self._render(scored, facts)[index]
+
+        # Legal, but filtered out of the ranking -- the capacity floor drops
+        # every shape narrower than `min_nodes`. This is the important case:
+        # forcing one node for a model that needs two. Render it through the
+        # same path so it still gets planner-authored prose; `_justification`
+        # already says the honest thing for it ("offered as the closest
+        # available shape, not a working plan -- the fit check will refuse it").
+        scored = scored + [
+            _Scored(
+                candidate=cand,
+                kind=want_kind,
+                family_rank=_family_rank(want_kind, facts),
+                prefer_fewer_nodes=facts.second_replica_possible,
+                step_seconds=comm.estimated_step_seconds(
+                    facts.shape,
+                    facts.group.exemplar,
+                    facts.link,
+                    cand.tp,
+                    cand.pp,
+                    cand.ep,
+                    cand.dp,
+                    facts.concurrency,
+                ),
+            )
+        ]
+        return self._render(scored, facts)[-1]
 
     def explain(self, plan: ParallelismPlan) -> str:
         """Multi-line rendering of a plan and the work behind it."""
@@ -380,9 +513,13 @@ class Planner:
         concurrency: int,
         context_length: int | None,
         kv_dtype: str,
+        allow_mixed_hardware: bool = False,
     ) -> _Facts:
+        # `groups` stays the real partition either way, so the pooling warning
+        # can name the odd nodes exactly as the exclusion note would have.
         groups = homogeneous_groups(nodes)
-        group = groups[0]
+        pooled = allow_mixed_hardware and len(nodes) > 0
+        group = pooled_group(nodes) if pooled else groups[0]
         context = context_length or DEFAULT_PLAN_CONTEXT
         min_nodes = self._fit.min_nodes_required(
             shape, group.exemplar, context, max(1, concurrency), kv_dtype=kv_dtype
@@ -397,6 +534,7 @@ class Planner:
             context=context,
             kv_dtype=kv_dtype,
             min_nodes=min_nodes,
+            pooled=pooled,
         )
 
     def _score(self, facts: _Facts) -> list[_Scored]:
@@ -502,13 +640,32 @@ class Planner:
         sentence = f"{label} across {nodes}" if cand.world_size > 1 else f"{label} on {nodes}"
 
         body = self._justification(chosen, facts)
-        note = exclusion_note(facts.group, facts.groups)
+        # Nothing was excluded when the caller named the nodes, so the exclusion
+        # clause would be a false statement. The hazard is stated affirmatively
+        # in the pooling warning below instead -- it is a full sentence, so it
+        # belongs with the other extras rather than in the `; ...` clause slot.
+        note = "" if facts.pooled else exclusion_note(facts.group, facts.groups)
         reason = f"{sentence}: {body}{note}."
 
-        for extra in (self._bubble_warning(chosen, facts), self._capacity_warning(facts)):
+        for extra in (
+            self._bubble_warning(chosen, facts),
+            self._capacity_warning(facts),
+            self._pooling_warning(facts),
+        ):
             if extra:
                 reason = f"{reason} {extra}"
         return reason
+
+    def _pooling_warning(self, facts: _Facts) -> str:
+        """The cost of a pool of unlike hardware, when one was asked for.
+
+        Empty unless the caller both named the nodes and named nodes that are
+        not alike: pooling machines that are interchangeable is not a hazard,
+        and warning about it would teach people to ignore the warning.
+        """
+        if not facts.pooled:
+            return ""
+        return pooling_note(homogeneous_groups(facts.group.nodes))
 
     def _justification(self, chosen: _Scored, facts: _Facts) -> str:
         cand = chosen.candidate
@@ -601,6 +758,26 @@ class Planner:
                 f"threshold that governs batched serving"
             )
 
+        if facts.link_gbps < TP_VIABLE_THRESHOLD:
+            # Only reachable when a caller asked for tensor parallel at a
+            # bandwidth the planner would not have picked it at (`plan_for`).
+            # The clause below is the planner's argument *for* tensor parallel
+            # and would be a false statement here -- it would report a measured
+            # 10.2 GB/s as "at or above the 40 GB/s threshold". State the
+            # measurement against the shape instead, and say plainly that the
+            # shape was asked for. The recommendation the operator overruled
+            # travels back beside this plan, with its own reason intact.
+            return (
+                f"measured all-reduce is {bw}, below the {thresh} threshold "
+                f"where tensor parallel becomes competitive -- at concurrency "
+                f"{c} it moves "
+                f"{comm.human_bytes(comm.tensor_bytes_per_step(facts.shape, cand.tp, c))} "
+                f"per step over "
+                f"{_plural(comm.tensor_exchanges_per_step(facts.shape, cand.tp), 'exchange')} "
+                f"-- so this shape was asked for rather than chosen; the planner "
+                f"does not rank tensor parallel first at this bandwidth"
+            )
+
         return (
             f"measured all-reduce is {bw}, at or above the {thresh} threshold, so "
             f"tensor parallel's "
@@ -658,18 +835,13 @@ class Planner:
         out: list[str] = []
         shape = facts.shape
 
+        # The sentence lives in legality.tp_rejection so that a degree the
+        # operator names by hand is refused in these exact words. See the note
+        # above the refusal helpers there.
         for tp in range(2, facts.group.size + 1):
-            bad = []
-            if shape.num_attention_heads % tp:
-                bad.append(f"num_attention_heads={shape.num_attention_heads}")
-            if shape.num_kv_heads % tp:
-                bad.append(f"num_kv_heads={shape.num_kv_heads}")
-            if bad:
-                out.append(
-                    f"TP={tp}: illegal, "
-                    + " and ".join(f"{b} is not divisible by {tp}" for b in bad)
-                    + " for this model"
-                )
+            line = tp_rejection(shape, tp)
+            if line:
+                out.append(line)
 
         if facts.capacity_impossible:
             out.append(

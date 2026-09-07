@@ -42,6 +42,7 @@ from control_plane.gateway.stubs import (
     StubPlanner,
     StubResolver,
 )
+from control_plane.planner import Planner
 from control_plane.providers import UnknownProviderError
 from control_plane.registry import JoinRejected, NodeNotFound
 from tests.fixtures import (
@@ -3354,6 +3355,60 @@ def test_node_payload_is_ineligible_when_device_class_is_unrecognized():
     )
 
 
+def _no_gpu_profile():
+    """What probe_local returns on a machine with no nvidia-smi: zeroed, never
+    partial. addressable_memory stays 0, so the fit gate still refuses it."""
+    from dataclasses import replace
+
+    return replace(
+        make_node_profile(device_class=DeviceClass.UNKNOWN),
+        gpu_name="",
+        gpu_count=0,
+        total_memory=0,
+        addressable_memory=0,
+        memory_bandwidth_gbps=0.0,
+        compute_capability="",
+        driver_version="",
+    )
+
+
+def test_node_payload_reports_power_as_unknown_when_there_is_no_gpu():
+    """A Pi in the roster read 0 W, which looks like a measured idle GPU.
+
+    The node reports real host temperature, memory and CPU utilisation, but
+    there is no GPU power draw to read on a board that has no GPU and no
+    portable host equivalent -- so power goes out as unknown, not as zero.
+    """
+    from tests.fixtures import node_state
+
+    no_gpu = _no_gpu_profile()
+    state = node_state(no_gpu)
+    state.power_watts = 0.0
+    state.temperature_c = 47.5
+    state.utilization_pct = 12.5
+    deps = build_deps(registry=FakeRegistry([state]))
+    with TestClient(create_app(deps)) as client:
+        node = client.get("/api/nodes").json()[0]
+
+    assert node["power_w"] is None
+    # Real readings from the host, and they must survive as themselves.
+    assert node["temp_c"] == 47.5
+    assert node["util_pct"] == 12.5
+
+
+def test_node_payload_reports_temperature_as_unknown_only_when_absent():
+    """A running board does not sit at exactly 0.0 C; that is a missing sensor."""
+    from tests.fixtures import node_state
+
+    no_gpu = _no_gpu_profile()
+    state = node_state(no_gpu)
+    state.temperature_c = 0.0
+    deps = build_deps(registry=FakeRegistry([state]))
+    with TestClient(create_app(deps)) as client:
+        node = client.get("/api/nodes").json()[0]
+    assert node["temp_c"] is None
+
+
 def test_candidate_payload_reports_eligibility_by_device_class():
     from control_plane.gateway import serialize
 
@@ -3556,3 +3611,210 @@ def test_a_gguf_model_is_refused_at_launch_by_the_runtime_support_gate():
         )
     assert reply.status_code == 400
     assert reply.json()["error"]["code"] == "runtime_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# Manual placement over HTTP
+#
+# The invariant that governs every one of these: a request carrying none of the
+# new fields must produce exactly the answer it produced before they existed.
+# Everything else is opt-in.
+# ---------------------------------------------------------------------------
+
+
+PLACEMENT_BODY = {
+    "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+    "context": 8192,
+    "concurrency": 4,
+    "target": "throughput",
+}
+
+
+def _real_planner_deps(**kw):
+    """The fixture cluster, planned by the real planner.
+
+    `build_deps` wires `StubPlanner`, which has no `plan_for` and no
+    `alternatives`. That is a case worth testing on its own (below), but the
+    operator-degree path needs a planner that can actually author a reason.
+    """
+    deps = build_deps(**kw)
+    deps.planner = Planner()
+    return deps
+
+
+class TestManualPlacement:
+    def test_a_body_without_placement_is_todays_answer(self):
+        """The compatibility pin. If this fails, the feature is not additive."""
+        with TestClient(create_app(build_deps())) as client:
+            body = client.post("/api/plan", json=PLACEMENT_BODY).json()
+
+        assert body["placement"]["mode"] == "planner"
+        assert body["placement"]["requested_node_ids"] is None
+        assert body["placement"]["mixed_hardware"] is False
+        assert body["degrees"]["source"] == "planner"
+        assert body["serve"]["overrides"] == []
+
+    def test_plan_uses_exactly_the_machines_named(self):
+        with TestClient(create_app(build_deps())) as client:
+            body = client.post(
+                "/api/plan", json={**PLACEMENT_BODY, "node_ids": ["spark-01"]}
+            ).json()
+
+        assert body["plan"]["node_ids"] == ["spark-01"]
+        assert body["placement"]["mode"] == "operator"
+        assert body["placement"]["requested_node_ids"] == ["spark-01"]
+
+    def test_an_unknown_machine_names_the_ones_that_exist(self):
+        with TestClient(create_app(build_deps())) as client:
+            response = client.post(
+                "/api/plan", json={**PLACEMENT_BODY, "node_ids": ["nope"]}
+            )
+
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "unknown_node"
+        assert body["error"]["param"] == "node_ids"
+        assert "spark-01" in body["error"]["message"]
+
+    def test_an_empty_selection_is_not_the_same_request_as_no_selection(self):
+        """Silently reading `[]` as "the planner picks" would substitute a
+        placement the caller did not ask for."""
+        with TestClient(create_app(build_deps())) as client:
+            response = client.post(
+                "/api/plan", json={**PLACEMENT_BODY, "node_ids": []}
+            )
+        assert response.status_code == 400
+
+    def test_operator_degrees_win_and_the_recommendation_comes_back_with_them(self):
+        """One round trip carries both: what will launch, and what was advised."""
+        with TestClient(create_app(_real_planner_deps())) as client:
+            body = client.post(
+                "/api/plan",
+                json={
+                    **PLACEMENT_BODY,
+                    "node_ids": ["spark-01", "spark-02"],
+                    "parallelism": {"tensor_parallel": 2},
+                },
+            ).json()
+
+        assert body["degrees"]["source"] == "operator"
+        assert body["plan"]["tensor_parallel"] == 2
+        assert body["plan"]["pipeline_parallel"] == 1
+        # The planner still says what it would have done, in its own words.
+        assert body["recommended_plan"]["pipeline_parallel"] == 2
+        assert body["recommended_plan"]["reason"]
+
+    def test_illegal_degrees_carry_the_planners_sentence_and_the_legal_ones(self):
+        with TestClient(create_app(_real_planner_deps())) as client:
+            response = client.post(
+                "/api/plan",
+                json={
+                    **PLACEMENT_BODY,
+                    "node_ids": ["spark-01", "spark-02"],
+                    "parallelism": {"tensor_parallel": 3},
+                },
+            )
+
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "illegal_parallelism"
+        assert body["error"]["param"] == "parallelism.tensor_parallel"
+        assert "not divisible by 3" in body["error"]["message"]
+        assert body["legal_degrees"]["tensor_parallel"] == [1, 2]
+
+    def test_a_named_machine_that_would_carry_no_rank_is_refused(self):
+        """sparkrun will not catch this -- it launches the degrees it is given
+        against the hosts it is given, without complaint."""
+        with TestClient(create_app(_real_planner_deps())) as client:
+            response = client.post(
+                "/api/plan",
+                json={
+                    **PLACEMENT_BODY,
+                    "node_ids": ["spark-01", "spark-02"],
+                    "parallelism": {},
+                },
+            )
+
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "placement_underfilled"
+        assert body["unused_node_ids"] == ["spark-02"]
+
+    def test_a_planner_without_plan_for_degrades_rather_than_fabricating(self):
+        """A gateway-authored `reason` would be rendered verbatim and persisted
+        on the deployment forever. 501 is the honest answer."""
+        with TestClient(create_app(build_deps())) as client:
+            response = client.post(
+                "/api/plan",
+                json={**PLACEMENT_BODY, "parallelism": {"tensor_parallel": 2}},
+            )
+            still_fine = client.post(
+                "/api/plan", json={**PLACEMENT_BODY, "node_ids": ["spark-01"]}
+            )
+
+        assert response.status_code == 501
+        assert response.json()["error"]["code"] == "manual_degrees_unsupported"
+        # Naming machines needs nothing beyond the frozen port.
+        assert still_fine.status_code == 200
+
+
+class TestMixedHardwareGate:
+    def test_a_dry_run_plans_the_mix_and_reports_the_gate(self):
+        """/api/plan must not refuse: the operator has to be able to see what
+        they are agreeing to before agreeing to it."""
+        with TestClient(create_app(build_deps())) as client:
+            body = client.post(
+                "/api/plan",
+                json={**PLACEMENT_BODY, "node_ids": ["spark-01", "ws-3090"]},
+            ).json()
+
+        assert body["placement"]["mixed_hardware"] is True
+        assert body["plan"]["node_ids"] == ["spark-01", "ws-3090"]
+        gates = [g["param"] for g in body["serve"]["overrides"]]
+        assert "allow_mixed_hardware" in gates
+        reason = next(
+            g["reason"]
+            for g in body["serve"]["overrides"]
+            if g["param"] == "allow_mixed_hardware"
+        )
+        assert "the slowest node the tail latency" in reason
+
+    def test_a_launch_is_refused_until_the_named_param_is_sent(self):
+        with TestClient(create_app(build_deps())) as client:
+            response = client.post(
+                "/api/deployments",
+                json={
+                    **PLACEMENT_BODY,
+                    "node_ids": ["spark-01", "ws-3090"],
+                    "runtime": "vllm",
+                },
+            )
+
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "mixed_hardware_not_allowed"
+        assert body["error"]["param"] == "allow_mixed_hardware"
+        assert body["override"]["value_required"] is True
+
+    def test_alike_machines_never_raise_the_gate(self):
+        with TestClient(create_app(build_deps())) as client:
+            body = client.post(
+                "/api/plan",
+                json={**PLACEMENT_BODY, "node_ids": ["spark-01", "spark-02"]},
+            ).json()
+
+        assert body["placement"]["mixed_hardware"] is False
+        assert body["serve"]["overrides"] == []
+
+    def test_the_default_cluster_is_mixed_and_must_not_start_refusing(self):
+        """The guard that keeps this feature additive.
+
+        The fixture cluster spans two hardware groups. Without the
+        "only when node_ids was named" condition on the mixed check, every
+        request that names no machines would begin failing here.
+        """
+        with TestClient(create_app(build_deps())) as client:
+            response = client.post("/api/plan", json=PLACEMENT_BODY)
+
+        assert response.status_code == 200
+        assert response.json()["placement"]["mixed_hardware"] is False

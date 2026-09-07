@@ -4,9 +4,16 @@ import type { SafeMetricsFrame } from './useMetrics'
 // Exactly nine series, because that is what the Telemetry sub-tab's three
 // chart rows draw: cluster (2), per Spark (4, keyed by node_id), per
 // deployment (3, keyed by served_name -- the metrics frame only knows
-// deployment_id, so the caller supplies the lookup). The control plane keeps
-// no history of its own; this is the only place any of it survives longer
-// than one frame, and it does that in this browser tab only.
+// deployment_id, so the caller supplies the lookup).
+//
+// This is the LIVE window and nothing more: one minute, at the frame's own
+// 1 Hz, in this browser tab, gone on reload. The claim that used to be here --
+// that the control plane keeps no history of its own -- stopped being true
+// when the telemetry package landed. It keeps thirty days of raw node samples
+// and four hundred of hourly rollups, and `state/history.ts` reads them. The
+// two are not interchangeable: this one has no gaps because it has no memory
+// of having missed anything, and that is exactly what the archive's envelope
+// reports and this cannot.
 
 export interface TelemetryPoint {
   t: number
@@ -25,8 +32,9 @@ export interface TelemetrySeries {
   depQueue: Record<string, TelemetryPoint[]>
 }
 
-/** Seconds of history kept. The control plane stores one snapshot, not a
- *  trace, so every series starts empty and fills in from here on. */
+/** Seconds of history kept. The SSE hub holds exactly one frame, so every
+ *  series starts empty and fills in from here on -- accumulated once, in
+ *  TelemetryProvider, so it keeps filling whichever destination is showing. */
 const WINDOW_S = 60
 
 const EMPTY: TelemetrySeries = {

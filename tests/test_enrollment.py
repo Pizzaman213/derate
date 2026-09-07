@@ -619,6 +619,114 @@ def gpu_path(tmp_path, present: bool) -> str:
     return str(bin_dir)
 
 
+def fake_docker(tmp_path, responses=None):
+    """A `docker` on PATH that records its argv and answers canned queries.
+
+    Prepended to the real PATH rather than replacing it: install.sh shells out
+    to sed, awk, sort and hostname on the success path, and stubbing all of
+    those would be testing the stubs. `curl` is stubbed too so the health probe
+    returns immediately instead of waiting out HEALTH_TIMEOUT.
+
+    ``responses`` maps a substring of the joined argv to the stdout for it. The
+    first match wins, so put the more specific key first.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "docker.log"
+    table = json.dumps(list((responses or {}).items()))
+
+    (bin_dir / "docker").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"log = {str(log)!r}\n"
+        f"table = json.loads({table!r})\n"
+        "argv = ' '.join(sys.argv[1:])\n"
+        "open(log, 'a').write(argv + chr(10))\n"
+        "for key, out in table:\n"
+        "    if key in argv:\n"
+        "        sys.stdout.write(out)\n"
+        "        break\n"
+        "sys.exit(0)\n"
+    )
+    (bin_dir / "docker").chmod(0o755)
+    (bin_dir / "curl").write_text("#!/bin/sh\nexit 0\n")
+    (bin_dir / "curl").chmod(0o755)
+    return f"{bin_dir}:{os.environ['PATH']}", log
+
+
+def docker_calls(log) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_install_replaces_a_node_it_finds_by_its_label(tmp_path):
+    """Re-running the command upgrades in place rather than colliding.
+
+    A second node on one machine fights the first for :8080, :8081 and the
+    data volume, and the loser's failure is a port bind error three layers
+    down from anything the operator typed.
+    """
+    path, log = fake_docker(tmp_path, {"ps -aq --filter label=": "c0ffee\n"})
+    result = sh("--join", "http://10.0.0.1:8080", "--token", "ej_x", path=path)
+
+    calls = docker_calls(log)
+    assert result.returncode == 0, result.stderr
+    assert any(c.startswith("rm -f c0ffee") for c in calls), calls
+    # The volume holds the cluster token and the node registry. An upgrade that
+    # forgot which cluster the machine was in would be a reinstall.
+    assert not any("volume rm" in c for c in calls), calls
+
+
+def test_install_pulls_before_it_destroys_anything(tmp_path):
+    """The other order leaves a machine with nothing running when the pull fails."""
+    path, log = fake_docker(tmp_path, {"ps -aq --filter label=": "c0ffee\n"})
+    sh("--join", "http://10.0.0.1:8080", "--token", "ej_x", path=path)
+
+    calls = docker_calls(log)
+    pulled = next(i for i, c in enumerate(calls) if c.startswith("pull "))
+    removed = next(i for i, c in enumerate(calls) if c.startswith("rm -f c0ffee"))
+    assert pulled < removed, calls
+
+
+def test_install_replaces_a_node_someone_started_by_hand(tmp_path):
+    """Named anything, or nothing -- if it came from this image it is a node.
+
+    The name filter alone missed a container started with a plain `docker run`,
+    which is how the worker on the development box was running.
+    """
+    path, log = fake_docker(tmp_path, {
+        "ps -aq --filter label=": "",
+        "ps -aq --filter name=": "",
+        "images -q ghcr.io": "sha256:aaa\n",
+        "ps -aq --filter ancestor=sha256:aaa": "beefbeef\n",
+    })
+    result = sh("--join", "http://10.0.0.1:8080", "--token", "ej_x", path=path)
+
+    assert result.returncode == 0, result.stderr
+    assert any(c.startswith("rm -f beefbeef") for c in docker_calls(log))
+
+
+def test_install_reclaims_superseded_images_but_never_the_running_one(tmp_path):
+    path, log = fake_docker(tmp_path, {
+        "images --no-trunc -q ghcr.io": "sha256:new\nsha256:old\n",
+        "inspect -f {{.Image}}": "sha256:new\n",
+    })
+    sh("--join", "http://10.0.0.1:8080", "--token", "ej_x", path=path)
+
+    calls = docker_calls(log)
+    assert "rmi sha256:old" in calls, calls
+    assert "rmi sha256:new" not in calls, calls
+
+
+def test_keep_images_leaves_superseded_images_alone(tmp_path):
+    path, log = fake_docker(tmp_path, {
+        "images --no-trunc -q ghcr.io": "sha256:new\nsha256:old\n",
+        "inspect -f {{.Image}}": "sha256:new\n",
+    })
+    sh("--keep-images", "--join", "http://10.0.0.1:8080", "--token", "ej_x", path=path)
+
+    assert not any(c.startswith("rmi ") for c in docker_calls(log))
+
+
 def test_the_script_is_valid_posix_sh():
     assert subprocess.run(["sh", "-n", str(INSTALL_SH)]).returncode == 0
 

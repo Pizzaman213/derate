@@ -23,6 +23,23 @@ class GatewaySettings:
     ui_dir: str | None = field(
         default_factory=lambda: os.environ.get("DERATE_UI_DIR")
     )
+    # Origins a browser may call this gateway from, comma separated. Empty (the
+    # default) installs no CORS middleware at all, which is the deployed shape:
+    # the coordinator serves the UI itself, so the only browser that talks to it
+    # is same-origin and needs no permission. It is only when the UI is pointed
+    # at a coordinator OTHER than the one that served it -- Settings ->
+    # Coordinator, or `npm run dev` against a remote box -- that the browser
+    # starts asking, and then the answer has to be given here by name. This is
+    # not a formality to wave through with "*": every /api route is unauthenticated
+    # cluster control, so an origin listed here can stop deployments and remove
+    # nodes from any page a person happens to have open.
+    allowed_origins: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            origin.strip()
+            for origin in os.environ.get("DERATE_ALLOWED_ORIGINS", "").split(",")
+            if origin.strip()
+        )
+    )
 
     # --- upstream proxying ---
     # Connect fast, read forever. A decode that takes ten minutes is not an

@@ -5,7 +5,7 @@ import { useCluster, useRouting, useSettings } from '../state/resources'
 import { useMetrics } from '../state/metrics'
 import type { Cluster, RoutingConfig, Settings } from '../api/types'
 import type { SafeMetricsFrame } from '../state/useMetrics'
-import { NodeInspector } from '../inspectors/NodeInspector'
+import { NodeInspector } from '../inspectors/node/NodeInspector'
 import { DeploymentInspector } from '../inspectors/DeploymentInspector'
 import { ModelInspector } from '../tabs/models/ModelInspector'
 
@@ -105,9 +105,20 @@ export function Sheet() {
 
   if (!sheet) return null
 
-  // A model carries a quantization ladder, which needs the wide card for
-  // the same reason the deployment inspector does.
-  const wide = sheet.kind === 'dep' || sheet.kind === 'model'
+  // Three sizes. A model carries a quantization ladder, which needs the wide
+  // card for the same reason the deployment inspector does; a node carries its
+  // own telemetry over a window, what it is serving, the requests that ran on
+  // it and its logs, which is a page rather than a card.
+  //
+  // Note that bare `.card` sets no max-height at all -- only `.wide` and
+  // `.full` do. That is fine now every long inspector is one of the two, and
+  // the only thing left on `.card` is `Gone`, which is two lines.
+  const size =
+    sheet.kind === 'node'
+      ? 'card full'
+      : sheet.kind === 'dep' || sheet.kind === 'model'
+        ? 'card wide'
+        : 'card'
 
   return createPortal(
     <div
@@ -121,7 +132,7 @@ export function Sheet() {
     >
       <div
         ref={cardRef}
-        className={wide ? 'card wide' : 'card'}
+        className={size}
         role="dialog"
         aria-modal="true"
         aria-label={
@@ -189,6 +200,7 @@ function SheetBody({
       <NodeInspector
         node={node}
         deployments={cluster?.deployments ?? []}
+        routing={routing ?? []}
         frame={frame}
         stale={stale}
         onClose={onClose}

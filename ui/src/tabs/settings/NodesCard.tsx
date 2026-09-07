@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useCandidates, useCluster } from '../../state/resources'
 import { useBackend } from '../../state/backend'
 import { gbytes, relativeTime, shortGpu } from '../../format'
+import { fromState, nodeName } from '../../state/names'
 
 // Ported from mockups-next/js/settings.js `settings()`'s `nodeTable` plus
 // derate.html's "discovered" row. The mockup's own address/kind form is not
@@ -72,7 +73,13 @@ export function NodesCard() {
               return (
                 <tr key={p.node_id}>
                   <td className="mono">
-                    {p.hostname}
+                    {nodeName(fromState(n))}
+                    {/* The id everything else is keyed by, kept beside a chosen
+                        name so this table can still be read against a
+                        deployment's node list. */}
+                    {nodeName(fromState(n)) !== p.node_id ? (
+                      <span className="unit"> {p.node_id}</span>
+                    ) : null}
                     {n.role === 'coordinator' ? <span className="unit"> coordinator</span> : null}
                   </td>
                   <td className="mono unit">{p.address}</td>

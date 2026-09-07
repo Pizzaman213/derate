@@ -296,6 +296,45 @@ def test_an_empty_window_is_an_empty_list_not_an_error(live):
 # ==========================================================================
 
 
+def test_events_are_filterable_by_node(live):
+    """`node_id` is stored and selected on every event row, but had no filter
+    until the node page needed one — so "what happened on this machine" meant
+    fetching the whole cluster's events and discarding most of them in the
+    browser. `logs` has filtered on it since it shipped; this is the same
+    clause on the same column."""
+    archive = live.archive
+    now = time.time()
+    for node in ("spark-01", "spark-02"):
+        _ingest(
+            archive,
+            node,
+            [
+                {
+                    "kind": KIND_EVENT,
+                    "ts": now - 5,
+                    "body": {
+                        "source": "deploy",
+                        "type": "state_changed",
+                        "ts": now - 5,
+                        "deployment_id": f"d-{node}",
+                    },
+                }
+            ],
+        )
+
+    with _client(live) as client:
+        scoped = client.get(
+            "/api/history/events", params={"node_id": "spark-02", "from": "-1h"}
+        ).json()
+        every = client.get("/api/history/events", params={"from": "-1h"}).json()
+
+    assert scoped["events"], f"expected spark-02's event, got {scoped}"
+    assert all(r["node_id"] == "spark-02" for r in scoped["events"])
+    # An absent node_id still means "no filter", so the unscoped call is
+    # unchanged by this.
+    assert {r["node_id"] for r in every["events"]} == {"spark-01", "spark-02"}
+
+
 def test_events_are_flattened_and_filterable_by_deployment(live):
     """The envelope puts `type` and `ts` at the top level beside the payload —
     the same shape EventBus.recent() produces, so a consumer written against

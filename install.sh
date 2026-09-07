@@ -22,6 +22,11 @@ set -eu
 IMAGE="${DERATE_IMAGE:-ghcr.io/pizzaman213/derate/node:latest}"
 CONTAINER=derate
 VOLUME=derate
+LABEL=io.derate.node
+# Every repository this node has ever shipped under. A machine installed before
+# the move to GHCR is still running a derate node; it just does not answer to
+# the current image name. Both are searched so an upgrade finds it.
+IMAGE_REPOS="ghcr.io/pizzaman213/derate/node derate/node"
 PORT=8080
 AGENT_PORT=8081
 JOIN=""
@@ -31,6 +36,7 @@ DRY_RUN=0
 UNINSTALL=0
 GPU=1
 PURGE=0
+KEEP_IMAGES=0
 INSTALL_DOCKER=0
 HEALTH_TIMEOUT=60
 
@@ -57,6 +63,7 @@ Options
   --dry-run           print the docker command that would run, and stop
   --uninstall         stop and remove the container (keeps the data volume)
   --purge             with --uninstall, also delete the data volume
+  --keep-images       do not reclaim derate images the upgrade superseded
   -h, --help          this
 USAGE
 }
@@ -89,6 +96,7 @@ while [ $# -gt 0 ]; do
         --dry-run)      DRY_RUN=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
         --purge)        PURGE=1; shift ;;
+        --keep-images)  KEEP_IMAGES=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown option '$1'. Try --help." ;;
     esac
@@ -172,6 +180,10 @@ fi
 # topology. The container refuses to start without it, so this is not a
 # preference the script is expressing.
 set -- -d --name "$CONTAINER" --network host --restart unless-stopped
+# The mark a later run finds this container by. Names are not enough: a node
+# started by hand, or by an older installer under a different name, is still an
+# instance of this thing and still binds the same ports.
+set -- "$@" --label "$LABEL=1"
 set -- "$@" -v "$VOLUME:/data"
 
 # sparkrun drives the cluster over SSH and reads its own config. Mounted only
@@ -253,10 +265,13 @@ fi
 
 ensure_docker
 
-if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    info "replacing the existing $CONTAINER container (the $VOLUME volume is kept)"
-    $DOCKER rm -f "$CONTAINER" >/dev/null
-fi
+# ---------------------------------------------------------------------------
+# Upgrade in place
+#
+# Pull first, destroy second. The other order -- which this script used to use
+# -- removes a working node and only then discovers the registry is
+# unreachable, leaving the machine with nothing running and nothing to run.
+# ---------------------------------------------------------------------------
 
 # A locally built or `docker load`-ed image is a first-class case, not an
 # error: a lab cluster has no registry, and the tag somebody built on the
@@ -273,6 +288,39 @@ if ! $DOCKER pull "$IMAGE" >/dev/null 2>&1; then
         info "  gunzip -c node.tgz | sudo docker load  # here"
         die "no image to run"
     fi
+fi
+
+# Every container on this machine that is an instance of this node, whatever it
+# is called. Three ways in, because an install can be older than any one of
+# them: the label this script now stamps on what it creates, the fixed name it
+# has always used, and the image itself -- which catches a container somebody
+# started by hand with `docker run`. A node is a node; if it is here it holds
+# the ports and the volume, and a second one would fight it for both.
+existing_nodes() {
+    {
+        $DOCKER ps -aq --filter "label=$LABEL" 2>/dev/null
+        $DOCKER ps -aq --filter "name=^${CONTAINER}$" 2>/dev/null
+        for repo in $IMAGE_REPOS; do
+            $DOCKER images -q "$repo" 2>/dev/null | while read -r img; do
+                [ -n "$img" ] && $DOCKER ps -aq --filter "ancestor=$img" 2>/dev/null
+            done
+        done
+    } | sort -u
+}
+
+OLD_NODES="$(existing_nodes)"
+if [ -n "$OLD_NODES" ]; then
+    for id in $OLD_NODES; do
+        was="$($DOCKER inspect -f '{{.Name}} ({{.State.Status}})' "$id" 2>/dev/null \
+               | sed 's|^/||')"
+        info "replacing existing node ${was:-$id}"
+    done
+    # The volume is deliberately untouched: it holds the cluster token, the
+    # node registry, measured links and deployment records. An upgrade that
+    # forgot which cluster the machine was in would be a reinstall.
+    info "the $VOLUME volume is kept"
+    # shellcheck disable=SC2086
+    $DOCKER rm -f $OLD_NODES >/dev/null 2>&1 || true
 fi
 
 # Docker's own message is the only useful thing to say about a failed start, so
@@ -353,6 +401,27 @@ until probe "http://127.0.0.1:$AGENT_PORT/agent/health"; do
     sleep 2
     waited=$((waited + 2))
 done
+
+# The node answered /agent/health, so the image it is running is known good and
+# the ones it replaced are dead weight -- a derate image is ~300 MB and an
+# upgrade would otherwise leave every previous one on the disk forever. Done
+# only after the health probe passes, so a failed start still has something to
+# roll back to. `docker rmi` refuses an image any container still references,
+# so the failure mode here is a no-op, never a broken node.
+if [ "$KEEP_IMAGES" -eq 0 ]; then
+    IN_USE=$($DOCKER inspect -f '{{.Image}}' "$CONTAINER" 2>/dev/null || true)
+    RECLAIMED=0
+    for repo in $IMAGE_REPOS; do
+        for img in $($DOCKER images --no-trunc -q "$repo" 2>/dev/null | sort -u); do
+            if [ "$img" != "$IN_USE" ] && $DOCKER rmi "$img" >/dev/null 2>&1; then
+                RECLAIMED=$((RECLAIMED + 1))
+            fi
+        done
+    done
+    if [ "$RECLAIMED" -gt 0 ]; then
+        info "reclaimed $RECLAIMED superseded derate image(s). --keep-images skips this."
+    fi
+fi
 
 LOGS=$($DOCKER logs "$CONTAINER" 2>&1 || true)
 

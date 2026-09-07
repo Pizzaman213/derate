@@ -3,6 +3,7 @@
 // a UI that opens without one is not the shape this ships in. Day-0 fixture
 // data lived here through bring-up; it is gone as of the derate port.
 
+import { apiUrl } from './origin'
 import { scrub } from './redact'
 import type {
   Candidate,
@@ -37,6 +38,7 @@ import type {
   ModelDetail,
   ModelSearchResponse,
   QuantTable,
+  ReachReport,
   VariantLadder,
   CapacityReport,
   NodeProcessList,
@@ -44,6 +46,11 @@ import type {
   StorageReport,
   CacheClearResult,
   ModelDeleteResult,
+  TelemetryEstate,
+  NodeHistory,
+  RequestHistory,
+  EventHistory,
+  LogHistory,
 } from './types'
 
 /** One turn's worth of arguments for `chatStream`.
@@ -86,6 +93,15 @@ export interface Backend {
   revokeEnrollment(tokenId: string): Promise<void>
   removeNode(nodeId: string): Promise<void>
   measureLink(a: string, b: string): Promise<LinkMeasurement | void>
+  /** Can these two nodes reach each other, and from which side? Four health
+   *  checks, seconds not a minute, and safe to run against a cluster that is
+   *  serving — deliberately not a mode of `measureLink`, which saturates the
+   *  interconnect. */
+  checkReach(a: string, b: string): Promise<ReachReport>
+  /** Give a node a display name, or clear it with an empty string. Changes
+   *  the caption and nothing else: `node_id` stays what it was, so every
+   *  deployment, link and routing target keyed by it still resolves. */
+  renameNode(nodeId: string, label: string): Promise<{ node_id: string; label: string | null }>
   /** `DELETE /api/deployments/{id}`. Drains first: the deployment stops
    *  admitting immediately and in-flight requests finish. */
   stopDeployment(deploymentId: string): Promise<void>
@@ -135,6 +151,31 @@ export interface Backend {
     modelId: string,
     opts?: { context?: number; concurrency?: number },
   ): Promise<VariantLadder>
+  /** Node samples over a window: 1 Hz raw rows, or 1-minute/1-hour rollups
+   *  when the window is too wide for raw. Answers from the registry's
+   *  five-minute in-RAM ring when no archive exists, and says so with
+   *  `resolution: 'ring'` and `durable: false`; 503s with a sentence when
+   *  neither is available. */
+  historyNodes(opts?: HistoryQuery & { nodeId?: string; step?: string }): Promise<NodeHistory>
+  /** Request attempts over a window, raw or rolled. Rolled buckets carry the
+   *  only real percentiles in the product -- everything on the live frame is
+   *  an exponential moving average. Filters by served name or target, never
+   *  by node: a raw row carries `node_id` and the caller filters. */
+  historyRequests(
+    opts?: HistoryQuery & { servedName?: string; targetId?: string; step?: string },
+  ): Promise<RequestHistory>
+  /** Lifecycle events the bus emitted, as recorded rather than as broadcast. */
+  historyEvents(
+    opts?: HistoryQuery & { nodeId?: string; deploymentId?: string; type?: string; source?: string },
+  ): Promise<EventHistory>
+  /** Log records at a level and worse, already redacted by the handler that
+   *  shipped them. */
+  historyLogs(
+    opts?: HistoryQuery & { nodeId?: string; level?: string; logger?: string; q?: string },
+  ): Promise<LogHistory>
+  /** Whether anything is being kept at all, and how much. Same shape as
+   *  `StorageReport.telemetry`. */
+  historyStatus(): Promise<TelemetryEstate>
   getSettings(): Promise<Settings>
   /** 501, with a message naming why, when the patch includes a daily spend
    *  cap and no provider port can be measured against. */
@@ -151,6 +192,45 @@ export interface Backend {
   ): () => void
 }
 
+/** The window every history route shares.
+ *
+ *  `from`/`to` are strings, not numbers, because `telemetry/query.py`'s
+ *  `resolve_window` accepts a relative form (`-1h`, `-7d`) as well as an
+ *  epoch. Sending `-1h` lets the server pick both boundaries off its own
+ *  clock, which removes an argument about skew that a browser cannot win. */
+export interface HistoryQuery {
+  from?: string
+  to?: string
+  limit?: number
+}
+
+/** Builds a history URL, omitting every parameter the caller did not set.
+ *
+ *  Omitting matters rather than being tidy: each of these routes treats an
+ *  empty string as "no filter" and an absent `from` as "the last hour", so a
+ *  `?node_id=&step=` sent for an unset option is the same request -- but a
+ *  `?limit=` is not, and neither is a `from` some caller stringified from
+ *  `undefined`. One builder, and none of them can drift. */
+function historyPath(
+  base: string,
+  window: HistoryQuery | undefined,
+  extra: Record<string, string | number | undefined>,
+): string {
+  const params = new URLSearchParams()
+  // `from` is the query key; the handler's parameter is `from_` with an alias.
+  for (const [key, value] of Object.entries({
+    from: window?.from,
+    to: window?.to,
+    limit: window?.limit,
+    ...extra,
+  })) {
+    if (value == null || value === '') continue
+    params.set(key, String(value))
+  }
+  const qs = params.toString()
+  return qs ? `${base}?${qs}` : base
+}
+
 export type StreamState =
   | { status: 'connecting' }
   | { status: 'open' }
@@ -159,13 +239,20 @@ export type StreamState =
 // ── HTTP backend ─────────────────────────────────────────────────────────────
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  // Every path in this file is written as the contract spells it -- relative,
+  // rooted at /api or /v1 -- and `apiUrl` is the one place a configured
+  // coordinator base is prepended. Same origin (the deployed shape, and the
+  // default) leaves the path untouched.
+  const url = apiUrl(path)
+  const res = await fetch(url, {
     ...init,
     headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
-    throw new ApiError(res.status, body || res.statusText, path)
+    // The resolved URL, not the contract path: when a base is set, which
+    // coordinator refused is half the message.
+    throw new ApiError(res.status, body || res.statusText, url)
   }
   if (res.status === 204) return undefined as T
   return scrub((await res.json()) as T)
@@ -216,6 +303,7 @@ interface ClusterWire {
 
 interface NodeWire {
   node_id: string
+  label?: string | null
   hostname: string
   address: string
   device_class: NodeProfile['device_class']
@@ -261,6 +349,7 @@ function toNodeState(n: NodeWire, coordinator: string | null): NodeStateDTO {
       compute_capability: n.compute_capability,
       driver_version: n.driver_version,
     },
+    label: n.label ?? null,
     healthy: n.healthy,
     state: nodeHealth(undefined, n.healthy),
     role: n.node_id === coordinator ? 'coordinator' : 'worker',
@@ -381,7 +470,7 @@ export const httpBackend: Backend = {
     // The one thing in this file `req<T>` cannot carry: it awaits `res.json()`,
     // and the whole value here is in not waiting for the end of the body.
     // `EventSource` is no help either -- it is GET-only and cannot send one.
-    const path = '/v1/chat/completions'
+    const path = apiUrl('/v1/chat/completions')
     const startedAt = performance.now()
 
     let requestId: string | null = null
@@ -520,6 +609,16 @@ export const httpBackend: Backend = {
       method: 'POST',
       body: JSON.stringify({ a, b }),
     }),
+  checkReach: (a, b) =>
+    req<ReachReport>('/api/links/reach', {
+      method: 'POST',
+      body: JSON.stringify({ a, b }),
+    }),
+  renameNode: (nodeId, label) =>
+    req<{ node_id: string; label: string | null }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/label`,
+      { method: 'PUT', body: JSON.stringify({ label }) },
+    ),
   memory: () => req<MemoryReportList>('/api/memory'),
   quantTable: () => req<QuantTable>('/api/models/quant-table'),
   catalog: () => req<CuratedModel[]>('/api/catalog'),
@@ -555,6 +654,37 @@ export const httpBackend: Backend = {
       { method: 'DELETE' },
     ),
   storage: () => req<StorageReport>('/api/storage'),
+  historyNodes: (opts) =>
+    req<NodeHistory>(
+      historyPath('/api/history/nodes', opts, { node_id: opts?.nodeId, step: opts?.step }),
+    ),
+  historyRequests: (opts) =>
+    req<RequestHistory>(
+      historyPath('/api/history/requests', opts, {
+        served_name: opts?.servedName,
+        target_id: opts?.targetId,
+        step: opts?.step,
+      }),
+    ),
+  historyEvents: (opts) =>
+    req<EventHistory>(
+      historyPath('/api/history/events', opts, {
+        node_id: opts?.nodeId,
+        deployment_id: opts?.deploymentId,
+        type: opts?.type,
+        source: opts?.source,
+      }),
+    ),
+  historyLogs: (opts) =>
+    req<LogHistory>(
+      historyPath('/api/history/logs', opts, {
+        node_id: opts?.nodeId,
+        level: opts?.level,
+        logger: opts?.logger,
+        q: opts?.q,
+      }),
+    ),
+  historyStatus: () => req<TelemetryEstate>('/api/history/status'),
   clearResolverCache: () =>
     req<CacheClearResult>('/api/storage/cache/resolver', { method: 'DELETE' }),
   deleteCachedModel: (nodeId, folder) =>
@@ -593,7 +723,7 @@ export const httpBackend: Backend = {
     const connect = () => {
       if (closed) return
       if (attempt === 0) onState({ status: 'connecting' })
-      es = new EventSource('/api/metrics/stream')
+      es = new EventSource(apiUrl('/api/metrics/stream'))
 
       es.onopen = () => {
         attempt = 0

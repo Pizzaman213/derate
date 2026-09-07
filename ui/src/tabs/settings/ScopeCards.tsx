@@ -46,12 +46,20 @@ const SCOPE_CHANGED: [string, string][] = [
     'Model catalog browser',
     'built after all \u2014 browse, quantizations and fit. 00-architecture.md \u00a71 amended 2026-09-07',
   ],
+  [
+    'Deep-dive metrics page',
+    'a machine\u2019s own page charts the durable archive. One node, not the cluster. Amended 2026-09-07',
+  ],
+  [
+    'Log browser',
+    'narrowed, not dropped: a node\u2019s recent lines on its own page, with no search and no logger filter. Amended 2026-09-07',
+  ],
 ]
 
 const OUT_OF_SCOPE: [string, string][] = [
   ['Chat history', 'the Chat tab is a test console; the transcript is never stored'],
-  ['Log browser', 'failure diagnostics only, on the deployment that failed'],
-  ['Deep-dive metrics page', 'the readouts are the whole metrics surface'],
+  ['Searchable logs', 'no query box and no logger filter, though the endpoint has both'],
+  ['Cluster-wide metrics destination', 'depth lives on the machine it is about'],
   ['WAN endpoint', 'the gateway binds to the LAN'],
 ]
 

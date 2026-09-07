@@ -32,7 +32,13 @@ from control_plane.planner import (
     StubPlanner,
     comm,
 )
-from control_plane.planner.legality import valid_tp_degrees
+from control_plane.planner.legality import IllegalDegrees, valid_tp_degrees
+from control_plane.planner.topology import (
+    exclusion_note,
+    homogeneous_groups,
+    pooled_group,
+    pooling_note,
+)
 from tests.fixtures import (
     DEEPSEEK_V3,
     GB10_PROFILES,
@@ -720,3 +726,183 @@ def test_best_available_single_node_reason_never_claims_a_fit():
     assert not any(r.startswith("single node: illegal") for r in plan.rejected), (
         "a plan must not reject its own chosen shape"
     )
+
+
+# --------------------------------------------------------------------------
+# Manual placement: the operator overrules, the planner still speaks
+#
+# `agents/E-planner.md` specifies this component as "a recommendation with
+# reasoning, not a lock" and says `alternatives` exists "so the UI can offer an
+# override". These cover the override path: the operator names the machines and
+# the degrees, and every sentence that comes back is still the planner's.
+# --------------------------------------------------------------------------
+
+
+class TestPlanFor:
+    def test_returns_the_ranked_entry_verbatim(self):
+        """An operator shape that IS in the ranking is that entry, not a copy.
+
+        The point of `plan_for` reusing `_render` rather than assembling its own
+        plan: no synthesized prose can enter the system this way.
+        """
+        planner = Planner()
+        ranked = planner.alternatives(
+            LLAMA_3_3_70B, SPARKS[:2], LINK_SPARK_10G, "throughput", 16,
+            context_length=32768,
+        )
+        match = next(p for p in ranked if p.kind is ParallelismKind.TENSOR)
+        forced = planner.plan_for(
+            LLAMA_3_3_70B, SPARKS[:2], LINK_SPARK_10G, "throughput", 16,
+            tensor_parallel=match.tensor_parallel,
+            pipeline_parallel=match.pipeline_parallel,
+            context_length=32768,
+        )
+        assert forced == match
+
+    def test_honours_a_shape_the_ranking_filtered_out(self):
+        """One node for a model that needs more than one.
+
+        `enumerate_candidates` drops everything below the capacity floor, so
+        this shape is not in `alternatives` at all -- and it is exactly the
+        override an operator reaches for. It must plan, carry planner-authored
+        prose, and leave the refusal to the fit gate.
+        """
+        planner = Planner()
+        plan = planner.plan_for(
+            LLAMA_3_3_70B, [SPARK_01], None, "throughput", 16,
+            context_length=FULL_CONTEXT,
+        )
+        assert plan.kind is ParallelismKind.SINGLE_NODE
+        assert plan.node_ids == [SPARK_01.node_id]
+        assert "the fit check will refuse it" in plan.reason
+        # A plan never lists its own shape in its own rejected list.
+        assert not any(r.startswith("single node: illegal") for r in plan.rejected)
+
+    def test_illegal_degrees_are_refused_in_the_planners_own_words(self):
+        """The refusal is byte-identical to the ranking's own rejection line.
+
+        This is what makes "existing vocabulary, not a new one" mechanical
+        rather than a matter of discipline: both come from
+        `legality.tp_rejection`, so they cannot drift apart.
+        """
+        planner = Planner()
+        # Three alike machines, so TP=3 is inside the range the ranking
+        # actually considers and therefore appears in its rejected list.
+        three = list(SPARKS) + [dataclasses.replace(SPARK_01, node_id="spark-03")]
+        recommended = planner.plan(
+            LLAMA_3_3_70B, three, LINK_SPARK_10G, "throughput", 16,
+            context_length=32768,
+        )
+        expected = next(r for r in recommended.rejected if r.startswith("TP=3"))
+
+        with pytest.raises(IllegalDegrees) as caught:
+            planner.plan_for(
+                LLAMA_3_3_70B, three, LINK_SPARK_10G, "throughput", 16,
+                tensor_parallel=3, context_length=32768,
+            )
+        assert [r.message for r in caught.value.refusals] == [expected]
+        assert caught.value.refusals[0].axis == "tensor_parallel"
+
+    def test_a_forced_tensor_plan_never_claims_the_link_is_fast_enough(self):
+        """The measurement is reported honestly even when overruled.
+
+        The planner's argument *for* tensor parallel reads "at or above the
+        threshold". Reusing it for a shape chosen against the threshold would
+        report a measured 10.2 GB/s as being above 40.
+        """
+        plan = Planner().plan_for(
+            LLAMA_3_3_70B, SPARKS[:2], LINK_SPARK_10G, "throughput", 16,
+            tensor_parallel=2, context_length=32768,
+        )
+        assert "at or above" not in plan.reason
+        assert "below the 40 GB/s threshold" in plan.reason
+        assert "asked for rather than chosen" in plan.reason
+
+    def test_the_operators_node_order_is_preserved(self):
+        """The first node is the pipeline head sparkrun SSHes to first."""
+        reversed_nodes = list(reversed(SPARKS[:2]))
+        plan = Planner().plan_for(
+            LLAMA_3_3_70B, reversed_nodes, LINK_SPARK_10G, "throughput", 16,
+            pipeline_parallel=2, context_length=32768,
+        )
+        assert plan.node_ids == [n.node_id for n in reversed_nodes]
+
+    def test_expert_parallel_is_refused_on_a_dense_model(self):
+        with pytest.raises(IllegalDegrees) as caught:
+            Planner().plan_for(
+                LLAMA_3_3_70B, SPARKS[:2], LINK_SPARK_10G, "throughput", 16,
+                expert_parallel=2, data_parallel=2,
+            )
+        assert "no experts to shard" in str(caught.value)
+
+    def test_a_pipeline_stage_must_own_a_layer(self):
+        with pytest.raises(IllegalDegrees) as caught:
+            Planner().plan_for(
+                LLAMA_3_3_70B, SPARKS[:2], LINK_SPARK_10G, "throughput", 16,
+                pipeline_parallel=LLAMA_3_3_70B.num_layers + 1,
+            )
+        assert "must own at least one" in str(caught.value)
+
+    def test_a_degree_below_one_is_refused(self):
+        with pytest.raises(IllegalDegrees) as caught:
+            Planner().plan_for(
+                LLAMA_3_3_70B, SPARKS[:2], LINK_SPARK_10G, "throughput", 16,
+                tensor_parallel=0,
+            )
+        assert "a parallelism degree is at least 1" in str(caught.value)
+
+    def test_world_size_over_the_rank_count_is_left_to_the_fit_gate(self):
+        """Legality is "cannot load", not "does not fit".
+
+        `fit.calculator.check` already refuses an over-wide plan and says how
+        many GPUs are missing. Refusing here too would be a second authority on
+        one fact, with a worse sentence.
+        """
+        plan = Planner().plan_for(
+            LLAMA_3_3_70B, SPARKS[:2], LINK_SPARK_10G, "throughput", 16,
+            tensor_parallel=2, pipeline_parallel=2, context_length=32768,
+        )
+        assert plan.world_size == 4
+
+
+class TestPooling:
+    def test_homogeneous_group_exemplars_are_unchanged(self):
+        """`exemplar` became the weakest member; for alike machines that is a
+        no-op, because `_shape_key` already makes every member tie."""
+        for group in homogeneous_groups(list(SPARKS) + [WS_3090]):
+            assert group.exemplar is group.nodes[0]
+
+    def test_a_pooled_group_binds_on_the_weakest_machine(self):
+        group = pooled_group([SPARK_01, WS_3090])
+        assert group.node_ids == [SPARK_01.node_id, WS_3090.node_id]
+        assert group.exemplar is WS_3090
+
+    def test_the_refusal_and_the_warning_share_one_hazard_sentence(self):
+        groups = homogeneous_groups([SPARK_01, WS_3090])
+        hazard_words = "the slowest node the tail latency for every request"
+        assert hazard_words in exclusion_note(groups[0], groups)
+        assert hazard_words in pooling_note(groups)
+
+    def test_alike_machines_are_never_warned_about(self):
+        """A pool of interchangeable machines is not a hazard. Warning about it
+        would teach people to ignore the warning."""
+        assert pooling_note(homogeneous_groups(SPARKS[:2])) == ""
+
+    def test_a_mixed_group_is_narrowed_by_default_and_pooled_on_request(self):
+        planner = Planner()
+        nodes = [SPARK_01, WS_3090]
+
+        narrowed = planner.plan(
+            LLAMA_3_3_70B, nodes, LINK_SPARK_10G, "throughput", 16,
+            context_length=32768,
+        )
+        assert WS_3090.node_id not in narrowed.node_ids
+        assert "excluded" in narrowed.reason
+
+        pooled = planner.plan(
+            LLAMA_3_3_70B, nodes, LINK_SPARK_10G, "throughput", 16,
+            context_length=32768, allow_mixed_hardware=True,
+        )
+        assert WS_3090.node_id in pooled.node_ids
+        assert "excluded" not in pooled.reason
+        assert "at the operator's instruction" in pooled.reason

@@ -55,6 +55,15 @@ PROCESS_QUERY = "pid,process_name,used_gpu_memory"
 CMDLINE_MAX = 2000
 TELEMETRY_TIMEOUT_S = 2.0
 MEMINFO = Path("/proc/meminfo")
+THERMAL_ZONES = Path("/sys/class/thermal")
+PROC_STAT = Path("/proc/stat")
+# A zone reporting outside this range is handing back a sentinel rather than a
+# temperature. Unpopulated sensors read 0 or -274 on plenty of boards.
+TEMP_MIN_C = 1.0
+TEMP_MAX_C = 150.0
+# How long the first CPU reading waits for something to difference against.
+# /proc/stat is cumulative, so one reading carries no rate at all.
+CPU_FIRST_DELTA_S = 0.12
 
 
 @dataclass(frozen=True)
@@ -210,6 +219,125 @@ def read_unified_memory() -> tuple[int, int] | None:
     return (host.used, host.total) if host else None
 
 
+def read_host_temperature() -> float | None:
+    """The hottest thermal zone in degrees C, or None when there are none.
+
+    Same aggregation rule as the GPU path: a node is one planning unit, so it
+    reports its hottest sensor rather than an average that hides a hot one. A
+    machine exposing no /sys/class/thermal at all returns None, which is
+    reported as unknown -- never as a cold 0, which reads like a measurement.
+    """
+    try:
+        zones = sorted(THERMAL_ZONES.glob("thermal_zone*/temp"))
+    except OSError:
+        return None
+    readings: list[float] = []
+    for zone in zones:
+        try:
+            milli = _num(zone.read_text())
+        except OSError:
+            continue
+        if milli is None:
+            continue
+        celsius = milli / 1000.0
+        if TEMP_MIN_C <= celsius <= TEMP_MAX_C:
+            readings.append(celsius)
+    return max(readings) if readings else None
+
+
+@dataclass(frozen=True)
+class _CpuTimes:
+    """The aggregate cpu line of /proc/stat, split into busy and idle."""
+
+    busy: int
+    total: int
+
+
+def read_cpu_times() -> _CpuTimes | None:
+    try:
+        first = PROC_STAT.read_text().split("\n", 1)[0]
+    except OSError:
+        return None
+    parts = first.split()
+    if len(parts) < 5 or parts[0] != "cpu":
+        return None
+    try:
+        values = [int(cell) for cell in parts[1:]]
+    except ValueError:
+        return None
+    # Fields 3 and 4 are idle and iowait; everything else is the CPU doing
+    # something. iowait counts as idle because the CPU is available.
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    total = sum(values)
+    return _CpuTimes(busy=max(0, total - idle), total=total)
+
+
+_last_cpu_times: _CpuTimes | None = None
+
+
+async def read_cpu_utilization() -> float | None:
+    """Busy percentage of the whole CPU since the previous call.
+
+    /proc/stat is cumulative, so a single reading carries no rate. Every poll
+    after the first differences against the one before it, which at the sample
+    cadence is exactly the window the UI draws. The first call has nothing to
+    difference against and takes its own short delta rather than reporting a
+    fabricated 0%.
+    """
+    global _last_cpu_times
+    current = read_cpu_times()
+    if current is None:
+        return None
+    previous = _last_cpu_times
+    _last_cpu_times = current
+    if previous is None or current.total <= previous.total:
+        # Nothing to difference against: either the first call ever, or one
+        # soon enough after the last that the counters have not ticked. Take a
+        # short delta of our own rather than reporting a fabricated 0%.
+        await asyncio.sleep(CPU_FIRST_DELTA_S)
+        previous, current = current, read_cpu_times()
+        if current is None:
+            return None
+        _last_cpu_times = current
+    span = current.total - previous.total
+    if span <= 0:
+        return None
+    busy = current.busy - previous.busy
+    return max(0.0, min(100.0, busy / span * 100.0))
+
+
+async def read_host_sample(ts: float) -> TelemetrySample | None:
+    """A sample for a machine with no GPU at all.
+
+    Every figure here is a host fact -- /proc/meminfo, /sys/class/thermal,
+    /proc/stat -- so it works on any Linux box, a Raspberry Pi included. It is
+    built only for a node the probe found no GPU on, and that is also a node
+    the planner will not place work on: this makes such a node legible in the
+    roster, it does not make it eligible. ``addressable_memory`` stays 0 on the
+    profile, so every fit against it still refuses.
+
+    ``power_watts`` stays 0.0: a board with no GPU has no GPU power draw to
+    read and there is no portable host equivalent. The gateway renders it as
+    unknown rather than as zero watts.
+    """
+    host = read_host_memory()
+    temperature = read_host_temperature()
+    utilization = await read_cpu_utilization()
+    if host is None and temperature is None and utilization is None:
+        return None
+    return TelemetrySample(
+        ts=ts,
+        memory_used=host.used if host else 0,
+        memory_total=host.total if host else 0,
+        power_watts=0.0,
+        temperature_c=temperature or 0.0,
+        utilization_pct=utilization or 0.0,
+        host_memory_total=host.total if host else 0,
+        host_memory_available=host.available if host else 0,
+        swap_used=host.swap_used if host else 0,
+    )
+
+
 async def read_compute_apps(
     rows: list[list[str]] | None = None,
 ) -> tuple[int, int] | None:
@@ -327,6 +455,14 @@ async def read_telemetry(
     if rows is None:
         rows = await run_nvidia_smi_async(TELEMETRY_QUERY)
     if not rows:
+        # A machine with no GPU at all is a different thing from a GPU node
+        # whose nvidia-smi timed out. The first has host facts worth reporting
+        # and would otherwise sit in the roster at a permanent 0W/0C/0%, which
+        # reads as broken telemetry rather than as absent hardware. The second
+        # must keep its last sample: host RAM appearing where VRAM belongs
+        # would be a wrong number, which is worse than a stale one.
+        if profile.gpu_count == 0:
+            return await read_host_sample(ts)
         return None
 
     used_mib: list[float] = []

@@ -36,6 +36,28 @@ needs neither a browser nor a cluster:
 node src/tabs/cluster/layout.check.mjs   # assertions, plus layout-preview.svg
 ```
 
+The history adapters have their own verifier, for a different reason: one route
+answers with raw per-second columns under six hours and bucket aggregates
+beyond, and reading the wrong shape yields an empty chart rather than an error.
+Typecheck cannot catch it — every column is optional precisely so both shapes
+fit one type. It runs against real payloads captured from a live coordinator,
+because a fixture written from the same reading of the schema that produced the
+bug agrees with the bug:
+
+```bash
+# from the ui root, with a coordinator reachable and a node that has samples
+C=http://localhost:8088 N=spark-01 FX=/tmp/derate-history-fx
+mkdir -p $FX
+curl -s "$C/api/history/nodes?node_id=$N&from=-5m"    > $FX/nodes-raw.json
+curl -s "$C/api/history/nodes?node_id=$N&from=-24h"   > $FX/nodes-1m.json
+curl -s "$C/api/history/requests?from=-6h&limit=500"  > $FX/requests-raw.json
+curl -s "$C/api/history/requests?from=-7d&limit=500"  > $FX/requests-1m.json
+HISTORY_FIXTURES=$FX node src/state/history.check.mjs
+```
+
+It asserts the fixtures really are the two shapes it thinks they are, so a
+schema change fails the check rather than quietly passing it.
+
 ## Layout
 
 ```
@@ -47,7 +69,8 @@ src/components/ Readout, Lamp, Bars, Panel, Verbatim
 src/shell/      header, app shell, the one sheet
 src/sidebar/    roster, plan, routing, cost
 src/tabs/       dashboard, cluster, spend, settings
-src/inspectors/ node and deployment detail, hosted by the sheet
+src/inspectors/ deployment detail, and node/ — the node page: charts, what
+                it serves, requests that ran on it, its links, events and logs
 ```
 
 ## Things that look like details and are not

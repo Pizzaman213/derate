@@ -567,6 +567,43 @@ svg text.m {
   max-height: 88vh;
   overflow-y: auto;
 }
+/* The node page. Wider than `.wide` because it carries two columns of its own
+   and a chart grid inside the left one; a 700px card puts those charts at
+   ~330px each, which is narrower than the deployments strip's spark cell. */
+.card.full {
+  width: 1180px;
+  max-width: 96vw;
+  max-height: 92vh;
+  overflow-y: auto;
+}
+/* The node page's two columns: what the machine IS on the left, what it is
+   DOING on the right. Slightly uneven because the left column holds the chart
+   grid and the right holds rows and tables, which read fine narrower. */
+.nodegrid {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr;
+  gap: var(--s-5);
+  align-items: start;
+}
+/* Same breakpoint as .chartgrid, and for the same reason: below it two charts
+   side by side are too narrow to read a trace in. */
+@media (max-width: 900px) {
+  .nodegrid {
+    grid-template-columns: 1fr;
+  }
+}
+/* The sheet header stays put while the page scrolls under it -- the window
+   chips are the control that changes what every chart below is showing, and a
+   control you have to scroll back up to reach reads as a one-time choice. */
+.nodehead {
+  position: sticky;
+  top: -20px;
+  z-index: 1;
+  background: var(--panel-raised);
+  margin: -20px -20px 0;
+  padding: 20px 20px 10px;
+  border-bottom: 1px solid var(--rule);
+}
 .sub {
   font-size: var(--size-micro);
   font-weight: 500;

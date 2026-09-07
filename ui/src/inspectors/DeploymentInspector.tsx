@@ -7,14 +7,8 @@ import { Lamp } from '../components/Lamp'
 import { ProportionBar } from '../components/Bars'
 import { Verbatim, VerbatimList } from '../components/Verbatim'
 import { nodeLive } from '../state/live'
-import { fmt, pct, planShortFromDegrees, relativeTime } from '../format'
-
-/** `fmt` plus its unit, dropped together -- a missing reading must not
- *  render as an em dash still wearing a unit it was never measured in. */
-function fmtUnit(v: number | null | undefined, decimals: number, unit: string): string {
-  const s = fmt(v, decimals)
-  return s === '—' ? s : `${s} ${unit}`
-}
+import { fromState, nameIndex } from '../state/names'
+import { fmt, fmtUnit, pct, planShortFromDegrees, relativeTime } from '../format'
 
 interface Props {
   dep: DeploymentDTO
@@ -52,6 +46,10 @@ function deriveLocalCost(
  *  physics derivation of them -- never mockups-next/js/routing.js's
  *  client-computed `curW()` or its flat 0.55/cost fixtures. */
 export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, onClose }: Props) {
+  // Same naming rule as the graph and the roster: a machine is called what the
+  // operator called it, everywhere, or this sheet's node list stops matching
+  // the plates it is describing.
+  const name = nameIndex(nodes.map(fromState))
   const depFrame = frame?.deployments.find((d) => d.deployment_id === dep.deployment_id)
   const targets = cfg?.targets ?? []
   const localTarget = targets.find((t) => t.kind === 'local') ?? null
@@ -209,7 +207,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
       </div>
       <div className="row">
         <span>Nodes</span>
-        <span className="mono">{dep.node_ids.join(', ') || '—'}</span>
+        <span className="mono">{dep.node_ids.map(name).join(', ') || '—'}</span>
       </div>
       <div className="row">
         <span>Measured all-reduce</span>
@@ -241,7 +239,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
           return (
             <div key={nodeId} className="slot">
               <span className="mono unit" style={{ width: 84 }}>
-                {nodeId}
+                {name(nodeId)}
               </span>
               <ProportionBar
                 value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}

@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { useCluster, useRouting, useTopology } from '../state/resources'
 import { useMetrics } from '../state/metrics'
-import { useTelemetry } from '../state/useTelemetry'
+import { useTelemetrySeries } from '../state/telemetry'
 import { useSelection } from '../state/selection'
 import { PlannerBar } from './dashboard/PlannerBar'
 import { AggregateRow } from './dashboard/AggregateRow'
@@ -25,10 +25,11 @@ const SUBS: { id: Sub; label: string }[] = [
  *  `.bararea` + `#verdict`) above three sub-tabs (`.subs`) -- what is running,
  *  what it is doing right now, and who it is doing it for.
  *
- *  Ported from mockups-next/js/dashboard.js + planner.js. `useTelemetry` is
- *  called exactly once, here, because this is the only destination that draws
- *  accumulated history; the live SSE subscription itself is hoisted once
- *  higher, in MetricsProvider, and shared with the header's stream lamp. */
+ *  Ported from mockups-next/js/dashboard.js + planner.js. The accumulated
+ *  60-second window used to be built here and drilled down from here, which
+ *  made it reachable only from this destination; it now sits beside the SSE
+ *  subscription in TelemetryProvider, because the node sheet draws it too and
+ *  is not inside this tab. */
 export function DashboardTab() {
   const [sub, setSub] = useState<Sub>('overview')
   const cluster = useCluster()
@@ -37,13 +38,7 @@ export function DashboardTab() {
   const { frame } = useMetrics()
   const selection = useSelection()
 
-  const servedNameById = useMemo(() => {
-    const m = new Map<string, string>()
-    for (const d of cluster.data?.deployments ?? []) m.set(d.deployment_id, d.served_name)
-    return m
-  }, [cluster.data])
-
-  const telemetry = useTelemetry(frame, (id) => servedNameById.get(id))
+  const telemetry = useTelemetrySeries()
 
   return (
     <div style={{ display: 'grid', gap: 'var(--s-4)' }}>

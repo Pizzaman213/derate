@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PlanResponse } from '../../api/types'
-import { CURATED_MODELS } from '../../api/catalog'
 import { useBackend } from '../../state/backend'
+import { useCatalog } from '../../state/resources'
 import { Verdict } from './Verdict'
 
 const CUSTOM = '__custom__'
@@ -19,13 +19,22 @@ const CUSTOM = '__custom__'
  *  planner's call, not a field a person fills in. */
 export function PlannerBar() {
   const { backend, invalidate } = useBackend()
+  // `GET /api/catalog`, not a copy of it. The same list used to live in
+  // `ui/src/api/catalog.ts` as well, byte for byte, which is exactly the drift
+  // moving it server-side was meant to end -- the Models tab read the wire while
+  // this read the copy, so the two pickers could disagree about what exists.
+  const catalog = useCatalog()
+  const models = catalog.data ?? []
 
-  const first = CURATED_MODELS[0]!
-  const [curatedId, setCuratedId] = useState(first.model_id)
+  const [curatedId, setCuratedId] = useState('')
   const [isCustom, setIsCustom] = useState(false)
   const [custom, setCustom] = useState('')
-  const [context, setContext] = useState(first.default_context)
-  const [concurrency, setConcurrency] = useState(first.default_concurrency)
+  // 8192/1 until the catalogue lands and its first entry says otherwise. It is
+  // also what `GET /api/capacity` and the client's own fallback use, so a
+  // verdict here and a verdict on the Models tab are answering the same
+  // question.
+  const [context, setContext] = useState(8192)
+  const [concurrency, setConcurrency] = useState(1)
   const [target, setTarget] = useState<'throughput' | 'latency'>('throughput')
   const [runtime, setRuntime] = useState<'vllm' | 'sglang'>('vllm')
 
@@ -40,6 +49,20 @@ export function PlannerBar() {
   const [override, setOverride] = useState(false)
 
   const seq = useRef(0)
+  const adopted = useRef(false)
+
+  // The catalogue is fetched, so the first selection cannot be made at mount.
+  // Adopt it once, and only while nothing has been chosen: doing it on every
+  // catalogue poll would yank the field out from under whoever is using it.
+  useEffect(() => {
+    if (adopted.current || isCustom || curatedId) return
+    const firstModel = models[0]
+    if (!firstModel) return
+    adopted.current = true
+    setCuratedId(firstModel.model_id)
+    setContext(firstModel.default_context)
+    setConcurrency(firstModel.default_concurrency)
+  }, [models, curatedId, isCustom])
 
   // Re-plan on any change, debounced. The dry run is cheap and starts
   // nothing, so making someone press a button to see the consequence of a
@@ -116,14 +139,16 @@ export function PlannerBar() {
               }
               setIsCustom(false)
               setCuratedId(v)
-              const m = CURATED_MODELS.find((x) => x.model_id === v)
+              const m = models.find((x) => x.model_id === v)
               if (m) {
                 setContext(m.default_context)
                 setConcurrency(m.default_concurrency)
               }
             }}
           >
-            {CURATED_MODELS.map((m) => (
+            {/* Empty until the catalogue lands. A hardcoded placeholder here
+                would be a fifth copy of the list. */}
+            {models.map((m) => (
               <option key={m.model_id} value={m.model_id}>
                 {m.label}
               </option>
@@ -206,7 +231,11 @@ export function PlannerBar() {
           onOverride={setOverride}
         />
       ) : !modelId ? (
-        <p className="unit" style={{ margin: '13px 0 0' }}>Enter a HuggingFace ID to plan a model.</p>
+        <p className="unit" style={{ margin: '13px 0 0' }}>
+          {catalog.loading && !models.length
+            ? 'Loading the model list…'
+            : 'Enter a HuggingFace ID to plan a model.'}
+        </p>
       ) : error ? (
         <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: '13px 0 0' }}>{error}</p>
       ) : (

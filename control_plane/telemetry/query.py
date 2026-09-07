@@ -261,6 +261,7 @@ def events(
     type: str = "",
     deployment_id: str = "",
     source: str = "",
+    node_id: str = "",
     from_ts: Any = None,
     to_ts: Any = None,
     limit: int = 500,
@@ -268,10 +269,15 @@ def events(
     frm, to = resolve_window(from_ts, to_ts)
     limit = max(1, min(int(limit), config.QUERY_MAX_ROWS))
     filters, args = "", []
+    # ``node_id`` is stored and selected already; it simply had no filter, so
+    # asking "what happened on this machine" meant pulling the whole cluster's
+    # events and discarding most of them in the caller. ``logs`` has filtered
+    # on it since it shipped -- this is the same clause.
     for column, value in (
         ("type", type),
         ("deployment_id", deployment_id),
         ("source", source),
+        ("node_id", node_id),
     ):
         if value:
             filters += f" AND {column} = ?"
@@ -283,7 +289,7 @@ def events(
             + " ORDER BY ts DESC LIMIT ?",
             (frm, to, *args, limit),
         ).fetchall()
-    out = _envelope(archive, RAW, frm, to)
+    out = _envelope(archive, RAW, frm, to, node_id)
     out["events"] = [_expand(dict(r)) for r in rows]
     out["truncated"] = len(rows) >= limit
     return out

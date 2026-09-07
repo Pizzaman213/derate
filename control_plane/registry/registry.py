@@ -53,6 +53,7 @@ from .reach import (
     dial,
     self_leg,
     summarize,
+    unknown_leg,
 )
 from .roster import load_roster, save_roster
 from .serde import memory_used_pct, profile_from_dict, profile_to_dict, state_to_dict
@@ -634,20 +635,25 @@ class Registry:
                 {"X-Derate-Token": self.cluster_token()},
             )
         except Exception as exc:
-            return ReachLeg(
-                source=COORDINATOR,
-                target=source,
-                url=source_url,
-                ok=False,
-                error=(
-                    f"Could not ask {source} to dial {target}: {exc}. "
-                    f"Whether {source} can reach {target} is still unknown."
+            # NOT a failed source -> target leg, and not a coordinator ->
+            # source one either: reporting it as the latter would put two legs
+            # with the same direction and opposite verdicts in one report,
+            # since the coordinator's own probe of `source` is already there.
+            return unknown_leg(
+                source,
+                target,
+                url,
+                why=(
+                    f"{source} could not be asked to dial {target}, so this "
+                    "direction was never tested."
                 ),
+                error=str(exc),
             )
         if not isinstance(payload, dict):
-            return ReachLeg(
-                source=source, target=target, url=url, ok=False,
-                error=f"{source} answered with something that was not a probe result.",
+            return unknown_leg(
+                source, target, url,
+                why=f"{source} answered with something that was not a probe result.",
+                error="unreadable probe result",
             )
         answered = payload.get("answered_as")
         return ReachLeg(
@@ -676,45 +682,61 @@ class Registry:
             if node_id not in self._members:
                 raise NodeNotFound(f"no member {node_id!r}")
 
-        legs: list[ReachLeg] = []
-        for node_id in (a, b):
+        # Every leg is an independent HTTP call, so they all go out at once.
+        # Run in sequence the worst case is four timeouts end to end -- about
+        # eighteen seconds under a button somebody is watching -- for an answer
+        # no leg needs any other leg to produce.
+        async def endpoint_leg(node_id: str, other: str) -> ReachLeg:
             url = self._agent_urls.get(node_id, "")
+            # This probe doubles as one of the pair's own directions exactly
+            # when the coordinator IS the machine at the other end. Between two
+            # workers it is a prerequisite and nothing more: reaching both of
+            # them from here says nothing about whether they can reach each
+            # other, and counting it as if it did would print "reachable both
+            # ways" over two directions nobody tested.
+            pair = other == self.local_node_id
             if node_id == self.local_node_id:
-                legs.append(self_leg(node_id, url))
-            elif not url:
-                legs.append(
-                    ReachLeg(
-                        source=COORDINATOR, target=node_id, url="", ok=False,
-                        error=f"No agent address on file for {node_id}.",
-                    )
+                return self_leg(node_id, url)
+            if not url:
+                return ReachLeg(
+                    source=COORDINATOR, target=node_id, url="", ok=False,
+                    error=f"No agent address on file for {node_id}.",
+                    pair=pair,
                 )
-            else:
-                legs.append(
-                    await dial(
-                        self._client.get_json,
-                        COORDINATOR,
-                        node_id,
-                        url,
-                        REACH_TIMEOUT_S,
-                    )
-                )
+            return await dial(
+                self._client.get_json,
+                COORDINATOR,
+                node_id,
+                url,
+                REACH_TIMEOUT_S,
+                pair=pair,
+            )
 
-        # The node-to-node legs, skipping any whose source is this process --
-        # the coordinator's own leg above already IS that dial, and running it
-        # twice would report the same probe as two independent findings.
-        for source, target in ((a, b), (b, a)):
-            if source == self.local_node_id or source == target:
-                continue
+        async def node_to_node_leg(source: str, target: str) -> ReachLeg:
             url = self._agent_urls.get(target, "")
             if not url:
-                legs.append(
-                    ReachLeg(
-                        source=source, target=target, url="", ok=False,
-                        error=f"No agent address on file for {target}.",
-                    )
+                # We have no address to hand the far node, so this direction is
+                # untested rather than broken. The coordinator's own leg
+                # already reports the missing address as the fault it is.
+                return unknown_leg(
+                    source, target, "",
+                    why=f"No agent address on file for {target} to hand {source}.",
+                    error="no address on file",
                 )
-                continue
-            legs.append(await self._peer_leg(source, target, url))
+            return await self._peer_leg(source, target, url)
+
+        # A node-to-node leg whose source is this process is skipped: the
+        # coordinator's own probe of the target already IS that dial, and
+        # running it twice would report one probe as two findings.
+        planned = [endpoint_leg(a, b), endpoint_leg(b, a)]
+        planned += [
+            node_to_node_leg(source, target)
+            for source, target in ((a, b), (b, a))
+            if source != self.local_node_id and source != target
+        ]
+        # gather preserves order, so the endpoint legs stay ahead of the
+        # node-to-node ones and the report reads the way it is built.
+        legs: list[ReachLeg] = list(await asyncio.gather(*planned))
 
         ok, sentence = summarize(legs)
         return {

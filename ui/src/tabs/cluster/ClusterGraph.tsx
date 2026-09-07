@@ -19,6 +19,7 @@ import { useMetrics } from '../../state/metrics'
 import { nodeLive, nodeSignal } from '../../state/live'
 import { PROPORTIONAL } from '../../state/policy'
 import { fmt, gbytes, pct, shortGpu } from '../../format'
+import { nodeName, nodeSubtitle } from '../../state/names'
 import {
   layoutCluster,
   moveToSlot,
@@ -202,6 +203,12 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
   const [dropSlot, setDropSlot] = useState<number | null>(null)
   const [dragging, setDragging] = useState<string | null>(null)
 
+  // The plates are captioned by name, so the announcements have to be too --
+  // a screen reader saying "spark-02 moved" about a plate reading "Rack 2" is
+  // the same ambiguity this feature exists to remove, just in another channel.
+  const name = (nodeId: string) =>
+    nodeName(topology.nodes.find((n) => n.node_id === nodeId), nodeId)
+
   const commitOrder = (nodeId: string, slot: number, spoken: string) => {
     const next = moveToSlot(layout.arrangement, nodeId, slot)
     if (next !== layout.arrangement) {
@@ -305,7 +312,7 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
         setDropSlot(null)
         if (cd.moved && slot != null) {
           lastPress.current = null
-          commitOrder(cd.nodeId, slot, `${cd.nodeId} moved to position ${slot + 1}.`)
+          commitOrder(cd.nodeId, slot, `${name(cd.nodeId)} moved to position ${slot + 1}.`)
         } else if (!cd.moved) {
           const at = performance.now()
           const prev = lastPress.current
@@ -346,7 +353,11 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
           const delta =
             e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : e.key === 'ArrowUp' ? -cols : cols
           const to = Math.max(0, Math.min(layout.arrangement.length - 1, at + delta))
-          commitOrder(focused, to, `${focused} moved to position ${to + 1} of ${layout.arrangement.length}.`)
+          commitOrder(
+            focused,
+            to,
+            `${name(focused)} moved to position ${to + 1} of ${layout.arrangement.length}.`,
+          )
           return
         }
       }
@@ -820,6 +831,7 @@ function PlateLayer({
             frame={frame}
             stale={stale}
             dragging={dragging === card.nodeId}
+            subline={layout.subline}
             share={share(routing, card.nodeId)}
             servedNames={servedOn(deployments, card.nodeId)}
             onSelect={onSelect}
@@ -863,6 +875,7 @@ function MachinePlate({
   frame,
   stale,
   dragging,
+  subline,
   share: shareOf,
   servedNames,
   onSelect,
@@ -874,6 +887,10 @@ function MachinePlate({
   frame: ReturnType<typeof useMetrics>['frame']
   stale: boolean
   dragging: boolean
+  /** Authored units reserved on every full-tier plate for the identity line.
+   *  Reserved floor-wide (see layout.SUBLINE_H), so a plate with nothing to
+   *  put there still shifts its rows down and stays aligned with its row. */
+  subline: number
   share: { served_name: string; weight: number } | null
   servedNames: string[]
   onSelect: (id: string) => void
@@ -892,14 +909,29 @@ function MachinePlate({
   // addressable memory is zero. Both are "no reading", never a live-looking 0.
   const rawMem = live?.memory_used_pct ?? topo?.memory_used_pct ?? null
   const mem = typeof rawMem === 'number' && Number.isFinite(rawMem) ? Math.max(0, Math.min(100, rawMem)) : null
-  const hostname = topo?.hostname || card.nodeId
+  // What to call it, and what the name is hiding. `hostname` is deliberately
+  // NOT the name: a worker in a --network host container reports the host's
+  // hostname, so naming plates that way draws two machines with one name (see
+  // state/names.ts). The id everything else keys by goes underneath.
+  const name = nodeName(topo ?? { node_id: card.nodeId }, card.nodeId)
+  const identity = nodeSubtitle(topo ?? { node_id: card.nodeId }, topo?.hostname)
+  // Only the tier the floor reserved room on can draw it; on the others the
+  // tooltip and the node sheet carry it.
+  const showsIdentity = card.bodyTier === 'full' && subline > 0 && identity !== ''
+  const dy = card.bodyTier === 'full' ? subline : 0
   const occupant = servedNames.length
     ? `${servedNames[0]}${servedNames.length > 1 ? ` +${servedNames.length - 1}` : ''}`
     : 'free'
 
   const tier = card.bodyTier
   const trackW = card.w - 22
-  const label = `${hostname}, ${topo?.role ?? 'machine'}, ${topo?.state ?? 'unknown'}, memory ${pct(mem)} percent, position ${card.slot + 1}`
+  // The tooltip and the screen reader always get the full identity, at every
+  // tier, whether or not the plate had room to draw it.
+  const label =
+    `${name}${identity ? ` (${identity})` : ''}` +
+    `${topo?.hostname && topo.hostname !== identity && topo.hostname !== name ? `, host ${topo.hostname}` : ''}` +
+    `, ${topo?.role ?? 'machine'}, ${topo?.state ?? 'unknown'}` +
+    `, memory ${pct(mem)} percent, position ${card.slot + 1}`
 
   // No onClick/onDoubleClick here: pointer capture on the SVG retargets both
   // to it (see DOUBLE_MS), so a press on a plate is resolved in the pointer
@@ -956,8 +988,13 @@ function MachinePlate({
       />
 
       <text x={card.x + 11} y={card.y + 15} className="m" fontSize={9} fill="var(--on-fill)">
-        {hostname}
+        {name}
       </text>
+      {showsIdentity ? (
+        <text x={card.x + 11} y={card.y + 26} className="m" fontSize={8} fill="var(--on-fill-dim)">
+          {identity}
+        </text>
+      ) : null}
       <text
         x={card.x + card.w - 11}
         y={card.y + 15}
@@ -976,7 +1013,7 @@ function MachinePlate({
       {mem == null ? (
         <rect
           x={card.x + 11}
-          y={card.y + 21}
+          y={card.y + 21 + dy}
           width={trackW}
           height={14}
           rx={2}
@@ -988,10 +1025,10 @@ function MachinePlate({
         />
       ) : (
         <>
-          <rect x={card.x + 11} y={card.y + 21} width={trackW} height={14} rx={2} fill="var(--on-fill)" opacity={0.18} />
+          <rect x={card.x + 11} y={card.y + 21 + dy} width={trackW} height={14} rx={2} fill="var(--on-fill)" opacity={0.18} />
           <rect
             x={card.x + 11}
-            y={card.y + 21}
+            y={card.y + 21 + dy}
             width={(trackW * mem) / 100}
             height={14}
             rx={2}
@@ -1002,20 +1039,20 @@ function MachinePlate({
       )}
 
       {tier !== 'chip' ? (
-        <text x={card.x + 11} y={card.y + 47} className="m" fontSize={9} fill="var(--on-fill-dim)">
+        <text x={card.x + 11} y={card.y + 47 + dy} className="m" fontSize={9} fill="var(--on-fill-dim)">
           {`${fmt(live?.power_w ?? topo?.power_w, 0)} W · ${fmt(live?.temp_c ?? topo?.temp_c, 0)} °C`}
         </text>
       ) : null}
 
       {tier === 'full' ? (
         <>
-          <text x={card.x + 11} y={card.y + 61} className="m" fontSize={9} fill="var(--on-fill-dim)">
+          <text x={card.x + 11} y={card.y + 61 + dy} className="m" fontSize={9} fill="var(--on-fill-dim)">
             {`GPU ${fmt(live?.util_pct ?? topo?.util_pct, 0)}% · ${pct(mem)}% memory`}
           </text>
           {shareOf ? (
-            <ShareBar card={card} trackW={trackW} share={shareOf} />
+            <ShareBar card={card} trackW={trackW} dy={dy} share={shareOf} />
           ) : (
-            <text x={card.x + 11} y={card.y + 74} className="m" fontSize={9} fill="var(--on-fill-dim)">
+            <text x={card.x + 11} y={card.y + 74 + dy} className="m" fontSize={9} fill="var(--on-fill-dim)">
               {[shortGpu(topo?.gpu_name ?? '') || topo?.device_class, topo?.total_memory ? `${gbytes(topo.total_memory, 0)} GiB` : '']
                 .filter(Boolean)
                 .join(' · ')}
@@ -1033,10 +1070,13 @@ function MachinePlate({
 function ShareBar({
   card,
   trackW,
+  dy,
   share: shareOf,
 }: {
   card: PlacedCard
   trackW: number
+  /** The plate's identity-line shift, so this rides with the rows above it. */
+  dy: number
   share: { served_name: string; weight: number }
 }) {
   const w = trackW - 30
@@ -1044,11 +1084,11 @@ function ShareBar({
   return (
     <g>
       <title>{`${shareOf.served_name}: ${pct(shareOf.weight * 100)} percent of traffic`}</title>
-      <rect x={card.x + 11} y={card.y + 68} width={w} height={6} rx={2} fill="var(--on-fill)" opacity={0.18} />
-      <rect x={card.x + 11} y={card.y + 68} width={w * clamped} height={6} rx={2} fill="var(--on-fill)" opacity={0.85} />
+      <rect x={card.x + 11} y={card.y + 68 + dy} width={w} height={6} rx={2} fill="var(--on-fill)" opacity={0.18} />
+      <rect x={card.x + 11} y={card.y + 68 + dy} width={w * clamped} height={6} rx={2} fill="var(--on-fill)" opacity={0.85} />
       <text
         x={card.x + card.w - 11}
-        y={card.y + 74}
+        y={card.y + 74 + dy}
         textAnchor="end"
         className="m"
         fontSize={9}

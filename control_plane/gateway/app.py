@@ -26,6 +26,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import capacity_api, enroll_api, internal_api, openai_api, ui_api
@@ -352,6 +353,29 @@ def create_app(
         openapi_url="/api/openapi.json",
     )
     app.state.ctx = ctx
+
+    # Only when an origin was named. Absent (the default), not one header
+    # changes and same-origin -- the deployed shape -- is untouched.
+    if settings.allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.allowed_origins),
+            allow_methods=["*"],
+            allow_headers=["*"],
+            # Without this the header is invisible to the page that asked for
+            # it: a cross-origin fetch may only read a handful of headers by
+            # default, and the request id is how the UI names the row that
+            # recorded a refusal.
+            expose_headers=["X-Request-Id"],
+            # Deliberately off. Nothing here is cookie-authenticated, and
+            # allow_credentials forbids the "*" an operator may reasonably use
+            # on a lab network.
+            allow_credentials=False,
+        )
+        log.info(
+            "CORS enabled for %s", ", ".join(settings.allowed_origins)
+        )
+
     app.include_router(openai_api.create_router(ctx))
     app.include_router(internal_api.create_router(ctx))
     # Above the StaticFiles mount below, and it must stay there: a Starlette

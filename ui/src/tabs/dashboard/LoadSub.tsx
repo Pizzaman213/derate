@@ -1,4 +1,5 @@
 import type { NodeStateDTO, RoutingConfig } from '../../api/types'
+import { fromState, nodeName } from '../../state/names'
 
 interface Props {
   routing: RoutingConfig[]
@@ -86,7 +87,7 @@ export function LoadSub({ routing, nodes }: Props) {
           <tbody>
             {rows.map((r) => (
               <tr key={r.node.profile.node_id}>
-                <td className="mono">{r.node.profile.hostname}</td>
+                <td className="mono">{nodeName(fromState(r.node))}</td>
                 {cols.map((c) => {
                   const cell = r.cells.get(c.key)
                   return cell ? (

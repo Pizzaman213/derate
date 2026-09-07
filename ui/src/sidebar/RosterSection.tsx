@@ -2,6 +2,7 @@ import { useCluster, useTopology } from '../state/resources'
 import { useMetrics } from '../state/metrics'
 import { useSelection } from '../state/selection'
 import { nodeLive, nodeSignal } from '../state/live'
+import { fromState, nodeName } from '../state/names'
 import { Lamp } from '../components/Lamp'
 import { Readout } from '../components/Readout'
 import { ProportionBar } from '../components/Bars'
@@ -69,7 +70,7 @@ export function RosterSection() {
                     color: ineligible ? 'var(--ink-muted)' : undefined,
                   }}
                 >
-                  {n.profile.hostname}
+                  {nodeName(fromState(n))}
                 </span>
                 <span className="mono unit" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <Lamp
