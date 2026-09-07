@@ -60,6 +60,10 @@ for (const [path, dest] of [
   ['/chat', 'chat'],
   ['/spend', 'spend'],
   ['/settings', 'settings'],
+  // Not in the header's nav, and still a destination like any other. The
+  // first-run screen has to survive being reloaded and typed, so it has to
+  // round trip through the scheme like the rest.
+  ['/setup', 'setup'],
 ]) {
   check(`${path} -> ${dest}`, parse(path).dest, dest)
   check(`${path} round trips`, href(parse(path)), path)
@@ -68,6 +72,15 @@ for (const [path, dest] of [
 // ── Model ids, which are the only ids with a slash in them ───────────────────
 
 const HF = 'meta-llama/Llama-3.1-8B-Instruct'
+
+// Setup has no subject of its own, so a model id does not follow it there --
+// same rule as every other destination that is not /models.
+//
+// A `?node=` selection DOES survive, and that is deliberate rather than an
+// oversight worth asserting away: the scheme's own comment says a selection is
+// not owned by a destination, and the setup screen simply reads no selection.
+// Pinning the opposite here would invent a rule the scheme does not have.
+check('setup drops a model', href({ ...parse('/models'), dest: 'setup', model: HF }), '/setup')
 check('hub id is the whole tail', parse(`/models/${HF}`).model, HF)
 check('hub id round trips', href(parse(`/models/${HF}`)), `/models/${HF}`)
 check('single-segment id', parse('/models/qwen3-30b-a3b').model, 'qwen3-30b-a3b')

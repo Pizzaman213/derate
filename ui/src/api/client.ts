@@ -46,6 +46,7 @@ import type {
   NodeProcessList,
   KillResult,
   StorageReport,
+  SetupStatus,
   CacheClearResult,
   ModelDeleteResult,
   TelemetryEstate,
@@ -75,6 +76,12 @@ export interface Backend {
   candidates(): Promise<Candidate[]>
   routing(): Promise<RoutingConfig[]>
   providers(): Promise<Provider[]>
+  /** `GET /api/setup`: has anyone set this cluster up, and what machine is it
+   *  running on. The first call a fresh install makes. */
+  setup(): Promise<SetupStatus>
+  /** Records that the wizard was finished, so it is not offered again --
+   *  including when the person chose to add nothing, which is still an answer. */
+  completeSetup(): Promise<void>
   /** `GET /v1/models`: every model the gateway will accept as `model`, local
    *  deployments and remote providers alike. */
   models(): Promise<ServedModel[]>
@@ -476,6 +483,21 @@ export const httpBackend: Backend = {
   candidates: () => req<Candidate[]>('/api/nodes/candidates'),
   routing: () => req<RoutingConfig[]>('/api/routing'),
   providers: () => req<Provider[]>('/api/providers'),
+  async setup(): Promise<SetupStatus> {
+    const wire = await req<Omit<SetupStatus, 'machine'> & { machine: NodeWire | null }>(
+      '/api/setup',
+    )
+    return {
+      ...wire,
+      // Through `toNodeState` rather than used raw: the setup screen shows the
+      // same hardware the cluster graph does, and a second mapping written here
+      // would agree with any bug that came from the same reading of the schema.
+      // The coordinator argument is the machine itself -- the server only names
+      // one it could identify, so if there is a row here, this is that machine.
+      machine: wire.machine ? toNodeState(wire.machine, wire.machine.node_id) : null,
+    }
+  },
+  completeSetup: () => req<void>('/api/setup/complete', { method: 'POST' }),
   async models(): Promise<ServedModel[]> {
     const wire = await req<ModelsWire>('/v1/models')
     return (wire.data ?? []).map((m) => ({

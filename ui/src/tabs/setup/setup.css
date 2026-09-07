@@ -1,0 +1,203 @@
+/* First run. A separate stylesheet rather than more of derate.css, which four
+   sessions edit at once -- and because this screen is the one place in the
+   product with no header, no sidebar and no roster, so almost nothing in the
+   shared sheet applies to it anyway.
+
+   Every colour is a token. The screen inherits both themes for free, and the
+   one deliberate exception is called out where it happens (.setup-qr). */
+
+.setup {
+  min-height: 100vh;
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.setup-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-4) var(--s-5);
+  border-bottom: 1px solid var(--rule);
+}
+.setup-wordmark { font-weight: 500; font-size: 18px; letter-spacing: -0.3px; }
+.setup-where { margin-left: auto; }
+
+.setup-main { max-width: 660px; margin: 0 auto; padding: var(--s-7) var(--s-5) 96px; }
+
+/* The ledger: what is true so far, and a way back into any of it. */
+.setup-ledger {
+  border-left: 2px solid var(--rule);
+  padding-left: var(--s-4);
+  margin-bottom: var(--s-6);
+}
+.setup-ledger:empty { display: none; }
+.setup-done {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  padding: var(--s-2) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.setup-done:last-child { border-bottom: 0; }
+.setup-tick { color: var(--live); flex: 0 0 auto; }
+.setup-what { flex: 1; }
+.setup-detail { color: var(--ink-muted); font-size: var(--size-unit); }
+
+.setup h1 {
+  font-size: 26px;
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: -0.2px;
+  margin: 0 0 var(--s-3);
+  text-wrap: balance;
+}
+.setup-lede { margin: 0 0 var(--s-5); max-width: 52ch; }
+.setup-step { animation: setup-rise var(--dur) var(--ease, cubic-bezier(0.2, 0.7, 0.3, 1)) both; }
+@keyframes setup-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) { .setup-step { animation: none; } }
+
+/* The machine plate. */
+.setup-plate {
+  background: var(--fill);
+  color: var(--on-fill);
+  border-radius: var(--radius-lg);
+  padding: var(--s-5);
+  margin-bottom: var(--s-5);
+}
+.setup-plate-name { font-size: 22px; font-weight: 500; margin-bottom: var(--s-1); }
+.setup-plate-spec { color: var(--on-fill-dim); font-size: var(--size-label); }
+.setup-plate-caption { color: var(--on-fill-dim); font-size: var(--size-unit); margin-top: var(--s-4); }
+
+.setup-row { display: flex; align-items: center; gap: var(--s-3); flex-wrap: wrap; }
+.setup-skip {
+  background: none;
+  border: 0;
+  padding: 6px 0;
+  color: var(--ink-muted);
+  font: inherit;
+  font-size: var(--size-label);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.setup-field {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: inherit;
+  background: var(--panel-raised);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  padding: 9px 12px;
+  width: 100%;
+}
+
+.setup-box {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-lg);
+  padding: var(--s-4);
+  margin: var(--s-5) 0;
+  background: var(--panel-recessed);
+}
+.setup-line { display: flex; align-items: center; gap: var(--s-3); padding: var(--s-2) 0; }
+.setup-line + .setup-line { border-top: 1px solid var(--rule); }
+.setup-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+.setup-dot.on { background: var(--live-solid); }
+.setup-dot.off { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-muted); }
+.setup-who { font-weight: 500; font-size: var(--size-label); min-width: 118px; }
+.setup-says { color: var(--ink-muted); font-size: var(--size-unit); }
+
+/* Model picks. */
+.setup-picks { display: grid; gap: var(--s-3); margin-bottom: var(--s-5); }
+.setup-pick {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--s-4);
+  align-items: center;
+  text-align: left;
+  width: 100%;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-lg);
+  padding: var(--s-4);
+  background: var(--panel-raised);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.setup-pick:hover:not(:disabled) { background: var(--hover); border-color: var(--edge); }
+.setup-pick:disabled { cursor: not-allowed; opacity: 0.72; }
+.setup-pick-title { font-weight: 500; margin-bottom: 2px; }
+.setup-pick-desc { color: var(--ink-muted); font-size: var(--size-label); line-height: 1.4; max-width: 46ch; }
+.setup-facts {
+  font-family: var(--font-mono);
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+  text-align: right;
+  white-space: nowrap;
+  line-height: 1.7;
+  font-variant-numeric: tabular-nums;
+}
+.setup-facts b { display: block; color: var(--ink); font-weight: 500; font-size: 14px; }
+.setup-facts .no { color: var(--fault); }
+
+/* The one terminal command in the product. */
+.setup-cmd {
+  background: var(--fill);
+  color: var(--on-fill);
+  border-radius: var(--radius-lg);
+  padding: var(--s-4);
+  margin: var(--s-4) 0;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+.setup-cmd code { font-family: var(--font-mono); font-size: 14px; flex: 1; word-break: break-all; }
+.setup-cmd button { border-color: var(--on-fill-dim); color: var(--on-fill); }
+/* Derived from --on-fill, not written out: --fill and --on-fill trade places in
+   dark mode, and a literal light hover would vanish on the light plate. */
+.setup-cmd button:hover { background: color-mix(in srgb, var(--on-fill) 12%, transparent); }
+
+/* The endpoint, and the handoff. */
+.setup-endpoint {
+  background: var(--panel-sunk);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-lg);
+  padding: var(--s-4);
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin: var(--s-4) 0;
+}
+.setup-endpoint code { font-family: var(--font-mono); font-size: 15px; flex: 1; word-break: break-all; }
+
+.setup-handoff { display: flex; gap: var(--s-5); align-items: center; margin: var(--s-4) 0; flex-wrap: wrap; }
+.setup-qr {
+  width: 132px;
+  height: 132px;
+  flex: 0 0 auto;
+  border-radius: var(--radius);
+  /* Deliberately NOT themed. A QR drawn light-on-dark is an inverted symbol and
+     most phone cameras will not read one, so the tile keeps the light palette's
+     paper and ink in both themes. The border stays tokenised so it still sits
+     in the page. */
+  background: #f7f4ee;
+  border: 1px solid var(--rule);
+  display: grid;
+  place-items: center;
+  padding: 8px;
+}
+.setup-qr svg { width: 100%; height: 100%; display: block; }
+
+.setup-note { font-size: var(--size-unit); color: var(--ink-muted); line-height: 1.45; }
+.setup-warn {
+  border-left: 2px solid var(--warn-solid);
+  padding-left: var(--s-3);
+  margin: var(--s-4) 0;
+  font-size: var(--size-label);
+  color: var(--ink-muted);
+}
+.setup-fault { border-left-color: var(--fault); }

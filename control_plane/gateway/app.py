@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
 
-from . import capacity_api, enroll_api, internal_api, openai_api, ui_api
+from . import capacity_api, enroll_api, internal_api, openai_api, setup_api, ui_api
 from .admission import AdmissionController
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
@@ -444,6 +444,11 @@ def create_app(
     # Same rule again: /api/memory and /api/capacity are JSON, and below the
     # mount they would answer index.html to a fetch that expects a report.
     app.include_router(capacity_api.create_router(ctx))
+    # Same rule, and this is the one it would be worst to get wrong: /api/setup
+    # is the FIRST call a freshly installed UI makes, so below the mount a new
+    # cluster's very first screen would parse index.html as JSON and show
+    # nothing, on the one boot where the person has no idea what to expect.
+    app.include_router(setup_api.create_router(ctx))
 
     @app.get("/healthz")
     async def healthz():

@@ -1611,3 +1611,30 @@ export interface ShellStatus {
   /** Seconds of inactivity before a session closes itself. */
   idle_timeout_s: number
 }
+
+/** `GET /api/setup`. Whether this coordinator has been set up, and the one
+ *  machine the first screen is about.
+ *
+ *  `completed` is derived on the server, not merely a stored flag: a cluster
+ *  that is serving a model or has a provider configured is set up whatever the
+ *  flag says, which is what stops a wiped data directory dropping a working
+ *  cluster back into onboarding. `reason` is that derivation in words, and is
+ *  the answer to "why am I not being offered setup".
+ *
+ *  `machine` is null on an ambiguous roster rather than a guess. The server
+ *  will only name a machine it can identify -- an authoritative local node id,
+ *  or a roster of exactly one -- because the first screen introduces this
+ *  machine's hardware and naming the wrong one is a lie the reader cannot
+ *  check. */
+export interface SetupStatus {
+  completed: boolean
+  reason: string
+  machine: NodeStateDTO | null
+  cluster: { nodes: number; healthy: number }
+  deployments: number
+  providers: number
+  /** False when no provider kind can be added and routed to. The cloud step is
+   *  then not rendered at all -- not disabled, not explained. A step nobody can
+   *  take is noise on the one screen where every word is read. */
+  provider_routing: boolean
+}

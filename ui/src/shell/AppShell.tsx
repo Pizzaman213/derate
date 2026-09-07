@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useBackend } from '../state/backend'
 import { SelectionProvider } from '../state/selection'
 import { useRouter, type Dest } from '../state/router'
 import { Header } from './Header'
@@ -10,6 +11,7 @@ import { StorageTab } from '../tabs/StorageTab'
 import { ChatTab } from '../tabs/ChatTab'
 import { SpendTab } from '../tabs/SpendTab'
 import { SettingsTab } from '../tabs/SettingsTab'
+import { SetupTab } from '../tabs/SetupTab'
 import { Sidebar } from '../sidebar/Sidebar'
 
 // `Dest` is the router's -- the set of destinations and the set of path
@@ -33,9 +35,47 @@ export type { Dest }
  *  narrower than the list feeding it. */
 const WIDE: ReadonlySet<Dest> = new Set<Dest>(['models'])
 
+/** Send a coordinator that nobody has set up to the setup screen, once.
+ *
+ *  Only from the default landing destination, and only on the first answer. A
+ *  person who has typed a URL, followed a link or clicked a tab has said where
+ *  they want to be, and yanking them out of it because a fetch came back late
+ *  is worse than never offering setup at all. `replace` rather than a push, so
+ *  Back does not land on the dashboard they never saw.
+ *
+ *  A failed request does nothing. The dashboard on a fresh install is a thin
+ *  screen, but it is a working one, and a coordinator that cannot answer
+ *  /api/setup has a bigger problem than onboarding. */
+function useFirstRunRedirect(dest: Dest) {
+  const { backend } = useBackend()
+  const { navigate } = useRouter()
+  const asked = useRef(false)
+  // Read through a ref so the effect does not re-run when the destination
+  // changes -- it must fire once, against wherever the person started.
+  const startedAt = useRef(dest)
+
+  useEffect(() => {
+    if (asked.current) return
+    asked.current = true
+    let live = true
+    backend
+      .setup()
+      .then((status) => {
+        if (!live || status.completed) return
+        if (startedAt.current !== 'dash') return
+        navigate({ dest: 'setup' }, { replace: true })
+      })
+      .catch(() => {})
+    return () => {
+      live = false
+    }
+  }, [backend, navigate])
+}
+
 export function AppShell() {
   const { route } = useRouter()
   const dest = route.dest
+  useFirstRunRedirect(dest)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   // What the sidebar was before a wide destination collapsed it, so leaving
   // one restores the choice rather than silently reopening a rail somebody had
@@ -63,6 +103,13 @@ export function AppShell() {
       restore.current = null
     }
   }, [dest])
+
+  // Before the frame, and deliberately not one of the sections below. On a
+  // fresh install the header, the roster rail and every panel are empty, and a
+  // chrome around four empty boxes is a worse first impression than no chrome.
+  // It is still a real destination with a real URL, so it can be linked,
+  // reloaded and re-run by typing it.
+  if (dest === 'setup') return <SetupTab />
 
   return (
     <SelectionProvider>

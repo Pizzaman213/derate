@@ -29,7 +29,20 @@
 // same by default. Break either and a shared link 404s only on reload, which
 // is the failure that makes people stop sharing links.
 
-export type Dest = 'dash' | 'models' | 'cluster' | 'storage' | 'chat' | 'spend' | 'settings'
+export type Dest =
+  | 'dash'
+  | 'models'
+  | 'cluster'
+  | 'storage'
+  | 'chat'
+  | 'spend'
+  | 'settings'
+  // Not in the header's nav, and deliberately still a real destination. First
+  // run is a screen with a subject of its own, so by the rule at the top of
+  // this file it belongs in the path -- which is also what makes it linkable,
+  // reloadable, and re-runnable by typing it, rather than a mode you can only
+  // reach by having installed the product ten seconds ago.
+  | 'setup'
 
 /** What the sheet (shell/Sheet.tsx) is showing. The model kind takes its two
  *  numbers from `ctx`/`seq`, so it is fully described by a kind and an id. */
@@ -66,6 +79,7 @@ const SEGMENT: Record<Dest, string> = {
   chat: 'chat',
   spend: 'spend',
   settings: 'settings',
+  setup: 'setup',
 }
 
 const BY_SEGMENT = new Map<string, Dest>(
