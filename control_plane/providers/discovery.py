@@ -77,6 +77,27 @@ def _entries(payload: Any) -> list[dict]:
     return [entry for entry in candidates if isinstance(entry, dict)]
 
 
+def recognized_envelope(payload: Any) -> bool:
+    """Whether *payload* is a model list we understand, empty or not.
+
+    ``_entries`` returns [] both for a catalogue we could not parse and for one
+    that is genuinely empty, and those are the same answer only until a
+    provider can be told to fetch a model. A freshly installed server holding
+    nothing is the normal state right before the first pull, and calling it
+    unrecognized marks it broken at the exact moment the operator is doing the
+    right thing.
+
+    The envelope is the signal, not its contents: Ollama with nothing pulled
+    answers ``{"object": "list", "data": null}``, which is a well-formed empty
+    catalogue wearing a null.
+    """
+    if isinstance(payload, list):
+        return True
+    if isinstance(payload, dict):
+        return any(key in payload for key in ("data", "models", "results"))
+    return False
+
+
 def _upstream_id(entry: dict) -> str | None:
     for key in ("id", "model", "name", "model_name"):
         value = entry.get(key)

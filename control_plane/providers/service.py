@@ -42,7 +42,7 @@ from .config import (
     WRITE_TIMEOUT_S,
     data_dir,
 )
-from .discovery import parse_models
+from .discovery import parse_models, recognized_envelope
 from .errors import (
     PullRefusedError,
     PullUnsupportedError,
@@ -577,8 +577,30 @@ class ProviderService:
 
         models = parse_models(payload, entry.spec, aliases=entry.runtime.aliases)
         if not models:
-            # An empty list is indistinguishable from a shape we failed to
-            # parse. Either way, keep what we had.
+            if entry.spec.pull_path and recognized_envelope(payload):
+                # A server that hosts its own weights and holds none yet is
+                # empty, not broken -- and that is the state every one of them
+                # is in between being added and being pulled to, which is the
+                # order the UI asks for. Marking it unhealthy there puts a red
+                # error on the screen for doing the right thing.
+                #
+                # Healthy with nothing in it routes nowhere on its own: an
+                # empty catalogue contributes no route targets, so /v1/models
+                # is unchanged and no request can land here. Health is a claim
+                # about the server answering, which it did.
+                entry.provider.models = []
+                entry.reindex()
+                entry.runtime.last_refreshed = now
+                entry.runtime.healthy = True
+                entry.runtime.last_error = None
+                self._persist()
+                log.info(
+                    "provider %s has no models yet; nothing pulled onto it",
+                    provider_id,
+                )
+                return self.get(provider_id)
+            # Otherwise an empty list is indistinguishable from a shape we
+            # failed to parse. Either way, keep what we had.
             self._note_refresh_failure(entry, now, "model list was empty or unrecognized")
             self._persist()
             return self.get(provider_id)

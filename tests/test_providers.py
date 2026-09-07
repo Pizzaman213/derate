@@ -958,6 +958,58 @@ def test_empty_model_list_is_treated_as_a_failed_refresh(tmp_path):
     assert "empty" in provider.last_error
 
 
+def test_a_self_hosted_server_with_nothing_pulled_is_empty_not_broken(tmp_path):
+    """The state every Ollama box is in between being added and being pulled to.
+
+    A provider has to exist before anything can be pulled onto it, so this is
+    the order the UI asks for -- and marking it unhealthy there puts a red
+    error on the screen for doing exactly the right thing.
+
+    Healthy with nothing in it routes nowhere on its own: an empty catalogue
+    contributes no route targets, so /v1/models is unchanged and no request can
+    land here. Health is a claim about the server answering, which it did.
+    """
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    # Queued before add(), which refreshes: this is the catalogue the provider
+    # is created against, so nothing is ever cached. What a real Ollama holding
+    # no models answers is a well-formed empty list wearing a null.
+    upstream.model_responses.append(
+        httpx.Response(200, json={"object": "list", "data": None})
+    )
+    provider = service.add({"provider_id": "ollama", "kind": ProviderKind.OLLAMA,
+                            "base_url": "http://pi:11434/v1"})
+
+    assert provider.models == []
+    assert provider.healthy is True
+    assert provider.last_error is None
+    # Healthy, and still routing nowhere -- the two are not in tension.
+    assert service.route_targets() == []
+
+
+def test_an_unparseable_catalogue_is_still_a_failure_for_a_pullable_kind(tmp_path):
+    """The exemption is for a shape we recognise, not for any empty answer."""
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    upstream.model_responses.append(httpx.Response(200, json={"surprise": True}))
+    provider = service.add({"provider_id": "ollama", "kind": ProviderKind.OLLAMA,
+                            "base_url": "http://pi:11434/v1"})
+
+    assert provider.healthy is False
+    assert "empty or unrecognized" in provider.last_error
+
+
+def test_a_hosted_api_returning_nothing_is_still_a_failed_refresh(tmp_path):
+    """OpenRouter with no models is broken, not empty -- it hosts no weights
+    of its own, so there is no pull that would explain the gap."""
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+    upstream.model_responses.append(httpx.Response(200, json={"data": []}))
+    provider = service.refresh("openrouter")
+    assert "empty" in provider.last_error
+
+
 def test_cold_start_does_not_depend_on_the_network(tmp_path):
     upstream = Upstream()
     service = make_service(tmp_path, upstream)
