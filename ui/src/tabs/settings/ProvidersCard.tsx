@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { ProviderKind } from '../../api/types'
-import { useProviders } from '../../state/resources'
+import { useProviderKinds, useProviders } from '../../state/resources'
 import { useBackend } from '../../state/backend'
 import { relativeTime } from '../../format'
 
