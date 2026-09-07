@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { SelectionProvider } from '../state/selection'
 import { Header } from './Header'
 import { Sheet } from './Sheet'
+import { DashboardTab } from '../tabs/DashboardTab'
+import { ClusterTab } from '../tabs/ClusterTab'
 
 export type Dest = 'dash' | 'cluster' | 'spend' | 'settings'
 
@@ -50,10 +52,10 @@ export function AppShell() {
 
         <main>
           <section role="tabpanel" hidden={dest !== 'dash'}>
-            <Placeholder label="Dashboard" />
+            <DashboardTab />
           </section>
           <section role="tabpanel" hidden={dest !== 'cluster'}>
-            <Placeholder label="Cluster" />
+            <ClusterTab />
           </section>
           <section role="tabpanel" hidden={dest !== 'spend'}>
             <Placeholder label="Spend" />

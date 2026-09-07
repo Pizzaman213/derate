@@ -245,6 +245,10 @@ export interface PlanResponse {
   model_id: string
   context_length: number
   concurrency: number
+  /** From the resolver, not the fit gate -- e.g. "least reliable source:
+   *  config estimate". Qualifies how trustworthy the plan/fit above are;
+   *  render verbatim alongside fit.warnings, never folded into it. */
+  resolver_warnings: string[]
 }
 
 export interface LaunchRequest {
