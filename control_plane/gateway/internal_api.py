@@ -1225,6 +1225,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         in the background and the model appears when the catalogue refresh
         picks it up; holding the request open for the whole download would time
         out in every proxy between here and the browser.
+
+        That background task lives in this process, so restarting the
+        coordinator cancels an in-flight pull and leaves the provider holding a
+        partial blob. It is a property of where the task runs rather than of
+        this route, it is not currently resumable, and the card says so on the
+        screen rather than letting a long download disappear unexplained.
         """
         from control_plane.providers.config import PULL_HEADROOM
         from control_plane.providers.errors import (

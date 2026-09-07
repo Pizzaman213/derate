@@ -84,7 +84,11 @@ export function PullCard() {
       })
       setDone(
         reply.download_bytes
-          ? `Pulling ${reply.model} — ${gbytes(reply.download_bytes, 2)} GiB. It appears here when the download finishes.`
+          ? // The transfer runs as a background task in the coordinator, so
+            // restarting it drops the download and leaves the far end holding
+            // a partial file. Cheap to say, and the alternative is somebody
+            // watching a 70B pull vanish with no explanation.
+            `Pulling ${reply.model} — ${gbytes(reply.download_bytes, 2)} GiB. It appears here when the download finishes. Restarting the coordinator cancels it.`
           : `${reply.model} is already on that machine.`,
       )
       setRefusal(null)
