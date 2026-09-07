@@ -892,3 +892,132 @@ The two being reversed were reaffirmed as recently as the durable-telemetry appe
 - **`allocatable` is now read, not recomputed** (UI, deviation) — the node sheet derived it as `addressable - used` and guarded that to unified memory, so every discrete node showed an em dash for the one figure that decides whether anything can launch on it. `/api/memory` has carried a real per-node `allocatable` from the fit gate all along and is already polled at 2 s for the Serve button. Same rule as the quantization table: a second copy of a figure is a second answer, and the one that disagrees with the fit gate is the one that costs somebody an OOM.
 
 - **Routing stays in the deployment inspector** — targets, shares, strength, circuits and cost are not duplicated onto the node page. Each served name on it is a button into the deployment sheet, which is the same one-detail-surface rule the cluster graph's rail already states.
+
+## Appendix: the coordinator's own node (integration, 2026-09-07)
+
+Section 2 describes the join protocol and section 3 the registry, and both are
+written entirely about *other* machines: a peer is discovered, presents a
+credential, is probed back, and waits for a click. None of that describes the
+machine the coordinator is itself running on, which arrives by no protocol at
+all. That case was already implemented -- `Registry.__init__` took a
+`local_profile` and installed it as a member -- but it was never written down,
+which is why it kept being re-proposed as missing.
+
+- **`Registry.enroll_local(profile=None, *, persist=True)`** (3, names an
+  existing behaviour) -- the coordinator's own host, registered with no token
+  and no admission step. This is not a hole in the credential model: there is
+  no far side to probe back and no network hop to authenticate, so the question
+  the join flow exists to answer has no content here. `handle_join`,
+  `offer_candidate` and `admit` are untouched, and this deliberately does not
+  route through them the way an enrollment-token admission does. Idempotent by
+  `node_id` -- `DERATE_NODE_ID` or the slugified hostname -- so a restart
+  replaces the entry rather than adding a second row for one machine. It is a
+  replace and not a no-op on purpose: a re-probe after a driver install should
+  update the hardware, and the live readings reset to unmeasured exactly as
+  `_load_roster` leaves a restored member.
+- **The roster now contains the local node** (bug fix) -- the constructor wrote
+  it straight into `_members`, and only an unrelated event that persisted for
+  its own reasons ever flushed it, so a coordinator that had admitted nobody
+  had a `registry.json` with no entry for the machine serving it. Construction
+  itself still writes nothing (`persist=False`): forty-odd tests build a
+  `Registry` per case, and a process-start side effect firing under pytest is
+  the same thing `startup.py` refuses when it keeps `bootstrap_key` out of
+  `create_agent_app`.
+- **`NodeState.is_local`** (4.1, additive field, default `false`) -- whether
+  this is the machine the coordinator is running on. Set by `enroll_local` and
+  by nothing else, so it is false on every node that arrived over the network,
+  including on a worker's own copy of its own state: the question is "is this
+  the coordinator's host", not "is this me". On `NodeState` rather than
+  `NodeProfile` for the reason `label` is -- the profile is the hardware as
+  probed and a re-probe must not carry a fact about which process is serving --
+  and it is not derivable from the profile at all, since moving the coordinator
+  to another machine leaves the hardware unchanged while this flips. On the
+  wire as `is_coordinator_host` on a node payload, and always `false` from the
+  agent surface.
+- **The gateway resolves the coordinator node in three rungs** (deviation from
+  the `list_nodes()[0]` guess) -- `node.py` already passes
+  `coordinator_node_id` explicitly because the composition root knows the
+  answer, so none of this runs in the real coordinator. What reaches it is a
+  gateway composed some other way, and each rung beats the guess it replaces:
+  the registry's own `local_node_id` first (the old guess read whichever member
+  led a dict, so a persisted roster starting with a worker named that worker as
+  the coordinator -- verifier N-8, one layer below where `node.py` fixed it);
+  then, only when nothing is enrolled at all, asking the registry to enroll its
+  own host; then the original guess. Duck-typed throughout, which is what keeps
+  it honest on a stub: the day-0 `StubRegistry` has neither attribute, falls to
+  the last rung, finds nothing and returns `None` exactly as before. A stub
+  surface must not invent a node -- it has no host to speak for. Self-enrolling
+  at this layer is recorded in `degraded_startup`, because reaching that rung
+  means the process that composed the gateway did not enroll its own host.
+
+## Appendix: build identity, and profiles that stop being frozen at join (2026-09-07)
+
+A Raspberry Pi joined this cluster running a container image that predated the
+CPU probe. It reported `device_class: "unknown"`, and the roster said *"device
+class is not recognized; cannot confirm this hardware is eligible to join the
+pool"*. The machine was fine. The software was stale, and nothing anywhere
+could say so -- `registry/serde.py` opens with "These payloads cross a version
+boundary" and then nothing on either side of that boundary identified its
+version. Old software and unidentifiable hardware rendered identically.
+
+Three things had to be true at once for that to happen, and each is addressed.
+
+- **`control_plane/version.py`** (5, new module) -- `build_id()`, resolved from
+  `DERATE_BUILD` (stamped into the image) and falling back to `git rev-parse`
+  with a `+dirty` suffix for a developer running from a checkout. Never raises
+  and never guesses: an unresolvable build is `""`, which renders as "an
+  unidentified build" rather than a fabricated one, because a wrong build id
+  sends someone to the wrong commit. The `pyproject.toml` version is
+  deliberately not a fallback -- it has been `0.1.0` for the life of the
+  project and would answer "which build" with a string true of every build ever
+  made, which is this file's failure in a more confident voice.
+- **`ARG`/`ENV DERATE_BUILD` and `org.opencontainers.image.revision`**
+  (Dockerfile, `docker/build.sh`) -- the build arg is resolved in `build.sh`
+  from the git SHA, because the Docker build context does not carry `.git`. A
+  plain `docker build` with no arg yields an empty stamp, and says so.
+- **`NodeState.build`** (4.1, additive field, default `""`) -- what the node
+  reported on `/agent/health`. Not on `NodeProfile`, and the distinction is the
+  whole point: the profile is what the hardware **is**, and this is what was
+  doing the looking. It rides the existing 5s heartbeat rather than taking a
+  call of its own -- `check_health` already dialled every member and threw the
+  body away. An agent that reports no build does not blank a known one:
+  absence stays absence.
+- **Build skew outranks the device class in `serialize._eligibility`** (4.8,
+  deviation) -- the same way unhealthy already outranks both, and for the same
+  reason: the order is the order an operator should act in. A node on an older
+  build now reads *"this node is running an older build of derate... re-run the
+  installer on that machine"* instead of a sentence about its hardware. Skew is
+  only ever reported between two builds we can **both** name -- two unknowns
+  are not agreement and one unknown is not a difference -- and it never makes
+  an identified node ineligible, because a GB10 on an older build is still a
+  GB10. On the wire as `build` and `build_skew` on a node payload.
+- **A stored profile is no longer written only at join** (3, deviation) --
+  `Registry.refresh_profile` / `refresh_round`, on a 60s loop, plus
+  `NodeAgent.reprobe_once` on the same cadence so the node re-reads its own
+  hardware and *publishes* it. Both are needed: without the agent half a driver
+  install is invisible to the node, and without the coordinator half it is
+  invisible to everyone else. Before this, `handle_join` was the only writer of
+  a profile, so a node that was upgraded or had a driver installed kept
+  reporting whatever it was when it first knocked, and the only cure was
+  restarting its container.
+- **`control_plane/registry/profiles.py::profile_supersedes`** (new module,
+  one rule) -- **an UNKNOWN profile never replaces an identified one.**
+  `probe_local` is total: its answer for "I could not look" is a fully-formed
+  profile asserting UNKNOWN. That is correct for a probe describing one moment,
+  and safe while a join was the only writer, since a join implies the far side
+  just answered. On a timer it is not: one wedged `nvidia-smi` would flip an
+  identified GB10 to unidentified, `_eligibility` would drop it from the
+  serving pool, and the roster would flap. Deliberately does **not** rank the
+  identified classes against each other -- a GB10 that comes back as CPU is
+  what pulling a card looks like and is believed. Only the absence of an answer
+  is filtered, never a different answer. It lives outside `probe.py` so the
+  probe keeps answering honestly about one moment without knowing what anyone
+  previously believed, and outside `serde.py` because the agent's own re-probe
+  never touches a wire.
+- **`Registry._loop` grew `prime`** -- health and telemetry call their function
+  before the first sleep, deliberately, so the UI does not open on a row of
+  zeros. Hardware is the opposite: it was read moments earlier by `start_node`,
+  so the refresh loop sleeps first. Priming it would shell out to `nvidia-smi`
+  to re-learn what was just learned, on every process start and in every test
+  that starts a registry. `NodeAgent` anchors `_last_reprobe` in `start()` for
+  the same reason.

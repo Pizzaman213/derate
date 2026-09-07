@@ -25,6 +25,8 @@ from control_plane.contracts import (
     RoutingConfig,
 )
 
+from control_plane.version import same_build
+
 from . import ui_detail
 
 # Never rendered, whatever a port puts in the object.
@@ -51,7 +53,18 @@ INELIGIBLE_DEVICE_CLASS = (
 )
 
 
-def _eligibility(healthy: bool, device_class: DeviceClass) -> tuple[bool, str | None]:
+INELIGIBLE_BUILD_SKEW = (
+    "this node is running an older build of derate than the coordinator, so "
+    "what it reports about its own hardware may be out of date; re-run the "
+    "installer on that machine"
+)
+
+
+def _eligibility(
+    healthy: bool,
+    device_class: DeviceClass,
+    skewed: bool = False,
+) -> tuple[bool, str | None]:
     """Conservative and honest: eligible unless there is a concrete reason not
     to be. Unhealthy always wins over an unrecognized device class as the
     reported reason, since an operator fixes reachability before hardware ID.
@@ -68,6 +81,15 @@ def _eligibility(healthy: bool, device_class: DeviceClass) -> tuple[bool, str | 
     if not healthy:
         return False, _INELIGIBLE_UNHEALTHY
     if device_class is DeviceClass.UNKNOWN:
+        # Build skew outranks the device class, the same way unhealthy
+        # outranks both. The order is the order an operator should act in, and
+        # this pair had the order wrong in the only way that matters: a
+        # Raspberry Pi whose image predated the CPU probe reported UNKNOWN,
+        # and the roster blamed the hardware. The machine was fine. Upgrading
+        # the node is the first thing to try, and until it is tried nothing it
+        # says about its own hardware is worth investigating.
+        if skewed:
+            return False, INELIGIBLE_BUILD_SKEW
         return False, INELIGIBLE_DEVICE_CLASS
     return True, None
 
@@ -102,7 +124,9 @@ def temp_reading(state: NodeState) -> float | None:
     return state.temperature_c
 
 
-def node_payload(state: NodeState, label: str | None = None) -> dict:
+def node_payload(
+    state: NodeState, label: str | None = None, coordinator_build: str | None = None
+) -> dict:
     """One node row.
 
     `label` is the operator's display name and is deliberately a parameter
@@ -121,7 +145,12 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
     # total its own sample carries -- without a denominator its memory readout
     # is a permanent em dash, which reads as broken rather than as absent.
     total = profile.total_memory or state.memory_total or 0
-    eligible, ineligible_reason = _eligibility(state.healthy, profile.device_class)
+    # Only a difference between two builds we can both name. Two unknowns are
+    # not agreement, and one unknown is not a difference -- see version.py.
+    skewed = not same_build(coordinator_build, state.build)
+    eligible, ineligible_reason = _eligibility(
+        state.healthy, profile.device_class, skewed
+    )
     return {
         "node_id": profile.node_id,
         # The name to show. Null, never the node_id: the UI has to tell
@@ -161,6 +190,12 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
         "util_pct": state.utilization_pct,
         "eligible": eligible,
         "ineligible_reason": ineligible_reason,
+        "is_coordinator_host": state.is_local,
+        # Which build this node is running, and whether it differs from the
+        # coordinator's. `build_skew` is never true on an absent id: a node
+        # that has not said is not a node that disagrees.
+        "build": state.build or None,
+        "build_skew": skewed,
     }
 
 

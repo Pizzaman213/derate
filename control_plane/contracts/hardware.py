@@ -72,6 +72,27 @@ class NodeState:
     # different questions ("is it reachable" / "is this number current") need
     # two different timestamps, or the UI shows an hour-old wattage as live.
     sample_ts: float = 0.0
+    # Whether this is the machine the coordinator is itself running on. Set by
+    # Registry.enroll_local and by nothing else, so it is false on every node
+    # that arrived over the network -- including on a worker's own copy of its
+    # own state, which is correct: the question is "is this the coordinator's
+    # host", not "is this me".
+    #
+    # On NodeState rather than NodeProfile, for the reason `label` is: the
+    # profile is the hardware as probed, and a re-probe must not carry a fact
+    # about which process happens to be serving. It is also not derivable from
+    # the profile at all -- move the coordinator to another machine and the
+    # hardware is unchanged while this flips.
+    is_local: bool = False
+    # Which build of derate this node is running, from its /agent/health. "" on
+    # a node that has not answered yet, or one whose build predates the field.
+    #
+    # Not on NodeProfile, and the distinction is the entire point: the profile
+    # is what the hardware IS, and this is what was doing the looking. They
+    # were conflated by absence until a Raspberry Pi running an old image
+    # reported itself as unidentified hardware, and the roster had no way to
+    # say "the machine is fine, the software is stale".
+    build: str = ""
 
 
 @dataclass(frozen=True)

@@ -68,6 +68,15 @@ def state_to_dict(state: NodeState) -> dict:
         "power_w": round(state.power_watts, 1),
         "temp_c": round(state.temperature_c, 1),
         "util_pct": round(state.utilization_pct, 1),
+        # Whether this is the coordinator's own machine. Always false on the
+        # agent surface -- a worker serving its own state is not serving the
+        # coordinator's host -- and set only by Registry.enroll_local.
+        "is_coordinator_host": state.is_local,
+        # Which build this node is running. "" means it has not said, which is
+        # what an agent older than the field looks like -- and is exactly the
+        # case that most needs saying, so it is never defaulted to something
+        # that reads like an answer.
+        "build": state.build or None,
     }
 
 

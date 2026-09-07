@@ -22,8 +22,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from control_plane.contracts import (
+    GB10_ADDRESSABLE,
+    GB10_MEM_BANDWIDTH,
+    GB10_TOTAL_MEMORY,
     Deployment,
     DeploymentState,
+    DeviceClass,
+    NodeProfile,
+    NodeState,
     Provider,
     ProviderKind,
     ProviderModel,
@@ -32,7 +38,7 @@ from control_plane.contracts import (
 )
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
 from control_plane.gateway import app as app_module
-from control_plane.gateway import stubs
+from control_plane.gateway import serialize, stubs
 from control_plane.gateway.proxy import (
     RETRY_SERVER_ERROR,
     RETRY_TRANSPORT,
@@ -1329,6 +1335,32 @@ def test_coordinator_node_id_is_left_alone_when_already_set():
     assert settings.coordinator_node_id == "spark-01"
 
 
+def _state(node_id, *, is_local=False) -> NodeState:
+    """A minimal member. Only node_id and is_local matter to these tests."""
+    return NodeState(
+        profile=NodeProfile(
+            node_id=node_id,
+            hostname=node_id,
+            address="10.0.0.1",
+            device_class=DeviceClass.GB10,
+            gpu_name="NVIDIA GB10",
+            gpu_count=1,
+            total_memory=GB10_TOTAL_MEMORY,
+            addressable_memory=GB10_ADDRESSABLE,
+            memory_bandwidth_gbps=GB10_MEM_BANDWIDTH,
+            compute_capability="12.1",
+            driver_version="580.173.02",
+        ),
+        healthy=True,
+        last_seen=0.0,
+        memory_used=0,
+        power_watts=0.0,
+        temperature_c=0.0,
+        utilization_pct=0.0,
+        is_local=is_local,
+    )
+
+
 def test_provider_misconfiguration_returns_the_half_open_probe(tmp_path):
     """A terminal misconfiguration Attempt (unresolvable key, unsupported
     adapter) must give the breaker's half-open probe back: without abandon,
@@ -1385,3 +1417,73 @@ def test_provider_misconfiguration_returns_the_half_open_probe(tmp_path):
             "%s left the half-open probe claimed: permanent unselectability"
             % exc_type.__name__
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Build skew. A Raspberry Pi running an old image reported device_class
+# "unknown", and the roster blamed the hardware for a fault entirely in the
+# software. These pin the order the two reasons are reported in.
+# ---------------------------------------------------------------------------
+
+
+def _unknown_state(build: str = "") -> NodeState:
+    state = _state("connor-pi")
+    state.profile = NodeProfile(
+        node_id="connor-pi",
+        hostname="connor-pi",
+        address="10.0.0.50",
+        device_class=DeviceClass.UNKNOWN,
+        gpu_name="",
+        gpu_count=0,
+        total_memory=0,
+        addressable_memory=0,
+        memory_bandwidth_gbps=0.0,
+        compute_capability="",
+        driver_version="",
+    )
+    state.build = build
+    return state
+
+
+def test_build_skew_is_reported_ahead_of_the_device_class():
+    """The order is the order an operator should act in. Upgrading the node is
+    the first thing to try, and until it is tried nothing the node says about
+    its own hardware is worth investigating."""
+    payload = serialize.node_payload(_unknown_state("old111"), None, "new222")
+
+    assert payload["build_skew"] is True
+    assert payload["ineligible_reason"] == serialize.INELIGIBLE_BUILD_SKEW
+    assert "older build" in payload["ineligible_reason"]
+
+
+def test_without_skew_an_unknown_node_still_blames_the_device_class():
+    """The original sentence is still correct for a genuinely unidentifiable
+    machine on a matching build, so it has to survive."""
+    payload = serialize.node_payload(_unknown_state("same"), None, "same")
+
+    assert payload["build_skew"] is False
+    assert payload["ineligible_reason"] == serialize.INELIGIBLE_DEVICE_CLASS
+
+
+def test_a_node_that_has_not_reported_a_build_is_not_skewed():
+    """One unknown is not a difference. Reporting skew against an absent id
+    would accuse every older agent of something we cannot actually see."""
+    payload = serialize.node_payload(_unknown_state(""), None, "new222")
+
+    assert payload["build_skew"] is False
+    assert payload["ineligible_reason"] == serialize.INELIGIBLE_DEVICE_CLASS
+    assert payload["build"] is None
+
+
+def test_skew_never_makes_an_identified_node_ineligible():
+    """Skew explains an unidentified node; it is not itself a disqualification.
+    A GB10 on an older build is still a GB10."""
+    state = _state("spark-01")
+    state.build = "old111"
+
+    payload = serialize.node_payload(state, None, "new222")
+
+    assert payload["build_skew"] is True
+    assert payload["eligible"] is True
+    assert payload["ineligible_reason"] is None

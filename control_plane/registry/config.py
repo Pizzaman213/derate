@@ -53,6 +53,18 @@ DISCRETE_MEMORY_RESERVE = _const("DISCRETE_MEMORY_RESERVE", 1 * 1024**3)
 # between the fit check and the load. 8 GiB is ~6% of the pool.
 HOST_MEMORY_RESERVE = _const("HOST_MEMORY_RESERVE", 8 * 1024**3)
 
+# How often a node re-reads its own hardware, and how often the coordinator
+# re-reads a member's profile. Both deliberately slow: hardware changes across
+# a driver install or a reboot, not between heartbeats, and the probe shells
+# out to nvidia-smi. 60s is fast enough that an operator who just ran the
+# installer sees the roster correct itself while still watching it.
+#
+# These exist because a profile used to be captured once, at join, and never
+# again -- so a node that was upgraded, or had a driver installed, kept
+# reporting whatever it happened to be when it first knocked.
+PROFILE_REPROBE_INTERVAL_S = _const("PROFILE_REPROBE_INTERVAL_S", 60.0)
+PROFILE_REFRESH_INTERVAL_S = _const("PROFILE_REFRESH_INTERVAL_S", 60.0)
+
 DEFAULT_AGENT_PORT = 8081
 DEFAULT_COORDINATOR_PORT = 8080
 

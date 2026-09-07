@@ -58,9 +58,21 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim
 
+# The build this image was made from. Empty on a plain `docker build`, which
+# is honest: control_plane/version.py renders that as "an unidentified build"
+# rather than inventing one. docker/build.sh always passes it.
+ARG DERATE_BUILD=""
+
 LABEL org.opencontainers.image.title="derate/node" \
       org.opencontainers.image.description="Derate node: agent, coordinator, gateway, UI" \
-      org.opencontainers.image.source="https://github.com/Pizzaman213/derate"
+      org.opencontainers.image.source="https://github.com/Pizzaman213/derate" \
+      org.opencontainers.image.revision="${DERATE_BUILD}"
+
+# Read by control_plane.version.build_id() and reported on /agent/profile and
+# /agent/health, so a node running an old image can be told apart from a node
+# whose hardware genuinely cannot be identified. Those two used to render
+# identically, which is how a working Raspberry Pi came to read as a fault.
+ENV DERATE_BUILD="${DERATE_BUILD}"
 
 # openssh-client: sparkrun drives the cluster over SSH.
 # iproute2: interface inspection for the host-networking preflight and for

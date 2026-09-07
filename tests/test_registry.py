@@ -11,6 +11,7 @@ hardware skip themselves when it is absent.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import stat
 import time
@@ -49,6 +50,7 @@ from control_plane.registry.config import (
 from control_plane.registry.discovery import DiscoveredPeer
 from control_plane.registry.net import normalize_agent_url
 from control_plane.registry.probe import bandwidth_for
+from control_plane.registry.profiles import profile_supersedes
 from control_plane.registry.serde import profile_from_dict, profile_to_dict
 from control_plane.registry.telemetry import (
     RingBuffer,
@@ -130,6 +132,10 @@ class FakeClient:
         self.join_rejects: set[str] = set()
         self.posts: list[tuple[str, dict]] = []
         self.headers: list[dict | None] = []
+        # agent_url -> extra keys to merge into that node's /agent/health.
+        # The real endpoint carries the node's build, which is how the
+        # coordinator learns it without a call of its own.
+        self.health_bodies: dict[str, dict] = {}
 
     def serve(self, agent_url: str, profile: NodeProfile) -> None:
         self.profiles[agent_url.rstrip("/")] = profile_to_dict(profile)
@@ -159,7 +165,9 @@ class FakeClient:
             raise ProbeFailed(f"no agent at {base}")
         # The real /agent/health names the node answering, which is how a
         # reachability check tells "reached it" from "reached something else".
-        return {"status": "ok", "node_id": self.profiles[base]["node_id"]}
+        body = {"status": "ok", "node_id": self.profiles[base]["node_id"]}
+        body.update(self.health_bodies.get(base, {}))
+        return body
 
     async def post_json(
         self, url: str, payload: dict, timeout: float, headers: dict | None = None
@@ -2116,7 +2124,9 @@ def test_start_called_twice_does_not_double_spawn_tasks(tmp_path):
         await registry.start()
         second_tasks = list(registry._tasks)
         assert first_tasks == second_tasks
-        assert len(second_tasks) == 2
+        # health, telemetry, profile-refresh. The third was added when a
+        # profile stopped being written only at join.
+        assert len(second_tasks) == 3
         assert all(not t.done() for t in second_tasks)
         await registry.stop()
 
@@ -2125,18 +2135,18 @@ def test_start_called_twice_does_not_double_spawn_tasks(tmp_path):
 
 def test_start_twice_concurrently_still_spawns_once(tmp_path):
     """Two overlapping start() calls (e.g. two request handlers racing the
-    composition root) must not each spawn their own pair of loops."""
+    composition root) must not each spawn their own set of loops."""
     registry = make_registry(tmp_path, local=SPARK_01)
 
     async def scenario():
         await asyncio.gather(registry.start(), registry.start())
-        assert len(registry._tasks) == 2
+        assert len(registry._tasks) == 3
         await registry.stop()
 
     run(scenario())
 
 
-def test_stop_then_restart_spawns_a_fresh_pair(tmp_path):
+def test_stop_then_restart_spawns_a_fresh_set(tmp_path):
     registry = make_registry(tmp_path, local=SPARK_01)
 
     async def scenario():
@@ -2144,7 +2154,7 @@ def test_stop_then_restart_spawns_a_fresh_pair(tmp_path):
         await registry.stop()
         assert registry._tasks == []
         await registry.start()
-        assert len(registry._tasks) == 2
+        assert len(registry._tasks) == 3
         await registry.stop()
 
     run(scenario())
@@ -2422,3 +2432,234 @@ def test_a_check_between_two_workers_does_not_pass_on_the_coordinator_legs(tmp_p
     # Both peer legs really were run here, so this pair IS verified both ways.
     assert result["ok"] is True
     assert "Reachable both ways" in result["summary"]
+
+
+# ----------------------------------------------------------------------
+# Section: enrolling the coordinator's own host
+#
+# The one enrollment with no token and no click. Everything here is about the
+# two properties that make it safe to run on every startup: it is idempotent by
+# node_id, and it never reaches the candidate/admit path that exists to gate
+# machines arriving over the network.
+# ----------------------------------------------------------------------
+
+
+def test_the_local_node_is_a_member_from_construction(tmp_path):
+    """No admit, no candidate step, no token. Nobody admits their own machine."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["spark-01"]
+    assert registry.local_node_id == "spark-01"
+    assert registry.candidates() == []
+
+
+def test_the_local_node_is_flagged_as_the_coordinators_own_host(tmp_path):
+    registry = make_registry(tmp_path, local=SPARK_01)
+
+    assert registry.get_node("spark-01").is_local is True
+
+
+def test_a_node_that_joined_is_not_flagged_as_the_local_host(tmp_path):
+    """is_local answers "is this the coordinator's machine", not "is this me"."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+
+    run(registry.add_node("10.0.0.12"))
+
+    assert registry.get_node("spark-02").is_local is False
+    assert registry.get_node("spark-01").is_local is True
+
+
+def test_enrolling_twice_replaces_rather_than_duplicates(tmp_path):
+    """The restart case. A second call must not add a second row."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+
+    registry.enroll_local(SPARK_01)
+    registry.enroll_local(SPARK_01)
+
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["spark-01"]
+
+
+def test_a_restart_against_the_same_data_dir_leaves_one_node(tmp_path):
+    """Idempotence across processes, which is the property that actually
+    matters: the roster is on disk and gets loaded before the local node is
+    installed."""
+    first = make_registry(tmp_path, local=SPARK_01)
+    first.enroll_local(SPARK_01)
+
+    second = make_registry(tmp_path, local=SPARK_01)
+
+    assert [s.profile.node_id for s in second.list_nodes()] == ["spark-01"]
+
+
+def test_enroll_local_updates_the_hardware_on_a_re_probe(tmp_path):
+    """A replace, not a no-op: install a driver and restart, and the roster
+    should show what the machine is now."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+    rebuilt = make_profile("spark-01", gpu_name="NVIDIA GB10", gpu_count=2)
+
+    registry.enroll_local(rebuilt)
+
+    assert len(registry.list_nodes()) == 1
+    assert registry.get_node("spark-01").profile.gpu_count == 2
+    assert registry.local_profile.gpu_count == 2
+
+
+def test_enroll_local_persists_the_local_node_to_the_roster(tmp_path):
+    """A coordinator that has admitted nobody still has itself on disk. It used
+    not to: the constructor wrote straight to _members and only an unrelated
+    event that persisted for its own reasons ever flushed it."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+    registry.enroll_local(SPARK_01)
+
+    stored = json.loads((tmp_path / "registry.json").read_text())
+
+    assert "spark-01" in stored["members"]
+
+
+def test_constructing_a_registry_writes_nothing(tmp_path):
+    """Construction must stay free of disk side effects; forty-odd tests build
+    one per case and process-start effects have no business firing there."""
+    make_registry(tmp_path, local=SPARK_01)
+
+    assert not (tmp_path / "registry.json").exists()
+
+
+def test_enroll_local_probes_when_it_is_given_no_profile(tmp_path, monkeypatch):
+    """The gateway's fallback calls it with nothing to hand."""
+    monkeypatch.setattr(
+        "control_plane.registry.probe.probe_local",
+        lambda *a, **k: SPARK_01,
+    )
+    registry = make_registry(tmp_path)
+    assert registry.local_node_id is None
+
+    state = registry.enroll_local()
+
+    assert state.profile.node_id == "spark-01"
+    assert state.is_local is True
+    assert registry.local_node_id == "spark-01"
+
+
+def test_enrolling_settles_a_stale_candidate_for_the_same_machine(tmp_path):
+    """A machine cannot be its own candidate."""
+    registry = make_registry(tmp_path)
+    registry.offer_candidate(SPARK_01, "http://10.0.0.11:8081")
+    assert [c["node_id"] for c in registry.candidates()] == ["spark-01"]
+
+    registry.enroll_local(SPARK_01)
+
+    assert registry.candidates() == []
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["spark-01"]
+
+
+def test_starting_flushes_the_local_node_to_disk(tmp_path):
+    """The real path: startup.py constructs with a local_profile and calls
+    start(). Construction writes nothing, so if start() did not flush, a
+    coordinator that never admitted anyone would have no roster entry for
+    itself -- which is what shipped before."""
+    registry = make_registry(tmp_path, local=SPARK_01)
+    assert not (tmp_path / "registry.json").exists()
+
+    async def scenario():
+        await registry.start()
+        await registry.stop()
+
+    run(scenario())
+
+    stored = json.loads((tmp_path / "registry.json").read_text())
+    assert list(stored["members"]) == ["spark-01"]
+
+
+# ----------------------------------------------------------------------
+# Section: build identity, and profiles that stop being frozen at join
+#
+# A Raspberry Pi joined this cluster running an image that predated the CPU
+# probe. It reported device_class "unknown", the roster said "device class is
+# not recognized", and the machine was fine -- the software was stale. Nothing
+# could tell those two apart, and a profile written only at join meant that
+# even fixing the Pi would not have fixed the roster until it re-joined.
+# ----------------------------------------------------------------------
+
+
+def test_an_unknown_probe_never_overwrites_identified_hardware():
+    """probe_local is total: its answer for "could not look" is a valid
+    profile saying UNKNOWN. On a timer that would flap a GB10 out of the
+    serving pool every time nvidia-smi hiccuped."""
+    blind = make_profile("spark-01", device_class=DeviceClass.UNKNOWN)
+
+    assert profile_supersedes(blind, SPARK_01) is False
+
+
+def test_unknown_replaces_unknown():
+    """Nothing better to keep, so there is nothing to protect."""
+    stored = make_profile("x", device_class=DeviceClass.UNKNOWN)
+    fresh = make_profile("x", device_class=DeviceClass.UNKNOWN)
+
+    assert profile_supersedes(fresh, stored) is True
+
+
+def test_a_refresh_that_cannot_reach_the_node_keeps_what_we_had(tmp_path):
+    """Unreachable is not evidence the hardware changed."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    client.kill("http://10.0.0.12:8081")
+
+    assert run(registry.refresh_profile("spark-02")) is False
+    assert registry.get_node("spark-02").profile.device_class is DeviceClass.GB10
+
+
+def test_a_refresh_answering_as_a_different_node_is_refused(tmp_path):
+    """Same refusal handle_join makes on a probe-back mismatch: the machine at
+    that address is not the one we think it is."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+
+    client.serve("http://10.0.0.12:8081", WS_3090)
+    assert run(registry.refresh_profile("spark-02")) is False
+    assert registry.get_node("spark-02").profile.node_id == "spark-02"
+
+
+def test_an_unchanged_profile_reports_no_change(tmp_path):
+    """So the roster is not rewritten to disk once a minute forever."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+
+    assert run(registry.refresh_profile("spark-02")) is False
+
+
+def test_the_heartbeat_records_the_build_a_node_reports(tmp_path):
+    """Build identity rides the health round rather than needing a call of its
+    own -- the coordinator already dials every member every 5s."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    client.health_bodies["http://10.0.0.12:8081"] = {"status": "ok", "build": "abc123"}
+
+    run(registry.check_health("spark-02"))
+
+    assert registry.get_node("spark-02").build == "abc123"
+
+
+def test_an_agent_that_reports_no_build_does_not_blank_a_known_one(tmp_path):
+    """An older agent has no build key at all. Absence stays absence rather
+    than erasing what we already knew."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    client.health_bodies["http://10.0.0.12:8081"] = {"status": "ok", "build": "abc123"}
+    run(registry.check_health("spark-02"))
+
+    client.health_bodies["http://10.0.0.12:8081"] = {"status": "ok"}
+    run(registry.check_health("spark-02"))
+
+    assert registry.get_node("spark-02").build == "abc123"

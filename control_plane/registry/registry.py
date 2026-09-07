@@ -24,12 +24,14 @@ from control_plane.contracts import (
     NodeProfile,
     NodeState,
 )
+from control_plane.version import build_id
 
 from .client import AgentClient, HttpAgentClient
 from .config import (
     HEARTBEAT_INTERVAL_S,
     HEARTBEAT_MISSES_UNHEALTHY,
     HEARTBEAT_TIMEOUT_S,
+    PROFILE_REFRESH_INTERVAL_S,
     ROLE_COORDINATOR,
     RegistryConfig,
     TELEMETRY_INTERVAL_S,
@@ -45,6 +47,7 @@ from .identity import ClusterIdentity, load_or_create_identity
 from .labels import normalize_label
 from .net import normalize_agent_url
 from .probe import probe_local
+from .profiles import profile_supersedes
 from .reach import (
     COORDINATOR,
     PEER_REACH_TIMEOUT_S,
@@ -125,23 +128,17 @@ class Registry:
 
         self._load_roster()
 
-        self.local_profile = local_profile
-        self.local_node_id = local_profile.node_id if local_profile else None
+        self.local_profile = None
+        self.local_node_id = None
         if local_profile is not None:
             # We are a member of our own cluster from the first instant. Nobody
             # has to admit the machine they are looking at.
-            self._members[local_profile.node_id] = NodeState(
-                profile=local_profile,
-                healthy=True,
-                last_seen=self._clock(),
-                memory_used=0,
-                power_watts=0.0,
-                temperature_c=0.0,
-                utilization_pct=0.0,
-            )
-            self._agent_urls[local_profile.node_id] = (
-                f"http://{local_profile.address}:{self.config.agent_port}"
-            )
+            #
+            # persist=False: constructing a Registry must not write to the data
+            # directory. Forty-odd tests build one per case, and a process-start
+            # side effect firing under pytest is the thing startup.py refuses
+            # when it keeps `bootstrap_key` out of `create_agent_app`.
+            self.enroll_local(local_profile, persist=False)
 
     # ------------------------------------------------------------------
     # RegistryPort
@@ -496,6 +493,72 @@ class Registry:
             "status": "candidate",
         }
 
+    def enroll_local(
+        self, profile: NodeProfile | None = None, *, persist: bool = True
+    ) -> NodeState | None:
+        """Register the machine this coordinator is running on. No token.
+
+        The one enrollment nobody clicks Admit for, and the one nobody can
+        present a credential for either: there is no far side to probe back and
+        no network hop to authenticate. The machine is the process asking, so
+        the question the join flow exists to answer -- "is this peer allowed
+        in" -- has no content here. ``handle_join`` and the candidate step are
+        untouched; this is a different act, and deliberately not a shortcut
+        through them.
+
+        Idempotent by ``node_id``, which is what makes a restart safe: the id
+        is ``DERATE_NODE_ID`` or the slugified hostname, stable across a
+        process lifetime, so a second call replaces the entry in place rather
+        than adding a second row for the same machine. It is a replace and not
+        a no-op on purpose -- a re-probe after a driver install should update
+        the hardware, and the live readings are reset to unmeasured rather than
+        carried over, matching what ``_load_roster`` does with a restored
+        member.
+
+        ``profile`` defaults to probing this host. ``persist`` writes the
+        roster, which the constructor skips; see the note there.
+        """
+        if profile is None:
+            # Deferred, like every other import that reaches hardware: this
+            # module is imported by the gateway, and probing is a cost only the
+            # caller that actually wants a probe should pay.
+            from .probe import probe_local
+
+            profile = probe_local(node_id=self.config.node_id)
+
+        previous = self._members.get(profile.node_id)
+        self.local_profile = profile
+        self.local_node_id = profile.node_id
+        state = NodeState(
+            profile=profile,
+            healthy=True,
+            last_seen=self._clock(),
+            memory_used=0,
+            power_watts=0.0,
+            temperature_c=0.0,
+            utilization_pct=0.0,
+            is_local=True,
+        )
+        self._members[profile.node_id] = state
+        self._agent_urls[profile.node_id] = (
+            f"http://{profile.address}:{self.config.agent_port}"
+        )
+        self._misses[profile.node_id] = 0
+        # A machine cannot be its own candidate. If this id was sitting in the
+        # candidate list -- a stale record from before it was the coordinator,
+        # say -- it is settled now.
+        self._candidates.pop(profile.node_id, None)
+        if persist:
+            # The roster used to never learn about the local node: the
+            # constructor wrote it straight into `_members` and only an
+            # unrelated event that persisted for its own reasons ever flushed
+            # it. A coordinator that had admitted nobody therefore had a
+            # registry.json with no entry for the machine serving it.
+            self._persist_roster()
+        if previous is None:
+            log.info("enrolled the local node %s", profile.describe())
+        return state
+
     def offer_candidate(
         self, profile: NodeProfile, agent_url: str, source: str = SOURCE_MDNS
     ) -> dict:
@@ -753,19 +816,108 @@ class Registry:
     # ------------------------------------------------------------------
 
     async def check_health(self, node_id: str) -> bool:
-        """One health probe. Healthy means an answer inside the timeout."""
+        """One health probe. Healthy means an answer inside the timeout.
+
+        The body used to be discarded. It now carries the node's build, which
+        rides this heartbeat rather than needing a call of its own -- this
+        already runs every 5s against every member, and "which build is that
+        node on" is only interesting at about that resolution.
+        """
         if node_id == self.local_node_id:
-            return True  # we are the process asking
+            # We are the process asking, so our own build is the one running
+            # here. Recorded rather than skipped: the skew comparison needs
+            # both sides, and the coordinator is one of them.
+            state = self._members.get(node_id)
+            if state is not None:
+                state.build = build_id()
+            return True
         url = self._agent_urls.get(node_id)
         if not url:
             return False
         try:
-            await self._client.get_json(
+            body = await self._client.get_json(
                 f"{url.rstrip('/')}/agent/health", timeout=HEARTBEAT_TIMEOUT_S
             )
+            self._record_build(node_id, body)
             return True
         except ProbeFailed:
             return False
+
+    def _record_build(self, node_id: str, body: object) -> None:
+        """Store what the node said it is running, if it said anything.
+
+        An older agent has no ``build`` key at all, and that is not a reason to
+        blank what we already knew -- nor to invent one. Absence stays absence.
+        """
+        state = self._members.get(node_id)
+        if state is None or not isinstance(body, dict):
+            return
+        build = str(body.get("build") or "").strip()
+        if not build:
+            return
+        if build != state.build:
+            log.info("node %s is running build %s", node_id, build)
+        state.build = build
+
+    async def refresh_profile(self, node_id: str) -> bool:
+        """Re-read one member's hardware. True when the stored profile changed.
+
+        Until this existed, ``handle_join`` was the only writer of a stored
+        profile, so a node that was upgraded, or had a driver installed, kept
+        reporting whatever it happened to be when it first knocked -- and the
+        only cure was restarting its container so it re-joined. A Raspberry Pi
+        sat in the roster as unidentified hardware for exactly that reason.
+
+        Guarded by ``profile_supersedes``: a probe that fails produces a valid
+        profile saying UNKNOWN, and on a timer that would flap an identified
+        node in and out of the serving pool. See that function for why the
+        filter is only on absence and never on a different answer.
+        """
+        if node_id == self.local_node_id:
+            # Our own hardware, read directly rather than over a loopback HTTP
+            # call to ourselves -- the same shortcut check_health takes.
+            fresh = await asyncio.to_thread(probe_local, node_id)
+        else:
+            url = self._agent_urls.get(node_id)
+            if not url:
+                return False
+            try:
+                fresh = await self.probe_remote(url)
+            except ProbeFailed:
+                return False  # unreachable is not evidence the hardware moved
+
+        state = self._members.get(node_id)
+        if state is None:
+            return False
+        if fresh.node_id != node_id:
+            # The machine at that address is not the one we think it is. Same
+            # refusal handle_join makes on a probe-back mismatch.
+            log.warning(
+                "refresh of %s answered as %s; keeping what we had",
+                node_id,
+                fresh.node_id,
+            )
+            return False
+        if not profile_supersedes(fresh, state.profile) or fresh == state.profile:
+            return False
+        log.info(
+            "node %s hardware changed: %s -> %s",
+            node_id,
+            state.profile.device_class.value,
+            fresh.device_class.value,
+        )
+        state.profile = fresh
+        if node_id == self.local_node_id:
+            self.local_profile = fresh
+        self._persist_roster()
+        return True
+
+    async def refresh_round(self) -> None:
+        """Re-read every member's hardware. One tick of the slow loop."""
+        await asyncio.gather(
+            *(self.refresh_profile(n) for n in list(self._members)),
+            return_exceptions=True,
+        )
 
     def record_health(self, node_id: str, ok: bool) -> None:
         """Three consecutive failures marks unhealthy. One success clears it.
@@ -998,7 +1150,20 @@ class Registry:
     # Background loops
     # ------------------------------------------------------------------
 
-    async def _loop(self, fn: Callable, interval: float, name: str) -> None:
+    async def _loop(
+        self, fn: Callable, interval: float, name: str, prime: bool = True
+    ) -> None:
+        """Run *fn* every *interval* seconds until stopped.
+
+        ``prime=False`` sleeps before the first call instead of after it. Health
+        and telemetry want the opposite -- they prime so the UI does not open on
+        a row of zeros -- but hardware was read moments ago by ``start_node``,
+        so an immediate re-probe would shell out to nvidia-smi to re-learn what
+        we just learned, on every process start and in every test that starts a
+        registry.
+        """
+        if not prime:
+            await asyncio.sleep(interval)
         while self._running:
             started = asyncio.get_running_loop().time()
             try:
@@ -1015,6 +1180,13 @@ class Registry:
         if self._running:
             return
         self._running = True
+        # Flush the local node to disk, which construction deliberately did not
+        # do. This is the seam where a process really is starting, so the write
+        # belongs here rather than in __init__ -- and without it a coordinator
+        # that never admitted anyone keeps a registry.json with no entry for
+        # the machine serving it, which is the state this used to ship in.
+        if self.local_profile is not None:
+            self._persist_roster()
         # Prime once before the loops start. Otherwise the first snapshot goes
         # out before the first poll lands and the UI opens on a row of zeros,
         # which reads as an idle node rather than an unpolled one.
@@ -1030,6 +1202,18 @@ class Registry:
             asyncio.create_task(
                 self._loop(self.telemetry_round, TELEMETRY_INTERVAL_S, "telemetry"),
                 name="registry-telemetry",
+            ),
+            # Hardware, two orders of magnitude slower than telemetry. A
+            # profile used to be written once, at join, so an upgraded node
+            # kept reporting whatever it was when it first knocked.
+            asyncio.create_task(
+                self._loop(
+                    self.refresh_round,
+                    PROFILE_REFRESH_INTERVAL_S,
+                    "profile-refresh",
+                    prime=False,
+                ),
+                name="registry-profiles",
             ),
         ]
 

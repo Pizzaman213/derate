@@ -51,12 +51,31 @@ if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
     docker buildx create --name "$BUILDER" --driver docker-container --bootstrap
 fi
 
+# The build this image is made from, stamped in so a running node can say what
+# it is. Resolved here rather than inside the Dockerfile because the build
+# context does not carry .git, and a container that cannot name its own build
+# is how an old image comes to read as broken hardware.
+if [ -z "${DERATE_BUILD:-}" ]; then
+    DERATE_BUILD="$(git rev-parse --short=12 HEAD 2>/dev/null || echo "")"
+    if [ -n "$DERATE_BUILD" ] && ! git diff --quiet HEAD 2>/dev/null; then
+        # Shipping a dirty tree is a real thing people do under deadline. Say
+        # so in the id rather than implying the SHA is reproducible.
+        DERATE_BUILD="${DERATE_BUILD}+dirty"
+    fi
+fi
+if [ -n "$DERATE_BUILD" ]; then
+    echo "==> build id ${DERATE_BUILD}"
+else
+    echo "==> no build id available; this image will report an unidentified build" >&2
+fi
+
 echo "==> building ${IMAGE}:${TAG} for ${PLATFORMS}"
 if ! docker buildx build \
     --builder "$BUILDER" \
     --platform "$PLATFORMS" \
     --build-arg "SPARKRUN_VERSION=${SPARKRUN_VERSION}" \
     --build-arg "SKIP_UI=${SKIP_UI}" \
+    --build-arg "DERATE_BUILD=${DERATE_BUILD}" \
     --tag "${IMAGE}:${TAG}" \
     "${OUTPUT[@]}" \
     "$ROOT"
