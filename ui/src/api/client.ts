@@ -143,7 +143,19 @@ export interface Backend {
   /** The largest model that runs right now, and the same question against
    *  the idle-hardware ceiling. The fit gate answers; nothing is computed
    *  in the browser. */
-  capacity(context: number, concurrency: number): Promise<CapacityReport>
+  /** What runs on this cluster, and how fast.
+   *
+   *  Both arguments are nullable, and null is NOT "use the default" -- it is a
+   *  different question. A null context asks the coordinator to choose one per
+   *  model out of what actually fits, clamped to each model's own window, and
+   *  the answer comes back on `CapacityRow.context`. That is the default path,
+   *  and it is what lets a fresh install with nothing configured show real
+   *  verdicts. Sending a number instead answers a narrower question and prints
+   *  it as though somebody had asked it. */
+  capacity(
+    context: number | null,
+    concurrency: number | null,
+  ): Promise<CapacityReport>
   /** The contract's own quantization table. Fetched, never re-typed here: a
    *  second copy of these byte figures is a second answer, and the one that
    *  disagrees with the fit gate is the one that gets somebody an OOM. */
@@ -691,11 +703,18 @@ export const httpBackend: Backend = {
         `&context=${opts?.context ?? 8192}` +
         `&concurrency=${opts?.concurrency ?? 1}`,
     ),
-  capacity: (context, concurrency) =>
-    req<CapacityReport>(
-      `/api/capacity?context=${encodeURIComponent(context)}` +
-        `&concurrency=${encodeURIComponent(concurrency)}`,
-    ),
+  capacity: (context, concurrency) => {
+    // Omitted rather than defaulted. An absent parameter is what asks the
+    // coordinator to choose; sending a number it did not choose would put a
+    // figure next to a row it was not computed for.
+    const params = [
+      context === null ? null : `context=${encodeURIComponent(context)}`,
+      concurrency === null ? null : `concurrency=${encodeURIComponent(concurrency)}`,
+    ].filter((p): p is string => p !== null)
+    return req<CapacityReport>(
+      `/api/capacity${params.length ? `?${params.join('&')}` : ''}`,
+    )
+  },
   stopDeployment: (deploymentId) =>
     req<void>(`/api/deployments/${encodeURIComponent(deploymentId)}`, {
       method: 'DELETE',
