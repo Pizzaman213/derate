@@ -60,6 +60,11 @@ class ParamBreakdown:
     def as_dict(self) -> dict[str, int]:
         data = {k: int(v) for k, v in asdict(self).items()}
         data["total"] = self.total
+        # Both totals, because they answer different questions and a reader
+        # comparing our figure against the repo's own "N B parameters" needs
+        # the second one to see why they differ. `total` is what a runtime
+        # loads; `total_with_mtp` is what the weight index counts.
+        data["total_with_mtp"] = self.total_with_mtp
         return data
 
 

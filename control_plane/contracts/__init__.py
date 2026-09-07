@@ -19,7 +19,14 @@ from .constants import (
     TP_VIABLE_THRESHOLD,
 )
 from .deployment import Deployment, DeploymentState
-from .hardware import DeviceClass, LinkMeasurement, NodeProfile, NodeState
+from .hardware import (
+    DeviceClass,
+    GpuProcess,
+    LinkMeasurement,
+    NodeProfile,
+    NodeState,
+)
+from .modality import ENDPOINT_FOR_MODALITY, Modality
 from .model import ModelShape
 from .plan import (
     FitRequest,
@@ -58,12 +65,15 @@ __all__ = [
     "DeploymentPort",
     "DeploymentState",
     "DeviceClass",
+    "ENDPOINT_FOR_MODALITY",
     "FitPort",
     "FitRequest",
     "FitResult",
+    "GpuProcess",
     "LinkMeasurement",
     "LinkPort",
     "MemoryBreakdown",
+    "Modality",
     "ModelShape",
     "NodeProfile",
     "NodeState",

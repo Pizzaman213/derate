@@ -2,7 +2,7 @@
 
 Every port a coordinator built here is real: the same Registry, LinkService,
 ModelResolver, FitCalculator, Planner, DeploymentManager and ProviderService
-node.py wires in production. mDNS is never exercised: SPARKPLANE_ROLE is
+node.py wires in production. mDNS is never exercised: DERATE_ROLE is
 always set explicitly, and ``resolve_role`` returns immediately for
 ``coordinator`` without a browse (control_plane/registry/bootstrap.py), so
 these tests build a real Registry directly rather than going through the

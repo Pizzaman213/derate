@@ -6,7 +6,10 @@ import { Lamp } from '../components/Lamp'
 
 const DESTS: { id: Dest; label: string }[] = [
   { id: 'dash', label: 'Dashboard' },
+  { id: 'models', label: 'Models' },
   { id: 'cluster', label: 'Cluster' },
+  { id: 'storage', label: 'Storage' },
+  { id: 'chat', label: 'Chat' },
   { id: 'spend', label: 'Spend' },
   { id: 'settings', label: 'Settings' },
 ]
@@ -55,8 +58,6 @@ export function Header({ dest, onSelectDest }: Props) {
         derate
       </span>
 
-      {/* Identifiers and the localStorage key stay `sparkplane` -- only the
-          visible wordmark above is the rebrand. */}
       {cluster.data ? (
         <span className="pill mono">
           {nodes.length} nodes · {nodes.filter((n) => n.healthy).length} healthy ·{' '}
@@ -105,16 +106,14 @@ export function Header({ dest, onSelectDest }: Props) {
 }
 
 // ── Theme ────────────────────────────────────────────────────────────────────
-// Transplanted from the old App.tsx verbatim: dark mode is a token swap, and
-// the localStorage key stays `sparkplane.theme` even though the wordmark now
-// reads `derate`.
+// Transplanted from the old App.tsx verbatim: dark mode is a token swap.
 
 type Theme = 'system' | 'light' | 'dark'
 
 /** Dark mode is a token swap. Nothing here touches a component. */
 function useTheme(): void {
   useEffect(() => {
-    const stored = (localStorage.getItem('sparkplane.theme') as Theme) ?? 'system'
+    const stored = (localStorage.getItem('derate.theme') as Theme) ?? 'system'
     apply(stored)
   }, [])
 }
@@ -123,12 +122,12 @@ function apply(theme: Theme) {
   const root = document.documentElement
   if (theme === 'system') root.removeAttribute('data-theme')
   else root.setAttribute('data-theme', theme)
-  localStorage.setItem('sparkplane.theme', theme)
+  localStorage.setItem('derate.theme', theme)
 }
 
 function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem('sparkplane.theme') as Theme) ?? 'system',
+    () => (localStorage.getItem('derate.theme') as Theme) ?? 'system',
   )
   return (
     <label>

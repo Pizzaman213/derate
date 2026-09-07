@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from control_plane.contracts import DeviceClass, NodeProfile, NodeState
+from control_plane.contracts import DeviceClass, GpuProcess, NodeProfile, NodeState
 
 from .telemetry import TelemetrySample
 
@@ -55,6 +55,9 @@ def state_to_dict(state: NodeState) -> dict:
         "profile": profile_to_dict(state.profile),
         "healthy": state.healthy,
         "last_seen": state.last_seen,
+        # None, not 0.0: "never sampled" and "sampled at the epoch" are
+        # different answers and only one of them is real.
+        "sample_ts": state.sample_ts or None,
         "memory_used": state.memory_used,
         "memory_used_pct": memory_used_pct(state),
         "power_w": round(state.power_watts, 1),
@@ -70,3 +73,69 @@ def telemetry_to_dict(node_id: str, sample: TelemetrySample | None) -> dict:
     payload["node_id"] = node_id
     payload["available"] = True
     return payload
+
+
+def processes_to_dict(
+    node_id: str, processes: list[GpuProcess] | None
+) -> dict:
+    """The resident-process payload, with its own reason for being empty.
+
+    ``available: false`` and ``processes: []`` are different answers and the UI
+    renders them differently. An unreadable nvidia-smi is not an idle GPU, and a
+    container without ``--pid=host`` sees no compute apps at all -- telling an
+    operator "nothing is resident" in either case is how they conclude the
+    memory is free when it is not.
+    """
+    if processes is None:
+        return {
+            "node_id": node_id,
+            "processes": [],
+            "available": False,
+            "reason": (
+                "nvidia-smi did not answer on this node, so what is holding GPU "
+                "memory could not be read."
+            ),
+        }
+    if not processes:
+        return {
+            "node_id": node_id,
+            "processes": [],
+            "available": True,
+            "reason": (
+                "No compute contexts are resident. If a model is running here, "
+                "the container is missing --pid=host and cannot see it."
+            ),
+        }
+    return {
+        "node_id": node_id,
+        "processes": [p.as_dict() for p in processes],
+        "available": True,
+        "reason": None,
+    }
+
+
+def storage_to_dict(payload: dict | None, node_id: str) -> dict:
+    """The storage payload, with its own reason for being empty.
+
+    Same shape and same rule as ``processes_to_dict`` above: ``available:
+    false`` is a different answer from an empty estate, and a storage screen
+    that renders "0 bytes free" for a node it could not reach is how somebody
+    concludes a disk is full when it is fine.
+    """
+    if payload is None:
+        return {
+            "node_id": node_id,
+            "filesystems": [],
+            "estate": [],
+            "unreadable": [],
+            "available": False,
+            "reason": (
+                "The data root could not be read on this node, so its disk "
+                "usage is unknown."
+            ),
+        }
+    out = dict(payload)
+    out["node_id"] = node_id
+    out["available"] = True
+    out["reason"] = None
+    return out

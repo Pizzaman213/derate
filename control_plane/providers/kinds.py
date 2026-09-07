@@ -36,6 +36,8 @@ class KindSpec:
     chat_path: str = "chat/completions"
     completions_path: str = "completions"
     embeddings_path: str = "embeddings"
+    speech_path: str = "audio/speech"
+    transcriptions_path: str = "audio/transcriptions"
     requires_key: bool = True
     requires_base_url: bool = False
     # OpenAI's stream_options.include_usage. Only set it where the upstream is

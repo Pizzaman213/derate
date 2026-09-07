@@ -1,13 +1,13 @@
 # The container
 
-One image, `sparkplane/node`, on every machine. Role is resolved at runtime.
+One image, `ghcr.io/pizzaman213/derate/node`, on every machine. Role is resolved at runtime.
 There is no coordinator image and no worker image, and there is no second
 service for the UI.
 
 ## Run it
 
 ```bash
-docker run --network host -v sparkplane:/data sparkplane/node
+docker run --network host --gpus all --pid=host -v derate:/data ghcr.io/pizzaman213/derate/node
 ```
 
 That is the whole install. The first node finds no coordinator, becomes one,
@@ -18,13 +18,14 @@ To also launch inference backends, the container needs the host's sparkrun
 config and its SSH identity, because sparkrun drives the cluster over SSH:
 
 ```bash
-docker run -d --name sparkplane \
+docker run -d --name derate \
   --network host \
+  --gpus all --pid=host \
   --restart unless-stopped \
-  -v sparkplane:/data \
+  -v derate:/data \
   -v "$HOME/.config/sparkrun:/root/.config/sparkrun:ro" \
   -v "$HOME/.ssh:/root/.ssh:ro" \
-  sparkplane/node
+  ghcr.io/pizzaman213/derate/node
 ```
 
 Without those two mounts everything else still works -- discovery, the
@@ -44,14 +45,48 @@ anything -- silent, and indistinguishable from "there is no second node".
 So the container checks at startup and refuses:
 
 ```
-sparkplane refuses to start: this container is on bridge networking.
+derate refuses to start: this container is on bridge networking.
 ...
 Start it again with --network host:
-    docker run --network host -v sparkplane:/data sparkplane/node
+    docker run --network host -v derate:/data ghcr.io/pizzaman213/derate/node
 ```
 
-`SPARKPLANE_ALLOW_BRIDGE=1` downgrades this to a loud warning. It is
+`DERATE_ALLOW_BRIDGE=1` downgrades this to a loud warning. It is
 unsupported and discovery will not work.
+
+## `--gpus all --pid=host` is not optional either
+
+The probe is `nvidia-smi`. A container without the GPU has no `nvidia-smi`,
+and a node whose probe finds no `nvidia-smi` is not an error -- it is a
+`NodeProfile` with `device_class=UNKNOWN`, no GPU name, and zeroed memory,
+because `registry/probe.py` never raises. That node joins, reports healthy,
+and sits in the roster reading
+
+```
+worker-docker   0W   0°C   0% GPU utilisation   —% memory used
+```
+
+with `ineligible_reason: "device class is not recognized"`. Nothing has
+failed, so nothing says so, and the node is simply never planned onto.
+
+`--pid=host` is part of the same requirement rather than a second one. On
+GB10 every aggregate FB memory field reports `[N/A]` -- unified memory, no
+discrete framebuffer to describe -- so `--query-compute-apps` is the only
+thing that separates a resident model from the desktop, and that is the
+difference the fit check turns on. `nvidia-smi` reports the processes it can
+see, and inside its own PID namespace it can see none of the ones holding
+the pool: `gpu_memory_used` reads 0 and every byte gets attributed to the
+operating system.
+
+`install.sh` passes both when the host has an NVIDIA driver. If Docker then
+refuses them -- the driver is present but the NVIDIA container toolkit is
+not -- it retries without, and says what was lost rather than leaving the
+machine uninstalled. `--no-gpu` skips them deliberately.
+
+The image also sets `NVIDIA_VISIBLE_DEVICES=all` and
+`NVIDIA_DRIVER_CAPABILITIES=utility`, so a host that has made the NVIDIA
+runtime its default needs no flag at all. `utility` is nvidia-smi and NVML
+and nothing else, which is all this image ever wants a GPU for.
 
 ## Configuration
 
@@ -59,21 +94,22 @@ Every variable has a working default, so first run needs none.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SPARKPLANE_ROLE` | `auto` | `coordinator` or `worker` forces the role |
-| `SPARKPLANE_PORT` | `8080` | gateway and UI, coordinator only |
-| `SPARKPLANE_AGENT_PORT` | `8081` | node agent, both roles |
-| `SPARKPLANE_TOKEN` | generated | cluster join token; generated and persisted on first run |
-| `SPARKPLANE_JOIN` | mDNS | an address, to skip discovery on another subnet |
-| `SPARKPLANE_DATA` | `/data` | persisted state |
-| `SPARKPLANE_VLLM_IMAGE` | see `flags.py` | container image for vLLM backends |
-| `SPARKPLANE_SGLANG_IMAGE` | see `flags.py` | container image for SGLang backends |
-| `SPARKPLANE_ALLOW_BRIDGE` | unset | bypass the host-networking check, unsupported |
-| `SPARKPLANE_LOG_LEVEL` | `INFO` | root log level |
-| `SPARKPLANE_TELEMETRY` | `1` | `0` records nothing, anywhere |
-| `SPARKPLANE_TELEMETRY_RETENTION_DAYS` | `30` | raw-sample horizon; rollups outlive it |
-| `SPARKPLANE_TELEMETRY_LOG_LEVEL` | `INFO` | floor for log lines that reach the journal |
-| `SPARKPLANE_TELEMETRY_MAX_BYTES` | 512 MiB | ceiling on a node's own journal |
-| `SPARKPLANE_TELEMETRY_SHIP_INTERVAL_S` | `5` | how often the coordinator collects |
+| `DERATE_ROLE` | `auto` | `coordinator` or `worker` forces the role |
+| `DERATE_PORT` | `8080` | gateway and UI, coordinator only |
+| `DERATE_AGENT_PORT` | `8081` | node agent, both roles |
+| `DERATE_TOKEN` | generated | cluster join token, or an enrollment token from the UI; the permanent one is generated and persisted on first run |
+| `DERATE_JOIN` | mDNS | an address, to skip discovery on another subnet |
+| `DERATE_DATA` | `/data` | persisted state |
+| `DERATE_VLLM_IMAGE` | see `flags.py` | container image for vLLM backends |
+| `DERATE_SGLANG_IMAGE` | see `flags.py` | container image for SGLang backends |
+| `DERATE_ALLOW_BRIDGE` | unset | bypass the host-networking check, unsupported |
+| `DERATE_LOG_LEVEL` | `INFO` | root log level |
+| `DERATE_TELEMETRY` | `1` | `0` records nothing, anywhere |
+| `DERATE_TELEMETRY_RETENTION_DAYS` | `30` | raw-sample horizon; rollups outlive it |
+| `DERATE_TELEMETRY_LOG_LEVEL` | `INFO` | floor for log lines that reach the journal |
+| `DERATE_TELEMETRY_MAX_BYTES` | 512 MiB | ceiling on a node's own journal |
+| `DERATE_TELEMETRY_SHIP_INTERVAL_S` | `5` | how often the coordinator collects |
+| `DERATE_INSTALL_SH` | in-image | the script served at `GET /install.sh` |
 
 Host networking ignores published ports, so a port collision here is a
 collision with something already on the machine. The container says which

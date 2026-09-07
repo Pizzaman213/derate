@@ -7,6 +7,7 @@ import type { Cluster, RoutingConfig, Settings } from '../api/types'
 import type { SafeMetricsFrame } from '../state/useMetrics'
 import { NodeInspector } from '../inspectors/NodeInspector'
 import { DeploymentInspector } from '../inspectors/DeploymentInspector'
+import { ModelInspector } from '../tabs/models/ModelInspector'
 
 // The one modal host (mockups-next: a single `#sheet`/`#cardBody` pair reused
 // by both the node inspector and the deployment inspector). Each inspector
@@ -104,7 +105,9 @@ export function Sheet() {
 
   if (!sheet) return null
 
-  const wide = sheet.kind === 'dep'
+  // A model carries a quantization ladder, which needs the wide card for
+  // the same reason the deployment inspector does.
+  const wide = sheet.kind === 'dep' || sheet.kind === 'model'
 
   return createPortal(
     <div
@@ -121,7 +124,13 @@ export function Sheet() {
         className={wide ? 'card wide' : 'card'}
         role="dialog"
         aria-modal="true"
-        aria-label={sheet.kind === 'node' ? sheet.id : `${sheet.id} deployment`}
+        aria-label={
+          sheet.kind === 'node'
+            ? sheet.id
+            : sheet.kind === 'model'
+              ? `${sheet.id} quantizations`
+              : `${sheet.id} deployment`
+        }
         tabIndex={-1}
       >
         <SheetBody
@@ -160,6 +169,19 @@ function SheetBody({
   stale: boolean
   onClose: () => void
 }) {
+  if (sheet.kind === 'model') {
+    // Resolves itself: a model is not something the cluster roster holds, and
+    // both of its payloads are hub-bound and belong outside `resources.ts`.
+    return (
+      <ModelInspector
+        modelId={sheet.id}
+        context={sheet.context}
+        concurrency={sheet.concurrency}
+        onClose={onClose}
+      />
+    )
+  }
+
   if (sheet.kind === 'node') {
     const node = cluster?.nodes.find((n) => n.profile.node_id === sheet.id)
     if (!node) return <Gone id={sheet.id} onClose={onClose} />

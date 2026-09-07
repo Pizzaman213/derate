@@ -61,4 +61,4 @@ COST_BLEND_OUTPUT_WEIGHT = 0.75
 
 def data_dir() -> Path:
     """Where persistent state lives. ``/data`` in the container."""
-    return Path(os.environ.get("SPARKPLANE_DATA_DIR", "/data"))
+    return Path(os.environ.get("DERATE_DATA_DIR", "/data"))

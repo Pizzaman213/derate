@@ -49,7 +49,7 @@ class LinkService:
         self._registry = registry
         self._measurer = measurer or default_measurer(clock=clock)
         self._clock = clock
-        self._local_node_id = local_node_id or os.environ.get("SPARKPLANE_NODE_ID")
+        self._local_node_id = local_node_id or os.environ.get("DERATE_NODE_ID")
         self._data_plane = dict(data_plane_addresses or {})
         # Serialises probes without touching readers.
         self._measure_lock = threading.Lock()
@@ -202,7 +202,7 @@ class LinkService:
         management IP the registry knows may not be on the ConnectX-7 fabric at
         all -- and measuring the management LAN would answer the wrong question.
         """
-        host = self._data_plane.get(node_id) or os.environ.get(f"SPARKPLANE_DATAPLANE_{_env_key(node_id)}")
+        host = self._data_plane.get(node_id) or os.environ.get(f"DERATE_DATAPLANE_{_env_key(node_id)}")
         if not host and self._registry is not None:
             state = self._registry.get_node(node_id)
             if state is not None:
@@ -238,12 +238,12 @@ def _local_names() -> frozenset[str]:
         for info in socket.getaddrinfo(hostname, None):
             names.add(info[4][0])
     except OSError:  # pragma: no cover - a box that cannot resolve its own name
-        log.debug("could not determine local hostname; relying on SPARKPLANE_NODE_ID")
+        log.debug("could not determine local hostname; relying on DERATE_NODE_ID")
     return frozenset(names)
 
 
 def _default_store_path() -> str:
-    return os.path.join(os.environ.get("SPARKPLANE_DATA_DIR", DEFAULT_DATA_DIR), DEFAULT_STORE_NAME)
+    return os.path.join(os.environ.get("DERATE_DATA_DIR", DEFAULT_DATA_DIR), DEFAULT_STORE_NAME)
 
 
 def _env_key(node_id: str) -> str:

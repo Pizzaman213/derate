@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .modality import Modality
+
 
 class ProviderKind(str, Enum):
     OPENROUTER = "openrouter"
@@ -29,6 +31,10 @@ class ProviderModel:
     supports_tools: bool
     input_cost_per_mtok: float | None  # USD, None when unknown
     output_cost_per_mtok: float | None
+    # Inferred from the upstream id by providers/discovery.py, which is a
+    # heuristic -- so it only ever moves a model off the TEXT default when
+    # the id says so plainly.
+    modality: Modality = Modality.TEXT
 
 
 @dataclass

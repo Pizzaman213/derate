@@ -18,6 +18,7 @@ from control_plane.contracts import (
     Deployment,
     DeploymentState,
     LinkMeasurement,
+    Modality,
     ModelShape,
     ParallelismKind,
     ParallelismPlan,
@@ -269,7 +270,9 @@ class StubDeployments:
             ),
         ]
 
-    def launch(self, shape, plan, fit, runtime, ctx, max_seqs) -> Deployment:
+    def launch(
+        self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=Modality.TEXT
+    ) -> Deployment:
         dep = _deployment(
             f"d-{len(self._deployments) + 1}",
             shape.model_id.split("/")[-1].lower(),

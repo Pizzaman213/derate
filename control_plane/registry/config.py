@@ -26,7 +26,7 @@ def _const(name: str, default: Any) -> Any:
 
 
 # Discovery
-MDNS_SERVICE_TYPE = _const("MDNS_SERVICE_TYPE", "_sparkplane._tcp.local.")
+MDNS_SERVICE_TYPE = _const("MDNS_SERVICE_TYPE", "_derate._tcp.local.")
 MDNS_BROWSE_SECONDS = _const("MDNS_BROWSE_SECONDS", 3.0)
 
 # Health: 5 s cadence, 2 s timeout, 3 consecutive misses. Worst case an
@@ -90,26 +90,26 @@ class RegistryConfig:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "RegistryConfig":
         env = os.environ if env is None else env
-        role = (env.get("SPARKPLANE_ROLE") or ROLE_AUTO).strip().lower()
+        role = (env.get("DERATE_ROLE") or ROLE_AUTO).strip().lower()
         if role not in VALID_ROLES:
             raise ValueError(
-                f"SPARKPLANE_ROLE={role!r} is not one of {', '.join(VALID_ROLES)}"
+                f"DERATE_ROLE={role!r} is not one of {', '.join(VALID_ROLES)}"
             )
         return cls(
             role=role,
-            token=env.get("SPARKPLANE_TOKEN") or None,
-            join_address=env.get("SPARKPLANE_JOIN") or None,
-            agent_port=_int(env, "SPARKPLANE_AGENT_PORT", DEFAULT_AGENT_PORT),
+            token=env.get("DERATE_TOKEN") or None,
+            join_address=env.get("DERATE_JOIN") or None,
+            agent_port=_int(env, "DERATE_AGENT_PORT", DEFAULT_AGENT_PORT),
             coordinator_port=_int(
-                env, "SPARKPLANE_PORT", DEFAULT_COORDINATOR_PORT
+                env, "DERATE_PORT", DEFAULT_COORDINATOR_PORT
             ),
-            data_dir=Path(env.get("SPARKPLANE_DATA_DIR") or "/data"),
-            node_id=env.get("SPARKPLANE_NODE_ID") or None,
-            cluster_id=env.get("SPARKPLANE_CLUSTER_ID") or None,
-            allow_bridge=(env.get("SPARKPLANE_ALLOW_BRIDGE") or "").lower()
+            data_dir=Path(env.get("DERATE_DATA_DIR") or "/data"),
+            node_id=env.get("DERATE_NODE_ID") or None,
+            cluster_id=env.get("DERATE_CLUSTER_ID") or None,
+            allow_bridge=(env.get("DERATE_ALLOW_BRIDGE") or "").lower()
             in ("1", "true", "yes"),
             host_memory_reserve=_int(
-                env, "SPARKPLANE_HOST_RESERVE_MIB", HOST_MEMORY_RESERVE // 1024**2
+                env, "DERATE_HOST_RESERVE_MIB", HOST_MEMORY_RESERVE // 1024**2
             )
             * 1024**2,
         )

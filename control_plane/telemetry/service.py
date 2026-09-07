@@ -77,7 +77,7 @@ class Telemetry:
     @classmethod
     def from_env(cls, root: Path | str | None = None, node_id: str = "") -> "Telemetry":
         if not config.enabled():
-            return cls.disabled("SPARKPLANE_TELEMETRY is off")
+            return cls.disabled("DERATE_TELEMETRY is off")
         base = Path(root) if root is not None else config.data_dir()
         if not base.is_dir():
             # Not an error. It is how a dev machine and the test suite stay

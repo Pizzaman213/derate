@@ -5,6 +5,16 @@
 // ever puts key material in a response, it dies here instead of on screen.
 //
 // There is deliberately no inverse of this function, and no reveal control.
+//
+// One credential is nevertheless rendered: the enrollment token in the install
+// command on Settings -> Add a node. It arrives inside `Enrollment.command` --
+// a whole composed shell line, not a field named `token` -- so it passes this
+// filter, and that is a decision rather than an oversight. The bound that makes
+// it acceptable is what the token IS: minted on demand for one install, spent
+// on first use, expiring within the hour, revocable from the same card. No
+// endpoint returns the permanent cluster token, which is the secret this
+// filter exists to keep off the screen; before this, the documented way to add
+// a machine was to copy that one by hand.
 
 const KEY_LIKE = /^(api_?key|secret|token|authorization|auth|password|bearer)$/i
 

@@ -34,10 +34,26 @@ from .config import (
     RegistryConfig,
     TELEMETRY_INTERVAL_S,
 )
+from .enrollment import (
+    DEFAULT_TTL_S,
+    DEFAULT_USES,
+    EnrollmentStore,
+    EnrollmentToken,
+)
 from .errors import JoinRejected, NodeNotFound, ProbeFailed
 from .identity import ClusterIdentity, load_or_create_identity
+from .labels import normalize_label
 from .net import normalize_agent_url
 from .probe import probe_local
+from .reach import (
+    COORDINATOR,
+    PEER_REACH_TIMEOUT_S,
+    REACH_TIMEOUT_S,
+    ReachLeg,
+    dial,
+    self_leg,
+    summarize,
+)
 from .roster import load_roster, save_roster
 from .serde import memory_used_pct, profile_from_dict, profile_to_dict, state_to_dict
 from .telemetry import (
@@ -52,6 +68,12 @@ log = logging.getLogger(__name__)
 SOURCE_MDNS = "mdns"
 SOURCE_JOIN = "join"
 SOURCE_MANUAL = "manual"
+# Arrived holding an enrollment token, so it was admitted on arrival. The
+# candidate record it labels exists only for the instant between the
+# probe-back and the promotion -- `admit` pops it, and the member roster
+# keeps profile and agent_url only -- so this never reaches disk. It is here
+# so the record is not mislabelled as a plain "join" on the way past.
+SOURCE_ENROLL = "enroll"
 
 
 class Registry:
@@ -70,6 +92,7 @@ class Registry:
         client: AgentClient | None = None,
         clock: Callable[[], float] = time.time,
         identity: ClusterIdentity | None = None,
+        enrollment: EnrollmentStore | None = None,
     ) -> None:
         self.config = config or RegistryConfig()
         self._clock = clock
@@ -81,10 +104,19 @@ class Registry:
             cluster_id=self.config.cluster_id,
             token=self.config.token,
         )
+        # Short-lived credentials the UI mints so a new machine can be
+        # installed with one command and be a member when it finishes.
+        # Shares the data dir with the identity, and the same 0600 rule.
+        self._enrollment = enrollment or EnrollmentStore(
+            self.config.data_dir, clock=self._clock
+        )
 
         self._members: dict[str, NodeState] = {}
         self._candidates: dict[str, dict] = {}
         self._agent_urls: dict[str, str] = {}
+        # node_id -> operator-chosen display name. Sparse on purpose: a node
+        # nobody renamed has no entry, not an entry equal to its node_id.
+        self._labels: dict[str, str] = {}
         self._misses: dict[str, int] = {}
         self._telemetry = TelemetryStore()
         self._tasks: list[asyncio.Task] = []
@@ -159,6 +191,48 @@ class Registry:
         }
 
     # ------------------------------------------------------------------
+    # Display names
+    # ------------------------------------------------------------------
+
+    def node_label(self, node_id: str) -> str | None:
+        """The operator's name for this node, or None if nobody renamed it."""
+        return self._labels.get(node_id)
+
+    def node_labels(self) -> dict[str, str]:
+        """Every label that is set. The gateway sends this with each payload."""
+        return dict(self._labels)
+
+    def set_node_label(self, node_id: str, label: object) -> str | None:
+        """Rename a node for display. Returns the stored label, or None.
+
+        Only members can be renamed: a candidate is a proposal, and naming one
+        would leave the name stranded if it is never admitted. `node_id` is
+        untouched -- deployments, links and routing keep referring to the node
+        by the id they were written against, and this changes nothing but what
+        the UI calls it.
+
+        Raises NodeNotFound for an unknown id and ValueError for a name that
+        cannot be rendered.
+        """
+        if node_id not in self._members:
+            raise NodeNotFound(f"no member {node_id!r}")
+        clean = normalize_label(label)
+        previous = self._labels.get(node_id)
+        if clean is None:
+            self._labels.pop(node_id, None)
+        else:
+            self._labels[node_id] = clean
+        if clean != previous:
+            log.info(
+                "node %s renamed: %s -> %s",
+                node_id,
+                previous or "(no name)",
+                clean or "(no name)",
+            )
+            self._persist_roster()
+        return clean
+
+    # ------------------------------------------------------------------
     # Roster persistence (M-12)
     # ------------------------------------------------------------------
 
@@ -189,6 +263,14 @@ class Registry:
                 utilization_pct=0.0,
             )
             self._agent_urls[node_id] = str(entry.get("agent_url", ""))
+            # A bad label on disk loses the name, never the node.
+            try:
+                label = normalize_label(entry.get("label"))
+            except ValueError as exc:
+                log.warning("dropping unusable label for %s: %s", node_id, exc)
+                label = None
+            if label:
+                self._labels[node_id] = label
         self._candidates = {
             node_id: record
             for node_id, record in data["candidates"].items()
@@ -207,6 +289,15 @@ class Registry:
             node_id: {
                 "profile": profile_to_dict(state.profile),
                 "agent_url": self._agent_urls.get(node_id, ""),
+                # Omitted rather than null when unset: an absent key reads as
+                # "never renamed" to any build, including one older than this
+                # field, which is the whole reason the roster is written key
+                # by key instead of as a dumped dataclass.
+                **(
+                    {"label": self._labels[node_id]}
+                    if self._labels.get(node_id)
+                    else {}
+                ),
             }
             for node_id, state in self._members.items()
         }
@@ -266,16 +357,35 @@ class Registry:
         Only a token holder can move the agent_url / profile on file for an
         existing member; a tokenless "re-join" is a status check, not a
         write.
+
+        A third credential exists: an *enrollment* token from
+        ``enrollment.EnrollmentStore``, minted in the UI for one install and
+        expiring within the hour. It is the one thing that admits a new node
+        without a click, because a human minted it and carried it to that
+        machine deliberately -- the same position ``add_node`` already takes
+        for a human typing an address. The response then carries
+        ``cluster_token`` once, so the node keeps working after the enrollment
+        token expires.
         """
         expected = self.cluster_token()
         has_token = bool(token)
+        # Two credentials are accepted here and they mean different things. The
+        # cluster token is permanent and buys candidacy, exactly as before. An
+        # enrollment token is short-lived, was minted by a human in the UI for
+        # this specific install, and buys membership outright -- minting it was
+        # the admission decision. Anything that is neither is still rejected
+        # with the same sentence, so this cannot be used to tell an expired
+        # enrollment token apart from a wrong one.
+        enrollment: EnrollmentToken | None = None
         if has_token and not hmac.compare_digest(str(token), expected):
-            log.warning(
-                "rejected join from %s (%s): wrong cluster token",
-                profile.node_id,
-                agent_url,
-            )
-            raise JoinRejected("invalid cluster token")
+            enrollment = self._enrollment.verify(token)
+            if enrollment is None:
+                log.warning(
+                    "rejected join from %s (%s): wrong cluster token",
+                    profile.node_id,
+                    agent_url,
+                )
+                raise JoinRejected("invalid cluster token")
 
         # Believe the profile only after the far side answers as itself,
         # token or not. A joiner can claim any hardware it likes in the body.
@@ -324,11 +434,18 @@ class Registry:
             state.healthy = True
             self._misses[confirmed.node_id] = 0
             self._persist_roster()
-            return {
+            result = {
                 "node_id": confirmed.node_id,
                 "cluster_id": self.cluster_id(),
                 "status": "member",
             }
+            if enrollment is not None:
+                # It is still holding the enrollment token, which means the
+                # cluster token we handed back last time never reached disk.
+                # Hand it over again rather than let this member 403 itself
+                # out of the cluster when the enrollment token expires.
+                result["cluster_token"] = expected
+            return result
 
         if not has_token:
             # No token at all: never a rejection, only a candidate -- and a
@@ -341,6 +458,31 @@ class Registry:
                 agent_url,
             )
             return {"node_id": confirmed.node_id, "status": "candidate"}
+
+        if enrollment is not None and enrollment.auto_admit:
+            # Straight to member. `admit` is the same promotion the UI button
+            # calls, reached through the candidate record so there is exactly
+            # one place that builds a NodeState from a profile.
+            self._candidates[confirmed.node_id] = self._candidate_record(
+                confirmed, agent_url, SOURCE_ENROLL
+            )
+            self.admit(confirmed.node_id)
+            self._enrollment.consume(enrollment.token_id)
+            log.info(
+                "admitted %s from %s on enrollment token %s",
+                confirmed.node_id,
+                agent_url,
+                enrollment.token_id,
+            )
+            return {
+                "node_id": confirmed.node_id,
+                "cluster_id": self.cluster_id(),
+                "status": "member",
+                # The permanent token, handed over once, so this node survives
+                # the enrollment token expiring. It is the only response that
+                # ever carries it, and only to a node we just admitted.
+                "cluster_token": expected,
+            }
 
         self._candidates[confirmed.node_id] = self._candidate_record(
             confirmed, agent_url, SOURCE_JOIN
@@ -393,6 +535,26 @@ class Registry:
         log.info("admitted %s as a member", node_id)
         return state
 
+    # ------------------------------------------------------------------
+    # Enrollment tokens (the curl installer's credential)
+    # ------------------------------------------------------------------
+
+    def mint_enrollment(
+        self,
+        ttl_s: float = DEFAULT_TTL_S,
+        uses: int | None = DEFAULT_USES,
+        auto_admit: bool = True,
+    ) -> EnrollmentToken:
+        """Mint a short-lived credential for one install. Raises ValueError."""
+        return self._enrollment.mint(ttl_s=ttl_s, uses=uses, auto_admit=auto_admit)
+
+    def enrollments(self) -> list[dict]:
+        """Live tokens, without the secrets. Expired ones are pruned on read."""
+        return self._enrollment.public_list()
+
+    def revoke_enrollment(self, token_id: str) -> bool:
+        return self._enrollment.revoke(token_id)
+
     async def add_node(self, address: str) -> NodeState:
         """Manual add: probe the address, then admit it directly.
 
@@ -418,6 +580,7 @@ class Registry:
         if not was_member and not was_candidate:
             raise NodeNotFound(f"no member or candidate {node_id!r}")
         self._agent_urls.pop(node_id, None)
+        self._labels.pop(node_id, None)
         self._misses.pop(node_id, None)
         self._telemetry.drop(node_id)
         self._persist_roster()
@@ -440,6 +603,128 @@ class Registry:
             return profile_from_dict(payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise ProbeFailed(f"{agent_url} returned an unusable profile: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Reachability
+    # ------------------------------------------------------------------
+
+    async def _peer_leg(self, source: str, target: str, url: str) -> ReachLeg:
+        """Ask `source`'s agent to dial `target`, and report what it found.
+
+        Two failures are possible and they are not the same finding: we could
+        not reach `source` to ask it, or `source` answered that it could not
+        reach `target`. The first is reported as a failed leg from the
+        coordinator -- blaming source→target for a coordinator→source problem
+        would send an operator to look at the wrong cable.
+        """
+        source_url = self._agent_urls.get(source)
+        if not source_url:
+            return ReachLeg(
+                source=source,
+                target=target,
+                url=url,
+                ok=False,
+                error=f"No agent address on file for {source}, so it cannot be asked.",
+            )
+        try:
+            payload = await self._client.post_json(
+                f"{source_url.rstrip('/')}/agent/reach",
+                {"url": url},
+                PEER_REACH_TIMEOUT_S,
+                {"X-Derate-Token": self.cluster_token()},
+            )
+        except Exception as exc:
+            return ReachLeg(
+                source=COORDINATOR,
+                target=source,
+                url=source_url,
+                ok=False,
+                error=(
+                    f"Could not ask {source} to dial {target}: {exc}. "
+                    f"Whether {source} can reach {target} is still unknown."
+                ),
+            )
+        if not isinstance(payload, dict):
+            return ReachLeg(
+                source=source, target=target, url=url, ok=False,
+                error=f"{source} answered with something that was not a probe result.",
+            )
+        answered = payload.get("answered_as")
+        return ReachLeg(
+            source=source,
+            target=target,
+            url=str(payload.get("url") or url),
+            ok=bool(payload.get("ok")),
+            ms=payload.get("ms") if payload.get("ok") else None,
+            error=payload.get("error") or None,
+            answered_as=str(answered) if answered else None,
+        )
+
+    async def check_reach(self, a: str, b: str) -> dict:
+        """Can these two nodes reach each other? Every direction, separately.
+
+        Cheap and non-disruptive, unlike a link measurement: four health
+        checks at most, none of which touches the fabric this is asking about
+        in any way a running deployment would notice. That is the point --
+        an operator should not have to saturate an interconnect for a minute
+        to find out whether a node answers at all.
+
+        Raises NodeNotFound for an id that is not a member, so a typo comes
+        back as a 404 rather than as an unreachable machine.
+        """
+        for node_id in (a, b):
+            if node_id not in self._members:
+                raise NodeNotFound(f"no member {node_id!r}")
+
+        legs: list[ReachLeg] = []
+        for node_id in (a, b):
+            url = self._agent_urls.get(node_id, "")
+            if node_id == self.local_node_id:
+                legs.append(self_leg(node_id, url))
+            elif not url:
+                legs.append(
+                    ReachLeg(
+                        source=COORDINATOR, target=node_id, url="", ok=False,
+                        error=f"No agent address on file for {node_id}.",
+                    )
+                )
+            else:
+                legs.append(
+                    await dial(
+                        self._client.get_json,
+                        COORDINATOR,
+                        node_id,
+                        url,
+                        REACH_TIMEOUT_S,
+                    )
+                )
+
+        # The node-to-node legs, skipping any whose source is this process --
+        # the coordinator's own leg above already IS that dial, and running it
+        # twice would report the same probe as two independent findings.
+        for source, target in ((a, b), (b, a)):
+            if source == self.local_node_id or source == target:
+                continue
+            url = self._agent_urls.get(target, "")
+            if not url:
+                legs.append(
+                    ReachLeg(
+                        source=source, target=target, url="", ok=False,
+                        error=f"No agent address on file for {target}.",
+                    )
+                )
+                continue
+            legs.append(await self._peer_leg(source, target, url))
+
+        ok, sentence = summarize(legs)
+        return {
+            "a": a,
+            "b": b,
+            "ok": ok,
+            "summary": sentence,
+            "checked_at": self._clock(),
+            "legs": [leg.as_dict() for leg in legs],
+        }
 
     # ------------------------------------------------------------------
     # Health
@@ -528,6 +813,7 @@ class Registry:
         state.temperature_c = sample.temperature_c
         state.utilization_pct = sample.utilization_pct
         state.last_seen = sample.ts
+        state.sample_ts = sample.ts
 
     async def _sample_node(self, node_id: str) -> None:
         state = self._members.get(node_id)
@@ -650,6 +936,7 @@ class Registry:
                     "util_pct": round(state.utilization_pct, 1),
                     "healthy": state.healthy,
                     "last_seen": state.last_seen,
+                    "sample_ts": state.sample_ts or None,
                     # The unified-memory numbers. On a discrete node gpu_used
                     # equals the pool figure and allocatable is simply headroom.
                     "gpu_used": sample.gpu_memory_used if sample else 0,

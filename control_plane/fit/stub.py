@@ -7,6 +7,8 @@ than no stub, so this returns the same shapes the real calculator does.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from control_plane.contracts import (
     COMM_BUFFER_BYTES,
     DEFAULT_GUARDRAIL,
@@ -28,12 +30,29 @@ class StubFit:
     """Implements ``FitPort`` with arithmetic simple enough to be obviously
     wrong, so nobody ships it by accident."""
 
-    def check(self, req: FitRequest, nodes: list[NodeProfile]) -> FitResult:
-        usable = (
-            min(n.usable_memory(DEFAULT_GUARDRAIL) for n in nodes)
-            if nodes
-            else 100 * GIB
-        )
+    def check(
+        self,
+        req: FitRequest,
+        nodes: list[NodeProfile],
+        *,
+        allocatable: Mapping[str, int] | None = None,
+    ) -> FitResult:
+        # Honour the live budget on the same principle as the None context
+        # sentinel below: a stub that skips a branch leaves every consumer
+        # tested against it with zero coverage of that branch.
+        if allocatable:
+            usable = min(
+                allocatable.get(n.node_id, n.usable_memory(DEFAULT_GUARDRAIL))
+                for n in nodes
+            ) if nodes else 100 * GIB
+            basis = "live"
+        else:
+            usable = (
+                min(n.usable_memory(DEFAULT_GUARDRAIL) for n in nodes)
+                if nodes
+                else 100 * GIB
+            )
+            basis = "static"
         world = max(1, req.plan.world_size)
         weights = int(req.shape.total_params * req.shape.bytes_per_param() / world)
         kv = int(
@@ -73,6 +92,7 @@ class StubFit:
             max_context_that_fits=req.context_length if fits else None,
             predicted_decode_tps=25.0,
             warnings=["stub fit calculator: these numbers are not a real gate"],
+            budget_basis=basis,
         )
 
     def max_context(

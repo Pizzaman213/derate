@@ -9,9 +9,12 @@ so the UI can be built against the full shape from day 0.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
+from functools import partial
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -19,19 +22,104 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from control_plane.contracts import (
     DeploymentState,
     FitRequest,
+    Modality,
     RoutingPolicy,
     Verdict,
 )
 from control_plane.providers import UnknownProviderError
 from control_plane.registry import JoinRejected, NodeNotFound
+from control_plane.registry import modelcache, storage as registry_storage
 from control_plane.registry.serde import profile_from_dict
 
 from control_plane.telemetry import query as tquery
 
-from . import errors, serialize, ui_detail
+from . import errors, gpu_procs, livefit, serialize, ui_detail
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.api")
+
+
+#: Named for exactly what it overrides, so the request body says it.
+_OVERRIDE_PARAM = "allow_over_live_memory"
+
+
+@dataclasses.dataclass(frozen=True)
+class _PlanOutcome:
+    """One dry run: both verdicts, the memory picture behind them, and the
+    single field the UI reads to decide what the Serve button may do."""
+
+    shape: object
+    plan: object
+    fit: object | None
+    fit_live: object | None
+    capacity: dict
+    serve: dict
+    context_length: int
+    concurrency: int
+    resolver_warnings: list
+    #: Which endpoint family this model answers on, taken from the
+    #: resolution that produced the shape rather than looked up again
+    #: later: a cold or cleared cache would otherwise silently record a
+    #: speech model as text, and the gateway would then refuse the very
+    #: requests the deployment exists to serve.
+    modality: object = Modality.TEXT
+
+def _modality_of(architectures) -> Modality:
+    """The endpoint family these architectures answer on.
+
+    Taken from the resolution in hand rather than from a later cache lookup:
+    `_architectures_for` reaches back into the shape cache, and a cold or
+    cleared cache would report no architecture, silently recording a speech
+    model as text. The gateway would then refuse the very requests the
+    deployment exists to serve, with nothing on screen connecting the two.
+
+    Imported lazily so `resolver/` stays an optional dependency of the gateway,
+    exactly as `resolve_full` and `supported_by` already are.
+    """
+    try:
+        from control_plane.resolver.support import modality_for
+    except Exception:
+        return Modality.TEXT
+    try:
+        return Modality(modality_for(architectures))
+    except ValueError:
+        # The resolver knows a family this build has no Modality for. Text
+        # keeps it on the routes it was already offered on.
+        return Modality.TEXT
+
+
+#: A node agent that cannot answer a read in this long is treated as down.
+_AGENT_TIMEOUT_S = 5.0
+#: SIGTERM grace (10s) plus SIGKILL wait (5s) on the agent side, plus slack.
+_KILL_TIMEOUT_S = 25.0
+#: Removing 182 GiB of blobs is a lot of unlink syscalls. Generous, because
+#: the alternative is a timeout on a delete that is actually succeeding.
+_DELETE_TIMEOUT_S = 120.0
+
+#: A deployment past these is not serving anything and its weights are fair
+#: game. Spelled from the contract enum rather than imported from
+#: ``deploy.fsm.TERMINAL``, because ``from control_plane.deploy import fsm``
+#: runs the package __init__ and pulls the manager, the sparkrun adapter and
+#: the event bus into the gateway's request module to obtain one frozenset.
+#: ``test_modelcache`` asserts this set and ``fsm.TERMINAL`` stay equal, so the
+#: two cannot drift apart.
+_TERMINAL_STATES = frozenset({DeploymentState.FAILED, DeploymentState.STOPPED})
+def _agent_detail(res) -> str:
+    """The sentence a node agent put in its refusal, however it wrapped it.
+
+    FastAPI's HTTPException nests ours under "detail", and a detail may itself
+    be the {code, message} object procs.py raises. Falling back to the raw body
+    keeps an unexpected shape readable instead of printing "unknown error".
+    """
+    try:
+        body = res.json()
+    except Exception:
+        return (res.text or "").strip() or f"HTTP {res.status_code}"
+    detail = body.get("detail", body) if isinstance(body, dict) else body
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("detail") or detail)
+    return str(detail)
+
 
 STALE_LINK_AGE_S = 7 * 24 * 3600
 _FABRIC_METHODS = {"nccl-tests", "ib_write_bw"}
@@ -76,6 +164,23 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             log.exception("registry unavailable")
             return []
 
+    def _labels() -> dict[str, str]:
+        """node_id -> operator-chosen display name, for the ids that have one.
+
+        Read through a getattr because RegistryPort does not require it: a
+        registry build without labels is not an error, it is a cluster where
+        nothing has been renamed, and every payload below degrades to the
+        node_id on its own.
+        """
+        labels = getattr(ctx.deps.registry, "node_labels", None)
+        if not callable(labels):
+            return {}
+        try:
+            return labels()
+        except Exception:
+            log.exception("registry labels unavailable")
+            return {}
+
     def _links_for(node_ids: list[str]):
         """Every pair, measured or not. Never emit a bandwidth figure that was
         not measured: an unmeasured pair carries measured=false and no numbers.
@@ -104,13 +209,17 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     async def cluster() -> JSONResponse:
         nodes = _nodes()
         node_ids = [n.profile.node_id for n in nodes]
+        labels = _labels()
         index = ctx.router.index()
         window = settings.metrics_rate_window_s
         return JSONResponse(
             {
                 "cluster_id": settings.cluster_id,
                 "coordinator": settings.coordinator_node_id,
-                "nodes": [serialize.node_payload(n) for n in nodes],
+                "nodes": [
+                    serialize.node_payload(n, labels.get(n.profile.node_id))
+                    for n in nodes
+                ],
                 "links": _links_for(node_ids),
                 "summary": {
                     "node_count": len(nodes),
@@ -130,6 +239,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.get("/api/topology")
     async def topology() -> JSONResponse:
         nodes = _nodes()
+        labels = _labels()
         index = ctx.router.index()
 
         by_node: dict[str, list[str]] = {}
@@ -171,6 +281,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             node_payloads.append(
                 {
                     "node_id": node_id,
+                    # Same rule as serialize.node_payload: null when nobody
+                    # renamed it, never a copy of the node_id.
+                    "label": labels.get(node_id) or None,
                     "hostname": node.profile.hostname,
                     "device_class": node.profile.device_class.value,
                     "gpu_name": node.profile.gpu_name,
@@ -184,6 +297,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "power_w": node.power_watts,
                     "temp_c": node.temperature_c,
                     "util_pct": node.utilization_pct,
+                    "sample_ts": node.sample_ts or None,
                     "strength": round(strength, 4),
                     "deployments": by_node.get(node_id, []),
                 }
@@ -219,7 +333,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.get("/api/nodes")
     async def list_nodes() -> JSONResponse:
-        return JSONResponse([serialize.node_payload(n) for n in _nodes()])
+        labels = _labels()
+        return JSONResponse(
+            [
+                serialize.node_payload(n, labels.get(n.profile.node_id))
+                for n in _nodes()
+            ]
+        )
 
     @router.get("/api/nodes/candidates")
     async def node_candidates() -> JSONResponse:
@@ -233,6 +353,139 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             log.exception("candidate listing failed")
             return JSONResponse([])
 
+    async def _agent_processes(node_id: str) -> tuple[dict | None, Response | None]:
+        """The node agent's resident-process payload, annotated. (payload, error).
+
+        The agent is the only thing that can see the machine's PIDs; the
+        coordinator can only ask. A node we have no agent URL for is a 404 that
+        says so, rather than an empty list that reads as an idle GPU.
+        """
+        agent_url = None
+        lookup = getattr(ctx.deps.registry, "agent_url", None)
+        if callable(lookup):
+            try:
+                agent_url = lookup(node_id)
+            except Exception:
+                log.exception("agent url lookup failed")
+        if not agent_url:
+            return None, errors.error_response(
+                404,
+                f"No agent URL for node '{node_id}'; its resident processes "
+                "cannot be read.",
+                "invalid_request_error",
+                "node_agent_unreachable",
+            )
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+                res = await client.get(f"{agent_url.rstrip('/')}/agent/processes")
+                res.raise_for_status()
+                payload = res.json()
+        except Exception as exc:
+            log.warning("process read failed for %s: %s", node_id, exc)
+            return None, errors.error_response(
+                502,
+                f"The node agent on '{node_id}' did not answer: "
+                f"{errors.detail(exc, _redactor())}",
+                "server_error",
+                "node_agent_unreachable",
+            )
+
+        try:
+            deployments = ctx.deps.deployments.list()
+        except Exception:
+            log.exception("deployment listing failed")
+            deployments = []
+        handles_fn = getattr(ctx.deps.deployments, "handles", None)
+        handles = None
+        if callable(handles_fn):
+            try:
+                handles = handles_fn()
+            except Exception:
+                log.exception("handle listing failed")
+        payload["processes"] = gpu_procs.attribute(
+            payload.get("processes") or [], deployments, handles, node_id
+        )
+        return payload, None
+
+    @router.get("/api/nodes/{node_id}/processes")
+    async def node_processes(node_id: str) -> Response:
+        payload, error = await _agent_processes(node_id)
+        return error if error is not None else JSONResponse(payload)
+
+    @router.delete("/api/nodes/{node_id}/processes/{pid}")
+    async def kill_node_process(node_id: str, pid: int) -> Response:
+        payload, error = await _agent_processes(node_id)
+        if error is not None:
+            return error
+        target = gpu_procs.find(payload.get("processes") or [], pid)
+        if target is None:
+            return errors.error_response(
+                404,
+                f"PID {pid} is not holding GPU memory on '{node_id}'.",
+                "invalid_request_error",
+                "not_a_gpu_process",
+            )
+        if not target.get("killable", True):
+            # Refused here rather than on the agent: the agent has no idea what
+            # a deployment is, and this is the check that keeps the router from
+            # dispatching to a backend somebody killed behind its back.
+            return errors.error_response(
+                409,
+                target.get("not_killable_reason")
+                or f"PID {pid} belongs to a running deployment.",
+                "invalid_request_error",
+                "process_is_managed",
+            )
+
+        token = None
+        token_fn = getattr(ctx.deps.registry, "cluster_token", None)
+        if callable(token_fn):
+            try:
+                token = token_fn()
+            except Exception:
+                log.exception("cluster token unavailable")
+        if not token:
+            return errors.error_response(
+                503,
+                "No cluster token is available, so the node agent cannot be "
+                "asked to kill anything.",
+                "server_error",
+                "cluster_token_unavailable",
+            )
+
+        agent_url = ctx.deps.registry.agent_url(node_id)
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=_KILL_TIMEOUT_S) as client:
+                res = await client.post(
+                    f"{agent_url.rstrip('/')}/agent/processes/{pid}/kill",
+                    headers={"X-Derate-Token": token},
+                )
+        except Exception as exc:
+            log.exception("kill request failed")
+            return errors.error_response(
+                502,
+                f"The node agent on '{node_id}' did not answer the kill: "
+                f"{errors.detail(exc, _redactor())}",
+                "server_error",
+                "node_agent_unreachable",
+            )
+        if res.status_code >= 400:
+            # The agent's own sentence, forwarded rather than paraphrased --
+            # "the agent may not signal that owner" is a different fix from
+            # "that PID is not on the GPU", and only it knows which happened.
+            detail = _agent_detail(res)
+            return errors.error_response(
+                res.status_code if res.status_code != 403 else 502,
+                f"The kill was refused on '{node_id}': {detail}",
+                "invalid_request_error",
+                "kill_refused",
+            )
+        return JSONResponse(res.json())
+
     @router.get("/api/nodes/{node_id}")
     async def get_node(node_id: str) -> JSONResponse:
         try:
@@ -244,7 +497,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 404, f"No node '{node_id}'.", "invalid_request_error", "node_not_found"
             )
-        return JSONResponse(serialize.node_payload(node))
+        return JSONResponse(serialize.node_payload(node, _labels().get(node_id)))
 
     @router.post("/api/nodes/join")
     async def join_node(request: Request) -> Response:
@@ -300,6 +553,45 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "node_not_found",
             )
 
+    @router.put("/api/nodes/{node_id}/label")
+    async def rename_node(node_id: str, request: Request) -> Response:
+        """Give a node a display name, or clear it with null / "".
+
+        A rename touches nothing but the caption. `node_id` is the key every
+        deployment, link measurement and routing target on disk was written
+        against, so it stays exactly what it was -- which is also why this is
+        a separate route rather than a PATCH on the node: there is no field on
+        a node this can be confused with.
+        """
+        rename = getattr(ctx.deps.registry, "set_node_label", None)
+        if not callable(rename):
+            return _not_implemented("Renaming a node", "registry")
+        try:
+            payload = await request.json()
+        except Exception:
+            return errors.error_response(
+                400, 'Body must be {"label": "a name"}.',
+                "invalid_request_error", "invalid_json",
+            )
+        if not isinstance(payload, dict) or "label" not in payload:
+            return errors.error_response(
+                400, 'Body must be {"label": "a name"}. Send null to clear it.',
+                "invalid_request_error", "invalid_request",
+            )
+        try:
+            label = rename(node_id, payload["label"])
+        except NodeNotFound:
+            return errors.error_response(
+                404, f"No node '{node_id}'.", "invalid_request_error", "node_not_found"
+            )
+        except ValueError as exc:
+            # The registry's own sentence, which names what was wrong with the
+            # name. Nothing here can improve on it.
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "invalid_label"
+            )
+        return JSONResponse({"node_id": node_id, "label": label})
+
     @router.delete("/api/nodes/{node_id}")
     async def remove_node(node_id: str) -> Response:
         remove = getattr(ctx.deps.registry, "remove_node", None)
@@ -334,7 +626,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception as exc:
             log.exception("link measurement failed")
             return errors.error_response(
-                502, f"Measurement failed: {type(exc).__name__}.",
+                502, f"Measurement failed. {errors.detail(exc, _redactor())}",
                 "server_error", "measure_failed",
             )
         if measurement is None:
@@ -348,6 +640,42 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "measurement_failed",
             )
         return JSONResponse(serialize.link_payload(measurement))
+
+    @router.post("/api/links/reach")
+    async def reach_check(request: Request) -> Response:
+        """Can these two nodes reach each other? Seconds, not a minute.
+
+        Deliberately a separate route from /api/links/measure rather than a
+        mode of it. Measuring saturates the interconnect for about a minute
+        and answers "how fast"; this answers "at all, and from which side",
+        costs four health checks, and is safe to run against a cluster that is
+        serving. Conflating them would put a disruptive operation behind a
+        button an operator reasonably expects to be free.
+        """
+        check = getattr(ctx.deps.registry, "check_reach", None)
+        if not callable(check):
+            return _not_implemented("Reachability checks", "registry")
+        try:
+            payload = await request.json()
+            a, b = payload["a"], payload["b"]
+        except Exception:
+            return errors.error_response(
+                400, 'Body must be {"a": node_id, "b": node_id}.',
+                "invalid_request_error", "invalid_request",
+            )
+        try:
+            result = await check(a, b)
+        except NodeNotFound as exc:
+            return errors.error_response(
+                404, f"{exc}.", "invalid_request_error", "node_not_found"
+            )
+        except Exception as exc:
+            log.exception("reachability check failed")
+            return errors.error_response(
+                502, f"Reachability check failed. {errors.detail(exc, _redactor())}",
+                "server_error", "reach_failed",
+            )
+        return JSONResponse(serialize.plain(result))
 
     # -- routing -----------------------------------------------------------
 
@@ -447,7 +775,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception as exc:
             log.exception("provider add failed")
             return errors.error_response(
-                400, f"Could not add provider: {type(exc).__name__}.",
+                400, f"Could not add provider. {errors.detail(exc, _redactor())}",
                 "invalid_request_error", "provider_add_failed",
             )
         ctx.router.rebuild(force_scores=True)
@@ -512,7 +840,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception as exc:
             log.exception("provider refresh failed")
             return errors.error_response(
-                502, f"Refresh failed: {type(exc).__name__}.",
+                502, f"Refresh failed. {errors.detail(exc, _redactor())}",
                 "server_error", "refresh_failed",
             )
         ctx.router.rebuild(force_scores=True)
@@ -542,6 +870,102 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     # -- plan and deployments ---------------------------------------------
 
+    #: Resolver failures are not all the same failure, and a blanket 502 tells
+    #: a caller nothing about whether to fix the request or retry it. Matched
+    #: on class NAME rather than by importing control_plane.resolver: this
+    #: gateway composes ports it does not own, and a third-party resolver
+    #: raising its own ModelNotFound deserves the same answer.
+    _PLAN_ERROR_STATUS: dict[str, tuple[int, str, str, dict]] = {
+        "ModelNotFound": (
+            404, "invalid_request_error", "model_not_found",
+            {},
+        ),
+        "MetadataUnavailable": (
+            502, "server_error", "metadata_unavailable",
+            {"Retry-After": "5"},
+        ),
+        "UnsupportedArchitecture": (
+            400, "invalid_request_error", "unsupported_architecture",
+            {},
+        ),
+    }
+
+    def _redactor():
+        """The shared provider redactor, or None. Reached the way the telemetry
+        service reaches it -- a fresh Redactor knows no secrets to scrub."""
+        return getattr(ctx.deps.providers, "redactor", None)
+
+    def _plan_error_response(exc: Exception, model_id: str | None) -> JSONResponse:
+        """The refusal, carrying the reason instead of only the class name."""
+        red = _redactor()
+        status, type_, code, headers = _PLAN_ERROR_STATUS.get(
+            type(exc).__name__, (502, "server_error", "plan_failed", {})
+        )
+        named = f" '{model_id}'" if model_id else ""
+        lead = {
+            "model_not_found": f"No model{named} could be found.",
+            "metadata_unavailable": (
+                f"Could not plan{named}: the model's metadata could not be "
+                f"fetched."
+            ),
+            "unsupported_architecture": (
+                f"Could not plan{named}: the architecture is not supported."
+            ),
+        }.get(code, f"Could not plan{named}.")
+        return errors.error_response(
+            status,
+            f"{lead} {errors.detail(exc, red)}".strip(),
+            type_,
+            code,
+            headers=headers or None,
+            exception=type(exc).__name__,
+            cause=errors.cause_chain(exc, red),
+            model_id=model_id,
+        )
+
+
+    def _capacity_block(
+        plan_nodes: list,
+        budgets: dict,
+        excluded: list,
+        fit,
+        fit_live,
+    ) -> dict:
+        """What the memory picture was at the moment the verdict was taken.
+
+        The UI draws the live line from this and explains the refusal from it,
+        so every figure is the one the gate actually used -- not a second
+        computation that can disagree with it.
+        """
+        report = getattr(ctx.deps.registry, "memory_report", None)
+        nodes_payload = []
+        if callable(report):
+            for node in plan_nodes:
+                try:
+                    one = report(node.node_id)
+                except Exception:
+                    log.exception("memory_report failed for %s", node.node_id)
+                    one = None
+                if one is not None:
+                    nodes_payload.append(one)
+
+        binding_node = None
+        if budgets:
+            binding_node = min(budgets, key=lambda k: budgets[k])
+
+        return {
+            "basis": (fit_live or fit).budget_basis if (fit_live or fit) else None,
+            "measured_at": time.time(),
+            "allocatable_per_node": (
+                budgets[binding_node] if binding_node else None
+            ),
+            "static_per_node": fit.usable_per_node if fit else None,
+            "binding_node": binding_node,
+            "nodes": nodes_payload,
+            "excluded": excluded,
+        }
+
+
     async def _plan_and_fit(payload: dict):
         """Resolve, plan, check fit. Launches nothing.
 
@@ -566,11 +990,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         resolve_full = getattr(ctx.deps.resolver, "resolve_full", None)
         resolver_warnings: list[str] = []
         weight_bytes: int | None = None
+        modality = Modality.TEXT
         if callable(resolve_full):
             resolution = await asyncio.to_thread(resolve_full, model_id, dtype)
             shape = resolution.shape
             resolver_warnings = list(resolution.warnings)
             weight_bytes = resolution.effective_weight_bytes()
+            modality = _modality_of(resolution.architectures)
         else:
             shape = await asyncio.to_thread(ctx.deps.resolver.resolve, model_id, dtype)
 
@@ -599,19 +1025,47 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
 
         plan_nodes = [n for n in nodes if n.node_id in set(plan.node_ids)] or nodes
-        fit = await asyncio.to_thread(
-            ctx.deps.fit.check,
-            FitRequest(
-                shape=shape,
-                context_length=context_length,
-                max_concurrent_seqs=concurrency,
-                kv_dtype=kv_dtype,
-                plan=plan,
-                weight_bytes=weight_bytes,
-            ),
-            plan_nodes,
+        req = FitRequest(
+            shape=shape,
+            context_length=context_length,
+            max_concurrent_seqs=concurrency,
+            kv_dtype=kv_dtype,
+            plan=plan,
+            weight_bytes=weight_bytes,
         )
-        return shape, plan, fit, context_length, concurrency, resolver_warnings
+
+        # The live budget. Two checks, not one widened verdict: the breakdown
+        # is identical under both budgets and only the budget-dependent terms
+        # differ, so two internally consistent FitResults beat one object whose
+        # `reason` would have to describe two budgets in one sentence.
+        budgets, excluded, live_reason = livefit.allocatable_map(
+            ctx.deps.registry, [n.node_id for n in plan_nodes]
+        )
+        budgets, zero_excluded = livefit.drop_zero_addressable(plan_nodes, budgets)
+        excluded = excluded + zero_excluded
+        if not budgets and live_reason is None:
+            live_reason = "every node was excluded from the live memory budget"
+
+        fit, fit_live, unavailable = await asyncio.to_thread(
+            livefit.dual_check, ctx.deps.fit, req, plan_nodes, budgets
+        )
+        serve = livefit.serve_decision(
+            fit, fit_live, unavailable or live_reason
+        )
+        capacity = _capacity_block(plan_nodes, budgets, excluded, fit, fit_live)
+
+        return _PlanOutcome(
+            shape=shape,
+            plan=plan,
+            fit=fit,
+            fit_live=fit_live,
+            capacity=capacity,
+            serve=serve,
+            context_length=context_length,
+            concurrency=concurrency,
+            resolver_warnings=resolver_warnings,
+            modality=modality,
+        )
 
     @router.post("/api/plan")
     async def plan_endpoint(request: Request) -> Response:
@@ -621,24 +1075,32 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
+        model_id = payload.get("model_id") if isinstance(payload, dict) else None
         try:
-            shape, plan, fit, _, _, resolver_warnings = await _plan_and_fit(payload)
+            out = await _plan_and_fit(payload)
         except ValueError as exc:
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
             )
         except Exception as exc:
-            log.exception("planning failed")
-            return errors.error_response(
-                502, f"Could not plan: {type(exc).__name__}.",
-                "server_error", "plan_failed",
-            )
+            log.exception("planning %s failed", model_id)
+            return _plan_error_response(exc, model_id)
         return JSONResponse(
             {
-                "shape": serialize.shape_payload(shape),
-                "plan": serialize.plan_payload(plan),
-                "fit": serialize.fit_payload(fit) if fit else None,
-                "resolver_warnings": resolver_warnings,
+                "shape": serialize.shape_payload(out.shape),
+                "plan": serialize.plan_payload(out.plan),
+                "fit": serialize.fit_payload(out.fit) if out.fit else None,
+                # The live verdict, budgeted against what the nodes can
+                # actually hand out right now. None when nothing could read
+                # them -- never a fabricated stand-in for the static answer.
+                "fit_live": (
+                    serialize.fit_payload(out.fit_live) if out.fit_live else None
+                ),
+                "capacity": out.capacity,
+                # The one field the UI reads for the button. Which verdict
+                # governs is decided here, not in the client.
+                "serve": out.serve,
+                "resolver_warnings": out.resolver_warnings,
             }
         )
 
@@ -659,20 +1121,42 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
-        try:
-            shape, plan, fit, context_length, concurrency, _ = await _plan_and_fit(
-                payload
+        model_id = payload.get("model_id") if isinstance(payload, dict) else None
+
+        # A dtype sizes; it does not launch. `_plan_and_fit` passes it to the
+        # resolver as a quantization override, which changes bytes-per-param in
+        # the fit arithmetic and nothing else: neither serve command template in
+        # deploy/flags.py carries --quantization, and the only model identifier
+        # either one interpolates is {model}, filled from shape.model_id
+        # (deploy/recipes.py). Honouring a dtype here would budget for 4-bit
+        # weights and then start the repo's real 16-bit ones -- the precise
+        # out-of-memory kill the fit gate exists to refuse. /api/plan still
+        # takes it, because "what would this cost at q4_k_m" is a fair question
+        # to ask while nothing is being started.
+        if isinstance(payload, dict) and payload.get("dtype"):
+            return errors.error_response(
+                400,
+                "A dtype cannot be launched. It changes only the sizing "
+                "arithmetic: neither serve command template carries "
+                "--quantization, so the runtime would load this repository's "
+                "own weights at their real precision while the fit check "
+                "budgeted for something smaller. A quantization variant is a "
+                "different repository -- pass that repository's id as model_id.",
+                "invalid_request_error",
+                "dtype_not_launchable",
             )
+        try:
+            out = await _plan_and_fit(payload)
         except ValueError as exc:
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
             )
         except Exception as exc:
-            log.exception("planning failed")
-            return errors.error_response(
-                502, f"Could not plan: {type(exc).__name__}.",
-                "server_error", "plan_failed",
-            )
+            log.exception("planning %s failed", model_id)
+            return _plan_error_response(exc, model_id)
+
+        shape, plan, fit = out.shape, out.plan, out.fit
+        context_length, concurrency = out.context_length, out.concurrency
 
         # No verdict at all is never a launch, checked or not: fail loud
         # rather than let a missing fit port silently mean "assume it fits".
@@ -709,15 +1193,69 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 },
             )
 
+        # It would fit on an idle machine, but not on this one as it is now.
+        # 409 rather than 400: the request is well formed and legal, the
+        # conflict is with current machine state, and an unchanged retry
+        # succeeds once the memory comes back. It also keeps the wont_fit 400
+        # above distinguishable from this.
+        live = out.fit_live
+        allow_over = bool(payload.get(_OVERRIDE_PARAM))
+        if live is not None and live.verdict is Verdict.WONT_FIT and not allow_over:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "message": (
+                            f"{live.reason} It would fit on an idle machine: "
+                            f"the static ceiling is "
+                            f"{fit.usable_per_node / 1024 ** 3:.1f} GiB. Free "
+                            f"that memory, or resend with "
+                            f"{_OVERRIDE_PARAM}: true."
+                        ),
+                        "type": "invalid_request_error",
+                        "param": _OVERRIDE_PARAM,
+                        "code": "live_memory_insufficient",
+                    },
+                    "plan": serialize.plan_payload(plan),
+                    "fit": serialize.fit_payload(fit),
+                    "fit_live": serialize.fit_payload(live),
+                    "capacity": out.capacity,
+                    "serve": out.serve,
+                    "override": {
+                        "param": _OVERRIDE_PARAM,
+                        "value_required": True,
+                        "overrides": (
+                            "the live allocatable-memory check on "
+                            + (out.capacity.get("binding_node") or "this node")
+                        ),
+                    },
+                },
+            )
+
+        # The budget the launch was actually gated on is the one recorded, so
+        # a later fit_miss compares against a number that existed rather than
+        # a ceiling that never did.
+        gating_fit = live if live is not None else fit
+        if live is not None and live.verdict is Verdict.WONT_FIT and allow_over:
+            gating_fit.warnings.append(
+                f"launched over a live-memory refusal at the operator's "
+                f"instruction ({_OVERRIDE_PARAM}): "
+                f"{live.usable_per_node / 1024 ** 3:.1f} GiB allocatable "
+                f"against {live.breakdown.total / 1024 ** 3:.1f} GiB needed"
+            )
+
         try:
             deployment = await asyncio.to_thread(
-                ctx.deps.deployments.launch,
-                shape,
-                plan,
-                fit,
-                runtime,
-                context_length,
-                concurrency,
+                partial(
+                    ctx.deps.deployments.launch,
+                    shape,
+                    plan,
+                    gating_fit,
+                    runtime,
+                    context_length,
+                    concurrency,
+                    modality=out.modality,
+                )
             )
         except ValueError as exc:
             # An input validation error -- e.g. a command-unsafe model id --
@@ -728,7 +1266,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception as exc:
             log.exception("launch failed")
             return errors.error_response(
-                502, f"Launch failed: {type(exc).__name__}.",
+                502, f"Launch failed. {errors.detail(exc, _redactor())}",
                 "server_error", "launch_failed",
             )
         ctx.router.rebuild(force_scores=True)
@@ -755,7 +1293,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception as exc:
             log.exception("stop failed")
             return errors.error_response(
-                502, f"Stop failed: {type(exc).__name__}.",
+                502, f"Stop failed. {errors.detail(exc, _redactor())}",
                 "server_error", "stop_failed",
             )
         ctx.router.rebuild(force_scores=True)
@@ -816,7 +1354,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             log.exception("history query failed")
             return errors.error_response(
                 502,
-                f"Could not read history: {type(exc).__name__}.",
+                f"Could not read history. {errors.detail(exc, _redactor())}",
                 "server_error",
                 "history_failed",
             )
@@ -951,5 +1489,325 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if telemetry is None:
             return JSONResponse({"enabled": False, "reason": "not configured"})
         return JSONResponse(await asyncio.to_thread(telemetry.status))
+
+    # -- Storage --------------------------------------------------------
+
+    async def _agent_storage(node_id: str, agent_url: str) -> dict:
+        """One node's disk picture, or a row saying why we have none.
+
+        Never raises. A storage screen covering a cluster must not go blank
+        because one worker is down -- the node that cannot be read is exactly
+        the node an operator is looking for.
+        """
+        import httpx
+
+        def _unavailable(reason: str) -> dict:
+            return {
+                "node_id": node_id,
+                "filesystems": [],
+                "estate": [],
+                "unreadable": [],
+                "available": False,
+                "reason": reason,
+            }
+
+        try:
+            async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+                res = await client.get(f"{agent_url.rstrip('/')}/agent/storage")
+        except Exception as exc:
+            log.warning("storage read failed for %s: %s", node_id, exc)
+            return _unavailable(
+                f"The node agent on '{node_id}' did not answer: "
+                f"{errors.detail(exc, _redactor())}"
+            )
+
+        if res.status_code == 404:
+            # Every other /agent route this node serves works; only this one is
+            # missing. That is a node running a build from before the storage
+            # probe existed, which is a rolling upgrade rather than a fault, and
+            # it deserves a sentence an operator can act on instead of an
+            # HTTP client's stringified 404.
+            return _unavailable(
+                f"The node agent on '{node_id}' has no storage route, so it is "
+                "running a build from before disk was measured. Its disk usage "
+                "will appear once it is upgraded."
+            )
+        try:
+            res.raise_for_status()
+            payload = res.json()
+        except Exception as exc:
+            log.warning("storage read failed for %s: %s", node_id, exc)
+            return _unavailable(
+                f"The node agent on '{node_id}' did not answer: "
+                f"{errors.detail(exc, _redactor())}"
+            )
+        payload["node_id"] = node_id
+        payload.setdefault("available", True)
+        payload.setdefault("reason", None)
+        return payload
+
+    async def _agent_model_cache(node_id: str, agent_url: str) -> dict:
+        """One node's downloaded weights, or a row saying why we have none."""
+        import httpx
+
+        def _unavailable(reason: str) -> dict:
+            return {
+                "available": False,
+                "path": None,
+                "repos": [],
+                "total_bytes": None,
+                "reason": reason,
+            }
+
+        try:
+            async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+                res = await client.get(f"{agent_url.rstrip('/')}/agent/models/cache")
+        except Exception as exc:
+            log.warning("model cache read failed for %s: %s", node_id, exc)
+            return _unavailable(
+                f"The node agent on '{node_id}' did not answer: "
+                f"{errors.detail(exc, _redactor())}"
+            )
+        if res.status_code == 404:
+            return _unavailable(
+                f"The node agent on '{node_id}' has no model cache route, so "
+                "it is running a build from before downloaded weights were "
+                "measured."
+            )
+        try:
+            res.raise_for_status()
+            return res.json()
+        except Exception as exc:
+            log.warning("model cache read failed for %s: %s", node_id, exc)
+            return _unavailable(
+                f"The node agent on '{node_id}' did not answer: "
+                f"{errors.detail(exc, _redactor())}"
+            )
+
+    @router.get("/api/storage")
+    async def storage() -> Response:
+        """Disk across the cluster, and what this product is spending it on.
+
+        Read on demand and fanned out concurrently. Deliberately not derived
+        from the metrics frame: disk is not sampled anywhere, precisely so the
+        journal does not carry a column per node per second for a number that
+        moves hourly.
+        """
+        registry = ctx.deps.registry
+        try:
+            nodes = registry.list_nodes()
+        except Exception:
+            log.exception("node listing failed")
+            nodes = []
+
+        lookup = getattr(registry, "agent_url", None)
+        targets: list[tuple[str, str]] = []
+        no_agent: list[dict] = []
+        for node in nodes:
+            node_id = node.profile.node_id
+            url = None
+            if callable(lookup):
+                try:
+                    url = lookup(node_id)
+                except Exception:
+                    url = None
+            if url:
+                targets.append((node_id, url))
+            else:
+                no_agent.append(
+                    {
+                        "node_id": node_id,
+                        "filesystems": [],
+                        "estate": [],
+                        "unreadable": [],
+                        "available": False,
+                        "reason": (
+                            f"No agent URL for node '{node_id}'; its disk "
+                            "usage cannot be read."
+                        ),
+                    }
+                )
+
+        measured = list(
+            await asyncio.gather(*(_agent_storage(n, u) for n, u in targets))
+        )
+        # The downloaded weights, from the same fan-out. Folded into the node
+        # row rather than served as a second endpoint: a screen that shows a
+        # filesystem 71% full and the 894 GiB of weights filling it must not be
+        # able to render one half a poll ahead of the other.
+        caches = list(
+            await asyncio.gather(*(_agent_model_cache(n, u) for n, u in targets))
+        )
+        for row, cache in zip(measured, caches):
+            row["models"] = cache
+        node_rows = sorted(measured + no_agent, key=lambda r: r["node_id"])
+
+        # The retention horizons come from the module that enforces them, so
+        # the UI never re-types a number that a deployment can move.
+        cfg = tquery.config
+        retention = {
+            "samples_raw_s": cfg.SAMPLES_RAW_RETENTION_S,
+            "requests_raw_s": cfg.REQUESTS_RAW_RETENTION_S,
+            "events_s": cfg.EVENTS_RETENTION_S,
+            "logs_s": cfg.LOGS_RETENTION_S,
+            "rollup_1m_s": cfg.ROLLUP_1M_RETENTION_S,
+            "rollup_1h_s": cfg.ROLLUP_1H_RETENTION_S,
+            "archive_max_bytes": cfg.ARCHIVE_MAX_BYTES,
+            "journal_max_bytes": cfg.JOURNAL_MAX_BYTES,
+            "journal_retention_s": cfg.JOURNAL_RETENTION_S,
+        }
+
+        telemetry = getattr(ctx, "telemetry", None)
+        if telemetry is None:
+            status: dict = {"enabled": False, "reason": "not configured"}
+        else:
+            try:
+                status = await asyncio.to_thread(telemetry.status)
+            except Exception:
+                log.exception("telemetry status failed")
+                status = {"enabled": False, "reason": "status unavailable"}
+
+        return JSONResponse(
+            {
+                "nodes": node_rows,
+                "telemetry": status,
+                "retention": retention,
+                "measured_at": time.time(),
+            }
+        )
+
+    @router.delete("/api/storage/nodes/{node_id}/models/{folder}")
+    async def delete_cached_model(node_id: str, folder: str) -> Response:
+        """Delete one downloaded repository from one node.
+
+        The largest reclaim in the product by orders of magnitude -- a single
+        120B repository is 182 GiB -- and the only one that can break a
+        running deployment, so the in-use check is here rather than on the
+        agent. The agent has no idea what a deployment is; this is the same
+        split, and the same 409, that killing a GPU process already uses.
+        """
+        try:
+            deployments = ctx.deps.deployments.list()
+        except Exception:
+            log.exception("deployment listing failed")
+            deployments = []
+
+        # Compared as encoded folder names. Decoding a folder back to a repo
+        # id is ambiguous whenever a name contains a double hyphen, and this
+        # is the comparison that decides whether a running model keeps its
+        # weights.
+        for dep in deployments:
+            state = getattr(dep, "state", None)
+            if state in _TERMINAL_STATES:
+                continue
+            model_id = getattr(getattr(dep, "shape", None), "model_id", "")
+            if not model_id or modelcache.folder_for(model_id) != folder:
+                continue
+            return errors.error_response(
+                409,
+                f"{model_id} is being served by deployment "
+                f"{getattr(dep, 'deployment_id', '?')} ({getattr(state, 'value', state)}). "
+                "Stop the deployment before deleting its weights; it would "
+                "otherwise keep running until it next needed a file that is "
+                "no longer there.",
+                "invalid_request_error",
+                "model_in_use",
+            )
+
+        token = None
+        token_fn = getattr(ctx.deps.registry, "cluster_token", None)
+        if callable(token_fn):
+            try:
+                token = token_fn()
+            except Exception:
+                log.exception("cluster token unavailable")
+        if not token:
+            return errors.error_response(
+                503,
+                "No cluster token is available, so the node agent cannot be "
+                "asked to delete anything.",
+                "server_error",
+                "cluster_token_unavailable",
+            )
+
+        lookup = getattr(ctx.deps.registry, "agent_url", None)
+        agent_url = lookup(node_id) if callable(lookup) else None
+        if not agent_url:
+            return errors.error_response(
+                404,
+                f"No agent URL for node '{node_id}'; its model cache cannot "
+                "be reached.",
+                "invalid_request_error",
+                "node_agent_unreachable",
+            )
+
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=_DELETE_TIMEOUT_S) as client:
+                res = await client.delete(
+                    f"{agent_url.rstrip('/')}/agent/models/cache/{folder}",
+                    headers={"X-Derate-Token": token},
+                )
+        except Exception as exc:
+            log.exception("model delete failed")
+            return errors.error_response(
+                502,
+                f"The node agent on '{node_id}' did not answer the delete: "
+                f"{errors.detail(exc, _redactor())}",
+                "server_error",
+                "node_agent_unreachable",
+            )
+        if res.status_code >= 400:
+            # The agent's own sentence, forwarded rather than paraphrased --
+            # only it knows whether the folder was missing, outside the cache,
+            # or refused by the filesystem.
+            return errors.error_response(
+                res.status_code if res.status_code != 403 else 502,
+                f"The delete was refused on '{node_id}': {_agent_detail(res)}",
+                "invalid_request_error",
+                "delete_refused",
+            )
+        return JSONResponse(res.json())
+
+    @router.delete("/api/storage/cache/resolver")
+    async def clear_resolver_cache() -> Response:
+        """Drop every cached model resolution.
+
+        The only mutation on this surface. Safe by construction: a cache miss
+        costs one hub round trip, and ShapeCache is keyed by model, revision
+        and dtype with a schema version, so nothing here can outlive a format
+        change anyway.
+        """
+        cache = getattr(ctx.deps.resolver, "cache", None)
+        if cache is None or not callable(getattr(cache, "clear", None)):
+            return errors.error_response(
+                503,
+                "This resolver has no shape cache, so there is nothing to "
+                "clear.",
+                "server_error",
+                "resolver_cache_unavailable",
+            )
+        directory = getattr(cache, "directory", None)
+        before = 0
+        if directory is not None:
+            before = registry_storage.path_bytes(Path(directory)) or 0
+        try:
+            await asyncio.to_thread(cache.clear)
+        except Exception as exc:
+            log.exception("resolver cache clear failed")
+            return errors.error_response(
+                500,
+                f"The resolver cache could not be cleared: "
+                f"{errors.detail(exc, _redactor())}",
+                "server_error",
+                "resolver_cache_clear_failed",
+            )
+        after = 0
+        if directory is not None:
+            after = registry_storage.path_bytes(Path(directory)) or 0
+        return JSONResponse(
+            {"cleared": True, "bytes_freed": max(0, before - after)}
+        )
 
     return router

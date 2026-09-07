@@ -1,12 +1,6 @@
-import type { LinkMeasurement, NodeStateDTO, TopologyEdge } from '../../api/types'
-import type { SafeMetricsFrame } from '../../state/useMetrics'
+import type { LinkMeasurement, TopologyEdge } from '../../api/types'
 import { useSelection } from '../../state/selection'
-import { nodeLive, nodeSignal } from '../../state/live'
-import { Readout } from '../../components/Readout'
-import { Lamp } from '../../components/Lamp'
-import { ProportionBar } from '../../components/Bars'
-import { Verbatim } from '../../components/Verbatim'
-import { fmt, gbytes, pct, relativeTime } from '../../format'
+import { fmt, relativeTime } from '../../format'
 import { edgeMeasured } from './layout'
 
 const TP_THRESHOLD = 40
@@ -14,12 +8,14 @@ const TP_THRESHOLD = 40
 interface Props {
   edges: TopologyEdge[]
   measurements: LinkMeasurement[]
-  nodes: NodeStateDTO[]
-  frame: SafeMetricsFrame | null
-  stale: boolean
   measuring: string | null
   measureError: { key: string; message: string } | null
   onMeasure: (a: string, b: string) => void
+  /** Above four machines the graph stops drawing the whole unmeasured mesh --
+   *  66 pairs at twelve machines buries the one link that carries a figure.
+   *  The chips below are the complete list either way, so this only changes
+   *  what the hint says, never what is listed. */
+  crowded: boolean
 }
 
 /** `fmt` plus its unit, dropped together -- a missing reading must not render
@@ -39,21 +35,24 @@ function findMeasurement(links: LinkMeasurement[], a: string, b: string): LinkMe
   return links.find((l) => (l.src === a && l.dst === b) || (l.src === b && l.dst === a))
 }
 
-/** The rail below the graph: three states, in order of how specific the
- *  selection is. Every field here is either a wire value or a straight
- *  aggregate over wire values -- nothing computed the way the mockup's own
- *  `curW()`/cost fields were. */
+/** The rail below the graph: a selected link, or the chip list. A machine is
+ *  deliberately NOT one of them -- pressing a plate only lights it, and its
+ *  readouts live in the node sheet a double-click opens (NodeInspector),
+ *  which carries the same four live figures and everything else about the
+ *  machine besides. One detail surface, one way into it.
+ *
+ *  Every field here is either a wire value or a straight aggregate over wire
+ *  values -- nothing computed the way the mockup's own `curW()`/cost fields
+ *  were. */
 export function SelectionRail({
   edges,
   measurements,
-  nodes,
-  frame,
-  stale,
   measuring,
   measureError,
   onMeasure,
+  crowded,
 }: Props) {
-  const { selNode, selLink } = useSelection()
+  const { selLink } = useSelection()
 
   if (selLink != null) {
     const edge = findEdge(edges, selLink)
@@ -77,25 +76,23 @@ export function SelectionRail({
     return <UnmeasuredLinkRail a={a} b={b} measuring={measuring} measureError={measureError} onMeasure={onMeasure} />
   }
 
-  if (selNode != null) {
-    const node = nodes.find((n) => n.profile.node_id === selNode)
-    if (node) return <NodeRail node={node} frame={frame} stale={stale} />
-  }
-
-  return <DefaultRail edges={edges} />
+  return <DefaultRail edges={edges} crowded={crowded} />
 }
 
 // ── Default: the chip list ──────────────────────────────────────────────────
 
-function DefaultRail({ edges }: { edges: TopologyEdge[] }) {
+function DefaultRail({ edges, crowded }: { edges: TopologyEdge[]; crowded: boolean }) {
   const { selectLink } = useSelection()
   const measured = edges.filter(edgeMeasured).length
 
   return (
     <div>
       <p className="unit" style={{ marginBottom: 8 }}>
-        Click a node, or a pair below, for detail. {edges.length} node pairs · {measured} measured ·{' '}
-        {edges.length - measured} never measured.
+        Double-click a machine, or click a pair below, for detail. {edges.length} node pairs ·{' '}
+        {measured} measured · {edges.length - measured} never measured.
+        {crowded
+          ? ' Every measured link is on the graph; click a machine to see its unmeasured pairs there too.'
+          : ''}
       </p>
       <div className="chips">
         {edges.map((e) => (
@@ -248,100 +245,6 @@ function Row({ label, value }: { label: string; value: string }) {
     <div className="row">
       <span>{label}</span>
       <span className="mono">{value}</span>
-    </div>
-  )
-}
-
-// ── A selected node ──────────────────────────────────────────────────────────
-
-function NodeRail({
-  node,
-  frame,
-  stale,
-}: {
-  node: NodeStateDTO
-  frame: SafeMetricsFrame | null
-  stale: boolean
-}) {
-  const live = nodeLive(node, frame, stale)
-  const signal = nodeSignal(node, live)
-  const down = signal === 'fault'
-  const grey = down || !live.fresh
-  const p = node.profile
-  const usable = Math.trunc(p.addressable_memory * 0.9)
-  const allocatable = p.device_class === 'gb10' ? p.addressable_memory - node.memory_used : null
-
-  return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <Lamp signal={signal} hollow={grey && !down} label={node.state} />
-        <span className="sub" style={{ border: 'none', paddingTop: 0, marginTop: 0, marginBottom: 0 }}>
-          {p.node_id}
-        </span>
-      </div>
-
-      <div style={{ display: 'flex', gap: 'var(--s3)', flexWrap: 'wrap', marginTop: 10 }}>
-        <Big label="power" value={live.power_w} unit="W" width={3} stale={grey} />
-        <Big label="temperature" value={live.temp_c} unit="°C" width={3} stale={grey} />
-        <Big label="GPU utilisation" value={live.util_pct} unit="%" width={3} stale={grey} />
-        <Big label="memory used" value={live.memory_used_pct} unit="%" width={3} stale={grey} />
-      </div>
-      <ProportionBar
-        value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}
-        height={6}
-        tone={grey ? 'muted' : 'ink'}
-        label={live.memory_used_pct == null ? 'no memory reading' : `${pct(live.memory_used_pct)} percent of addressable memory in use`}
-      />
-
-      <div className="row">
-        <span>Addressable</span>
-        <span className="mono">
-          {gbytes(p.addressable_memory, 1)} GiB · {gbytes(usable, 1)} GiB usable at the 0.90 guardrail
-        </span>
-      </div>
-      <div className="row">
-        <span>Allocatable</span>
-        <span className="mono">{allocatable != null ? `${gbytes(allocatable, 1)} GiB` : '—'}</span>
-      </div>
-
-      {node.eligible === false && node.ineligible_reason ? (
-        <div style={{ marginTop: 8 }}>
-          <Verbatim text={node.ineligible_reason} size="label" />
-        </div>
-      ) : null}
-
-      {down && node.last_error ? (
-        <div style={{ marginTop: 8 }}>
-          <Verbatim text={node.last_error} size="label" />
-        </div>
-      ) : null}
-
-      <div className="unit" style={{ marginTop: 8 }}>
-        {p.device_class === 'gb10'
-          ? 'Unified memory: the model and the operating system share one pool, so the static ceiling overstates what is actually allocatable. Only power, temperature, memory and GPU utilisation refresh live; the rest is read at fetch time.'
-          : 'Discrete memory. Only power, temperature, memory and GPU utilisation refresh live.'}
-      </div>
-    </div>
-  )
-}
-
-function Big({
-  label,
-  value,
-  unit,
-  width,
-  stale,
-}: {
-  label: string
-  value: number | null
-  unit: string
-  width: number
-  stale: boolean
-}) {
-  return (
-    <div style={{ display: 'grid', gap: 4 }}>
-      <Readout value={value} decimals={0} width={width} unit={unit} size="readout" align="left" stale={stale} />
-      <span className="unit">{label}</span>
     </div>
   )
 }

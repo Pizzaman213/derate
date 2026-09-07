@@ -23,7 +23,7 @@ export function ClusterCard() {
     ['Coordinator', s?.coordinator || '—'],
     ['Nodes', s ? `${s.node_count} · ${s.healthy_count} healthy` : '—'],
     ['Total memory', s ? `${gbytes(s.total_addressable_memory, 0)} GiB` : '—'],
-    ['Discovery', 'mDNS · _sparkplane._tcp.local.'],
+    ['Discovery', 'mDNS · _derate._tcp.local.'],
   ]
 
   return (

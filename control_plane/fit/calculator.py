@@ -14,6 +14,7 @@ is a bug in this file.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 from control_plane.contracts import (
     BYTES_PER_PARAM,
@@ -85,6 +86,15 @@ def _reported_context(max_ctx: int) -> int | None:
     is exactly as unhelpful a "try 0 tokens" as a ``weights`` one.
     """
     return None if max_ctx == 0 else max_ctx
+
+
+def _budget_word(basis: str) -> str:
+    """What to call the budget in a reason string.
+
+    Under a live budget "usable" is the wrong word: it is not what the hardware
+    could spend, it is what was left at the moment we looked.
+    """
+    return "allocatable right now" if basis == "live" else "usable"
 
 
 def _dedup(items: list[str]) -> list[str]:
@@ -180,6 +190,8 @@ def min_nodes_required(
     kv_dtype: str = "auto",
     guardrail: float = DEFAULT_GUARDRAIL,
     weight_bytes: int | None = None,
+    *,
+    usable: int | None = None,
 ) -> int:
     """Fewest nodes of this kind that hold the model at this context and
     concurrency, under the most memory-efficient shard available at each size.
@@ -197,9 +209,15 @@ def min_nodes_required(
     means the answer is a different machine or a smaller quantization, not more
     Sparks.
 
+    ``usable``, when given, replaces the static ceiling as the per-node budget.
+    A caller gating on live allocatable memory must pass it: otherwise the
+    node count comes back computed against memory that is not available, and
+    "spread it over 5 nodes" names a number that would still OOM.
+
     Exported for Agent E.
     """
-    usable = node_profile.usable_memory(guardrail)
+    if usable is None:
+        usable = node_profile.usable_memory(guardrail)
     for n in range(1, MAX_SEARCH_NODES + 1):
         for plan in _candidate_shards(n, shape):
             breakdown, _ = memory_breakdown(
@@ -385,11 +403,29 @@ class FitCalculator:
 
     # -- FitPort ----------------------------------------------------------
 
-    def check(self, req: FitRequest, nodes: list[NodeProfile]) -> FitResult:
+    def check(
+        self,
+        req: FitRequest,
+        nodes: list[NodeProfile],
+        *,
+        allocatable: Mapping[str, int] | None = None,
+    ) -> FitResult:
+        """Gate this request against these nodes.
+
+        ``allocatable`` maps node_id -> bytes the node can actually hand out
+        right now. Given, the budget is that figure and ``budget_basis`` on the
+        result is ``"live"``; omitted, it is the static addressable ceiling
+        under the guardrail, exactly as before. Keyword-only and defaulted, so
+        every existing call site is unchanged.
+
+        A node absent from the mapping falls back to its static ceiling and
+        says so in ``warnings`` -- an unpolled node must not read as having no
+        capacity, or a cold coordinator would refuse every launch.
+        """
         shape, plan = req.shape, req.plan
         used, warnings = self._participating(plan, nodes)
-        node = min(used, key=lambda n: n.usable_memory(self.guardrail))
-        usable = node.usable_memory(self.guardrail)
+        node, usable, basis, budget_notes = self._budget(used, allocatable)
+        warnings.extend(budget_notes)
         bandwidth = min(n.memory_bandwidth_gbps for n in used)
 
         if len({(n.addressable_memory, n.gpu_name) for n in used}) > 1:
@@ -447,10 +483,13 @@ class FitCalculator:
                 max_context_that_fits=None,
                 predicted_decode_tps=tps,
                 warnings=_dedup(warnings),
+                budget_basis=basis,
             )
 
         if headroom < 0:
-            term, reason = self._diagnose(req, breakdown, usable, node, max_ctx)
+            term, reason = self._diagnose(
+                req, breakdown, usable, node, max_ctx, basis
+            )
             # The sentinel keys on whether any context at all was found to
             # fit (max_ctx == 0), not on which term the diagnosis names: a
             # "combined" refusal where nothing fits is exactly as unhelpful a
@@ -467,6 +506,7 @@ class FitCalculator:
                 max_context_that_fits=reported_ctx,
                 predicted_decode_tps=tps,
                 warnings=_dedup(warnings),
+                budget_basis=basis,
             )
 
         if tps < DEGRADED_TPS_THRESHOLD:
@@ -491,6 +531,7 @@ class FitCalculator:
                 max_context_that_fits=max_ctx,
                 predicted_decode_tps=tps,
                 warnings=_dedup(warnings),
+                budget_basis=basis,
             )
 
         ceiling = "at least " if max_ctx >= MAX_CONTEXT_SEARCH else ""
@@ -500,7 +541,8 @@ class FitCalculator:
             usable_per_node=usable,
             headroom=headroom,
             reason=(
-                f"Fits: {_gib(breakdown.total)} of {_gib(usable)} usable per "
+                f"Fits: {_gib(breakdown.total)} of {_gib(usable)} "
+                f"{_budget_word(basis)} per "
                 f"rank, {_gib(headroom)} headroom. Predicted decode "
                 f"{tps:.0f} tok/s. Context could go to {ceiling}"
                 f"{max_ctx} tokens at {req.max_concurrent_seqs} sequences."
@@ -509,7 +551,61 @@ class FitCalculator:
             max_context_that_fits=max_ctx,
             predicted_decode_tps=tps,
             warnings=_dedup(warnings),
+            budget_basis=basis,
         )
+
+    def _budget(
+        self,
+        used: list[NodeProfile],
+        allocatable: Mapping[str, int] | None,
+    ) -> tuple[NodeProfile, int, str, list[str]]:
+        """The binding node, its budget, which basis produced it, and notes.
+
+        Static basis is the addressable ceiling under the guardrail: what this
+        hardware could ever spend with nothing else running. Live basis is what
+        the node can hand out at this moment, which on a unified-memory part is
+        the only one a launch can rely on -- the operating system and any
+        process this control plane did not start are spending from the same
+        pool.
+
+        The binding node is the argmin over whichever budget is in force, not
+        over the static ceiling, because the smallest ceiling and the smallest
+        live figure need not be the same node.
+        """
+        notes: list[str] = []
+        if not allocatable:
+            node = min(used, key=lambda n: n.usable_memory(self.guardrail))
+            return node, node.usable_memory(self.guardrail), "static", notes
+
+        budgets: dict[str, int] = {}
+        for n in used:
+            ceiling = n.usable_memory(self.guardrail)
+            live = allocatable.get(n.node_id)
+            if live is None:
+                # Never read an unpolled node as having no capacity.
+                budgets[n.node_id] = ceiling
+                notes.append(
+                    f"no live memory reading for {n.node_id}; budgeting against "
+                    f"its {_gib(ceiling)} static ceiling"
+                )
+            else:
+                budgets[n.node_id] = live
+
+        node = min(used, key=lambda n: budgets[n.node_id])
+        usable = budgets[node.node_id]
+        if allocatable.get(node.node_id) is None:
+            # The binding node is one we could not read, so the verdict is not
+            # a live one however many other nodes we did read.
+            return node, usable, "static", notes
+
+        ceiling = node.usable_memory(self.guardrail)
+        if usable < ceiling:
+            notes.append(
+                f"{node.node_id} can allocate {_gib(usable)} right now, "
+                f"{_gib(ceiling - usable)} below its {_gib(ceiling)} static "
+                f"ceiling"
+            )
+        return node, usable, "live", notes
 
     def max_context(
         self,
@@ -519,6 +615,8 @@ class FitCalculator:
         max_seqs: int,
         kv_dtype: str,
         weight_bytes: int | None = None,
+        *,
+        allocatable: Mapping[str, int] | None = None,
     ) -> int:
         """Largest context that fits this plan on these nodes, on a
         ``CONTEXT_ROUNDING`` grain. Verified, never extrapolated. 0 means not
@@ -530,7 +628,7 @@ class FitCalculator:
         caller that omits it gets the formula basis unchanged.
         """
         used, _ = self._participating(plan, nodes)
-        usable = min(n.usable_memory(self.guardrail) for n in used)
+        _, usable, _, _ = self._budget(used, allocatable)
         return self._largest_context(
             shape, plan, usable, max_seqs, kv_dtype, weight_bytes=weight_bytes
         )
@@ -657,24 +755,33 @@ class FitCalculator:
         usable: int,
         node: NodeProfile,
         max_ctx: int,
+        basis: str = "static",
     ) -> tuple[str, str]:
         over = breakdown.total - usable
         weights_held = breakdown.weights + breakdown.replicated
 
         if weights_held > usable:
-            return "weights", self._weights_reason(req, breakdown, usable, node, over)
+            return "weights", self._weights_reason(
+                req, breakdown, usable, node, over, basis
+            )
 
         without_kv = breakdown.total - breakdown.kv_cache
         if without_kv <= usable and breakdown.kv_cache > 0:
             # Everything else fits. Context, concurrency, or cache dtype closes
             # the gap, and we can say by how much.
             return "kv_cache", self._kv_reason(
-                req, breakdown, usable, node, max_ctx, over
+                req, breakdown, usable, node, max_ctx, over, basis
             )
 
-        return "combined", self._combined_reason(req, breakdown, usable, node, over)
+        return "combined", self._combined_reason(
+            req, breakdown, usable, node, over, basis
+        )
 
-    def _nodes_phrase(self, req: FitRequest, node: NodeProfile) -> str:
+    def _nodes_phrase(
+        self, req: FitRequest, node: NodeProfile, usable: int | None = None
+    ) -> str:
+        # Under a live budget the static ceiling is not available, so a node
+        # count derived from it would name a number that still OOMs.
         n = min_nodes_required(
             req.shape,
             node,
@@ -683,6 +790,7 @@ class FitCalculator:
             req.kv_dtype,
             self.guardrail,
             req.weight_bytes,
+            usable=usable,
         )
         if n < 0:
             return f"more than {MAX_SEARCH_NODES} nodes"
@@ -721,6 +829,7 @@ class FitCalculator:
         usable: int,
         node: NodeProfile,
         over: int,
+        basis: str = "static",
     ) -> str:
         shape = req.shape
         ranks = req.plan.world_size
@@ -731,16 +840,23 @@ class FitCalculator:
             if breakdown.replicated
             else ""
         )
-        fixes = [self._nodes_phrase(req, node)]
+        live = basis == "live"
+        fixes = [self._nodes_phrase(req, node, usable if live else None)]
         suggestion = self._suggest_quant(req, breakdown, usable)
         if suggestion:
             name, size = suggestion
             fixes.append(f"requantize to {name} ({_gib(size)} per rank)")
+        where = (
+            f"on {node.node_id}; its {self.guardrail:.0%} static ceiling is "
+            f"{_gib(node.usable_memory(self.guardrail))}"
+            if live
+            else f"{self.guardrail:.0%} of {_gib(node.addressable_memory)} "
+            f"addressable on {node.gpu_name}"
+        )
         return (
             f"Won't fit: weights alone are {_gib(held)} per rank{replicated_note} "
-            f"against {_gib(usable)} usable "
-            f"({self.guardrail:.0%} of {_gib(node.addressable_memory)} "
-            f"addressable on {node.gpu_name}). Over budget by {_gib(over)} in "
+            f"against {_gib(usable)} {_budget_word(basis)} "
+            f"({where}). Over budget by {_gib(over)} in "
             f"total. Context and concurrency cannot fix this at "
             f"{shape.dtype} on {ranks} rank{'s' if ranks != 1 else ''} — it "
             f"needs {_options(fixes)}."
@@ -754,6 +870,7 @@ class FitCalculator:
         node: NodeProfile,
         max_ctx: int,
         over: int,
+        basis: str = "static",
     ) -> str:
         shape, plan = req.shape, req.plan
         divisor = kv_divisor(shape, plan)
@@ -780,13 +897,17 @@ class FitCalculator:
                 fixes.append(
                     f"quantize the KV cache to fp8 ({_gib(kv_fp8)}, still short)"
                 )
-        fixes.append(f"spread it over {self._nodes_phrase(req, node)}")
+        fixes.append(
+            f"spread it over "
+            f"{self._nodes_phrase(req, node, usable if basis == 'live' else None)}"
+        )
 
         return (
             f"Over budget by {_gib(over)}. KV cache is the problem: "
             f"{_gib(breakdown.kv_cache)} per rank at {req.context_length} tokens "
             f"x {req.max_concurrent_seqs} sequences, against {_gib(kv_budget)} "
-            f"left after weights, activations and overhead. "
+            f"left after weights, activations and overhead"
+            f"{' on the machine as it is right now' if basis == 'live' else ''}. "
             f"{_options(fixes, capitalize=True)}."
         )
 
@@ -797,6 +918,7 @@ class FitCalculator:
         usable: int,
         node: NodeProfile,
         over: int,
+        basis: str = "static",
     ) -> str:
         named = [
             ("weights", breakdown.weights),
@@ -815,13 +937,14 @@ class FitCalculator:
                 f"{biggest} is the biggest term at {_gib(biggest_size)}, "
                 f"{share:.0%} of the budget, but the rest still needs "
                 f"{_gib(breakdown.total - biggest_size)} against "
-                f"{_gib(usable)} usable, so shedding it alone will not close "
+                f"{_gib(usable)} {_budget_word(basis)}, so shedding it alone "
+                f"will not close "
                 f"the gap"
             )
         else:
             lead = "no single term dominates"
 
-        fixes = [self._nodes_phrase(req, node)]
+        fixes = [self._nodes_phrase(req, node, usable if basis == "live" else None)]
         seqs = self._largest_max_seqs(
             req.shape, req.plan, usable, req.context_length, req.kv_dtype,
             req.max_concurrent_seqs - 1, req.weight_bytes,
@@ -834,6 +957,7 @@ class FitCalculator:
             fixes.append(f"requantize to {name} ({_gib(size)} per rank)")
         return (
             f"Won't fit: {_gib(breakdown.total)} needed per rank against "
-            f"{_gib(usable)} usable, over budget by {_gib(over)}. Every term: "
+            f"{_gib(usable)} {_budget_word(basis)}, over budget by {_gib(over)}. "
+            f"Every term: "
             f"{terms}. Here {lead} — it needs {_options(fixes)}."
         )

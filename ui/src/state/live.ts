@@ -11,6 +11,16 @@ import type { SafeMetricsFrame } from './useMetrics'
 export const HOT_C = 80
 export const MEMORY_PRESSURE_PCT = 92
 
+/** How old a node's own telemetry sample may get before its live readings stop
+ *  counting as live. The coordinator samples every second and the metrics frame
+ *  is published on its own interval, so a handful of missed samples is noise;
+ *  a node that has not produced one in this long has a dead telemetry source,
+ *  not a slow one. The canonical case is a container started without `--gpus`:
+ *  its agent answers /agent/health forever, so `last_seen` stays fresh while
+ *  power, temperature and utilisation are frozen at whatever they read when
+ *  nvidia-smi was last reachable. */
+export const SAMPLE_STALE_S = 30
+
 export interface NodeLive {
   power_w: number | null
   temp_c: number | null
@@ -27,8 +37,15 @@ export function nodeLive(
   streamStale: boolean,
 ): NodeLive & { fresh: boolean } {
   const f = frame?.nodes.find((n) => n.node_id === node.profile.node_id)
+  // The frame arriving does not mean this node is in it. Its sample carries its
+  // own age, measured on the coordinator's clock like the frame's `ts`, so a
+  // node whose telemetry died is caught even while the stream is healthy.
+  const sampleTs = f?.sample_ts ?? node.sample_ts ?? null
+  const sampleFresh =
+    frame != null && sampleTs != null && frame.ts - sampleTs <= SAMPLE_STALE_S
   const hasLive =
     !streamStale &&
+    sampleFresh &&
     f != null &&
     (f.power_w != null || f.temp_c != null || f.util_pct != null)
 
@@ -41,10 +58,15 @@ export function nodeLive(
       fresh: true,
     }
   }
+  const addressable = node.profile.addressable_memory
   return {
     power_w: node.power_watts,
     temp_c: node.temperature_c,
-    memory_used_pct: (node.memory_used / node.profile.addressable_memory) * 100,
+    // Guarded: a node that probed as UNKNOWN -- no nvidia-smi, so no GPU name
+    // and no memory at all -- has addressable_memory 0, and dividing by it
+    // yields Infinity, which renders as a percentage and reads as a
+    // catastrophic reading rather than as the absent one it is.
+    memory_used_pct: addressable > 0 ? (node.memory_used / addressable) * 100 : null,
     util_pct: node.utilization_pct,
     fresh: false,
   }

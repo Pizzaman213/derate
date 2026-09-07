@@ -31,11 +31,11 @@ class _AccountingProviders:
 def client(tmp_path, monkeypatch):
     """A gateway whose settings file lives in tmp_path rather than /data.
 
-    Done by pointing SPARKPLANE_DATA_DIR at a temp dir rather than by injecting
+    Done by pointing DERATE_DATA_DIR at a temp dir rather than by injecting
     a store, so the test exercises the real wiring create_app builds -- the
     default path resolution is part of what is under test.
     """
-    monkeypatch.setenv("SPARKPLANE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
 
     def _app(providers=None):
         deps = GatewayDeps(providers=providers) if providers else GatewayDeps()
@@ -60,7 +60,7 @@ def test_settings_is_reachable_even_when_the_ui_is_mounted(tmp_path, monkeypatch
     app.router.routes -- this FastAPI wraps included routers in _IncludedRouter
     objects with no .path, so route introspection asserts on an implementation
     detail while this asserts on the property that matters."""
-    monkeypatch.setenv("SPARKPLANE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
     ui = tmp_path / "ui"
     ui.mkdir()
     (ui / "index.html").write_text("<!doctype html><title>derate</title>")

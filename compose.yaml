@@ -1,10 +1,11 @@
 # Optional. `docker run` works standalone and is the documented path:
 #
-#     docker run -d --name sparkplane --network host --restart unless-stopped \
-#       -v sparkplane:/data \
+#     docker run -d --name derate --network host --gpus all --pid=host \
+#       --restart unless-stopped \
+#       -v derate:/data \
 #       -v "$HOME/.config/sparkrun:/root/.config/sparkrun:ro" \
 #       -v "$HOME/.ssh:/root/.ssh:ro" \
-#       sparkplane/node
+#       ghcr.io/pizzaman213/derate/node
 #
 # This file exists for the single-node case and for people who prefer compose.
 # It is never required: a compose file you must have is a configuration step,
@@ -12,16 +13,30 @@
 
 services:
   node:
-    image: sparkplane/node:latest
+    image: ghcr.io/pizzaman213/derate/node:latest
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: sparkplane
+    container_name: derate
 
     # Not optional. mDNS is multicast and does not cross a bridge, and the
     # agent needs the real interfaces to report ConnectX-7 topology. The
     # container refuses to start without it.
     network_mode: host
+
+    # Also not optional, and it fails quietly rather than loudly. Without the
+    # GPU the container has no nvidia-smi, and a node with no nvidia-smi probes
+    # as an unknown device class: no GPU name, zero memory, zero power, zero
+    # temperature. It still joins and still reports healthy -- it is simply
+    # never planned onto, and nothing anywhere says why.
+    #
+    # `pid: host` is part of the same requirement. On GB10 the aggregate FB
+    # memory fields all read [N/A], so per-process accounting is the only way
+    # to tell a resident model from the desktop, and nvidia-smi only reports
+    # processes inside its own PID namespace -- which, in a container, is none
+    # of the ones that matter.
+    gpus: all
+    pid: host
 
     restart: unless-stopped
 
@@ -29,32 +44,39 @@ services:
       # Cluster token, node registry, link measurements, deployment records,
       # resolved-shape cache, synthesized recipes, telemetry journal and
       # archive.
-      - sparkplane:/data
+      - derate:/data
       # The host's sparkrun config, read-only: registries, saved clusters,
       # container image defaults.
       - ${HOME}/.config/sparkrun:/root/.config/sparkrun:ro
       # sparkrun drives the cluster over SSH.
       - ${HOME}/.ssh:/root/.ssh:ro
+      # The model cache the runtime downloads into. Read-WRITE, unlike the two
+      # above, and deliberately: the Storage tab's whole purpose for this mount
+      # is deleting weights, and 894 GiB of them is the largest thing on a
+      # serving box by orders of magnitude. Without it the node reports "no
+      # model cache" honestly and nothing breaks -- it simply cannot see or
+      # reclaim what the runtime downloaded.
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
 
     environment:
       # Every one has a working default; they are listed so they are
       # discoverable, not because they need setting.
-      SPARKPLANE_ROLE: ${SPARKPLANE_ROLE:-auto}
-      SPARKPLANE_PORT: ${SPARKPLANE_PORT:-8080}
-      SPARKPLANE_AGENT_PORT: ${SPARKPLANE_AGENT_PORT:-8081}
+      DERATE_ROLE: ${DERATE_ROLE:-auto}
+      DERATE_PORT: ${DERATE_PORT:-8080}
+      DERATE_AGENT_PORT: ${DERATE_AGENT_PORT:-8081}
       # Unset -> the coordinator generates a token on first run and prints it.
-      SPARKPLANE_TOKEN: ${SPARKPLANE_TOKEN:-}
+      DERATE_TOKEN: ${DERATE_TOKEN:-}
       # Unset -> discover the coordinator over mDNS. Set to an address to skip
       # discovery when the other node is on a different subnet.
-      SPARKPLANE_JOIN: ${SPARKPLANE_JOIN:-}
-      SPARKPLANE_LOG_LEVEL: ${SPARKPLANE_LOG_LEVEL:-INFO}
+      DERATE_JOIN: ${DERATE_JOIN:-}
+      DERATE_LOG_LEVEL: ${DERATE_LOG_LEVEL:-INFO}
       # Durable telemetry. Every node journals to /data and the coordinator
       # collects it; these bound how much of it is kept and for how long.
-      SPARKPLANE_TELEMETRY: ${SPARKPLANE_TELEMETRY:-1}
-      SPARKPLANE_TELEMETRY_RETENTION_DAYS: ${SPARKPLANE_TELEMETRY_RETENTION_DAYS:-30}
-      SPARKPLANE_TELEMETRY_LOG_LEVEL: ${SPARKPLANE_TELEMETRY_LOG_LEVEL:-INFO}
-      SPARKPLANE_TELEMETRY_MAX_BYTES: ${SPARKPLANE_TELEMETRY_MAX_BYTES:-}
-      SPARKPLANE_TELEMETRY_SHIP_INTERVAL_S: ${SPARKPLANE_TELEMETRY_SHIP_INTERVAL_S:-5}
+      DERATE_TELEMETRY: ${DERATE_TELEMETRY:-1}
+      DERATE_TELEMETRY_RETENTION_DAYS: ${DERATE_TELEMETRY_RETENTION_DAYS:-30}
+      DERATE_TELEMETRY_LOG_LEVEL: ${DERATE_TELEMETRY_LOG_LEVEL:-INFO}
+      DERATE_TELEMETRY_MAX_BYTES: ${DERATE_TELEMETRY_MAX_BYTES:-}
+      DERATE_TELEMETRY_SHIP_INTERVAL_S: ${DERATE_TELEMETRY_SHIP_INTERVAL_S:-5}
 
     healthcheck:
       # /agent/health exists in both roles. /api/cluster is coordinator-only
@@ -62,12 +84,12 @@ services:
       test:
         - CMD-SHELL
         - >-
-          curl -fsS http://127.0.0.1:${SPARKPLANE_AGENT_PORT:-8081}/agent/health ||
-          curl -fsS http://127.0.0.1:${SPARKPLANE_PORT:-8080}/agent/health
+          curl -fsS http://127.0.0.1:${DERATE_AGENT_PORT:-8081}/agent/health ||
+          curl -fsS http://127.0.0.1:${DERATE_PORT:-8080}/agent/health
       interval: 15s
       timeout: 5s
       start_period: 30s
       retries: 3
 
 volumes:
-  sparkplane:
+  derate:

@@ -1,6 +1,6 @@
 """mDNS advertisement and browsing over the management LAN.
 
-Advertises ``_sparkplane._tcp.local.`` with role, cluster_id and node_id in TXT,
+Advertises ``_derate._tcp.local.`` with role, cluster_id and node_id in TXT,
 so a browsing node can tell a coordinator from a worker before it tries to join.
 
 zeroconf is a soft import. The package must stay importable, and every unit test
@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - exercised by absence, not by tests
 
 ZEROCONF_MISSING = (
     "zeroconf is not installed, so mDNS discovery is disabled. Nodes will not "
-    "find each other automatically. Install it, or use SPARKPLANE_JOIN=<addr>."
+    "find each other automatically. Install it, or use DERATE_JOIN=<addr>."
 )
 
 

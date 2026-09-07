@@ -11,6 +11,7 @@ from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import Any
 
+from control_plane.contracts.quant import quant_info
 from control_plane.contracts import (
     Deployment,
     DeviceClass,
@@ -71,7 +72,15 @@ def _eligibility(healthy: bool, device_class: DeviceClass) -> tuple[bool, str | 
     return True, None
 
 
-def node_payload(state: NodeState) -> dict:
+def node_payload(state: NodeState, label: str | None = None) -> dict:
+    """One node row.
+
+    `label` is the operator's display name and is deliberately a parameter
+    rather than something read off the profile: the profile is re-probed from
+    the machine on every join and would overwrite a name a human chose. It
+    stays keyword-optional so a caller without a registry to ask still emits a
+    valid row -- with no name, which is what "nobody renamed it" looks like.
+    """
     profile = state.profile
     # Reported against physical memory, which is the basis Agent A's telemetry
     # and the topology payload in the architecture doc both use. Admission
@@ -81,6 +90,10 @@ def node_payload(state: NodeState) -> dict:
     eligible, ineligible_reason = _eligibility(state.healthy, profile.device_class)
     return {
         "node_id": profile.node_id,
+        # The name to show. Null, never the node_id: the UI has to tell
+        # "renamed to the same thing" from "never renamed", and only one of
+        # those should follow the node_id when the id itself changes.
+        "label": label or None,
         "hostname": profile.hostname,
         "address": profile.address,
         "device_class": profile.device_class.value,
@@ -93,6 +106,10 @@ def node_payload(state: NodeState) -> dict:
         "driver_version": profile.driver_version,
         "healthy": state.healthy,
         "last_seen": state.last_seen,
+        # When the four live readings below were last actually measured, as
+        # opposed to when the agent last answered a health check. They diverge
+        # whenever a node's telemetry source dies while its agent stays up.
+        "sample_ts": state.sample_ts or None,
         "memory_used": state.memory_used,
         "memory_used_pct": round(state.memory_used / total * 100.0, 1)
         if total
@@ -160,6 +177,240 @@ def shape_payload(shape: ModelShape) -> dict:
     return plain(shape)
 
 
+def _mtp_payload(breakdown: dict, warnings: list) -> dict | None:
+    """The multi-token-prediction module, stated rather than silently dropped.
+
+    The resolver excludes MTP parameters from ``total_params`` on purpose: no
+    runtime loads that module unless speculative decoding is turned on, and
+    charging it would refuse launches that would in fact have fit. But the
+    weight index on the hub *does* count it, so a reader comparing our figure
+    against the repo's own "N B parameters" finds a discrepancy with nothing to
+    explain it. This surfaces the size of that gap and the resolver's own
+    sentence about it, so the screen can say so.
+
+    ``None`` when the checkpoint carries no MTP module, which is most of them.
+    """
+    params = int(breakdown.get("mtp") or 0)
+    if params <= 0:
+        return None
+    note = next((w for w in warnings if "multi-token-prediction" in w), None)
+    return {
+        "params": params,
+        "excluded_from_total": True,
+        "note": note,
+    }
+
+
+def _capabilities(shape: Any, breakdown: dict, warnings: list) -> dict:
+    """The architectural facts a reader needs, as numbers.
+
+    Numbers only. "GQA 8:1" is typography and belongs to whichever component is
+    laying the row out; the ratio itself is arithmetic and belongs here, so no
+    client ever divides two head counts and gets a different answer.
+
+    When a capability is absent every sibling is ``None`` rather than ``0``.
+    They are not the same claim -- ``sliding_window: 0`` would say every layer
+    is windowed -- and the UI already draws a null differently from a zero.
+    """
+    experts = shape.num_experts or 0
+    kv_heads = shape.num_kv_heads or 0
+    heads = shape.num_attention_heads or 0
+    latent = shape.mla_latent_dim
+    window = shape.sliding_window
+    vision = shape.vision_params or 0
+    mtp_params = int(breakdown.get("mtp") or 0)
+    rope = getattr(shape, "effective_mla_rope_dim", 0) or 0
+
+    return {
+        "moe": {
+            "present": bool(experts),
+            "num_experts": experts or None,
+            "num_experts_per_token": (shape.num_experts_per_token or None) if experts else None,
+            "active_params": shape.effective_active_params if experts else None,
+            # Read straight off the shape rather than divided again downstream.
+            "active_fraction": (
+                (shape.effective_active_params / shape.total_params)
+                if experts and shape.total_params
+                else None
+            ),
+        },
+        "mla": {
+            "present": latent is not None,
+            "latent_dim": latent,
+            "rope_dim": rope if latent is not None else None,
+            # The width actually cached per layer per token. The latent alone
+            # is not it, and reading `mla_latent_dim` as if it were understates
+            # the KV cache on every DeepSeek checkpoint.
+            "cached_width_per_layer": (latent + rope) if latent is not None else None,
+        },
+        "gqa": {
+            "present": bool(kv_heads and heads > kv_heads),
+            "num_attention_heads": heads or None,
+            "num_kv_heads": kv_heads or None,
+            "ratio": (heads / kv_heads) if kv_heads else None,
+        },
+        "sliding_window": {
+            "present": window is not None,
+            "window": window,
+            # None means every layer caches the full context; 0 means every
+            # layer is windowed. Anything between is a real interleave.
+            "layers_with_full_attention": shape.layers_with_full_attention,
+            "num_layers": shape.num_layers,
+        },
+        "vision": {"present": bool(vision), "vision_params": vision or None},
+        "context": {"max_position_embeddings": None},  # filled by the caller
+        "mtp": {
+            "present": bool(mtp_params),
+            "params": mtp_params or None,
+            # The checkpoint carries the module; no runtime loads it unless
+            # speculative decoding is on, so it is excluded from total_params.
+            # Both figures ship so the gap can be stated instead of discovered.
+            "counted_in_total_params": False if mtp_params else None,
+            "total_params_with_mtp": (
+                shape.total_params + mtp_params if mtp_params else None
+            ),
+            "note": next(
+                (w for w in warnings if "multi-token-prediction" in w), None
+            ),
+        },
+    }
+
+
+def _launchable(res: Any, shape: Any) -> dict:
+    """Whether this can be served here at all, and why not when it cannot.
+
+    Mirrors what ``POST /api/deployments`` will decide, so a Serve button drawn
+    from this cannot disagree with the launch it triggers. GGUF is the case
+    that matters: both serve command templates take a repository path, not a
+    ``.gguf`` file, and nothing in the runtime tables claims to load one.
+    """
+    model_id = str(shape.model_id or "")
+    if model_id.startswith("hf://") or model_id.lower().endswith(".gguf"):
+        return {
+            "ok": False,
+            "reason": (
+                "a single GGUF file is not a launchable target: both serve "
+                "commands take a repository path, not a file"
+            ),
+        }
+    try:
+        family = quant_info(shape.dtype).family
+    except Exception:  # an unpriced dtype is the resolver's problem, not ours
+        family = ""
+    if family == "gguf":
+        return {
+            "ok": False,
+            "reason": (
+                f"{shape.dtype} is a llama.cpp format; neither vllm nor sglang "
+                "is verified to load it, and there is no llama.cpp runtime here"
+            ),
+        }
+    support = getattr(res, "support", None)
+    if support is not None and not support.any_runtime_ok:
+        entries = list(support.runtimes)
+        return {
+            "ok": False,
+            # Verbatim: the runtime's own sentence is more precise than a
+            # rewrite, and it is what the launch would have said.
+            "reason": entries[0].reason if entries else "no runtime can load this",
+        }
+    return {"ok": True, "reason": ""}
+
+
+def resolution_payload(res: Any) -> dict:
+    """A resolver ``Resolution`` on the wire, with the arithmetic already done.
+
+    Duck-typed on purpose. ``ResolverPort`` (contracts/ports.py) guarantees only
+    ``resolve()``; ``resolve_full`` is an extra this gateway probes for with
+    ``getattr``, and nothing in ``control_plane/gateway/**`` imports
+    ``control_plane.resolver``. Reading attributes off whatever the port handed
+    back keeps that decoupling, and keeps a stub resolver serializable.
+
+    Every derived number is computed here rather than on the client. The UI's
+    standing rule is that it never recomputes anything the backend owns -- a
+    second implementation of a GQA ratio or a byte count is a second answer that
+    can disagree with the real one -- so the client gets labels and layout, and
+    nothing to calculate.
+    """
+    shape = res.shape
+    breakdown = dict(getattr(res, "param_breakdown", {}) or {})
+    warnings = list(getattr(res, "warnings", []) or [])
+
+    # `as_dict()` emits `total` but not `total_with_mtp`; the checkpoint figure
+    # is what a hub weight index reports, so both belong on the wire.
+    if breakdown and "total_with_mtp" not in breakdown:
+        breakdown["total_with_mtp"] = int(breakdown.get("total") or 0) + int(
+            breakdown.get("mtp") or 0
+        )
+
+    kv_heads = shape.num_kv_heads or 0
+    payload: dict[str, Any] = {
+        "model_id": shape.model_id,
+        "revision": getattr(res, "revision", None),
+        "model_type": getattr(res, "model_type", ""),
+        "architectures": list(getattr(res, "architectures", ()) or ()),
+        "max_position_embeddings": getattr(res, "max_position_embeddings", None),
+        "shape": shape_payload(shape),
+        # Derived, so the client never divides anything.
+        "is_moe": shape.is_moe,
+        "active_params_effective": shape.effective_active_params,
+        "effective_head_dim": shape.effective_head_dim,
+        # None rather than a fabricated 1 when a config never said how many KV
+        # heads there are: an invented 1:1 ratio reads as MHA, which is a claim.
+        "gqa_ratio": (shape.num_attention_heads / kv_heads) if kv_heads else None,
+        "bytes_per_param": shape.bytes_per_param(),
+        "weight_bytes": getattr(res, "weight_bytes", None),
+        "param_breakdown": breakdown,
+        "mtp": _mtp_payload(breakdown, warnings),
+        "warnings": warnings,
+        "from_cache": getattr(res, "from_cache", False),
+        "resolved_at": getattr(res, "resolved_at", 0.0),
+        "elapsed_ms": getattr(res, "elapsed_ms", 0.0),
+    }
+
+    # Provenance. These are enums on the dataclass and plain strings once
+    # cached, so normalize rather than assuming either spelling.
+    for key in ("param_source", "quant_source"):
+        source = getattr(res, key, None)
+        payload[key] = getattr(source, "value", source)
+
+    effective = getattr(res, "effective_weight_bytes", None)
+    payload["weight_bytes_effective"] = effective() if callable(effective) else None
+
+    support = getattr(res, "support", None)
+    if support is not None:
+        quant = support.quant
+        payload["support"] = {
+            "architectures": list(support.architectures or ()),
+            "runtimes": [
+                {
+                    "runtime": entry.runtime,
+                    "level": getattr(entry.level, "value", entry.level),
+                    "reason": entry.reason,
+                }
+                for entry in support.runtimes
+            ],
+            "quant": {
+                "dtype": quant.dtype,
+                "native_compute_capability": quant.native_compute_capability,
+                "emulated_below_native": quant.emulated_below_native,
+                "note": quant.note,
+            },
+        }
+    else:
+        payload["support"] = None
+
+    capabilities = _capabilities(shape, breakdown, warnings)
+    capabilities["context"]["max_position_embeddings"] = payload[
+        "max_position_embeddings"
+    ]
+    payload["capabilities"] = capabilities
+    payload["launchable"] = _launchable(res, shape)
+    payload["effective_mla_rope_dim"] = getattr(shape, "effective_mla_rope_dim", None)
+
+    return payload
+
+
 def plan_payload(plan: ParallelismPlan) -> dict:
     data = plain(plan)
     data["world_size"] = plan.world_size
@@ -183,6 +434,7 @@ def deployment_payload(deployment: Deployment) -> dict:
         "backend_url": deployment.backend_url,
         "context_length": deployment.context_length,
         "max_concurrent_seqs": deployment.max_concurrent_seqs,
+        "modality": deployment.modality.value,
         "started_at": deployment.started_at,
         "last_error": deployment.last_error,
         "node_ids": list(deployment.plan.node_ids) if deployment.plan else [],
@@ -198,6 +450,7 @@ def provider_model_payload(model: ProviderModel) -> dict:
         "context_length": model.context_length,
         "supports_streaming": model.supports_streaming,
         "supports_tools": model.supports_tools,
+        "modality": model.modality.value,
         "input_cost_per_mtok": model.input_cost_per_mtok,
         "output_cost_per_mtok": model.output_cost_per_mtok,
     }

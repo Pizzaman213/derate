@@ -85,7 +85,7 @@ class NcclMeasurer:
         self._min_bytes = min_bytes
         self._max_bytes = max_bytes
         self._timeout_s = timeout_s
-        env_args = os.environ.get("SPARKPLANE_MPIRUN_ARGS", "")
+        env_args = os.environ.get("DERATE_MPIRUN_ARGS", "")
         self._extra = tuple(extra_mpirun_args or ()) + tuple(shlex.split(env_args))
 
     def available(self) -> bool:
@@ -193,7 +193,7 @@ class NcclMeasurer:
         return self._runner.run(argv, timeout=self._timeout_s)
 
     def _launcher(self) -> str | None:
-        override = os.environ.get("SPARKPLANE_MPIRUN")
+        override = os.environ.get("DERATE_MPIRUN")
         if override:
             return override
         for name in ("mpirun", "srun"):
@@ -203,7 +203,7 @@ class NcclMeasurer:
         return None
 
     def _binary(self, name: str) -> str | None:
-        for env in ("SPARKPLANE_NCCL_TESTS_DIR", "NCCL_TESTS_DIR"):
+        for env in ("DERATE_NCCL_TESTS_DIR", "NCCL_TESTS_DIR"):
             base = os.environ.get(env)
             if base:
                 candidate = os.path.join(base, name)

@@ -1,4 +1,7 @@
+import { useState } from 'react'
+import { isAudio } from '../api/types'
 import type { DeploymentDTO, NodeStateDTO, RouteTarget, RoutingConfig, Settings } from '../api/types'
+import { useBackend } from '../state/backend'
 import type { SafeMetricsFrame } from '../state/useMetrics'
 import { Lamp } from '../components/Lamp'
 import { ProportionBar } from '../components/Bars'
@@ -57,9 +60,41 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
   const meanDuration = counters?.mean_duration_s ?? null
   const ttft = depFrame?.ttft_ms ?? null
 
+  // A speech or transcription deployment decodes no tokens, so every
+  // token-denominated readout below is absent rather than zero.
+  const audio = isAudio(dep.modality)
   const degraded = dep.state === 'degraded'
   const serving = dep.state === 'ready' || degraded
   const rate = settings?.electricity_rate_usd_per_kwh ?? 0
+
+  const { backend, invalidate } = useBackend()
+  const [stopping, setStopping] = useState(false)
+  const [stopError, setStopError] = useState<string | null>(null)
+  // Read the disabled state off the wire, not off local `stopping`, so a
+  // reload part-way through a stop still shows the truth.
+  const alreadyStopping = dep.state === 'stopping' || dep.state === 'stopped'
+
+  const stop = async () => {
+    // The consequence, not just the question: this is what the backend
+    // actually does -- set_draining, then stop.
+    if (
+      !window.confirm(
+        `Stop ${dep.served_name}? It stops accepting new requests immediately; ` +
+          `requests already in flight finish.`,
+      )
+    )
+      return
+    setStopping(true)
+    setStopError(null)
+    try {
+      await backend.stopDeployment(dep.deployment_id)
+      invalidate()
+    } catch (e) {
+      setStopError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setStopping(false)
+    }
+  }
 
   return (
     <div>
@@ -70,11 +105,33 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
             {dep.served_name}
           </span>
         </span>
-        <button onClick={onClose}>Close</button>
+        <span style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+          {alreadyStopping ? (
+            <button disabled>{dep.state === 'stopped' ? 'Stopped' : 'Stopping…'}</button>
+          ) : (
+            <button onClick={() => void stop()} disabled={stopping}>
+              {stopping ? 'Stopping…' : 'Stop'}
+            </button>
+          )}
+          <button onClick={onClose}>Close</button>
+        </span>
       </div>
+      {stopError ? (
+        <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: '8px 0 0' }}>
+          {stopError}
+        </p>
+      ) : null}
       <div className="unit" style={{ margin: '5px 0 0' }}>
-        {planShortFromDegrees(dep.plan)} · {dep.runtime} · {dep.context_length.toLocaleString()} ctx ·{' '}
-        {dep.max_concurrent_seqs} seqs · up {dep.started_at != null ? relativeTime(dep.started_at) : '—'}
+        {planShortFromDegrees(dep.plan)} · {dep.runtime}
+        {audio ? (
+          <> · {dep.modality}</>
+        ) : (
+          <>
+            {' '}
+            · {dep.context_length.toLocaleString()} ctx · {dep.max_concurrent_seqs} seqs
+          </>
+        )}{' '}
+        · up {dep.started_at != null ? relativeTime(dep.started_at) : '—'}
       </div>
 
       {dep.last_error ? (
@@ -86,6 +143,15 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
       <div className="sub" style={{ border: 'none', paddingTop: 0 }}>
         latency and throughput
       </div>
+      {audio ? (
+        <div className="unit">
+          Every reading here is denominated in tokens — aggregate and per-stream decode rate, time between
+          tokens, time to first token. A {dep.modality} deployment produces audio, so none of them exist for
+          it. They are absent rather than zero: the control plane measures no audio-side rate today, and a 0
+          would read as a stalled deployment.
+        </div>
+      ) : (
+      <>
       <div className="quad">
         <Quad value={depFrame?.tokens_per_sec ?? null} unit="tok/s aggregate, all streams" />
         <Quad value={decodeTps} unit="tok/s per stream" />
@@ -106,6 +172,8 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
         <PhaseBar ttftMs={ttft} meanDurationS={meanDuration} />
       ) : (
         <div className="unit">Not yet observed.</div>
+      )}
+      </>
       )}
 
       <div className="sub">targets{cfg ? ` · ${cfg.policy.replace(/_/g, ' ')}` : ''}</div>

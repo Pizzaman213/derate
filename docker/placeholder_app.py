@@ -20,16 +20,16 @@ import socket
 import sys
 import threading
 
-PORT = int(os.environ.get("SPARKPLANE_PORT", "8080"))
-AGENT_PORT = int(os.environ.get("SPARKPLANE_AGENT_PORT", str(PORT)))
-ROLE = os.environ.get("SPARKPLANE_ROLE", "auto")
+PORT = int(os.environ.get("DERATE_PORT", "8080"))
+AGENT_PORT = int(os.environ.get("DERATE_AGENT_PORT", str(PORT)))
+ROLE = os.environ.get("DERATE_ROLE", "auto")
 
-PAGE = """<!doctype html><meta charset=utf-8><title>sparkplane</title>
+PAGE = """<!doctype html><meta charset=utf-8><title>derate</title>
 <style>body{font:15px/1.6 ui-sans-serif,system-ui,sans-serif;max-width:44rem;
 margin:12vh auto;padding:0 1.5rem;color:#e6e6e6;background:#111}
 code{background:#1e1e1e;padding:.15rem .4rem;border-radius:3px}
 h1{font-size:1.3rem;font-weight:600}</style>
-<h1>sparkplane node</h1>
+<h1>derate node</h1>
 <p>The container is up, host networking is confirmed, and the agent health
 endpoint is answering.</p>
 <p>The coordinator UI is served by the gateway (Agent G) once
@@ -40,7 +40,7 @@ placeholder that proves the container and its networking are correct.</p>
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "sparkplane-placeholder"
+    server_version = "derate-placeholder"
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.rstrip("/") in ("/agent/health", "/health"):
@@ -71,7 +71,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stderr.write("[sparkplane] %s\n" % (fmt % args))
+        sys.stderr.write("[derate] %s\n" % (fmt % args))
 
 
 def serve(port: int, label: str) -> http.server.ThreadingHTTPServer:
@@ -86,12 +86,12 @@ def serve(port: int, label: str) -> http.server.ThreadingHTTPServer:
     except OSError as exc:
         if exc.errno != errno.EADDRINUSE:
             raise
-        variable = "SPARKPLANE_AGENT_PORT" if label == "agent" else "SPARKPLANE_PORT"
+        variable = "DERATE_AGENT_PORT" if label == "agent" else "DERATE_PORT"
         print(
-            "[sparkplane] port %d is already in use on this host.\n"
-            "[sparkplane] Host networking shares the host's ports, so this is a "
+            "[derate] port %d is already in use on this host.\n"
+            "[derate] Host networking shares the host's ports, so this is a "
             "collision with something already running.\n"
-            "[sparkplane] Pick another one:  docker run --network host -e %s=<port> ..."
+            "[derate] Pick another one:  docker run --network host -e %s=<port> ..."
             % (port, variable),
             file=sys.stderr,
         )
@@ -100,7 +100,7 @@ def serve(port: int, label: str) -> http.server.ThreadingHTTPServer:
 
 def main() -> int:
     print(
-        "[sparkplane] placeholder node app: agent on :%d, UI on :%d (role=%s). "
+        "[derate] placeholder node app: agent on :%d, UI on :%d (role=%s). "
         "control_plane.node is not in this image yet."
         % (AGENT_PORT, PORT, ROLE),
         file=sys.stderr,

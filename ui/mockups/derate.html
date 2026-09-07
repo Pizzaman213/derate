@@ -1,0 +1,1407 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>derate</title>
+<!-- Self-hosted, not a CDN. Architecture section 1: the gateway binds to the
+     LAN and nothing here is exposed to the internet, so a Google Fonts <link>
+     cannot resolve on a LAN-only or air-gapped box -- it blocks first paint
+     until it times out and then the design silently falls back to a system
+     stack, losing the tabular-nums this whole instrument panel depends on for
+     digits that do not shift as values update. IBM Plex is SIL OFL; see
+     fonts/LICENSE. The React app already vendors these via @fontsource. -->
+<style>
+@font-face{font-family:'IBM Plex Sans';font-style:normal;font-weight:400;font-display:swap;
+  src:url('fonts/ibm-plex-sans-latin-400-normal.woff2') format('woff2')}
+@font-face{font-family:'IBM Plex Sans';font-style:normal;font-weight:500;font-display:swap;
+  src:url('fonts/ibm-plex-sans-latin-500-normal.woff2') format('woff2')}
+@font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:400;font-display:swap;
+  src:url('fonts/ibm-plex-mono-latin-400-normal.woff2') format('woff2')}
+@font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:500;font-display:swap;
+  src:url('fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2')}
+</style>
+
+<style>
+:root{
+  --panel:#EDE9E0; --recessed:#E4DFD4; --sunk:#DAD4C7; --ink:#1A1917;
+  --fill:#1A1917; --onfill:#EDE9E0; --muted:#66625A; --rule:#C9C2B4; --flow:#8E877C;
+  --onfill-dim:#9D9A94;
+  --live:#3D8B4A; --warn:#B8862C; --fault:#A93A2E;
+}
+[data-theme=dark]{
+  --panel:#191817; --recessed:#221F1D; --sunk:#2A2724; --ink:#EDE9E0;
+  --fill:#E2DCD0; --onfill:#191817; --muted:#8C867B; --rule:#3A3631; --flow:#6E6960;
+  --onfill-dim:#5A5750;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--panel);color:var(--ink);font-family:'IBM Plex Sans',system-ui,sans-serif;
+  font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.mono{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}
+.label{font-size:13px;font-weight:500}
+.unit{font-size:12px;color:var(--muted)}
+.mut{color:var(--muted)}
+button,select,input{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--rule);
+  border-radius:3px;padding:6px 9px;cursor:pointer}
+input{cursor:text}
+button:hover,select:hover{background:var(--sunk)}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+button[disabled]{opacity:.42;cursor:default}
+.ghost{border:none;background:none;padding:5px 7px}
+.ghost:hover{background:var(--sunk)}
+
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid var(--rule)}
+.dest{display:flex;gap:2px;margin-left:auto}
+.dest button{border:none;background:none;border-bottom:2px solid transparent;border-radius:0;padding:6px 13px;color:var(--muted)}
+.dest button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--ink)}
+
+.wrap{--rail:300px;position:relative;display:grid;grid-template-columns:1fr var(--rail);
+  transition:grid-template-columns .18s ease}
+.wrap.narrow{--rail:0px}
+@media (max-width:1200px){ .wrap{--rail:260px} aside .inner{width:260px} }
+@media (max-width:980px){
+  .wrap{grid-template-columns:1fr} main{border-right:none}
+  aside{max-height:none;border-top:1px solid var(--rule)}
+  aside .inner{width:auto;max-height:none}
+  header{flex-wrap:wrap} .dest{margin-left:0;order:9;width:100%}
+  .rail{display:none}
+}
+@media (max-width:760px){
+  .quad{grid-template-columns:repeat(2,1fr)}
+  .deprow{grid-template-columns:1fr 72px 58px}
+  .deprow svg{display:none}
+}
+main{padding:20px 22px;border-right:1px solid var(--rule);overflow:hidden;min-height:calc(100vh - 55px)}
+aside{background:var(--recessed);overflow:hidden;max-height:calc(100vh - 55px)}
+aside .inner{padding:18px;display:flex;flex-direction:column;gap:15px;width:300px;
+  overflow-y:auto;max-height:calc(100vh - 55px)}
+aside section{border-bottom:1px solid var(--rule);padding-bottom:13px}
+aside section:last-child{border:none}
+
+/* pull tab: a grip on the seam that grows into a handle under the pointer */
+.rail{position:absolute;top:50%;right:var(--rail);height:168px;width:24px;z-index:5;
+  display:flex;align-items:center;justify-content:flex-end;
+  transform:translateY(-50%);transition:right .18s ease}
+.rail .tab{width:6px;height:46px;padding:0;border:none;border-radius:3px 0 0 3px;
+  background:var(--rule);color:var(--muted);display:flex;align-items:center;justify-content:center;
+  transition:width .16s ease,height .16s ease,background .16s ease,color .16s ease}
+.rail .tab svg{opacity:0;transition:opacity .16s ease,transform .18s ease}
+.rail:hover .tab,.rail .tab:focus-visible{width:18px;height:66px;background:var(--recessed);
+  border:1px solid var(--rule);border-right:none;color:var(--ink)}
+.rail:hover .tab svg,.rail .tab:focus-visible svg{opacity:1}
+.wrap.narrow .rail .tab svg{transform:rotate(180deg)}
+@media (hover:none){
+  .rail .tab{width:18px;height:66px;background:var(--recessed);border:1px solid var(--rule);border-right:none}
+  .rail .tab svg{opacity:1}
+}
+h2{font-size:13px;font-weight:500;color:var(--muted);margin-bottom:9px}
+h3{font-size:15px;font-weight:500;margin-bottom:4px}
+
+.stage{background:var(--recessed);border:1px solid var(--rule);border-radius:3px;padding:16px 18px}
+.stage.bare{background:none;border:none;border-radius:0;padding:0}
+.bararea{display:flex;gap:7px;align-items:flex-end;flex-wrap:wrap;padding-bottom:13px;margin-bottom:13px;
+  border-bottom:1px solid var(--rule)}
+.fld{display:flex;flex-direction:column;gap:3px}
+.fld label{font-size:12px;color:var(--muted)}
+.fld input,.fld select{padding:5px 8px}
+
+.readout{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums;font-size:24px;font-weight:500;line-height:1.1}
+.big{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums;font-size:42px;font-weight:500;line-height:1}
+.row{display:flex;justify-content:space-between;align-items:baseline;padding:4px 0}
+.row .mono{font-size:14px}
+
+.slot{display:flex;align-items:center;gap:8px;font-size:12px;padding:2px 0}
+.bar{flex:1;height:15px;background:var(--sunk);border-radius:2px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--fill)}
+.bar.free{background:none;border:1px dashed var(--rule)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.pill{display:inline-block;font-size:12px;padding:2px 8px;border:1px solid var(--rule);border-radius:3px;color:var(--muted)}
+
+.why{font-size:12px;color:var(--muted);margin-top:8px;padding-left:10px;border-left:2px solid var(--rule);display:none}
+.why.on{display:block}
+.why div{padding:3px 0}
+
+.verdict{border:1px solid var(--rule);border-radius:3px;padding:12px;margin-bottom:13px;font-size:13px;display:none;background:var(--panel)}
+.verdict.on{display:block}
+.verdict.bad{border-color:var(--fault)}
+.vhead{font-weight:500;margin-bottom:7px}
+.budget{display:flex;height:20px;border-radius:2px;overflow:hidden;margin:8px 0;background:var(--sunk)}
+.budget span{display:block;height:100%}
+.legend{display:flex;gap:13px;font-size:12px;color:var(--muted);flex-wrap:wrap;align-items:center}
+.legend b{font-weight:400;color:var(--ink)}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:500;font-size:12px;color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--rule)}
+td{padding:8px;border-bottom:1px solid var(--rule)}
+td.num{text-align:right;font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}
+tr:last-child td{border:none}
+
+.deprow{display:grid;grid-template-columns:150px 78px 1fr 74px 62px;gap:12px;align-items:center;
+  padding:9px 0;border-bottom:1px solid var(--rule);cursor:pointer}
+.deprow:last-child{border:none}
+.deprow:hover{background:var(--sunk)}
+.deprow.sel{background:var(--sunk)}
+
+.card2{background:var(--recessed);border:1px solid var(--rule);border-radius:3px;padding:15px 17px;margin-bottom:14px}
+.split{display:flex;height:26px;border-radius:2px;overflow:hidden;background:var(--sunk);margin:10px 0}
+.split span{display:flex;align-items:center;padding-left:8px;font-size:12px;font-family:'IBM Plex Mono',monospace}
+.sw{display:flex;align-items:center;gap:9px;padding:7px 0}
+.sw input{width:auto;cursor:pointer}
+.soon{opacity:.5}
+.soon .pill{border-style:dashed}
+
+svg text{font-family:'IBM Plex Sans',sans-serif}
+svg text.m{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}
+.node,.name{cursor:pointer}
+.node:hover>rect:first-of-type,.name:hover>rect:first-of-type{stroke:var(--ink);stroke-width:2}
+
+.sheet{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:9}
+.sheet.on{display:flex}
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:3px;padding:20px;width:440px;max-width:92vw}
+.card.wide{width:700px;max-height:88vh;overflow-y:auto}
+.sub{font-size:11px;font-weight:500;color:var(--muted);letter-spacing:.04em;
+  margin:16px 0 8px;padding-top:11px;border-top:1px solid var(--rule)}
+.quad{display:grid;grid-template-columns:repeat(auto-fit,minmax(108px,1fr));gap:14px}
+.quad .readout{font-size:21px}
+.dets{opacity:0;transition:opacity .12s}
+.deprow:hover .dets,.deprow.sel .dets{opacity:1}
+.throttle{width:100%;margin:6px 0 2px}
+.cmd{font-family:'IBM Plex Mono',monospace;font-size:12px;line-height:1.55;white-space:pre;
+  background:var(--panel);border:1px solid var(--rule);border-radius:3px;padding:10px 12px;
+  overflow-x:auto;margin-top:8px}
+.cmd .ovr{background:var(--sunk);border-radius:2px;padding:0 2px}
+.phase{display:flex;height:22px;border-radius:2px;overflow:hidden;background:var(--sunk);
+  box-shadow:inset 0 0 0 1px var(--rule);margin:8px 0 4px}
+.phase span{display:flex;align-items:center;padding-left:7px;font-size:11px;
+  font-family:'IBM Plex Mono',monospace;white-space:nowrap;overflow:hidden}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
+.chips button{font-size:12px;padding:4px 10px;border-radius:3px}
+.chips button[aria-pressed=true]{background:var(--fill);color:var(--onfill);border-color:var(--fill)}
+.swapbar{display:none;align-items:center;gap:10px;padding:9px 12px;margin-bottom:12px;font-size:13px;
+  border:1px solid var(--warn);border-radius:3px;background:var(--panel)}
+.swapbar.on{display:flex}
+.subs{display:flex;gap:2px;margin:0 0 14px;border-bottom:1px solid var(--rule)}
+.subs button{border:none;background:none;border-radius:0;padding:6px 12px;color:var(--muted);
+  border-bottom:2px solid transparent;font-size:13px}
+.subs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--ink)}
+.chartgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+@media (max-width:900px){.chartgrid{grid-template-columns:1fr}}
+.chart{border:1px solid var(--rule);border-radius:3px;padding:10px 12px;background:var(--panel)}
+.chart h4{font-size:12px;font-weight:500;margin:0 0 2px;display:flex;justify-content:space-between;align-items:baseline}
+.chart h4 .now{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums;font-size:15px}
+.chart .ax{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;margin-top:2px}
+</style>
+
+<header>
+  <svg width="32" height="24" viewBox="0 0 64 50" aria-label="derate">
+    <path d="M26 25 V39 H56" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="square" opacity=".32"/>
+    <path d="M8 25 H26 V11 H56" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="square"/>
+  </svg>
+  <span style="font-weight:500;font-size:18px;letter-spacing:-.3px">derate</span>
+  <span class="pill mono" id="pill"></span>
+  <span class="pill mono" id="cloudPill" style="display:none">cloud off</span>
+  <div class="dest" role="tablist">
+    <button role="tab" aria-selected="true" data-d="dash">Dashboard</button>
+    <button role="tab" aria-selected="false" data-d="cluster">Cluster</button>
+    <button role="tab" aria-selected="false" data-d="spend">Spend</button>
+    <button role="tab" aria-selected="false" data-d="settings">Settings</button>
+  </div>
+  <button id="theme">Dark</button>
+</header>
+
+<div class="wrap" id="wrap">
+<div class="rail">
+  <button class="tab" id="tog" aria-controls="side" aria-expanded="true"
+    aria-label="Hide sidebar" title="Hide sidebar">
+    <svg width="7" height="12" viewBox="0 0 7 12" fill="none" stroke="currentColor"
+      stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l5 5-5 5"/></svg>
+  </button>
+</div>
+<main>
+
+  <section id="d-cluster" hidden>
+    <div class="stage bare">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+        <span class="unit">Drag to pan · scroll to zoom · click a model to scope the sidebar · double-click to inspect</span>
+        <button id="splitBtn" style="margin-left:auto">Split sparks</button>
+        <button id="spill">Saturate</button>
+        <span class="unit mono" id="zoomLbl" style="min-width:38px;text-align:right">100%</span>
+        <button id="reset" title="Reset pan and zoom (0)">Reset view</button>
+        <button id="measure">Re-measure</button>
+      </div>
+      <svg id="graph" viewBox="0 0 700 460" style="width:100%"></svg>
+      <div class="legend" style="margin-top:11px;padding-top:11px;border-top:1px solid var(--rule)">
+        <span><b>heavy</b> measured, on your hardware</span>
+        <span><b>thin dashed</b> crosses the routing boundary, no measured fabric</span>
+        <span><b>hairline</b> reachable through the proxy, not routed there</span>
+        <span><b>faded</b> idle</span><span><b>grey</b> request in flight</span>
+        <span><b>outlined</b> third party</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="d-dash">
+    <div class="swapbar" id="swapbar"></div>
+    <div class="subs" role="tablist" aria-label="Dashboard sections">
+      <button role="tab" aria-selected="true"  data-s="overview">Overview</button>
+      <button role="tab" aria-selected="false" data-s="telemetry">Telemetry</button>
+      <button role="tab" aria-selected="false" data-s="load">Load</button>
+    </div>
+    <div class="stage">
+      <div class="bararea" style="margin-bottom:0;border:none;padding-bottom:0">
+        <div class="fld" style="flex:1;min-width:180px"><label for="mid">Model</label>
+          <input id="mid" value="openai/gpt-oss-120b" spellcheck="false"></div>
+        <div class="fld"><label for="quant">Precision</label>
+          <select id="quant"><option value="mxfp4">mxfp4</option><option value="nvfp4">nvfp4</option>
+          <option value="fp8">fp8</option><option value="bf16">bf16</option><option value="q4_k_m">q4_k_m</option></select></div>
+        <div class="fld" style="width:84px"><label for="ctx">Context</label><input id="ctx" value="8192" class="mono"></div>
+        <div class="fld" style="width:62px"><label for="seqs">Seqs</label><input id="seqs" value="16" class="mono"></div>
+        <div class="fld"><label for="place">Place on</label><select id="place"></select></div>
+        <div class="fld"><label for="runtime">Runtime</label>
+          <select id="runtime"><option value="vllm">vllm</option><option value="sglang">sglang</option></select></div>
+        <div class="fld" style="flex:1;min-width:190px"><label for="extra">Extra launch flags</label>
+          <input id="extra" placeholder="--enforce-eager --swap-space 8" spellcheck="false"></div>
+        <button id="planBtn">Plan</button>
+        <button id="serveBtn" disabled>Serve</button>
+      </div>
+      <div class="verdict" id="verdict" style="margin-top:13px;margin-bottom:0"></div>
+      <div style="margin-top:13px">
+        <button id="cmdBtn" class="ghost" style="padding:0;font-size:12px;color:var(--muted)">launch command &#9656;</button>
+        <div id="cmdBox" style="display:none">
+          <div class="cmd" id="cmdOut"></div>
+          <div class="unit" style="margin-top:6px">This is the recipe command derate synthesizes and runs.
+            Extra flags are appended verbatim. A flag the runtime does not accept fails the launch; it is not ignored.</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="s-overview">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin:20px 0 6px">
+      <div><div class="readout" id="aTps">—</div><div class="unit">tokens per second, all models</div></div>
+      <div><div class="readout" id="aDep">—</div><div class="unit">deployments serving</div></div>
+      <div><div class="readout" id="aPow">—</div><div class="unit">watts drawn</div></div>
+      <div><div class="readout" id="aFree">—</div><div class="unit">slots free</div></div>
+    </div>
+
+    <div style="margin-top:16px">
+      <h2>Deployments</h2>
+      <div id="deps"></div>
+    </div>
+    </div><!-- /s-overview -->
+
+    <div id="s-telemetry" hidden>
+      <div class="unit" style="margin-bottom:12px">Every series below comes from the 1 Hz
+        metrics frame and is accumulated in this browser. The control plane stores no history —
+        it keeps one snapshot — so this window is 60 seconds and starts empty on load.
+        There are no percentiles anywhere in the system; TTFT and mean duration are moving averages.</div>
+      <h2>Cluster</h2>
+      <div class="chartgrid" id="telCluster"></div>
+      <h2 style="margin-top:18px">Per Spark</h2>
+      <div class="chips" id="telNodePick"></div>
+      <div class="chartgrid" id="telNodes"></div>
+      <h2 style="margin-top:18px">Per deployment</h2>
+      <div class="unit" id="telDepNote" style="margin:-4px 0 10px"></div>
+      <div class="chartgrid" id="telDeps"></div>
+    </div>
+
+    <div id="s-load" hidden>
+      <h2>Request load by Spark</h2>
+      <table id="loadTable"></table>
+      <div class="unit" id="loadNote" style="margin-top:8px"></div>
+    </div>
+  </section>
+
+  <section id="d-spend" hidden>
+    <div class="card2">
+      <h3>Where requests went today</h3>
+      <div class="unit">Local means hardware you own. Remote means a managed node or a third-party API.</div>
+      <div class="split" id="lrSplit"></div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:14px">
+        <div><div class="big" id="sLocal">—</div><div class="unit">% local</div></div>
+        <div><div class="big" id="sReq">—</div><div class="unit">requests today</div></div>
+        <div><div class="big" id="sCost">—</div><div class="unit">spent today</div></div>
+        <div><div class="big" id="sSaved">—</div><div class="unit">saved vs all-cloud</div></div>
+      </div>
+    </div>
+
+    <div class="card2">
+      <h3>By target</h3>
+      <div class="unit" style="margin-bottom:10px">Local cost derives from measured power draw at your electricity rate.</div>
+      <table id="spendTable"></table>
+    </div>
+
+    <div class="card2">
+      <h3>Containment</h3>
+      <div class="unit">Stop traffic leaving your hardware, and cap what it can cost when it does.</div>
+      <label class="sw"><input type="checkbox" id="cloudOff"> <span>Local only — never route to cloud providers</span></label>
+      <label class="sw"><input type="checkbox" id="managedOff"> <span>Exclude managed remote nodes too (brev-h100)</span></label>
+      <div style="display:flex;gap:10px;align-items:flex-end;margin-top:10px">
+        <div class="fld" style="width:130px"><label for="cap">Daily cap</label><input id="cap" value="5.00" class="mono"></div>
+        <div class="fld" style="width:130px"><label for="rate">Electricity $/kWh</label><input id="rate" value="0.14" class="mono"></div>
+        <span class="unit">Cloud targets stop admitting once the cap is hit.</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="d-settings" hidden>
+    <div class="card2">
+      <h3>Nodes</h3>
+      <div class="unit" style="margin-bottom:10px">Nodes on the local subnet are discovered automatically. Add anything else by address.</div>
+      <table id="nodeTable"></table>
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-top:12px">
+        <div class="fld" style="flex:1"><label for="naddr">Address</label><input id="naddr" placeholder="10.0.4.19"></div>
+        <div class="fld"><label for="nkind">Kind</label>
+          <select id="nkind"><option value="0">local · measured fabric</option><option value="1">remote · routing only</option></select></div>
+        <button id="addNode">Add node</button>
+      </div>
+      <div class="unit" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule)">
+        <span class="pill">discovered</span> spark-03 · GB10 · 10.0.4.21
+        <button style="padding:3px 8px;margin-left:8px" onclick="alert('Would probe and admit spark-03.')">Add</button>
+      </div>
+    </div>
+
+    <div class="card2">
+      <h3>Providers</h3>
+      <div class="unit" style="margin-bottom:10px">Keys are stored as references and resolved at request time. They are never displayed, logged, or included in exports.</div>
+      <table id="provTable"></table>
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-top:12px;flex-wrap:wrap">
+        <div class="fld"><label for="pkind">Provider</label>
+          <select id="pkind"><option>openrouter</option><option>openai</option><option>anthropic</option>
+          <option>together</option><option>groq</option><option>custom</option></select></div>
+        <div class="fld" style="flex:1;min-width:180px"><label for="pkey">API key</label>
+          <input id="pkey" type="password" placeholder="sk-..." autocomplete="off"></div>
+        <button id="addProv">Add provider</button>
+      </div>
+    </div>
+
+    <div class="card2">
+      <h3>Cluster</h3>
+      <div class="row"><span>Join token</span><span class="mono">••••••••••••</span></div>
+      <div class="row"><span>Discovery</span><span class="mono">mDNS · _derate._tcp.local.</span></div>
+      <div class="row"><span>Gateway</span><span class="mono">0.0.0.0:8080</span></div>
+      <label class="sw"><input type="checkbox" checked> <span>Measure links when a node joins</span></label>
+      <label class="sw"><input type="checkbox" checked> <span>Refuse launches that will not fit</span></label>
+    </div>
+
+    <div class="card2 soon">
+      <h3>Planned <span class="pill">not yet built</span></h3>
+      <div class="row"><span>Scheduled model swaps</span><span class="unit">time-based placement</span></div>
+      <div class="row"><span>Auto-eviction policy</span><span class="unit">currently always manual</span></div>
+      <div class="row"><span>Prometheus export</span><span class="unit">/metrics endpoint</span></div>
+      <div class="row"><span>Multi-user API keys</span><span class="unit">per-key quotas and usage</span></div>
+      <div class="row"><span>Model catalog sync</span><span class="unit">browse Hugging Face in-app</span></div>
+      <div class="row"><span>Alerting</span><span class="unit">node down, cap reached, OOM</span></div>
+    </div>
+  </section>
+
+</main>
+
+<aside id="side"><div class="inner">
+  <section><h2>Nodes</h2><div id="roster"></div></section>
+  <section>
+    <h2 id="scopeHead">Plan</h2>
+    <div class="row"><span class="label" id="planLabel"></span><span class="mono" id="linkNow"></span></div>
+    <button id="whyBtn" class="ghost" style="padding:0;font-size:12px;color:var(--muted);margin-top:4px">why ▸</button>
+    <div class="why" id="whyBox"></div>
+  </section>
+  <section>
+    <h2>Routing</h2>
+    <select id="policy" style="width:100%">
+      <option value="local_first">local_first</option><option value="least_outstanding">least_outstanding</option>
+      <option value="weighted_capacity">weighted_capacity</option><option value="cost_aware">cost_aware</option>
+      <option value="round_robin">round_robin</option>
+    </select>
+    <div id="weights" style="margin-top:10px"></div>
+    <div class="unit" id="policyNote"></div>
+  </section>
+  <section><h2 id="costHead">Cost per Mtok</h2><div id="costRows"></div></section>
+</div></aside>
+</div>
+
+<div class="sheet" id="sheet"><div class="card" id="cardBody"></div></div>
+
+<script>
+const $=s=>document.querySelector(s), NS='http://www.w3.org/2000/svg';
+const el=(t,a,x)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);
+  if(x!=null)e.textContent=x;return e;};
+const money=v=>'$'+v.toFixed(2);
+
+const S={
+  joined:1, saturated:0, link:10.2, sel:0, cloudOff:0, managedOff:0, spentToday:0.41, reqToday:1284,
+  nodes:[
+    {id:'spark-01',gpu:'GB10',unified:1,bw:273,remote:0,slots:[null],w:71,t:62,cpu:34,tps:64,thr:100,cost:0.019,req:0},
+    {id:'spark-02',gpu:'GB10',unified:1,bw:273,remote:0,slots:[null],w:68,t:60,cpu:31,tps:63,thr:100,cost:0.019,req:0},
+    {id:'ws-3090',gpu:'RTX 3090 x4',unified:0,bw:936,remote:0,
+      slots:[{m:'mistral-7b',pc:70},{m:'embed-v3',pc:45},null,null],w:212,t:68,cpu:12,tps:64,thr:100,cost:0.048,req:0},
+    {id:'brev-h100',gpu:'H100 80GB',unified:0,bw:3350,remote:1,lat:41,rate:2.30,
+      slots:[null],w:340,t:54,cpu:8,tps:186,thr:100,cost:0.310,req:0}
+  ],
+  providers:[{id:'openrouter',cost:0.600,key:'OPENROUTER_API_KEY',on:1,req:0,
+    models:318,spill:['gpt-oss-120b']}]
+};
+// Fixed, not random. A demo value is fine; a value that changes every reload
+// is not, and a value that decides a provenance LABEL is the exact failure
+// this project exists to prevent. strength_source is a backend field
+// (measured|predicted|bandwidth|default), not a threshold on a request count.
+[[0,412],[1,388],[2,1386],[3,240]].forEach(([i,v])=>{ if(S.nodes[i]) S.nodes[i].req=v; });
+S.nodes.forEach(n=>{ n.src = n.remote ? 'predicted' : 'measured'; });
+S.providers[0].req=96;
+
+function setJoined(){ S.joined=1;
+  S.nodes[0].slots=[{m:'gpt-oss-120b',pc:78}]; S.nodes[1].slots=[{m:'gpt-oss-120b',pc:74}];
+  S.nodes[3].slots=[{m:'gpt-oss-120b',pc:62}];
+  S.deps=[{name:'gpt-oss-120b',plan:'PP 2',span:[0,1],remote:[3],prov:1,tps:127},
+    {name:'mistral-7b',plan:'1 slot',solo:{n:2,g:0},tps:64},
+    {name:'embed-v3',plan:'1 slot',solo:{n:2,g:1},tps:41}]; decorate(); }
+function setSplit(){ S.joined=0;
+  S.nodes[0].slots=[{m:'qwen3-8b',pc:34}]; S.nodes[1].slots=[{m:'llama-3.1-8b',pc:41}];
+  S.nodes[3].slots=[{m:'qwen3-coder-30b',pc:58}];
+  S.deps=[{name:'qwen3-8b',plan:'1 slot',solo:{n:0},tps:212},
+    {name:'llama-3.1-8b',plan:'1 slot',solo:{n:1},tps:198},
+    {name:'qwen3-coder-30b',plan:'1 slot · remote',solo:{n:3},tps:186},
+    {name:'mistral-7b',plan:'1 slot',solo:{n:2,g:0},tps:64},
+    {name:'embed-v3',plan:'1 slot',solo:{n:2,g:1},tps:41}]; decorate(); }
+const DETAIL={
+  'gpt-oss-120b'   :{ttft:184,dur:6.2,queue:3,ctx:8192, seqs:16,dtype:'mxfp4',rt:'vllm',up:'2h 14m',req:620,dtps:42,stream:1},
+  'mistral-7b'     :{ttft:41 ,dur:1.9,queue:0,ctx:16384,seqs:8, dtype:'fp8',  rt:'vllm',up:'6h 02m',req:284,dtps:64,stream:1},
+  'embed-v3'       :{ttft:12 ,dur:0.3,queue:1,ctx:512,  seqs:32,dtype:'bf16', rt:'vllm',up:'6h 02m',req:1102,dtps:41,stream:0},
+  'qwen3-8b'       :{ttft:38 ,dur:2.1,queue:1,ctx:32768,seqs:16,dtype:'bf16', rt:'vllm',up:'11m',req:210,dtps:96,stream:1},
+  'llama-3.1-8b'   :{ttft:44 ,dur:2.4,queue:0,ctx:32768,seqs:16,dtype:'bf16', rt:'vllm',up:'11m',req:176,dtps:88,stream:1},
+  'qwen3-coder-30b':{ttft:96 ,dur:4.8,queue:2,ctx:65536,seqs:8, dtype:'fp8',  rt:'vllm',up:'11m',req:95,dtps:58,stream:1}};
+function decorate(){ S.deps.forEach(d=>Object.assign(d,
+  DETAIL[d.name]||{ttft:null,dur:null,dtps:null,stream:1,queue:0,ctx:8192,seqs:8,dtype:'bf16',rt:'vllm',up:'—'})); }
+setJoined();
+S.hist={};
+
+const dep=()=>S.deps[Math.min(S.sel,S.deps.length-1)];
+function tgts(d){
+  const a=[];
+  if(d.span) d.span.forEach(n=>a.push({n,kind:'local'}));
+  else if(d.solo) a.push({...d.solo,kind:S.nodes[d.solo.n].remote?'remote':'local'});
+  (d.remote||[]).forEach(n=>{ if(!S.managedOff) a.push({n,kind:'remote'}); });
+  const _p=S.providers[0];
+  if(!S.cloudOff && _p && _p.on && _p.spill.includes(d.name)) a.push({p:0,kind:'prov'});
+  return a;
+}
+
+// ---------- sidebar ----------
+function roster(){
+  $('#roster').innerHTML=S.nodes.map((n,i)=>{
+    const free=n.slots.filter(s=>!s).length;
+    const rows=n.slots.map(s=>s
+      ?`<div class="slot"><div class="bar"><i style="width:${s.pc}%"></i></div><span class="mono mut" style="width:100px">${s.m}</span></div>`
+      :`<div class="slot"><div class="bar free"></div><span class="mono mut" style="width:100px">free</span></div>`).join('');
+    const th=n.thr<100?` · <span style="color:var(--warn)">${n.thr}%</span>`:'';
+    const off=n.remote&&S.managedOff;
+    return `<div style="margin-bottom:10px;cursor:pointer;${off?'opacity:.45':''}" ondblclick="inspect(${i})">
+      <div class="row" style="padding:0 0 3px"><span class="label">${n.id}${n.remote?' <span class="unit">remote</span>':''}</span>
+      <span class="mono unit"><span class="dot" style="background:var(--${off?'muted':'live'})"></span> ${Math.round(n.w*n.thr/100)} W${th}</span></div>
+      ${rows}<div class="unit" style="margin-top:2px">${free} free · GPU ${n.cpu}%${n.unified?' · shared':''}${n.remote?` · ${n.lat} ms`:''}</div></div>`;
+  }).join('');
+  const slots=S.nodes.reduce((a,n)=>a+n.slots.length,0), free=S.nodes.reduce((a,n)=>a+n.slots.filter(s=>!s).length,0);
+  $('#pill').textContent=`${S.nodes.length} nodes · ${slots} slots · ${free} free`;
+  $('#cloudPill').style.display=S.cloudOff?'inline-block':'none';
+  $('#place').innerHTML='<option value="auto">auto</option>'+S.nodes.map((n,i)=>`<option value="${i}">${n.id}</option>`).join('');
+}
+
+function sidebar(){
+  const d=dep(), t=tgts(d), w=curW();
+  $('#scopeHead').textContent='Plan · '+d.name;
+  $('#planLabel').textContent=d.plan;
+  $('#linkNow').textContent=d.span?S.link+' GB/s':'—';
+  $('#whyBox').innerHTML=d.span
+    ? `<div>Pipeline parallel across 2 nodes, because measured all-reduce is ${S.link} GB/s and target concurrency is 16.</div>
+       <div class="mut" style="margin-top:8px">Rejected</div>
+       <div>TP 2 — ${S.link} GB/s is below the 40 GB/s threshold.</div>
+       <div>Spanning brev-h100 — remote node, no measured fabric. Routing only.</div>`
+    : `<div>Fits in one slot on ${S.nodes[d.solo.n].id}, so it is placed whole rather than sharded.</div>
+       <div class="mut" style="margin-top:8px">Rejected</div>
+       <div>Sharding — would pay a handoff per token to solve a capacity problem that does not exist.</div>`;
+  $('#weights').innerHTML=t.map((x,i)=>{
+    const nm=x.kind==='prov'?'openrouter':S.nodes[x.n].id;
+    return `<div class="slot"><div class="bar"><i style="width:${(w[i]*100).toFixed(0)}%;opacity:${w[i]?1:.25}"></i></div>
+      <span class="mono unit" style="width:32px;text-align:right">${(w[i]*100).toFixed(0)}%</span></div>
+      <div class="unit" style="margin:-2px 0 6px">${nm}</div>`;}).join('');
+  $('#policyNote').textContent = t.length>1?NOTES[$('#policy').value]:'Single target. Policy has no effect.';
+  $('#costHead').textContent='Cost per Mtok · '+d.name;
+  $('#costRows').innerHTML=t.map(x=>{
+    const nm=x.kind==='prov'?'openrouter':S.nodes[x.n].id;
+    const c=x.kind==='prov'?S.providers[0].cost:S.nodes[x.n].cost;
+    return `<div class="row"><span>${nm}</span><span class="mono">$${c.toFixed(3)}</span></div>`;}).join('');
+}
+
+// ---------- deployments strip ----------
+function depsStrip(){
+  $('#deps').innerHTML=S.deps.map((d,i)=>{
+    if(!S.hist[d.name]) S.hist[d.name]=Array.from({length:40},()=>d.tps*(0.9+Math.random()*0.2));
+    const h=S.hist[d.name], mx=Math.max(...h,1)*1.2;
+    const pts=h.map((v,j)=>`${j/39*100},${22-v/mx*20}`).join(' ');
+    const t=tgts(d);
+    return `<div class="deprow ${i===S.sel?'sel':''}" onclick="selDep(${i})" ondblclick="inspectDep(${i})" title="Double-click for detail">
+      <span class="mono" style="font-size:13px">${d.name}</span>
+      <span class="unit">${d.plan}</span>
+      <svg viewBox="0 0 100 24" preserveAspectRatio="none" style="width:100%;height:24px">
+        <polyline points="${pts}" fill="none" stroke="var(--ink)" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
+      <span class="mono" style="text-align:right;font-size:13px" id="dt${i}">${d.tps.toFixed(0)} <span class="unit">tok/s</span></span>
+      <span class="unit" style="text-align:right">${t.length} target${t.length===1?'':'s'}
+        <button class="ghost dets" style="padding:1px 5px;margin-left:4px"
+          onclick="event.stopPropagation();inspectDep(${i})" aria-label="Detail">&#8599;</button></span>
+    </div>`;}).join('');
+}
+function selDep(i){ S.sel=i; sidebar(); depsStrip(); render(); telemetry(); }
+S.selNode=null;
+function selNode(i){ S.selNode=S.selNode===i?null:i; render(); telemetry(); }
+function aggregate(){
+  let tot=0;
+  S.deps.forEach(d=>{ const h=S.hist[d.name]; if(h) tot+=h[h.length-1]; });
+  const set=(id,v)=>{ const e=document.getElementById(id); if(e) e.textContent=v; };
+  set('aTps', tot.toFixed(0));
+  set('aDep', S.deps.length);
+  set('aPow', Math.round(S.nodes.reduce((a,n)=>a+n.w*n.thr/100,0)));
+  set('aFree', S.nodes.reduce((a,n)=>a+n.slots.filter(x=>!x).length,0));
+}
+
+// ---------- telemetry history ----------
+// Nine series, and only nine, because that is exactly what the 1 Hz frame
+// carries: cluster {tokens_per_sec, total_power_w}; per node {power_w, temp_c,
+// memory_used_pct, util_pct}; per deployment {tokens_per_sec, ttft_ms,
+// queue_depth}. Anything else would be a chart with nothing behind it.
+const WINDOW=60;
+S.tel={cluster:{tps:[],pw:[]},nodes:{},deps:{}};
+function pushTel(){
+  const push=(a,v)=>{ a.push(v); if(a.length>WINDOW) a.shift(); };
+  let tot=0; S.deps.forEach(d=>{ const h=S.hist[d.name]; if(h) tot+=h[h.length-1]; });
+  push(S.tel.cluster.tps, tot);
+  push(S.tel.cluster.pw, S.nodes.reduce((a,n)=>a+n.w*n.thr/100,0));
+  S.nodes.forEach((n,i)=>{
+    const t=S.tel.nodes[i]||(S.tel.nodes[i]={pw:[],temp:[],mem:[],util:[]});
+    push(t.pw,n.w*n.thr/100); push(t.temp,n.t); push(t.util,n.cpu);
+    const sl=n.slots.find(x=>x); push(t.mem, sl?sl.pc:0);
+  });
+  S.deps.forEach(d=>{
+    const t=S.tel.deps[d.name]||(S.tel.deps[d.name]={tps:[],dtps:[],ttft:[],q:[]});
+    const h=S.hist[d.name];
+    push(t.tps, h?h[h.length-1]:0);
+    push(t.dtps, d.dtps==null?null:d.dtps*(0.94+Math.random()*0.12));
+    push(t.ttft, d.ttft==null?null:d.ttft*(0.9+Math.random()*0.2));
+    push(t.q, d.queue);
+  });
+}
+
+// A chart with a visible baseline and its own min/max, so an amplitude is
+// readable rather than merely decorative. Null gaps break the line instead of
+// drawing across them: a gap is not a value.
+function chart(title,unit,data,dp){
+  const pts=data.filter(v=>v!=null&&isFinite(v));
+  if(!pts.length) return `<div class="chart"><h4><span>${title}</span><span class="now">—</span></h4>
+    <div class="unit">no samples yet</div></div>`;
+  const mx=Math.max(...pts), mn=Math.min(...pts), span=(mx-mn)||1;
+  const W=100,H=34;
+  let d='',pen=false;
+  data.forEach((v,i)=>{
+    const x=(i/Math.max(1,WINDOW-1))*W;
+    if(v==null||!isFinite(v)){ pen=false; return; }
+    const y=H-((v-mn)/span)*(H-4)-2;
+    d+=(pen?'L':'M')+x.toFixed(1)+','+y.toFixed(1)+' '; pen=true;
+  });
+  const now=pts[pts.length-1];
+  return `<div class="chart">
+    <h4><span>${title}</span><span class="now">${now.toFixed(dp||0)} <span class="unit">${unit}</span></span></h4>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:44px;display:block">
+      <line x1="0" y1="${H-2}" x2="${W}" y2="${H-2}" stroke="var(--rule)" stroke-width="0.5" vector-effect="non-scaling-stroke"/>
+      <path d="${d}" fill="none" stroke="var(--ink)" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
+    <div class="ax"><span>min ${mn.toFixed(dp||0)}</span><span>${pts.length}s</span><span>max ${mx.toFixed(dp||0)}</span></div>
+  </div>`;
+}
+
+// Drill-down, not a wall. Cluster charts are always visible; per-Spark and
+// per-deployment charts render only for the current selection. The wall is 30
+// charts at 4 nodes and 3 models but 130 at 12 nodes and 20 models, all
+// repainting at 1 Hz, on the surface the density audit flagged as first to
+// degrade. Selection is shared with the flow graph (S.selNode) and the
+// deployments strip (S.sel), so drilling in one place drills everywhere.
+function telemetry(){
+  if($('#s-telemetry').hidden) return;
+  $('#telCluster').innerHTML =
+      chart('Throughput, all models','tok/s',S.tel.cluster.tps,0)
+    + chart('Power drawn','W',S.tel.cluster.pw,0);
+
+  const ni = S.selNode==null ? 0 : S.selNode;
+  $('#telNodePick').innerHTML = S.nodes.map((n,i)=>
+    `<button aria-pressed="${i===ni}" onclick="pickNode(${i})">${n.id}</button>`).join('');
+  const n=S.nodes[ni], t=S.tel.nodes[ni]||{pw:[],temp:[],mem:[],util:[]};
+  $('#telNodes').innerHTML = n ? (
+      chart(n.id+' \u00b7 power','W',t.pw,0)
+    + chart(n.id+' \u00b7 temperature','\u00b0C',t.temp,0)
+    + chart(n.id+' \u00b7 memory','%',t.mem,0)
+    + chart(n.id+' \u00b7 GPU utilisation','%',t.util,0)) : '';
+
+  const d=dep();
+  $('#telDepNote').textContent = d
+    ? `Showing ${d.name}. Selecting a model anywhere \u2014 the deployments strip or the cluster graph \u2014 changes this.`
+    : 'Nothing is being served.';
+  const td=d?(S.tel.deps[d.name]||{tps:[],dtps:[],ttft:[],q:[]}):null;
+  $('#telDeps').innerHTML = td ? (
+      chart(d.name+' \u00b7 aggregate throughput','tok/s',td.tps,0)
+    + chart(d.name+' \u00b7 per-stream decode','tok/s',td.dtps,0)
+    + chart(d.name+' \u00b7 time to first token','ms',td.ttft,0)
+    + chart(d.name+' \u00b7 queued','reqs',td.q,0)) : '';
+}
+// Picking a Spark here selects it everywhere rather than toggling it off.
+function pickNode(i){ S.selNode=i; render(); telemetry(); }
+
+document.querySelectorAll('.subs button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.subs button').forEach(x=>x.setAttribute('aria-selected',x===b));
+  ['overview','telemetry','load'].forEach(v=>$('#s-'+v).hidden=(v!==b.dataset.s));
+  if(b.dataset.s==='load') loadMatrix();
+  if(b.dataset.s==='telemetry') telemetry();
+});
+
+// ---------- load by spark ----------
+// Derived, not measured: the gateway keys request stats by target_id only
+// (StatsRegistry is dict[str, TargetStats]) and has no per-node accounting.
+// A deployment's counts are attributed to every node in its plan, because in
+// pipeline parallel EVERY request traverses EVERY node -- so a 620-request
+// PP-2 model is 620 on each Spark, not 310 and 310. Splitting it would be
+// inventing a number. Column totals therefore exceed the request total, and
+// the note below says so rather than letting it read as broken arithmetic.
+function loadMatrix(){
+  const t=document.getElementById('loadTable'); if(!t) return;
+  // d.remote holds managed nodes serving the same name; omitting them hid
+  // brev-h100 entirely even though it holds a slot and takes traffic.
+  const nodesOf=d=>[...(d.span?d.span:(d.solo?[d.solo.n]:[])),...(d.remote||[])];
+  const rows=S.nodes.map((n,ni)=>({n,ni,deps:S.deps.filter(d=>nodesOf(d).includes(ni))}))
+                    .filter(r=>r.deps.length);
+  if(!rows.length){ t.innerHTML=''; $('#loadNote').textContent='Nothing is being served.'; return; }
+  let shared=false;
+  t.innerHTML=`<tr><th>Spark</th>${S.deps.map(d=>`<th style="text-align:right">${d.name}</th>`).join('')}
+      <th style="text-align:right">Node total</th></tr>`
+    + rows.map(r=>{
+        let tot=0;
+        const cells=S.deps.map(d=>{
+          if(!nodesOf(d).includes(r.ni)) return '<td class="num mut">—</td>';
+          tot+=d.req||0;
+          const sh=nodesOf(d).length>1; if(sh) shared=true;
+          return `<td class="num">${(d.req||0).toLocaleString()}${
+            sh?' <span class="unit">shared</span>':''}</td>`;
+        }).join('');
+        return `<tr><td class="mono">${r.n.id}</td>${cells}<td class="num">${tot.toLocaleString()}</td></tr>`;
+      }).join('');
+  const real=S.deps.reduce((a,d)=>a+(d.req||0),0);
+  const summed=rows.reduce((a,r)=>a+r.deps.reduce((b,d)=>b+(d.req||0),0),0);
+  $('#loadNote').innerHTML = shared
+    ? `${real.toLocaleString()} requests today. Node totals sum to ${summed.toLocaleString()} `
+      + `because a model spanning Sparks is counted on each — in pipeline parallel every `
+      + `request traverses every node, so the count is shared, not divided.`
+    : `${real.toLocaleString()} requests today.`;
+}
+
+// ---------- spend ----------
+function spend(){
+  const local=S.nodes.filter(n=>!n.remote).reduce((a,n)=>a+n.req,0);
+  const managed=S.nodes.filter(n=>n.remote).reduce((a,n)=>a+n.req,0);
+  const cloud=S.providers.reduce((a,p)=>a+p.req,0);
+  const tot=local+managed+cloud;
+  const pc=v=>tot>0?(v/tot*100):0;   // 0/0 rendered NaN% across the whole tab
+  $('#lrSplit').innerHTML=
+    `<span style="width:${pc(local)}%;background:var(--fill);color:var(--onfill)">local ${pc(local).toFixed(0)}%</span>
+     <span style="width:${pc(managed)}%;background:var(--fill);opacity:.55;color:var(--onfill)">managed ${pc(managed).toFixed(0)}%</span>
+     <span style="width:${pc(cloud)}%;background:var(--warn);color:#1A1917">cloud ${pc(cloud).toFixed(0)}%</span>`;
+  $('#sLocal').textContent=pc(local).toFixed(0);
+  $('#sReq').textContent=tot.toLocaleString();
+  $('#sCost').textContent=money(S.spentToday);
+  const allCloud=tot*0.0009*0.600;
+  $('#sSaved').textContent=money(Math.max(0,allCloud-S.spentToday));
+  const rows=[...S.nodes.map(n=>({nm:n.id,kind:n.remote?'managed remote':'local',req:n.req,cost:n.cost,
+      spend:n.req*0.0009*n.cost})),
+    ...S.providers.map(p=>({nm:p.id,kind:'cloud',req:p.req,cost:p.cost,spend:p.req*0.0009*p.cost}))];
+  $('#spendTable').innerHTML=`<tr><th>Target</th><th>Kind</th><th style="text-align:right">Requests</th>
+    <th style="text-align:right">$/Mtok</th><th style="text-align:right">Spent</th></tr>`+
+    rows.map(r=>`<tr><td class="mono">${r.nm}</td><td class="unit">${r.kind}</td>
+      <td class="num">${r.req.toLocaleString()}</td><td class="num">$${r.cost.toFixed(3)}</td>
+      <td class="num">${money(r.spend)}</td></tr>`).join('');
+}
+
+// ---------- settings ----------
+function settings(){
+  $('#nodeTable').innerHTML=`<tr><th>Node</th><th>Hardware</th><th>Kind</th><th></th></tr>`+
+    S.nodes.map((n,i)=>`<tr><td class="mono">${n.id}</td><td class="unit">${n.gpu}</td>
+      <td class="unit">${n.remote?'remote · routing only':'local · measured'}</td>
+      <td style="text-align:right"><button style="padding:3px 9px" onclick="rmNode(${i})">Remove</button></td></tr>`).join('');
+  $('#provTable').innerHTML=`<tr><th>Provider</th><th>Key</th><th>$/Mtok</th><th></th></tr>`+
+    S.providers.map((p,i)=>`<tr><td class="mono">${p.id}</td><td class="mono mut">•••••••• ${p.key}</td>
+      <td class="mono">$${p.cost.toFixed(3)}</td>
+      <td style="text-align:right"><button style="padding:3px 9px" onclick="rmProv(${i})">Remove</button></td></tr>`).join('');
+}
+function rmNode(i){
+  if(S.nodes[i].slots.some(s=>s)){ alert(`${S.nodes[i].id} is running a deployment. Stop it first.`); return; }
+  S.nodes.splice(i,1); roster(); settings(); render();
+}
+function rmProv(i){ S.providers.splice(i,1); roster(); sidebar(); settings(); render(); }
+$('#addNode').onclick=()=>{
+  const a=$('#naddr').value.trim(); if(!a) return;
+  const rm=$('#nkind').value==='1';
+  S.nodes.push({id:'node-'+(S.nodes.length+1),gpu:'probing…',unified:0,bw:0,remote:rm?1:0,
+    lat:rm?60:0,rate:rm?1.0:0,slots:[null],w:0,t:0,cpu:0,tps:0,thr:100,cost:rm?0.4:0.03,req:0});
+  $('#naddr').value=''; roster(); settings(); render();
+};
+$('#addProv').onclick=()=>{
+  const k=$('#pkind').value, key=$('#pkey').value;
+  if(!key){ alert('Enter an API key. It is stored as a reference and never displayed again.'); return; }
+  S.providers.push({id:k,cost:0.5,key:k.toUpperCase()+'_API_KEY',on:1,req:0,models:0,spill:[]});
+  $('#pkey').value=''; roster(); sidebar(); settings(); render();
+};
+$('#cloudOff').onchange=e=>{ S.cloudOff=e.target.checked; roster(); sidebar(); render(); spend(); };
+$('#managedOff').onchange=e=>{ S.managedOff=e.target.checked; roster(); sidebar(); render(); spend(); };
+
+// ---------- graph ----------
+const paths={};
+let GW=700;
+// The viewBox used to track clientWidth 1:1, so every font-size in the graph was
+// its literal pixel size -- and the graph is authored at 9px, well under the 12px
+// floor the rest of the panel keeps. Dividing the coordinate space scales every
+// glyph, stroke and gap together, so not one layout constant has to move.
+const GSCALE=12/9;
+// Pan and zoom move the VIEWPORT, never the layout. Node positions stay a pure
+// function of the data, so a machine never moves between refreshes. Panning
+// only rewrites one transform attribute -- it does not re-render, so in-flight
+// particles survive a drag.
+const VIEW={k:1,tx:0,ty:0,drag:null};
+const clampv=(v,a,b)=>Math.max(a,Math.min(b,v));
+function applyView(){
+  const sc=document.getElementById('scene');
+  if(sc) sc.setAttribute('transform',
+    `translate(${VIEW.tx.toFixed(1)} ${VIEW.ty.toFixed(1)}) scale(${VIEW.k.toFixed(3)})`);
+  const z=document.getElementById('zoomLbl');
+  if(z) z.textContent=Math.round(VIEW.k*100)+'%';
+}
+function resetView(){ VIEW.k=1; VIEW.tx=0; VIEW.ty=0; applyView(); }
+function zoomAt(px,py,f){
+  const nk=clampv(VIEW.k*f,0.4,4), r=nk/VIEW.k;
+  VIEW.tx=px-(px-VIEW.tx)*r; VIEW.ty=py-(py-VIEW.ty)*r; VIEW.k=nk; applyView();
+}
+function render(){
+  const g=$('#graph'); g.innerHTML=''; for(const k in paths) delete paths[k];
+  const NX=152,NW=134,TX=340,TW=Math.max(240,GW-TX);
+  // Two gutters, so a vertical run belongs to exactly one class of edge.
+  // G1 carries measured, on-premises paths. G2 carries everything that crosses
+  // the routing boundary, where there is no measured fabric to draw a figure
+  // from -- so those edges are thin and dashed, the same grammar an unmeasured
+  // node-to-node link already uses. Weight is not opacity: opacity means idle.
+  const G1=300,G2=314,G3=328;
+  const OFFBOX={fill:'none',stroke:'var(--ink)','stroke-width':2.5,
+    'stroke-dasharray':'5 4','stroke-linecap':'butt'};
+  const junction=(x,y,o)=>el('circle',{cx:x,cy:y,r:3,fill:'var(--ink)',opacity:o});
+  const conns=[],boxes=[],rows=[]; let y=36;
+
+  S.deps.forEach((d,di)=>{
+    let bf=[];
+    // Compact always, expanded on select. Height is data-driven so the
+    // selected node grows in place rather than opening a modal over the graph.
+    if(d.span){ const bw=Math.round((TW-64)/2);
+      const h=d.span.includes(S.selNode)?100:70;
+      bf=[{x:TX,y,w:bw,h,n:d.span[0]},{x:TX+bw+64,y,w:bw,h,n:d.span[1]}]; y+=h+28; }
+    else if(!S.nodes[d.solo.n].remote){
+      const h=d.solo.n===S.selNode?84:54;
+      bf=[{x:TX,y,w:TW,h,n:d.solo.n,g:d.solo.g}]; y+=h+10; }
+    rows.push({d,di,local:bf,ny:bf.length?bf[0].y+bf[0].h/2:null});
+  });
+  const placed=rows.filter(r=>r.ny!=null);
+  const bd=y+14; let ry=bd+20;
+  const remotes=[];
+  S.nodes.forEach((n,ni)=>{ if(n.remote){ remotes.push({n:ni,x:TX,y:ry,w:TW,h:38}); ry+=46; } });
+  rows.forEach(r=>{ if(r.ny==null){ const rb=remotes.find(x=>x.n===r.d.solo.n); if(rb) r.ny=rb.y+rb.h/2; } });
+  const provY=ry; if(S.providers.length&&!S.cloudOff) ry+=46;
+  g.setAttribute('viewBox',`0 0 ${GW} ${ry+14}`);
+
+  boxes.push(el('text',{x:0,y:9,'font-size':11,fill:'var(--muted)'},'endpoint'));
+  boxes.push(el('text',{x:NX,y:9,'font-size':11,fill:'var(--muted)'},'served names'));
+  boxes.push(el('text',{x:TX,y:9,'font-size':11,fill:'var(--muted)'},'targets · measured, plans possible'));
+
+  const ey=placed.length?placed[Math.floor(placed.length/2)].ny:120;
+  boxes.push(el('rect',{x:0,y:ey-23,width:132,height:46,rx:4,fill:'var(--fill)'}));
+  boxes.push(el('text',{x:12,y:ey-3,class:'m','font-size':10,fill:'var(--onfill)'},'POST /v1/chat/'));
+  boxes.push(el('text',{x:12,y:ey+12,class:'m','font-size':10,fill:'var(--onfill)'},'completions'));
+
+  rows.forEach(r=>{
+    if(r.ny==null) return;
+    conns.push(el('path',{d:`M132 ${ey} H146 V${r.ny} H${NX}`,fill:'none',stroke:'var(--ink)','stroke-width':5,'stroke-linecap':'square'}));
+    const ng=el('g',{class:'name','data-d':r.di});
+    ng.appendChild(el('rect',{x:NX,y:r.ny-18,width:NW,height:36,rx:3,fill:'var(--fill)',
+      ...(r.di===S.sel?{stroke:'var(--ink)','stroke-width':2}:{})}));
+    ng.appendChild(el('text',{x:NX+11,y:r.ny+4,class:'m','font-size':10,fill:'var(--onfill)'},r.d.name));
+    boxes.push(ng);
+
+    r.local.forEach((b,i)=>{
+      const my=b.y+b.h/2;
+      conns.push(el('path',{d:`M${NX+NW} ${r.ny} H${G1} V${my} H${b.x}`,fill:'none',stroke:'var(--ink)','stroke-width':5,'stroke-linecap':'square'}));
+      paths[r.di+'#L'+i]=[{x:132,y:ey},{x:146,y:ey},{x:146,y:r.ny},{x:NX+NW,y:r.ny},{x:G1,y:r.ny},{x:G1,y:my},{x:b.x+b.w/2,y:my}];
+      const n=S.nodes[b.n], selD=b.n===S.selNode;
+      const grp=el('g',{class:'node','data-n':b.n});
+      if(selD) grp.appendChild(el('rect',{x:b.x-3,y:b.y-3,width:b.w+6,height:b.h+6,rx:6,
+        fill:'none',stroke:'var(--ink)','stroke-width':1.5}));
+      grp.appendChild(el('rect',{x:b.x,y:b.y,width:b.w,height:b.h,rx:4,fill:'var(--fill)'}));
+      const sl=b.g!=null?n.slots[b.g]:n.slots[0];
+      grp.appendChild(el('text',{x:b.x+11,y:b.y+15,class:'m','font-size':9,fill:'var(--onfill)'},
+        b.g!=null?`${n.id} · gpu${b.g}`:n.id));
+      grp.appendChild(el('rect',{x:b.x+11,y:b.y+21,width:b.w-22,height:14,rx:2,fill:'var(--onfill)',opacity:.18}));
+      grp.appendChild(el('rect',{x:b.x+11,y:b.y+21,width:(b.w-22)*(sl?sl.pc/100:0),height:14,rx:2,fill:'var(--onfill)',opacity:.85}));
+      // Was --fill text sitting on the bar: legible over the .85 fill, but 1.65:1
+      // over the .18 track behind it -- so it vanished whenever the bar was short
+      // or the slot read 'free'. The bar is geometry; the name belongs on the id row.
+      grp.appendChild(el('text',{x:b.x+b.w-11,y:b.y+15,class:'m','font-size':9,
+        fill:'var(--onfill)','text-anchor':'end'},sl?sl.m:'free'));
+      // Always, not only on tall PP boxes: the same node used to show telemetry
+      // as half a pipeline and hide it when solo.
+      const tl=el('text',{x:b.x+11,y:b.y+47,class:'m','font-size':9,
+        fill:'var(--onfill-dim)','data-nf':b.n},'');
+      grp.appendChild(tl);
+      if(selD){
+        // Only these four refresh at 1 Hz from the metrics frame. Everything
+        // below is fetch-time and must not be made to look live.
+        grp.appendChild(el('text',{x:b.x+11,y:b.y+61,class:'m','font-size':9,
+          fill:'var(--onfill-dim)'},`${n.t} °C · GPU ${n.cpu}% · ${n.bw} GB/s`));
+        grp.appendChild(el('text',{x:b.x+11,y:b.y+74,class:'m','font-size':9,
+          fill:'var(--onfill-dim)'},`${n.gpu}${n.unified?' · unified memory':''}`));
+      }
+      boxes.push(grp);
+    });
+
+    if(r.d.span){
+      const a=r.local[0],b=r.local[1],mid=a.x+a.w,gap=b.x-mid;
+      // No bytes-on-the-wire telemetry exists anywhere in the control plane, so
+      // "74% utilised" measured nothing. all_reduce_gbps is a one-off saturation
+      // figure; the only honest proportion is against the 40 GB/s TP threshold.
+      const frac=Math.min(1,S.link/40);
+      boxes.push(el('rect',{x:mid,y:a.y+19,width:gap,height:7,fill:'var(--ink)',opacity:.16}));
+      boxes.push(el('rect',{x:mid,y:a.y+19,width:gap*frac,height:7,fill:'var(--ink)'}));
+      // Both captions are wider than the 64px gap they sit in, so they cross the
+      // node boxes -- which are filled --fill, the same value as --ink. Without a
+      // knockout that is ink on ink at 1:1. Plate first, text second.
+      // The caption is wider than the 64px gap, so on the box row it crossed both
+      // node boxes -- filled --fill, the same value as --ink. It now sits in the
+      // gutter above the row, over --panel, with a knockout as insurance.
+      const LB=`${S.link} of 40 GB/s`, lbw=LB.length*5.4+10;
+      boxes.push(el('rect',{x:mid+gap/2-lbw/2,y:a.y-17,width:lbw,height:13,rx:2,fill:'var(--panel)'}));
+      boxes.push(el('text',{x:mid+gap/2,y:a.y-8,class:'m','font-size':9,fill:'var(--ink)',
+        'text-anchor':'middle'},LB));
+      // This one is narrower than the gap, so it needs no plate -- and --muted now
+      // clears AA on --panel in both themes.
+      boxes.push(el('text',{x:mid+gap/2,y:a.y+62,'font-size':9,fill:'var(--muted)',
+        'text-anchor':'middle'},'TP 2 rejected'));
+    }
+  });
+
+  const BLAB='routing boundary · managed, never sharded';
+  boxes.push(el('line',{x1:0,y1:bd,x2:GW,y2:bd,stroke:'var(--rule)'}));
+  boxes.push(el('rect',{x:TX-4,y:bd-9,width:BLAB.length*5.3+8,height:18,fill:'var(--panel)'}));
+  boxes.push(el('text',{x:TX,y:bd+4,'font-size':11,fill:'var(--muted)'},BLAB));
+
+  const w=curW();
+  remotes.forEach(rb=>{
+    const n=S.nodes[rb.n];
+    const owner=rows.find(r=>tgts(r.d).some(x=>x.n===rb.n));
+    const ti=owner?tgts(owner.d).findIndex(x=>x.n===rb.n):-1;
+    const act=owner&&owner.di===S.sel&&ti>=0&&w[ti]>0&&!S.managedOff;
+    if(owner&&owner.ny!=null&&!S.managedOff){
+      conns.push(el('path',{...OFFBOX,d:`M${NX+NW} ${owner.ny} H${G2} V${rb.y+rb.h/2} H${rb.x}`,
+        opacity:act?1:.5}));
+      conns.push(junction(G2,owner.ny,act?1:.5));
+      paths[owner.di+'#R'+rb.n]=[{x:132,y:ey},{x:146,y:ey},{x:146,y:owner.ny},{x:NX+NW,y:owner.ny},
+        {x:G2,y:owner.ny},{x:G2,y:rb.y+rb.h/2},{x:rb.x+rb.w/2,y:rb.y+rb.h/2}];
+    }
+    // Opacity on the group composited the labels too, which put the excluded-node
+    // text at 2.0:1. Idle keeps its opacity (that still clears AA); excluded drops
+    // to an outline instead -- the same grammar the third-party provider box uses.
+    const off=S.managedOff, rtxt=off?'var(--muted)':'var(--onfill)';
+    const grp=el('g',{class:'node','data-n':rb.n,...(off?{}:{opacity:act?1:.62})});
+    grp.appendChild(el('rect',{x:rb.x,y:rb.y,width:rb.w,height:rb.h,rx:4,
+      ...(off?{fill:'none',stroke:'var(--rule)','stroke-width':1}:{fill:'var(--fill)'})}));
+    grp.appendChild(el('text',{x:rb.x+11,y:rb.y+15,class:'m','font-size':9,fill:rtxt},
+      `${n.id} · 1 slot · ${n.lat} ms · $${(n.rate||0).toFixed(2)}/hr${S.managedOff?' · excluded':''}`));
+    grp.appendChild(el('rect',{x:rb.x+11,y:rb.y+21,width:rb.w-22,height:14,rx:2,
+      fill:off?'var(--rule)':'var(--onfill)',opacity:off?.5:.18}));
+    grp.appendChild(el('rect',{x:rb.x+11,y:rb.y+21,width:(rb.w-22)*(n.slots[0]?n.slots[0].pc/100:0),height:14,rx:2,
+      fill:off?'var(--muted)':'var(--onfill)',opacity:off?.55:.85}));
+    grp.appendChild(el('text',{x:rb.x+rb.w-11,y:rb.y+15,class:'m','font-size':9,
+      fill:rtxt,'text-anchor':'end'},n.slots[0]?n.slots[0].m:'free'));
+    boxes.push(grp);
+  });
+
+  // A provider is ONE endpoint that can serve anything, so it is drawn as a bus:
+  // a rail tapping every running model, and a single trunk into the box. N edges
+  // converging on a point states the same relation N times. A box per remote
+  // model would put ~300 nodes in this column and is also the model-catalog
+  // browser we are told not to build.
+  // Tap weight is the honest part: 2.5px means the provider is a configured
+  // target for that name and will take traffic; 1px hairline means merely
+  // reachable through the proxy. Drawing those identically would claim routing
+  // that is not configured.
+  const P=S.providers[0];
+  if(P&&S.providers.length){
+    if(!S.cloudOff){
+      const named=rows.filter(r=>r.ny!=null);
+      let anyAct=false;
+      if(named.length){
+        const top=Math.min(...named.map(r=>r.ny));
+        // one rail, one entry into the provider
+        conns.push(el('path',{...OFFBOX,d:`M${G3} ${top} V${provY+19} H${TX}`,opacity:.5}));
+        named.forEach(o=>{
+          const cfg=P.spill.includes(o.d.name);
+          const t=tgts(o.d), pi=t.findIndex(x=>x.kind==='prov');
+          const act=cfg&&o.di===S.sel&&pi>=0&&w[pi]>0; anyAct=anyAct||act;
+          conns.push(el('path',{...OFFBOX,d:`M${NX+NW} ${o.ny} H${G3}`,
+            'stroke-width':cfg?2.5:1,opacity:act?1:(cfg?.5:.22)}));
+          if(cfg) conns.push(junction(G3,o.ny,act?1:.5));
+          if(cfg) paths[o.di+'#P']=[{x:132,y:ey},{x:146,y:ey},{x:146,y:o.ny},{x:NX+NW,y:o.ny},
+            {x:G3,y:o.ny},{x:G3,y:provY+19},{x:TX+TW/2,y:provY+19}];
+        });
+      }
+      // Idle reads on the outline. The words carry their own colour, because a
+      // .55 group put this box's primary line at 3.70:1 in light mode.
+      const grp=el('g',{});
+      grp.appendChild(el('rect',{x:TX+.5,y:provY+.5,width:TW-1,height:38,rx:3,fill:'none',
+        stroke:'var(--ink)','stroke-width':1,opacity:anyAct?1:.55}));
+      grp.appendChild(el('text',{x:TX+11,y:provY+15,class:'m','font-size':9,
+        fill:anyAct?'var(--ink)':'var(--muted)'},
+        `${P.id} · third party · $${P.cost.toFixed(3)}/Mtok · no telemetry`));
+      grp.appendChild(el('text',{x:TX+11,y:provY+30,class:'m','font-size':9,fill:'var(--muted)'},
+        `proxy for any served name · ${P.models} models · ${
+          P.spill.length?`routed for ${P.spill.join(', ')}`:'none routed here yet'}`));
+      boxes.push(grp);
+    } else {
+      boxes.push(el('text',{x:TX,y:provY+20,'font-size':11,fill:'var(--muted)'},
+        'cloud providers disabled · local only'));
+    }
+  }
+
+  const scene=el('g',{id:'scene'});
+  conns.forEach(c=>scene.appendChild(c));
+  scene.appendChild(el('g',{id:'particles'}));
+  boxes.forEach(b=>scene.appendChild(b));
+  g.appendChild(scene);
+  applyView();
+  document.querySelectorAll('#graph .node').forEach(x=>{
+    x.addEventListener('click',()=>selNode(+x.dataset.n));
+    x.addEventListener('dblclick',()=>inspect(+x.dataset.n));});
+  document.querySelectorAll('#graph .name').forEach(x=>{
+    x.addEventListener('click',()=>selDep(+x.dataset.d));
+    x.addEventListener('dblclick',()=>inspectDep(+x.dataset.d));});
+}
+
+function fitGraph(){
+  const g=$('#graph'); if(!g) return;
+  // The 640 floor is a *rendered* minimum, so it has to be divided by GSCALE too;
+  // left at 640 it out-clamps the scale below ~900px and the type falls back under 12px.
+  GW=Math.max(Math.round(640/GSCALE),Math.round((g.clientWidth||700)/GSCALE));
+  render();
+}
+let _rz=0;
+addEventListener('resize',()=>{ if(!_rz) _rz=requestAnimationFrame(()=>{_rz=0;fitGraph();}); });
+
+(function(){
+  const g=$('#graph'); if(!g) return;
+  const toVB=e=>{ const r=g.getBoundingClientRect(), vb=g.viewBox.baseVal;
+    return {x:(e.clientX-r.left)/r.width*(vb.width||GW),
+            y:(e.clientY-r.top)/r.height*(vb.height||400),
+            sx:(vb.width||GW)/r.width, sy:(vb.height||400)/r.height}; };
+  g.style.cursor='grab'; g.style.touchAction='none';
+  g.setAttribute('tabindex','0');
+  g.setAttribute('aria-label','Request flow graph. Drag to pan, scroll to zoom. Arrow keys pan, plus and minus zoom, 0 resets.');
+
+  g.addEventListener('wheel',e=>{ e.preventDefault(); const p=toVB(e);
+    zoomAt(p.x,p.y,Math.exp(-e.deltaY*0.0015)); },{passive:false});
+
+  g.addEventListener('pointerdown',e=>{
+    if(e.target.closest('.node,.name')) return;
+    VIEW.drag={x:e.clientX,y:e.clientY,tx:VIEW.tx,ty:VIEW.ty};
+    g.setPointerCapture(e.pointerId); g.style.cursor='grabbing';
+  });
+  g.addEventListener('pointermove',e=>{
+    if(!VIEW.drag) return; const p=toVB(e);
+    VIEW.tx=VIEW.drag.tx+(e.clientX-VIEW.drag.x)*p.sx;
+    VIEW.ty=VIEW.drag.ty+(e.clientY-VIEW.drag.y)*p.sy;
+    applyView();
+  });
+  const end=()=>{ VIEW.drag=null; g.style.cursor='grab'; };
+  g.addEventListener('pointerup',end); g.addEventListener('pointercancel',end);
+
+  // a drag-only viewport has no keyboard path; these give it one
+  g.addEventListener('keydown',e=>{
+    const step=e.shiftKey?60:20, vb=g.viewBox.baseVal;
+    const c={x:(vb.width||GW)/2,y:(vb.height||400)/2};
+    const k={ArrowLeft:[step,0],ArrowRight:[-step,0],ArrowUp:[0,step],ArrowDown:[0,-step]}[e.key];
+    if(k){ e.preventDefault(); VIEW.tx+=k[0]; VIEW.ty+=k[1]; applyView(); }
+    else if(e.key==='+'||e.key==='='){ e.preventDefault(); zoomAt(c.x,c.y,1.2); }
+    else if(e.key==='-'||e.key==='_'){ e.preventDefault(); zoomAt(c.x,c.y,1/1.2); }
+    else if(e.key==='0'){ e.preventDefault(); resetView(); }
+  });
+})();
+
+// ---------- particles ----------
+function fly(){
+  const t=tgts(dep()), w=curW(); if(!t.length) return;
+  let acc=0, idx=0, r=Math.random();
+  for(let i=0;i<w.length;i++){ acc+=w[i]; if(r<=acc){ idx=i; break; } }
+  const x=t[idx]; if(!x) return;
+  let k = x.kind==='prov' ? S.sel+'#P'
+    : x.kind==='remote' ? S.sel+'#R'+x.n
+    : S.sel+'#L'+(dep().span?(Math.random()<.5?0:1):0);
+  const pts=paths[k]; if(!pts) return;
+  const layer=$('#particles'); if(!layer) return;
+  const box=el('rect',{width:11,height:9,rx:1.5,fill:'var(--flow)'});
+  layer.appendChild(box);
+  const segs=[]; let tot=0;
+  for(let i=1;i<pts.length;i++){ const L=Math.hypot(pts[i].x-pts[i-1].x,pts[i].y-pts[i-1].y); segs.push(L); tot+=L; }
+  const dur=1600,t0=performance.now();
+  (function step(now){
+    const p=Math.min((now-t0)/dur,1); let d=p*tot,i=0;
+    while(i<segs.length&&d>segs[i]){ d-=segs[i]; i++; }
+    if(i>=segs.length) i=segs.length-1;
+    const a=pts[i],b=pts[i+1]||pts[i],f=segs[i]?d/segs[i]:0;
+    box.setAttribute('x',a.x+(b.x-a.x)*f-5); box.setAttribute('y',a.y+(b.y-a.y)*f-4);
+    if(p<1) requestAnimationFrame(step); else box.remove();
+  })(t0);
+}
+setInterval(()=>{ if(!$('#d-cluster').hidden) fly(); },380);
+setInterval(()=>{ if(!$('#d-cluster').hidden&&S.saturated) fly(); },200);
+
+// ---------- inspector ----------
+function inspect(i){
+  const n=S.nodes[i];
+  $('#cardBody').innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:baseline">
+      <span class="label mono" style="font-size:16px">${n.id}</span>
+      <button onclick="document.getElementById('sheet').classList.remove('on')">Close</button></div>
+    <div class="unit" style="margin:4px 0 14px">${n.gpu} · ${n.unified?'unified memory':'discrete'} · ${n.bw} GB/s${n.remote?' · managed remote':''}</div>
+    <div class="row"><span>decode</span><span class="mono">${(n.tps*n.thr/100).toFixed(1)} tok/s</span></div>
+    <div class="row"><span>power</span><span class="mono">${Math.round(n.w*n.thr/100)} W</span></div>
+    <div class="row"><span>temperature</span><span class="mono">${n.t} °C</span></div>
+    <div class="row"><span>GPU utilisation</span><span class="mono">${n.cpu} %</span></div>
+    <div class="row"><span>slot</span><span class="mono">${n.slots[0]?n.slots[0].m:'free'}</span></div>
+    <div class="row"><span>requests today</span><span class="mono">${n.req.toLocaleString()}</span></div>
+    ${n.remote?`<div class="row"><span>latency</span><span class="mono">${n.lat} ms</span></div>
+      <div class="row"><span>rate</span><span class="mono">$${(n.rate||0).toFixed(2)}/hr</span></div>`:''}
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--rule)">
+      <label class="unit" for="thr">Simulate throttling · ${n.thr}%</label>
+      <input class="throttle" type="range" id="thr" min="20" max="100" step="5" value="${n.thr}" oninput="setThr(${i},this.value)">
+      <div class="unit">${n.remote
+        ? 'Managed by us and fully instrumented, but no measured fabric to the local nodes. It can hold a deployment; it can never be part of one that spans nodes.'
+        : n.unified ? 'CPU and GPU share one 273 GB/s bus, so CPU load reduces decode bandwidth directly.'
+        : 'Each card has its own memory bandwidth, so throttling one slot does not affect the others.'}</div>
+    </div>`;
+  $('#sheet').classList.add('on');
+}
+function setThr(i,v){ S.nodes[i].thr=+v; roster(); inspect(i); }
+function closeSheet(){ S.openDep=null; $('#sheet').classList.remove('on'); $('#cardBody').className='card'; }
+$('#sheet').onclick=e=>{ if(e.target.id==='sheet') closeSheet(); };
+
+// ---------- model inspector ----------
+// Every figure maps to a field the control plane actually produces: ttft_ms and
+// mean_duration_s are EWMAs on TargetStats, "queued" is TargetStats.outstanding,
+// and ms/token is arithmetic on the decode rate. There are no percentiles
+// anywhere in the system, so none are shown.
+const fmtN=(v,d=0)=>v==null||!isFinite(v)?'\u2014':v.toFixed(d);
+function inspectDep(i){
+  const d=S.deps[i]; if(!d) return;
+  S.openDep=i; S.sel=i; sidebar(); depsStrip(); render();
+  const t=tgts(d), w=curW(d), h=S.hist[d.name]||[], tps=h.length?h[h.length-1]:d.tps;
+  const nodes=d.span?d.span:(d.solo?[d.solo.n]:[]);
+  const mx=Math.max(...h,1)*1.2;
+  const pts=h.map((v,j)=>`${j/Math.max(1,h.length-1)*100},${26-v/mx*24}`).join(' ');
+
+  const rows=t.map((x,k)=>{
+    const prov=x.kind==='prov';
+    const nm=prov?'openrouter':S.nodes[x.n].id;
+    const cost=prov?S.providers[0].cost:S.nodes[x.n].cost;
+    const req=prov?S.providers[0].req:S.nodes[x.n].req;
+    const str=prov?0.55:Math.min(1,S.nodes[x.n].tps*S.nodes[x.n].thr/100/200);
+    return `<tr><td class="mono">${nm}</td><td class="unit">${prov?'remote':x.kind}</td>
+      <td class="num">${(w[k]*100).toFixed(0)}%</td><td class="num">${Math.round(w[k]*(d.queue||0))}</td>
+      <td class="num">${str.toFixed(2)} <span class="unit">${prov?'default':S.nodes[x.n].src}</span></td>
+      <td class="num">$${cost.toFixed(3)}</td><td class="num">${req.toLocaleString()}</td></tr>`;}).join('');
+
+  const mem=nodes.map(n=>{
+    const nd=S.nodes[n], sl=(d.solo&&d.solo.g!=null)?nd.slots[d.solo.g]:nd.slots[0];
+    return `<div class="slot"><span class="mono unit" style="width:74px">${nd.id}</span>
+      <div class="bar"><i style="width:${sl?sl.pc:0}%"></i></div>
+      <span class="mono unit" style="width:34px;text-align:right">${sl?sl.pc:0}%</span></div>`;}).join('');
+
+  const why=d.span
+    ? `<div>Pipeline parallel across ${d.span.length} nodes, because measured all-reduce is ${S.link} GB/s and target concurrency is ${d.seqs}.</div>
+       <div class="mut" style="margin-top:6px">Rejected</div>
+       <div>TP ${d.span.length} \u2014 ${S.link} GB/s is below the 40 GB/s threshold.</div>
+       <div>Spanning brev-h100 \u2014 remote node, no measured fabric. Routing only.</div>`
+    : `<div>Fits in one slot on ${S.nodes[d.solo.n].id}, so it is placed whole rather than sharded.</div>
+       <div class="mut" style="margin-top:6px">Rejected</div>
+       <div>Sharding \u2014 would pay a handoff per token to solve a capacity problem that does not exist.</div>`;
+
+  $('#cardBody').className='card wide';
+  $('#cardBody').innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">
+      <span class="label mono" style="font-size:17px">${d.name}</span>
+      <span class="unit" style="margin-right:auto"><span class="dot" style="background:var(--live)"></span> ready</span>
+      <button onclick="beginSwap(${i})">Change model</button>
+      <button onclick="closeSheet()">Close</button></div>
+    <div class="unit" style="margin:5px 0 0">${d.plan} \u00b7 ${d.rt} \u00b7 ${d.dtype} \u00b7 ${d.ctx.toLocaleString()} ctx \u00b7 ${d.seqs} seqs \u00b7 up ${d.up}</div>
+
+    <div class="sub" style="border:none;padding-top:0">latency and throughput</div>
+    <div class="quad">
+      <div><div class="readout" id="md-tps">${fmtN(tps)}</div><div class="unit">tok/s aggregate, all streams</div></div>
+      <div><div class="readout" id="md-dtps">${fmtN(d.dtps)}</div><div class="unit">tok/s per stream</div></div>
+      <div><div class="readout" id="md-itl">${fmtN(d.dtps>0?1000/d.dtps:null,1)}</div><div class="unit">ms between tokens</div></div>
+      <div><div class="readout" id="md-ttft">${fmtN(d.ttft)}</div><div class="unit">ms to first token</div></div>
+      <div><div class="readout" id="md-q">${d.queue}</div><div class="unit">queued now</div></div>
+    </div>
+    <svg viewBox="0 0 100 28" preserveAspectRatio="none" style="width:100%;height:38px;margin-top:10px">
+      <polyline points="${pts}" fill="none" stroke="var(--ink)" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
+    <div class="unit">Aggregate is a trailing-window sum across every stream; per stream is one request's own
+      decode rate, averaged over requests \u2014 they answer different questions and only match at concurrency 1.
+      Mean request ${fmtN(d.dur,1)} s. All are exponential moving averages; the control plane keeps no percentiles.
+      For a non-streaming response there is no first-token boundary, so per-stream decode falls back to whole-request
+      duration and silently includes prefill.</div>
+
+    <div class="sub">where a request's time goes</div>
+    ${(()=>{
+      // Prefill time is REAL and already measured: proxy.py sets
+      // ttft_s = now - started on the first chunk, decode_s = now - first_token_at.
+      // This split needs no new instrumentation. What does NOT exist is prefill
+      // THROUGHPUT -- that needs prompt tokens, and the gateway has no tokenizer
+      // (estimate_prompt_tokens is len(chars)/4). Charting a chars/4 estimate as
+      // a token rate would invent a benchmark, so this shows time only.
+      if(!d.stream) return `<div class="unit">This model does not stream, so there is no
+        first-token boundary and the phases cannot be separated \u2014 the accounting records
+        the whole request as its own decode window. Mean request ${fmtN(d.dur,1)} s.</div>`;
+      if(d.ttft==null||d.dur==null) return `<div class="unit">Not yet observed.</div>`;
+      const pre=d.ttft/1000, dec=Math.max(0,d.dur-pre), tot=pre+dec, pp=pre/tot*100;
+      return `<div class="phase">
+          <span style="width:${pp.toFixed(1)}%;background:var(--fill);color:var(--onfill)">${pp>=12?'prefill':''}</span>
+          <span style="width:${(100-pp).toFixed(1)}%;background:var(--fill);opacity:.45;color:var(--onfill)">decode</span>
+        </div>
+        <div class="legend"><span><b>${fmtN(pre*1000)} ms</b> prefill (${pp.toFixed(1)}%)</span>
+          <span><b>${fmtN(dec,1)} s</b> decode</span>
+          <span><b>${fmtN(tot,1)} s</b> mean request</span></div>
+        <div class="unit" style="margin-top:6px">Prefill processes the whole prompt at once and is
+          compute-bound; decode emits one token at a time and is memory-bandwidth-bound. The planner
+          and the fit gate reason about decode bandwidth, not this.</div>`;
+    })()}
+    <div class="sub">targets \u00b7 ${$('#policy').value}</div>
+    <table><tr><th>Target</th><th>Kind</th><th style="text-align:right">Share</th>
+      <th style="text-align:right">In flight</th><th style="text-align:right">Strength</th>
+      <th style="text-align:right">$/Mtok</th><th style="text-align:right">Requests</th></tr>${rows}</table>
+
+    <div class="sub">placement</div>
+    <div class="row"><span>Plan</span><span class="mono">${d.plan}</span></div>
+    <div class="row"><span>Nodes</span><span class="mono">${nodes.map(n=>S.nodes[n].id).join(', ')||'\u2014'}</span></div>
+    <div class="row"><span>Measured all-reduce</span><span class="mono">${d.span?S.link+' GB/s':'\u2014'}</span></div>
+    <div class="why on" style="margin-top:8px">${why}</div>
+
+    <div class="sub">memory on each node</div>${mem||'<div class="unit">\u2014</div>'}`;
+  $('#sheet').classList.add('on');
+}
+
+// ---------- routing ----------
+const NOTES={local_first:'Remote targets take traffic only once every local slot stops admitting.',
+  least_outstanding:'Fewest in-flight wins. Accounts for a replica mid-prefill.',
+  weighted_capacity:'Share proportional to measured throughput.',
+  cost_aware:'Cheapest admitting target. Local priced from measured draw.',
+  round_robin:'Even rotation. Ignores that a replica may be mid-prefill.'};
+function curW(d){
+  const t=tgts(d||dep()), p=$('#policy').value, n=t.length;
+  if(n===0) return []; if(n===1) return [1];
+  const loc=t.map(x=>x.kind==='local'?1:0), nl=loc.reduce((a,b)=>a+b,0);
+  if(p==='local_first'){
+    if(!nl) return t.map(()=>1/n);
+    return S.saturated&&n>nl ? t.map((x,i)=>loc[i]?0:1/(n-nl)) : t.map((x,i)=>loc[i]?1/nl:0);
+  }
+  if(p==='cost_aware'){ const c=t.map(x=>x.kind==='prov'?S.providers[0].cost:S.nodes[x.n].cost);
+    const m=Math.min(...c); return c.map(v=>v===m?1/c.filter(z=>z===m).length:0); }
+  if(p==='weighted_capacity'){ const s=t.map(x=>x.kind==='prov'?0.55:S.nodes[x.n].tps/200);
+    const tt=s.reduce((a,b)=>a+b,0); return s.map(v=>v/tt); }
+  return t.map(()=>1/n);
+}
+$('#reset').onclick=resetView;
+$('#policy').onchange=()=>{ sidebar(); render(); };
+$('#spill').onclick=e=>{ S.saturated=!S.saturated; $('#policy').value='local_first';
+  e.target.textContent=S.saturated?'Relieve':'Saturate'; sidebar(); render(); };
+$('#measure').onclick=e=>{ e.target.disabled=1; e.target.textContent='Measuring…';
+  setTimeout(()=>{ S.link=+(9.8+Math.random()*0.8).toFixed(1); sidebar(); render();
+    e.target.disabled=0; e.target.textContent='Re-measure'; },1400); };
+$('#splitBtn').onclick=e=>{ S.joined?setSplit():setJoined(); S.sel=0; S.hist={};
+  e.target.textContent=S.joined?'Split sparks':'Join sparks'; roster(); sidebar(); depsStrip(); aggregate(); render(); };
+
+// ---------- chrome ----------
+document.querySelectorAll('.dest button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.dest button').forEach(x=>x.setAttribute('aria-selected',x===b));
+  ['cluster','dash','spend','settings'].forEach(v=>$('#d-'+v).hidden=(v!==b.dataset.d));
+  if(b.dataset.d==='spend') spend();
+  if(b.dataset.d==='settings') settings();
+  if(b.dataset.d==='dash'){ depsStrip(); aggregate(); loadMatrix(); }
+  if(b.dataset.d==='cluster') fitGraph();
+});
+$('#tog').onclick=e=>{ const hid=$('#wrap').classList.toggle('narrow'), b=e.currentTarget;
+  b.setAttribute('aria-expanded',String(!hid));
+  b.setAttribute('aria-label',hid?'Show sidebar':'Hide sidebar'); b.title=b.getAttribute('aria-label');
+  setTimeout(fitGraph,200); };
+$('#theme').onclick=e=>{ const d=document.documentElement.getAttribute('data-theme')==='dark';
+  document.documentElement.setAttribute('data-theme',d?'light':'dark'); e.target.textContent=d?'Dark':'Light'; };
+$('#whyBtn').onclick=e=>{ const on=$('#whyBox').classList.toggle('on'); e.target.textContent=on?'why ▾':'why ▸'; };
+
+// ---------- launch command ----------
+// Mirrors _VLLM_COMMAND / _SGLANG_COMMAND in control_plane/deploy/flags.py.
+// derate synthesizes a recipe per deployment whose command template
+// references every knob, because a sparkrun flag the template does not mention
+// is a SILENT no-op -- accepted, exit 0, and the setting never applied. Extra
+// flags therefore have to be templated in too, not just passed along.
+const RUNTIMES={
+  vllm:{seqKey:'--max-num-seqs',ep:'--enable-expert-parallel',
+    img:'ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest'},
+  sglang:{seqKey:'--max-running-requests',ep:'--enable-ep-moe',
+    img:'scitrera/dgx-spark-sglang:0.5.9-t5'}};
+S.plan=null;
+S.swap=null;
+function renderCmd(){
+  const box=document.getElementById('cmdOut'); if(!box) return;
+  const P=S.plan;
+  if(!P){ box.textContent='Press Plan to render the command.'; return; }
+  const rt=RUNTIMES[P.runtime]||RUNTIMES.vllm;
+  const bin=P.runtime==='sglang'?'python -m sglang.launch_server --model-path':'vllm serve';
+  const L=[`${bin} ${P.model}`,
+    `--served-model-name ${P.served}`,
+    `--host 0.0.0.0`,`--port 8000`,
+    `--tensor-parallel-size ${P.tp}`,
+    `--pipeline-parallel-size ${P.pp}`,
+    `--max-model-len ${P.ctx}`,
+    `${rt.seqKey} ${P.seqs}`,
+    `--gpu-memory-utilization 0.90`,
+    `--trust-remote-code`];
+  if(P.ep) L.push(rt.ep);
+  const extra=(P.extra||'').trim();
+  box.innerHTML=L.map((l,i)=>(i?'    ':'')+esc(l)).join(' \\\n')
+    + (extra?' \\\n    <span class="ovr">'+esc(extra)+'</span>':'');
+}
+const esc=x=>String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+$('#cmdBtn').onclick=e=>{ const b=$('#cmdBox'), on=b.style.display==='none';
+  b.style.display=on?'block':'none'; e.target.innerHTML='launch command '+(on?'&#9662;':'&#9656;'); };
+['#extra','#runtime'].forEach(q=>$(q).addEventListener('input',()=>{ if(S.plan){
+  S.plan.extra=$('#extra').value; S.plan.runtime=$('#runtime').value; renderCmd(); } }));
+
+// Swapping keeps the served name, so every client keeps working across the change.
+function beginSwap(i){
+  const d=S.deps[i]; if(!d) return;
+  S.swap={name:d.name,idx:i}; closeSheet();
+  document.querySelector('.dest button[data-d=dash]').click();
+  $('#mid').value=''; $('#ctx').value=d.ctx; $('#seqs').value=d.seqs;
+  $('#swapbar').className='swapbar on';
+  $('#swapbar').innerHTML=`<span>Replacing <b class="mono">${esc(d.name)}</b>. `
+    +`It keeps its served name, so clients need no change. `
+    +`It stops admitting only when the replacement is ready.</span>`
+    +`<button style="margin-left:auto" onclick="cancelSwap()">Cancel</button>`;
+  $('#mid').focus();
+}
+function cancelSwap(){ S.swap=null; $('#swapbar').className='swapbar'; $('#serveBtn').textContent='Serve'; }
+
+// ---------- fit ----------
+const USABLE=107.7,GIB=1024**3;
+const BPP={fp32:4,bf16:2,fp16:2,fp8:1,mxfp4:0.53125,nvfp4:0.5625,q4_k_m:0.6125};
+const shapes={'openai/gpt-oss-120b':{L:36,kv:8,hd:64,P:120e9,A:5.1e9,sw:128,full:18},
+  'meta-llama/llama-3.3-70b-instruct':{L:80,kv:8,hd:128,P:70e9},
+  'deepseek-ai/deepseek-v3':{L:61,kv:1,hd:576,P:671e9,A:37e9,mla:1},
+  'qwen/qwen3-8b':{L:36,kv:8,hd:128,P:8e9},
+  'mistralai/mistral-7b-instruct-v0.3':{L:32,kv:8,hd:128,P:7e9}};
+function shapeOf(id){
+  const k=id.trim().toLowerCase();
+  if(!k) return null;                       // '' matched everything: s.includes('') is always true
+  if(shapes[k]) return shapes[k];
+  for(const s in shapes){ const base=s.split('/')[1];
+    if(k===s||k===base||(k.length>=4&&(s.includes(k)||k.includes(base)))) return shapes[s]; }
+  return null;}
+$('#planBtn').onclick=()=>{
+  const id=$('#mid').value,q=$('#quant').value,ctx=+$('#ctx').value||8192,seqs=+$('#seqs').value||1;
+  const pl=$('#place').value,v=$('#verdict'),sh=shapeOf(id); $('#serveBtn').disabled=true;
+  if(!sh){ v.className='verdict on bad';
+    v.innerHTML=`<div class="vhead" style="color:var(--fault)">Could not resolve ${id}</div>
+      <div class="mut">No config.json reachable. Check the id, or the repo may be gated.</div>`; return; }
+  const bpp=BPP[q]||2,W=sh.P*bpp/GIB;
+  const perTok=sh.mla?sh.L*sh.hd*2:2*sh.L*sh.kv*sh.hd*2;
+  const effCtx=sh.sw?(sh.full*ctx+(sh.L-sh.full)*Math.min(sh.sw,ctx))/sh.L:ctx;
+  const KV=perTok*effCtx*seqs/GIB,fixed=3.6;
+  const cap=pl==='auto'?USABLE:(S.nodes[+pl].unified?USABLE:(S.nodes[+pl].remote?76:22));
+  const solo=W+KV+fixed,two=W/2+KV/2+fixed,need=Math.ceil(W/(USABLE-fixed));
+  const bw=pl==='auto'?273:S.nodes[+pl].bw;
+  const tps=Math.round(bw*1e9/((sh.A||sh.P)*bpp)*0.55);
+  const bar=(a,b,c)=>`<div class="budget"><span style="width:${Math.min(a/cap*100,100)}%;background:${c}"></span>
+    <span style="width:${Math.max(0,Math.min(b/cap*100,100-a/cap*100))}%;background:${c};opacity:.5"></span></div>`;
+  const free=S.nodes.reduce((a,n)=>a+n.slots.filter(s=>!s).length,0);
+  const where=pl==='auto'?'the best free slot':S.nodes[+pl].id;
+  const twoUp=(pl==='auto'&&solo>cap&&two<=USABLE);
+  S.plan={model:id,served:S.swap?S.swap.name:(id.split('/').pop()||id),
+    tp:1,pp:twoUp?2:1,ctx,seqs,ep:!!sh.A,runtime:$('#runtime').value,extra:$('#extra').value};
+  renderCmd();
+
+  if(solo<=cap){ v.className='verdict on';
+    v.innerHTML=`<div class="vhead" style="color:var(--live)">Fits · 1 slot on ${where}</div>${bar(W,KV,'var(--fill)')}
+      <div class="legend"><span><b>${W.toFixed(1)}</b> weights</span><span><b>${KV.toFixed(1)}</b> kv</span>
+      <span><b>${(cap-solo).toFixed(1)} GiB</b> free of ${cap}</span></div>
+      <div class="mut" style="margin-top:8px">Predicted ${tps} tok/s. ${free} slot${free===1?'':'s'} free across the cluster.</div>`;
+    $('#serveBtn').disabled=free===0;
+  } else if(pl==='auto'&&two<=USABLE){ v.className='verdict on';
+    v.innerHTML=`<div class="vhead" style="color:var(--live)">Fits · PP 2 across both Sparks</div>${bar(W/2,KV/2,'var(--fill)')}
+      <div class="legend"><span><b>${(W/2).toFixed(1)}</b> weights</span><span><b>${(KV/2).toFixed(1)}</b> kv</span>
+      <span><b>${(USABLE-two).toFixed(1)} GiB</b> free per node</span></div>
+      <div class="mut" style="margin-top:8px">Pipeline parallel over tensor parallel: measured all-reduce is ${S.link} GB/s,
+      below the 40 GB/s threshold. brev-h100 excluded, no measured fabric to it.</div>`;
+    $('#serveBtn').disabled=false;
+  } else if(W+fixed>cap&&(pl!=='auto'||W/2+fixed>USABLE)){ v.className='verdict on bad';
+    v.innerHTML=`<div class="vhead" style="color:var(--fault)">Won't fit · limiting term: weights</div>${bar(W,0,'var(--fault)')}
+      <div class="legend"><span><b>${W.toFixed(1)} GiB</b> weights</span><span><b>${cap}</b> GiB usable</span></div>
+      <div style="margin-top:8px">Weights alone exceed the budget at zero context on ${where}.
+      ${pl==='auto'?`Needs at least ${need} nodes at ${q}, or a smaller quantization.`:'Try auto placement or a smaller quantization.'}</div>`;
+  } else {
+    const per=pl==='auto'?2:1, budget=cap-(W/per+fixed);
+    let mx=Math.floor(budget*GIB/(perTok*seqs/per)); mx=Math.max(512,Math.floor(mx/512)*512);
+    v.className='verdict on bad';
+    v.innerHTML=`<div class="vhead" style="color:var(--fault)">Won't fit · limiting term: kv_cache</div>${bar(W/per,KV/per,'var(--fault)')}
+      <div class="legend"><span><b>${(W/per).toFixed(1)}</b> weights</span><span><b>${(KV/per).toFixed(1)}</b> kv</span>
+      <span><b>${cap}</b> GiB usable</span></div>
+      <div style="margin-top:8px">KV cache is the problem: ${(KV/per).toFixed(1)} GiB at ${ctx.toLocaleString()} tokens
+      across ${seqs} sequences. Drop context to ${mx.toLocaleString()}, cut concurrency, or quantize the KV cache to fp8.</div>
+      <button style="margin-top:10px" onclick="document.getElementById('ctx').value=${mx};document.getElementById('planBtn').click()">
+      Retry at ${mx.toLocaleString()} tokens</button>`;
+  }
+};
+$('#serveBtn').onclick=e=>{ e.target.disabled=1;
+  e.target.textContent=S.swap?'Swapping…':'Launching…';
+  setTimeout(()=>{ e.target.textContent='Serve';
+    $('#verdict').insertAdjacentHTML('beforeend',
+      `<div class="mut" style="margin-top:10px;padding-top:9px;border-top:1px solid var(--rule)">
+       Launched. Now in <span class="mono">/v1/models</span>.</div>`); },1500); };
+
+roster(); sidebar(); depsStrip(); aggregate(); fitGraph(); spend(); settings(); loadMatrix();
+
+setInterval(()=>{
+  S.deps.forEach((d,i)=>{
+    const sc=d.span?(S.nodes[d.span[0]].thr+S.nodes[d.span[1]].thr)/200:S.nodes[d.solo.n].thr/100;
+    const h=S.hist[d.name]; if(!h) return;
+    // Scale once, at the source, so the strip cell, the hero total and the
+    // telemetry charts cannot disagree about the same quantity.
+    const prev=h[h.length-1]/(h.sc||1);
+    const base=Math.max(0,Math.min(prev+(Math.random()-.5)*8, d.tps*1.15)*(0.98+0.04*Math.random()));
+    const v=base*sc; h.sc=sc; h.push(v); h.shift();
+    const cell=document.getElementById('dt'+i);
+    if(cell) cell.innerHTML=`${v.toFixed(0)} <span class="unit">tok/s</span>`;
+  });
+  document.querySelectorAll('#graph [data-nf]').forEach(e=>{
+    const n=S.nodes[+e.getAttribute('data-nf')];
+    if(n) e.textContent=`${(n.tps*n.thr/100).toFixed(0)} tok/s · ${Math.round(n.w*n.thr/100)} W`; });
+  if(S.openDep!=null){
+    const d=S.deps[S.openDep], h=d&&S.hist[d.name];
+    if(h){ const v=h[h.length-1], set=(id,x)=>{const e=document.getElementById(id); if(e) e.textContent=x;};
+      set('md-tps',fmtN(v)); set('md-dtps',fmtN(d.dtps));
+      set('md-itl',fmtN(d.dtps>0?1000/d.dtps:null,1));
+      set('md-ttft',fmtN(d.ttft)); set('md-q',d.queue); }
+  }
+  pushTel(); telemetry();
+  S.spentToday+=S.cloudOff?0.0002:0.0006;
+  if(!$('#d-spend').hidden) spend();
+  if(!$('#d-dash').hidden){ aggregate(); if(Math.random()<0.25) depsStrip(); }
+},1000);
+</script>

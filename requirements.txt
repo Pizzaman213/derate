@@ -1,7 +1,12 @@
-# Runtime dependencies for the sparkplane node image.
+# Runtime dependencies for the derate node image.
 # sparkrun is installed separately and pinned by build arg; see Dockerfile.
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+# Already pulled in by uvicorn[standard], but /v1/realtime imports it directly
+# as a *client* to dial the upstream, so it is named rather than relied on
+# transitively -- a future uvicorn that drops the extra would otherwise break
+# realtime with an ImportError at connect time.
+websockets==15.0.1
 httpx==0.28.1
 pydantic==2.10.4
 zeroconf==0.136.2

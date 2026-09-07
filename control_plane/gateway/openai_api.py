@@ -13,16 +13,47 @@ import logging
 import time
 from uuid import uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, WebSocket
 from starlette.responses import JSONResponse, Response
 
-from control_plane.contracts import TargetKind
+from control_plane.contracts import Modality, TargetKind
 from control_plane.telemetry import RequestTrace
 
-from . import errors
+from . import errors, realtime
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.openai")
+
+# Which kind of model each endpoint family needs. The gateway has always had
+# one family, so naming a model was the only question a request had to answer;
+# with /v1/audio/* there are two, and a chat request that lands on a TTS
+# deployment gets a confusing 400 from the backend instead of a useful one from
+# us. This table is what makes the refusal actionable.
+_ENDPOINT_MODALITY: dict[str, Modality] = {
+    "/chat/completions": Modality.TEXT,
+    "/completions": Modality.TEXT,
+    "/embeddings": Modality.EMBEDDING,
+    "/audio/speech": Modality.SPEECH,
+    "/audio/transcriptions": Modality.TRANSCRIPTION,
+}
+
+#: The modalities that are genuinely a different endpoint family. TEXT and
+#: EMBEDDING are deliberately not in here: one vLLM server answers
+#: /v1/chat/completions and /v1/embeddings from the same weights, and this
+#: gateway has always let it, so treating them as exclusive would refuse
+#: requests that work today. Audio is the axis that is actually new.
+_AUDIO_MODALITIES = frozenset({Modality.SPEECH, Modality.TRANSCRIPTION})
+
+
+def _modality_conflict(has: Modality, wants: Modality) -> bool:
+    """True when this model cannot serve this endpoint.
+
+    Only asked about audio, and asked in both directions: a speech model must
+    not receive a chat request, and a chat model must not receive a speech one.
+    """
+    if has is wants:
+        return False
+    return has in _AUDIO_MODALITIES or wants in _AUDIO_MODALITIES
 
 # How much of the prompt seeds the cache-affinity hash. Long enough that a
 # shared system prompt collides, short enough to stay cheap.
@@ -56,6 +87,88 @@ def _prefix_key(body: dict) -> str | None:
     return None
 
 
+async def _read_bounded_body(request: Request, limit: int) -> bytes | None:
+    """Read the whole body, or None if it goes past *limit*.
+
+    Streamed rather than `await request.body()` so an oversized upload is
+    dropped at the limit instead of being buffered in full and then rejected.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _boundary_of(content_type: str) -> bytes | None:
+    """The boundary token out of a multipart content-type header."""
+    for part in content_type.split(";")[1:]:
+        key, _, value = part.strip().partition("=")
+        if key.strip().lower() == "boundary":
+            token = value.strip().strip('"')
+            return token.encode("latin-1") if token else None
+    return None
+
+
+def _field_span(raw: bytes, content_type: str, name: str) -> tuple[str, int, int] | None:
+    """Find a simple form field: its value, and where the value sits in *raw*.
+
+    Deliberately not a general multipart parser. It reads the one text field
+    the gateway needs -- the model name -- and returns its byte span so the
+    value can be swapped without re-encoding the file part beside it. Anything
+    it does not understand it declines to find, and the caller answers with a
+    missing-parameter 400 rather than guessing.
+    """
+    boundary = _boundary_of(content_type)
+    if not boundary:
+        return None
+    needle = b'name="%s"' % name.encode("latin-1")
+    delimiter = b"--" + boundary
+    cursor = 0
+    while True:
+        start = raw.find(delimiter, cursor)
+        if start < 0:
+            return None
+        cursor = start + len(delimiter)
+        head_end = raw.find(b"\r\n\r\n", cursor)
+        if head_end < 0:
+            return None
+        headers = raw[cursor:head_end]
+        body_start = head_end + 4
+        body_end = raw.find(b"\r\n" + delimiter, body_start)
+        if body_end < 0:
+            return None
+        if needle in headers:
+            try:
+                return raw[body_start:body_end].decode("utf-8"), body_start, body_end
+            except UnicodeDecodeError:
+                return None
+        cursor = body_end
+
+
+def _multipart_field(raw: bytes, content_type: str, name: str) -> str | None:
+    found = _field_span(raw, content_type, name)
+    return found[0].strip() if found else None
+
+
+def _rewrite_multipart_field(
+    raw: bytes, content_type: str, name: str, value: str
+) -> bytes | None:
+    """Swap one field's value, leaving every other byte alone.
+
+    Needed because a remote provider calls the model something else, and on
+    this path the name is inside the body rather than in a dict we can copy.
+    """
+    found = _field_span(raw, content_type, name)
+    if found is None:
+        return None
+    _, start, end = found
+    return raw[:start] + value.encode("utf-8") + raw[end:]
+
+
 def create_router(ctx: GatewayContext) -> APIRouter:
     router = APIRouter()
 
@@ -73,16 +186,24 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "id": served_name,
                     "object": "model",
                     "created": created,
-                    "owned_by": "sparkplane",
+                    "owned_by": "derate",
                     # Extras. Clients ignore what they do not know; the UI uses them.
                     "context_length": index.context_length.get(served_name),
                     "target_count": len(targets),
                     "target_kinds": kinds,
+                    # Which endpoint family accepts this name. Without it a
+                    # client cannot tell a TTS model from a chat model.
+                    "modality": index.modality.get(
+                        served_name, Modality.TEXT
+                    ).value,
                 }
             )
         return JSONResponse({"object": "list", "data": data})
 
-    async def _proxy(request: Request, path: str, streaming_allowed: bool) -> Response:
+    async def _proxy(
+        request: Request, path: str, streaming_allowed: bool
+    ) -> Response:
+        """The JSON entry point: chat, completions, embeddings, audio/speech."""
         try:
             raw = await request.body()
             body = json.loads(raw) if raw else {}
@@ -104,8 +225,87 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "missing_model",
             )
 
+        return await _serve(
+            request,
+            path,
+            model=model,
+            body=body,
+            raw_len=len(raw),
+            streaming=bool(body.get("stream")) and streaming_allowed,
+        )
+
+    async def _proxy_multipart(request: Request, path: str) -> Response:
+        """The multipart entry point: audio/transcriptions.
+
+        The one request shape that cannot go through _proxy. The body is a
+        form carrying an audio file, so there is no JSON to parse and the model
+        name arrives as a field rather than a key.
+
+        The bytes are read once and forwarded verbatim, boundary and all.
+        Parsing the form properly would mean pulling in python-multipart and
+        rebuilding a 25 MiB upload in order to change nothing about it -- and
+        the rebuilt body would have to be held anyway, because a target that
+        fails still has to be retryable.
+        """
+        content_type = request.headers.get("content-type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            return errors.error_response(
+                400,
+                "This endpoint expects a multipart/form-data upload carrying "
+                "'file' and 'model'.",
+                "invalid_request_error",
+                "invalid_content_type",
+            )
+
+        limit = ctx.settings.max_audio_upload_bytes
+        raw = await _read_bounded_body(request, limit)
+        if raw is None:
+            return errors.error_response(
+                413,
+                f"The upload is larger than the {limit // (1024 * 1024)} MiB limit.",
+                "invalid_request_error",
+                "payload_too_large",
+            )
+
+        model = _multipart_field(raw, content_type, "model")
+        if not model:
+            return errors.error_response(
+                400, "You must provide a 'model' parameter.",
+                "invalid_request_error", "missing_model",
+            )
+
+        return await _serve(
+            request,
+            path,
+            model=model,
+            body=None,
+            raw_len=len(raw),
+            streaming=False,
+            content=raw,
+            content_type=content_type,
+        )
+
+    async def _serve(
+        request: Request,
+        path: str,
+        *,
+        model: str,
+        body: dict | None,
+        raw_len: int,
+        streaming: bool,
+        content: bytes | None = None,
+        content_type: str | None = None,
+    ) -> Response:
+        """Everything both entry points share: model lookup, the modality
+        guard, failover, the breaker, parking and the trace id.
+
+        `body` is None exactly when `content` is set, which is what tells the
+        rest of this function it is looking at bytes it cannot inspect.
+        """
         settings = ctx.settings
-        streaming = bool(body.get("stream")) and streaming_allowed
+        # An audio body has no tokens to count and nothing to read a `usage`
+        # block out of.
+        count_tokens = body is not None
 
         # Minted before the first thing that can refuse, so a 404 is recorded
         # as readily as a 200. Every attempt this request makes shares the id,
@@ -116,7 +316,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             served_name=model,
             node_id=settings.coordinator_node_id or "",
             streaming=streaming,
-            body_bytes=len(raw),
+            body_bytes=raw_len,
         )
 
         def _tagged(response: Response) -> Response:
@@ -158,7 +358,20 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             # Otherwise it was serving moments ago and its target has gone.
             # Fall through: the parking lot below is exactly for that.
 
-        prefix_key = _prefix_key(body)
+        # The model exists (or is parkable). Before anything is sent, check it
+        # answers on this endpoint at all -- a refusal here is cheap and says
+        # something the backend's own 400 would not.
+        wants = _ENDPOINT_MODALITY.get(path)
+        has = index.modality.get(model)
+        if wants is not None and has is not None and _modality_conflict(has, wants):
+            return _refused(
+                errors.wrong_modality(model, has, wants, f"/v1{path}"),
+                "wrong_modality",
+            )
+
+        # Nothing to hash in an opaque upload, and cache affinity means
+        # nothing for a transcription anyway -- there is no shared prefix.
+        prefix_key = _prefix_key(body) if body is not None else None
         client_headers = dict(request.headers)
         ctx.retry_budget.note_request()
 
@@ -222,6 +435,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # out of the loop would carry one target's body rewrite -- or
                 # worse, one provider's key -- onto the next target.
                 upstream_body = body
+                upstream_content = content
                 api_key = None
                 on_finish = None
                 use_provider_service = False
@@ -231,7 +445,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
                 if target.kind is TargetKind.LOCAL:
                     deployment = selection.deployment
-                    if deployment is not None:
+                    # Admission is KV-cache arithmetic end to end, and a KV
+                    # cache is not what a speech or transcription server has.
+                    # Charging one a budget that does not describe it would
+                    # refuse requests for a reason that does not exist.
+                    if (
+                        deployment is not None
+                        and deployment.modality is Modality.TEXT
+                        and body is not None
+                    ):
                         decision = ctx.admission.check(deployment, body)
                         trace.prompt_tokens = decision.prompt_tokens
                         if not decision.ok:
@@ -268,8 +490,28 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     # the only edit made to a request body, and it is required
                     # for it to route.
                     if selection.model is not None:
-                        upstream_body = dict(body)
-                        upstream_body["model"] = selection.model.upstream_id
+                        if body is not None:
+                            upstream_body = dict(body)
+                            upstream_body["model"] = selection.model.upstream_id
+                        elif content is not None and content_type is not None:
+                            # The name is inside the body here rather than in a
+                            # dict we can copy, so it is spliced in place. Only
+                            # the field's bytes move; the audio part beside it
+                            # is untouched.
+                            rewritten = _rewrite_multipart_field(
+                                content,
+                                content_type,
+                                "model",
+                                selection.model.upstream_id,
+                            )
+                            if rewritten is None:
+                                # We read the field on the way in, so failing to
+                                # rewrite it means the body changed shape under
+                                # us. Sending it unrewritten would name a model
+                                # this provider does not have.
+                                ctx.breaker.abandon(target.target_id)
+                                continue
+                            upstream_content = rewritten
                     provider_id = (
                         selection.provider.provider_id
                         if selection.provider is not None
@@ -294,6 +536,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         open_upstream is not None
                         and provider_id is not None
                         and provider_upstream_id is not None
+                        # The managed path builds its payload with dict(body),
+                        # which an opaque upload has none of. A multipart
+                        # request therefore takes the raw forward below: it
+                        # still carries the provider's key and still fails over,
+                        # but the provider service's own spend accounting and
+                        # budget enforcement do not run on it. Acceptable for
+                        # now because transcription is priced per audio-minute
+                        # and nothing on this path can read that figure anyway.
+                        and content is None
                     )
                     if not use_provider_service and selection.provider is not None:
                         try:
@@ -350,6 +601,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         on_finish=on_finish,
                         trace=trace,
                         attempt_no=attempt_no,
+                        content=upstream_content,
+                        content_type=content_type,
+                        count_tokens=count_tokens,
                     )
                 if not result.retryable:
                     return _tagged(result.response)
@@ -386,7 +640,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # Nothing was reachable. If this model was serving a moment ago and no
         # target is deliberately shedding load, hold the request briefly for
         # one to come back rather than refusing outright.
-        if ctx.parking.accepts(model, len(raw)) and ctx.router.parkable(model):
+        if ctx.parking.accepts(model, raw_len) and ctx.router.parkable(model):
             parked_at = time.monotonic()
             recovered = await ctx.parking.park(
                 model,
@@ -414,5 +668,40 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.post("/v1/embeddings")
     async def embeddings(request: Request) -> Response:
         return await _proxy(request, "/embeddings", False)
+
+    @router.post("/v1/audio/speech")
+    async def audio_speech(request: Request) -> Response:
+        """Text in, audio bytes out.
+
+        The body is JSON with a top-level "model", which is exactly what _proxy
+        already parses, and the response path has always been byte-transparent
+        -- it streams the upstream's own bytes and headers -- so an MP3 comes
+        back through the same machinery a token stream does. There is no
+        `stream` field on this endpoint, which is why providers/service.py stops
+        injecting one.
+        """
+        return await _proxy(request, "/audio/speech", False)
+
+    @router.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(request: Request) -> Response:
+        """Audio file in, text out.
+
+        The only endpoint here that is not JSON: it is a multipart upload, so
+        it takes _proxy_multipart. Everything after the body is read -- model
+        lookup, the modality guard, failover, the breaker, parking, the trace
+        id -- is the same code path as every other route.
+        """
+        return await _proxy_multipart(request, "/audio/transcriptions")
+
+    @router.websocket("/v1/realtime")
+    async def realtime_session(websocket: WebSocket) -> None:
+        """A realtime voice session, relayed to a provider that implements it.
+
+        The only route here that is not a request/response pair, and the only
+        one that does not go through _serve: a session cannot be re-offered to
+        another target halfway through, because the upstream holds conversation
+        state we never saw. See realtime.py for what this does and does not do.
+        """
+        await realtime.relay(ctx, websocket)
 
     return router

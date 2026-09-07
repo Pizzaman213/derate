@@ -77,6 +77,16 @@ def _screen_free_text(value: str, field: str) -> None:
 
 _ID_SAFE = re.compile(r"[^a-z0-9._-]+")
 
+#: Endpoints whose request body has a `stream` field. Everything else -- today
+#: that means /v1/audio/speech and /v1/audio/transcriptions -- must not have one
+#: added, because a strict upstream rejects an unknown field outright.
+_STREAMING_ENDPOINTS = ("chat/completions", "completions")
+
+
+def _accepts_stream(endpoint: str) -> bool:
+    tail = endpoint.strip("/")
+    return any(tail.endswith(name) for name in _STREAMING_ENDPOINTS)
+
 
 @dataclass
 class UpstreamResponse:
@@ -664,6 +674,7 @@ class ProviderService:
 
     # -- forwarding --------------------------------------------------------
 
+
     def _prepare(
         self, provider_id: str, upstream_id: str, body: dict, stream: bool, endpoint: str
     ) -> tuple[_Entry, str, dict[str, str], dict]:
@@ -696,7 +707,12 @@ class ProviderService:
 
         payload = dict(body)
         payload["model"] = upstream_id
-        payload["stream"] = bool(stream)
+        # Only where the endpoint actually has a `stream` field. /v1/audio/speech
+        # does not, and a strict upstream answers 400 for an unknown one -- so
+        # injecting it unconditionally would break every audio request that ever
+        # reached a provider.
+        if _accepts_stream(endpoint):
+            payload["stream"] = bool(stream)
         model = entry.models_by_upstream.get(upstream_id)
         priced = model is not None and self.blended_cost(model) is not None
         if (

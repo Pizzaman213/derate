@@ -43,6 +43,14 @@ VLLM_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration",
         "SolarForCausalLM", "StableLmForCausalLM", "Starcoder2ForCausalLM",
         "TeleChat2ForCausalLM", "XverseForCausalLM", "Zamba2ForCausalLM",
+        # Speech. vLLM serves these on /v1/audio/transcriptions rather than
+        # /v1/chat/completions, which is why a deployment carries a Modality:
+        # being loadable and being answerable on the chat route are different
+        # claims, and this set only makes the first one. SGLang has no
+        # transcription server, so they are deliberately absent from its set.
+        "WhisperForConditionalGeneration",
+        "Qwen2AudioForConditionalGeneration",
+        "VoxtralForConditionalGeneration",
     }
 )
 
@@ -65,6 +73,29 @@ SGLANG_ARCHITECTURES: frozenset[str] = frozenset(
     }
 )
 
+#: Architectures this build knows are speech models, and which endpoint family
+#: each answers. The resolver reports it; the deployment manager records it on
+#: the Deployment so the gateway can route on it. Absent means text, which is
+#: what every model here was before audio existed.
+AUDIO_ARCHITECTURES: dict[str, str] = {
+    "WhisperForConditionalGeneration": "transcription",
+    "Qwen2AudioForConditionalGeneration": "transcription",
+    "VoxtralForConditionalGeneration": "transcription",
+}
+
+
+def modality_for(architectures) -> str:
+    """Which endpoint family these architectures answer on.
+
+    A string rather than the Modality enum so `resolver/` keeps its existing
+    independence from `contracts/` beyond ModelShape; the caller converts.
+    """
+    for name in architectures or ():
+        found = AUDIO_ARCHITECTURES.get(name)
+        if found:
+            return found
+    return "text"
+
 #: Quantization support per runtime. Anything absent is unsupported.
 _VLLM_QUANTS: dict[str, SupportLevel] = {
     "fp32": SupportLevel.SUPPORTED, "fp16": SupportLevel.SUPPORTED,
@@ -77,6 +108,16 @@ _VLLM_QUANTS: dict[str, SupportLevel] = {
     "q5_k_m": SupportLevel.UNVERIFIED, "q4_k_m": SupportLevel.UNVERIFIED,
     "q4_0": SupportLevel.UNVERIFIED, "q3_k_m": SupportLevel.UNVERIFIED,
     "q2_k": SupportLevel.UNVERIFIED,
+    # The rest of the llama.cpp ladder, at the same level as the K-quants
+    # above: vLLM has a GGUF loader, we have not verified these on it. An
+    # absent key would default to UNSUPPORTED, which would make iq4_xs read
+    # as stricter than q4_k_m for no reason anyone could defend.
+    "q4_1": SupportLevel.UNVERIFIED, "q5_0": SupportLevel.UNVERIFIED, "q5_1": SupportLevel.UNVERIFIED,
+    "q2_k_s": SupportLevel.UNVERIFIED, "iq1_s": SupportLevel.UNVERIFIED, "iq1_m": SupportLevel.UNVERIFIED,
+    "iq2_xxs": SupportLevel.UNVERIFIED, "iq2_xs": SupportLevel.UNVERIFIED, "iq2_s": SupportLevel.UNVERIFIED,
+    "iq2_m": SupportLevel.UNVERIFIED, "iq3_xxs": SupportLevel.UNVERIFIED, "iq3_xs": SupportLevel.UNVERIFIED,
+    "iq3_s": SupportLevel.UNVERIFIED, "iq3_m": SupportLevel.UNVERIFIED, "iq4_xs": SupportLevel.UNVERIFIED,
+    "iq4_nl": SupportLevel.UNVERIFIED,
 }
 
 _SGLANG_QUANTS: dict[str, SupportLevel] = {
@@ -90,6 +131,15 @@ _SGLANG_QUANTS: dict[str, SupportLevel] = {
     "q5_k_m": SupportLevel.UNSUPPORTED, "q4_k_m": SupportLevel.UNSUPPORTED,
     "q4_0": SupportLevel.UNSUPPORTED, "q3_k_m": SupportLevel.UNSUPPORTED,
     "q2_k": SupportLevel.UNSUPPORTED,
+    # SGLang has no GGUF path at all, so the whole ladder is refused --
+    # stated explicitly rather than left to the default, so the table reads
+    # as a decision rather than an omission.
+    "q4_1": SupportLevel.UNSUPPORTED, "q5_0": SupportLevel.UNSUPPORTED, "q5_1": SupportLevel.UNSUPPORTED,
+    "q2_k_s": SupportLevel.UNSUPPORTED, "iq1_s": SupportLevel.UNSUPPORTED, "iq1_m": SupportLevel.UNSUPPORTED,
+    "iq2_xxs": SupportLevel.UNSUPPORTED, "iq2_xs": SupportLevel.UNSUPPORTED, "iq2_s": SupportLevel.UNSUPPORTED,
+    "iq2_m": SupportLevel.UNSUPPORTED, "iq3_xxs": SupportLevel.UNSUPPORTED, "iq3_xs": SupportLevel.UNSUPPORTED,
+    "iq3_s": SupportLevel.UNSUPPORTED, "iq3_m": SupportLevel.UNSUPPORTED, "iq4_xs": SupportLevel.UNSUPPORTED,
+    "iq4_nl": SupportLevel.UNSUPPORTED,
 }
 
 

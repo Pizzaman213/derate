@@ -114,6 +114,7 @@ class StubRegistry:
                 power_watts=power,
                 temperature_c=temp,
                 utilization_pct=util,
+                sample_ts=now,
             )
             # Seed a full ring so history() answers on the first call.
             for i in range(60):
@@ -185,6 +186,7 @@ class StubRegistry:
                     "util_pct": state.utilization_pct,
                     "healthy": state.healthy,
                     "last_seen": state.last_seen,
+                    "sample_ts": state.sample_ts or None,
                 }
             )
         return {

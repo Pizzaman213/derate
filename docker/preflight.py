@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Startup preflight for the sparkplane node container.
+"""Startup preflight for the derate node container.
 
 One check matters here: are we on host networking?
 
@@ -19,7 +19,7 @@ Detection, in order of confidence:
 4. Otherwise every non-loopback interface is a veth (ifindex != iflink),
    which is exactly what a bridged container gets. Bridge networking.
 
-SPARKPLANE_ALLOW_BRIDGE=1 downgrades the refusal to a loud warning. It is
+DERATE_ALLOW_BRIDGE=1 downgrades the refusal to a loud warning. It is
 unsupported and discovery will not work; it exists so somebody debugging in
 a constrained CI sandbox is not stuck.
 """
@@ -35,7 +35,7 @@ HOST_BRIDGE_PREFIXES = ("docker", "br-", "virbr", "cni", "flannel")
 
 BRIDGE_MESSAGE = """\
 ================================================================================
-sparkplane refuses to start: this container is on bridge networking.
+derate refuses to start: this container is on bridge networking.
 
     Host networking is required. mDNS is multicast and does not cross a
     Docker bridge, so this container would start cleanly, report itself
@@ -44,7 +44,7 @@ sparkplane refuses to start: this container is on bridge networking.
 
 Start it again with --network host:
 
-    docker run --network host -v sparkplane:/data sparkplane/node
+    docker run --network host -v derate:/data ghcr.io/pizzaman213/derate/node
 
 With compose, the service needs:
 
@@ -53,7 +53,7 @@ With compose, the service needs:
 Interfaces visible in this namespace: %s
 
 To override anyway (unsupported, discovery will not work):
-    SPARKPLANE_ALLOW_BRIDGE=1
+    DERATE_ALLOW_BRIDGE=1
 ================================================================================"""
 
 
@@ -122,13 +122,13 @@ def check(stream=sys.stderr) -> bool:
 
     host_net, why = on_host_network()
     if host_net:
-        print("[sparkplane] host networking confirmed (%s)" % why, file=stream)
+        print("[derate] host networking confirmed (%s)" % why, file=stream)
         return True
 
-    if os.environ.get("SPARKPLANE_ALLOW_BRIDGE") in ("1", "true", "yes"):
+    if os.environ.get("DERATE_ALLOW_BRIDGE") in ("1", "true", "yes"):
         print(
-            "[sparkplane] WARNING: bridge networking detected (%s). "
-            "SPARKPLANE_ALLOW_BRIDGE is set, continuing anyway. mDNS discovery "
+            "[derate] WARNING: bridge networking detected (%s). "
+            "DERATE_ALLOW_BRIDGE is set, continuing anyway. mDNS discovery "
             "will not work and this node will not find or be found by any other."
             % why,
             file=stream,

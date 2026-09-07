@@ -100,7 +100,7 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     # the exact species of bug this composition root exists to prevent.
     cluster_id = getattr(runtime.identity, "cluster_id", None) or GatewaySettings.cluster_id
     settings = GatewaySettings(
-        host=os.environ.get("SPARKPLANE_HOST", "0.0.0.0"),
+        host=os.environ.get("DERATE_HOST", "0.0.0.0"),
         port=config.coordinator_port,
         cluster_id=cluster_id,
         # The composition root KNOWS which node is the coordinator -- itself.
@@ -109,10 +109,10 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
         # /api/topology name that worker as coordinator (verifier N-8).
         coordinator_node_id=runtime.profile.node_id,
         electricity_rate_usd_per_kwh=float(
-            os.environ.get("SPARKPLANE_ELECTRICITY_RATE", "0")
+            os.environ.get("DERATE_ELECTRICITY_RATE", "0")
         ),
         # ui_dir is left to GatewaySettings' own default_factory, which reads
-        # SPARKPLANE_UI_DIR -- the same thing gateway/main.py relies on.
+        # DERATE_UI_DIR -- the same thing gateway/main.py relies on.
     )
 
     return GatewayDeps(
@@ -216,10 +216,10 @@ async def run(config: RegistryConfig | None = None) -> None:
 
 def main() -> None:
     logging.basicConfig(
-        level=os.environ.get("SPARKPLANE_LOG_LEVEL", "INFO"),
+        level=os.environ.get("DERATE_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    logging.getLogger().setLevel(os.environ.get("SPARKPLANE_LOG_LEVEL", "INFO"))
+    logging.getLogger().setLevel(os.environ.get("DERATE_LOG_LEVEL", "INFO"))
     asyncio.run(run())
 
 

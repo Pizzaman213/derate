@@ -3,14 +3,16 @@
 The offline half runs against captured config.json payloads in
 ``tests/resolver_data`` and never touches the network. The network half is
 skipped automatically when the hub is unreachable; set
-``SPARKPLANE_TEST_NETWORK=0`` to skip it deliberately.
+``DERATE_TEST_NETWORK=0`` to skip it deliberately.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import struct
+import tempfile
 import time
 from pathlib import Path
 
@@ -44,7 +46,7 @@ from control_plane.resolver.config_map import map_config, vision_config
 from control_plane.resolver.gguf import read_gguf_file
 from control_plane.resolver.params import analytic_breakdown
 from control_plane.resolver.quant_detect import UnknownQuantization
-from control_plane.resolver.support import build_verdict, sharding_notes
+from control_plane.resolver.support import build_verdict, modality_for, sharding_notes
 from control_plane.resolver.types import ParamSource, QuantSource, SupportLevel
 from tests.fixtures import DEEPSEEK_V3, GB10_PROFILES, GPT_OSS_120B, LLAMA_3_3_70B, WS_3090
 
@@ -488,6 +490,32 @@ def write_gguf(path: Path, metadata: dict, tensors: list[tuple[str, tuple[int, .
         out += struct.pack(f"<{len(dims)}Q", *dims)
         out += struct.pack("<IQ", ggml_type, 0)
     path.write_bytes(bytes(out))
+
+
+@functools.lru_cache(maxsize=1)
+def _special_gguf_bytes() -> bytes:
+    """A GGUF whose *name* says nothing but whose header says q8_0.
+
+    Backs the rule that a file with an unfashionable name is read, not
+    discarded: the header is the file's own account of itself and it outranks a
+    naming convention somebody chose not to follow.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "special.gguf"
+        write_gguf(
+            path,
+            {
+                "general.architecture": "llama",
+                "general.file_type": 7,  # q8_0
+                "llama.block_count": 4,
+                "llama.embedding_length": 512,
+                "llama.attention.head_count": 8,
+                "llama.attention.head_count_kv": 8,
+                "llama.vocab_size": 32000,
+            },
+            [("token_embd.weight", (512, 32000), 8)],
+        )
+        return path.read_bytes()
 
 
 class TestGGUF:
@@ -1005,6 +1033,75 @@ class TestLocalDirectory:
 # --------------------------------------------------------------------------
 
 
+class TestSpeechModels:
+    """Whisper and its descendants: encoder-decoder, and served on a different
+    endpoint family from everything else in the support tables."""
+
+    def test_whisper_resolves_despite_publishing_its_widths_per_half(self, resolver):
+        """The gate that used to reject it outright.
+
+        `_first` is an exact-key lookup, and whisper-large-v3 publishes
+        `decoder_attention_heads` rather than `num_attention_heads`, so
+        map_config raised KeyError before anything else could run. It does
+        carry `num_hidden_layers`, so the head count was the whole gap.
+        """
+        res = offline(resolver, "whisper-large-v3", "openai/whisper-large-v3")
+        assert res.shape.num_layers == 32
+        assert res.shape.hidden_size == 1280
+        assert res.shape.num_attention_heads == 20
+        assert res.architectures == ("WhisperForConditionalGeneration",)
+
+    def test_the_shape_says_it_describes_only_the_decoder(self, resolver):
+        """An encoder-decoder shape charged as if it were decoder-only
+        understates the weights, so the guess is stated rather than hidden."""
+        res = offline(resolver, "whisper-large-v3", "openai/whisper-large-v3")
+        assert any("encoder-decoder" in w for w in res.warnings)
+
+    def test_the_decoder_position_limit_is_read(self, resolver):
+        """448, not absent.
+
+        Whisper states `max_target_positions` and nothing under any of the
+        usual names. Absent, the planner would offer a context length that vLLM
+        then refuses to start with -- a launch that fails minutes later for a
+        reason chosen here.
+        """
+        res = offline(resolver, "whisper-large-v3", "openai/whisper-large-v3")
+        assert res.max_position_embeddings == 448
+
+    def test_vllm_supports_whisper_and_sglang_says_it_does_not(self):
+        """vLLM serves transcription; sglang has no transcription server. The
+        table says so rather than implying both runtimes are equivalent."""
+        verdict = build_verdict(("WhisperForConditionalGeneration",), "fp16")
+        assert verdict.for_runtime("vllm").ok
+        assert not verdict.for_runtime("sglang").ok
+
+    def test_a_speech_architecture_reports_its_endpoint_family(self):
+        """Being loadable and being answerable on the chat route are different
+        claims; this is the second one."""
+        assert modality_for(("WhisperForConditionalGeneration",)) == "transcription"
+        assert modality_for(("LlamaForCausalLM",)) == "text"
+        # An unresolved shape reports no architecture, and text is the safe
+        # reading: the model stays on the routes it was always offered on.
+        assert modality_for(()) == "text"
+
+    def test_modality_of_reads_the_cache_and_says_text_when_it_is_cold(self, resolver):
+        """`modality_of` reaches back into the shape cache, exactly as
+        `supported_by` does, so a shape the cache has never seen reports text.
+
+        That is the safe reading -- the model stays on the routes it was always
+        offered on -- but it is also why the launch path does **not** use this:
+        it takes the modality from the resolution in hand, so a cold cache
+        cannot silently record a speech model as text. See
+        `internal_api._modality_of`.
+        """
+        res = offline(resolver, "whisper-large-v3", "openai/whisper-large-v3")
+        # resolve_config is documented "no network, no cache", so nothing was
+        # written and the lookup has nothing to find.
+        assert resolver.modality_of(res.shape) == "text"
+        # The architectures the launch path actually uses say otherwise.
+        assert modality_for(res.architectures) == "transcription"
+
+
 class TestRuntimeSupport:
     def test_supported_architecture_and_quant(self):
         verdict = build_verdict(("LlamaForCausalLM",), "bf16")
@@ -1183,7 +1280,7 @@ def test_real_resolver_satisfies_the_port(resolver):
 
 
 def _hub_reachable() -> bool:
-    if os.environ.get("SPARKPLANE_TEST_NETWORK") == "0":
+    if os.environ.get("DERATE_TEST_NETWORK") == "0":
         return False
     try:
         import requests
@@ -1288,3 +1385,377 @@ class TestLive:
         assert res.shape.num_kv_heads == 2
         assert res.shape.dtype == "q4_k_m"
         assert res.weight_bytes and res.weight_bytes > 0
+
+
+from control_plane.contracts.quant import QUANT_INFO  # noqa: E402
+from control_plane.resolver.quant_detect import from_name as _from_name  # noqa: E402
+
+
+class TestQuantLadderCoverage:
+    """The llama.cpp ladder, including the formats Unsloth actually publishes.
+
+    Before this, ``from_name`` recognised 13 of the 27 ``.gguf`` files in
+    ``unsloth/Qwen3-30B-A3B-GGUF``. The other 14 -- every Unsloth Dynamic quant
+    and the whole importance-matrix family -- returned ``None``, fell through to
+    the bf16 default, and were charged three to eight times their real size. The
+    visible symptom was ``unsloth/DeepSeek-R1-GGUF`` planning as 671B bf16 and
+    being refused outright by the fit gate.
+    """
+
+    #: Real file names from unsloth/Qwen3-30B-A3B-GGUF, with the scheme each
+    #: must resolve to. Not a sample: this is the whole repo listing.
+    UNSLOTH_FILES = [
+        ("Qwen3-30B-A3B-UD-Q2_K_XL.gguf", "q2_k"),
+        ("Qwen3-30B-A3B-UD-Q3_K_XL.gguf", "q3_k_m"),
+        ("Qwen3-30B-A3B-UD-Q4_K_XL.gguf", "q4_k_m"),
+        ("Qwen3-30B-A3B-UD-Q5_K_XL.gguf", "q5_k_m"),
+        ("Qwen3-30B-A3B-UD-Q6_K_XL.gguf", "q6_k"),
+        ("Qwen3-30B-A3B-UD-Q8_K_XL.gguf", "q8_0"),
+        ("Qwen3-30B-A3B-UD-IQ1_S.gguf", "iq1_s"),
+        ("Qwen3-30B-A3B-UD-IQ1_M.gguf", "iq1_m"),
+        ("Qwen3-30B-A3B-UD-IQ2_M.gguf", "iq2_m"),
+        ("Qwen3-30B-A3B-UD-IQ2_XXS.gguf", "iq2_xxs"),
+        ("Qwen3-30B-A3B-UD-IQ3_XXS.gguf", "iq3_xxs"),
+        ("Qwen3-30B-A3B-IQ4_NL.gguf", "iq4_nl"),
+        ("Qwen3-30B-A3B-IQ4_XS.gguf", "iq4_xs"),
+        ("Qwen3-30B-A3B-Q2_K.gguf", "q2_k"),
+        ("Qwen3-30B-A3B-Q2_K_L.gguf", "q2_k"),
+        ("Qwen3-30B-A3B-Q3_K_M.gguf", "q3_k_m"),
+        ("Qwen3-30B-A3B-Q3_K_S.gguf", "q3_k_m"),
+        ("Qwen3-30B-A3B-Q4_0.gguf", "q4_0"),
+        ("Qwen3-30B-A3B-Q4_1.gguf", "q4_1"),
+        ("Qwen3-30B-A3B-Q4_K_M.gguf", "q4_k_m"),
+        ("Qwen3-30B-A3B-Q4_K_S.gguf", "q4_k_m"),
+        ("Qwen3-30B-A3B-Q5_K_M.gguf", "q5_k_m"),
+        ("Qwen3-30B-A3B-Q5_K_S.gguf", "q5_k_m"),
+        ("Qwen3-30B-A3B-Q6_K.gguf", "q6_k"),
+        ("Qwen3-30B-A3B-Q8_0.gguf", "q8_0"),
+        ("BF16/Qwen3-30B-A3B-BF16-00001-of-00002.gguf", "bf16"),
+        ("BF16/Qwen3-30B-A3B-BF16-00002-of-00002.gguf", "bf16"),
+    ]
+
+    def test_every_real_unsloth_filename_is_recognised(self):
+        missed = [f for f, _ in self.UNSLOTH_FILES if _from_name(f) is None]
+        assert not missed, f"{len(missed)} of {len(self.UNSLOTH_FILES)} undetected: {missed}"
+
+    def test_each_real_filename_resolves_to_the_right_scheme(self):
+        wrong = [
+            (f, want, _from_name(f))
+            for f, want in self.UNSLOTH_FILES
+            if _from_name(f) != want
+        ]
+        assert not wrong, f"misdetected: {wrong}"
+
+    def test_the_ud_prefix_is_stripped_rather_than_defeating_detection(self):
+        """"UD-" says how a file was built, not what it costs."""
+        for spelling in ("UD-Q4_K_XL", "ud-q4_k_xl", "UD_Q4_K_XL", "udq4kxl"):
+            assert normalize_dtype(spelling) == "q4_k_m", spelling
+
+    def test_bare_ud_is_not_a_quantization(self):
+        assert normalize_dtype("ud") is None
+        assert normalize_dtype("ud-nonsense") is None
+
+    def test_each_family_is_strictly_monotonic_in_cost(self):
+        """A mistyped constant shows up here and almost nowhere else.
+
+        Checked within a family rather than across all of them, because the two
+        families are not currently comparable -- see the xfail below.
+        """
+        families = {
+            "importance-matrix": [
+                "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
+                "iq3_xxs", "iq3_xs", "iq3_s", "iq3_m", "iq4_xs", "iq4_nl",
+            ],
+            "llama.cpp block": [
+                "q2_k", "q3_k_m", "q4_0", "q4_k_m", "q4_1",
+                "q5_0", "q5_k_m", "q5_1", "q6_k", "q8_0",
+            ],
+            "float": ["fp8", "fp16", "fp32"],
+        }
+        for name, ladder in families.items():
+            for lower, higher in zip(ladder, ladder[1:]):
+                assert BYTES_PER_PARAM[lower] < BYTES_PER_PARAM[higher], (
+                    f"{name}: {lower} ({BYTES_PER_PARAM[lower]}) must cost less "
+                    f"than {higher} ({BYTES_PER_PARAM[higher]})"
+                )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "q2_k and q3_k_m carry the pure-block figures (2.63 and 3.65 bpw). "
+            "llama.cpp's own measured table says 3.1593 and 3.9960, and the real "
+            "files in unsloth/Qwen3-30B-A3B-GGUF measure 2.96 and 3.85 -- so both "
+            "guess LOW, the one direction contracts/quant.py's docstring forbids. "
+            "They are not corrected here because that docstring calls them frozen "
+            "in the architecture doc and the Agent C brief; changing them is a "
+            "contract decision, not a bug fix. When it is taken, this test starts "
+            "passing and should have the xfail removed."
+        ),
+    )
+    def test_k_quants_price_at_least_what_the_real_files_cost(self):
+        """Measured bpw, from hub file sizes / 30.53B params on Qwen3-30B-A3B."""
+        for key, measured in (("q2_k", 2.95), ("q3_k_m", 3.85)):
+            assert BYTES_PER_PARAM[key] * 8 >= measured, key
+
+    def test_every_priced_scheme_has_a_quant_info_row(self):
+        assert set(BYTES_PER_PARAM) == set(QUANT_INFO)
+
+    def test_quant_info_bits_agree_with_the_byte_table(self):
+        for key, info in QUANT_INFO.items():
+            assert info.bits_per_weight == pytest.approx(
+                BYTES_PER_PARAM[key] * 8, rel=1e-3
+            ), key
+
+    def test_the_formats_that_used_to_guess_low_no_longer_do(self):
+        """Q4_1, Q5_0 and Q5_1 were all priced as q4_0's 4.5 bpw.
+
+        Their real block costs are 5.0, 5.5 and 6.0. Under-counting is the one
+        direction this table may not be wrong in, because it becomes an
+        out-of-memory kill minutes into a load rather than a refusal before it.
+        """
+        for key, floor in (("q4_1", 5.0), ("q5_0", 5.5), ("q5_1", 6.0)):
+            assert BYTES_PER_PARAM[key] * 8 >= floor, key
+
+    def test_every_ftype_maps_to_a_priced_scheme(self):
+        from control_plane.resolver.gguf import GGUF_FILE_TYPES
+
+        unknown = {v for v in GGUF_FILE_TYPES.values() if v not in BYTES_PER_PARAM}
+        assert not unknown, f"ftype map names unpriced schemes: {unknown}"
+
+    def test_the_importance_matrix_ftypes_are_present(self):
+        """22-31 were absent, so those files fell through to the bf16 default."""
+        from control_plane.resolver.gguf import GGUF_FILE_TYPES
+
+        for ftype in range(19, 32):
+            assert ftype in GGUF_FILE_TYPES, f"LLAMA_FTYPE {ftype} is unmapped"
+
+    def test_gguf_schemes_have_a_verdict_on_both_runtimes(self):
+        """An absent key defaults to UNSUPPORTED, which would silently make the
+        IQ family stricter on vLLM than the K-quants beside it."""
+        from control_plane.resolver.support import _SGLANG_QUANTS, _VLLM_QUANTS
+
+        gguf = {k for k in BYTES_PER_PARAM if quant_info(k).family == "gguf"}
+        assert not gguf - set(_VLLM_QUANTS)
+        assert not gguf - set(_SGLANG_QUANTS)
+
+
+from control_plane.resolver.support import build_verdict  # noqa: E402
+from control_plane.resolver.types import (  # noqa: E402
+    ParamSource,
+    QuantSource,
+    Resolution,
+)
+from tests.fixtures import MODEL_SHAPES  # noqa: E402
+
+
+class TestQuantVariants:
+    """The ladder as something you can actually pick from.
+
+    ``available_quants`` returned scheme keys and threw away the repository each
+    came from, which is most of the answer: a quantization is a different
+    repository, not a flag, so a bare key is not launchable and not browsable.
+    """
+
+    class _Hub:
+        """A hub with one model published at several quantizations."""
+
+        def __init__(self):
+            self.searched = []
+
+        def search(self, query, limit=50):
+            self.searched.append(query)
+            return [
+                {"id": "acme/Widget-7B", "downloads": 900},
+                {"id": "acme/Widget-7B-AWQ", "downloads": 120},
+                {"id": "acme/Widget-7B-GGUF", "downloads": 400},
+                # A GGUF repo whose name does not end in "gguf". Real: a
+                # requantizer's second pass carries a qualifier after the
+                # format.
+                {"id": "acme/Widget-7B-GGUF-v2", "downloads": 300},
+                # A different model whose name merely contains the stem.
+                {"id": "acme/Widget-7B-Thinking-2507-GGUF", "downloads": 999},
+                # Apple silicon; nothing in this cluster loads it.
+                {"id": "acme/Widget-7B-mlx", "downloads": 50},
+            ]
+
+        def read_range(self, model_id, filename, start, length, revision="main"):
+            """Serve the header of the one file whose name refuses to say."""
+            blob = _special_gguf_bytes()
+            return blob[start : start + length]
+
+        def model_info(self, model_id, revision="main"):
+            from control_plane.resolver.hf import ModelInfo
+
+            if model_id == "acme/Widget-7B-GGUF-v2":
+                files = {"Widget-7B-Q5_K_M.gguf": 5_100_000_000}
+                return ModelInfo(
+                    model_id, "sha", tuple(files), None, None, (), file_sizes=files
+                )
+            if model_id != "acme/Widget-7B-GGUF":
+                return ModelInfo(model_id, "sha", (), None, None, ())
+            files = {
+                "Widget-7B-UD-Q4_K_XL.gguf": 4_000_000_000,
+                "Widget-7B-IQ4_XS.gguf": 3_700_000_000,
+                "Widget-7B-Q8_0.gguf": 7_500_000_000,
+                # One quantization split across two shards.
+                "BF16/Widget-7B-BF16-00001-of-00002.gguf": 9_000_000_000,
+                "BF16/Widget-7B-BF16-00002-of-00002.gguf": 5_000_000_000,
+                # Not weights. A projector is loaded beside a model, an
+                # importance matrix is calibration data for building the IQ
+                # quants, and neither is a thing you serve.
+                "mmproj-F16.gguf": 600_000_000,
+                "imatrix.gguf": 20_000_000,
+                # A real quantization whose name says nothing recognisable.
+                "Widget-7B-special.gguf": 3_100_000_000,
+            }
+            return ModelInfo(
+                model_id, "sha", tuple(files), None, None, (), file_sizes=files
+            )
+
+    def _resolver(self, monkeypatch, model_id="acme/Widget-7B-GGUF"):
+        resolver = ModelResolver(client=self._Hub())
+        shape = MODEL_SHAPES["llama-3.3-70b"]
+        monkeypatch.setattr(
+            resolver,
+            "resolve_full",
+            lambda mid, dtype=None: Resolution(
+                shape=shape,
+                revision="main",
+                param_source=ParamSource.CONFIG_ESTIMATE,
+                quant_source=QuantSource.TORCH_DTYPE,
+                support=build_verdict(("LlamaForCausalLM",), shape.dtype),
+            ),
+        )
+        return resolver
+
+    def test_each_variant_carries_the_repository_you_would_launch(self, monkeypatch):
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        assert variants, "no variants found"
+        assert all(v.repo_id for v in variants)
+        assert {"acme/Widget-7B-AWQ"} <= {v.repo_id for v in variants}
+
+    def test_a_sibling_model_is_not_offered_as_a_quantization(self, monkeypatch):
+        """Widget-7B-Thinking-2507 contains the stem but is a different model.
+
+        Offering it would present an unrelated multi-gigabyte download as a
+        smaller build of the thing that was asked for.
+        """
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        assert not [v for v in variants if "Thinking" in v.repo_id]
+
+    def test_mlx_repositories_are_still_excluded(self, monkeypatch):
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        assert not [v for v in variants if "mlx" in v.repo_id.lower()]
+
+    def test_shards_are_summed_into_one_variant(self, monkeypatch):
+        """Two shards are one 14 GB variant, not two undersized ones.
+
+        Listed separately they would both look too small to be the model, and
+        picking either would fetch half of it.
+        """
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        bf16 = [v for v in variants if v.gguf_file and "BF16" in v.gguf_file]
+        assert len(bf16) == 1, [v.label for v in bf16]
+        assert bf16[0].file_bytes == 14_000_000_000
+
+    def test_gguf_file_sizes_are_measured_not_estimated(self, monkeypatch):
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        by_label = {v.label: v for v in variants}
+        assert by_label["UD-Q4_K_XL"].file_bytes == 4_000_000_000
+
+    def test_the_published_name_is_kept_beside_the_canonical_key(self, monkeypatch):
+        """Rendering "q4_k_m" for a file called "UD-Q4_K_XL" would paraphrase a
+        name somebody else chose, which this codebase does not do to server
+        strings."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        ud = [v for v in variants if v.label == "UD-Q4_K_XL"]
+        assert ud and ud[0].dtype == "q4_k_m"
+
+    def test_a_gguf_repository_is_not_launchable_by_its_own_id(self, monkeypatch):
+        """These repos keep the original config.json, so torch_dtype reads
+        bfloat16 and the repo resolves to a confident bf16 that is not a set of
+        weights anything here could load."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        own = [v for v in variants if v.source == "self"][0]
+        assert own.launchable is False
+        assert "choose one" in own.note
+
+    def test_no_gguf_file_is_launchable(self, monkeypatch):
+        """Both serve command templates take a repository path, not a file."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        assert all(not v.launchable for v in variants if v.source == "gguf_file")
+
+    def test_a_safetensors_quantization_repo_is_launchable(self, monkeypatch):
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        awq = [v for v in variants if v.repo_id.endswith("-AWQ")][0]
+        assert awq.launchable is True and awq.dtype == "awq_int4"
+
+    def test_variants_are_unique(self, monkeypatch):
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        keys = [(v.repo_id, v.gguf_file) for v in variants]
+        assert len(keys) == len(set(keys))
+
+    def test_available_quants_is_derived_and_still_sorted_keys(self, monkeypatch):
+        """The old API keeps working, and cannot drift from the new one."""
+        resolver = self._resolver(monkeypatch)
+        keys = resolver.available_quants("acme/Widget-7B-GGUF")
+        assert keys == sorted(set(keys))
+        assert set(keys) == {v.dtype for v in resolver.quant_variants("acme/Widget-7B-GGUF")}
+
+    def test_files_that_are_not_weights_are_never_offered(self, monkeypatch):
+        """A projector and an importance matrix share the folder and the
+        extension with the weights, and neither is a thing you can serve.
+
+        Offered as variants they read as unusually small builds of the model --
+        a 600 MB row beside a 4 GB one looks like the efficient choice.
+        """
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        files = [v.gguf_file or "" for v in variants]
+        assert not [f for f in files if "mmproj" in f]
+        assert not [f for f in files if f.endswith("imatrix.gguf")]
+
+    def test_a_file_whose_name_says_nothing_is_read_not_dropped(self, monkeypatch):
+        """The header is the file's own account of itself.
+
+        Dropping the file because its name missed a convention hides a
+        quantization that exists; reading a few KiB of it costs one ranged
+        request and answers the question exactly.
+        """
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        special = [v for v in variants if v.gguf_file == "Widget-7B-special.gguf"]
+        assert special, [v.gguf_file for v in variants]
+        assert special[0].dtype == "q8_0"
+        assert "header" in special[0].note
+        assert special[0].file_bytes == 3_100_000_000
+
+    def test_a_gguf_repo_whose_name_does_not_end_in_gguf_is_found(self, monkeypatch):
+        """"-GGUF-v2" is a requantizer's second pass, not a different model."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        from_v2 = [v for v in variants if v.repo_id == "acme/Widget-7B-GGUF-v2"]
+        assert from_v2, sorted({v.repo_id for v in variants})
+        assert from_v2[0].label == "Q5_K_M"
+
+    def test_a_shard_family_reports_how_many_files_it_is(self, monkeypatch):
+        """Without the count, one filename and a summed size disagree about how
+        much is being described."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        bf16 = [v for v in variants if v.gguf_file and "BF16" in v.gguf_file][0]
+        assert bf16.shard_count == 2
+        assert "2 of 2 shards" in bf16.note
+        single = [v for v in variants if v.label == "UD-Q4_K_XL"][0]
+        assert single.shard_count == 1
+
+    def test_the_first_shard_is_the_one_named(self, monkeypatch):
+        """Shard one carries the header, so it is the file worth naming and the
+        one a reader would open."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        bf16 = [v for v in variants if v.gguf_file and "BF16" in v.gguf_file][0]
+        assert bf16.gguf_file.endswith("-00001-of-00002.gguf")
+
+    def test_offline_returns_the_repository_itself_and_no_search(self, monkeypatch):
+        """Never an empty list masquerading as "no quantizations exist"."""
+        resolver = self._resolver(monkeypatch)
+        resolver.offline = True
+        variants = resolver.quant_variants("acme/Widget-7B-GGUF")
+        assert [v.source for v in variants] == ["self"]
+        assert resolver.client.searched == []

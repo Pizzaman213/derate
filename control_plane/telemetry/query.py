@@ -58,14 +58,36 @@ def _stamp(value: Any, now: float, default: float) -> float:
     return now + value if value <= 0 else (now - value if value < 1e6 else value)
 
 
-def pick_step(step: Any, from_ts: float, to_ts: float) -> str:
-    """`auto` unless the caller insists, and never finer than the data."""
+def pick_step(
+    step: Any,
+    from_ts: float,
+    to_ts: float,
+    *,
+    limit: int | None = None,
+    series: int = 1,
+) -> str:
+    """`auto` unless the caller insists, and never finer than the data.
+
+    ``auto`` is also never finer than the row budget can carry. Node samples
+    land at 1 Hz per node, so a six-hour window is ~21,600 rows each against a
+    5,000-row cap: choosing RAW there does not return six hours at full
+    resolution, it returns the first 40 minutes of it. Stepping up to a
+    coarser rollup answers the question that was actually asked.
+    """
     if isinstance(step, str) and step.lower() in STEP_NAMES:
         return step.lower()
     span = to_ts - from_ts
-    if span <= config.AUTO_STEP_RAW_MAX_S:
+    budget = limit if limit and limit > 0 else None
+    reach = max(1, series)
+
+    def fits(sample_period_s: float) -> bool:
+        if budget is None:
+            return True
+        return (span / sample_period_s) * reach <= budget
+
+    if span <= config.AUTO_STEP_RAW_MAX_S and fits(1.0):
         return RAW
-    if span <= config.AUTO_STEP_1M_MAX_S:
+    if span <= config.AUTO_STEP_1M_MAX_S and fits(60.0):
         return "1m"
     return "1h"
 
@@ -86,6 +108,19 @@ def _envelope(
     }
 
 
+def _node_count(archive: Archive) -> int:
+    """How many nodes the archive holds rows for. Cheap: the cursors table has
+    one row per node, not one per sample."""
+    try:
+        with archive.lock:
+            row = archive.conn.execute(
+                "SELECT COUNT(*) AS n FROM cursors"
+            ).fetchone()
+        return int(row["n"]) if row else 1
+    except Exception:
+        return 1
+
+
 def nodes(
     archive: Archive,
     *,
@@ -97,7 +132,6 @@ def nodes(
 ) -> dict[str, Any]:
     """Node metrics over a window, at whatever resolution fits it."""
     frm, to = resolve_window(from_ts, to_ts)
-    chosen = pick_step(step, frm, to)
     limit = max(1, min(int(limit), config.QUERY_MAX_ROWS))
     args: list[Any] = [frm, to]
     where = ""
@@ -105,13 +139,20 @@ def nodes(
         where = " AND node_id = ?"
         args.append(node_id)
 
+    # Node samples land once per second PER NODE, so the row budget is shared
+    # across however many nodes the window covers. Telling pick_step how many
+    # series it is choosing a resolution for is what stops `auto` returning
+    # the first 40 minutes of a six-hour request and calling it "raw".
+    series = 1 if node_id else max(1, _node_count(archive))
+    chosen = pick_step(step, frm, to, limit=limit, series=series)
+
     with archive.lock:
         if chosen == RAW:
             sql = (
                 "SELECT node_id, ts, memory_used, memory_total, power_w, temp_c, "
                 "util_pct, gpu_memory_used, gpu_process_count, host_memory_total, "
                 "host_memory_available, swap_used FROM samples "
-                "WHERE ts >= ? AND ts < ?" + where + " ORDER BY ts LIMIT ?"
+                "WHERE ts >= ? AND ts < ?" + where + " ORDER BY ts DESC LIMIT ?"
             )
         else:
             sql = (
@@ -121,11 +162,14 @@ def nodes(
                 "gpu_memory_used_max, host_memory_available_min, swap_used_max "
                 "FROM rollup_samples WHERE step = ? AND bucket >= ? AND bucket < ?"
                 + where
-                + " ORDER BY bucket LIMIT ?"
+                + " ORDER BY bucket DESC LIMIT ?"
             )
             args = [STEP_NAMES[chosen], *args]
         rows = [dict(r) for r in archive.conn.execute(sql, (*args, limit))]
 
+    # Read back newest-first so the LIMIT drops the far end of the window,
+    # then restore chronological order for the caller.
+    rows.reverse()
     out = _envelope(archive, chosen, frm, to, node_id)
     out["truncated"] = len(rows) >= limit
     out["samples"] = rows
@@ -178,7 +222,7 @@ def requests(
                 "prompt_tokens, cost_usd, ttft_hist, duration_hist "
                 "FROM rollup_requests WHERE step = ? AND bucket >= ? AND bucket < ?"
                 + filters
-                + " ORDER BY bucket LIMIT ?",
+                + " ORDER BY bucket DESC LIMIT ?",
                 (STEP_NAMES[chosen], frm, to, *args, limit),
             ):
                 entry = {
@@ -202,6 +246,9 @@ def requests(
                 entry["duration"] = Hist.from_blob(r["duration_hist"]).summary()
                 rows.append(entry)
 
+    # Both branches read newest-first so the LIMIT drops the far end rather
+    # than the recent end; one reverse puts the caller back in time order.
+    rows.reverse()
     out = _envelope(archive, chosen, frm, to)
     out["truncated"] = len(rows) >= limit
     out["requests"] = rows

@@ -74,6 +74,14 @@ class FitResult:
     max_context_that_fits: int | None
     predicted_decode_tps: float | None
     warnings: list[str] = field(default_factory=list)
+    # Which budget ``usable_per_node`` came from: "static" is the addressable
+    # ceiling under the guardrail -- what this hardware could ever spend --
+    # and "live" is what the node could actually hand out at the moment the
+    # check ran. Trailing and defaulted, so every existing construction is
+    # unchanged. It exists because Deployment.fit is persisted and
+    # _emit_fit_miss reports usable_per_node from it: without this a stored
+    # verdict cannot say which budget judged it.
+    budget_basis: str = "static"
 
     @property
     def ok(self) -> bool:

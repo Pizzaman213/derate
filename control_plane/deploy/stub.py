@@ -23,6 +23,7 @@ from control_plane.contracts import (
     Deployment,
     DeploymentState as S,
     FitResult,
+    Modality,
     ModelShape,
     ParallelismPlan,
     Verdict,
@@ -61,7 +62,7 @@ class StubDeploymentManager:
         self._timers: list[threading.Timer] = []
         # Rendering is real: the stub shows the command the real manager
         # would run, so the UI is not developed against a fiction.
-        self._adapter = SparkrunAdapter(recipe_dir="/tmp/sparkplane-stub-recipes")
+        self._adapter = SparkrunAdapter(recipe_dir="/tmp/derate-stub-recipes")
 
     # -- DeploymentPort ---------------------------------------------------
 
@@ -75,6 +76,7 @@ class StubDeploymentManager:
         max_seqs: int,
         *,
         served_name: str | None = None,
+        modality: Modality = Modality.TEXT,
     ) -> Deployment:
         name = served_name or default_served_name(shape)
         if fit.verdict is Verdict.WONT_FIT:
@@ -105,6 +107,7 @@ class StubDeploymentManager:
                 max_concurrent_seqs=max_seqs,
                 started_at=None,
                 last_error=None,
+                modality=modality,
             )
             record = _Record(deployment=deployment, handle={"port": port})
             self._records[deployment.deployment_id] = record

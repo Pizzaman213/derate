@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from .modality import Modality
 from .model import ModelShape
 from .plan import FitResult, ParallelismPlan
 
@@ -36,3 +37,6 @@ class Deployment:
     max_concurrent_seqs: int
     started_at: float | None
     last_error: str | None
+    # Which endpoint family this deployment answers on. Defaults to TEXT so
+    # every record written before this field existed still decodes.
+    modality: Modality = Modality.TEXT

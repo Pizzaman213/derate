@@ -74,6 +74,6 @@ the fit check was told to expect.
 | `weight_bytes` | root-level shard sizes, or summed GGUF tensor sizes | `None` |
 | `vision_params` | analytic from `vision_config` | 0 |
 
-Resolution is cached on disk under `$SPARKPLANE_CACHE_DIR`, `/data/cache/resolver`
+Resolution is cached on disk under `$DERATE_CACHE_DIR`, `/data/cache/resolver`
 in the container. Cold is around 100 ms, cached is microseconds. `ShapeCache` is
 safe to share between components; pass one in if you want a single warm cache.

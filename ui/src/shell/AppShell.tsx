@@ -3,12 +3,22 @@ import { SelectionProvider } from '../state/selection'
 import { Header } from './Header'
 import { Sheet } from './Sheet'
 import { DashboardTab } from '../tabs/DashboardTab'
+import { ModelsTab } from '../tabs/ModelsTab'
 import { ClusterTab } from '../tabs/ClusterTab'
+import { StorageTab } from '../tabs/StorageTab'
+import { ChatTab } from '../tabs/ChatTab'
 import { SpendTab } from '../tabs/SpendTab'
 import { SettingsTab } from '../tabs/SettingsTab'
 import { Sidebar } from '../sidebar/Sidebar'
 
-export type Dest = 'dash' | 'cluster' | 'spend' | 'settings'
+export type Dest =
+  | 'dash'
+  | 'models'
+  | 'cluster'
+  | 'storage'
+  | 'chat'
+  | 'spend'
+  | 'settings'
 
 /** The chrome: header, the four destinations, the collapsible sidebar, and the
  *  one sheet. What each destination and each sidebar section actually shows is
@@ -57,8 +67,17 @@ export function AppShell() {
           <section role="tabpanel" hidden={dest !== 'dash'}>
             <DashboardTab />
           </section>
+          <section role="tabpanel" hidden={dest !== 'models'}>
+            <ModelsTab />
+          </section>
           <section role="tabpanel" hidden={dest !== 'cluster'}>
             <ClusterTab />
+          </section>
+          <section role="tabpanel" hidden={dest !== 'storage'}>
+            <StorageTab />
+          </section>
+          <section role="tabpanel" hidden={dest !== 'chat'}>
+            <ChatTab />
           </section>
           <section role="tabpanel" hidden={dest !== 'spend'}>
             <SpendTab />

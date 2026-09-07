@@ -22,7 +22,7 @@ from ..contracts.providers import ProviderKind
 from .secrets import SecretStore
 from .service import ProviderService
 
-STUB_KEY_REF = "SPARKPLANE_STUB_PROVIDER_KEY"
+STUB_KEY_REF = "DERATE_STUB_PROVIDER_KEY"
 STUB_KEY_VALUE = "sk-or-v1-stub00000000000000000000000000000000000000"
 STUB_PROVIDER_ID = "openrouter-stub"
 
@@ -190,7 +190,7 @@ def build_stub_service(
     path is special-cased for the stub, which is the point.
     """
     root = Path(data_path) if data_path is not None else Path(
-        tempfile.mkdtemp(prefix="sparkplane-provider-stub-")
+        tempfile.mkdtemp(prefix="derate-provider-stub-")
     )
     root.mkdir(parents=True, exist_ok=True)
 

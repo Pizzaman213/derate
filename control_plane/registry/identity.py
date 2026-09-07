@@ -43,7 +43,7 @@ def load_or_create_identity(
     """Read the persisted identity, or mint and persist one.
 
     An explicit token from the environment always wins and is persisted, so
-    that restarting with SPARKPLANE_TOKEN set does not silently keep an old one.
+    that restarting with DERATE_TOKEN set does not silently keep an old one.
     An unwritable data volume is a warning, not a failure: the cluster still
     forms, the token just does not survive a restart.
     """
@@ -86,14 +86,26 @@ def load_or_create_identity(
 
 
 def banner(identity: ClusterIdentity, ui_url: str) -> str:
-    """What the coordinator prints on first start."""
+    """What the coordinator prints on first start.
+
+    The token is still here: this is the coordinator's own stdout on the
+    coordinator's own machine, which is the one place the permanent secret
+    belongs. But it is no longer the thing you are told to carry -- the UI
+    mints a one-hour token per install, and that is what the next machine
+    should be given.
+    """
     return (
         "\n"
-        "  sparkplane coordinator\n"
+        "  derate coordinator\n"
         f"  cluster:  {identity.cluster_id}\n"
         f"  token:    {identity.token}\n"
         f"  ui:       {ui_url}\n"
         "\n"
-        "  Start another node with the same command on this subnet, or pass\n"
-        f"  SPARKPLANE_TOKEN={identity.token} to join from elsewhere.\n"
+        "  Add another machine: open the UI, Settings -> Add a node, and run\n"
+        "  the command it gives you over there. It installs, joins and is\n"
+        "  admitted; there is nothing to click afterwards.\n"
+        "\n"
+        "  Same subnet, no UI: the same install command with no arguments\n"
+        f"  finds this coordinator. From elsewhere, DERATE_TOKEN={identity.token}\n"
+        "  joins as a candidate you then admit by hand.\n"
     )

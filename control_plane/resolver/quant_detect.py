@@ -18,12 +18,46 @@ from .types import QuantSource
 
 #: Patterns in a repo or file name, most specific first. Last resort only.
 _NAME_PATTERNS: tuple[tuple[str, str], ...] = (
+    # Importance-matrix formats first: "IQ4_XS" contains no substring the
+    # K-quant patterns below match, but "IQ4_NL" and friends are close enough
+    # to the plain families that ordering them after would risk a looser rule
+    # claiming them as the family grows.
+    (r"\biq1[._-]?s\b", "iq1_s"),
+    (r"\biq1[._-]?m\b", "iq1_m"),
+    (r"\biq2[._-]?xxs\b", "iq2_xxs"),
+    (r"\biq2[._-]?xs\b", "iq2_xs"),
+    (r"\biq2[._-]?s\b", "iq2_s"),
+    (r"\biq2[._-]?m\b", "iq2_m"),
+    (r"\biq3[._-]?xxs\b", "iq3_xxs"),
+    (r"\biq3[._-]?xs\b", "iq3_xs"),
+    (r"\biq3[._-]?s\b", "iq3_s"),
+    (r"\biq3[._-]?m\b", "iq3_m"),
+    (r"\biq4[._-]?xs\b", "iq4_xs"),
+    (r"\biq4[._-]?nl\b", "iq4_nl"),
+    # K-quant _XL sizes. The [sml] class below cannot match "XL", so without
+    # these an Unsloth Dynamic file falls through to the bf16 default and is
+    # charged four times what it costs. Priced at the base scheme's _M rung --
+    # see contracts/quant.py's _XL aliases for why not a rung higher.
+    (r"\bq2[._-]?k[._-]?xl\b", "q2_k"),
+    (r"\bq3[._-]?k[._-]?xl\b", "q3_k_m"),
+    (r"\bq4[._-]?k[._-]?xl\b", "q4_k_m"),
+    (r"\bq5[._-]?k[._-]?xl\b", "q5_k_m"),
+    (r"\bq6[._-]?k[._-]?xl\b", "q6_k"),
+    (r"\bq8[._-]?k[._-]?xl\b", "q8_0"),
+    # Q2_K_S and Q2_K_L had no pattern at all: there is a q3_k_[sml] rule but
+    # never a q2_k_[sml] one, and the bare rule below cannot reach them
+    # because "_" is a word character, so \b never fires between "k" and "_".
+    (r"\bq2[._-]?k[._-]?s\b", "q2_k_s"),
+    (r"\bq2[._-]?k[._-]?l\b", "q2_k"),
     (r"\bq2[._-]?k\b", "q2_k"),
     (r"\bq3[._-]?k[._-]?[sml]\b", "q3_k_m"),
     (r"\bq3[._-]?k\b", "q3_k_m"),
     (r"\bq4[._-]?k[._-]?[sml]\b", "q4_k_m"),
     (r"\bq4[._-]?k\b", "q4_k_m"),
-    (r"\bq4[._-]?[01]\b", "q4_0"),
+    (r"\bq4[._-]?0\b", "q4_0"),
+    (r"\bq4[._-]?1\b", "q4_1"),
+    (r"\bq5[._-]?0\b", "q5_0"),
+    (r"\bq5[._-]?1\b", "q5_1"),
     (r"\bq5[._-]?k[._-]?[sml]\b", "q5_k_m"),
     (r"\bq5[._-]?k\b", "q5_k_m"),
     (r"\bq6[._-]?k\b", "q6_k"),

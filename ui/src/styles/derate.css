@@ -377,6 +377,29 @@ h3 {
   display: block;
   height: 100%;
 }
+/* The cluster floor fills the panel it is in, so the legend and the selection
+   rail sit on the BOTTOM edge of the destination rather than trailing the
+   drawing up into the top half of a tall window, and the drawing gets the room
+   between the toolbar and them. Same arithmetic as .chat below: the 55px
+   header, plus main's own 20px padding top and bottom. */
+.clusterstage {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 95px);
+}
+.clusterstage .floor {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  /* A flex item's floor is its content; without this a wide drawing would
+     refuse to shrink and push the legend back off the bottom. It is also what
+     lets the graph read its own height back: with a definite height here, the
+     graph's `flex: 1` resolves against free space rather than against its own
+     content, so measuring it cannot feed back into sizing it. */
+  min-height: 0;
+}
+
 .legend {
   display: flex;
   gap: 13px;
@@ -482,14 +505,40 @@ svg text.m {
   font-family: 'IBM Plex Mono', monospace;
   font-variant-numeric: tabular-nums;
 }
-.node,
-.name {
+.machine,
+.band,
+.edge {
   cursor: pointer;
 }
-.node:hover > rect:first-of-type,
-.name:hover > rect:first-of-type {
+/* The card's own border carries the node's signal colour, so hover cannot
+   restyle it without overwriting state with decoration. It gets its own ring
+   OUTSIDE the card instead -- the same trick --select-on-panel uses. */
+.machine > rect.ring,
+.band > rect.ring {
+  stroke: none;
+}
+.machine:hover > rect.ring,
+.machine:focus-visible > rect.ring,
+.band:hover > rect.ring,
+.band:focus-visible > rect.ring {
+  stroke: var(--edge);
+  stroke-width: 1.5;
+}
+.edge:hover > path:last-of-type {
   stroke: var(--ink);
-  stroke-width: 2;
+}
+/* An edge is role=button and tabbable, but a bracket has no path to restyle
+   and the UA outline on an SVG <g> is inconsistent across browsers. Give it
+   the same ring the plates get. */
+.edge:focus-visible {
+  outline: 2px solid var(--select-on-panel);
+  outline-offset: 2px;
+}
+.edge:focus-visible > path:last-of-type {
+  stroke: var(--ink);
+}
+.machine[data-dragging='true'] {
+  cursor: grabbing;
 }
 
 .sheet {
@@ -666,4 +715,102 @@ svg text.m {
   display: flex;
   justify-content: space-between;
   margin-top: 2px;
+}
+
+/* ── Chat ───────────────────────────────────────────────────────────────────
+   The model list beside the transcript. Both scroll inside main's own height
+   rather than growing the page: a long transcript must never push the composer
+   off the bottom of the window.
+
+   `textarea` is styled here rather than in base.css on purpose. base.css owns
+   the bare `button`/`select`/`input` rules and this file does not redefine
+   them -- but there was no textarea anywhere in the product until the
+   composer, so there is nothing there to duplicate. The rule below copies
+   base.css's `input` declaration rather than inventing a surface of its own. */
+
+.chat {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: var(--s-4);
+  /* the 55px header, plus main's own 20px padding top and bottom */
+  height: calc(100vh - 95px);
+  min-height: 420px;
+}
+.chatlist {
+  overflow-y: auto;
+  padding-right: var(--s-3);
+  border-right: 1px solid var(--rule);
+}
+.chatlist button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-bottom: 1px solid var(--rule);
+  border-radius: 0;
+  padding: var(--s-2) var(--s-1);
+}
+.chatlist button[aria-pressed='true'] {
+  background: var(--panel-sunk);
+}
+
+.chatpane {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-width: 0;
+}
+.chatbody {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+}
+.chathead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding-bottom: var(--s-2);
+  border-bottom: 1px solid var(--rule);
+}
+.chatlog {
+  overflow-y: auto;
+  padding: var(--s-3) var(--s-3) 0 0;
+}
+.turn {
+  padding: var(--s-3) 0;
+}
+.turn + .turn {
+  border-top: 1px solid var(--rule);
+}
+.turn.me {
+  color: var(--ink-muted);
+}
+
+.composer {
+  border-top: 1px solid var(--rule);
+  padding-top: var(--s-3);
+  display: grid;
+  gap: var(--s-2);
+}
+.composer textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: var(--s-half) var(--s1);
+  resize: vertical;
+  min-height: 62px;
+}
+
+@media (max-width: 760px) {
+  .chat {
+    grid-template-columns: 1fr;
+    grid-template-rows: 160px minmax(0, 1fr);
+  }
+  .chatlist {
+    border-right: none;
+    border-bottom: 1px solid var(--rule);
+    padding-right: 0;
+  }
 }

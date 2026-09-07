@@ -120,6 +120,7 @@ class FakeClient:
         self.join_responses: dict[str, dict] = {}
         self.join_rejects: set[str] = set()
         self.posts: list[tuple[str, dict]] = []
+        self.headers: list[dict | None] = []
 
     def serve(self, agent_url: str, profile: NodeProfile) -> None:
         self.profiles[agent_url.rstrip("/")] = profile_to_dict(profile)
@@ -147,16 +148,43 @@ class FakeClient:
             return self.telemetry.get(base, {"available": False})
         if base not in self.profiles:
             raise ProbeFailed(f"no agent at {base}")
-        return {"status": "ok"}
+        # The real /agent/health names the node answering, which is how a
+        # reachability check tells "reached it" from "reached something else".
+        return {"status": "ok", "node_id": self.profiles[base]["node_id"]}
 
-    async def post_json(self, url: str, payload: dict, timeout: float) -> dict:
+    async def post_json(
+        self, url: str, payload: dict, timeout: float, headers: dict | None = None
+    ) -> dict:
         self.posts.append((url, payload))
+        self.headers.append(headers)
+        if url.endswith("/agent/reach"):
+            return self._reach(url, payload)
         base = url.replace("/api/nodes/join", "")
         if base in self.join_rejects:
             raise ProbeFailed(f"POST {url} failed: 403 Forbidden")
         return self.join_responses.get(
             base, {"node_id": payload["profile"]["node_id"], "cluster_id": "c-test", "status": "candidate"}
         )
+
+    def _reach(self, url: str, payload: dict) -> dict:
+        """Stand in for one node's agent dialling another.
+
+        The asking node has to be up for us to ask it at all, so an asker in
+        `down` raises -- that is a coordinator-to-asker failure, and the
+        registry reports it as one.
+        """
+        asker = url[: -len("/agent/reach")]
+        if asker in self.down:
+            raise ProbeFailed(f"POST {url} failed: unreachable")
+        target = str(payload.get("url", "")).rstrip("/")
+        if target in self.down or target not in self.profiles:
+            return {"ok": False, "url": target, "error": f"unreachable {target}"}
+        return {
+            "ok": True,
+            "url": target,
+            "ms": 1.5,
+            "answered_as": self.profiles[target]["node_id"],
+        }
 
 
 def make_registry(tmp_path, client=None, local=None, token="tok-123") -> Registry:
@@ -1154,7 +1182,7 @@ def test_rejoin_until_admitted_stops_when_told_to():
 
 def test_explicit_join_address_skips_discovery():
     async def explode(*a, **k):
-        raise AssertionError("SPARKPLANE_JOIN must skip discovery")
+        raise AssertionError("DERATE_JOIN must skip discovery")
 
     async def join(url, token, profile, agent_url, **k):
         assert url == "http://10.9.9.9:8080"
@@ -1200,17 +1228,17 @@ def test_role_is_sticky_for_the_process(tmp_path):
 
 def test_config_rejects_an_unknown_role():
     with pytest.raises(ValueError):
-        RegistryConfig.from_env({"SPARKPLANE_ROLE": "leader"})
+        RegistryConfig.from_env({"DERATE_ROLE": "leader"})
 
 
 def test_config_reads_the_environment():
     config = RegistryConfig.from_env(
         {
-            "SPARKPLANE_ROLE": "worker",
-            "SPARKPLANE_TOKEN": "tok",
-            "SPARKPLANE_JOIN": "10.0.0.1",
-            "SPARKPLANE_AGENT_PORT": "9091",
-            "SPARKPLANE_DATA_DIR": "/tmp/sp",
+            "DERATE_ROLE": "worker",
+            "DERATE_TOKEN": "tok",
+            "DERATE_JOIN": "10.0.0.1",
+            "DERATE_AGENT_PORT": "9091",
+            "DERATE_DATA_DIR": "/tmp/sp",
         }
     )
     assert config.role == "worker"
@@ -1639,7 +1667,7 @@ def test_host_reserve_is_configurable():
 
 
 def test_config_reads_the_host_reserve_from_the_environment():
-    config = RegistryConfig.from_env({"SPARKPLANE_HOST_RESERVE_MIB": "4096"})
+    config = RegistryConfig.from_env({"DERATE_HOST_RESERVE_MIB": "4096"})
     assert config.host_memory_reserve == 4 * GIB
 
 
@@ -2013,7 +2041,7 @@ def test_remove_node_of_unknown_id_raises_rather_than_silently_succeeding(tmp_pa
 
 
 def test_explicit_join_rejection_stays_worker_in_waiting_not_fatal(tmp_path):
-    """Containerized-join defect: SPARKPLANE_JOIN's branch let JoinRejected
+    """Containerized-join defect: DERATE_JOIN's branch let JoinRejected
     propagate and kill the process, while the discovered path became a
     worker-in-waiting. A rejection proves the NAMED coordinator exists, and
     on first boot the join races our own agent app (the probe-back lands
@@ -2033,3 +2061,217 @@ def test_explicit_join_rejection_stays_worker_in_waiting_not_fatal(tmp_path):
     assert decision.status == "rejected"
     assert decision.coordinator_url == "http://10.0.0.5:8088"
     assert "retrying" in decision.reason
+
+
+# ----------------------------------------------------------------------
+# Display names
+#
+# A rename changes the caption and nothing else. node_id is the key every
+# deployment, link measurement and routing target on disk was written
+# against, so these tests exist mostly to pin down what a rename must NOT
+# move.
+# ----------------------------------------------------------------------
+
+
+def named_registry(tmp_path):
+    """A coordinator with spark-02 admitted, ready to be renamed."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    return registry, client
+
+
+def test_rename_sets_a_label_and_leaves_the_node_id_alone(tmp_path):
+    registry, _ = named_registry(tmp_path)
+
+    assert registry.set_node_label("spark-02", "  Rack 2   box ") == "Rack 2 box"
+
+    assert registry.node_label("spark-02") == "Rack 2 box"
+    # The identity everything else is keyed by is untouched.
+    assert registry.get_node("spark-02").profile.node_id == "spark-02"
+    assert registry.get_node("spark-02").profile.hostname == SPARK_02.hostname
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["spark-01", "spark-02"]
+
+
+def test_labels_are_sparse_so_unnamed_is_distinguishable_from_named(tmp_path):
+    registry, _ = named_registry(tmp_path)
+    registry.set_node_label("spark-02", "Rack 2")
+
+    # spark-01 was never renamed, so it has no entry at all -- not an entry
+    # equal to its node_id, which the UI could not tell from a real rename.
+    assert registry.node_labels() == {"spark-02": "Rack 2"}
+    assert registry.node_label("spark-01") is None
+
+
+def test_rename_survives_a_restart(tmp_path):
+    registry, _ = named_registry(tmp_path)
+    registry.set_node_label("spark-02", "Rack 2")
+
+    restarted = make_registry(tmp_path, client=FakeClient(), local=SPARK_01)
+
+    assert restarted.node_label("spark-02") == "Rack 2"
+
+
+def test_an_empty_name_clears_the_rename(tmp_path):
+    """Select-all, delete, save is how a human asks for the default back."""
+    registry, _ = named_registry(tmp_path)
+    registry.set_node_label("spark-02", "Rack 2")
+
+    assert registry.set_node_label("spark-02", "") is None
+
+    assert registry.node_label("spark-02") is None
+    assert make_registry(tmp_path, client=FakeClient()).node_label("spark-02") is None
+
+
+def test_rename_refuses_a_name_that_cannot_be_rendered(tmp_path):
+    registry, _ = named_registry(tmp_path)
+    for bad in ("x" * 49, "a\x00b", 17):
+        with pytest.raises(ValueError):
+            registry.set_node_label("spark-02", bad)
+    assert registry.node_label("spark-02") is None
+
+
+def test_rename_of_an_unknown_node_raises_rather_than_stranding_a_name(tmp_path):
+    registry, _ = named_registry(tmp_path)
+    with pytest.raises(NodeNotFound):
+        registry.set_node_label("spark-99", "Ghost")
+    assert registry.node_labels() == {}
+
+
+def test_removing_a_node_forgets_its_name(tmp_path):
+    """Otherwise a machine rejoining under the same id inherits a name the
+    operator deleted along with the node."""
+    registry, _ = named_registry(tmp_path)
+    registry.set_node_label("spark-02", "Rack 2")
+
+    registry.remove_node("spark-02")
+
+    assert registry.node_labels() == {}
+    assert make_registry(tmp_path, client=FakeClient()).node_label("spark-02") is None
+
+
+def test_an_unusable_persisted_label_loses_the_name_not_the_node(tmp_path):
+    import json
+
+    registry, _ = named_registry(tmp_path)
+    registry.set_node_label("spark-02", "Rack 2")
+    path = tmp_path / "registry.json"
+    data = json.loads(path.read_text())
+    data["members"]["spark-02"]["label"] = "x" * 400
+    path.write_text(json.dumps(data))
+
+    restarted = make_registry(tmp_path, client=FakeClient())
+
+    assert restarted.get_node("spark-02") is not None
+    assert restarted.node_label("spark-02") is None
+
+
+# ----------------------------------------------------------------------
+# Reachability
+#
+# Cheap, non-disruptive, and directional. The point of these is that a
+# one-way failure stays one-way in the report: an operator has to be able
+# to see WHICH side cannot dial the other.
+# ----------------------------------------------------------------------
+
+
+def test_reach_reports_the_coordinator_leg_and_both_peer_legs(tmp_path):
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    client.serve(registry.agent_url("spark-01"), SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+
+    result = run(registry.check_reach("spark-01", "spark-02"))
+
+    assert result["ok"] is True
+    legs = {(leg["source"], leg["target"]): leg for leg in result["legs"]}
+    # The coordinator IS spark-01, so its leg to itself is stated, not dialled.
+    assert legs[("coordinator", "spark-01")]["note"]
+    assert legs[("coordinator", "spark-01")]["ms"] is None
+    # ...and its leg to spark-02 is a real dial, which doubles as spark-01 ->
+    # spark-02. Only the reverse direction has to be asked of the far node.
+    assert legs[("coordinator", "spark-02")]["ok"] is True
+    assert legs[("coordinator", "spark-02")]["answered_as"] == "spark-02"
+    assert legs[("spark-02", "spark-01")]["ok"] is True
+    assert ("spark-01", "spark-02") not in legs
+
+
+def test_reach_asks_the_far_node_with_the_cluster_token(tmp_path):
+    """/agent/reach makes a node dial an address we name. Uncredentialed, that
+    is a port scanner running inside the operator's network."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="tok-123", local=SPARK_01)
+    client.serve(registry.agent_url("spark-01"), SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+
+    run(registry.check_reach("spark-01", "spark-02"))
+
+    asked = [(u, h) for (u, _), h in zip(client.posts, client.headers) if u.endswith("/agent/reach")]
+    assert asked and all(h and h.get("X-Derate-Token") == "tok-123" for _, h in asked)
+
+
+def test_reach_keeps_a_one_way_failure_one_way(tmp_path):
+    """The direction that failed is the whole finding. A merged verdict would
+    send an operator to look at the machine that is demonstrably fine."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    client.serve(registry.agent_url("spark-01"), SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    # spark-02 can no longer dial the coordinator back, but still answers us.
+    client.kill(registry.agent_url("spark-01"))
+
+    result = run(registry.check_reach("spark-01", "spark-02"))
+
+    legs = {(leg["source"], leg["target"]): leg for leg in result["legs"]}
+    assert result["ok"] is False
+    assert legs[("coordinator", "spark-02")]["ok"] is True
+    assert legs[("spark-02", "spark-01")]["ok"] is False
+    assert "spark-02 → spark-01" in result["summary"]
+
+
+def test_reach_never_reports_a_millisecond_figure_for_a_leg_that_failed(tmp_path):
+    """Same rule as an unmeasured link carrying no bandwidth: 0 ms beside
+    'unreachable' reads as a fast link."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    client.kill("http://10.0.0.12:8081")
+
+    result = run(registry.check_reach("spark-01", "spark-02"))
+
+    assert result["ok"] is False
+    for leg in result["legs"]:
+        if not leg["ok"]:
+            assert leg["ms"] is None
+            assert leg["error"]
+
+
+def test_being_unable_to_ask_a_node_is_not_a_finding_about_its_peer(tmp_path):
+    """If we cannot reach spark-02 to ask it anything, whether spark-02 can
+    reach spark-01 is unknown -- reporting it as 'spark-02 cannot reach
+    spark-01' would be inventing a result."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    client.serve(registry.agent_url("spark-01"), SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    client.kill("http://10.0.0.12:8081")
+
+    result = run(registry.check_reach("spark-01", "spark-02"))
+
+    peer_legs = [leg for leg in result["legs"] if leg["source"] == "spark-02"]
+    assert peer_legs == []
+    blamed = [leg for leg in result["legs"] if not leg["ok"]]
+    assert all(leg["target"] == "spark-02" for leg in blamed)
+    assert any("still unknown" in (leg["error"] or "") for leg in blamed)
+
+
+def test_reach_of_an_unknown_node_raises(tmp_path):
+    registry, _ = named_registry(tmp_path)
+    with pytest.raises(NodeNotFound):
+        run(registry.check_reach("spark-01", "spark-99"))

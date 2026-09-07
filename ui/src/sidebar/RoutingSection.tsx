@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { RoutingConfig, RoutingPolicy, RouteTarget } from '../api/types'
 import { useSelection } from '../state/selection'
+import { PROPORTIONAL } from '../state/policy'
 import { useRouting } from '../state/resources'
 import { useBackend } from '../state/backend'
 import { Lamp } from '../components/Lamp'
@@ -28,10 +29,6 @@ const POLICIES: { value: RoutingPolicy; help: string }[] = [
   { value: 'cost_aware', help: 'Cheapest admitting target. Local priced from measured draw.' },
 ]
 
-// `weight` is only semantically a configured traffic SHARE under these two
-// policies. Drawing a filled proportional bar under, say, least_outstanding
-// would claim a configured split the router does not use for selection.
-const PROPORTIONAL = new Set<RoutingPolicy>(['weighted_capacity', 'round_robin'])
 
 function targetLabel(t: RouteTarget): string {
   if (t.kind === 'local' && t.node_ids && t.node_ids.length > 0) return t.node_ids.join(' + ')

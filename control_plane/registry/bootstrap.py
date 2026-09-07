@@ -9,6 +9,7 @@ until it comes back. That is a deliberate scope decision, not an oversight.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import random
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from .config import (
 )
 from .discovery import DiscoveredPeer, browse_async
 from .errors import JoinRejected, ProbeFailed
+from .identity import load_or_create_identity
 from .net import normalize_agent_url
 from .serde import profile_to_dict
 
@@ -55,6 +57,10 @@ class RoleDecision:
     # (a coordinator answered but the token did not match), or None (nobody
     # to join at all), as the coordinator saw it.
     status: str | None = None
+    # Set only when we were admitted on an enrollment token: the permanent
+    # cluster token, handed over once so this node keeps working after the
+    # enrollment token expires. The caller must persist it.
+    cluster_token: str | None = None
 
     @property
     def is_coordinator(self) -> bool:
@@ -89,6 +95,35 @@ async def post_join(
         raise
 
 
+def adopt_cluster_token(config: RegistryConfig, result: dict | None) -> RegistryConfig:
+    """Keep the permanent token a coordinator handed back, and use it from now on.
+
+    A node admitted on an enrollment token holds a credential that expires
+    within the hour. ``Registry.handle_join`` therefore returns the permanent
+    cluster token with the admission, exactly once. Persisting it here is not
+    housekeeping: ``handle_join`` checks the token *before* it checks
+    membership, so a worker that kept presenting a spent enrollment token
+    would eventually 403 itself out of a cluster it is already a member of.
+
+    Returns the config to use from here on -- the same object when there was
+    nothing to adopt. Writing goes through ``load_or_create_identity``, which
+    already prefers an explicit token and creates the file at 0600.
+    """
+    token = (result or {}).get("cluster_token")
+    if not token or token == config.token:
+        return config
+    load_or_create_identity(
+        config.data_dir,
+        cluster_id=(result or {}).get("cluster_id") or config.cluster_id,
+        token=str(token),
+    )
+    log.info(
+        "adopted the cluster token from the coordinator; the enrollment token "
+        "this node installed with is no longer needed"
+    )
+    return dataclasses.replace(config, token=str(token))
+
+
 async def resolve_role(
     config: RegistryConfig,
     profile: NodeProfile,
@@ -100,7 +135,7 @@ async def resolve_role(
 
     if config.role == ROLE_COORDINATOR:
         return RoleDecision(
-            ROLE_COORDINATOR, None, False, "SPARKPLANE_ROLE=coordinator"
+            ROLE_COORDINATOR, None, False, "DERATE_ROLE=coordinator"
         )
 
     # An explicit join address is a deliberate instruction for a node on another
@@ -123,7 +158,7 @@ async def resolve_role(
             # answering at all) still fails loudly -- that is a typo, not a
             # cluster.
             reason = (
-                f"SPARKPLANE_JOIN={config.join_address} answered but rejected "
+                f"DERATE_JOIN={config.join_address} answered but rejected "
                 f"the join ({exc}); staying a worker and retrying rather than "
                 "dying -- the agent app was not yet listening for the "
                 "probe-back on a first boot, and admission or a token fix "
@@ -135,9 +170,10 @@ async def resolve_role(
             ROLE_WORKER,
             url,
             True,
-            f"SPARKPLANE_JOIN={config.join_address}",
+            f"DERATE_JOIN={config.join_address}",
             cluster_id=(result or {}).get("cluster_id"),
             status=(result or {}).get("status"),
+            cluster_token=(result or {}).get("cluster_token"),
         )
 
     peers = await browse(MDNS_BROWSE_SECONDS, profile.node_id)
@@ -155,6 +191,7 @@ async def resolve_role(
                 f"joined coordinator {peer.node_id} at {url}",
                 cluster_id=(result or {}).get("cluster_id") or peer.cluster_id,
                 status=(result or {}).get("status"),
+                cluster_token=(result or {}).get("cluster_token"),
             )
         except JoinRejected:
             # Someone else's cluster on the same subnet -- or the same
@@ -192,7 +229,7 @@ async def resolve_role(
             ROLE_WORKER,
             None,
             False,
-            "SPARKPLANE_ROLE=worker but no coordinator answered; waiting to be found",
+            "DERATE_ROLE=worker but no coordinator answered; waiting to be found",
         )
 
     if coordinators:
@@ -249,6 +286,10 @@ async def rejoin_until_admitted(
             log.debug("coordinator %s unreachable (%s); retrying", url, exc)
             await sleep(REJOIN_INTERVAL_S + jitter() * REJOIN_JITTER_S)
             continue
+
+        # Before the status check: an admission carries the permanent token
+        # with it, and the next iteration of this loop must present that one.
+        config = adopt_cluster_token(config, result)
 
         if (result or {}).get("status") == "member":
             log.info(

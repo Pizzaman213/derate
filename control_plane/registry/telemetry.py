@@ -30,7 +30,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from control_plane.contracts import DEFAULT_GUARDRAIL, DeviceClass, NodeProfile
+from control_plane.contracts import (
+    DEFAULT_GUARDRAIL,
+    DeviceClass,
+    GpuProcess,
+    NodeProfile,
+)
 
 from .config import HOST_MEMORY_RESERVE, TELEMETRY_RING_SAMPLES
 from .probe import _num
@@ -40,6 +45,14 @@ log = logging.getLogger(__name__)
 TELEMETRY_QUERY = "memory.used,memory.total,power.draw,temperature.gpu,utilization.gpu"
 # Per-process GPU memory. Works on GB10 where the aggregate fields do not.
 COMPUTE_APPS_QUERY = "pid,used_gpu_memory"
+# The same family with the name attached. Deliberately a second constant:
+# COMPUTE_APPS_QUERY feeds the 5s poll and its column order is load-bearing
+# for gpu_memory_used, so it is not extended in place.
+PROCESS_QUERY = "pid,process_name,used_gpu_memory"
+# Long enough that a vLLM serve line keeps its --port, which is what the
+# coordinator attributes a process to a deployment by. Truncating below
+# that would silently turn a managed backend into an unattributed one.
+CMDLINE_MAX = 2000
 TELEMETRY_TIMEOUT_S = 2.0
 MEMINFO = Path("/proc/meminfo")
 
@@ -225,6 +238,77 @@ async def read_compute_apps(
         total += int(mib) * 1024**2
         count += 1
     return total, count
+
+
+def _proc_cmdline(pid: int) -> str | None:
+    """/proc/<pid>/cmdline, NUL-joined and truncated. None when unreadable.
+
+    Unreadable is the normal case in a container without ``--pid=host``, and it
+    is also what a process that exited between the nvidia-smi read and this one
+    looks like. Neither is an error worth raising over a best-effort field.
+    """
+    try:
+        raw = Path("/proc/%d/cmdline" % pid).read_bytes()
+    except (OSError, ValueError):
+        return None
+    text = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    if not text:
+        return None
+    return text[:CMDLINE_MAX]
+
+
+def _proc_user(pid: int) -> str | None:
+    """Owner of /proc/<pid>, by name when we can resolve it, else uid."""
+    try:
+        uid = Path("/proc/%d" % pid).stat().st_uid
+    except (OSError, ValueError):
+        return None
+    try:
+        import pwd
+
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, ImportError):
+        return str(uid)
+
+
+async def read_gpu_processes(
+    rows: list[list[str]] | None = None,
+) -> list[GpuProcess] | None:
+    """Every compute context holding GPU memory, named.
+
+    Three-valued like :func:`read_compute_apps`, and for the same reason: None
+    means nvidia-smi could not be asked, ``[]`` means it answered and the GPU is
+    idle. Collapsing those two would report an unreadable driver as an empty
+    machine, which is the one answer an operator must not be given before
+    deciding nothing is holding the memory.
+    """
+    if rows is None:
+        rows = await run_nvidia_smi_async(
+            PROCESS_QUERY, flag="--query-compute-apps", allow_empty=True
+        )
+    if rows is None:
+        return None
+    out: list[GpuProcess] = []
+    for row in rows:
+        if len(row) < 3:
+            continue
+        pid = _num(row[0])
+        mib = _num(row[2])
+        if pid is None or mib is None:
+            continue
+        pid = int(pid)
+        full = row[1].strip()
+        out.append(
+            GpuProcess(
+                pid=pid,
+                name=full.rsplit("/", 1)[-1] or full,
+                command=_proc_cmdline(pid) or (full or None),
+                user=_proc_user(pid),
+                gpu_memory=int(mib) * 1024**2,
+            )
+        )
+    out.sort(key=lambda p: p.gpu_memory, reverse=True)
+    return out
 
 
 async def read_telemetry(

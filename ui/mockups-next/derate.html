@@ -1,0 +1,265 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>derate — working</title>
+<!-- Self-hosted, not a CDN. Architecture section 1: the gateway binds to the
+     LAN and nothing here is exposed to the internet, so a Google Fonts <link>
+     cannot resolve on a LAN-only or air-gapped box -- it blocks first paint
+     until it times out and then the design silently falls back to a system
+     stack, losing the tabular-nums this whole instrument panel depends on for
+     digits that do not shift as values update. IBM Plex is SIL OFL; see
+     fonts/LICENSE. The React app already vendors these via @fontsource. -->
+<link rel="stylesheet" href="styles/fonts.css">
+<link rel="stylesheet" href="styles/derate.css">
+
+<header>
+  <svg width="32" height="24" viewBox="0 0 64 50" aria-label="derate">
+    <path d="M26 25 V39 H56" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="square" opacity=".32"/>
+    <path d="M8 25 H26 V11 H56" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="square"/>
+  </svg>
+  <span style="font-weight:500;font-size:18px;letter-spacing:-.3px">derate</span>
+  <span class="pill mono" id="pill"></span>
+  <span class="pill mono" id="cloudPill" style="display:none">cloud off</span>
+  <div class="dest" role="tablist">
+    <button role="tab" aria-selected="true" data-d="dash">Dashboard</button>
+    <button role="tab" aria-selected="false" data-d="cluster">Cluster</button>
+    <button role="tab" aria-selected="false" data-d="spend">Spend</button>
+    <button role="tab" aria-selected="false" data-d="settings">Settings</button>
+  </div>
+  <button id="theme">Dark</button>
+</header>
+
+<div class="wrap" id="wrap">
+<div class="rail">
+  <button class="tab" id="tog" aria-controls="side" aria-expanded="true"
+    aria-label="Hide sidebar" title="Hide sidebar">
+    <svg width="7" height="12" viewBox="0 0 7 12" fill="none" stroke="currentColor"
+      stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l5 5-5 5"/></svg>
+  </button>
+</div>
+<main>
+
+  <section id="d-cluster" hidden>
+    <div class="stage bare">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+        <span class="unit">Drag to pan · scroll to zoom · click a model to scope the sidebar · double-click to inspect</span>
+        <button id="splitBtn" style="margin-left:auto">Split sparks</button>
+        <button id="spill">Saturate</button>
+        <span class="unit mono" id="zoomLbl" style="min-width:38px;text-align:right">100%</span>
+        <button id="reset" title="Reset pan and zoom (0)">Reset view</button>
+        <button id="measure">Re-measure</button>
+      </div>
+      <svg id="graph" viewBox="0 0 700 460" style="width:100%"></svg>
+      <div id="rail" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--rule)"></div>
+      <div class="legend" style="margin-top:11px;padding-top:11px;border-top:1px solid var(--rule)">
+        <span><b>heavy</b> measured, on your hardware</span>
+        <span><b>thin dashed</b> crosses the routing boundary, no measured fabric</span>
+        <span><b>hairline</b> reachable through the proxy, not routed there</span>
+        <span><b>faded</b> idle</span><span><b>grey</b> request in flight</span>
+        <span><b>outlined</b> third party</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="d-dash">
+    <div class="swapbar" id="swapbar"></div>
+    <div class="subs" role="tablist" aria-label="Dashboard sections">
+      <button role="tab" aria-selected="true"  data-s="overview">Overview</button>
+      <button role="tab" aria-selected="false" data-s="telemetry">Telemetry</button>
+      <button role="tab" aria-selected="false" data-s="load">Load</button>
+    </div>
+    <div class="stage">
+      <div class="bararea" style="margin-bottom:0;border:none;padding-bottom:0">
+        <div class="fld" style="flex:1;min-width:180px"><label for="mid">Model</label>
+          <input id="mid" value="openai/gpt-oss-120b" spellcheck="false"></div>
+        <div class="fld"><label for="quant">Precision</label>
+          <select id="quant"><option value="mxfp4">mxfp4</option><option value="nvfp4">nvfp4</option>
+          <option value="fp8">fp8</option><option value="bf16">bf16</option><option value="q4_k_m">q4_k_m</option></select></div>
+        <div class="fld" style="width:84px"><label for="ctx">Context</label><input id="ctx" value="8192" class="mono"></div>
+        <div class="fld" style="width:62px"><label for="seqs">Seqs</label><input id="seqs" value="16" class="mono"></div>
+        <div class="fld"><label for="place">Place on</label><select id="place"></select></div>
+        <div class="fld"><label for="runtime">Runtime</label>
+          <select id="runtime"><option value="vllm">vllm</option><option value="sglang">sglang</option></select></div>
+        <div class="fld" style="flex:1;min-width:190px"><label for="extra">Extra launch flags</label>
+          <input id="extra" placeholder="--enforce-eager --swap-space 8" spellcheck="false"></div>
+        <button id="planBtn">Plan</button>
+        <button id="serveBtn" disabled>Serve</button>
+      </div>
+      <div class="verdict" id="verdict" style="margin-top:13px;margin-bottom:0"></div>
+      <div style="margin-top:13px">
+        <button id="cmdBtn" class="ghost" style="padding:0;font-size:12px;color:var(--muted)">launch command &#9656;</button>
+        <div id="cmdBox" style="display:none">
+          <div class="cmd" id="cmdOut"></div>
+          <div class="unit" style="margin-top:6px">This is the recipe command derate synthesizes and runs.
+            Extra flags are appended verbatim. A flag the runtime does not accept fails the launch; it is not ignored.</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="s-overview">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin:20px 0 6px">
+      <div><div class="readout" id="aTps">—</div><div class="unit">tokens per second, all models</div></div>
+      <div><div class="readout" id="aDep">—</div><div class="unit">deployments serving</div></div>
+      <div><div class="readout" id="aPow">—</div><div class="unit">watts drawn</div></div>
+      <div><div class="readout" id="aFree">—</div><div class="unit">slots free</div></div>
+    </div>
+
+    <div style="margin-top:16px">
+      <h2>Deployments</h2>
+      <div id="deps"></div>
+    </div>
+    </div><!-- /s-overview -->
+
+    <div id="s-telemetry" hidden>
+      <div class="unit" style="margin-bottom:12px">Every series below comes from the 1 Hz
+        metrics frame and is accumulated in this browser. The control plane stores no history —
+        it keeps one snapshot — so this window is 60 seconds and starts empty on load.
+        There are no percentiles anywhere in the system; TTFT and mean duration are moving averages.</div>
+      <h2>Cluster</h2>
+      <div class="chartgrid" id="telCluster"></div>
+      <h2 style="margin-top:18px">Per Spark</h2>
+      <div class="chips" id="telNodePick"></div>
+      <div class="chartgrid" id="telNodes"></div>
+      <h2 style="margin-top:18px">Per deployment</h2>
+      <div class="unit" id="telDepNote" style="margin:-4px 0 10px"></div>
+      <div class="chartgrid" id="telDeps"></div>
+    </div>
+
+    <div id="s-load" hidden>
+      <h2>Request load by Spark</h2>
+      <table id="loadTable"></table>
+      <div class="unit" id="loadNote" style="margin-top:8px"></div>
+    </div>
+  </section>
+
+  <section id="d-spend" hidden>
+    <div class="card2">
+      <h3>Where requests went today</h3>
+      <div class="unit">Local means hardware you own. Remote means a managed node or a third-party API.</div>
+      <div class="split" id="lrSplit"></div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:14px">
+        <div><div class="big" id="sLocal">—</div><div class="unit">% local</div></div>
+        <div><div class="big" id="sReq">—</div><div class="unit">requests today</div></div>
+        <div><div class="big" id="sCost">—</div><div class="unit">spent today</div></div>
+        <div><div class="big" id="sSaved">—</div><div class="unit">saved vs all-cloud</div></div>
+      </div>
+    </div>
+
+    <div class="card2">
+      <h3>By target</h3>
+      <div class="unit" style="margin-bottom:10px">Local cost derives from measured power draw at your electricity rate.</div>
+      <table id="spendTable"></table>
+    </div>
+
+    <div class="card2">
+      <h3>Containment</h3>
+      <div class="unit">Stop traffic leaving your hardware, and cap what it can cost when it does.</div>
+      <label class="sw"><input type="checkbox" id="cloudOff"> <span>Local only — never route to cloud providers</span></label>
+      <label class="sw"><input type="checkbox" id="managedOff"> <span>Exclude managed remote nodes too (brev-h100)</span></label>
+      <div style="display:flex;gap:10px;align-items:flex-end;margin-top:10px">
+        <div class="fld" style="width:130px"><label for="cap">Daily cap</label><input id="cap" value="5.00" class="mono"></div>
+        <div class="fld" style="width:130px"><label for="rate">Electricity $/kWh</label><input id="rate" value="0.14" class="mono"></div>
+        <span class="unit">Cloud targets stop admitting once the cap is hit.</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="d-settings" hidden>
+    <div class="card2">
+      <h3>Nodes</h3>
+      <div class="unit" style="margin-bottom:10px">Nodes on the local subnet are discovered automatically. Add anything else by address.</div>
+      <table id="nodeTable"></table>
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-top:12px">
+        <div class="fld" style="flex:1"><label for="naddr">Address</label><input id="naddr" placeholder="10.0.4.19"></div>
+        <div class="fld"><label for="nkind">Kind</label>
+          <select id="nkind"><option value="0">local · measured fabric</option><option value="1">remote · routing only</option></select></div>
+        <button id="addNode">Add node</button>
+      </div>
+      <div class="unit" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule)">
+        <span class="pill">discovered</span> spark-03 · GB10 · 10.0.4.21
+        <button style="padding:3px 8px;margin-left:8px" onclick="alert('Would probe and admit spark-03.')">Add</button>
+      </div>
+    </div>
+
+    <div class="card2">
+      <h3>Providers</h3>
+      <div class="unit" style="margin-bottom:10px">Keys are stored as references and resolved at request time. They are never displayed, logged, or included in exports.</div>
+      <table id="provTable"></table>
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-top:12px;flex-wrap:wrap">
+        <div class="fld"><label for="pkind">Provider</label>
+          <select id="pkind"><option>openrouter</option><option>openai</option><option>anthropic</option>
+          <option>together</option><option>groq</option><option>custom</option></select></div>
+        <div class="fld" style="flex:1;min-width:180px"><label for="pkey">API key</label>
+          <input id="pkey" type="password" placeholder="sk-..." autocomplete="off"></div>
+        <button id="addProv">Add provider</button>
+      </div>
+    </div>
+
+    <div class="card2">
+      <h3>Cluster</h3>
+      <div id="clusterCard"></div>
+      <div class="unit" style="margin-top:9px">The join token is held as a reference and shown only
+        on the coordinator's first run. Copy it to bring another machine in; it is not recoverable
+        from this screen.</div>
+    </div>
+
+    <div class="card2 soon">
+      <h3>Not built yet <span class="pill">planned</span></h3>
+      <div class="row"><span>Manual placement</span><span class="unit">the planner has no placement field</span></div>
+      <div class="row"><span>Link utilisation</span><span class="unit">no bytes-on-the-wire telemetry exists</span></div>
+      <div class="row"><span>Managed remote node tier</span><span class="unit">a target is local or a provider; there is no third kind</span></div>
+      <div class="row"><span>Add a node by address</span><span class="unit">join is worker-to-coordinator and token-gated</span></div>
+      <div class="row"><span>Prefix cache hit rate</span><span class="unit">the backend reports null for it</span></div>
+      <div class="row"><span>Scheduled model swaps</span><span class="unit">time-based placement</span></div>
+      <div class="row"><span>Auto-eviction policy</span><span class="unit">currently always manual</span></div>
+      <div class="row"><span>Alerting</span><span class="unit">node down, cap reached, OOM</span></div>
+    </div>
+
+    <div class="card2 soon">
+      <h3>Deliberately out of scope <span class="pill">will not build</span></h3>
+      <div class="unit" style="margin-bottom:6px">Named non-goals. Each looks like a small addition
+        to a screen that already exists, which is exactly how they get built by accident.</div>
+      <div class="row"><span>Model catalog browser</span><span class="unit">the picker is a short list plus a free-text id</span></div>
+      <div class="row"><span>Chat interface or history</span><span class="unit">this is a control plane; clients bring their own</span></div>
+      <div class="row"><span>Log browser</span><span class="unit">failure diagnostics only, on the deployment that failed</span></div>
+      <div class="row"><span>Deep-dive metrics page</span><span class="unit">the readouts are the whole metrics surface</span></div>
+      <div class="row"><span>WAN endpoint</span><span class="unit">the gateway binds to the LAN</span></div>
+    </div>
+  </section>
+
+</main>
+
+<aside id="side"><div class="inner">
+  <section><h2>Nodes</h2><div id="roster"></div></section>
+  <section>
+    <h2 id="scopeHead">Plan</h2>
+    <div class="row"><span class="label" id="planLabel"></span><span class="mono" id="linkNow"></span></div>
+    <button id="whyBtn" class="ghost" style="padding:0;font-size:12px;color:var(--muted);margin-top:4px">why ▸</button>
+    <div class="why" id="whyBox"></div>
+  </section>
+  <section>
+    <h2>Routing</h2>
+    <select id="policy" style="width:100%">
+      <option value="local_first">local_first</option><option value="least_outstanding">least_outstanding</option>
+      <option value="weighted_capacity">weighted_capacity</option><option value="cost_aware">cost_aware</option>
+      <option value="round_robin">round_robin</option>
+    </select>
+    <div id="weights" style="margin-top:10px"></div>
+    <div class="unit" id="policyNote"></div>
+  </section>
+  <section><h2 id="costHead">Cost per Mtok</h2><div id="costRows"></div></section>
+</div></aside>
+</div>
+
+<div class="sheet" id="sheet"><div class="card" id="cardBody"></div></div>
+
+<script src="js/state.js"></script>
+<script src="js/sidebar.js"></script>
+<script src="js/dashboard.js"></script>
+<script src="js/spend.js"></script>
+<script src="js/settings.js"></script>
+<script src="js/cluster.js"></script>
+<script src="js/inspectors.js"></script>
+<script src="js/routing.js"></script>
+<script src="js/planner.js"></script>
+<script src="js/main.js"></script>

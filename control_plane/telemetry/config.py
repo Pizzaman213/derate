@@ -127,13 +127,13 @@ LOG_MESSAGE_MAX_CHARS = 8192
 def data_dir() -> Path:
     """The data root.
 
-    ``SPARKPLANE_DATA_DIR`` is the name every Python component reads --
+    ``DERATE_DATA_DIR`` is the name every Python component reads --
     providers/config.py, registry/config.py and links/service.py all read it
     independently with the same ``/data`` fallback. The shell exports
-    ``SPARKPLANE_DATA`` and entrypoint.sh bridges the two; reading the shell
+    ``DERATE_DATA`` and entrypoint.sh bridges the two; reading the shell
     name here would split them the moment anyone overrides one.
     """
-    return Path(os.environ.get("SPARKPLANE_DATA_DIR", "/data"))
+    return Path(os.environ.get("DERATE_DATA_DIR", "/data"))
 
 
 def telemetry_dir(root: Path | str | None = None) -> Path:
@@ -178,21 +178,21 @@ def _env_int(name: str, default: int) -> int:
 
 def enabled() -> bool:
     """Whether to record anything at all. On by default."""
-    return _env_flag("SPARKPLANE_TELEMETRY", True)
+    return _env_flag("DERATE_TELEMETRY", True)
 
 
 def retention_days() -> float:
     """Raw-sample horizon, in days. Scales the other raw horizons with it."""
-    return _env_float("SPARKPLANE_TELEMETRY_RETENTION_DAYS", SAMPLES_RAW_RETENTION_S / DAY_S)
+    return _env_float("DERATE_TELEMETRY_RETENTION_DAYS", SAMPLES_RAW_RETENTION_S / DAY_S)
 
 
 def log_ship_level() -> str:
-    return os.environ.get("SPARKPLANE_TELEMETRY_LOG_LEVEL", LOG_SHIP_LEVEL).upper()
+    return os.environ.get("DERATE_TELEMETRY_LOG_LEVEL", LOG_SHIP_LEVEL).upper()
 
 
 def journal_max_bytes() -> int:
-    return _env_int("SPARKPLANE_TELEMETRY_MAX_BYTES", JOURNAL_MAX_BYTES)
+    return _env_int("DERATE_TELEMETRY_MAX_BYTES", JOURNAL_MAX_BYTES)
 
 
 def ship_interval_s() -> float:
-    return _env_float("SPARKPLANE_TELEMETRY_SHIP_INTERVAL_S", SHIP_INTERVAL_S)
+    return _env_float("DERATE_TELEMETRY_SHIP_INTERVAL_S", SHIP_INTERVAL_S)

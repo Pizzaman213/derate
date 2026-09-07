@@ -69,12 +69,26 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
 #: general.file_type -> a key in BYTES_PER_PARAM. The enum is llama.cpp's
 #: LLAMA_FTYPE; only the values that name a storage format appear here.
 GGUF_FILE_TYPES: dict[int, str] = {
-    0: "fp32", 1: "fp16", 2: "q4_0", 3: "q4_0",
-    7: "q8_0", 8: "q4_0", 9: "q4_0",
+    0: "fp32", 1: "fp16",
+    # 3, 8 and 9 are Q4_1, Q5_0 and Q5_1. All three used to answer "q4_0",
+    # which charges 4.5 bpw for formats that cost 5.0, 5.5 and 6.0 -- a third
+    # under on the worst of them, and under is the direction that turns into an
+    # out-of-memory kill minutes into a load rather than a refusal before it.
+    2: "q4_0", 3: "q4_1", 7: "q8_0", 8: "q5_0", 9: "q5_1",
     10: "q2_k", 11: "q3_k_m", 12: "q3_k_m", 13: "q3_k_m",
     14: "q4_k_m", 15: "q4_k_m", 16: "q5_k_m", 17: "q5_k_m",
-    18: "q6_k", 19: "q2_k", 20: "q2_k",
-    32: "bf16", 38: "mxfp4",
+    18: "q6_k",
+    # 19 and 20 are IQ2_XXS and IQ2_XS, not two more spellings of Q2_K; 21 is
+    # Q2_K_S. Everything from 22 to 31 is the rest of the importance-matrix
+    # family and was absent entirely, so those files fell through to
+    # dominant_file_type() -> None and were then charged at the bf16 default --
+    # four to eight times their real footprint, which is what made every
+    # Unsloth GGUF repo look like it would not fit.
+    19: "iq2_xxs", 20: "iq2_xs", 21: "q2_k_s",
+    22: "iq3_xs", 23: "iq3_xxs", 24: "iq1_s", 25: "iq4_nl",
+    26: "iq3_s", 27: "iq3_m", 28: "iq2_s", 29: "iq2_m",
+    30: "iq4_xs", 31: "iq1_m",
+    32: "bf16", 38: "mxfp4", 39: "nvfp4",
 }
 
 

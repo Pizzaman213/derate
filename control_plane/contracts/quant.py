@@ -38,6 +38,34 @@ BYTES_PER_PARAM: dict[str, float] = {
     "awq_int4": 0.5625,
     "gptq_int4": 0.5625,
     "nf4": 0.5163,
+    # llama.cpp plain block formats that were absent. Their ggml block sizes
+    # are in resolver/gguf.py's GGML_TYPES: Q4_1 is 20 bytes per 32 elements,
+    # Q5_0 22, Q5_1 24. They were previously all priced as q4_0 (4.5 bpw),
+    # which under-counts by up to a third -- the one direction this table is
+    # not allowed to be wrong in.
+    "q4_1": 0.625,  # 5.0 bpw
+    "q5_0": 0.6875,  # 5.5 bpw
+    "q5_1": 0.75,  # 6.0 bpw
+    "q2_k_s": 0.3712,  # 2.9697 bpw
+    # The importance-matrix (IQ) family. Figures are llama.cpp's own measured
+    # whole-model bpw from tools/quantize/README.md, not the pure block
+    # arithmetic: a real file keeps its embedding and output tensors at higher
+    # precision, so the measured figure runs above the block figure and is the
+    # safe one to charge. On a model much larger than the 7B those were taken
+    # from, the high-precision tensors are a smaller fraction and these
+    # over-estimate slightly -- again, the safe direction.
+    "iq1_s": 0.2505,  # 2.0042 bpw
+    "iq1_m": 0.2683,  # 2.1460 bpw
+    "iq2_xxs": 0.2978,  # 2.3824 bpw
+    "iq2_xs": 0.3235,  # 2.5882 bpw
+    "iq2_s": 0.3425,  # 2.7403 bpw
+    "iq2_m": 0.3662,  # 2.9294 bpw
+    "iq3_xxs": 0.4069,  # 3.2548 bpw
+    "iq3_xs": 0.4372,  # 3.4977 bpw
+    "iq3_s": 0.4576,  # 3.6606 bpw
+    "iq3_m": 0.4704,  # 3.7628 bpw
+    "iq4_xs": 0.5575,  # 4.4597 bpw
+    "iq4_nl": 0.5852,  # 4.6818 bpw
 }
 
 #: What we fall back to when quantization cannot be determined. Never guess low:
@@ -98,6 +126,51 @@ _ALIASES: dict[str, str] = {
     "gptqmarlin": "gptq_int4",
     "w4a16": "gptq_int4",
     "bnbnf4": "nf4",
+    # Importance-matrix spellings. normalize_dtype() also tries the
+    # separator-stripped form, so both "iq4_xs" and "IQ4-XS" land here.
+    "iq1s": "iq1_s",
+    "iq1m": "iq1_m",
+    "iq2xxs": "iq2_xxs",
+    "iq2xs": "iq2_xs",
+    "iq2s": "iq2_s",
+    "iq2m": "iq2_m",
+    "iq3xxs": "iq3_xxs",
+    "iq3xs": "iq3_xs",
+    "iq3s": "iq3_s",
+    "iq3m": "iq3_m",
+    "iq4xs": "iq4_xs",
+    "iq4nl": "iq4_nl",
+    "q41": "q4_1",
+    "q50": "q5_0",
+    "q51": "q5_1",
+    "q2ks": "q2_k_s",
+    "q2kl": "q2_k",
+    # Unsloth Dynamic. "UD-" names a per-tensor mix with no fixed bits per
+    # weight, so there is no honest constant for it. These map it onto its base
+    # scheme, which correctly identifies the *family*; they are not a reliable
+    # size. Measured against the 27 real files of unsloth/Qwen3-30B-A3B-GGUF,
+    # the base rung lands between 15% under and 7% over the true figure, and it
+    # is worst at the bottom of the ladder, where the tensors Unsloth keeps at
+    # high precision dominate:
+    #
+    #     UD-Q4_K_XL  4.64 bpw real vs 4.90 charged   +5.6%
+    #     UD-Q3_K_XL  3.62               3.65         +0.6%
+    #     UD-Q6_K_XL  6.90               6.56         -5.0%
+    #     UD-Q8_K_XL  9.43               8.50         -9.9%
+    #     UD-Q2_K_XL  3.10               2.63        -15.0%
+    #     UD-IQ1_S    2.37               2.00        -15.4%
+    #
+    # A negative figure is the direction this table must never be wrong in, so
+    # anything sizing a UD variant has to use the real file size -- the hub
+    # reported one for all 27 -- and treat these purely as a family label. A
+    # rung *up* is not a fix either: it would overstate UD-Q4_K_XL by 23% and
+    # still under-call UD-IQ1_M.
+    "q2kxl": "q2_k",
+    "q3kxl": "q3_k_m",
+    "q4kxl": "q4_k_m",
+    "q5kxl": "q5_k_m",
+    "q6kxl": "q6_k",
+    "q8kxl": "q8_0",
 }
 
 
@@ -141,6 +214,22 @@ QUANT_INFO: dict[str, QuantInfo] = {
     "awq_int4": QuantInfo("awq_int4", 4.5, "int", 7.5, False, "Marlin and GEMM kernels from Turing"),
     "gptq_int4": QuantInfo("gptq_int4", 4.5, "int", 7.5, False, "Marlin and GEMM kernels from Turing"),
     "nf4": QuantInfo("nf4", 4.13, "int", 7.5, False, "bitsandbytes"),
+    "q4_1": QuantInfo("q4_1", 5.0, "gguf", None, False, "llama.cpp block format"),
+    "q5_0": QuantInfo("q5_0", 5.5, "gguf", None, False, "llama.cpp block format"),
+    "q5_1": QuantInfo("q5_1", 6.0, "gguf", None, False, "llama.cpp block format"),
+    "q2_k_s": QuantInfo("q2_k_s", 2.9697, "gguf", None, False, "llama.cpp block format"),
+    "iq1_s": QuantInfo("iq1_s", 2.0042, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq1_m": QuantInfo("iq1_m", 2.146, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq2_xxs": QuantInfo("iq2_xxs", 2.3824, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq2_xs": QuantInfo("iq2_xs", 2.5882, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq2_s": QuantInfo("iq2_s", 2.7403, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq2_m": QuantInfo("iq2_m", 2.9294, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq3_xxs": QuantInfo("iq3_xxs", 3.2548, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq3_xs": QuantInfo("iq3_xs", 3.4977, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq3_s": QuantInfo("iq3_s", 3.6606, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq3_m": QuantInfo("iq3_m", 3.7628, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq4_xs": QuantInfo("iq4_xs", 4.4597, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
+    "iq4_nl": QuantInfo("iq4_nl", 4.6818, "gguf", None, False, "llama.cpp importance-matrix format; needs an imatrix to quantize, not to run"),
 }
 
 
@@ -160,7 +249,19 @@ def normalize_dtype(name: str | None) -> str | None:
     squashed = "".join(ch for ch in raw if ch.isalnum())
     if squashed in BYTES_PER_PARAM:
         return squashed
-    return _ALIASES.get(squashed)
+    hit = _ALIASES.get(squashed)
+    if hit is not None:
+        return hit
+    # "UD-" marks an Unsloth Dynamic mix wrapped around an ordinary scheme
+    # ("UD-Q4_K_XL", "UD-IQ2_M"). The prefix says how the file was built, not
+    # what it costs, so it is stripped and the base scheme priced -- see the
+    # note beside the _XL aliases above for why that is the safe reading.
+    if squashed.startswith("ud") and len(squashed) > 2:
+        base = squashed[2:]
+        if base in BYTES_PER_PARAM:
+            return base
+        return _ALIASES.get(base)
+    return None
 
 
 def is_known_dtype(dtype: str | None) -> bool:

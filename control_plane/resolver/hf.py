@@ -18,12 +18,12 @@ import requests
 from .types import MetadataUnavailable, ModelNotFound
 
 DEFAULT_ENDPOINT = "https://huggingface.co"
-DEFAULT_TIMEOUT = float(os.environ.get("SPARKPLANE_HF_TIMEOUT", "8.0"))
-_USER_AGENT = "sparkplane-resolver/1.0"
+DEFAULT_TIMEOUT = float(os.environ.get("DERATE_HF_TIMEOUT", "8.0"))
+_USER_AGENT = "derate-resolver/1.0"
 
 
 def hf_token() -> str | None:
-    for var in ("SPARKPLANE_HF_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+    for var in ("DERATE_HF_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         value = os.environ.get(var)
         if value:
             return value.strip()
@@ -210,6 +210,21 @@ class HubClient:
                 "direction": "-1",
             },
         )
+        # "No such model" and "the hub would not answer" are different facts,
+        # and returning [] for both makes a rate limit look like an empty
+        # catalogue. A fabricated answer is worse than a raised one: the caller
+        # can degrade honestly, and available_quants already catches
+        # ResolverError and carries on.
+        if resp.status_code == 429:
+            raise MetadataUnavailable(
+                "the HuggingFace hub is rate limiting this coordinator; set "
+                "HF_TOKEN to raise the limit, or try again shortly"
+            )
+        if resp.status_code >= 500:
+            raise MetadataUnavailable(
+                f"the HuggingFace hub returned HTTP {resp.status_code} for a "
+                f"search; nothing can be listed until it recovers"
+            )
         if resp.status_code >= 400:
             return []
         try:

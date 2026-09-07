@@ -18,7 +18,13 @@ class AgentClient(Protocol):
     """What the registry needs from the outside world. Nothing more."""
 
     async def get_json(self, url: str, timeout: float) -> dict: ...
-    async def post_json(self, url: str, payload: dict, timeout: float) -> dict: ...
+    async def post_json(
+        self,
+        url: str,
+        payload: dict,
+        timeout: float,
+        headers: dict[str, str] | None = None,
+    ) -> dict: ...
 
 
 class HttpAgentClient:
@@ -44,10 +50,23 @@ class HttpAgentClient:
         except Exception as exc:
             raise ProbeFailed(f"GET {url} failed: {exc}") from exc
 
-    async def post_json(self, url: str, payload: dict, timeout: float) -> dict:
+    async def post_json(
+        self,
+        url: str,
+        payload: dict,
+        timeout: float,
+        headers: dict[str, str] | None = None,
+    ) -> dict:
+        """POST JSON. `headers` carries the cluster token to a peer's agent.
+
+        Keyword-defaulted rather than required: every caller that predates the
+        credentialed agent routes passes three arguments and still works.
+        """
         client = await self._get_client()
         try:
-            response = await client.post(url, json=payload, timeout=timeout)
+            response = await client.post(
+                url, json=payload, timeout=timeout, headers=headers or None
+            )
             response.raise_for_status()
             return response.json()
         except Exception as exc:

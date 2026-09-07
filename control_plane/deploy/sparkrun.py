@@ -61,7 +61,7 @@ NOT_INSTALLED = (
     "through sparkrun and will not launch vLLM or SGLang by hand.\n"
     "Install it with:  uv tool install sparkrun\n"
     "Then re-run this launch. If sparkrun is installed somewhere unusual, "
-    "point SPARKPLANE_SPARKRUN_BIN at it."
+    "point DERATE_SPARKRUN_BIN at it."
 )
 
 

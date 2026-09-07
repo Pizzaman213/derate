@@ -531,7 +531,7 @@ def test_telemetry_is_off_when_there_is_nowhere_to_write(tmp_path):
 
 
 def test_the_env_switch_turns_it_off(tmp_path, monkeypatch):
-    monkeypatch.setenv("SPARKPLANE_TELEMETRY", "0")
+    monkeypatch.setenv("DERATE_TELEMETRY", "0")
     assert not Telemetry.from_env(root=tmp_path).enabled
 
 

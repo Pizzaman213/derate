@@ -194,6 +194,10 @@ def node_state(
         power_watts=71.0,
         temperature_c=62.0,
         utilization_pct=40.0,
+        # A fixture node is one that reports: its readings are as current as
+        # its last_seen. Leaving this 0.0 would make every fixture look like a
+        # node whose telemetry has died.
+        sample_ts=last_seen,
     )
 
 

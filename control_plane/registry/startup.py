@@ -17,7 +17,12 @@ from pathlib import Path
 from control_plane.contracts import NodeProfile
 
 from .agent import NodeAgent, create_agent_app
-from .bootstrap import RoleDecision, rejoin_until_admitted, resolve_role
+from .bootstrap import (
+    RoleDecision,
+    adopt_cluster_token,
+    rejoin_until_admitted,
+    resolve_role,
+)
 from .config import ROLE_COORDINATOR, RegistryConfig
 from .discovery import Advertiser
 from .identity import ClusterIdentity, banner, load_or_create_identity
@@ -62,8 +67,13 @@ class NodeRuntime:
         a worker-in-waiting.
         """
         cluster_id = result.get("cluster_id") or ""
+        # An admission on an enrollment token carries the permanent cluster
+        # token with it. Take it before building the identity, or this node
+        # keeps the credential that is about to expire.
+        self.config = adopt_cluster_token(self.config, result)
         self.identity = ClusterIdentity(cluster_id=cluster_id, token=self.config.token or "")
         self.node_agent.cluster_id = cluster_id
+        self.node_agent.set_token(self.config.token)
         self.decision = dataclasses.replace(
             self.decision, joined=True, status="member", cluster_id=cluster_id
         )
@@ -118,7 +128,7 @@ def _journal_only(config: RegistryConfig, profile: NodeProfile):
     from control_plane.telemetry.service import Telemetry
 
     if not tconfig.enabled():
-        return Telemetry.disabled("SPARKPLANE_TELEMETRY is off")
+        return Telemetry.disabled("DERATE_TELEMETRY is off")
     root = Path(config.data_dir)
     if not root.is_dir():
         return Telemetry.disabled(f"{root} does not exist")
@@ -149,6 +159,13 @@ async def start_node(
 
     agent_url = f"http://{profile.address}:{config.agent_port}"
     decision = await resolve_role(config, profile, agent_url)
+    # A node admitted on an enrollment token was handed the permanent cluster
+    # token in the join response. Persist it now, before anything derives an
+    # identity from `config.token`.
+    config = adopt_cluster_token(
+        config,
+        {"cluster_token": decision.cluster_token, "cluster_id": decision.cluster_id},
+    )
 
     if decision.role == ROLE_COORDINATOR:
         identity = load_or_create_identity(
@@ -179,6 +196,8 @@ async def start_node(
         port=config.agent_port,
         advertiser=advertiser,
         sink=telemetry.sink,
+        token=identity.token,
+        data_root=config.data_dir,
     )
     await node_agent.start()
     await telemetry.start(node_id=profile.node_id)

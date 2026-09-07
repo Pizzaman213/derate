@@ -11,6 +11,7 @@ import logging
 import re
 from typing import Any
 
+from ..contracts.modality import Modality
 from ..contracts.providers import ProviderModel
 from .kinds import KindSpec, PricingUnit
 
@@ -20,12 +21,43 @@ log = logging.getLogger(__name__)
 # provider does not publish one, and reads as "unknown" everywhere downstream.
 CONTEXT_UNKNOWN = 0
 
-# Model families where streaming is not a meaningful operation. Matched on the
-# upstream id, which is a heuristic, and is why it only ever clears a flag.
-_NON_STREAMING = re.compile(
-    r"(embed|embedding|rerank|moderation|whisper|tts|dall-e|stable-diffusion|flux)",
-    re.IGNORECASE,
+# What a provider's model id says it does. Matched on the upstream id, which is
+# a heuristic, and is why every pattern here only ever moves a model *off* the
+# TEXT default -- an id that says nothing stays text, which is what an unknown
+# chat model is. Order matters: the first match wins, so the narrow families
+# come before the broad ones ("whisper" before "speech", or every ASR model
+# would classify as TTS).
+#
+# This table also drives the streaming flag it grew out of: a speech,
+# transcription or embedding endpoint has no token stream to open.
+_MODALITY_PATTERNS: tuple[tuple[re.Pattern[str], "Modality | None"], ...] = (
+    (
+        re.compile(r"(whisper|transcrib|speech[-_]?to[-_]?text|\bstt\b|\basr\b)", re.I),
+        Modality.TRANSCRIPTION,
+    ),
+    (
+        re.compile(r"(\btts\b|text[-_]?to[-_]?speech|\bvoice\b|speech)", re.I),
+        Modality.SPEECH,
+    ),
+    (re.compile(r"(embed|embedding)", re.I), Modality.EMBEDDING),
+    # Known non-streaming, but not an endpoint family this gateway routes.
+    # Left as TEXT so nothing claims to serve them, while the streaming flag
+    # is still cleared the way it always was.
+    (re.compile(r"(rerank|moderation|dall-e|stable-diffusion|flux)", re.I), None),
 )
+
+
+def _modality(upstream_id: str) -> Modality:
+    """Best guess at what this model answers on. TEXT when the id does not say."""
+    for pattern, modality in _MODALITY_PATTERNS:
+        if pattern.search(upstream_id):
+            return modality or Modality.TEXT
+    return Modality.TEXT
+
+
+def _streamable(upstream_id: str) -> bool:
+    """False for every family in the table, including the unrouted ones."""
+    return not any(pattern.search(upstream_id) for pattern, _ in _MODALITY_PATTERNS)
 
 
 def _entries(payload: Any) -> list[dict]:
@@ -100,8 +132,8 @@ def _supports_streaming(entry: dict, upstream_id: str) -> bool:
     if isinstance(params, list) and params:
         # OpenRouter lists every accepted parameter; stream is implied for chat
         # models and absent for the rest.
-        return not _NON_STREAMING.search(upstream_id)
-    return not _NON_STREAMING.search(upstream_id)
+        return _streamable(upstream_id)
+    return _streamable(upstream_id)
 
 
 def _as_float(value: Any) -> float | None:
@@ -181,6 +213,7 @@ def parse_models(
                 supports_tools=_supports_tools(entry),
                 input_cost_per_mtok=input_cost,
                 output_cost_per_mtok=output_cost,
+                modality=_modality(upstream_id),
             )
         )
     models.sort(key=lambda m: m.served_name)

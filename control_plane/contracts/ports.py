@@ -6,6 +6,8 @@ Everyone codes against the protocol, not the implementation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from typing import Protocol, runtime_checkable
 
 from .deployment import Deployment
@@ -38,7 +40,13 @@ class ResolverPort(Protocol):
 
 @runtime_checkable
 class FitPort(Protocol):
-    def check(self, req: FitRequest, nodes: list[NodeProfile]) -> FitResult: ...
+    def check(
+        self,
+        req: FitRequest,
+        nodes: list[NodeProfile],
+        *,
+        allocatable: Mapping[str, int] | None = None,
+    ) -> FitResult: ...
     def max_context(self, shape, plan, nodes, max_seqs, kv_dtype) -> int: ...
 
 
@@ -66,7 +74,12 @@ class ProviderPort(Protocol):
 
 @runtime_checkable
 class DeploymentPort(Protocol):
-    def launch(self, shape, plan, fit, runtime, ctx, max_seqs) -> Deployment: ...
+    # `modality` is keyword-only and defaulted: an implementation that predates
+    # audio keeps working, and one that accepts it records what the deployment
+    # answers on so the gateway can route a request to the right endpoint.
+    def launch(
+        self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=...
+    ) -> Deployment: ...
     def stop(self, deployment_id: str) -> None: ...
     def list(self) -> list[Deployment]: ...
     def get(self, deployment_id: str) -> Deployment | None: ...

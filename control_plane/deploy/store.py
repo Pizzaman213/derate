@@ -26,6 +26,7 @@ from control_plane.contracts import (
     DeploymentState,
     FitResult,
     MemoryBreakdown,
+    Modality,
     ModelShape,
     ParallelismKind,
     ParallelismPlan,
@@ -36,7 +37,9 @@ from .fsm import PERSISTED, TERMINAL
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+#: 2 adds Deployment.modality. decode() defaults it to TEXT, so a v1 record
+#: on disk still loads and a downgrade only loses the field.
+SCHEMA_VERSION = 2
 
 #: Low-severity finding: delete() had no caller, so FAILED/STOPPED records
 #: accumulated on disk forever and were reloaded into memory on every
@@ -166,6 +169,7 @@ def encode(d: Deployment) -> dict[str, Any]:
         "max_concurrent_seqs": d.max_concurrent_seqs,
         "started_at": d.started_at,
         "last_error": d.last_error,
+        "modality": d.modality.value,
     }
 
 
@@ -198,4 +202,7 @@ def decode(raw: dict[str, Any]) -> Deployment:
         max_concurrent_seqs=raw["max_concurrent_seqs"],
         started_at=raw["started_at"],
         last_error=raw["last_error"],
+        # Absent in schema v1. A record written before modality existed was
+        # necessarily a text deployment, so the default is also the truth.
+        modality=Modality(raw.get("modality", Modality.TEXT.value)),
     )

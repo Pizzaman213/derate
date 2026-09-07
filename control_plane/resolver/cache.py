@@ -41,7 +41,7 @@ from .types import (
 #: something different now.
 SCHEMA_VERSION = 3
 
-DEFAULT_TTL_SECONDS = float(os.environ.get("SPARKPLANE_RESOLVER_TTL", 24 * 3600))
+DEFAULT_TTL_SECONDS = float(os.environ.get("DERATE_RESOLVER_TTL", 24 * 3600))
 
 #: A revision only counts as pinned when it is exactly a full commit sha.
 #: Anything shorter or differently shaped -- a long branch name included --
@@ -55,13 +55,13 @@ def _is_pinned_commit(revision: str) -> bool:
 
 def default_cache_dir() -> Path:
     """``/data`` in the container, the user cache otherwise."""
-    override = os.environ.get("SPARKPLANE_CACHE_DIR")
+    override = os.environ.get("DERATE_CACHE_DIR")
     if override:
         return Path(override).expanduser() / "resolver"
     data = Path("/data")
     if data.is_dir() and os.access(data, os.W_OK):
         return data / "cache" / "resolver"
-    return Path.home() / ".cache" / "sparkplane" / "resolver"
+    return Path.home() / ".cache" / "derate" / "resolver"
 
 
 def cache_key(model_id: str, revision: str, dtype: str | None) -> str:

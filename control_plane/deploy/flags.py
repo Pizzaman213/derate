@@ -139,7 +139,7 @@ RUNTIMES: dict[str, RuntimeSpec] = {
     "vllm": RuntimeSpec(
         name="vllm",
         sparkrun_runtime="vllm",
-        default_image_env="SPARKPLANE_VLLM_IMAGE",
+        default_image_env="DERATE_VLLM_IMAGE",
         default_image="ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
         max_seqs_key="max_num_seqs",
         command_template=_VLLM_COMMAND,
@@ -149,7 +149,7 @@ RUNTIMES: dict[str, RuntimeSpec] = {
     "sglang": RuntimeSpec(
         name="sglang",
         sparkrun_runtime="sglang",
-        default_image_env="SPARKPLANE_SGLANG_IMAGE",
+        default_image_env="DERATE_SGLANG_IMAGE",
         default_image="scitrera/dgx-spark-sglang:0.5.9-t5",
         max_seqs_key="max_running_requests",
         command_template=_SGLANG_COMMAND,

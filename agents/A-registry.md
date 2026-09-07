@@ -34,16 +34,16 @@ GET /agent/telemetry    -> current NodeState metrics
 GET /agent/health       -> 200 with uptime and role
 ```
 
-Advertises over mDNS as `_sparkplane._tcp.local.` with TXT records carrying `role`, `cluster_id`, and `node_id`. Use `zeroconf`. Advertise on startup, withdraw cleanly on shutdown.
+Advertises over mDNS as `_derate._tcp.local.` with TXT records carrying `role`, `cluster_id`, and `node_id`. Use `zeroconf`. Advertise on startup, withdraw cleanly on shutdown.
 
 ### 3. Role resolution and join
 
-On startup, read `SPARKPLANE_ROLE` (default `auto`):
+On startup, read `DERATE_ROLE` (default `auto`):
 
 1. Browse mDNS for 3 seconds.
-2. A coordinator responds and `SPARKPLANE_TOKEN` matches: start as worker, `POST /api/nodes/join` to it with our profile and agent URL.
+2. A coordinator responds and `DERATE_TOKEN` matches: start as worker, `POST /api/nodes/join` to it with our profile and agent URL.
 3. Nothing responds: become coordinator, generate and persist a cluster token if none exists, print it, start advertising `role=coordinator`.
-4. `SPARKPLANE_ROLE=coordinator` or `=worker` forces the outcome. `SPARKPLANE_JOIN=<addr>` skips discovery for a node on another subnet.
+4. `DERATE_ROLE=coordinator` or `=worker` forces the outcome. `DERATE_JOIN=<addr>` skips discovery for a node on another subnet.
 
 Role is sticky for the process lifetime. There is no election and no failover. If the coordinator dies, workers keep running and the UI goes dark until it comes back. This is a deliberate scope decision.
 

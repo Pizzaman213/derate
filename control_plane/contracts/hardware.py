@@ -44,6 +44,44 @@ class NodeState:
     power_watts: float
     temperature_c: float
     utilization_pct: float
+    # unix ts of the last applied telemetry sample; 0.0 when there has never
+    # been one. Deliberately not ``last_seen``: the health loop refreshes that
+    # on every answered /agent/health, so a node whose nvidia-smi is gone --
+    # a container started without --gpus, say -- keeps a fresh last_seen while
+    # the four live readings below are frozen at whatever they last were. Two
+    # different questions ("is it reachable" / "is this number current") need
+    # two different timestamps, or the UI shows an hour-old wattage as live.
+    sample_ts: float = 0.0
+
+
+@dataclass(frozen=True)
+class GpuProcess:
+    """One compute context holding GPU memory, as nvidia-smi reports it.
+
+    Additive to section 4.1, and deliberately not a field on ``TelemetrySample``:
+    this is read on demand when an operator opens a node, never on the 5s poll,
+    so the durable journal does not carry a process list nobody reads.
+
+    ``command`` and ``user`` are best-effort from /proc and are None when the
+    entry could not be read -- a container without ``--pid=host`` sees neither
+    these processes nor their /proc entries, and inventing a name for one would
+    be worse than admitting we could not look.
+    """
+
+    pid: int
+    name: str  # basename, for display
+    command: str | None  # full /proc cmdline, truncated
+    user: str | None
+    gpu_memory: int  # bytes
+
+    def as_dict(self) -> dict:
+        return {
+            "pid": self.pid,
+            "name": self.name,
+            "command": self.command,
+            "user": self.user,
+            "gpu_memory": self.gpu_memory,
+        }
 
 
 @dataclass(frozen=True)

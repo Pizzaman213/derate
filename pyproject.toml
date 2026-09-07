@@ -1,5 +1,5 @@
 [project]
-name = "sparkplane"
+name = "derate"
 version = "0.1.0"
 description = "Planning and orchestration for DGX Spark clusters"
 requires-python = ">=3.12"

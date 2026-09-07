@@ -117,6 +117,10 @@ class MetricsHub:
                         "temp_c": node.temperature_c,
                         "memory_used_pct": used_pct,
                         "util_pct": node.utilization_pct,
+                        # When these four were measured. The UI greys a node
+                        # whose sample has aged out rather than passing a
+                        # frozen reading off as current.
+                        "sample_ts": node.sample_ts or None,
                     }
                 )
                 total_power += node.power_watts or 0.0

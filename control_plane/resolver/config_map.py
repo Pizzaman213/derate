@@ -19,6 +19,14 @@ _VISION_CONFIG_KEYS = ("vision_config", "vision_tower_config", "visual", "vit_co
 _LAYER_KEYS = ("num_hidden_layers", "n_layer", "n_layers", "num_layers", "num_blocks")
 _HIDDEN_KEYS = ("hidden_size", "d_model", "n_embd", "model_dim", "hidden_dim", "dim")
 _HEAD_KEYS = ("num_attention_heads", "n_head", "num_heads", "n_heads", "attention_heads")
+
+# Encoder-decoder speech models (Whisper and its descendants) publish their
+# widths per half rather than once. The decoder is the autoregressive half --
+# it is what generates tokens and what holds a KV cache -- so it is the half a
+# shape must describe. Consulted only when the ordinary keys are absent, so no
+# decoder-only config can reach them.
+_DECODER_LAYER_KEYS = ("decoder_layers", "n_decoder_layers")
+_DECODER_HEAD_KEYS = ("decoder_attention_heads",)
 _KV_HEAD_KEYS = (
     "num_key_value_heads",
     "num_kv_heads",
@@ -169,6 +177,24 @@ def map_config(config: dict[str, Any]) -> Mapped:
     num_layers = _int(_first(cfg, _LAYER_KEYS))
     hidden_size = _int(_first(cfg, _HIDDEN_KEYS))
     num_heads = _int(_first(cfg, _HEAD_KEYS))
+
+    # Whisper large-v3 carries num_hidden_layers but no num_attention_heads,
+    # only encoder_/decoder_attention_heads. Fall back to the decoder's
+    # figures, and say so: an encoder-decoder shape charged as if it were
+    # decoder-only understates the weights by the size of the encoder, which
+    # the parameter count from the weight index later corrects.
+    if cfg.get("is_encoder_decoder") is True:
+        if num_layers is None:
+            num_layers = _int(_first(cfg, _DECODER_LAYER_KEYS))
+        if num_heads is None:
+            num_heads = _int(_first(cfg, _DECODER_HEAD_KEYS))
+        if num_layers is not None and num_heads is not None:
+            warnings.append(
+                "encoder-decoder config; shape describes the decoder stack "
+                "only, and the encoder is counted through the measured "
+                "parameter total rather than this shape"
+            )
+
     if num_layers is None or hidden_size is None or num_heads is None:
         missing = [
             name
@@ -245,7 +271,21 @@ def map_config(config: dict[str, Any]) -> Mapped:
             cfg.get("attention_bias", cfg.get("bias", cfg.get("use_bias", False)))
         ),
         max_position_embeddings=_int(
-            _first(cfg, ("max_position_embeddings", "n_positions", "max_seq_len", "seq_length"))
+            _first(
+                cfg,
+                (
+                    "max_position_embeddings",
+                    "n_positions",
+                    "max_seq_len",
+                    "seq_length",
+                    # Encoder-decoder speech models state the two halves
+                    # separately; the decoder's limit is the one that bounds a
+                    # request. Whisper large-v3 publishes 448 here and nothing
+                    # under any of the names above, so without it the planner
+                    # would offer a context length vLLM then refuses to start.
+                    "max_target_positions",
+                ),
+            )
         ),
         model_type=model_type,
         architectures=arch_names,

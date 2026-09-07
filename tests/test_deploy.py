@@ -24,6 +24,7 @@ from control_plane.contracts import (  # noqa: E402
     Deployment,
     DeploymentPort,
     DeploymentState as S,
+    Modality,
     NodeState,
     ParallelismKind,
     ParallelismPlan,
@@ -1398,6 +1399,45 @@ def test_store_roundtrips_every_contract_field(tmp_path):
     assert handle["cluster_id"] == "sparkrun_abc"
 
 
+def test_a_schema_v1_record_still_loads_after_modality_was_added(tmp_path):
+    """Adding a contract field must not orphan what is already on disk.
+
+    The codec is hand-written precisely so a contract change is noticed, but
+    "noticed" has to mean a default, not a KeyError on every restart. A record
+    written before modality existed was necessarily a text deployment, so the
+    default is also the truth.
+    """
+    store = DeploymentStore(tmp_path / "deployments")
+    current = Deployment(
+        "d-1", "gpt-oss-120b", fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm",
+        S.READY, "http://h:8100/v1", 4096, 8, 1757193600.0, None,
+    )
+    path = store.save(current, {"port": 8100})
+
+    # Rewrite it as v1: no modality key anywhere, which is exactly what the
+    # previous build wrote.
+    raw = json.loads(path.read_text())
+    raw["schema_version"] = 1
+    del raw["deployment"]["modality"]
+    path.write_text(json.dumps(raw))
+
+    (restored, _), = store.load_all()
+    assert restored.modality is Modality.TEXT
+    assert restored == current
+
+
+def test_modality_survives_a_store_roundtrip(tmp_path):
+    store = DeploymentStore(tmp_path / "deployments")
+    original = Deployment(
+        "d-2", "kokoro", fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm",
+        S.READY, "http://h:8100/v1", 4096, 8, 1757193600.0, None,
+        modality=Modality.SPEECH,
+    )
+    store.save(original, {"port": 8100})
+    (restored, _), = store.load_all()
+    assert restored.modality is Modality.SPEECH
+
+
 # ==========================================================================
 # Low: FAILED/STOPPED records must not accumulate forever. purge_expired()
 # is the terminal-record GC; reconcile() runs it once per restart.
@@ -1804,7 +1844,7 @@ def _preflight_module():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "sparkplane_preflight", REPO / "docker" / "preflight.py"
+        "derate_preflight", REPO / "docker" / "preflight.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -1859,7 +1899,7 @@ def test_preflight_override_is_a_loud_warning_not_silence(monkeypatch):
     monkeypatch.setattr(module, "interfaces", lambda: ["eth0"])
     monkeypatch.setattr(module, "is_veth", lambda name: True)
     monkeypatch.setattr(module.Path, "exists", lambda self: False)
-    monkeypatch.setenv("SPARKPLANE_ALLOW_BRIDGE", "1")
+    monkeypatch.setenv("DERATE_ALLOW_BRIDGE", "1")
 
     stream = io.StringIO()
     assert module.check(stream=stream) is True
@@ -1885,10 +1925,10 @@ def test_dockerfile_ships_one_image_with_the_required_shape():
     # Persisted state.
     assert 'VOLUME ["/data"]' in dockerfile
     # Every environment variable has a working default.
-    for var in ("SPARKPLANE_ROLE", "SPARKPLANE_PORT", "SPARKPLANE_AGENT_PORT"):
+    for var in ("DERATE_ROLE", "DERATE_PORT", "DERATE_AGENT_PORT"):
         assert "%s=" % var in dockerfile
-    assert "SPARKPLANE_TOKEN" in dockerfile
-    assert "SPARKPLANE_JOIN" in dockerfile
+    assert "DERATE_TOKEN" in dockerfile
+    assert "DERATE_JOIN" in dockerfile
 
 
 def test_compose_uses_host_networking_and_restarts():
@@ -1912,12 +1952,12 @@ def test_image_refuses_bridge_networking():
     """The acceptance test for the trap: started on a bridge, the container
     exits with a message naming --network host."""
     if subprocess.run(
-        ["docker", "image", "inspect", "sparkplane/node:test"], capture_output=True
+        ["docker", "image", "inspect", "derate/node:test"], capture_output=True
     ).returncode != 0:
-        pytest.skip("build sparkplane/node:test first: docker build -t sparkplane/node:test .")
+        pytest.skip("build derate/node:test first: docker build -t derate/node:test .")
 
     proc = subprocess.run(
-        ["docker", "run", "--rm", "--network", "bridge", "sparkplane/node:test"],
+        ["docker", "run", "--rm", "--network", "bridge", "derate/node:test"],
         capture_output=True, text=True, timeout=120,
     )
     output = proc.stdout + proc.stderr
@@ -1930,11 +1970,11 @@ def test_image_refuses_bridge_networking():
 def test_image_starts_on_host_networking_and_answers_agent_health():
     """docker run --network host, no configuration, working health endpoint."""
     if subprocess.run(
-        ["docker", "image", "inspect", "sparkplane/node:test"], capture_output=True
+        ["docker", "image", "inspect", "derate/node:test"], capture_output=True
     ).returncode != 0:
-        pytest.skip("build sparkplane/node:test first: docker build -t sparkplane/node:test .")
+        pytest.skip("build derate/node:test first: docker build -t derate/node:test .")
 
-    name = "sparkplane-acceptance-%d-%d" % (os.getpid(), int(time.time()))
+    name = "derate-acceptance-%d-%d" % (os.getpid(), int(time.time()))
     subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
     # Two distinct ports, so the two-port path is what gets exercised, and
     # free ones because host networking shares the host's ports -- a fixed
@@ -1947,9 +1987,9 @@ def test_image_starts_on_host_networking_and_answers_agent_health():
             # --restart is exercised through compose; it conflicts with --rm.
             "docker", "run", "-d", "--name", name,
             "--network", "host",
-            "-e", "SPARKPLANE_PORT=%d" % ui_port,
-            "-e", "SPARKPLANE_AGENT_PORT=%d" % agent_port,
-            "sparkplane/node:test",
+            "-e", "DERATE_PORT=%d" % ui_port,
+            "-e", "DERATE_AGENT_PORT=%d" % agent_port,
+            "derate/node:test",
         ],
         capture_output=True, text=True, timeout=120,
     )
@@ -2042,9 +2082,9 @@ def test_image_says_which_variable_moves_a_port_collision():
     """Host networking shares the host's ports. A collision must not be a
     traceback."""
     if subprocess.run(
-        ["docker", "image", "inspect", "sparkplane/node:test"], capture_output=True
+        ["docker", "image", "inspect", "derate/node:test"], capture_output=True
     ).returncode != 0:
-        pytest.skip("build sparkplane/node:test first: docker build -t sparkplane/node:test .")
+        pytest.skip("build derate/node:test first: docker build -t derate/node:test .")
 
     import socket as _socket
 
@@ -2060,16 +2100,16 @@ def test_image_says_which_variable_moves_a_port_collision():
         proc = subprocess.run(
             [
                 "docker", "run", "--rm", "--network", "host",
-                "-e", "SPARKPLANE_PORT=%d" % ui_port,
-                "-e", "SPARKPLANE_AGENT_PORT=%d" % taken,
-                "sparkplane/node:test",
+                "-e", "DERATE_PORT=%d" % ui_port,
+                "-e", "DERATE_AGENT_PORT=%d" % taken,
+                "derate/node:test",
             ],
             capture_output=True, text=True, timeout=120,
         )
         output = proc.stdout + proc.stderr
         assert proc.returncode != 0
         assert "already in use" in output
-        assert "SPARKPLANE_AGENT_PORT" in output
+        assert "DERATE_AGENT_PORT" in output
         assert "Traceback" not in output
     finally:
         holder.close()

@@ -1,28 +1,52 @@
-import { useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useCluster, useRouting, useTopology } from '../state/resources'
-import { useMetrics } from '../state/metrics'
 import { useBackend } from '../state/backend'
-import { FlowGraph, type FlowGraphHandle } from './cluster/FlowGraph'
+import { ClusterGraph, type ClusterGraphHandle } from './cluster/ClusterGraph'
 import { GraphToolbar } from './cluster/GraphToolbar'
 import { SelectionRail } from './cluster/SelectionRail'
+import { clearOrder, readOrder, writeOrder } from './cluster/order'
 
-/** The Cluster destination: the request-flow graph and the rail beneath it.
+const EMPTY_TOPOLOGY = { cluster_id: '', coordinator: '', nodes: [], edges: [], deployments: [] }
+
+/** The Cluster destination: the machine floor and the rail beneath it.
  *
- *  Ported from mockups-next/js/cluster.js + inspectors.js. This component
- *  fetches its own data (the same `state/resources` hooks every other
- *  destination uses) rather than taking props, so it can be dropped into
+ *  This component fetches its own data (the same `state/resources` hooks every
+ *  other destination uses) rather than taking props, so it can be dropped into
  *  AppShell's `cluster` tabpanel on its own. */
 export function ClusterTab() {
   const cluster = useCluster()
   const topology = useTopology()
   const routing = useRouting()
-  const { frame, stale } = useMetrics()
   const { backend, invalidate } = useBackend()
 
   const [measuring, setMeasuring] = useState<string | null>(null)
   const [measureError, setMeasureError] = useState<{ key: string; message: string } | null>(null)
-  const graphRef = useRef<FlowGraphHandle>(null)
+  const graphRef = useRef<ClusterGraphHandle>(null)
   const zoomLabelRef = useRef<HTMLSpanElement>(null)
+
+  const clusterId = topology.data?.cluster_id ?? ''
+  const [order, setOrder] = useState<string[] | null>(null)
+  const [live, setLive] = useState('')
+
+  // The arrangement is per cluster, and the cluster id is not known until the
+  // first poll answers.
+  useEffect(() => {
+    setOrder(clusterId ? readOrder(clusterId) : null)
+  }, [clusterId])
+
+  const reorder = useCallback(
+    (next: string[]) => {
+      setOrder(next)
+      if (clusterId) writeOrder(clusterId, next)
+    },
+    [clusterId],
+  )
+
+  const resetLayout = useCallback(() => {
+    setOrder(null)
+    if (clusterId) clearOrder(clusterId)
+    setLive('Machines put back in their default order.')
+  }, [clusterId])
 
   const measure = async (a: string, b: string) => {
     const key = [a, b].sort().join('~')
@@ -41,50 +65,78 @@ export function ClusterTab() {
     }
   }
 
-  return (
-    <div className="stage bare">
-      <GraphToolbar graphRef={graphRef} zoomLabelRef={zoomLabelRef} />
+  const nodeCount = topology.data?.nodes.length ?? 0
 
-      <FlowGraph
-        ref={graphRef}
-        deployments={cluster.data?.deployments ?? []}
-        topology={topology.data ?? { cluster_id: '', coordinator: '', nodes: [], edges: [], deployments: [] }}
-        nodes={cluster.data?.nodes ?? []}
-        routing={routing.data ?? []}
+  return (
+    <div className="stage bare clusterstage">
+      <GraphToolbar
+        graphRef={graphRef}
         zoomLabelRef={zoomLabelRef}
+        rearranged={order != null}
+        onResetLayout={resetLayout}
       />
 
+      {/* The drawing takes whatever is left between the toolbar and the two
+          reference blocks below, and sits in the middle of it. */}
+      <div className="floor">
+        <ClusterGraph
+          ref={graphRef}
+          deployments={cluster.data?.deployments ?? []}
+          topology={topology.data ?? EMPTY_TOPOLOGY}
+          nodes={cluster.data?.nodes ?? []}
+          routing={routing.data ?? []}
+          zoomLabelRef={zoomLabelRef}
+          order={order}
+          onReorder={reorder}
+          announce={setLive}
+        />
+      </div>
+
+      <p aria-live="polite" className="sr-only">
+        {live}
+      </p>
+
+      {/* The rail and the legend are the reference desk, so .clusterstage pins
+          them to the bottom of the destination instead of letting them trail
+          the drawing. Nothing above them moves when a link is selected. */}
       <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--rule)' }}>
         <SelectionRail
           edges={topology.data?.edges ?? []}
           measurements={cluster.data?.links ?? []}
-          nodes={cluster.data?.nodes ?? []}
-          frame={frame}
-          stale={stale}
           measuring={measuring}
           measureError={measureError}
           onMeasure={(a, b) => void measure(a, b)}
+          crowded={nodeCount > 4}
         />
       </div>
 
+      {/* One meaning per channel. Width is measured bandwidth; a dash is
+          never-measured or a boundary crossing; colour means something is
+          wrong, which is why a healthy plate has none. */}
       <div className="legend" style={{ marginTop: 11, paddingTop: 11, borderTop: '1px solid var(--rule)' }}>
         <span>
-          <b>heavy</b> measured, on your hardware
+          <b>thick</b> measured all-reduce, against the 40 GB/s tensor-parallel threshold
+        </span>
+        <span>
+          <b>dashed</b> never measured, and carrying no figure
+        </span>
+        <span>
+          <b>inset meter</b> memory used
+        </span>
+        <span>
+          <b>plate border</b> amber or red when the machine needs looking at
+        </span>
+        <span>
+          <b>band</b> one deployment across the machines it occupies
         </span>
         <span>
           <b>thin dashed</b> crosses the routing boundary, no measured fabric
         </span>
         <span>
-          <b>hairline</b> reachable through the proxy, not routed there
-        </span>
-        <span>
-          <b>faded</b> idle
+          <b>outlined</b> third party
         </span>
         <span>
           <b>blue</b> request in flight
-        </span>
-        <span>
-          <b>outlined</b> third party
         </span>
       </div>
     </div>

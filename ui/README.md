@@ -13,35 +13,41 @@ npm run typecheck
 
 ## Running before there is a cluster
 
-`VITE_API_MODE` selects the backend, and defaults to `auto`:
+The client is **live only**. `src/api/fixtures.ts` and `VITE_API_MODE` are gone
+as of the derate port: the coordinator is always there in the deployed shape,
+and a second code path that only runs when it is not was a second thing to keep
+honest.
 
-| value | behaviour |
-|---|---|
-| `auto` | probe `GET /api/cluster` once; use it if it answers, otherwise fixtures |
-| `live` | always the coordinator |
-| `fixture` | always the in-browser stub, even if a coordinator is running |
+The day-0 stub still exists, on the server side, and is the way to bring up a
+richer cluster than the machine in front of you:
 
-In fixture mode the nameplate says **fixture data** and offers three scenarios —
-two Sparks serving, one node with nothing running, spark-02 unreachable. Demo
-numbers are always labelled as demo numbers; a fixture that looks live is worse
-than one that says what it is.
+```bash
+DERATE_GATEWAY=http://localhost:8088 npm run dev   # against a real coordinator
+```
 
-`src/api/fixtures.ts` is Agent G's day-0 stub reimplemented in the browser. Node
-profiles, the 10.2 GB/s ConnectX-7 measurement and the model shapes are copied
-from `tests/fixtures/`, so this renders the same demo data every other
-workstream tests against. **Delete it at integration**, along with the fixture
-branch of `src/api/client.ts`.
+`vite.config.ts` proxies `/api` and `/v1` to `$DERATE_GATEWAY`, defaulting
+to `:8080`. Point it wherever the coordinator actually is.
+
+For the parts of the graph a two-node cluster cannot show — the compact and chip
+density tiers, the ring, a wide unmeasured mesh — run the layout verifier, which
+needs neither a browser nor a cluster:
+
+```bash
+node src/tabs/cluster/layout.check.mjs   # assertions, plus layout-preview.svg
+```
 
 ## Layout
 
 ```
 src/api/        types mirrored from the frozen contracts, the HTTP client,
-                the fixture stub, and a defensive credential scrub
-src/state/      polled resources and the 1 Hz metrics stream
+                and a defensive credential scrub
+src/state/      polled resources, the 1 Hz metrics stream, selection
 src/styles/     the token layer; dark mode redefines five variables
-src/components/ Readout, Lamp, Sparkline, Bars, Panel, Verbatim
-src/panels/     sidebar: roster, discovery, plan, routing, providers
-src/views/      instrument, cluster graph, plan and refusal, node detail
+src/components/ Readout, Lamp, Bars, Panel, Verbatim
+src/shell/      header, app shell, the one sheet
+src/sidebar/    roster, plan, routing, cost
+src/tabs/       dashboard, cluster, spend, settings
+src/inspectors/ node and deployment detail, hosted by the sheet
 ```
 
 ## Things that look like details and are not
@@ -57,10 +63,28 @@ more precise than any rewrite, and they are the product. They are rendered
 exactly as received — never truncated, re-cased, or summarised. Rendering one
 through anything else is the bug.
 
-**Graph layout is a pure function of the sorted node ids.** Row up to four
-machines, ring beyond. No force simulation: at this node count physics produces
-drifting, unrepeatable positions, and a machine that moves between refreshes is
-a machine you cannot learn the position of.
+**The cluster graph is a machine floor, and it draws every machine.** One card
+per node in `/api/topology`, whether or not it is running anything — an idle
+Spark, a node that just joined and a node that has gone unreachable are all
+things you need to see, and a graph built out of deployments cannot show any of
+them. Cards shrink by tier as the cluster grows (full to 4, compact to 8, chip
+to 12) rather than being sized by dividing the available width, which is how the
+previous layout could compute a negative box.
+
+**Positions are a pure function of the node set.** Coordinator first, then
+sorted ids, arranged in a row or a grid and a ring past twelve. No force
+simulation: at this node count physics produces drifting, unrepeatable
+positions, and a machine that moves between refreshes is a machine you cannot
+learn the position of. A machine can be dragged to another slot to match the
+rack it is actually in; what gets stored is a permutation of node ids, never
+coordinates, because coordinates stop meaning anything the moment the window
+resizes or the card size changes. `Reset layout` puts the default back.
+
+**The unmeasured mesh is not all drawn at once.** `/api/topology` returns every
+pair, so twelve machines is sixty-six edges of which one or two carry a figure.
+Every measured link is always on the canvas; an unmeasured pair is drawn when a
+deployment is relying on it, when the whole mesh is small enough to show, or
+when its machine is selected. The rail below lists all of them either way.
 
 **Edge thickness is scaled against the 40 GB/s tensor-parallel threshold**, not
 against the fastest link present, so a link drawn at full weight is a link where
@@ -79,7 +103,20 @@ add an inverse.
 
 ## Deliberately not built
 
-Per `00-architecture.md` §1: no WAN endpoint, no chat interface or history, no
-log browser, no deep-dive metrics page, no model catalog browser. The picker is
-the four curated shapes plus one free-text HuggingFace ID field. The main view's
-readouts are the whole metrics surface.
+Per `00-architecture.md` §1: no WAN endpoint, no chat history, no log browser,
+no deep-dive metrics page. The main view's readouts are the whole metrics
+surface.
+
+§1's "model catalog browser" was reversed deliberately and is recorded in that
+file's section 1 amendment appendix. The Models tab browses the curated
+catalog, running deployments and provider models, and opens each one on its
+quantization ladder -- every variant with the repository that carries it, its
+measured size, and a fit verdict from the same gate a launch goes through. It
+is not the catalog §1 refused: a catalog lists what exists, this answers what
+runs here. Settings carries the reversal on screen under "Scope changed".
+
+§1's "chat interface" half was reversed deliberately and is recorded in that
+file's integration appendix. The Chat tab is a client for `/v1/models` and
+`/v1/chat/completions`, both of which already existed; it adds no backend
+surface and stores nothing, in the browser or on the coordinator. The history
+half of the non-goal stands.

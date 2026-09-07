@@ -1184,13 +1184,13 @@ def test_non_strict_mode_still_backfills_stubs_by_default():
 
 
 def test_static_ui_is_served_when_ui_dir_exists_and_api_routes_still_work(tmp_path):
-    (tmp_path / "index.html").write_text("<h1>hello sparkplane</h1>")
+    (tmp_path / "index.html").write_text("<h1>hello derate</h1>")
     settings = GatewaySettings(ui_dir=str(tmp_path))
 
     with TestClient(create_app(GatewayDeps(registry=_EmptyRegistry(), settings=settings))) as client:
         page = client.get("/")
         assert page.status_code == 200
-        assert "hello sparkplane" in page.text
+        assert "hello derate" in page.text
 
         assert client.get("/healthz").status_code == 200
         assert client.get("/v1/models").status_code == 200
@@ -1217,12 +1217,12 @@ def test_no_ui_dir_by_default_leaves_root_unmounted():
 
 
 def test_ui_dir_setting_defaults_from_the_environment_variable(monkeypatch, tmp_path):
-    monkeypatch.setenv("SPARKPLANE_UI_DIR", str(tmp_path))
+    monkeypatch.setenv("DERATE_UI_DIR", str(tmp_path))
     assert GatewaySettings().ui_dir == str(tmp_path)
 
 
 def test_ui_dir_setting_defaults_to_none_without_the_environment_variable(monkeypatch):
-    monkeypatch.delenv("SPARKPLANE_UI_DIR", raising=False)
+    monkeypatch.delenv("DERATE_UI_DIR", raising=False)
     assert GatewaySettings().ui_dir is None
 
 

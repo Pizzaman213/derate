@@ -21,9 +21,9 @@ BRIDGE_MESSAGE = (
     "Bridge networking detected. mDNS discovery cannot cross a Docker bridge, "
     "so this node would never find or be found by a coordinator.\n"
     "Start the container with host networking:\n"
-    "    docker run --network host -v sparkplane:/data sparkplane/node\n"
-    "If you are certain this is wrong, set SPARKPLANE_ALLOW_BRIDGE=1 to skip "
-    "this check. Discovery will not work; use SPARKPLANE_JOIN=<addr> instead."
+    "    docker run --network host -v derate:/data ghcr.io/pizzaman213/derate/node\n"
+    "If you are certain this is wrong, set DERATE_ALLOW_BRIDGE=1 to skip "
+    "this check. Discovery will not work; use DERATE_JOIN=<addr> instead."
 )
 
 # Interfaces a default-bridge container sees. If a container sees these and
@@ -85,7 +85,7 @@ def require_host_networking(
 ) -> None:
     """Raise BridgeNetworkError unless we can actually do mDNS."""
     if allow_bridge:
-        log.warning("SPARKPLANE_ALLOW_BRIDGE set: skipping the host-network check")
+        log.warning("DERATE_ALLOW_BRIDGE set: skipping the host-network check")
         return
     if detect_bridge_networking(interfaces=interfaces, container=container):
         raise BridgeNetworkError(BRIDGE_MESSAGE)

@@ -8,6 +8,7 @@ must be how the tests run.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import threading
@@ -18,13 +19,15 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.websockets import WebSocketDisconnect
 from starlette.routing import Route
 
 from control_plane.contracts import (
     Deployment,
     DeploymentState,
     DeviceClass,
+    Modality,
     NodeProfile,
     Provider,
     ProviderKind,
@@ -58,6 +61,11 @@ SECRET_KEY = "sk-do-not-leak-me-0123456789"
 
 # A request carrying this is held open by FakeBackend until released.
 HOLD_MARKER = "please-hold-this-request"
+
+#: A minimal MP3: an ID3v2 header and a frame's worth of noise. Not valid
+#: audio, deliberately -- it only has to be bytes that are not UTF-8 JSON,
+#: so that anything on the path which tried to decode it would fail loudly.
+SPEECH_BYTES = b"ID3\x03\x00\x00\x00\x00\x00\x00" + bytes(range(256)) * 4
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +172,7 @@ class FakeDeployments:
         self.deployments = list(deployments or [])
         self.launched = []
 
-    def launch(self, shape, plan, fit, runtime, ctx, max_seqs):
+    def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=Modality.TEXT):
         dep = make_deployment(
             f"d-new-{len(self.launched) + 1}",
             shape.model_id,
@@ -249,6 +257,7 @@ def make_deployment(
     max_concurrent_seqs=8,
     kv_cache_bytes=12 * GIB,
     shape_key="llama-3.3-70b",
+    modality=Modality.TEXT,
 ) -> Deployment:
     fit = fits()
     fit.predicted_decode_tps = predicted_tps
@@ -271,6 +280,7 @@ def make_deployment(
         max_concurrent_seqs=max_concurrent_seqs,
         started_at=1757193600.0,
         last_error=None,
+        modality=modality,
     )
 
 
@@ -284,6 +294,7 @@ def make_provider(
     enabled=True,
     priority=10,
     output_cost=0.30,
+    modality=Modality.TEXT,
 ) -> Provider:
     return Provider(
         provider_id=provider_id,
@@ -302,6 +313,7 @@ def make_provider(
                 supports_tools=True,
                 input_cost_per_mtok=0.10,
                 output_cost_per_mtok=output_cost,
+                modality=modality,
             )
         ],
         healthy=healthy,
@@ -358,6 +370,8 @@ class FakeBackend:
         self.first_chunk_delay = first_chunk_delay
         self.requests: list[dict] = []
         self.headers: list[dict] = []
+        # Raw multipart bodies, kept unparsed. See _transcriptions.
+        self.uploads: list[bytes] = []
         # Set to a threading.Event to block responses. Only requests whose
         # body carries HOLD_MARKER wait on it, so a test can hold one request
         # open while still probing the gateway with others.
@@ -367,6 +381,10 @@ class FakeBackend:
                 Route("/v1/chat/completions", self._chat, methods=["POST"]),
                 Route("/v1/completions", self._chat, methods=["POST"]),
                 Route("/v1/embeddings", self._embeddings, methods=["POST"]),
+                Route("/v1/audio/speech", self._speech, methods=["POST"]),
+                Route(
+                    "/v1/audio/transcriptions", self._transcriptions, methods=["POST"]
+                ),
             ]
         )
 
@@ -419,6 +437,31 @@ class FakeBackend:
                 "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
                 "usage": {"prompt_tokens": 4, "total_tokens": 4},
             }
+        )
+
+    async def _transcriptions(self, request):
+        """Record the upload verbatim.
+
+        Deliberately reads request.body() rather than request.form(): the point
+        of the test is that the bytes the gateway sent are the bytes the client
+        sent, and parsing them would hide a re-encode instead of catching it.
+        """
+        self.uploads.append(await request.body())
+        self.headers.append(dict(request.headers))
+        return JSONResponse({"text": "hello from the cluster"})
+
+    async def _speech(self, request):
+        """Answer the way a TTS server does: binary audio, not JSON.
+
+        The ID3 header is what makes `file` call it an MP3, and asserting on it
+        is how a test proves the gateway did not decode, re-encode or otherwise
+        touch the bytes on their way through.
+        """
+        await self._record(request)
+        return Response(
+            SPEECH_BYTES,
+            media_type="audio/mpeg",
+            headers={"content-disposition": 'attachment; filename="speech.mp3"'},
         )
 
     async def _sse(self):
@@ -691,6 +734,474 @@ def test_embeddings_are_proxied():
             )
     assert reply.status_code == 200
     assert reply.json()["data"][0]["embedding"] == [0.1, 0.2]
+
+
+# ---------------------------------------------------------------------------
+# audio endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_speech_is_proxied_and_the_audio_comes_back_untouched():
+    """The bytes a client gets are the bytes the runtime sent.
+
+    This is the whole reason /v1/audio/speech needed no new response path: the
+    proxy streams aiter_raw() and forwards the upstream's own headers, so an
+    MP3 survives it. Asserting byte equality rather than a status code is what
+    proves nothing on the way through decoded or re-encoded it.
+    """
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [
+                    make_deployment(
+                        "d-1",
+                        "kokoro",
+                        backend_url=running.base_url,
+                        modality=Modality.SPEECH,
+                    )
+                ]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/audio/speech",
+                json={"model": "kokoro", "input": "hello", "voice": "af"},
+            )
+    assert reply.status_code == 200
+    assert reply.content == SPEECH_BYTES
+    assert reply.headers["content-type"] == "audio/mpeg"
+    # The trace id every /v1 response carries. An audio response is not exempt.
+    assert reply.headers["X-Request-Id"].startswith("r-")
+
+
+def test_speech_requests_carry_no_stream_field():
+    """A TTS body has no `stream`, and a strict upstream 400s on an unknown one.
+
+    The provider path used to add `stream` to every forwarded body; this pins
+    that it no longer does for audio, which is the difference between /v1/audio
+    working against a real provider and not.
+    """
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [
+                    make_deployment(
+                        "d-1",
+                        "kokoro",
+                        backend_url=running.base_url,
+                        modality=Modality.SPEECH,
+                    )
+                ]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            client.post(
+                "/v1/audio/speech", json={"model": "kokoro", "input": "hi"}
+            )
+    assert "stream" not in backend.requests[0]
+
+
+def test_a_speech_model_is_refused_on_the_chat_endpoint():
+    """Naming a TTS model in a chat request is a mistake worth explaining.
+
+    "No such model" would be a lie -- it exists and is serving -- so the
+    refusal has to name the endpoint that would have worked, or the caller is
+    left thinking they mistyped the model name.
+    """
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [
+                make_deployment(
+                    "d-1",
+                    "kokoro",
+                    backend_url="http://backend.invalid/v1",
+                    modality=Modality.SPEECH,
+                )
+            ]
+        )
+    )
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/v1/chat/completions",
+            json={"model": "kokoro", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert reply.status_code == 400
+    error = reply.json()["error"]
+    assert error["code"] == "wrong_modality"
+    assert "/v1/audio/speech" in error["message"]
+    assert error["correct_endpoint"] == "/v1/audio/speech"
+
+
+def test_a_chat_model_is_refused_on_the_speech_endpoint():
+    """The guard runs in both directions, and refuses before anything is sent."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-1", "llama-3.3-70b", backend_url=running.base_url)]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/audio/speech",
+                json={"model": "llama-3.3-70b", "input": "hello"},
+            )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "wrong_modality"
+    # Refused by us, so the runtime never heard about it.
+    assert backend.requests == []
+
+
+def test_a_text_model_still_serves_embeddings():
+    """Text and embeddings are one family here and must stay one.
+
+    One vLLM server answers both from the same weights, so a modality check
+    that treated them as exclusive would refuse requests that work today. Only
+    audio is a real split.
+    """
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-1", "llama-3.3-70b", backend_url=running.base_url)]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/embeddings", json={"model": "llama-3.3-70b", "input": "hello"}
+            )
+    assert reply.status_code == 200
+
+
+def test_models_listing_says_what_each_model_answers():
+    """Without this a client cannot tell a TTS model from a chat model, which
+    is exactly the confusion that made a provider's whisper-1 show up in the
+    chat picker."""
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [
+                make_deployment("d-1", "llama-3.3-70b", backend_url="http://a.invalid/v1"),
+                make_deployment(
+                    "d-2",
+                    "kokoro",
+                    backend_url="http://b.invalid/v1",
+                    modality=Modality.SPEECH,
+                ),
+            ]
+        )
+    )
+    with TestClient(create_app(deps)) as client:
+        rows = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
+    assert rows["llama-3.3-70b"]["modality"] == "text"
+    assert rows["kokoro"]["modality"] == "speech"
+
+
+def test_transcription_upload_reaches_the_runtime_byte_for_byte():
+    """The upload is forwarded, not re-encoded.
+
+    This is the whole reason the proxy grew a raw-content path: it used to send
+    every request as `json=body` under a hardcoded application/json, which a
+    multipart upload cannot survive. Asserting the exact bytes -- and the exact
+    content-type, boundary included -- is what proves nothing rebuilt the form.
+    """
+    backend = FakeBackend()
+    audio = b"ID3\x03\x00" + bytes(range(256)) * 8  # binary, and contains \r\n
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [
+                    make_deployment(
+                        "d-1",
+                        "whisper",
+                        backend_url=running.base_url,
+                        modality=Modality.TRANSCRIPTION,
+                    )
+                ]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/audio/transcriptions",
+                data={"model": "whisper", "language": "en"},
+                files={"file": ("clip.mp3", audio, "audio/mpeg")},
+            )
+            sent_type = reply.request.headers["content-type"]
+            sent_body = reply.request.read()
+
+    assert reply.status_code == 200
+    assert reply.json()["text"] == "hello from the cluster"
+    assert backend.uploads[0] == sent_body
+    assert backend.headers[-1]["content-type"] == sent_type
+    # The audio survived intact, \r\n runs and all.
+    assert audio in backend.uploads[0]
+
+
+def test_transcription_needs_a_model_field():
+    """The model arrives as a form field here, not a JSON key, so the missing
+    -parameter refusal has to come from reading the form."""
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/v1/audio/transcriptions", files={"file": ("clip.mp3", b"x", "audio/mpeg")}
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "missing_model"
+
+
+def test_transcription_refuses_a_body_that_is_not_multipart():
+    """A JSON body here is a client that meant a different endpoint. Say so
+    rather than failing somewhere further in on a boundary that never existed."""
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/v1/audio/transcriptions", json={"model": "whisper"}
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_content_type"
+
+
+def test_an_oversized_upload_is_refused_rather_than_buffered():
+    """The cap is a real limit, not a formality: this body is read whole and
+    held for the life of the call so a failed target stays retryable."""
+    settings = GatewaySettings(max_audio_upload_bytes=1024)
+    deps = build_deps(settings=settings)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "whisper"},
+            files={"file": ("big.mp3", b"\x00" * 4096, "audio/mpeg")},
+        )
+    assert reply.status_code == 413
+    assert reply.json()["error"]["code"] == "payload_too_large"
+
+
+def test_a_transcription_model_is_refused_on_the_speech_endpoint():
+    """The two audio families are distinct from each other, not just from text."""
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [
+                make_deployment(
+                    "d-1",
+                    "whisper",
+                    backend_url="http://backend.invalid/v1",
+                    modality=Modality.TRANSCRIPTION,
+                )
+            ]
+        )
+    )
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/v1/audio/speech", json={"model": "whisper", "input": "hi"}
+        )
+    assert reply.status_code == 400
+    error = reply.json()["error"]
+    assert error["code"] == "wrong_modality"
+    assert error["correct_endpoint"] == "/v1/audio/transcriptions"
+
+
+def test_transcription_records_no_invented_token_count():
+    """An audio upload has no tokens, and the trace must not claim otherwise.
+
+    _NoAccounting exists for exactly this: a `data:` frame count over binary
+    audio would be fiction, and a 0 would read as a request that produced
+    nothing.
+    """
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [
+                    make_deployment(
+                        "d-1",
+                        "whisper",
+                        backend_url=running.base_url,
+                        modality=Modality.TRANSCRIPTION,
+                    )
+                ]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/audio/transcriptions",
+                data={"model": "whisper"},
+                files={"file": ("clip.mp3", b"audio", "audio/mpeg")},
+            )
+    assert reply.status_code == 200
+    assert reply.headers["X-Request-Id"].startswith("r-")
+
+
+def test_a_remote_transcription_gets_the_provider_name_for_the_model():
+    """A provider calls the model something else, and on this path the name is
+    inside the body rather than in a dict we can copy.
+
+    So the field is spliced in place. The test asserts both halves of that: the
+    upstream sees its own id, and the audio part beside the field is untouched.
+    """
+    backend = FakeBackend()
+    audio = b"ID3\x03\x00" + bytes(range(256)) * 4
+    with RunningBackend(backend) as running:
+        provider = make_provider(
+            "openai",
+            base_url=running.base_url,
+            served_name="whisper",
+            upstream_id="whisper-1",
+            modality=Modality.TRANSCRIPTION,
+        )
+        deps = build_deps(providers=FakeProviders([provider]))
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/audio/transcriptions",
+                data={"model": "whisper"},
+                files={"file": ("clip.mp3", audio, "audio/mpeg")},
+            )
+
+    assert reply.status_code == 200
+    sent = backend.uploads[0]
+    assert b'name="model"\r\n\r\nwhisper-1\r\n' in sent
+    assert b"whisper-1-1" not in sent  # spliced, not appended to
+    assert audio in sent
+
+
+# ---------------------------------------------------------------------------
+# realtime
+# ---------------------------------------------------------------------------
+
+
+def test_realtime_url_is_derived_from_the_provider_base_url():
+    """Providers publish one base URL for everything, so the realtime address
+    is derived rather than configured separately."""
+    from control_plane.gateway.realtime import realtime_url
+
+    assert (
+        realtime_url("https://api.openai.com/v1", "gpt-4o-realtime")
+        == "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime"
+    )
+    # http downgrades to ws, for a box on the LAN.
+    assert realtime_url("http://h:8000/v1", "m").startswith("ws://")
+    # A trailing slash on the path must not produce "//realtime", and a query
+    # already on the base URL is kept rather than replaced.
+    assert realtime_url("https://x.co/v1/?a=1", "m") == "wss://x.co/v1/realtime?a=1&model=m"
+
+
+def test_realtime_needs_a_model():
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive()
+    assert caught.value.code == 1008
+
+
+def test_realtime_refuses_an_unknown_model():
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect("/v1/realtime?model=nope") as ws:
+                ws.receive()
+    assert caught.value.code == 1008
+
+
+def test_realtime_refuses_a_local_model_and_says_why():
+    """A local runtime does not speak this protocol, and composing a session
+    from local STT + chat + TTS is a different project.
+
+    The refusal has to say that: a session that opened and then produced no
+    audio would look like a bug in the client.
+    """
+    deps = build_deps(
+        deployments=FakeDeployments(
+            [make_deployment("d-1", "llama-3.3-70b", backend_url="http://h.invalid/v1")]
+        )
+    )
+    with TestClient(create_app(deps)) as client:
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect("/v1/realtime?model=llama-3.3-70b") as ws:
+                ws.receive()
+    assert caught.value.code == 1008
+    assert "served locally" in (caught.value.reason or "")
+
+
+def test_realtime_relays_both_directions_over_a_real_socket():
+    """The relay's actual job, measured over real sockets in both directions.
+
+    TestClient cannot stand in here: this needs a genuine WebSocket upstream,
+    and the property under test is that frames cross unmodified -- text as
+    text, binary as binary. Collapsing the two would corrupt either the JSON
+    event stream or the audio, and only a round trip catches it.
+    """
+    import websockets
+
+    received: list = []
+
+    async def upstream(conn):
+        await conn.send(json.dumps({"type": "session.created"}))
+        async for frame in conn:
+            received.append(frame)
+            if isinstance(frame, bytes):
+                await conn.send(b"PCM:" + frame)
+            else:
+                await conn.send(json.dumps({"type": "echo", "of": json.loads(frame)["type"]}))
+
+    async def scenario():
+        port = _free_port()
+        server = await websockets.serve(upstream, "127.0.0.1", port)
+        provider = make_provider(
+            "openai",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            served_name="voice",
+            upstream_id="gpt-4o-realtime",
+        )
+        deps = build_deps(providers=FakeProviders([provider]))
+        with RunningServer(create_app(deps)) as gateway:
+            url = f"ws://127.0.0.1:{gateway.port}/v1/realtime?model=voice"
+            async with websockets.connect(url) as ws:
+                hello = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                await ws.send(json.dumps({"type": "session.update"}))
+                echoed = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                audio = bytes(range(256)) * 4
+                await ws.send(audio)
+                back = await asyncio.wait_for(ws.recv(), 10)
+        server.close()
+        await server.wait_closed()
+        return hello, echoed, audio, back
+
+    hello, echoed, audio, back = asyncio.run(scenario())
+    assert hello["type"] == "session.created"
+    assert echoed == {"type": "echo", "of": "session.update"}
+    # Binary survived as binary, and byte-identical.
+    assert isinstance(back, bytes) and back == b"PCM:" + audio
+    assert audio in received
+
+
+def test_the_speech_route_is_reachable_even_when_the_ui_is_mounted(tmp_path):
+    """A Starlette mount at "/" catches everything not matched by an EARLIER
+    route, so a route registered below it silently serves index.html instead.
+
+    Asked by mounting a UI and calling, not by inspecting app.router.routes:
+    included routers are wrapped in objects with no .path, so introspection
+    would assert on an implementation detail rather than the property that
+    matters. A 400 here is a pass -- it means openai_api answered, since
+    index.html would have been a 200 with HTML.
+    """
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<!doctype html><title>derate</title>")
+
+    app = create_app(
+        GatewayDeps(),
+        settings=GatewaySettings(cluster_id="c-test", ui_dir=str(ui)),
+    )
+    with TestClient(app) as client:
+        reply = client.post("/v1/audio/speech", json={"input": "no model named"})
+        root = client.get("/")
+
+    assert reply.headers["content-type"].startswith("application/json")
+    assert reply.json()["error"]["code"] == "missing_model"
+    # The mount is genuinely there, so the test above proves ordering.
+    assert root.status_code == 200
+    assert "<!doctype html>" in root.text
 
 
 # ---------------------------------------------------------------------------
@@ -2567,7 +3078,7 @@ def test_create_deployment_maps_a_launch_value_error_to_400():
     """M-11: a launch-time input validation error is a 400, not a 502."""
 
     class RejectingDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None):
             raise ValueError("model id is not a safe command argument")
 
     deployments = RejectingDeployments()
@@ -2908,3 +3419,140 @@ def test_link_measure_returns_503_when_every_rung_fails():
     assert reply.json()["error"]["code"] == "measurement_failed"
     assert "spark-01" in reply.json()["error"]["message"]
     assert "spark-02" in reply.json()["error"]["message"]
+
+
+# ---- a dtype sizes, it does not launch --------------------------------------
+#
+# `_plan_and_fit` accepts a `dtype` and hands it to the resolver as a
+# quantization override. That is legitimate for /api/plan, which starts
+# nothing. It is not legitimate for /api/deployments: neither serve command
+# template in deploy/flags.py carries --quantization, and the only model
+# identifier either interpolates is {model}, filled from shape.model_id. So a
+# honoured dtype would size for 4-bit weights and then start the repository's
+# real 16-bit ones -- the out-of-memory kill the fit gate exists to refuse.
+
+
+def test_plan_still_accepts_a_dtype_because_it_starts_nothing():
+    """The sizing question stays askable: "what would this cost at q4_k_m"."""
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "dtype": "q4_k_m",
+            },
+        )
+    # 200, not the 400 the launch path gives. Whether the *stub* resolver
+    # honours the override is its own business -- what is being pinned here is
+    # that the plan path does not refuse the question.
+    assert reply.status_code == 200
+    assert "plan" in reply.json()
+
+
+def test_launch_refuses_a_dtype_that_would_size_one_model_and_start_another():
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "dtype": "q4_k_m",
+            },
+        )
+    assert reply.status_code == 400
+    error = reply.json()["error"]
+    assert error["code"] == "dtype_not_launchable"
+    # The message has to name the missing flag, or the reader is left thinking
+    # they passed the wrong dtype rather than that the mechanism is absent.
+    assert "--quantization" in error["message"]
+    assert "different repository" in error["message"]
+
+
+def test_launch_refuses_the_dtype_before_it_resolves_anything():
+    """The guard is a cheap pre-check, not a late refusal.
+
+    Ordering matters: resolving first would spend a hub round trip, and on a
+    slow or unreachable hub the caller would get a 502 about metadata rather
+    than the 400 that tells them what they actually did wrong.
+    """
+
+    class CountingResolver(StubResolver):
+        def __init__(self):
+            self.calls = 0
+
+        def resolve(self, model_id, dtype=None):
+            self.calls += 1
+            return super().resolve(model_id, dtype)
+
+    deps = build_deps()
+    deps.resolver = CountingResolver()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct", "dtype": "q4_k_m"},
+        )
+    assert reply.status_code == 400
+    assert deps.resolver.calls == 0
+
+
+def test_launch_without_a_dtype_is_untouched_by_the_guard():
+    """An empty or absent dtype is not a dtype; the guard must not catch it."""
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        for body in (
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "dtype": None},
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "dtype": ""},
+        ):
+            reply = client.post("/api/deployments", json=body)
+            assert reply.status_code != 400 or (
+                reply.json()["error"]["code"] != "dtype_not_launchable"
+            ), body
+
+
+def test_a_gguf_model_is_refused_at_launch_by_the_runtime_support_gate():
+    """Pins the second layer, which is currently load-bearing by accident.
+
+    recipes.py's _COMMAND_SAFE allows "hf://owner/repo/file.gguf" through --
+    every character is in its allowlist and it starts with a letter. What
+    actually stops a GGUF launch is support.py marking every gguf key
+    UNSUPPORTED on sglang and UNVERIFIED on vllm, neither of which is
+    RuntimeSupport.ok. That is one dict edit away from silently opening a path
+    to a runtime that cannot load the file, so it gets a test.
+    """
+    from dataclasses import replace
+
+    from control_plane.resolver.support import build_verdict
+    from control_plane.resolver.types import ParamSource, QuantSource, Resolution
+
+    base = MODEL_SHAPES["llama-3.3-70b"]
+    gguf_shape = replace(base, model_id="unsloth/Llama-3.3-70B-GGUF", dtype="q4_k_m")
+
+    class GGUFResolver(StubResolver):
+        def resolve(self, model_id, dtype=None):
+            return gguf_shape
+
+        def resolve_full(self, model_id, dtype=None):
+            return Resolution(
+                shape=gguf_shape,
+                revision="main",
+                param_source=ParamSource.GGUF_TENSORS,
+                quant_source=QuantSource.GGUF_FILE_TYPE,
+                support=build_verdict(("LlamaForCausalLM",), gguf_shape.dtype),
+            )
+
+        def supported_by(self, shape, runtime):
+            return build_verdict(
+                ("LlamaForCausalLM",), shape.dtype
+            ).for_runtime(runtime).as_tuple()
+
+    deps = build_deps()
+    deps.resolver = GGUFResolver()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "unsloth/Llama-3.3-70B-GGUF", "runtime": "sglang"},
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "runtime_unsupported"

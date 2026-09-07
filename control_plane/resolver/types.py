@@ -73,6 +73,45 @@ class RuntimeSupport:
 
 
 @dataclass(frozen=True)
+class QuantVariant:
+    """One obtainable set of weights for a model.
+
+    The unit a person actually picks. ``repo_id`` is what would be launched --
+    a quantization is a different repository, not a flag, because neither serve
+    command template carries ``--quantization`` and the only model identifier
+    they interpolate is the repo id.
+
+    ``label`` is kept beside ``dtype`` on purpose. ``dtype`` is the canonical
+    key this codebase prices with; ``label`` is what the publisher called it,
+    and rendering "q4_k_m" for a file named "UD-Q4_K_XL" would be a paraphrase
+    of a string somebody else chose.
+
+    ``file_bytes`` is a measurement or it is ``None``. It is never a table
+    estimate -- for a GGUF variant the hub reports the real size, and an
+    Unsloth Dynamic mix has no fixed bits-per-weight for a table to hold.
+    """
+
+    dtype: str
+    label: str
+    repo_id: str
+    source: str  # "self" | "repo_name" | "tags" | "gguf_file"
+    gguf_file: str | None = None
+    file_bytes: int | None = None
+    downloads: int | None = None
+    launchable: bool = True
+    note: str = ""
+    #: Files in this quantization. Greater than one when llama.cpp split the
+    #: build; ``file_bytes`` is their sum, and ``gguf_file`` names only the
+    #: first, so without this the size and the filename disagree about how much
+    #: is being described.
+    shard_count: int = 1
+    #: Every file in the set, in shard order. ``gguf_file`` is the first of
+    #: these. Carried so a screen can show what a summed size is the sum *of*
+    #: rather than asserting a count nobody can check.
+    shard_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class QuantRequirement:
     """What silicon a quantization scheme needs."""
 

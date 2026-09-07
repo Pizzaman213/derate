@@ -15,6 +15,7 @@ from .bootstrap import (
 from .client import AgentClient, HttpAgentClient
 from .config import RegistryConfig
 from .discovery import Advertiser, DiscoveredPeer, browse, browse_async
+from .enrollment import EnrollmentStore, EnrollmentToken
 from .errors import (
     BridgeNetworkError,
     JoinRejected,
@@ -45,6 +46,8 @@ __all__ = [
     "BridgeNetworkError",
     "ClusterIdentity",
     "DiscoveredPeer",
+    "EnrollmentStore",
+    "EnrollmentToken",
     "HostMemory",
     "HttpAgentClient",
     "JoinRejected",

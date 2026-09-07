@@ -8,6 +8,8 @@ read from real metadata or accompanied by a warning saying it was not.
 
 from __future__ import annotations
 
+import re
+
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,15 +17,22 @@ from pathlib import Path
 from typing import Any
 
 from control_plane.contracts import ModelShape, NodeProfile
-from control_plane.contracts.quant import BYTES_PER_PARAM, bytes_per_param, normalize_dtype
+from control_plane.contracts.quant import (
+    BYTES_PER_PARAM,
+    DEFAULT_DTYPE,
+    bytes_per_param,
+    normalize_dtype,
+    quant_info,
+)
 
 from . import gguf as gguf_mod
-from . import quant_detect, support
+from . import gguf_names, quant_detect, support
 from .cache import ShapeCache
 from .config_map import Mapped, map_config, vision_config
 from .hf import HubClient, ModelInfo, count_safetensors_params, safetensors_header
 from .params import ParamBreakdown, analytic_breakdown, reconcile
 from .types import (
+    QuantVariant,
     MetadataUnavailable,
     ModelNotFound,
     ParamSource,
@@ -52,7 +61,7 @@ class ModelResolver:
     ) -> None:
         self.client = client or HubClient()
         self.cache = cache if cache is not None else ShapeCache()
-        self.offline = offline or os.environ.get("SPARKPLANE_OFFLINE") == "1"
+        self.offline = offline or os.environ.get("DERATE_OFFLINE") == "1"
 
     # ---- ResolverPort --------------------------------------------------
 
@@ -480,6 +489,17 @@ class ModelResolver:
             return True, f"{reason}; {'; '.join(problems)}"
         return True, reason
 
+    def modality_of(self, shape: ModelShape) -> str:
+        """Which endpoint family this model answers on: "text" for anything
+        this build does not recognise as speech.
+
+        Same architecture lookup as ``supported_by``, and the same limitation:
+        a shape that was never resolved here reports no architecture and
+        therefore reads as text, which is the safe default -- it means the
+        model is offered on the routes it always was.
+        """
+        return support.modality_for(self._architectures_for(shape))
+
     def support_verdict(self, shape: ModelShape) -> SupportVerdict:
         return support.build_verdict(self._architectures_for(shape), shape.dtype)
 
@@ -499,66 +519,389 @@ class ModelResolver:
 
     # ---- quantization variants -------------------------------------------
 
+    #: Shard suffix llama.cpp writes when a quantization spans several files.
+    _SHARD_RE = re.compile(r"-\d{5}-of-\d{5}(?=\.gguf$)", re.IGNORECASE)
+
+    #: Suffixes a quantizer appends to a repository name. Stripped from both
+    #: sides of a comparison so a repo differing only by its quantization is
+    #: recognised as the same model, and one differing by anything else is not.
+    _QUANT_SUFFIXES = (
+        "-GGUF", "-AWQ", "-GPTQ", "-FP8", "-FP4", "-bnb-4bit", "-INT4", "-INT8",
+        "-NVFP4", "-MXFP4", "-4bit", "-8bit",
+    )
+
+    #: How many GGUF repositories to open for one model. Each one costs a
+    #: model-info round trip, and the tail of a hub search for a popular model
+    #: is other people's re-uploads of the same quantizations. Six covers the
+    #: publishers who actually maintain distinct ladders -- Unsloth, bartowski,
+    #: mradermacher, lmstudio-community and a couple of others -- without
+    #: turning one click into thirty requests.
+    _MAX_GGUF_REPOS = 6
+
+    @staticmethod
+    def _looks_like_gguf_repo(hit_id: str, tags: tuple[str, ...] | list[str]) -> bool:
+        """Does this search hit ship GGUF files?
+
+        ``endswith("gguf")`` was too strict in both directions publishers
+        actually deviate: ``-GGUF-v2`` and ``-gguf-imatrix`` are ordinary GGUF
+        repositories whose names carry a qualifier after the format, and the
+        hub tags them all ``gguf`` regardless of what the name does. Ask the
+        tag first and fall back to the name as a token.
+        """
+        if any(str(t).strip().lower() == "gguf" for t in tags):
+            return True
+        return "gguf" in re.split(r"[-_./\s]+", hit_id.lower())
+
+    #: Qualifiers a requantizer appends *after* the format, to say this is its
+    #: second go at the same weights: ``-GGUF-v2``, ``-gguf-imatrix``,
+    #: mradermacher's ``-i1-GGUF``.
+    _BUILD_QUALIFIER_RE = re.compile(r"[-_.](?:v\d+(?:\.\d+)?|i1|imatrix|imat)$", re.IGNORECASE)
+
+    @classmethod
+    def _quant_stem(cls, model_id: str) -> str:
+        """A repository name reduced to the model it quantizes."""
+        name = model_id.split("/")[-1]
+        saw_format = False
+        changed = True
+        while changed:
+            changed = False
+            # A build qualifier only counts in the company of a format suffix,
+            # on either side of it: "Widget-7B-GGUF-v2" and mradermacher's
+            # "Widget-7B-i1-GGUF" are both somebody's second pass at the same
+            # weights. A bare "-v0.2" is a different model, and collapsing
+            # Mistral-7B-Instruct-v0.2 into -v0.1 would offer one model as a
+            # build of the other -- the confusion the exact-match guard exists
+            # to prevent.
+            match = cls._BUILD_QUALIFIER_RE.search(name)
+            if match:
+                stripped = name[: match.start()]
+                exposes = any(stripped.upper().endswith(s.upper()) for s in cls._QUANT_SUFFIXES)
+                if stripped and (exposes or saw_format):
+                    name = stripped
+                    changed = True
+                    continue
+            for suffix in cls._QUANT_SUFFIXES:
+                if name.upper().endswith(suffix.upper()) and len(name) > len(suffix):
+                    name = name[: -len(suffix)]
+                    saw_format = True
+                    changed = True
+        return name.lower().replace("-", "").replace("_", "").replace(".", "")
+
     def available_quants(self, model_id: str) -> list[str]:
         """Quantization schemes obtainable for this model, this repo included.
 
-        Searches the hub for sibling repos of the same model. Names are the only
-        signal most quantizers leave, so this is a shortlist to offer a user,
-        not a promise that each one loads.
+        The scheme keys only. :meth:`quant_variants` is the richer answer and
+        this is now derived from it, so the two can never disagree about what
+        exists.
         """
-        found: set[str] = set()
+        return sorted({v.dtype for v in self.quant_variants(model_id)})
+
+    def search_models(self, query: str, limit: int = 40) -> list[dict]:
+        """Hub search hits, trimmed, and deliberately unresolved.
+
+        Resolving here would be one network round trip per row per keystroke.
+        The caller gets names and popularity and nothing that claims to be a
+        shape; whoever wants a shape asks for one model.
+
+        Raises rather than returning ``[]`` when the hub refused us -- "no
+        results" and "rate limited" are different answers and the screen has to
+        be able to say which.
+        """
+        if self.offline:
+            raise MetadataUnavailable(
+                "the resolver is offline; the hub cannot be searched"
+            )
+        hits = self.client.search(query, limit=limit)
+        out: list[dict] = []
+        for hit in hits:
+            model_id = str(hit.get("id") or hit.get("modelId") or "")
+            if not model_id or "mlx" in model_id.lower():
+                continue
+            tags = [str(t) for t in (hit.get("tags") or ())]
+            out.append(
+                {
+                    "model_id": model_id,
+                    "downloads": hit.get("downloads"),
+                    "likes": hit.get("likes"),
+                    "pipeline_tag": hit.get("pipeline_tag"),
+                    "last_modified": hit.get("lastModified"),
+                    "gated": hit.get("gated"),
+                    "tags": tags[:12],
+                    # A guess from the name, offered as one. Cheap, and it is
+                    # what lets a list show "-AWQ" and "-GGUF" apart without a
+                    # resolve per row.
+                    "quant_hint": quant_detect.from_name(model_id),
+                    # No shape here. The wire says so rather than leaving the
+                    # client to infer it from missing keys.
+                    "resolved": False,
+                }
+            )
+        return out
+
+    def quant_variants(self, model_id: str) -> list[QuantVariant]:
+        """Every obtainable set of weights, with what it costs and where it is.
+
+        Names are the only signal most quantizers leave, so this is a shortlist
+        to offer a person, not a promise that each one loads. That caveat is
+        carried on every variant rather than left in this docstring, because it
+        has to reach the screen.
+
+        Two things this does that the old scheme-key version could not. It
+        keeps the repository each scheme came from, without which a variant is
+        not launchable -- a quantization is a different repo, not a flag. And
+        when the model id is itself a GGUF repo, it enumerates that repo's own
+        files, which is the case Unsloth's entire catalogue consists of and the
+        one that otherwise resolves to a single confident ``bf16`` read out of
+        a leftover ``config.json``.
+        """
+        variants: list[QuantVariant] = []
+        seen: set[tuple[str, str | None]] = set()
+
+        def add(variant: QuantVariant) -> None:
+            key = (variant.repo_id, variant.gguf_file)
+            if key not in seen:
+                seen.add(key)
+                variants.append(variant)
+
+        # Enumerate this repository's own files first. A GGUF repository is the
+        # common case in a quantization catalogue and it changes what the repo
+        # id itself means, so the "self" entry below has to be built knowing the
+        # answer.
+        own_files: list[QuantVariant] = []
+        if not self.offline:
+            own_files = self._gguf_file_variants(model_id, add_to=None)
+
         try:
             res = self.resolve_full(model_id)
-            found.add(res.shape.dtype)
+            is_collection = bool(own_files)
+            add(
+                QuantVariant(
+                    dtype=res.shape.dtype,
+                    label=res.shape.dtype,
+                    repo_id=model_id,
+                    source="self",
+                    file_bytes=res.weight_bytes,
+                    # A repository that ships nothing but .gguf files is not
+                    # launchable by its own id, whatever its config.json says.
+                    # These repos keep the original config, so torch_dtype reads
+                    # "bfloat16" and the repo resolves to a confident bf16 that
+                    # is not a set of weights anything here could load. That is
+                    # the single most misleading answer this resolver can give
+                    # about a quantization catalogue, so it is refused here
+                    # rather than left for a launch to discover.
+                    launchable=(
+                        not is_collection
+                        and quant_info(res.shape.dtype).family != "gguf"
+                    ),
+                    note=(
+                        f"this repository ships {len(own_files)} quantizations; "
+                        "choose one of them rather than the repository itself"
+                        if is_collection
+                        else "the repository as it stands"
+                    ),
+                )
+            )
         except ResolverError:
             pass
 
-        if self.offline:
-            return sorted(found)
+        for variant in own_files:
+            add(variant)
 
-        base = model_id.split("/")[-1]
-        stem = base
-        for suffix in ("-GGUF", "-AWQ", "-GPTQ", "-FP8", "-FP4", "-bnb-4bit", "-INT4", "-INT8"):
+        if self.offline:
+            return variants
+
+        stem = model_id.split("/")[-1]
+        for suffix in self._QUANT_SUFFIXES:
             if stem.upper().endswith(suffix.upper()):
                 stem = stem[: -len(suffix)]
         try:
             hits = self.client.search(stem, limit=60)
         except ResolverError:
-            return sorted(found)
+            return variants
 
-        needle = stem.lower().replace("-", "").replace("_", "")
-        gguf_repos: list[str] = []
+        needle = self._quant_stem(model_id)
+        gguf_repos: list[tuple[int, str]] = []
         for hit in hits:
             hit_id = str(hit.get("id") or hit.get("modelId") or "")
+            if not hit_id or hit_id == model_id:
+                continue
             lowered = hit_id.lower()
-            flattened = hit_id.split("/")[-1].lower().replace("-", "").replace("_", "")
-            if needle and needle not in flattened:
+            # Substring matching is too loose to decide what is a variant of
+            # what. Searching "Qwen3-30B-A3B" returns Qwen3-30B-A3B-Thinking-2507
+            # and -Instruct-2507, whose names contain the stem but which are
+            # different models -- offering them as quantizations would present a
+            # 21 GB download as a smaller build of the thing you asked for. So
+            # the hit has to reduce to exactly the stem once its own quantization
+            # suffix is removed.
+            if needle and self._quant_stem(hit_id) != needle:
                 continue
             if "mlx" in lowered:
                 continue  # Apple silicon format; nothing in this cluster loads it
-            if lowered.endswith("gguf") and len(gguf_repos) < 2:
-                gguf_repos.append(hit_id)
+            downloads = hit.get("downloads")
+            downloads = int(downloads) if isinstance(downloads, int) else None
+            if self._looks_like_gguf_repo(hit_id, hit.get("tags") or ()):
+                # Ordered by popularity below rather than by the order the hub
+                # happened to return them, so a truncated list keeps the
+                # ladders people actually use.
+                gguf_repos.append((downloads if downloads is not None else -1, hit_id))
             key = quant_detect.from_name(hit_id)
             if key:
-                found.add(key)
+                add(
+                    QuantVariant(
+                        dtype=key,
+                        label=hit_id.split("/")[-1],
+                        repo_id=hit_id,
+                        source="repo_name",
+                        downloads=downloads,
+                        launchable=quant_info(key).family != "gguf",
+                        note="scheme read from the repository name",
+                    )
+                )
+                continue
             for tag in hit.get("tags", []) or ():
                 key = normalize_dtype(str(tag))
                 if key and key in BYTES_PER_PARAM:
-                    found.add(key)
+                    add(
+                        QuantVariant(
+                            dtype=key,
+                            label=hit_id.split("/")[-1],
+                            repo_id=hit_id,
+                            source="tags",
+                            downloads=downloads,
+                            launchable=quant_info(key).family != "gguf",
+                            note=f"scheme read from the repository tag {tag!r}",
+                        )
+                    )
+                    break
 
-        # A GGUF repo holds one file per quantization, so the schemes are in the
-        # file names rather than the repo name. Two repos is enough to enumerate
-        # the usual ladder without turning this into a crawl.
-        for repo in gguf_repos:
-            try:
-                info = self.client.model_info(repo)
-            except ResolverError:
+        gguf_repos.sort(key=lambda pair: pair[0], reverse=True)
+        for _, repo in gguf_repos[: self._MAX_GGUF_REPOS]:
+            self._gguf_file_variants(repo, add_to=add)
+        return variants
+
+    def _dtype_from_header(self, repo_id: str, filename: str) -> str | None:
+        """The scheme a GGUF declares about itself, or ``None``.
+
+        Costs one ranged read of a few KiB -- the metadata block, never the
+        weights -- so it is spent only on files whose name refused to say.
+        Every failure degrades to ``None``: an unreadable header is a reason to
+        show the file with a caveat, not a reason to hide it.
+        """
+        if self.offline:
+            return None
+        try:
+            reader = gguf_mod.RangeReader(
+                lambda start, length: self.client.read_range(repo_id, filename, start, length)
+            )
+            return gguf_mod.dominant_file_type(gguf_mod.read_header(reader))
+        except Exception:
+            return None
+
+    def _gguf_file_variants(self, repo_id: str, add_to=None) -> list[QuantVariant]:
+        """One variant per quantization in a GGUF repo, sized from the hub.
+
+        Shards are summed, not listed. ``unsloth/Qwen3-30B-A3B-GGUF`` ships its
+        BF16 build as ``...-00001-of-00002.gguf`` plus ``...-00002-of-00002.gguf``;
+        drawn as two rows they would be two variants that are each too small to
+        be the model, and picking either would download half of it.
+
+        Two things a listing must not do, both of which this used to do. It must
+        not offer files that are not weights -- a repository's vision projector
+        and its importance matrix live in the same folder under the same
+        extension. And it must not drop a real quantization because its name is
+        unfashionable: a ``.gguf`` says what it is in its own header, so a name
+        that parses to nothing is a reason to read the file, not to pretend it
+        is absent.
+        """
+        try:
+            info = self.client.model_info(repo_id)
+        except ResolverError:
+            return []
+
+        grouped: dict[str, dict] = {}
+        for filename in info.gguf_files():
+            if not gguf_names.is_weight_file(filename):
                 continue
-            for filename in info.gguf_files():
-                key = quant_detect.from_name(filename)
-                if key:
-                    found.add(key)
-        return sorted(found)
+            stem = gguf_names.variant_stem(filename)
+            family = gguf_names.shard_family(filename)
+            entry = grouped.setdefault(
+                stem,
+                {
+                    "dtype": quant_detect.from_name(filename),
+                    "token": gguf_names.quant_token(filename),
+                    "first": None,
+                    "any": filename,
+                    "files": [],
+                    "bytes": 0,
+                    "measured": False,
+                    "shards": 0,
+                    "expected": family[2] if family else 1,
+                },
+            )
+            entry["shards"] += 1
+            entry["files"].append(filename)
+            # Shard one carries the header. For a single-file quantization
+            # that is the file itself.
+            if family is None or family[1] == 1:
+                entry["first"] = filename
+            size = info.file_sizes.get(filename)
+            if isinstance(size, int) and size > 0:
+                entry["bytes"] += size
+                entry["measured"] = True
+
+        out: list[QuantVariant] = []
+        for stem, entry in sorted(grouped.items()):
+            first = entry["first"] or entry["any"]
+            label = entry["token"]
+            if not label:
+                label = stem.rsplit("/", 1)[-1]
+                if label.lower().endswith(".gguf"):
+                    label = label[: -len(".gguf")]
+
+            notes = ["one file inside a GGUF repository; size is measured, not estimated"]
+            dtype = entry["dtype"]
+            if not dtype:
+                dtype = self._dtype_from_header(repo_id, first)
+                if dtype:
+                    notes.append("scheme read from the file's own header, not its name")
+                else:
+                    # Charged at the default rather than at a guess. The
+                    # measured size is still the honest number beside it.
+                    dtype = DEFAULT_DTYPE
+                    notes.append(
+                        "the name says nothing and the header could not be "
+                        f"read; priced at {DEFAULT_DTYPE}, which over-charges "
+                        "rather than under-charges"
+                    )
+
+            shards, expected = entry["shards"], entry["expected"]
+            if expected > 1:
+                notes.append(f"{shards} of {expected} shards, summed")
+                if shards != expected:
+                    notes.append(
+                        "the repository is missing part of this set; the size "
+                        "below is what is actually published"
+                    )
+
+            variant = QuantVariant(
+                dtype=dtype,
+                label=label,
+                repo_id=repo_id,
+                source="gguf_file",
+                gguf_file=first,
+                file_bytes=entry["bytes"] if entry["measured"] else None,
+                shard_count=shards,
+                shard_files=tuple(sorted(entry["files"])),
+                # A single .gguf file is not a launchable target: both serve
+                # command templates take a repository path, and no runtime here
+                # claims to load llama.cpp's format anyway.
+                launchable=False,
+                note="; ".join(notes),
+            )
+            out.append(variant)
+            if add_to is not None:
+                add_to(variant)
+        return out
 
 
 # ---- helpers -------------------------------------------------------------

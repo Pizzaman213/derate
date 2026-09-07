@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from control_plane.contracts import (
     Deployment,
     DeploymentState,
+    Modality,
     NodeProfile,
     NodeState,
     Provider,
@@ -79,6 +80,11 @@ class TargetIndex:
     remote_priority: dict[str, int] = field(default_factory=dict)
     # served_name -> context length advertised on /v1/models
     context_length: dict[str, int] = field(default_factory=dict)
+    # served_name -> which endpoint family answers for it. A name served both
+    # locally and remotely is one entry, so the first target to claim it sets
+    # the modality and the rest agree by construction: two models that answer
+    # different endpoints are two different served_names.
+    modality: dict[str, Modality] = field(default_factory=dict)
     # served_name -> deployments that exist but cannot serve yet, for 503 bodies
     pending: dict[str, list[Deployment]] = field(default_factory=dict)
     # target_id -> why the 15% weak-target floor benched it, None otherwise.
@@ -138,6 +144,7 @@ def build_index(
         index.capacity[tid] = dep.max_concurrent_seqs
         index.zero_weight_reason[tid] = None  # filled in by apply_scores
         index.context_length.setdefault(dep.served_name, dep.context_length)
+        index.modality.setdefault(dep.served_name, dep.modality)
         index.targets.setdefault(dep.served_name, []).append(
             RouteTarget(
                 target_id=tid,
@@ -165,6 +172,7 @@ def build_index(
             index.remote_priority[tid] = provider.priority
             index.zero_weight_reason[tid] = None  # remotes are never floored
             index.context_length.setdefault(model.served_name, model.context_length)
+            index.modality.setdefault(model.served_name, model.modality)
             index.targets.setdefault(model.served_name, []).append(
                 RouteTarget(
                     target_id=tid,

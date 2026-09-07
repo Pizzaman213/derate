@@ -8,20 +8,39 @@ export interface Segment {
 
 interface SegmentBarProps {
   segments: Segment[]
-  /** The usable-memory line the total is measured against. */
-  usable: number
+  /** The line the verdict is measured against, and the ONLY one the overrun
+   *  test uses. null when nothing measured it -- which draws no fault region
+   *  rather than implying everything fits. */
+  usable: number | null
+  /** A second line drawn behind, for context only: the static ceiling when
+   *  `usable` is the live figure. Never used for the overrun test. Two rules
+   *  of equal weight read as a range, and repainting past both would put
+   *  three colour regions in a bar whose whole thesis is that colour reports
+   *  state rather than category. */
+  ceiling?: number | null
   height?: number
 }
 
-/** The memory breakdown, drawn proportionally against the usable line.
- *  Everything past the line is over budget and is drawn in fault. */
-export function SegmentBar({ segments, usable, height = 22 }: SegmentBarProps) {
+/** Two lines within this share of the span are the same line, visually. */
+const COINCIDENT = 0.01
+
+/** The memory breakdown, drawn proportionally against the line the verdict
+ *  used. Everything past that line is over budget and is drawn in fault. */
+export function SegmentBar({ segments, usable, ceiling, height = 22 }: SegmentBarProps) {
   const total = segments.reduce((a, s) => a + s.bytes, 0)
-  // Scale so both the total and the usable line are always on screen. When the
-  // total overruns, the line sits partway across and the overrun is visible.
-  const span = Math.max(total, usable) * 1.02
+  // Scale so the total and both lines are always on screen. When the total
+  // overruns, the line sits partway across and the overrun is visible.
+  const span = Math.max(total, usable ?? 0, ceiling ?? 0) * 1.02
   const pct = (b: number) => `${(b / span) * 100}%`
-  const overruns = total > usable
+  // A missing budget is not a budget of zero: no line, and no fault region.
+  const overruns = usable != null && total > usable
+  // Suppress a ceiling at or below the live line, or close enough to it that
+  // two rules would render as a smudge.
+  const showCeiling =
+    ceiling != null &&
+    usable != null &&
+    ceiling > usable &&
+    (ceiling - usable) / span > COINCIDENT
 
   let run = 0
   return (
@@ -37,7 +56,7 @@ export function SegmentBar({ segments, usable, height = 22 }: SegmentBarProps) {
         {segments.map((s, i) => {
           const left = pct(run)
           run += s.bytes
-          const beyond = run > usable
+          const beyond = usable != null && run > usable
           return (
             <div
               key={s.key}
@@ -60,18 +79,38 @@ export function SegmentBar({ segments, usable, height = 22 }: SegmentBarProps) {
             />
           )
         })}
-        {/* the usable line */}
-        <div
-          style={{
-            position: 'absolute',
-            left: pct(usable),
-            top: -4,
-            bottom: -4,
-            width: 0,
-            borderLeft: '2px solid var(--ink)',
-          }}
-          title="usable memory per node"
-        />
+        {/* The static ceiling, behind the blocks: a hairline the segments
+            paint over reads as "the old ceiling, now covered", which is what
+            it is. Weight and dash separate the two lines, never hue. */}
+        {showCeiling ? (
+          <div
+            style={{
+              position: 'absolute',
+              left: pct(ceiling as number),
+              top: 0,
+              bottom: 0,
+              width: 0,
+              borderLeft: '1px dashed var(--ink-muted)',
+              zIndex: 0,
+            }}
+            title="ceiling on idle hardware"
+          />
+        ) : null}
+        {/* The line the verdict actually used. */}
+        {usable != null ? (
+          <div
+            style={{
+              position: 'absolute',
+              left: pct(usable),
+              top: -4,
+              bottom: -4,
+              width: 0,
+              borderLeft: '2px solid var(--ink)',
+              zIndex: 1,
+            }}
+            title="the memory this verdict was measured against"
+          />
+        ) : null}
       </div>
     </div>
   )

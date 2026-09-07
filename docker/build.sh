@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Multi-arch build for sparkplane/node.
+# Multi-arch build for ghcr.io/pizzaman213/derate/node.
 #
 # Both architectures, always. GB10 is arm64 and the workstation is usually
 # amd64; an amd64-only image means the heterogeneous case does not work at
 # all, which is half the demo.
 set -euo pipefail
 
-IMAGE="${IMAGE:-sparkplane/node}"
+IMAGE="${IMAGE:-ghcr.io/pizzaman213/derate/node}"
 TAG="${TAG:-latest}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
-BUILDER="${BUILDER:-sparkplane}"
+BUILDER="${BUILDER:-derate}"
 SPARKRUN_VERSION="${SPARKRUN_VERSION:-0.2.40}"
 # Release builds leave this at 0: a UI that does not compile must fail the image.
 SKIP_UI="${SKIP_UI:-0}"

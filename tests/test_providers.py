@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator, Callable
 import httpx
 import pytest
 
+from control_plane.contracts.modality import Modality
 from control_plane.contracts.providers import Provider, ProviderKind, ProviderModel
 from control_plane.contracts.routing import (
     RouteTarget,
@@ -220,6 +221,67 @@ def test_together_pricing_is_read_as_dollars_per_million(tmp_path):
         spec_for(ProviderKind.TOGETHER),
     )
     assert models[0].input_cost_per_mtok == pytest.approx(0.88)
+
+
+def test_a_catalog_says_which_models_are_audio(tmp_path):
+    """The bug this field exists to fix.
+
+    An OpenAI catalog is ingested wholesale, so whisper-1 and tts-1 have always
+    arrived as ordinary ProviderModels and surfaced in /v1/models -- and in the
+    chat picker -- as though they were chat models. Classifying them is what
+    lets the gateway keep a chat request off them.
+    """
+    models = {
+        m.upstream_id: m
+        for m in parse_models(
+            {
+                "data": [
+                    {"id": "gpt-4o"},
+                    {"id": "tts-1"},
+                    {"id": "gpt-4o-mini-tts"},
+                    {"id": "whisper-1"},
+                    {"id": "gpt-4o-transcribe"},
+                    {"id": "text-embedding-3-small"},
+                ]
+            },
+            spec_for(ProviderKind.OPENAI),
+        )
+    }
+    assert models["gpt-4o"].modality is Modality.TEXT
+    assert models["tts-1"].modality is Modality.SPEECH
+    assert models["gpt-4o-mini-tts"].modality is Modality.SPEECH
+    assert models["whisper-1"].modality is Modality.TRANSCRIPTION
+    # "whisper" must win over "speech"/"tts" or every ASR model reads as TTS.
+    assert models["gpt-4o-transcribe"].modality is Modality.TRANSCRIPTION
+    assert models["text-embedding-3-small"].modality is Modality.EMBEDDING
+
+
+def test_an_unknown_model_id_stays_text(tmp_path):
+    """The classifier is a heuristic over model ids, so it only ever moves a
+    model off the default when the id says so plainly. An unrecognised id is an
+    unknown chat model, which is what TEXT means."""
+    models = parse_models(
+        {"data": [{"id": "some-org/an-unreleased-model-v2"}]},
+        spec_for(ProviderKind.OPENROUTER),
+    )
+    assert models[0].modality is Modality.TEXT
+
+
+def test_audio_models_are_still_marked_non_streaming(tmp_path):
+    """The modality table grew out of the non-streaming list and has to keep
+    doing that job: a speech or embedding endpoint has no token stream."""
+    models = {
+        m.upstream_id: m
+        for m in parse_models(
+            {"data": [{"id": "gpt-4o"}, {"id": "tts-1"}, {"id": "rerank-v3"}]},
+            spec_for(ProviderKind.OPENAI),
+        )
+    }
+    assert models["gpt-4o"].supports_streaming is True
+    assert models["tts-1"].supports_streaming is False
+    # Not an endpoint family we route, but still not streamable.
+    assert models["rerank-v3"].supports_streaming is False
+    assert models["rerank-v3"].modality is Modality.TEXT
 
 
 def test_ollama_needs_no_key(tmp_path):

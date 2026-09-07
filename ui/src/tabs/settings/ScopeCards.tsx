@@ -32,16 +32,24 @@ const NOT_BUILT: [string, string][] = [
   ['Manual placement', 'the planner has no placement field'],
   ['Link utilisation', 'no bytes-on-the-wire telemetry exists'],
   ['Managed remote node tier', 'a target is local or a provider; there is no third kind'],
-  ['Add a node by address', 'join is worker-to-coordinator and token-gated'],
   ['Prefix cache hit rate', 'the backend reports null for it'],
   ['Scheduled model swaps', 'time-based placement'],
   ['Auto-eviction policy', 'currently always manual'],
   ['Alerting', 'node down, cap reached, OOM'],
 ]
 
+//: Reversed non-goals. Kept on screen rather than quietly deleted: the card
+//: below exists precisely because these get built by accident, so building one
+//: on purpose has to be visible and dated, not tidied away.
+const SCOPE_CHANGED: [string, string][] = [
+  [
+    'Model catalog browser',
+    'built after all \u2014 browse, quantizations and fit. 00-architecture.md \u00a71 amended 2026-09-07',
+  ],
+]
+
 const OUT_OF_SCOPE: [string, string][] = [
-  ['Model catalog browser', 'the picker is a short list plus a free-text id'],
-  ['Chat interface or history', 'this is a control plane; clients bring their own'],
+  ['Chat history', 'the Chat tab is a test console; the transcript is never stored'],
   ['Log browser', 'failure diagnostics only, on the deployment that failed'],
   ['Deep-dive metrics page', 'the readouts are the whole metrics surface'],
   ['WAN endpoint', 'the gateway binds to the LAN'],
@@ -184,6 +192,23 @@ export function ScopeCards() {
           Not built yet <span className="pill">planned</span>
         </h3>
         {NOT_BUILT.map(([label, note]) => (
+          <div className="row" key={label}>
+            <span>{label}</span>
+            <span className="unit">{note}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="card2">
+        <h3>
+          Scope changed <span className="pill">was out of scope</span>
+        </h3>
+        <div className="unit" style={{ marginBottom: 6 }}>
+          A named non-goal that was built anyway. Recorded here rather than
+          removed, because the card below is the thing that stops these
+          happening by accident and it only works if reversals are visible.
+        </div>
+        {SCOPE_CHANGED.map(([label, note]) => (
           <div className="row" key={label}>
             <span>{label}</span>
             <span className="unit">{note}</span>

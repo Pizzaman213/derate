@@ -1,20 +1,30 @@
 import type { RefObject } from 'react'
-import type { FlowGraphHandle } from './FlowGraph'
+import type { ClusterGraphHandle } from './ClusterGraph'
 
 interface Props {
-  graphRef: RefObject<FlowGraphHandle>
+  graphRef: RefObject<ClusterGraphHandle>
   zoomLabelRef: RefObject<HTMLSpanElement>
+  /** Only offered when there is something to reset -- a control that does
+   *  nothing is worse than no control. */
+  rearranged: boolean
+  onResetLayout: () => void
 }
 
 /** The one line of chrome above the graph. The zoom percentage is written
- *  directly into `zoomLabelRef` by FlowGraph on every pan/zoom -- never React
- *  state -- so this component itself never re-renders while someone is
- *  scrolling or dragging; Reset is the only thing here that calls back in. */
-export function GraphToolbar({ graphRef, zoomLabelRef }: Props) {
+ *  directly into `zoomLabelRef` by ClusterGraph on every pan/zoom -- never
+ *  React state -- so this component itself never re-renders while someone is
+ *  scrolling or dragging.
+ *
+ *  There is no separate "fit" control because the resting view IS the fit:
+ *  the viewBox is the graph element's own box, and ClusterGraph scales the
+ *  drawing up until it fills it. The percentage is reported relative to that
+ *  framing, so every machine is already framed at 100% and "Reset view" is the
+ *  way back to it. */
+export function GraphToolbar({ graphRef, zoomLabelRef, rearranged, onResetLayout }: Props) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
       <span className="unit">
-        Drag to pan · scroll to zoom · click a node or a name to select · double-click to inspect
+        Drag a machine to rearrange it · drag the background to pan · scroll to zoom · double-click to inspect
       </span>
       <span
         ref={zoomLabelRef}
@@ -23,6 +33,11 @@ export function GraphToolbar({ graphRef, zoomLabelRef }: Props) {
       >
         100%
       </span>
+      {rearranged ? (
+        <button onClick={onResetLayout} title="Put the machines back in their default order">
+          Reset layout
+        </button>
+      ) : null}
       <button onClick={() => graphRef.current?.reset()} title="Reset pan and zoom (0)">
         Reset view
       </button>

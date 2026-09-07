@@ -28,7 +28,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import internal_api, openai_api, ui_api
+from . import capacity_api, enroll_api, internal_api, openai_api, ui_api
 from .admission import AdmissionController
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
@@ -135,6 +135,34 @@ async def _consume_deployment_events(ctx: GatewayContext, events) -> None:
         raise
     except Exception:
         log.exception("deployment event stream ended unexpectedly")
+
+
+class _UIStatics(StaticFiles):
+    """The built UI, with the one cache rule the bundler's naming scheme implies.
+
+    Vite content-hashes every asset and **deletes the previous one** on each
+    build. `ui_dir` is served straight off disk, so the moment anyone rebuilds,
+    a browser tab still holding the old `index.html` asks for a hash that no
+    longer exists, gets a 404, and renders nothing. The failure is silent from
+    every angle worth looking at: the server logs a 200 for `/`, the page is
+    blank, and no `/api/*` request is ever made to hint that the app never
+    started. Starlette sends an ETag and Last-Modified but no `Cache-Control`,
+    and absent one a browser is free to reuse `index.html` from cache without
+    revalidating -- so this is a rebuild away at any time, not a rare race.
+
+    The document is therefore never stored and the hashed assets are immutable,
+    which is what a content hash means and the pair the naming scheme was
+    designed for.
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        name = Path(full_path).name
+        if name.endswith(".html"):
+            response.headers["cache-control"] = "no-store, must-revalidate"
+        elif "/assets/" in Path(full_path).as_posix():
+            response.headers["cache-control"] = "public, max-age=31536000, immutable"
+        return response
 
 
 def create_app(
@@ -313,7 +341,7 @@ def create_app(
             await telemetry.stop()
 
     app = FastAPI(
-        title="Sparkplane Gateway",
+        title="Derate Gateway",
         version="0.1.0",
         lifespan=lifespan,
         # The UI and OpenAI clients both talk to this; the surface is the
@@ -330,6 +358,13 @@ def create_app(
     # mount at "/" catches every path not matched by an EARLIER route, so a
     # router registered after it never sees a request.
     app.include_router(ui_api.create_router(ctx))
+    # Same rule, and it bites harder here: enroll_api owns "/install.sh", a
+    # root-level path. Below the mount, `curl | sh` on a new machine would be
+    # piped index.html.
+    app.include_router(enroll_api.create_router(ctx))
+    # Same rule again: /api/memory and /api/capacity are JSON, and below the
+    # mount they would answer index.html to a fetch that expects a report.
+    app.include_router(capacity_api.create_router(ctx))
 
     @app.get("/healthz")
     async def healthz():
@@ -347,10 +382,10 @@ def create_app(
     if settings.ui_dir:
         ui_path = Path(settings.ui_dir)
         if ui_path.is_dir():
-            app.mount("/", StaticFiles(directory=str(ui_path), html=True), name="ui")
+            app.mount("/", _UIStatics(directory=str(ui_path), html=True), name="ui")
         else:
             log.warning(
-                "SPARKPLANE_UI_DIR=%s does not exist; not serving the UI",
+                "DERATE_UI_DIR=%s does not exist; not serving the UI",
                 settings.ui_dir,
             )
 

@@ -35,6 +35,9 @@ export function PlannerBar() {
   const [checking, setChecking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [launching, setLaunching] = useState(false)
+  // An override is granted against one measurement. It is cleared on every
+  // replan below, so it can never outlive the number that justified it.
+  const [override, setOverride] = useState(false)
 
   const seq = useRef(0)
 
@@ -54,6 +57,7 @@ export function PlannerBar() {
     }
     const mine = ++seq.current
     setChecking(true)
+    setOverride(false)
     const id = window.setTimeout(() => {
       backend
         .plan({ model_id: modelId, context, concurrency, target })
@@ -78,7 +82,16 @@ export function PlannerBar() {
     if (!result) return
     setLaunching(true)
     try {
-      await backend.launch({ model_id: modelId, context, concurrency, target, runtime })
+      await backend.launch({
+        model_id: modelId,
+        context,
+        concurrency,
+        target,
+        runtime,
+        // Sent only when someone has read the sentence naming the measured
+        // figure and ticked the box.
+        ...(override ? { allow_over_live_memory: true } : {}),
+      })
       invalidate()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -189,6 +202,8 @@ export function PlannerBar() {
           onUseMaxContext={setContext}
           onLaunch={() => void launch()}
           launching={launching}
+          override={override}
+          onOverride={setOverride}
         />
       ) : !modelId ? (
         <p className="unit" style={{ margin: '13px 0 0' }}>Enter a HuggingFace ID to plan a model.</p>

@@ -224,12 +224,12 @@ SYSFS_ONE_PORT["/sys/class/infiniband/mlx5_1/ports/1/phys_state"] = "3: Disabled
 def _clean_env(monkeypatch):
     """Nothing here should depend on the developer's shell."""
     for name in (
-        "SPARKPLANE_MPIRUN",
-        "SPARKPLANE_MPIRUN_ARGS",
-        "SPARKPLANE_NCCL_TESTS_DIR",
+        "DERATE_MPIRUN",
+        "DERATE_MPIRUN_ARGS",
+        "DERATE_NCCL_TESTS_DIR",
         "NCCL_TESTS_DIR",
-        "SPARKPLANE_NODE_ID",
-        "SPARKPLANE_DATA_DIR",
+        "DERATE_NODE_ID",
+        "DERATE_DATA_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
 

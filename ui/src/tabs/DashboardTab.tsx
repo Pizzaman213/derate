@@ -8,11 +8,15 @@ import { AggregateRow } from './dashboard/AggregateRow'
 import { DeploymentsStrip } from './dashboard/DeploymentsStrip'
 import { TelemetrySub } from './dashboard/TelemetrySub'
 import { LoadSub } from './dashboard/LoadSub'
+import { HeadroomSub } from './dashboard/HeadroomSub'
 
-type Sub = 'overview' | 'telemetry' | 'load'
+type Sub = 'overview' | 'headroom' | 'telemetry' | 'load'
 
 const SUBS: { id: Sub; label: string }[] = [
   { id: 'overview', label: 'Overview' },
+  // Second, directly under the planner: it answers the planner's question in
+  // reverse -- not "does this fit" but "what fits".
+  { id: 'headroom', label: 'Headroom' },
   { id: 'telemetry', label: 'Telemetry' },
   { id: 'load', label: 'Load' },
 ]
@@ -53,6 +57,10 @@ export function DashboardTab() {
 
       <div className="stage">
         <PlannerBar />
+      </div>
+
+      <div hidden={sub !== 'headroom'}>
+        <HeadroomSub context={8192} concurrency={1} />
       </div>
 
       <div hidden={sub !== 'overview'} style={{ display: 'grid', gap: 'var(--s-4)' }}>

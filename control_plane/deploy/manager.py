@@ -29,12 +29,14 @@ from control_plane.contracts import (
     Deployment,
     DeploymentState as S,
     FitResult,
+    Modality,
     ModelShape,
     NodeState,
     ParallelismPlan,
     RegistryPort,
     Verdict,
 )
+from control_plane.procmatch import matches_deployment
 
 from . import events as ev
 from .events import EventBus
@@ -53,6 +55,9 @@ HEALTH_FAIL_THRESHOLD = 2
 READY_TIMEOUT_S = 1800.0
 READY_POLL_INTERVAL_S = 3.0
 STOP_CONFIRM_TIMEOUT_S = 30.0
+#: Per-request budget when talking to a node agent during a forced stop.
+#: Long enough to cover the agent's own SIGTERM grace plus SIGKILL wait.
+AGENT_KILL_TIMEOUT_S = 25.0
 
 #: M-15: the acceptance bar above assumed an instant probe. health.probe()
 #: tries up to len(HEALTH_PATHS) URLs, each able to block for its own
@@ -224,6 +229,7 @@ class DeploymentManager:
         max_seqs: int,
         *,
         served_name: str | None = None,
+        modality: Modality = Modality.TEXT,
     ) -> Deployment:
         """Refuse, render, run, then watch for readiness.
 
@@ -276,6 +282,7 @@ class DeploymentManager:
                 max_concurrent_seqs=max_seqs,
                 started_at=None,
                 last_error=None,
+                modality=modality,
             )
             port = self._allocate_port()
             record = _Record(deployment=deployment, handle={"port": port})
@@ -285,7 +292,7 @@ class DeploymentManager:
         worker = threading.Thread(
             target=self._launch_worker,
             args=(record, port),
-            name="sparkplane-launch-%s" % deployment.deployment_id,
+            name="derate-launch-%s" % deployment.deployment_id,
             daemon=True,
         )
         self._workers.append(worker)
@@ -334,6 +341,7 @@ class DeploymentManager:
             return
 
         left_behind: str | None = None
+        kill_detail: str | None = None
         if cluster_id:
             ok, output = self.adapter.stop(cluster_id, hosts=hosts)
             deadline = self._clock() + self.stop_confirm_timeout_s
@@ -346,6 +354,17 @@ class DeploymentManager:
                 time.sleep(1.0)
                 confirmed = self.adapter.is_running(cluster_id, hosts=hosts) is False
             if not confirmed:
+                # Second tier. sparkrun has said what it can and the workload is
+                # still holding the pool; the node agents are the only thing left
+                # that can reach the processes directly. This fires only on an
+                # explicit operator stop -- the rule at the top of this file, that
+                # memory pressure never kills, is about the watch loop and still
+                # stands.
+                killed, kill_detail = self._kill_through_agents(record, cluster_id)
+                if killed:
+                    confirmed = self.adapter.is_running(cluster_id, hosts=hosts) is not True
+
+            if not confirmed:
                 left_behind = (
                     "sparkrun stop did not confirm within %.0fs. Workload %s may still be "
                     "running on %s. Check with: sparkrun cluster check-job %s\n%s"
@@ -356,6 +375,26 @@ class DeploymentManager:
                         cluster_id,
                         output.strip(),
                     )
+                )
+                if kill_detail:
+                    left_behind += "\n\nForce kill: %s" % kill_detail
+                self.bus.emit(
+                    ev.STOP_ESCALATED,
+                    deployment_id=deployment_id,
+                    served_name=record.deployment.served_name,
+                    cluster_id=cluster_id,
+                    hosts=hosts,
+                    detail=left_behind,
+                )
+            elif kill_detail:
+                # It did stop, but not gracefully. An operator who is about to
+                # relaunch needs to know a SIGKILL happened here: an abrupt
+                # teardown is where a half-written cache or a wedged driver
+                # comes from, and this is the only record that it did.
+                left_behind = (
+                    "sparkrun stop did not confirm within %.0fs, so the backend "
+                    "was killed on its nodes. %s"
+                    % (self.stop_confirm_timeout_s, kill_detail)
                 )
                 self.bus.emit(
                     ev.STOP_ESCALATED,
@@ -371,6 +410,96 @@ class DeploymentManager:
                 record.deployment.last_error = left_behind
             self._transition(record, S.STOPPED)
 
+    def _kill_through_agents(
+        self, record: _Record, cluster_id: str | None
+    ) -> tuple[bool, str | None]:
+        """Last resort: signal this deployment's processes on their own nodes.
+
+        Returns (killed_anything, detail). Every failure mode here is answered
+        with a sentence rather than an exception -- this runs inside a stop the
+        operator already asked for, and a traceback would replace a partial
+        result with none at all.
+
+        Reached only from :meth:`stop`, after ``sparkrun stop`` has had its full
+        confirmation budget. ``registry`` is None in unit tests and stub wiring,
+        which skips the tier entirely and leaves the old behaviour exactly as it
+        was.
+        """
+        if self.registry is None:
+            return False, None
+        node_ids = list(record.deployment.plan.node_ids or [])
+        if not node_ids:
+            return False, None
+
+        urls_fn = getattr(self.registry, "agent_urls", None)
+        token_fn = getattr(self.registry, "cluster_token", None)
+        if not callable(urls_fn) or not callable(token_fn):
+            return False, None
+        try:
+            # include_local matters: on a single-Spark cluster the workload is
+            # on the coordinator's own node, and excluding it would make this
+            # tier a no-op in the most common topology there is.
+            urls = urls_fn(include_local=True)
+            token = token_fn()
+        except Exception:
+            logger.exception("could not reach the registry for a force kill")
+            return False, None
+        if not token:
+            return False, "no cluster token is available, so the node agents could not be asked"
+
+        port = record.handle.get("port")
+        notes: list[str] = []
+        killed = False
+        import httpx
+
+        for node_id in node_ids:
+            url = urls.get(node_id)
+            if not url:
+                notes.append("%s: no agent URL" % node_id)
+                continue
+            base = url.rstrip("/")
+            try:
+                with httpx.Client(timeout=AGENT_KILL_TIMEOUT_S) as client:
+                    res = client.get("%s/agent/processes" % base)
+                    res.raise_for_status()
+                    processes = res.json().get("processes") or []
+            except Exception as exc:
+                notes.append("%s: could not read processes (%s)" % (node_id, exc))
+                continue
+
+            targets = [
+                p
+                for p in processes
+                if matches_deployment(p.get("command") or "", cluster_id, port)
+            ]
+            if not targets:
+                notes.append("%s: nothing matched this deployment" % node_id)
+                continue
+
+            for proc in targets:
+                pid = proc.get("pid")
+                try:
+                    with httpx.Client(timeout=AGENT_KILL_TIMEOUT_S) as client:
+                        res = client.post(
+                            "%s/agent/processes/%s/kill" % (base, pid),
+                            headers={"X-Derate-Token": token},
+                        )
+                except Exception as exc:
+                    notes.append("%s: kill of pid %s failed (%s)" % (node_id, pid, exc))
+                    continue
+                if res.status_code >= 400:
+                    notes.append(
+                        "%s: pid %s was refused (%s)" % (node_id, pid, res.text.strip()[:200])
+                    )
+                    continue
+                killed = True
+                try:
+                    notes.append("%s: %s" % (node_id, res.json().get("detail", "killed")))
+                except Exception:
+                    notes.append("%s: pid %s killed" % (node_id, pid))
+
+        return killed, "; ".join(notes) if notes else None
+
     def list(self) -> list[Deployment]:
         with self._lock:
             return [r.deployment for r in self._records.values()]
@@ -379,6 +508,26 @@ class DeploymentManager:
         with self._lock:
             record = self._records.get(deployment_id)
             return record.deployment if record else None
+
+    def handles(self) -> dict[str, dict]:
+        """The sparkrun handle behind each record, for callers that must match
+        a running process back to a deployment.
+
+        Deliberately not on ``DeploymentPort``: section 4.7's protocol is
+        frozen at launch/stop/list/get, and the gateway reaches this through a
+        ``getattr`` so a port without it (the stubs) degrades to "nothing is
+        attributable" rather than failing. Only the fields an outside caller
+        can act on -- we do not hand out the recipe path.
+        """
+        with self._lock:
+            return {
+                deployment_id: {
+                    "cluster_id": record.handle.get("cluster_id"),
+                    "port": record.handle.get("port"),
+                    "hosts": list(record.handle.get("hosts") or []),
+                }
+                for deployment_id, record in self._records.items()
+            }
 
     # -- the rest of Agent F's surface ------------------------------------
 
@@ -458,7 +607,7 @@ class DeploymentManager:
                 return
             self._stop_event.clear()
             self._watch_thread = threading.Thread(
-                target=self._watch_loop, name="sparkplane-watch", daemon=True
+                target=self._watch_loop, name="derate-watch", daemon=True
             )
             self._watch_thread.start()
 
@@ -527,7 +676,7 @@ class DeploymentManager:
 
         thread = threading.Thread(
             target=finish,
-            name="sparkplane-stop-%s" % record.deployment.deployment_id,
+            name="derate-stop-%s" % record.deployment.deployment_id,
             daemon=True,
         )
         self._workers.append(thread)
@@ -537,7 +686,7 @@ class DeploymentManager:
         thread = threading.Thread(
             target=self._wait_for_ready,
             args=(record,),
-            name="sparkplane-ready-%s" % record.deployment.deployment_id,
+            name="derate-ready-%s" % record.deployment.deployment_id,
             daemon=True,
         )
         self._workers.append(thread)
@@ -791,7 +940,7 @@ class DeploymentManager:
             thread = threading.Thread(
                 target=run,
                 args=(record,),
-                name="sparkplane-probe-%s" % record.deployment.deployment_id,
+                name="derate-probe-%s" % record.deployment.deployment_id,
                 daemon=True,
             )
             thread.start()
@@ -940,7 +1089,7 @@ class DeploymentManager:
         threading.Thread(
             target=self._post_mortem,
             args=(record,),
-            name="sparkplane-postmortem-%s" % deployment.deployment_id,
+            name="derate-postmortem-%s" % deployment.deployment_id,
             daemon=True,
         ).start()
 

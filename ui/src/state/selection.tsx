@@ -23,7 +23,14 @@ import type { TopologyDeployment } from '../api/types'
 //   - the sheet (the one modal, see shell/Sheet.tsx) names a kind and an id;
 //     it does not otherwise interact with the three selections above.
 
-export type SheetTarget = { kind: 'node' | 'dep'; id: string }
+export type SheetTarget =
+  | { kind: 'node' | 'dep'; id: string }
+  /** A model id rather than a cluster object: the sheet resolves it
+   *  itself, because a model is not something the cluster holds. The two
+   *  numbers ride along because the fit verdicts in the ladder are taken
+   *  at them, and the sheet has no other way to see what the tab's fields
+   *  were set to. */
+  | { kind: 'model'; id: string; context: number; concurrency: number }
 
 export interface SelectionApi {
   selDep: string | null

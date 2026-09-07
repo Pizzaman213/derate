@@ -1,4 +1,4 @@
-# Spark Control Plane
+# Derate
 
 Planning and orchestration for DGX Spark clusters. Measures the interconnect, derives the parallelism plan from it, refuses launches that will run out of memory, and fronts every model behind one endpoint.
 
@@ -47,14 +47,84 @@ Every agent then ships a stub of their port in the first hour. Agent G's fixture
 
 Anything not integrated by its checkpoint gets stubbed and cut, not rescued.
 
+## Install
+
+```bash
+# the first machine. It becomes the coordinator and serves the UI on :8080.
+curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/integration/install.sh | sh
+
+# every machine after. The UI composes this line for you, address and token
+# already filled in: Settings -> Add a node.
+curl -fsSL http://<coordinator>:8080/install.sh | sh -s -- \
+    --join http://<coordinator>:8080 --token ej_...
+```
+
+One image, one container, role decided at runtime. The script checks Docker,
+pulls `ghcr.io/pizzaman213/derate/node`, and runs it with host networking and a data volume;
+`--dry-run` prints the `docker run` it would use and stops, `--uninstall`
+reverses it. The `docker run` form below is still the whole of what it does and
+remains supported.
+
+The token in the second command is an **enrollment token**: minted on demand,
+expiring in an hour, spent by the machine that uses it. A node holding one is
+admitted on arrival, so there is nothing to click. The permanent cluster token
+still only makes a candidate — it is not the thing you carry around any more.
+
+```bash
+docker run --network host --gpus all --pid=host \
+    -v derate:/data ghcr.io/pizzaman213/derate/node    # equivalent, by hand
+```
+
+`--gpus all` because the hardware probe is `nvidia-smi`, and a container
+without one probes as unidentified hardware the planner will not place work
+on — a node that joins, reports healthy, and shows zeros. `--pid=host`
+because on GB10 per-process accounting is the only memory number nvidia-smi
+will still give you, and it only counts processes in its own namespace.
+`install.sh` passes both for you.
+
+## Voice and TTS
+
+The OpenAI surface covers audio as well as text:
+
+```
+POST /v1/audio/speech            text in, audio bytes out
+POST /v1/audio/transcriptions    audio file in, text out
+GET  /v1/realtime                websocket, relayed to a provider
+```
+
+`GET /v1/models` reports a `modality` per model (`text`, `embedding`, `speech`,
+`transcription`), and naming a model on the wrong endpoint is refused with the
+one that would have worked. That matters even if you never serve audio
+yourself: an OpenAI or OpenRouter catalog is ingested wholesale, so `tts-1` and
+`whisper-1` arrive as ordinary models, and without the modality they show up in
+the chat picker as if they were chat models.
+
+Three ways to serve audio, cheapest first:
+
+1. **A remote provider.** Add OpenAI or Groq and their audio models are routed
+   like any other.
+2. **An OpenAI-compatible server on the LAN** — Kokoro-FastAPI,
+   openedai-speech, faster-whisper-server. Add it as a `custom` provider with
+   its base URL; nothing needs to be launched by the control plane. This is the
+   shortest path to local TTS, because neither vLLM nor SGLang serves
+   `/v1/audio/speech` at all.
+3. **A Whisper deployment the control plane launches**, on vLLM. Planned,
+   fit-checked and launched like any other model; it is recorded as a
+   transcription deployment, so it is offered on `/v1/audio/transcriptions` and
+   kept off the chat routes.
+
+An audio deployment reports `—` rather than a token rate, in the strip and in
+the inspector. There is no audio-side rate measured today, and a zero would
+read as a stalled deployment.
+
 ## The demo
 
 ```bash
-docker run --network host -v sparkplane:/data sparkplane/node   # node 1
-docker run --network host -v sparkplane:/data sparkplane/node   # node 2, same command
+curl -fsSL .../install.sh | sh                                  # node 1
+curl -fsSL http://node-1:8080/install.sh | sh -s -- --join http://node-1:8080 --token ej_...
 ```
 
-Second node finds the first. UI shows both. Launch a model that will not fit on one. The plan panel says pipeline parallel, names the measured 10.2 GB/s link as the reason, and lists tensor parallel as rejected.
+Second node joins the first and appears as a member. Launch a model that will not fit on one. The plan panel says pipeline parallel, names the measured 10.2 GB/s link as the reason, and lists tensor parallel as rejected.
 
 NVIDIA's own playbook specifies tensor parallel for two Sparks. At the bandwidth the link actually delivers, pipeline parallel wins batched serving by roughly 2.2x. The tool measures, disagrees with the playbook, and is right. That is the sixty seconds.
 

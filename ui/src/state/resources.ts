@@ -10,3 +10,52 @@ export const useCandidates = () => useResource((b) => b.candidates(), 3000)
 export const useRouting = () => useResource((b) => b.routing(), 5000)
 export const useProviders = () => useResource((b) => b.providers(), 15000)
 export const useSettings = () => useResource((b) => b.getSettings(), 5000)
+// Only ever a row or two, and only while somebody is mid-install. Polled
+// rather than held in the card's own state so a second browser -- or a
+// refresh -- still sees the token that is currently live.
+export const useEnrollments = () => useResource((b) => b.enrollments(), 10000)
+// The Chat tab's model list. `/v1/models` changes only when a deployment
+// crosses into or out of READY, or a provider refreshes its catalogue, so it
+// is polled at the lazy end -- but it is polled, because a model finishing its
+// launch while you are looking at the list is the case worth catching.
+export const useModels = () => useResource((b) => b.models(), 10000)
+
+// What the Serve button gates on, so it is polled fast: a two-second-old
+// allocatable figure is a different decision from a five-second-old one.
+export const useMemoryReport = () => useResource((b) => b.memory(), 2000)
+// What is resident on one node's GPU. Only mounted while a node sheet is open,
+// and every poll costs an nvidia-smi call on that node, so it matches the
+// telemetry cadence rather than the 2s memory poll. `nodeId` empty means no
+// node is open; the hook still has to be called unconditionally, so it fetches
+// an empty list instead of being skipped.
+export const useNodeProcesses = (nodeId: string) =>
+  useResource(
+    (b) =>
+      nodeId
+        ? b.nodeProcesses(nodeId)
+        : Promise.resolve({ node_id: '', processes: [], available: true, reason: null }),
+    5000,
+  )
+
+// Disk, cluster-wide. Slow on purpose, for two reasons: one call fans out to
+// every node agent and walks a directory on each, and the number it returns
+// moves over hours, not seconds. There is no stream to fall back on -- disk is
+// not sampled anywhere -- so this hook is the only source and it still does not
+// need to be fast.
+export const useStorage = () => useResource((b) => b.storage(), 30000)
+
+// The capacity walk resolves models against the hub and is memoised server
+// side; polling it hard would buy nothing and cost the hub.
+export const useCapacity = (context: number, concurrency: number) =>
+  useResource((b) => b.capacity(context, concurrency), 20000)
+
+// Static for the life of the process: it is the contract's own table, and it
+// answers with no ports wired. Fetched once, effectively.
+export const useQuantTable = () => useResource((b) => b.quantTable(), 3_600_000)
+// The curated shortlist changes only when someone edits fit/catalog.py.
+export const useCatalog = () => useResource((b) => b.catalog(), 3_600_000)
+
+// Model detail and the variant ladder are deliberately NOT here. `useResource`
+// refires on every `revision` bump, so an open model would re-run its hub calls
+// after every launch, admit and settings change. They are user-driven and live
+// in the tab's own state, debounced.

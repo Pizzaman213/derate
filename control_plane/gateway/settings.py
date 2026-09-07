@@ -21,7 +21,7 @@ class GatewaySettings:
     # (the default) leaves "/" unmounted, which is what every existing test
     # and the day-0 stub gateway expects.
     ui_dir: str | None = field(
-        default_factory=lambda: os.environ.get("SPARKPLANE_UI_DIR")
+        default_factory=lambda: os.environ.get("DERATE_UI_DIR")
     )
 
     # --- upstream proxying ---
@@ -52,7 +52,7 @@ class GatewaySettings:
     # Local targets price from measured power draw against this rate.
     # Zero by default, which makes local free and therefore always cheapest.
     electricity_rate_usd_per_kwh: float = 0.0
-    # Operator-set, persisted to $SPARKPLANE_DATA_DIR/settings.json and applied
+    # Operator-set, persisted to $DERATE_DATA_DIR/settings.json and applied
     # through the existing `admitting` gate rather than a new mechanism.
     # local_only is a HARD block, not a routing preference: policies.eligible()
     # filters on admitting before any of the seven selectors run, so it outranks
@@ -106,6 +106,15 @@ class GatewaySettings:
     # long prefill is not a failure, and an intermediary in front of us may
     # have its own read timeout on the headers.
     upstream_header_hold_s: float = 10.0
+
+    # --- audio ---
+    # A transcription request carries an audio file, and unlike every other
+    # body on this path it is read whole before anything is sent: the model
+    # name lives in a form field that could be the last part in the stream, and
+    # a target that fails still has to be retryable, which means the bytes must
+    # still be in hand. So the cap is a real limit rather than a formality.
+    # 25 MiB is what OpenAI accepts, which is the number a client will expect.
+    max_audio_upload_bytes: int = 25 * 1024 * 1024
 
     # --- parking ---
     # When a model's only nodes have just died, hold the request this long for

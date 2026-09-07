@@ -71,7 +71,7 @@ class Resolved:
 
 def data_dir() -> Path:
     """Where the volume is mounted. Same env var the providers store reads."""
-    return Path(os.environ.get("SPARKPLANE_DATA_DIR", "/data"))
+    return Path(os.environ.get("DERATE_DATA_DIR", "/data"))
 
 
 def settings_path(root: Path | None = None) -> Path:

@@ -237,7 +237,7 @@ def _empty_group() -> dict[str, Any]:
 
 
 def _expire(conn, now: float) -> dict[str, int]:
-    # SPARKPLANE_TELEMETRY_RETENTION_DAYS moves every raw horizon together
+    # DERATE_TELEMETRY_RETENTION_DAYS moves every raw horizon together
     # rather than only the samples one, so halving it halves the request and
     # log windows too and the ratios between them are preserved. Unset, this
     # is exactly 1.0.

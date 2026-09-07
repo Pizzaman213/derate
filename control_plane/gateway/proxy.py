@@ -214,6 +214,26 @@ class _BodyAccounting:
         _apply_sniffed(self.usage, self._sniffer)
         return self.usage
 
+class _NoAccounting:
+    """For a body that carries no tokens to count.
+
+    TTFT is still real -- it is when the client could first have seen a byte,
+    whatever those bytes are -- so it is kept. Everything else stays None,
+    which is what settle() records as "not measured" rather than as zero.
+    """
+
+    def __init__(self, started: float) -> None:
+        self.started = started
+        self.usage = _Usage()
+
+    def note_chunk(self, chunk: bytes, now: float) -> None:
+        if self.usage.ttft_s is None:
+            self.usage.ttft_s = now - self.started
+
+    def finish(self, now: float) -> _Usage:
+        return self.usage
+
+
 def _forward_request_headers(incoming: dict[str, str]) -> dict[str, str]:
     out = {}
     for key, value in incoming.items():
@@ -321,7 +341,7 @@ class UpstreamProxy:
         *,
         selection,
         path: str,
-        body: dict,
+        body: dict | None,
         client_headers: dict[str, str],
         api_key: str | None,
         stats: StatsRegistry,
@@ -329,6 +349,9 @@ class UpstreamProxy:
         on_finish=None,
         trace=None,
         attempt_no: int = 0,
+        content: bytes | None = None,
+        content_type: str | None = None,
+        count_tokens: bool = True,
     ) -> Attempt:
         """One target's turn. Returns an :class:`Attempt`, not a response.
 
@@ -338,7 +361,10 @@ class UpstreamProxy:
         target = selection.target
         url = target.backend_url.rstrip("/") + path
         headers = _forward_request_headers(client_headers)
-        headers["content-type"] = "application/json"
+        # A multipart upload is forwarded byte for byte under the client's own
+        # content-type, boundary included -- re-encoding it would mean parsing
+        # and rebuilding an audio file to change nothing about it.
+        headers["content-type"] = content_type or "application/json"
 
         if target.kind is TargetKind.REMOTE:
             if api_key:
@@ -354,7 +380,15 @@ class UpstreamProxy:
         target_stats = stats.get(target.target_id)
         target_stats.begin()
         started = time.monotonic()
-        accounting = _StreamAccounting(started) if streaming else _BodyAccounting(started)
+        # Token accounting reads SSE frames or a JSON usage block; an audio
+        # body is neither. Sniffing one would buffer a megabyte of MP3 to
+        # learn nothing, and the frame count it produced would be fiction.
+        if not count_tokens:
+            accounting = _NoAccounting(started)
+        elif streaming:
+            accounting = _StreamAccounting(started)
+        else:
+            accounting = _BodyAccounting(started)
         finished = False
 
         def settle(
@@ -404,7 +438,12 @@ class UpstreamProxy:
             if on_finish is not None:
                 on_finish()
 
-        request = self.client.build_request("POST", url, json=body, headers=headers)
+        if content is not None:
+            request = self.client.build_request(
+                "POST", url, content=content, headers=headers
+            )
+        else:
+            request = self.client.build_request("POST", url, json=body, headers=headers)
         try:
             response = await self.client.send(request, stream=True)
         except httpx.HTTPError as exc:

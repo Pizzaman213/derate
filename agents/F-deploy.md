@@ -76,12 +76,12 @@ When a launch fails with an out-of-memory error despite passing the fit check, l
 
 ## 4. Docker
 
-**One image, `sparkplane/node`, running on every machine.** Role is resolved at runtime by Agent A, not baked at build time. There is no separate worker image and no separate UI service.
+**One image, `derate/node`, running on every machine.** Role is resolved at runtime by Agent A, not baked at build time. There is no separate worker image and no separate UI service.
 
 Inference backends are not containerized by us; sparkrun manages those on the host.
 
 ```bash
-docker run --network host -v sparkplane:/data sparkplane/node
+docker run --network host -v derate:/data derate/node
 ```
 
 The same command on every node. The first becomes coordinator and serves the UI on 8080. The rest discover it and join. That sequence is the demo, so it has to work on a clean machine with nothing preinstalled but Docker and sparkrun.
@@ -92,7 +92,7 @@ Requirements on the image:
 - Multi-arch build. GB10 is arm64 and the workstation is likely amd64. Build both or the heterogeneous case does not work at all.
 - UI served from the same origin as the API. No CORS, no second service.
 - Volumes: `/data` for persisted state (cluster token, node registry, link measurements, deployment records, resolved-shape cache) and a read-only mount of the host sparkrun config.
-- Environment: `SPARKPLANE_ROLE` (default `auto`), `SPARKPLANE_TOKEN`, `SPARKPLANE_JOIN`, `SPARKPLANE_PORT` (default 8080), `SPARKPLANE_AGENT_PORT`. Every one has a working default so first run needs no configuration.
+- Environment: `DERATE_ROLE` (default `auto`), `DERATE_TOKEN`, `DERATE_JOIN`, `DERATE_PORT` (default 8080), `DERATE_AGENT_PORT`. Every one has a working default so first run needs no configuration.
 - Health check on `/agent/health`, which exists in both roles. Do not health check `/api/cluster`; it is coordinator-only and would mark every worker unhealthy.
 - Restart policy `unless-stopped`. On restart the container re-resolves its role, so a restarted coordinator reclaims the role if no other has taken it.
 
@@ -137,7 +137,7 @@ An in-memory manager that fakes the lifecycle with timers: LAUNCHING for 3 secon
 - Restarting the control plane re-adopts a still-running deployment rather than orphaning or duplicating it.
 - Crossing 95 percent memory emits a critical event that Agent G receives.
 - An illegal state transition raises rather than silently correcting.
-- `docker run --network host sparkplane/node` on a clean machine reaches a working UI with no configuration.
+- `docker run --network host derate/node` on a clean machine reaches a working UI with no configuration.
 - The same command on a second machine joins the first automatically, no flags, no IPs.
 - The image runs on both arm64 and amd64.
 - Started with bridge networking, the container exits with a message naming `--network host`.
