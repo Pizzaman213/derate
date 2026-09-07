@@ -838,12 +838,27 @@ def _quant_node_check(ctx: GatewayContext, resolution: Any) -> dict:
     An "emulated" pass is collected as a problem too. It is not a refusal, but
     on pre-Blackwell silicon a runtime that emulates MXFP4 upcasts the weights
     to bf16 and quadruples them, which the fit check was not told about.
+
+    Only nodes that could actually hold the model are asked. ``healthy_nodes()``
+    filters on liveness alone, so it includes machines the probe found no GPU on
+    -- and those answer every quantization question with "compute capability ''
+    is unreadable", which describes a silicon generation problem on hardware
+    that has no silicon to describe. Worse, it set ``ok`` False for a model
+    every real node can run. The predicate is the one this file already applies
+    at the capacity probe and ``livefit.drop_zero_addressable`` applies to
+    budgets: zero addressable bytes means not a candidate.
+
+    Skipped nodes are reported rather than dropped, for the reason
+    ``drop_zero_addressable`` gives: dropping one silently is its own lie.
+    ``ok`` keeps its meaning -- "no candidate objected" -- so a cluster with no
+    candidates at all leaves it True and lets ``skipped`` carry the story.
     """
     support = getattr(resolution, "support", None)
     if support is None:
         return {"ok": True, "problems": [], "checked": 0}
     requirement = support.quant
     problems: list[str] = []
+    skipped: list[dict[str, str]] = []
     ok = True
     checked = 0
     try:
@@ -853,14 +868,22 @@ def _quant_node_check(ctx: GatewayContext, resolution: Any) -> dict:
         states = []
     for state in states:
         profile = state.profile
+        if profile.addressable_memory <= 0:
+            skipped.append(
+                {
+                    "node_id": profile.node_id,
+                    "reason": "no GPU memory; derate launches CUDA runtimes only",
+                }
+            )
+            continue
         checked += 1
         passed, reason = requirement.check(profile.compute_capability)
         if not passed:
             ok = False
-            problems.append(f"{profile.node_id} ({profile.gpu_name}): {reason}")
+            problems.append(f"{profile.describe()}: {reason}")
         elif "emulated" in reason:
-            problems.append(f"{profile.node_id} ({profile.gpu_name}): {reason}")
-    return {"ok": ok, "problems": problems, "checked": checked}
+            problems.append(f"{profile.describe()}: {reason}")
+    return {"ok": ok, "problems": problems, "checked": checked, "skipped": skipped}
 
 
 def _resolve(ctx: GatewayContext, model_id: str):

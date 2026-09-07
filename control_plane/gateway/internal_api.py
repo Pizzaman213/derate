@@ -316,6 +316,21 @@ def _select_nodes(registry, nodes, requested, warnings: list[str]):
                 param=_PLACEMENT_PARAM,
                 extra={"unhealthy_node_ids": [node_id]},
             )
+        # A machine that reports no GPU memory cannot carry a rank. The fit
+        # gate already drops these from the live budget so they cannot become
+        # the argmin (`livefit.drop_zero_addressable`); naming one explicitly
+        # deserves the same answer said out loud, rather than a plan built
+        # around a machine that can hold nothing.
+        if profile.addressable_memory <= 0:
+            raise _PlacementRefused(
+                400,
+                f"The machine '{node_id}' reports no addressable GPU memory, "
+                f"so nothing can be placed on it. It can still be a cluster "
+                f"member; it cannot be a serving node.",
+                "node_has_no_memory",
+                param=_PLACEMENT_PARAM,
+                extra={"unusable_node_ids": [node_id]},
+            )
         if profile.device_class is DeviceClass.UNKNOWN:
             warnings.append(serialize.INELIGIBLE_DEVICE_CLASS)
         chosen.append(profile)

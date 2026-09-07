@@ -17,7 +17,12 @@ from fastapi.testclient import TestClient
 from control_plane.contracts.quant import BYTES_PER_PARAM, QUANT_INFO
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
 from control_plane.resolver import StubResolver as DetailResolver
-from tests.test_gateway import build_deps
+from tests.test_gateway import (
+    FakeRegistry,
+    _no_gpu_profile,
+    build_deps,
+    make_node_profile,
+)
 
 
 @pytest.fixture()
@@ -157,6 +162,67 @@ def test_detail_reports_whether_this_cluster_can_run_the_scheme(client):
     ).json()["nodes"]
     assert nodes["checked"] >= 1, "no node was consulted"
     assert isinstance(nodes["problems"], list)
+
+
+def _detail_nodes(states):
+    """The `nodes` block of /api/models/detail for a given roster."""
+    deps = build_deps(registry=FakeRegistry(states))
+    deps.resolver = DetailResolver()
+    with TestClient(create_app(deps)) as c:
+        return c.get(
+            "/api/models/detail",
+            params={"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+        ).json()["nodes"]
+
+
+def test_a_node_with_no_gpu_is_not_asked_about_quantization():
+    """It answered every scheme with "compute capability '' is unreadable".
+
+    That describes a silicon generation problem on a machine with no silicon to
+    describe -- a Raspberry Pi in the roster made every model look like it had
+    a hardware blocker, complete with empty parentheses where the GPU name
+    would be. It also set ok False for a model the real node runs fine.
+    """
+    from tests.fixtures import node_state
+
+    states = [node_state(make_node_profile()), node_state(_no_gpu_profile())]
+    nodes = _detail_nodes(states)
+
+    assert nodes["checked"] == 1  # the GB10, and only the GB10
+    assert not any("unreadable" in p for p in nodes["problems"])
+    assert not any("()" in p for p in nodes["problems"])
+    assert nodes["skipped"] == [
+        {
+            "node_id": _no_gpu_profile().node_id,
+            "reason": "no GPU memory; derate launches CUDA runtimes only",
+        }
+    ]
+
+
+def test_a_gpu_whose_compute_capability_is_unreadable_still_objects():
+    """The filter must not swallow the case the message was written for.
+
+    A card behind a driver too old to report a capability has memory, is a real
+    placement candidate, and genuinely cannot be promised a scheme.
+    """
+    from dataclasses import replace
+
+    from tests.fixtures import node_state
+
+    blind = replace(make_node_profile(), compute_capability="")
+    nodes = _detail_nodes([node_state(blind)])
+
+    assert nodes["checked"] == 1
+    assert nodes["skipped"] == []
+    assert any("unreadable" in p for p in nodes["problems"])
+    # And it names the card, since this one has a name to give.
+    assert any("NVIDIA GB10" in p for p in nodes["problems"])
+
+
+def test_node_descriptions_never_render_empty_parentheses():
+    """`node-id ()` reads as a missing value in a sentence about hardware."""
+    assert _no_gpu_profile().describe() == _no_gpu_profile().node_id
+    assert make_node_profile().describe().endswith(" (NVIDIA GB10)")
 
 
 def test_detail_says_so_when_the_resolver_cannot_describe_a_model(client):

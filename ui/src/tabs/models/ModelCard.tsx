@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import type { QuantTable } from '../../api/types'
-import { gbytes } from '../../format'
+import { Lamp } from '../../components/Lamp'
+import { sizeLabel } from '../../format'
 import { dominantColor } from './dominant'
 import { avatarUrl, hashString, isFirstParty, ownerAccent, ownerInitials } from './owner'
 import type { ModelRow } from './rows'
@@ -28,13 +29,19 @@ export function ModelCard({
   row,
   table,
   onOpen,
+  current,
 }: {
   row: ModelRow
   table: QuantTable | null
   onOpen: (row: ModelRow) => void
+  current?: boolean
 }) {
-  const owner = row.model_id.includes('/') ? row.model_id.split('/')[0]! : ''
-  const repo = row.model_id.includes('/') ? row.model_id.split('/').slice(1).join('/') : row.label
+  // A bare repo id (`gpt2`) has no publisher at all. That is different from a
+  // publisher we could not identify, so the owner line is omitted rather than
+  // drawn as an em dash.
+  const slash = row.model_id.indexOf('/')
+  const owner = slash > 0 ? row.model_id.slice(0, slash) : ''
+  const repo = slash > 0 ? row.model_id.slice(slash + 1) : row.model_id
 
   const support = useMemo(() => classifySupport(row, table), [row, table])
   const url = avatarUrl(owner)
@@ -45,22 +52,25 @@ export function ModelCard({
   const unsupported = support.status === 'unsupported'
   const dots = [
     unsupported
-      ? { key: 'unsupported', color: 'var(--fault-solid, var(--fault))', label: support.reason! }
+      ? { key: 'unsupported', signal: 'fault' as const, label: support.reason! }
       : null,
     onDevice
       ? {
           key: 'ondevice',
-          color: 'var(--live-solid, var(--live))',
+          signal: 'live' as const,
+          // No promise about the first launch. There is no expected size for a
+          // base repository to check a cache against, so "it will not have to
+          // pull this" is a claim nothing here can support -- several of these
+          // hold a config file and no weights.
           label:
-            `Already on ${row.cachedOn.length === 1 ? row.cachedOn[0] : `${row.cachedOn.length} nodes`}` +
-            (row.bytesOnDisk != null ? `, ${gbytes(row.bytesOnDisk)} GiB` : '') +
-            '. The first launch does not have to pull it.',
+            `Cached on ${row.cachedOn.length === 1 ? row.cachedOn[0] : `${row.cachedOn.length} nodes`}` +
+            (row.bytesOnDisk != null ? `: ${sizeLabel(row.bytesOnDisk)} on disk` : ''),
         }
       : null,
     row.verdict === 'wont_fit'
-      ? { key: 'wontfit', color: 'var(--warn-solid, var(--warn))', label: row.reason ?? 'Will not fit.' }
+      ? { key: 'wontfit', signal: 'warn' as const, label: row.reason ?? 'Will not fit.' }
       : null,
-  ].filter(Boolean) as { key: string; color: string; label: string }[]
+  ].filter(Boolean) as { key: string; signal: 'live' | 'warn' | 'fault'; label: string }[]
 
   // A deterministic aura position per card, so a grid does not look stamped
   // from one template but also never moves between renders.
@@ -72,11 +82,11 @@ export function ModelCard({
     row.total_params != null
       ? `${(row.total_params / 1e9).toFixed(row.total_params >= 1e11 ? 0 : 1)}B`
       : row.bytesOnDisk != null
-        ? `${gbytes(row.bytesOnDisk)} GiB`
+        ? sizeLabel(row.bytesOnDisk)
         : null
 
   const description = [
-    `${repo} by ${owner || 'unknown publisher'}`,
+    owner ? `${repo} by ${owner}` : repo,
     ...dots.map((d) => d.label),
   ].join('. ')
 
@@ -84,6 +94,7 @@ export function ModelCard({
     <button
       type="button"
       className="mcard"
+      aria-current={current ? 'true' : undefined}
       aria-label={description}
       title={dots.length ? dots.map((d) => d.label).join('\n\n') : undefined}
       onClick={() => onOpen(row)}
@@ -106,8 +117,8 @@ export function ModelCard({
 
         <span className="mcard-id">
           <span className="mcard-name">{repo}</span>
-          <span className="mcard-owner">
-            <span className="mcard-owner-name">{owner || '—'}</span>
+          <span className="mcard-owner" hidden={!owner}>
+            <span className="mcard-owner-name">{owner}</span>
             {isFirstParty(owner) ? (
               <span className="mcard-verified" aria-label="Published by the team that trained it">
                 ✓
@@ -122,14 +133,11 @@ export function ModelCard({
               ⚿
             </span>
           ) : null}
+          {/* The app's own lamp, at card scale. A parallel dot component would
+              have been a second indicator with the same job and its own rules
+              about what the colours mean. */}
           {dots.map((d) => (
-            <span
-              key={d.key}
-              role="img"
-              aria-label={d.label}
-              className="mcard-dot"
-              style={{ background: d.color }}
-            />
+            <Lamp key={d.key} signal={d.signal} label={d.label} size={6} />
           ))}
         </span>
       </span>
@@ -150,7 +158,7 @@ export function ModelCard({
             <span className="mcard-stat">{row.predicted_decode_tps.toFixed(0)} tok/s</span>
           ) : null}
         </span>
-        {size ? <span className="mcard-chip">{size}</span> : null}
+        {size ? <span className="pill">{size}</span> : null}
       </span>
     </button>
   )

@@ -906,3 +906,44 @@ class TestPooling:
         assert WS_3090.node_id in pooled.node_ids
         assert "excluded" not in pooled.reason
         assert "at the operator's instruction" in pooled.reason
+
+
+class TestUnprobedHardware:
+    """A machine the registry could not probe reports 0 GB/s and 0 bytes.
+
+    It never reaches the planner on its own -- it sorts into the weakest group
+    and the strongest one wins -- but an operator naming it by hand puts it
+    straight into the scorer. Found live on 2026-09-07 against a Raspberry Pi
+    that had joined the cluster: `ZeroDivisionError` out of
+    `comm.compute_seconds_per_step`.
+    """
+
+    UNPROBED = dataclasses.replace(
+        SPARK_01,
+        node_id="unprobed",
+        hostname="unprobed",
+        gpu_name="",
+        gpu_count=0,
+        addressable_memory=0,
+        memory_bandwidth_gbps=0.0,
+    )
+
+    def test_zero_bandwidth_ranks_last_instead_of_dividing_by_zero(self):
+        step = comm.compute_seconds_per_step(LLAMA_3_3_70B, self.UNPROBED, 1)
+        assert step == float("inf")
+
+    def test_pooling_an_unprobed_machine_does_not_raise(self):
+        """The gateway refuses this placement with a better sentence, but the
+        planner must not be the thing that stops it -- a crash in the scorer
+        surfaces as `plan_failed: ZeroDivisionError`, which tells nobody
+        anything."""
+        plan = Planner().plan(
+            LLAMA_3_3_70B,
+            [SPARK_01, self.UNPROBED],
+            None,
+            "throughput",
+            8,
+            context_length=32768,
+            allow_mixed_hardware=True,
+        )
+        assert plan.node_ids

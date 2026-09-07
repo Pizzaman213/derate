@@ -9,10 +9,10 @@ import {
 } from '../state/resources'
 import { useBackend } from '../state/backend'
 import type { ModelSearchResponse } from '../api/types'
-import { useSelection } from '../state/selection'
 import { QuantTableCard } from './models/QuantTableCard'
 import { CatalogList } from './models/CatalogList'
 import { CardGrid } from './models/CardGrid'
+import { ModelInspector } from './models/ModelInspector'
 import {
   cacheIndex,
   capacityIndex,
@@ -67,7 +67,6 @@ export function ModelsTab() {
   const cluster = useCluster()
   const providers = useProviders()
   const storage = useStorage()
-  const { openSheet } = useSelection()
 
   const [source, setSource] = useState<Origin>('catalog')
   const [query, setQuery] = useState('')
@@ -79,6 +78,16 @@ export function ModelsTab() {
   const [concurrency, setConcurrency] = useState(1)
   const [sort, setSort] = useState<Sort>('fit')
   const [format, setFormat] = useState<Format>('all')
+  /** The model in the detail pane. Held here, not in the shell's sheet: it is
+   *  this screen's own selection and it has to survive every list change
+   *  around it.
+   *
+   *  The id only. It used to snapshot context and concurrency at the moment of
+   *  opening, which meant editing either field afterwards rebanded the list
+   *  while the pane beside it went on answering the old question -- the caption
+   *  saying 32,768 and the ladder under it saying 8,192, both correct, on one
+   *  screen. The numbers now come from one place for both. */
+  const [selected, setSelected] = useState<string | null>(null)
   // Cards to browse, rows to compare. Remembered, because which one somebody
   // wants depends on what they came here to do and that does not change
   // between visits.
@@ -210,13 +219,16 @@ export function ModelsTab() {
 
   /** Adopt the numbers a curated entry is normally served at, so the ladder's
    *  verdicts are taken at something sensible rather than at whatever was last
-   *  typed into the fields above. */
+   *  typed into the fields above.
+   *
+   *  Opens the detail pane beside the list rather than a sheet over it.
+   *  Choosing a model is comparison work -- read a verdict, go back, read the
+   *  next -- and a modal that covers the list makes you hold the previous
+   *  answer in your head. */
   const open = (row: ModelRow) => {
-    const ctx = row.default_context ?? context
-    const seqs = row.default_concurrency ?? concurrency
-    if (row.default_context) setContext(ctx)
-    if (row.default_concurrency) setConcurrency(seqs)
-    openSheet({ kind: 'model', id: row.model_id, context: ctx, concurrency: seqs })
+    if (row.default_context) setContext(row.default_context)
+    if (row.default_concurrency) setConcurrency(row.default_concurrency)
+    setSelected(row.model_id)
   }
 
   return (
@@ -314,6 +326,9 @@ export function ModelsTab() {
               >
                 <span aria-hidden>{v === 'cards' ? '\u25a6' : '\u25a4'}</span>
                 <span className="sr-only">{v}</span>
+                {v === 'cards' && selected ? (
+                  <span className="sr-only"> (browse view; the open model shows rows)</span>
+                ) : null}
               </button>
             ))}
           </div>
@@ -349,8 +364,14 @@ export function ModelsTab() {
             />
           </div>
         </div>
+      </div>
 
-        <div id="mt-panel" role="tabpanel" aria-labelledby={`mt-tab-${source}`}>
+      {/* Full width until something is open. The split is for comparing one
+          model against the list; with nothing selected it was just a 360px
+          column holding fifty cards one per row, which is the narrowest
+          possible way to show a catalogue. */}
+      <div className={selected ? 'msplit detail' : 'msplit'}>
+        <div className="card2 msplit-list" id="mt-panel" role="tabpanel" aria-labelledby={`mt-tab-${source}`}>
           {/* Where the verdicts came from, said once at the top rather than
               repeated on every row. */}
           {source === 'catalog' || source === 'ondevice' ? (
@@ -397,27 +418,59 @@ export function ModelsTab() {
             </>
           ) : null}
 
-          {/* Cards to browse, rows to compare. Same rows, same banding, same
-              verdicts underneath -- only the shape of the thing you scan. */}
-          {view === 'cards' ? (
-            <CardGrid
-              groups={groups}
-              table={quantTable.data}
-              loading={status.loading}
-              error={status.error}
-              emptyNote={emptyNote(source, query)}
-              onOpen={open}
-            />
-          ) : (
-            <CatalogList
-              groups={groups}
-              loading={status.loading}
-              error={status.error}
-              emptyNote={emptyNote(source, query)}
-              onOpen={open}
-            />
-          )}
+          {/* Cards to browse, rows to compare -- same rows, same banding, same
+              verdicts underneath, only the shape of the thing you scan.
+
+              With a model open the master pane is always rows, whatever the
+              toggle says. A 204px card in a 360px column is one card per row
+              and forty-eight of them is a column of postage stamps; Studio's
+              split does the same thing for the same reason. The toggle governs
+              browsing, which is where a card grid earns its space. */}
+          <div className="mpanel">
+            {view === 'cards' && !selected ? (
+              <CardGrid
+                groups={groups}
+                table={quantTable.data}
+                loading={status.loading}
+                error={status.error}
+                emptyNote={emptyNote(source, query)}
+                onOpen={open}
+              />
+            ) : (
+              <CatalogList
+                groups={groups}
+                loading={status.loading}
+                error={status.error}
+                emptyNote={emptyNote(source, query)}
+                onOpen={open}
+                selectedId={selected}
+                compact={selected != null}
+              />
+            )}
+          </div>
         </div>
+
+        {selected ? (
+          <div className="card2 msplit-detail">
+            <div className="msplit-detail-body">
+              {/* Keyed on the id so switching models remounts rather than
+                  letting the previous model's ladder linger under the new
+                  heading while its own two requests are still in flight.
+
+                  The debounced numbers, not the raw fields: these are the same
+                  pair the capacity walk is asked for, so the bands in the list
+                  and the ladder in this pane are always answering one question,
+                  and typing a context does not fire a hub call per keystroke. */}
+              <ModelInspector
+                key={selected}
+                modelId={selected}
+                context={capContext}
+                concurrency={capConcurrency}
+                onClose={() => setSelected(null)}
+              />
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <QuantTableCard />

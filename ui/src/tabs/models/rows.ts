@@ -51,8 +51,12 @@ export interface ModelRow {
   predicted_decode_tps: number | null
   headroom: number | null
   total_params: number | null
-  /** The quantization the capacity walk had to step down to, when it stepped. */
+  /** The quantization the capacity walk had to step down to, when it stepped.
+   *  A SUGGESTION, not a fact about the repository -- never classify the
+   *  repository's format from it. */
   dtype: string | null
+  /** What the repository actually holds. This is the one to reason about. */
+  nativeDtype: string | null
   requantized: boolean
   warnings: string[]
 
@@ -89,6 +93,7 @@ const EMPTY = {
   headroom: null,
   total_params: null,
   dtype: null,
+  nativeDtype: null,
   requantized: false,
   warnings: [] as string[],
   cachedOn: [] as string[],
@@ -169,6 +174,12 @@ export function cacheIndex(report: StorageReport | null | undefined): CacheIndex
   for (const n of report?.nodes ?? []) {
     for (const repo of n.models?.repos ?? []) {
       if (!repo.repo_id) continue
+      // `blob_count: 0` is a cache directory with no files in it -- a resolve
+      // touched the repo and wrote nothing. Four of this cluster's 52 are in
+      // that state, and counting them as cached made the card say "already on
+      // spark-4d38, the first launch does not have to pull it" about a model
+      // of which not one byte is present. Exact, not a size threshold.
+      if (repo.blob_count === 0) continue
       const list = nodes.get(repo.repo_id)
       if (list) list.push(n.node_id)
       else nodes.set(repo.repo_id, [n.node_id])
@@ -208,6 +219,7 @@ function withFit(row: ModelRow, cap: CapacityIndex, cache: CacheIndex): ModelRow
           headroom: c.headroom,
           total_params: c.total_params,
           dtype: c.dtype,
+          nativeDtype: c.native_dtype,
           requantized: c.requantized,
           warnings: c.warnings,
         }

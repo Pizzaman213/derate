@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { SelectionProvider } from '../state/selection'
 import { Header } from './Header'
 import { Sheet } from './Sheet'
@@ -30,13 +30,35 @@ export type Dest =
  *  node, which link, which deployment, which sheet) is shell state, needed by
  *  `Sheet` below and by every destination and sidebar section a later package
  *  adds, and nothing outside the shell has a reason to reach it. */
+/** Destinations that are themselves a split and want the full width.
+ *
+ *  Models puts a master list beside a detail pane; with the roster rail open as
+ *  well that is three columns on a 1440px screen and the detail pane ends up
+ *  narrower than the list feeding it. */
+const WIDE: ReadonlySet<Dest> = new Set<Dest>(['models'])
+
 export function AppShell() {
   const [dest, setDest] = useState<Dest>('dash')
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  // What the sidebar was before a wide destination collapsed it, so leaving
+  // one restores the choice rather than silently reopening a rail somebody had
+  // deliberately closed.
+  const restore = useRef<boolean | null>(null)
+
+  const go = (next: Dest) => {
+    setDest(next)
+    if (WIDE.has(next)) {
+      if (restore.current === null) restore.current = sidebarOpen
+      setSidebarOpen(false)
+    } else if (restore.current !== null) {
+      setSidebarOpen(restore.current)
+      restore.current = null
+    }
+  }
 
   return (
     <SelectionProvider>
-      <Header dest={dest} onSelectDest={setDest} />
+      <Header dest={dest} onSelectDest={go} />
 
       <div className={sidebarOpen ? 'wrap' : 'wrap narrow'}>
         <div className="rail">
@@ -46,7 +68,13 @@ export function AppShell() {
             aria-expanded={sidebarOpen}
             aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
             title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
-            onClick={() => setSidebarOpen((v) => !v)}
+            onClick={() => {
+              // An explicit toggle overrides the automatic collapse, including
+              // on the way back out: once somebody has said what they want the
+              // rail to do here, restoring an older value would fight them.
+              restore.current = null
+              setSidebarOpen((v) => !v)
+            }}
           >
             <svg
               width="7"

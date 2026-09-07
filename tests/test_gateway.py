@@ -8,6 +8,8 @@ must be how the tests run.
 
 from __future__ import annotations
 
+import dataclasses
+
 import asyncio
 import json
 import socket
@@ -3853,3 +3855,34 @@ class TestMixedHardwareGate:
 
         assert response.status_code == 200
         assert response.json()["placement"]["mixed_hardware"] is False
+
+
+def test_a_machine_with_no_memory_cannot_be_named_as_a_serving_node():
+    """Found live: a Raspberry Pi in the roster, named by hand, reached the
+    scorer and produced `plan_failed: ZeroDivisionError`. The fit gate already
+    drops zero-memory machines from the live budget; naming one deserves the
+    same answer said out loud."""
+    spark = NODE_PROFILES["spark-01"]
+    unprobed = dataclasses.replace(
+        spark,
+        node_id="unprobed",
+        hostname="unprobed",
+        gpu_name="",
+        gpu_count=0,
+        addressable_memory=0,
+        memory_bandwidth_gbps=0.0,
+    )
+    registry = FakeRegistry([node_state(spark), node_state(unprobed)])
+    deps = build_deps(registry=registry)
+    deps.planner = Planner()
+
+    with TestClient(create_app(deps)) as client:
+        response = client.post(
+            "/api/plan",
+            json={**PLACEMENT_BODY, "node_ids": [spark.node_id, "unprobed"]},
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "node_has_no_memory"
+    assert body["unusable_node_ids"] == ["unprobed"]

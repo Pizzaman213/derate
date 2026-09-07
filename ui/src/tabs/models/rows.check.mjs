@@ -102,6 +102,48 @@ check(tts.status === 'unsupported' && /text-to-speech/.test(tts.reason), 'a text
 check(S.classifySupport(row({ pipelineTag: 'text-generation' }), table).status !== 'unsupported', 'a text-generation model with no detectable quantization is left unmarked')
 check(S.classifySupport(row({}), null).status === 'unknown', 'with no quant table, support is unknown rather than assumed fine')
 
+console.log('\n--- an empty cache directory is not a cached model ---')
+const raw = storage.nodes.flatMap((n) => (n.models?.repos ?? []))
+const empty = raw.filter((r) => r.blob_count === 0)
+console.log(`  ${empty.length} of ${raw.length} cache entries hold no files: ${empty.map((r) => r.repo_id).join(', ') || 'none'}`)
+for (const r of empty) {
+  check(cache.nodes(r.repo_id).length === 0, `${r.repo_id} is not reported as on device`)
+}
+check(R.onDeviceRows(cap, cache).length === new Set(raw.filter((r) => r.blob_count > 0).map((r) => r.repo_id)).size,
+  'the On device source lists exactly the repos that hold files')
+
+console.log('\n--- running source: a live deployment must be findable by repo id ---')
+const cluster = await get('/api/cluster')
+const deps = await get('/api/deployments')
+const depRows = Array.isArray(deps) ? deps : (deps.deployments ?? [])
+if (depRows.length === 0) {
+  console.log('  (nothing deployed; skipped)')
+} else {
+  const run = R.runningRows({ deployments: depRows }, cache)
+  check(run.length === depRows.length, 'every deployment becomes a row')
+  // What the ladder's post-launch state depends on: the deployment record is
+  // addressable by the repo id a launch was sent with.
+  const d = depRows[0]
+  check(run.some((r) => r.model_id === d.model_id), 'a deployment row is keyed by the model id the launch used')
+  check(typeof d.state === 'string' && d.state === d.state.toLowerCase(), 'deployment state is lower case, as the signal mapping assumes')
+  console.log(`  ${d.model_id} -> ${d.served_name} (${d.state})`)
+}
+void cluster
+
+console.log('\n--- support reads the native dtype, never the fit gate\'s step-down ---')
+const qwen = catRows.find((r) => r.model_id === 'Qwen/Qwen3-30B-A3B')
+if (qwen) {
+  console.log(`  ${qwen.model_id}: native=${qwen.nativeDtype} suggested=${qwen.dtype} requantized=${qwen.requantized}`)
+  check(qwen.nativeDtype === 'bf16', 'the native dtype is carried through the join')
+  const v = S.classifySupport(qwen, table)
+  check(v.status !== 'unsupported',
+    'a bf16 repo the gate would step down to a GGUF quant is NOT marked unsupported')
+  // The regression itself: classifying from the suggestion produced this.
+  const fromSuggestion = S.classifySupport({ ...qwen, nativeDtype: null, quantHint: qwen.dtype }, table)
+  check(fromSuggestion.status === 'unsupported',
+    'and classifying from the step-down would have marked it — which is the bug')
+}
+
 console.log('\n--- owner identity ---')
 check(O.ownerAccent('Qwen') === O.ownerAccent('Qwen'), 'an accent is stable for the same publisher')
 check(O.ownerAccent('Qwen') !== O.ownerAccent('openai'), 'different publishers get different accents')

@@ -50,7 +50,7 @@ def _shape_key(p: NodeProfile) -> tuple:
 
 def _node_names(groups: list[NodeGroup]) -> str:
     """``node_id (gpu_name)`` for every node in these groups, in order."""
-    return ", ".join(f"{n.node_id} ({n.gpu_name})" for g in groups for n in g.nodes)
+    return ", ".join(n.describe() for g in groups for n in g.nodes)
 
 
 @dataclass(frozen=True)

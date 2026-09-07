@@ -289,9 +289,9 @@ def check_nodes(
         passed, reason = requirement.check(node.compute_capability)
         if not passed:
             ok = False
-            problems.append(f"{node.node_id} ({node.gpu_name}): {reason}")
+            problems.append(f"{node.describe()}: {reason}")
         elif "emulated" in reason:
-            problems.append(f"{node.node_id} ({node.gpu_name}): {reason}")
+            problems.append(f"{node.describe()}: {reason}")
     return ok, problems
 
 

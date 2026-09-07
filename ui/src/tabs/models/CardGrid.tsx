@@ -23,6 +23,8 @@ export function CardGrid({
   error,
   emptyNote,
   onOpen,
+  selectedId,
+  split,
 }: {
   groups: Group[]
   table: QuantTable | null
@@ -30,6 +32,10 @@ export function CardGrid({
   error: Error | null
   emptyNote: string
   onOpen: (row: ModelRow) => void
+  /** The model open in the detail pane, marked `aria-current` in the list. */
+  selectedId?: string | null
+  /** Master-pane layout: one card per row. */
+  split?: boolean
 }) {
   const [, bump] = useReducer((n: number) => n + 1, 0)
   useEffect(() => {
@@ -62,9 +68,15 @@ export function CardGrid({
             <span>{g.title}</span>
             <span className="unit">{g.rows.length}</span>
           </div>
-          <div className="mgrid">
+          <div className={split ? 'mgrid split' : 'mgrid'}>
             {g.rows.map((row) => (
-              <ModelCard key={row.key} row={row} table={table} onOpen={onOpen} />
+              <ModelCard
+                key={row.key}
+                row={row}
+                table={table}
+                onOpen={onOpen}
+                current={row.model_id === selectedId}
+              />
             ))}
           </div>
         </section>

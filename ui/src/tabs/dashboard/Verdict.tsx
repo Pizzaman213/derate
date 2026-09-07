@@ -284,16 +284,18 @@ export function Verdict({
                 onChange={(v) => onGrant(g.param, v)}
               />
             ))}
-            {/* One launch, one button, however many permissions it took. */}
-            <div>
-              <button onClick={onLaunch} disabled>
-                {gates.length === 1
-                  ? 'Serve anyway'
-                  : `Serve anyway — ${
-                      gates.filter((g) => granted[g.param] === true).length
-                    } of ${gates.length} agreed`}
-              </button>
-            </div>
+            {/* No button until every box is ticked -- the override stays a
+                second, deliberate act, which is the whole point of the gate.
+                Once they all are, `canServe` flips and the Serve button in the
+                branch above renders, labelled "Serve anyway". With more than
+                one gate the count says how far along you are, because
+                otherwise ticking the first box appears to do nothing. */}
+            {gates.length > 1 ? (
+              <span className="unit">
+                {gates.filter((g) => granted[g.param] === true).length} of{' '}
+                {gates.length} agreed
+              </span>
+            ) : null}
           </div>
         ) : (
           <p className="label" style={{ margin: 0, fontWeight: 400, color: 'var(--fault)' }}>

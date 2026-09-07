@@ -111,6 +111,15 @@ def compute_seconds_per_step(
     """
     active_bytes = shape.effective_active_params * shape.bytes_per_param()
     aggregate_bw = profile.memory_bandwidth_gbps * 1e9 * max(1, world_size)
+    if aggregate_bw <= 0:
+        # A profile the registry could not probe reports 0 GB/s, and it reaches
+        # here the moment an operator names such a machine by hand. Infinity is
+        # the honest ranking answer -- a machine whose memory bandwidth is
+        # unknown cannot be shown to decode any faster than never -- and it
+        # sorts the candidate last instead of raising ZeroDivisionError inside
+        # the scorer. Whether the machine may be placed on at all is a
+        # placement question, refused earlier and with a better sentence.
+        return float("inf")
     return active_bytes / aggregate_bw
 
 

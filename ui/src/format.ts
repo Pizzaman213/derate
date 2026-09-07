@@ -65,3 +65,15 @@ export function relativeTime(unixSeconds: number, now = Date.now() / 1000): stri
   if (d < 3600) return `${Math.round(d / 60)}m ago`
   return `${Math.round(d / 3600)}h ago`
 }
+
+/** A byte count at a scale that shows it.
+ *
+ *  `gbytes` is right for weights and wrong for everything under a gigabyte: a
+ *  1.6 MB metadata stub rendered as "0.0 GiB" reads as an empty measurement
+ *  rather than a small one, and the model cache is full of them.
+ */
+export function sizeLabel(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GiB`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(bytes >= 10 * 1024 ** 2 ? 0 : 1)} MiB`
+  return `${Math.max(1, Math.round(bytes / 1024))} KiB`
+}

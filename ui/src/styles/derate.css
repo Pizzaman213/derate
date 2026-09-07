@@ -924,7 +924,7 @@ svg text.m {
   text-align: left;
   overflow: hidden;
   border: 1px solid var(--rule);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius);
   background: var(--panel);
   cursor: pointer;
   isolation: isolate;
@@ -971,12 +971,14 @@ svg text.m {
   flex: 0 0 auto;
   width: 44px;
   height: 44px;
-  border-radius: 14px;
+  border-radius: 0;
   overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.12);
+  /* A hairline in the panel's own rule colour rather than a white inset ring,
+     which only reads as an edge on dark chrome. */
+  box-shadow: inset 0 0 0 1px var(--rule);
 }
 .mcard-avatar img {
   width: 100%;
@@ -1039,12 +1041,6 @@ svg text.m {
   flex: 0 0 auto;
   margin-top: 3px;
 }
-.mcard-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  display: inline-block;
-}
 .mcard-glyph {
   font-size: 11px;
   line-height: 1;
@@ -1076,18 +1072,6 @@ svg text.m {
   gap: 3px;
   white-space: nowrap;
 }
-.mcard-chip {
-  flex: 0 0 auto;
-  padding: 1px 7px;
-  border: 1px solid var(--rule);
-  border-radius: 999px;
-  background: var(--panel-recessed);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  color: var(--ink);
-  white-space: nowrap;
-}
 
 /* ── Toolbar controls ─────────────────────────────────────────────────────── */
 
@@ -1108,9 +1092,9 @@ svg text.m {
 .mbar-search input {
   width: 100%;
   height: 34px;
-  padding: 0 34px 0 32px;
+  padding: 0 34px 0 30px;
   border: 1px solid var(--rule);
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--panel-recessed);
 }
 .mbar-search .mbar-icon {
@@ -1128,13 +1112,13 @@ svg text.m {
   top: 50%;
   transform: translateY(-50%);
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius);
   padding: 2px 7px;
   color: var(--ink-muted);
 }
 .mbar select {
   height: 34px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   padding: 0 var(--s-2);
   background: var(--panel-recessed);
 }
@@ -1146,13 +1130,13 @@ svg text.m {
   height: 34px;
   padding: 3px;
   border: 1px solid var(--rule);
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--panel-recessed);
   flex: 0 0 auto;
 }
 .mview button {
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius);
   height: 26px;
   padding: 0 11px;
   color: var(--ink-muted);
@@ -1161,4 +1145,87 @@ svg text.m {
 .mview button[aria-pressed='true'] {
   background: var(--fill);
   color: var(--on-fill);
+}
+
+/* ── Models: master / detail split ──────────────────────────────────────────
+ *
+ * Studio's hub is a split: a narrow master pane of one-card-per-row on the
+ * left, the model itself on the right. It is the right shape for this screen
+ * because choosing a model is comparison work -- you read a fit verdict, go
+ * back, read the next one -- and a modal that covers the list makes you hold
+ * the previous answer in your head. The list stays put and the right pane
+ * changes under it.
+ *
+ * The app's own right sidebar collapses on this destination (AppShell), which
+ * is where the width for the detail pane comes from.
+ */
+
+/* One column until a model is open, then master and detail. The list is the
+ * whole screen while you are still choosing; the narrow master pane only earns
+ * its narrowness once there is something beside it worth the room. */
+.msplit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--s-3);
+  align-items: start;
+}
+.msplit.detail {
+  grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
+}
+
+/* The master pane's rows stack onto two lines, so the row rule has to clear
+ * both rather than sitting between them. */
+.msplit.detail .deprow {
+  align-items: start;
+  padding: 8px 0;
+}
+
+.msplit-list,
+.msplit-detail {
+  min-width: 0;
+}
+
+/* Each pane scrolls on its own, so reading a long ladder never scrolls the
+ * list out from under the thing being compared. Only in the split: full width,
+ * the list is the page and capping it would strand a scrollbar inside another
+ * one. */
+.msplit.detail .msplit-list .mpanel,
+.msplit-detail-body {
+  max-height: calc(100vh - 300px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+/* One card per row in the master pane: at 300px the auto-fill grid would place
+ * one anyway, but saying so keeps the card from stretching oddly at 360px. */
+.mgrid.split {
+  grid-template-columns: 1fr;
+  gap: var(--s-2);
+}
+.mgrid.split .mcard {
+  height: auto;
+  min-height: 104px;
+}
+
+/* The selected row, in both views. Same wash the deployments strip uses for
+ * selection, so it reads as the same idea. */
+.mcard[aria-current='true'] {
+  border-color: var(--rule-strong);
+  background: var(--panel-sunk);
+}
+.deprow[aria-current='true'] {
+  background: var(--panel-sunk);
+}
+
+/* Below the split's own breakpoint the panes stack: the list first, the detail
+ * under it, which is the phone shape and needs no separate design. */
+@media (max-width: 1100px) {
+  .msplit.detail {
+    grid-template-columns: 1fr;
+  }
+  .msplit.detail .msplit-list .mpanel,
+  .msplit-detail-body {
+    max-height: none;
+  }
 }

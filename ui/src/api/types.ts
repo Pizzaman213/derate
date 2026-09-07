@@ -1098,8 +1098,18 @@ export interface ModelDetail {
       note: string
     }
   } | null
-  /** Can the nodes we actually have run this scheme? */
-  nodes: { ok: boolean; problems: string[]; checked: number }
+  /** Can the nodes we actually have run this scheme?
+   *
+   *  `checked` counts only placement candidates. `skipped` names the machines
+   *  that were not asked and why -- a node with no GPU answers every
+   *  quantization question with a compute-capability complaint, which says
+   *  nothing about the model. Not blockers: never render them as problems. */
+  nodes: {
+    ok: boolean
+    problems: string[]
+    checked: number
+    skipped?: { node_id: string; reason: string }[]
+  }
   warnings: string[]
   from_cache: boolean
   resolved_at: number

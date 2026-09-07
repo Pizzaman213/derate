@@ -34,6 +34,18 @@ class NodeProfile:
     def usable_memory(self, guardrail: float = DEFAULT_GUARDRAIL) -> int:
         return int(self.addressable_memory * guardrail)
 
+    def describe(self) -> str:
+        """``node_id (gpu_name)``, or bare ``node_id`` when there is no GPU.
+
+        Three separate modules build this string for reason lines, and all
+        three used to print an empty ``()`` for a machine the probe found no
+        GPU on -- ``unknown_profile()`` zeroes ``gpu_name`` rather than
+        inventing a placeholder. Empty parentheses read as a missing value in a
+        sentence that is otherwise about hardware, so the parentheses go away
+        with the name.
+        """
+        return f"{self.node_id} ({self.gpu_name})" if self.gpu_name else self.node_id
+
 
 @dataclass
 class NodeState:

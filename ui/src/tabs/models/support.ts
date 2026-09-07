@@ -78,7 +78,12 @@ export function classifySupport(row: ModelRow, table: QuantTable | null): Suppor
  *  sentence attached rather than a refusal. */
 function detectScheme(row: ModelRow, table: QuantTable | null): string | null {
   if (row.quantHint) return row.quantHint.toLowerCase()
-  if (row.dtype) return row.dtype.toLowerCase()
+  // `nativeDtype`, never `dtype`. `dtype` is what the fit gate would step DOWN
+  // to in order to make the model fit -- a recommendation about a different set
+  // of weights. Reading it here put a red "q4_k_m is a llama.cpp format"
+  // unsupported dot on `Qwen/Qwen3-30B-A3B`, which is a bf16 safetensors repo
+  // and the one model on this cluster that both fits and can be served.
+  if (row.nativeDtype) return row.nativeDtype.toLowerCase()
   if (!table) return null
   const haystack = `${row.model_id} ${row.tags.join(' ')}`.toLowerCase()
   // Longest key first: `q4_k_m` and `q4_k_s` both contain no shorter key, but

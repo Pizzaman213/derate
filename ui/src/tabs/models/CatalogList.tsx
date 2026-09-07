@@ -19,12 +19,19 @@ export function CatalogList({
   error,
   emptyNote,
   onOpen,
+  selectedId,
+  compact,
 }: {
   groups: Group[]
   loading: boolean
   error: Error | null
   emptyNote: string
   onOpen: (row: ModelRow) => void
+  /** The model open in the detail pane, marked `aria-current` in the list. */
+  selectedId?: string | null
+  /** Master-pane width. Four columns do not fit in 360px, so the row stacks:
+   *  name on one line, everything describing it on the next. */
+  compact?: boolean
 }) {
   if (error) {
     return (
@@ -54,7 +61,13 @@ export function CatalogList({
             <span className="unit">{g.rows.length}</span>
           </div>
           {g.rows.map((row) => (
-            <Row key={row.key} row={row} onOpen={onOpen} />
+            <Row
+              key={row.key}
+              row={row}
+              onOpen={onOpen}
+              current={row.model_id === selectedId}
+              compact={compact}
+            />
           ))}
         </section>
       ))}
@@ -71,10 +84,38 @@ const LAMP: Record<Band, { signal: 'live' | 'warn' | 'fault' | 'idle'; label: st
 }
 
 const COLUMNS = 'minmax(0, 1.2fr) minmax(0, 1.6fr) auto auto'
+const COLUMNS_COMPACT = 'minmax(0, 1fr) auto'
 
-function Row({ row, onOpen }: { row: ModelRow; onOpen: (row: ModelRow) => void }) {
+function Row({
+  row,
+  onOpen,
+  current,
+  compact,
+}: {
+  row: ModelRow
+  onOpen: (row: ModelRow) => void
+  current?: boolean
+  compact?: boolean
+}) {
   const lamp = LAMP[bandOf(row)]
-  const cells = (
+  const cells = compact ? (
+    <>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+        {lamp.label ? <Lamp {...lamp} hollow={lamp.signal === 'idle'} /> : null}
+        <span className="mono" style={{ wordBreak: 'break-all' }}>
+          {row.label}
+        </span>
+      </span>
+      <span className="num" style={{ whiteSpace: 'nowrap' }}>
+        <Numbers row={row} />
+      </span>
+      {/* Second line, spanning both columns: everything that describes the row
+          rather than names it. */}
+      <span className="unit" style={{ gridColumn: '1 / -1', wordBreak: 'break-all' }}>
+        <Facts row={row} />
+      </span>
+    </>
+  ) : (
     <>
       <span
         style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}
@@ -106,7 +147,10 @@ function Row({ row, onOpen }: { row: ModelRow; onOpen: (row: ModelRow) => void }
     return (
       <div
         className="deprow"
-        style={{ gridTemplateColumns: COLUMNS, cursor: 'default' }}
+        style={{
+          gridTemplateColumns: compact ? COLUMNS_COMPACT : COLUMNS,
+          cursor: 'default',
+        }}
         aria-disabled
       >
         {cells}
@@ -119,8 +163,10 @@ function Row({ row, onOpen }: { row: ModelRow; onOpen: (row: ModelRow) => void }
       <button
         type="button"
         className="deprow"
+        aria-current={current ? 'true' : undefined}
         style={{
-          gridTemplateColumns: COLUMNS,
+          gridTemplateColumns: compact ? COLUMNS_COMPACT : COLUMNS,
+          rowGap: 2,
           width: '100%',
           textAlign: 'left',
           // Only the three sides a button adds and a row does not. `border: 0`

@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
-import type { QuantVariant, VariantLadder } from '../../api/types'
+import type { Cluster, QuantVariant, VariantLadder } from '../../api/types'
 import { ApiError } from '../../api/client'
 import { useBackend } from '../../state/backend'
-import { useStorage } from '../../state/resources'
+import { useCluster, useStorage } from '../../state/resources'
 import { Disclosure } from '../../components/Panel'
 import { Lamp } from '../../components/Lamp'
 import { OverrideGate } from '../../components/OverrideGate'
@@ -46,6 +46,9 @@ export function QuantLadder({
 }) {
   const { backend, invalidate } = useBackend()
   const storage = useStorage()
+  // Where a launch actually got to. `invalidate()` refreshes this, and the 5s
+  // cluster poll keeps it moving afterwards.
+  const cluster = useCluster()
   const [launching, setLaunching] = useState<string | null>(null)
   const [launchError, setLaunchError] = useState<string | null>(null)
   const [launched, setLaunched] = useState<string | null>(null)
@@ -174,7 +177,7 @@ export function QuantLadder({
           <span style={{ marginLeft: 'auto' }}>
             {pick.launchable && pick.fits === true ? (
               launched === pick.repo_id ? (
-                <span className="unit">launched</span>
+                <Launched repoId={pick.repo_id} cluster={cluster.data} />
               ) : (
                 <button
                   className="ghost"
@@ -335,6 +338,7 @@ export function QuantLadder({
                       key={key}
                       variant={v}
                       cache={cache}
+                      cluster={cluster.data}
                       recommended={
                         recommended != null &&
                         v.repo_id === recommended.repo_id &&
@@ -472,6 +476,40 @@ function Skeleton() {
   )
 }
 
+/** Where the launch got to.
+ *
+ *  "launched" on its own was a dead end: the button vanished, one word replaced
+ *  it, and nothing said whether the thing was starting, serving or already dead
+ *  in a pull. The deployment record answers all three, and it is already being
+ *  polled -- this only has to find the row and render its state.
+ *
+ *  Before the record exists there is a real gap of a second or two, which is
+ *  said as "starting" rather than left blank. */
+function Launched({ repoId, cluster }: { repoId: string; cluster: Cluster | null }) {
+  const dep = (cluster?.deployments ?? []).find((d) => d.model_id === repoId)
+  if (!dep) return <span className="unit">starting…</span>
+  // `degraded` is warn, not fault: it is serving. `stopping` is warn for the
+  // same reason -- it is still answering until it is not.
+  const signal =
+    dep.state === 'ready'
+      ? 'live'
+      : dep.state === 'failed' || dep.state === 'stopped'
+        ? 'fault'
+        : 'warn'
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <Lamp signal={signal} label={`${dep.served_name}: ${dep.state}`} />
+      <span className="unit">{dep.served_name}</span>
+      <span className="unit">{dep.state}</span>
+      {dep.last_error ? (
+        <span className="unit" style={{ color: 'var(--fault)' }} title={dep.last_error}>
+          — {dep.last_error}
+        </span>
+      ) : null}
+    </span>
+  )
+}
+
 /** Already on a node's disk, so the first launch does not have to pull it.
  *  A badge rather than a second lamp: the one lamp on a row means fit.
  *
@@ -560,6 +598,7 @@ function fitLamp(variant: QuantVariant): { signal: 'live' | 'warn' | 'fault' | '
 function Row({
   variant,
   cache,
+  cluster,
   recommended,
   launching,
   launched,
@@ -569,6 +608,7 @@ function Row({
 }: {
   variant: QuantVariant
   cache: ReturnType<typeof cacheIndex>
+  cluster: Cluster | null
   recommended: boolean
   launching: boolean
   launched: boolean
@@ -644,7 +684,7 @@ function Row({
       </td>
       <td>
         {launched ? (
-          <span className="unit">launched</span>
+          <Launched repoId={variant.repo_id} cluster={cluster} />
         ) : fits === true ? (
           <button
             className="ghost"

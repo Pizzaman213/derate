@@ -19,6 +19,27 @@ import { gbytes } from '../../format'
  *  resolve and usually cached; the ladder is a search plus a repository read
  *  per GGUF repo and can take seconds. Waiting for the slow one before drawing
  *  the fast one would leave the sheet blank for no reason. */
+/** One line per distinct reason, naming the machines that were not asked.
+ *
+ *  Grouped rather than listed per node: today every skip shares one reason, and
+ *  three identical sentences under a heading read as three problems. The server
+ *  owns the wording -- this only decides how many times to say it. */
+function skippedLines(
+  skipped: { node_id: string; reason: string }[] | undefined,
+): string[] {
+  if (!skipped?.length) return []
+  const byReason = new Map<string, string[]>()
+  for (const s of skipped) {
+    const ids = byReason.get(s.reason) ?? []
+    ids.push(s.node_id)
+    byReason.set(s.reason, ids)
+  }
+  return [...byReason].map(([reason, ids]) => {
+    const noun = ids.length === 1 ? 'node' : 'nodes'
+    return `${ids.length} ${noun} not considered: ${ids.join(', ')} — ${reason}`
+  })
+}
+
 export function ModelInspector({
   modelId,
   context,
@@ -94,6 +115,13 @@ export function ModelInspector({
         </button>
       </div>
 
+      {/* What it is, in one line, then what you can do with it. The reference
+          sections follow underneath.
+
+          They used to come first: six of them -- parameters, provenance,
+          runtimes, hardware, assumptions -- between picking a model and the
+          only control on the screen. Reading them is occasional; serving is why
+          the pane is open. */}
       {detail ? (
         <>
           <div className="unit" style={{ marginBottom: 10 }}>
@@ -101,7 +129,22 @@ export function ModelInspector({
             {detail.from_cache ? ' · from cache' : null}
           </div>
           <CapabilityChips detail={detail} />
+        </>
+      ) : detailError ? null : (
+        <p className="unit">Resolving…</p>
+      )}
 
+      <div className="sub">quantizations</div>
+      <QuantLadder
+        ladder={ladder}
+        loading={loadingLadder}
+        error={ladderError}
+        context={context}
+        concurrency={concurrency}
+      />
+
+      {detail ? (
+        <>
           <div className="sub">what this repository is</div>
           <ParamBreakdownTable detail={detail} />
 
@@ -148,10 +191,17 @@ export function ModelInspector({
             </div>
           ))}
 
-          {detail.nodes.problems.length ? (
+          {detail.nodes.problems.length || detail.nodes.skipped?.length ? (
             <>
               <div className="sub">on this hardware</div>
               <VerbatimList items={detail.nodes.problems} />
+              {skippedLines(detail.nodes.skipped).map((line) => (
+                // Muted, and deliberately not a VerbatimList row: these
+                // machines were not asked, which is not the same as objecting.
+                <div key={line} className="unit" style={{ marginTop: 6 }}>
+                  {line}
+                </div>
+              ))}
             </>
           ) : null}
 
@@ -163,24 +213,19 @@ export function ModelInspector({
           ) : null}
         </>
       ) : detailError ? (
-        <p
-          className="label"
-          style={{ fontWeight: 400, color: 'var(--fault)', whiteSpace: 'pre-wrap' }}
-        >
-          {detailError}
-        </p>
-      ) : (
-        <p className="unit">Resolving…</p>
-      )}
-
-      <div className="sub">quantizations</div>
-      <QuantLadder
-        ladder={ladder}
-        loading={loadingLadder}
-        error={ladderError}
-        context={context}
-        concurrency={concurrency}
-      />
+        <>
+          <div className="sub">what this repository is</div>
+          {/* The resolve failing does not stop the ladder above from being
+              useful, so this is stated where the detail would have been rather
+              than in place of the whole pane. */}
+          <p
+            className="label"
+            style={{ fontWeight: 400, color: 'var(--fault)', whiteSpace: 'pre-wrap' }}
+          >
+            {detailError}
+          </p>
+        </>
+      ) : null}
     </>
   )
 }
