@@ -44,6 +44,8 @@ from .config import (
 )
 from .discovery import parse_models
 from .errors import (
+    PullRefusedError,
+    PullUnsupportedError,
     AdapterUnsupportedError,
     MissingKeyError,
     ProviderError,
@@ -51,7 +53,7 @@ from .errors import (
     UnknownProviderError,
     UpstreamError,
 )
-from .kinds import KindSpec, auth_headers, join_url, spec_for
+from .kinds import KindSpec, auth_headers, join_url, native_base, spec_for
 from .runtime import ProviderRuntime, jittered_delay, parse_retry_after
 from .secrets import Redactor, SecretRedactingFilter, SecretStore, looks_like_secret
 from .serialization import assert_no_key_material, provider_public_dict
@@ -387,6 +389,75 @@ class ProviderService:
         self._persist()
         log.info("added provider %s (%s)", provider_id, kind.value)
         return provider_id
+
+    async def pull(
+        self,
+        provider_id: str,
+        model: str,
+        *,
+        on_size: Callable[[int], None] | None = None,
+    ) -> dict:
+        """Tell a self-hosted provider to fetch *model*, then re-read its catalogue.
+
+        Streamed rather than awaited whole, for one reason that matters: the
+        response's first frames carry the download total, and that is the only
+        moment before several minutes of transfer at which anything can decide
+        the weights are too big for the machine. ``on_size`` is called once with
+        that total; raising from it aborts the transfer, which is how the
+        caller's memory gate refuses without first filling somebody's SD card.
+
+        The native API, not the OpenAI-compatible one -- pulling is not in that
+        spec. ``pull_path`` names it per kind so nothing here assumes Ollama.
+        """
+        entry = self._entry(provider_id)
+        if not entry.spec.pull_path:
+            raise PullUnsupportedError(
+                f"{entry.spec.display_name} does not host its own weights, so "
+                f"there is nothing to pull onto it."
+            )
+        model = model.strip()
+        if not model:
+            raise ValueError("pull needs a model name")
+        _screen_free_text(model, "model")
+
+        url = join_url(native_base(entry.provider.base_url), entry.spec.pull_path)
+        client = self._client()
+        seen_size = False
+        digest = ""
+        async with client.stream(
+            "POST",
+            url,
+            json={"model": model, "stream": True},
+            timeout=httpx.Timeout(connect=CONNECT_TIMEOUT_S, read=None, write=WRITE_TIMEOUT_S, pool=CONNECT_TIMEOUT_S),
+        ) as response:
+            if response.status_code >= 400:
+                body = (await response.aread()).decode("utf-8", "replace")[:400]
+                raise UpstreamError(provider_id, response.status_code, body)
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    frame = json.loads(line)
+                except ValueError:
+                    continue
+                # The upstream reports its own failures in-band, at 200.
+                if frame.get("error"):
+                    raise UpstreamError(provider_id, 502, str(frame["error"])[:400])
+                total = frame.get("total")
+                if not seen_size and isinstance(total, (int, float)) and total > 0:
+                    seen_size = True
+                    if on_size is not None:
+                        # Raising here leaves the `async with` to close the
+                        # connection, which is what stops the transfer.
+                        on_size(int(total))
+                if frame.get("digest"):
+                    digest = str(frame["digest"])
+
+        # The catalogue is what makes the model routable; without this the pull
+        # succeeds and nothing can address it until the refresh loop comes round.
+        await self._refresh_standalone(provider_id)
+        return {"provider_id": provider_id, "model": model, "digest": digest}
 
     def _mint_id(self, kind: ProviderKind) -> str:
         base = _ID_SAFE.sub("-", kind.value.lower()).strip("-") or "provider"

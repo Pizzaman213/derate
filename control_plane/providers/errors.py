@@ -48,6 +48,25 @@ class AdapterUnsupportedError(ProviderError):
     """This provider's wire format has no adapter in this build."""
 
 
+class PullUnsupportedError(ProviderError):
+    """This kind hosts no weights of its own, so there is nothing to fetch."""
+
+
+class PullRefusedError(ProviderError):
+    """The weights will not fit the machine that would hold them.
+
+    Carries both figures because a refusal that does not say what to change is
+    a refusal the operator has to guess their way past.
+    """
+
+    def __init__(self, provider_id: str, model: str, needs: int, free: int, detail: str):
+        self.provider_id = provider_id
+        self.model = model
+        self.needs = needs
+        self.free = free
+        super().__init__(detail)
+
+
 class UpstreamError(ProviderError):
     """An error from the upstream, with its status code and message preserved.
 

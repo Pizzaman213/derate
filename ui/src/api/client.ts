@@ -15,6 +15,7 @@ import type {
   NodeProfile,
   NodeStateDTO,
   ProviderKindSpec,
+  PullAccepted,
   DeploymentDTO,
   Enrollment,
   EnrollmentRow,
@@ -171,8 +172,18 @@ export interface Backend {
   ): Promise<EventHistory>
   /** Log records at a level and worse, already redacted by the handler that
    *  shipped them. */
+  /** `exclude` is a comma-separated list of logger prefixes to drop. Omitted,
+   *  the server applies its own -- the same list the journal handler declines
+   *  to record -- so a window from before that change reads like one from
+   *  after it. Pass an empty string to see everything the archive still holds. */
   historyLogs(
-    opts?: HistoryQuery & { nodeId?: string; level?: string; logger?: string; q?: string },
+    opts?: HistoryQuery & {
+      nodeId?: string
+      level?: string
+      logger?: string
+      q?: string
+      exclude?: string
+    },
   ): Promise<LogHistory>
   /** Whether anything is being kept at all, and how much. Same shape as
    *  `StorageReport.telemetry`. */
@@ -182,6 +193,10 @@ export interface Backend {
    *  cap and no provider port can be measured against. */
   patchSettings(patch: SettingsPatch): Promise<Settings>
   providerKinds(): Promise<ProviderKindSpec[]>
+  pullToProvider(
+    providerId: string,
+    body: { model: string; allow_over_memory?: boolean },
+  ): Promise<PullAccepted>
   addProvider(spec: ProviderSpec): Promise<Provider>
   removeProvider(providerId: string): Promise<void>
   patchProvider(providerId: string, patch: ProviderPatch): Promise<Provider>
@@ -217,6 +232,12 @@ function historyPath(
   base: string,
   window: HistoryQuery | undefined,
   extra: Record<string, string | number | undefined>,
+  /** Keys whose empty string is a VALUE, not an omission. Only `exclude` so
+   *  far: absent means "apply the server's own quiet-logger list", and present
+   *  but empty means "apply none of it, show me everything the archive still
+   *  holds". Dropping it with the other blanks would silently turn the second
+   *  into the first, which is the one answer it must never give. */
+  meaningfulWhenEmpty: readonly string[] = [],
 ): string {
   const params = new URLSearchParams()
   // `from` is the query key; the handler's parameter is `from_` with an alias.
@@ -226,7 +247,8 @@ function historyPath(
     limit: window?.limit,
     ...extra,
   })) {
-    if (value == null || value === '') continue
+    if (value == null) continue
+    if (value === '' && !meaningfulWhenEmpty.includes(key)) continue
     params.set(key, String(value))
   }
   const qs = params.toString()
@@ -339,7 +361,11 @@ function nodeHealth(state: string | undefined, healthy: boolean): NodeHealth {
   return healthy ? 'healthy' : 'unreachable'
 }
 
-function toNodeState(n: NodeWire, coordinator: string | null): NodeStateDTO {
+/** Exported for `tabs/models/rows.check.mjs`, which drives `board.ts` with real
+ *  `/api/cluster` payloads and has to hand it the same shape the app does. A
+ *  second copy of this mapping written inside the verifier would agree with any
+ *  bug that came from the same reading of the schema. */
+export function toNodeState(n: NodeWire, coordinator: string | null): NodeStateDTO {
   return {
     profile: {
       node_id: n.node_id,
@@ -688,7 +714,8 @@ export const httpBackend: Backend = {
         level: opts?.level,
         logger: opts?.logger,
         q: opts?.q,
-      }),
+        exclude: opts?.exclude,
+      }, ['exclude']),
     ),
   historyStatus: () => req<TelemetryEstate>('/api/history/status'),
   clearResolverCache: () =>
@@ -702,6 +729,11 @@ export const httpBackend: Backend = {
   patchSettings: (patch) =>
     req<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
   providerKinds: () => req<ProviderKindSpec[]>('/api/providers/kinds'),
+  pullToProvider: (providerId, body) =>
+    req<PullAccepted>(`/api/providers/${encodeURIComponent(providerId)}/pull`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   addProvider: (spec) =>
     req<Provider>('/api/providers', { method: 'POST', body: JSON.stringify(spec) }),
   removeProvider: (providerId) =>

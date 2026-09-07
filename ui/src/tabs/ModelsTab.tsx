@@ -11,6 +11,7 @@ import { useBackend } from '../state/backend'
 import { DEFAULT_CONCURRENCY, DEFAULT_CONTEXT, useRouter } from '../state/router'
 import type { ModelSearchResponse } from '../api/types'
 import { QuantTableCard } from './models/QuantTableCard'
+import { PullCard } from './models/PullCard'
 import { CatalogList } from './models/CatalogList'
 import { CardGrid } from './models/CardGrid'
 import { ModelInspector } from './models/ModelInspector'
@@ -357,6 +358,15 @@ export function ModelsTab() {
           </div>
         </div>
 
+        {/* Hidden while a model is open: the Serve panel in the detail pane
+            carries the same pair, bound to the same two query parameters, and
+            two identical fields writing one piece of state reads as two
+            settings that might disagree. The caption above still states the
+            numbers, so the list never stops saying what it is answering at. */}
+        {/* Rendered away rather than `hidden`: `.bararea` sets `display:
+            flex`, which beats the `hidden` attribute's UA rule, so the
+            attribute alone would leave both pairs on screen. */}
+        {selected ? null : (
         <div className="bararea">
           <div className="fld" style={{ width: 96 }}>
             <label htmlFor="mt-ctx">Context</label>
@@ -387,6 +397,7 @@ export function ModelsTab() {
             />
           </div>
         </div>
+        )}
       </div>
 
       {/* Full width until something is open. The split is for comparing one
@@ -499,6 +510,8 @@ export function ModelsTab() {
           </div>
         ) : null}
       </div>
+
+      <PullCard />
 
       <QuantTableCard />
     </div>

@@ -15,6 +15,7 @@ import logging
 from functools import partial
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Query, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -457,6 +458,48 @@ def _plan_label(plan) -> str:
     return " + ".join(parts) if parts else "single node"
 
 
+#: How long to wait for a provider to report what it is about to download.
+#: Long enough for a cold registry lookup on a slow link, short enough that a
+#: silent upstream does not hold a browser request open.
+PULL_GATE_TIMEOUT_S = 30.0
+
+#: Strong references to in-flight pulls. asyncio holds only a weak reference to
+#: a bare task, so without this the transfer can be collected mid-download and
+#: the model simply never arrives.
+_PULLS: set = set()
+
+
+def _gib(value: int | float) -> str:
+    return f"{(value or 0) / 1024 ** 3:.1f}"
+
+
+def _provider_host_memory(ctx, base_url: str) -> tuple[int, str]:
+    """(free bytes, node name) for the machine a provider's URL points at.
+
+    Matched by address against the roster, because a provider is just a URL and
+    a machine only becomes measurable by having joined. (0, its host) when
+    nothing matches -- that is "unknown", not "full", and the caller must not
+    turn it into a refusal.
+
+    ``memory_total`` and ``memory_used`` are the node's live figures. On a
+    machine with no GPU they are host RAM, which is exactly the pool a model
+    served from that box would occupy.
+    """
+    host = urlparse(base_url).hostname or ""
+    if not host:
+        return 0, "that machine"
+    try:
+        nodes = ctx.deps.registry.list_nodes()
+    except Exception:
+        log.exception("registry unavailable while sizing a pull")
+        return 0, host
+    for state in nodes:
+        if state.profile.address == host or state.profile.hostname == host:
+            free = max(0, (state.memory_total or 0) - (state.memory_used or 0))
+            return free, state.profile.node_id
+    return 0, host
+
+
 def _not_implemented(operation: str, owner: str) -> JSONResponse:
     return errors.error_response(
         501,
@@ -538,7 +581,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "node_count": len(nodes),
                     "healthy_nodes": sum(1 for n in nodes if n.healthy),
                     "total_memory": sum(n.profile.total_memory for n in nodes),
-                    "total_power_w": round(sum(n.power_watts or 0.0 for n in nodes), 1),
+                    "total_power_w": round(
+                        sum(serialize.power_reading(n) or 0.0 for n in nodes), 1
+                    ),
                     "model_count": len(index.targets),
                     "deployment_count": len(index.deployments),
                     "tokens_per_sec": round(
@@ -600,6 +645,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "hostname": node.profile.hostname,
                     "device_class": node.profile.device_class.value,
                     "gpu_name": node.profile.gpu_name,
+                    # Carried so a plate can name its own utilisation line
+                    # without a second fetch: 0 means the figure below came
+                    # from /proc/stat and is CPU, not GPU. The layout is built
+                    # from this payload, so a card can exist before
+                    # /api/cluster has answered.
+                    "gpu_count": node.profile.gpu_count,
                     "state": "healthy" if node.healthy else "unhealthy",
                     "role": "coordinator"
                     if node_id == settings.coordinator_node_id
@@ -607,8 +658,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "memory_used_pct": round(node.memory_used / total_mem * 100.0, 1)
                     if total_mem
                     else None,
-                    "power_w": node.power_watts,
-                    "temp_c": node.temperature_c,
+                    # Same rule as /api/nodes, from the same place: a machine
+                    # with no GPU has no GPU power draw, and 0 W here would
+                    # read as an idle one.
+                    "power_w": serialize.power_reading(node),
+                    "temp_c": serialize.temp_reading(node),
                     "util_pct": node.utilization_pct,
                     "sample_ts": node.sample_ts or None,
                     "strength": round(strength, 4),
@@ -1147,6 +1201,163 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         spend = ui_detail.provider_spend(ctx.deps.providers)
         return JSONResponse(
             serialize.provider_payload(provider, spend.get(provider.provider_id))
+        )
+
+    @router.post("/api/providers/{provider_id}/pull")
+    async def pull_provider_model(provider_id: str, request: Request) -> Response:
+        """Fetch weights onto a provider that hosts its own.
+
+        The gate is the point. A pull is minutes of transfer onto a machine
+        that may be a Raspberry Pi with a gigabyte free, and the only moment
+        anything can judge it is the download total in the response's first
+        frames -- before that there is no size, and after it the SD card is
+        already filling. ``ProviderService.pull`` surfaces exactly that moment
+        through ``on_size``, and raising from the callback aborts the transfer.
+
+        Refusing needs a number to refuse against, and derate does not own this
+        machine. When the provider's address matches a node in the roster, its
+        measured free memory is that number. When it does not -- a box that
+        never joined -- there is nothing to measure and the pull proceeds
+        unjudged, which is the same rule the fit gate follows for a node with
+        no live reading: absence degrades, it never refuses.
+
+        Returns 202 once the size is known and accepted. The transfer continues
+        in the background and the model appears when the catalogue refresh
+        picks it up; holding the request open for the whole download would time
+        out in every proxy between here and the browser.
+        """
+        from control_plane.providers.config import PULL_HEADROOM
+        from control_plane.providers.errors import (
+            PullRefusedError,
+            PullUnsupportedError,
+        )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return errors.error_response(
+                400, "Body must be JSON.", "invalid_request_error", "invalid_json"
+            )
+        model = str(body.get("model") or "").strip()
+        if not model:
+            return errors.error_response(
+                400,
+                "Name the model to pull, as the provider names it.",
+                "invalid_request_error",
+                "model_required",
+            )
+        override = bool(body.get("allow_over_memory"))
+
+        pull = getattr(ctx.deps.providers, "pull", None)
+        if not callable(pull):
+            return _not_implemented("Pulling weights", "provider store")
+        try:
+            provider = ctx.deps.providers.get(provider_id)
+        except UnknownProviderError:
+            return errors.error_response(
+                404, f"No provider '{provider_id}'.",
+                "invalid_request_error", "provider_not_found",
+            )
+
+        free, node_id = _provider_host_memory(ctx, provider.base_url)
+        budget = int(free * PULL_HEADROOM) if free else 0
+
+        loop = asyncio.get_running_loop()
+        gated: asyncio.Future = loop.create_future()
+
+        def on_size(total: int) -> None:
+            if budget and total > budget and not override:
+                exc = PullRefusedError(
+                    provider_id, model, total, free,
+                    f"{model} is {_gib(total)} GiB to download and {node_id} has "
+                    f"{_gib(free)} GiB free, of which a model may use "
+                    f"{_gib(budget)} GiB -- the server process, its KV cache and "
+                    f"the operating system need the rest. Pick a smaller model, "
+                    f"free memory on {node_id}, or send allow_over_memory to "
+                    f"pull it anyway.",
+                )
+                if not gated.done():
+                    gated.set_exception(exc)
+                raise exc
+            if not gated.done():
+                gated.set_result(total)
+
+        async def runner():
+            try:
+                return await pull(provider_id, model, on_size=on_size)
+            except Exception as exc:
+                if not gated.done():
+                    gated.set_exception(exc)
+                raise
+            else:
+                if not gated.done():
+                    # Completed without ever reporting a total: already present
+                    # upstream, so there was nothing to download.
+                    gated.set_result(0)
+
+        def _finished(t: asyncio.Task) -> None:
+            """Retire the task, and always retrieve its exception.
+
+            Not optional bookkeeping: a task whose exception is never read has
+            asyncio log "Task exception was never retrieved" at ERROR when it
+            is collected, at an unpredictable later moment. The refusal has
+            already been reported to the caller through `gated` by then, so
+            that record is a duplicate arriving with no request attached to it
+            -- and it lands in the journal, which is how it first showed up.
+            """
+            _PULLS.discard(t)
+            if t.cancelled():
+                return
+            failure = t.exception()
+            if failure is not None:
+                log.warning(
+                    "pull of %r onto %s did not complete: %s",
+                    model, provider_id, failure,
+                )
+                return
+            # Only a completed pull changes what is routable.
+            ctx.router.rebuild(force_scores=True)
+
+        task = loop.create_task(runner())
+        _PULLS.add(task)
+        task.add_done_callback(_finished)
+
+        try:
+            total = await asyncio.wait_for(asyncio.shield(gated), timeout=PULL_GATE_TIMEOUT_S)
+        except PullRefusedError as exc:
+            return errors.error_response(
+                409, str(exc), "invalid_request_error", "pull_over_memory",
+            )
+        except PullUnsupportedError as exc:
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "pull_unsupported",
+            )
+        except asyncio.TimeoutError:
+            task.cancel()
+            return errors.error_response(
+                504,
+                f"{provider.display_name} did not report a download size within "
+                f"{PULL_GATE_TIMEOUT_S:.0f}s. Nothing was pulled.",
+                "server_error", "pull_no_size",
+            )
+        except Exception as exc:
+            log.exception("provider pull failed")
+            return errors.error_response(
+                502, f"Could not pull. {errors.detail(exc, _redactor())}",
+                "server_error", "pull_failed",
+            )
+
+        return JSONResponse(
+            {
+                "provider_id": provider_id,
+                "model": model,
+                "download_bytes": total,
+                "checked_against": node_id,
+                "free_bytes": free,
+                "budget_bytes": budget,
+                "state": "pulling" if total else "present",
+            },
+            status_code=202,
         )
 
     @router.delete("/api/providers/{provider_id}")
@@ -2038,16 +2249,29 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         logger: str = "",
         q: str = "",
         node_id: str = "",
+        exclude: str | None = None,
         from_: str = Query("", alias="from"),
         to: str = "",
         limit: int = 500,
     ) -> Response:
+        # `exclude` defaults to whatever the log handler declines to record, so
+        # a caller gets the same answer either side of the change that started
+        # dropping them -- a window from last week reads like a window from
+        # today, without every client having to carry the list. `?exclude=`
+        # (present, empty) asks for everything, including the access lines
+        # still sitting in the archive from before.
+        prefixes = (
+            tquery.config.quiet_loggers()
+            if exclude is None
+            else tuple(p.strip() for p in exclude.split(",") if p.strip())
+        )
         return await _history(
             tquery.logs,
             level=level,
             logger=logger,
             q=q,
             node_id=node_id,
+            exclude=prefixes,
             from_ts=from_,
             to_ts=to,
             limit=limit,

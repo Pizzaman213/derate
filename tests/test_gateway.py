@@ -221,6 +221,9 @@ class FakeProviders:
             raise UnknownProviderError(provider_id)
         return provider
 
+    def get(self, provider_id):
+        return self._find(provider_id)
+
     def refresh(self, provider_id):
         return self._find(provider_id)
 
@@ -565,6 +568,142 @@ def test_gateway_constructs_and_serves_with_every_dependency_stubbed():
             "/api/deployments",
         ):
             assert client.get(path).status_code == 200, path
+
+
+class PullableProviders(FakeProviders):
+    """A provider store that can be told to fetch weights.
+
+    Reports a download size through on_size exactly as the streaming pull does,
+    which is the only hook the memory gate has.
+    """
+
+    def __init__(self, providers=None, *, size=0, raises=None):
+        super().__init__(providers)
+        self.size = size
+        self.raises = raises
+        self.pulled = []
+
+    async def pull(self, provider_id, model, *, on_size=None):
+        if self.raises is not None:
+            raise self.raises
+        if on_size is not None and self.size:
+            on_size(self.size)
+        self.pulled.append((provider_id, model))
+        return {"provider_id": provider_id, "model": model, "digest": "sha256:x"}
+
+
+def _pull_setup(*, size, free_bytes, used=0, address="192.168.11.99"):
+    """A cluster with one node and one provider pointing at that node."""
+    from dataclasses import replace as _replace
+
+    from tests.fixtures import node_state
+
+    profile = _replace(make_node_profile(), address=address)
+    state = node_state(profile)
+    state.memory_total = free_bytes + used
+    state.memory_used = used
+    provider = make_provider(base_url=f"http://{address}:11434/v1")
+    providers = PullableProviders([provider], size=size)
+    deps = build_deps(registry=FakeRegistry([state]), providers=providers)
+    return deps, providers, profile.node_id
+
+
+def test_a_pull_that_fits_is_accepted_and_runs_in_the_background():
+    deps, providers, node_id = _pull_setup(size=300 * 1024**2, free_bytes=2 * GIB)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/providers/openrouter/pull", json={"model": "qwen2.5:0.5b"}
+        )
+    assert reply.status_code == 202, reply.text
+    body = reply.json()
+    assert body["download_bytes"] == 300 * 1024**2
+    # Named, so the refusal and the acceptance agree about which box was judged.
+    assert body["checked_against"] == node_id
+    assert body["state"] == "pulling"
+    assert providers.pulled == [("openrouter", "qwen2.5:0.5b")]
+
+
+def test_a_pull_too_big_for_the_machine_is_refused_with_both_figures():
+    """A pull is minutes of transfer onto a box that may have a gigabyte free.
+
+    The download total in the stream's first frames is the only moment anything
+    can judge it -- before that there is no size, after it the card is filling.
+    """
+    deps, _providers, node_id = _pull_setup(size=3 * GIB, free_bytes=GIB)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/providers/openrouter/pull", json={"model": "llama3.2:3b"}
+        )
+    assert reply.status_code == 409
+    body = reply.json()["error"]
+    assert body["code"] == "pull_over_memory"
+    # Both numbers and the way out, or the operator has to guess past it.
+    assert "3.0 GiB" in body["message"] and "1.0 GiB" in body["message"]
+    assert node_id in body["message"]
+    assert "allow_over_memory" in body["message"]
+
+
+def test_an_over_memory_pull_proceeds_when_it_is_asked_for_explicitly():
+    deps, providers, _ = _pull_setup(size=3 * GIB, free_bytes=GIB)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/providers/openrouter/pull",
+            json={"model": "llama3.2:3b", "allow_over_memory": True},
+        )
+    assert reply.status_code == 202
+    assert providers.pulled == [("openrouter", "llama3.2:3b")]
+
+
+def test_a_pull_onto_a_machine_that_never_joined_is_not_refused():
+    """derate does not own that box. No reading is unknown, not full.
+
+    The same rule the fit gate follows for a node with no live figure: absence
+    degrades to unjudged, it never refuses.
+    """
+    deps, providers, _ = _pull_setup(
+        size=99 * GIB, free_bytes=GIB, address="10.9.9.9"
+    )
+    # The provider points at 10.9.9.9; the roster's only node is elsewhere.
+    deps.registry = FakeRegistry([])
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/providers/openrouter/pull", json={"model": "huge:latest"}
+        )
+    assert reply.status_code == 202
+    assert reply.json()["free_bytes"] == 0
+    assert providers.pulled == [("openrouter", "huge:latest")]
+
+
+def test_pulling_onto_a_kind_that_hosts_nothing_says_so():
+    from control_plane.providers.errors import PullUnsupportedError
+
+    providers = PullableProviders(
+        [make_provider()],
+        raises=PullUnsupportedError("OpenRouter does not host its own weights"),
+    )
+    deps = build_deps(registry=FakeRegistry(), providers=providers)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/providers/openrouter/pull", json={"model": "anything"}
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "pull_unsupported"
+
+
+def test_a_pull_needs_a_model_name():
+    deps, _, _ = _pull_setup(size=0, free_bytes=GIB)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/api/providers/openrouter/pull", json={"model": "  "})
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "model_required"
+
+
+def test_the_native_api_is_addressed_by_stripping_the_openai_shim():
+    """One address for the box. Two would eventually name two machines."""
+    from control_plane.providers.kinds import join_url, native_base
+
+    for given in ("http://pi:11434/v1", "http://pi:11434/v1/", "http://pi:11434"):
+        assert join_url(native_base(given), "api/pull") == "http://pi:11434/api/pull"
 
 
 def test_provider_kinds_tell_the_form_what_each_kind_needs():
@@ -3438,6 +3577,71 @@ def test_node_payload_reports_power_as_unknown_when_there_is_no_gpu():
     # Real readings from the host, and they must survive as themselves.
     assert node["temp_c"] == 47.5
     assert node["util_pct"] == 12.5
+
+
+def test_every_surface_agrees_that_a_gpu_less_node_has_no_power_reading():
+    """/api/nodes said null and the live frame said 0 W, for the same machine.
+
+    The UI prefers the frame while it is fresh, so the roster rendered the
+    measured-looking zero the /api/nodes rule exists to suppress. Found live on
+    a worker container started without --gpus: 0 W beside a real 50 C.
+    """
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+    from tests.fixtures import node_state
+
+    state = node_state(_no_gpu_profile())
+    state.power_watts = 0.0
+    state.temperature_c = 50.1
+    state.utilization_pct = 6.0
+    registry = FakeRegistry([state])
+
+    with TestClient(create_app(build_deps(registry=registry))) as client:
+        node = client.get("/api/nodes").json()[0]
+        topo = client.get("/api/topology").json()["nodes"][0]
+
+    frame = MetricsHub(
+        registry=registry,
+        deployments=FakeDeployments([]),
+        stats=StatsRegistry(),
+        settings=GatewaySettings(),
+    ).snapshot()["nodes"][0]
+
+    assert node["power_w"] is None
+    assert topo["power_w"] is None
+    assert frame["power_w"] is None
+    # And the host readings survive on all three, unchanged.
+    assert [node["temp_c"], topo["temp_c"], frame["temp_c"]] == [50.1] * 3
+    assert [node["util_pct"], topo["util_pct"], frame["util_pct"]] == [6.0] * 3
+
+
+def test_the_cluster_power_total_does_not_count_a_node_with_no_gpu():
+    """Zero either way today, since a GPU-less node reports 0.0 W. The total
+    is summed from the same reading the rows show so it cannot start
+    disagreeing with them if that ever stops being true."""
+    from tests.fixtures import node_state
+
+    spark = node_state(NODE_PROFILES["spark-01"])
+    spark.power_watts = 91.0
+    no_gpu = node_state(_no_gpu_profile())
+    no_gpu.power_watts = 4.5  # a stale or fabricated figure, not a measurement
+    deps = build_deps(registry=FakeRegistry([spark, no_gpu]))
+
+    with TestClient(create_app(deps)) as client:
+        summary = client.get("/api/cluster").json()["summary"]
+
+    assert summary["total_power_w"] == 91.0
+
+
+def test_the_topology_payload_carries_gpu_count():
+    """The cluster plate labels its utilisation line from this, and the layout
+    is built from /api/topology -- so a plate can be on screen before
+    /api/cluster answers, and would otherwise call host CPU "GPU"."""
+    from tests.fixtures import node_state
+
+    deps = build_deps(registry=FakeRegistry([node_state(_no_gpu_profile())]))
+    with TestClient(create_app(deps)) as client:
+        assert client.get("/api/topology").json()["nodes"][0]["gpu_count"] == 0
 
 
 def test_node_payload_measures_memory_against_the_live_total_when_there_is_no_gpu():

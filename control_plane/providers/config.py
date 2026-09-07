@@ -62,3 +62,13 @@ COST_BLEND_OUTPUT_WEIGHT = 0.75
 def data_dir() -> Path:
     """Where persistent state lives. ``/data`` in the container."""
     return Path(os.environ.get("DERATE_DATA_DIR", "/data"))
+
+
+#: Fraction of a machine's free memory a pulled model's weights may occupy.
+#:
+#: Weights are not the whole cost -- the server process, its KV cache and the
+#: operating system all want room in the same pool -- so the download total is
+#: checked against a share of what is free rather than all of it. On a box with
+#: no GPU this pool is host RAM, and a machine that swaps a model is not slow,
+#: it is unusable, which is why this refuses rather than warns.
+PULL_HEADROOM = float(os.environ.get("DERATE_PULL_HEADROOM", "0.8"))

@@ -38,6 +38,12 @@ class KindSpec:
     embeddings_path: str = "embeddings"
     speech_path: str = "audio/speech"
     transcriptions_path: str = "audio/transcriptions"
+    #: Whether this kind hosts its own weights and can be told to fetch one.
+    #: True only for a server the operator runs: a hosted API already has every
+    #: model it is going to have, and "pull" there would be a control that does
+    #: nothing. The native path is deliberately not the OpenAI-compatible one --
+    #: pulling is not in that spec, so it is named per kind rather than assumed.
+    pull_path: str = ""
     requires_key: bool = True
     requires_base_url: bool = False
     # OpenAI's stream_options.include_usage. Only set it where the upstream is
@@ -107,6 +113,9 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         requires_key=False,
         # Ollama's OpenAI shim has rejected unknown stream fields historically.
         supports_stream_usage=False,
+        # Native API, not the /v1 shim: pulling has no OpenAI equivalent. The
+        # shim's own prefix is stripped before this is joined on.
+        pull_path="api/pull",
     ),
     ProviderKind.CUSTOM: KindSpec(
         kind=ProviderKind.CUSTOM,
@@ -145,3 +154,19 @@ def auth_headers(spec: KindSpec, key: str | None) -> dict[str, str]:
 
 def join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def native_base(base_url: str) -> str:
+    """The server's own root, with the OpenAI-compatibility prefix removed.
+
+    A provider's ``base_url`` addresses the OpenAI shim, because that is what
+    every request in this system speaks. Pulling weights has no equivalent in
+    that spec and lives on the server's native API one level up, so the shim
+    segment is stripped rather than a second URL being configured -- one
+    address for the box, and no way for the two to disagree about which machine
+    is meant.
+    """
+    trimmed = base_url.rstrip("/")
+    if trimmed.endswith("/v1"):
+        return trimmed[: -len("/v1")]
+    return trimmed

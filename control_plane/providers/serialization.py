@@ -75,6 +75,7 @@ def kinds_public() -> list[dict]:
                 "base_url": spec.base_url,
                 "requires_key": spec.requires_key,
                 "requires_base_url": spec.requires_base_url,
+                "supports_pull": bool(spec.pull_path),
                 "publishes_pricing": spec.pricing.value != "none",
                 "forwardable": spec.forwardable,
                 "unsupported_reason": spec.unsupported_reason or None,

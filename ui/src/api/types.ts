@@ -57,6 +57,9 @@ export interface TopologyNode {
   hostname: string
   device_class: DeviceClass
   gpu_name: string
+  /** 0 on a machine the probe found no GPU on, whose `util_pct` is then host
+   *  CPU from /proc/stat. Optional only because the stubs predate it. */
+  gpu_count?: number
   state: NodeHealth
   role: NodeRole
   memory_used_pct: number
@@ -186,11 +189,29 @@ export interface ProviderKindSpec {
   base_url: string
   requires_key: boolean
   requires_base_url: boolean
+  /** Whether this kind hosts its own weights and can be told to fetch one.
+   *  False for a hosted API, which already has every model it will ever have. */
+  supports_pull: boolean
   publishes_pricing: boolean
   forwardable: boolean
   /** Set when this build cannot talk to the kind at all. The server's own
    *  sentence; render it verbatim and do not offer the kind. */
   unsupported_reason: string | null
+}
+
+/** `POST /api/providers/{id}/pull`. 202 once the download size is known and
+ *  accepted; the transfer continues on the server. */
+export interface PullAccepted {
+  provider_id: string
+  model: string
+  /** 0 when the provider already had it and nothing was downloaded. */
+  download_bytes: number
+  /** The node the size was judged against, or the bare host when no node in
+   *  the roster claims that address and the pull went unjudged. */
+  checked_against: string
+  free_bytes: number
+  budget_bytes: number
+  state: 'pulling' | 'present'
 }
 
 export interface NodeStateDTO {
