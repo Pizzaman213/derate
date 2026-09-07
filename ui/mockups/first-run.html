@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>derate — first run</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Tokens lifted from ui/src/styles/tokens.css so this sits inside the app
+   rather than beside it. Dark mode is the same swap the real app does, in both
+   of the forms tokens.css uses: the media query for a viewer on system
+   default, and the [data-theme] stamp for one who chose a theme explicitly.
+   A mockup that only carried the media query would render light-on-light for
+   anyone whose host stamps the attribute. */
+:root {
+  --panel-sunk:#D6D0C2; --panel-recessed:#E3DED3; --panel:#EDE9E0; --panel-raised:#F7F4EE;
+  --ink:#1A1917; --ink-muted:#5C5851; --rule:#C9C2B4; --rule-strong:#B4AC9A; --edge:#82796B;
+  --fill:#33302B; --on-fill:#EDE9E0; --on-fill-dim:#A8A398;
+  --live:#2F6E3A; --warn:#7F5C14; --fault:#9A3327;
+  --live-solid:#3D8B4A; --warn-solid:#B8862C; --flow:#4A6FA5;
+  --font-sans:'IBM Plex Sans',ui-sans-serif,system-ui,sans-serif;
+  --font-mono:'IBM Plex Mono',ui-monospace,'SF Mono',monospace;
+  --size-body:15px; --size-label:13px; --size-unit:12px;
+  --s-1:4px; --s-2:8px; --s-3:12px; --s-4:16px; --s-5:24px; --s-6:32px; --s-7:48px;
+  --radius:3px; --radius-lg:6px;
+  --hover:color-mix(in srgb,var(--ink) 5%,transparent);
+  --dur:180ms; --ease:cubic-bezier(.2,.7,.3,1);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme='light']){
+    --panel-sunk:#0E0D0C; --panel-recessed:#141312; --panel:#191817; --panel-raised:#232120;
+    --ink:#EDE9E0; --ink-muted:#979186; --rule:#423D37; --rule-strong:#5A544C; --edge:#7C746A;
+    --fill:#E2DCD0; --on-fill:#191817; --on-fill-dim:#5A5750;
+    --live:#72C182; --warn:#D6A64A; --fault:#E58273;
+    --live-solid:#4E9E5C; --warn-solid:#C4922F; --flow:#7FA3D4;
+  }
+}
+:root[data-theme='dark']{
+  --panel-sunk:#0E0D0C; --panel-recessed:#141312; --panel:#191817; --panel-raised:#232120;
+  --ink:#EDE9E0; --ink-muted:#979186; --rule:#423D37; --rule-strong:#5A544C; --edge:#7C746A;
+  --fill:#E2DCD0; --on-fill:#191817; --on-fill-dim:#5A5750;
+  --live:#72C182; --warn:#D6A64A; --fault:#E58273;
+  --live-solid:#4E9E5C; --warn-solid:#C4922F; --flow:#7FA3D4;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--panel); color:var(--ink);
+  font-family:var(--font-sans); font-size:var(--size-body); line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:var(--font-mono); font-variant-numeric:tabular-nums; font-feature-settings:'tnum' 1,'zero' 1}
+.unit{font-size:var(--size-unit); color:var(--ink-muted); line-height:1.45}
+.label{font-size:var(--size-label); font-weight:500}
+
+/* ── frame ──────────────────────────────────────────────────────────── */
+header{
+  display:flex; align-items:center; gap:var(--s-3);
+  padding:var(--s-4) var(--s-5); border-bottom:1px solid var(--rule);
+}
+header .wordmark{font-weight:500; font-size:18px; letter-spacing:-.3px}
+header .where{margin-left:auto}
+
+main{max-width:660px; margin:0 auto; padding:var(--s-7) var(--s-5) 96px}
+
+/* ── the ledger: what is true so far ────────────────────────────────── */
+.ledger{border-left:2px solid var(--rule); padding-left:var(--s-4); margin-bottom:var(--s-6)}
+.ledger:empty{display:none}
+.done{
+  display:flex; align-items:baseline; gap:var(--s-2);
+  padding:var(--s-2) 0; border-bottom:1px solid var(--rule);
+}
+.done:last-child{border-bottom:0}
+.done .tick{color:var(--live); flex:0 0 auto}
+.done .what{flex:1}
+.done .detail{color:var(--ink-muted); font-size:var(--size-unit)}
+.done button{font-size:var(--size-unit); padding:2px 8px; border-color:transparent; color:var(--ink-muted)}
+.done button:hover{border-color:var(--rule)}
+
+/* ── the active step ────────────────────────────────────────────────── */
+h1{
+  font-size:26px; font-weight:500; line-height:1.25; letter-spacing:-.2px;
+  margin:0 0 var(--s-3); text-wrap:balance;
+}
+.lede{margin:0 0 var(--s-5); max-width:52ch}
+.step{animation:rise var(--dur) var(--ease) both}
+@keyframes rise{from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:none}}
+@media (prefers-reduced-motion:reduce){ .step{animation:none} }
+
+/* the machine plate — the hero of step one */
+.plate{
+  background:var(--fill); color:var(--on-fill);
+  border-radius:var(--radius-lg); padding:var(--s-5);
+  margin-bottom:var(--s-5);
+}
+.plate .name{font-size:22px; font-weight:500; margin-bottom:var(--s-1)}
+.plate .spec{color:var(--on-fill-dim); font-size:var(--size-label)}
+.plate .bar{
+  height:6px; border-radius:2px;
+  /* Derived from --on-fill rather than written as a literal: --fill and
+     --on-fill trade places in dark mode, and a hardcoded light track would
+     sit invisibly on the light plate the dark theme paints. */
+  background:color-mix(in srgb,var(--on-fill) 16%,transparent);
+  margin:var(--s-4) 0 var(--s-2); overflow:hidden;
+}
+.plate .bar span{display:block; height:100%; width:82%; background:var(--on-fill); opacity:.85}
+.plate .caption{color:var(--on-fill-dim); font-size:var(--size-unit)}
+
+/* controls */
+button{
+  font:inherit; color:inherit; background:transparent;
+  border:1px solid var(--rule); border-radius:var(--radius);
+  padding:6px 12px; cursor:pointer; transition:background var(--dur) var(--ease);
+}
+button:hover:not(:disabled){background:var(--hover)}
+button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(--ink); outline-offset:2px}
+.primary{
+  background:var(--fill); color:var(--on-fill); border-color:var(--fill);
+  padding:9px 18px; font-weight:500;
+}
+.primary:hover:not(:disabled){background:var(--ink); border-color:var(--ink)}
+.row{display:flex; align-items:center; gap:var(--s-3); flex-wrap:wrap}
+.skip{
+  background:none; border:0; padding:6px 0; color:var(--ink-muted);
+  font-size:var(--size-label); text-decoration:underline; text-underline-offset:3px;
+}
+input[type=password],input[type=text]{
+  font:inherit; font-family:var(--font-mono); font-size:14px;
+  color:inherit; background:var(--panel-raised);
+  border:1px solid var(--edge); border-radius:var(--radius);
+  padding:9px 12px; width:100%;
+}
+input::placeholder{color:var(--ink-muted)}
+
+/* the routing explainer — why a key is worth pasting */
+.flowbox{
+  border:1px solid var(--rule); border-radius:var(--radius-lg);
+  padding:var(--s-4); margin:var(--s-5) 0; background:var(--panel-recessed);
+}
+.flowline{display:flex; align-items:center; gap:var(--s-3); padding:var(--s-2) 0}
+.flowline + .flowline{border-top:1px solid var(--rule)}
+.dot{width:8px; height:8px; border-radius:50%; flex:0 0 auto}
+.dot.on{background:var(--live-solid)}
+.dot.off{background:transparent; box-shadow:inset 0 0 0 1.5px var(--ink-muted)}
+.flowline .who{font-weight:500; font-size:var(--size-label); min-width:118px}
+.flowline .says{color:var(--ink-muted); font-size:var(--size-unit)}
+
+/* model picks */
+.picks{display:grid; gap:var(--s-3); margin-bottom:var(--s-5)}
+.pick{
+  display:grid; grid-template-columns:1fr auto; gap:var(--s-4);
+  align-items:center; text-align:left; width:100%;
+  border:1px solid var(--rule); border-radius:var(--radius-lg);
+  padding:var(--s-4); background:var(--panel-raised);
+}
+.pick:hover{background:var(--hover); border-color:var(--edge)}
+.pick[aria-pressed=true]{border-color:var(--edge); box-shadow:inset 0 0 0 1px var(--edge)}
+.pick .title{font-weight:500; margin-bottom:2px}
+.pick .desc{color:var(--ink-muted); font-size:var(--size-label); line-height:1.4; max-width:46ch}
+.pick .facts{
+  font-family:var(--font-mono); font-size:var(--size-unit);
+  color:var(--ink-muted); text-align:right; white-space:nowrap; line-height:1.7;
+}
+.pick .facts b{display:block; color:var(--ink); font-weight:500; font-size:14px}
+
+/* the endpoint, the actual payoff */
+.endpoint{
+  background:var(--panel-sunk); border:1px solid var(--edge); border-radius:var(--radius-lg);
+  padding:var(--s-4); display:flex; align-items:center; gap:var(--s-3); margin:var(--s-4) 0;
+}
+.endpoint code{font-family:var(--font-mono); font-size:15px; flex:1; word-break:break-all}
+.progress{height:4px; background:var(--panel-sunk); border-radius:2px; overflow:hidden; margin:var(--s-4) 0 var(--s-2)}
+.progress span{display:block; height:100%; background:var(--flow); width:0; transition:width 1.4s linear}
+
+footer{
+  position:fixed; left:0; right:0; bottom:0; background:var(--panel-recessed);
+  border-top:1px solid var(--rule); padding:var(--s-3) var(--s-5);
+  display:flex; gap:var(--s-3); align-items:center; font-size:var(--size-unit);
+  color:var(--ink-muted);
+}
+footer button{font-size:var(--size-unit); padding:3px 9px}
+footer .spacer{flex:1}
+
+/* ── add-more-machines: the one allowed terminal command ─────────────── */
+.cmd{
+  background:var(--fill); color:var(--on-fill); border-radius:var(--radius-lg);
+  padding:var(--s-4); margin:var(--s-4) 0; display:flex; align-items:center; gap:var(--s-3);
+}
+.cmd code{font-family:var(--font-mono); font-size:14px; flex:1; word-break:break-all}
+.cmd button{border-color:var(--on-fill-dim); color:var(--on-fill)}
+/* Same reason as .plate .bar: on --fill, which inverts. */
+.cmd button:hover{background:color-mix(in srgb,var(--on-fill) 12%,transparent)}
+
+/* ── the handoff: scan instead of typing an IP ───────────────────────── */
+.handoff{display:flex; gap:var(--s-5); align-items:center; margin:var(--s-4) 0; flex-wrap:wrap}
+.qr{
+  width:132px; height:132px; flex:0 0 auto; border-radius:var(--radius);
+  /* Deliberately NOT themed. A QR code drawn light-on-dark is an inverted
+     symbol, and most phone cameras will not read one. The tile keeps the light
+     palette's paper and ink in both themes so it always scans; the border is
+     themed so it still sits in the page. */
+  background:#F7F4EE; border:1px solid var(--rule);
+  display:grid; place-items:center; padding:8px;
+}
+.qr svg{width:100%; height:100%; display:block}
+.qr .fallback{font-size:var(--size-unit); color:#5C5851; text-align:center; padding:var(--s-2)}
+
+/* ── first generation happens here, not in another app ───────────────── */
+.chat{
+  border:1px solid var(--rule); border-radius:var(--radius-lg);
+  background:var(--panel-raised); overflow:hidden; margin:var(--s-4) 0 var(--s-6);
+}
+.log{padding:var(--s-4); display:grid; gap:var(--s-3); min-height:96px}
+.msg{max-width:52ch; font-size:14px; line-height:1.5}
+.msg.you{justify-self:end; background:var(--panel-sunk); padding:8px 12px; border-radius:var(--radius)}
+.msg.it{color:var(--ink)}
+.msg .tool{
+  display:inline-block; font-family:var(--font-mono); font-size:var(--size-unit);
+  color:var(--ink-muted); border-bottom:1px solid var(--rule);
+  padding-bottom:2px; margin-bottom:6px;
+}
+.ask{display:flex; gap:var(--s-2); border-top:1px solid var(--rule); padding:var(--s-3)}
+.ask input{border-color:var(--rule)}
+.caret::after{content:'▍'; animation:blink 1s steps(2) infinite; color:var(--ink-muted)}
+@keyframes blink{50%{opacity:0}}
+@media (prefers-reduced-motion:reduce){ .caret::after{animation:none} }
+
+/* per-node download rows */
+.dl{border:1px solid var(--rule); border-radius:var(--radius-lg); padding:var(--s-4); margin:var(--s-4) 0}
+.dl + .dl{margin-top:var(--s-2)}
+.dl .head{display:flex; align-items:baseline; gap:var(--s-2)}
+.dl .head .who{font-weight:500; font-size:var(--size-label)}
+.dl .head .rate{margin-left:auto; font-family:var(--font-mono); font-size:var(--size-unit); color:var(--ink-muted)}
+</style>
+</head>
+<body>
+
+<header>
+  <svg width="30" height="23" viewBox="0 0 64 50" aria-label="derate">
+    <path d="M26 25 V39 H56" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="square" opacity=".32"/>
+    <path d="M8 25 H26 V11 H56" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="square"/>
+  </svg>
+  <span class="wordmark">derate</span>
+  <span class="unit where mono" id="crumb">setting up</span>
+</header>
+
+<main>
+  <div class="ledger" id="ledger"></div>
+  <div id="stage"></div>
+</main>
+
+<footer>
+  <span>Mockup of the proposed first-run flow. Click through it.</span>
+  <span class="spacer"></span>
+  <button id="cap">provider routing: on</button>
+  <button id="restart">Restart</button>
+</footer>
+
+<script>
+const ledger = document.getElementById('ledger');
+const stage  = document.getElementById('stage');
+const crumb  = document.getElementById('crumb');
+const capBtn = document.getElementById('cap');
+
+/* providerRouting mirrors the gateway capability check. When a provider
+   adapter cannot route a request end to end, the cloud step is not rendered
+   at all: no greyed row, no dead link, no mention that a step was skipped. */
+let providerRouting = true;
+
+const ENDPOINT = 'http://192.168.0.71:8088/v1';
+const state = { node:null, key:null, model:null, joined:null };
+
+const MODELS = [
+  { id:'qwen3-30b-a3b', title:'Qwen3 30B',
+    desc:'A good default. Only 3.3B of its parameters run per word, so it answers about as fast as a much smaller model.',
+    size:'17 GB', speed:'58 tok/sec' },
+  { id:'gpt-oss-120b', title:'GPT-OSS 120B',
+    desc:'The largest model this machine will run. Better on hard questions, noticeably slower to answer.',
+    size:'61 GB', speed:'23 tok/sec' },
+  { id:'qwen2.5-0.5b', title:'Qwen2.5 0.5B',
+    desc:'Tiny and nearly instant. Worth starting here to check everything works before a long download.',
+    size:'0.4 GB', speed:'240 tok/sec' },
+];
+
+const TPS_HINT = 'tokens per second — roughly how fast it writes. 15 or so is reading speed.';
+
+/* ── the ledger: what is true so far ────────────────────────────────── */
+function drawLedger(){
+  const rows = [];
+  if (state.node) rows.push(['This machine', state.node, () => go('machine')]);
+  if (providerRouting){
+    if (state.key === 'skipped') rows.push(['Cloud backup', 'skipped for now', () => go('cloud')]);
+    else if (state.key)          rows.push(['Cloud backup', 'OpenRouter connected', () => go('cloud')]);
+  }
+  if (state.model) rows.push(['Model', state.model.title, () => go('model')]);
+  if (state.joined === 'skipped') rows.push(['Other machines', 'none yet', () => go('machines')]);
+  else if (state.joined)          rows.push(['Other machines', state.joined, () => go('machines')]);
+
+  ledger.innerHTML = rows.map(([what, detail]) => `
+    <div class="done">
+      <span class="tick" aria-hidden="true">✓</span>
+      <span class="what"><span class="label">${what}</span>
+        <span class="detail"> — ${detail}</span></span>
+      <button data-back="${what}">Change</button>
+    </div>`).join('');
+  ledger.querySelectorAll('[data-back]').forEach((b,i) => b.onclick = rows[i][2]);
+}
+
+/* ── 1 ─ the machine, already found ─────────────────────────────────── */
+function stepMachine(){
+  stage.innerHTML = `
+    <div class="step">
+      <h1>This machine is ready to serve models.</h1>
+      <p class="lede">Derate looked at the hardware it's running on. Nothing has been
+        set up yet, and nothing is running.</p>
+
+      <div class="plate">
+        <div class="name mono">NVIDIA GB10</div>
+        <div class="spec mono">119.7 GB usable · 273 GB/s memory bandwidth</div>
+        <div class="bar"><span></span></div>
+        <div class="caption">Large enough for models up to roughly 120 billion parameters.</div>
+      </div>
+
+      <div class="row">
+        <button class="primary" id="use">Use this machine</button>
+        <button class="skip" id="later">I only want cloud models</button>
+      </div>
+    </div>`;
+  document.getElementById('use').onclick   = () => { state.node = 'NVIDIA GB10, 119.7 GB'; next('machine'); };
+  document.getElementById('later').onclick = () => { state.node = null; next('machine'); };
+}
+
+/* ── 2 ─ the key, pasted, not referenced ────────────────────────────── */
+function stepCloud(){
+  stage.innerHTML = `
+    <div class="step">
+      <h1>Add a cloud provider as backup?</h1>
+      <p class="lede">Optional. With one connected, Derate keeps using your machine
+        and only reaches for the cloud when your machine is already busy.</p>
+
+      <div class="flowbox">
+        <div class="flowline">
+          <span class="dot on"></span>
+          <span class="who">Your machine</span>
+          <span class="says">takes every request it has room for</span>
+        </div>
+        <div class="flowline">
+          <span class="dot off"></span>
+          <span class="who">OpenRouter</span>
+          <span class="says">takes the overflow, so nothing waits in a queue</span>
+        </div>
+      </div>
+
+      <label class="label" for="key" style="display:block;margin-bottom:var(--s-2)">OpenRouter key</label>
+      <input id="key" type="password" placeholder="sk-or-v1-..." autocomplete="off">
+      <p class="unit" style="margin:var(--s-2) 0 var(--s-5)">
+        Stored on the coordinator and never shown again, not even to you.
+      </p>
+
+      <div class="row">
+        <button class="primary" id="addkey">Add key</button>
+        <button class="skip" id="skipkey">Skip — local only</button>
+      </div>
+    </div>`;
+  document.getElementById('addkey').onclick  = () => {
+    state.key = document.getElementById('key').value.trim() || 'sk-or-v1-demo'; next('cloud');
+  };
+  document.getElementById('skipkey').onclick = () => { state.key = 'skipped'; next('cloud'); };
+}
+
+/* ── 3 ─ pick one, sized to the hardware ────────────────────────────── */
+function stepModel(){
+  stage.innerHTML = `
+    <div class="step">
+      <h1>Pick something to run.</h1>
+      <p class="lede">All three fit on your machine. You can add more later, and run
+        several at once.</p>
+      <div class="picks">
+        ${MODELS.map(m => `
+          <button class="pick" data-id="${m.id}">
+            <span>
+              <span class="title">${m.title}</span>
+              <span class="desc">${m.desc}</span>
+            </span>
+            <span class="facts"><b title="${TPS_HINT}">${m.speed}</b>${m.size} download</span>
+          </button>`).join('')}
+      </div>
+      <p class="unit">Downloads happen in the background. You can close this page.</p>
+    </div>`;
+  stage.querySelectorAll('.pick').forEach(b => b.onclick = () => {
+    state.model = MODELS.find(m => m.id === b.dataset.id);
+    next('model');
+  });
+}
+
+/* ── 4 ─ other machines: the only terminal command in the product ───── */
+function stepMachines(){
+  stage.innerHTML = `
+    <div class="step">
+      <h1>Add another machine?</h1>
+      <p class="lede">Any other computer on your network can join this one. A gaming
+        desktop, a laptop, a Raspberry Pi. Models run wherever they fit, and you keep
+        using the same address.</p>
+
+      <p class="label" style="margin-bottom:var(--s-2)">Run this on the other machine</p>
+      <div class="cmd">
+        <code id="join">curl -fsSL derate.sh/join | sh -s -- 192.168.0.71:8088</code>
+        <button id="copyjoin">Copy</button>
+      </div>
+      <p class="unit" style="margin-bottom:var(--s-5)">
+        This is the only step that needs a terminal, and only on the machine being added.
+        Nothing to install on this one.
+      </p>
+
+      <div class="row">
+        <button class="primary" id="joined">A machine joined</button>
+        <button class="skip" id="skipjoin">Skip — just this machine</button>
+      </div>
+    </div>`;
+  document.getElementById('copyjoin').onclick = e => {
+    navigator.clipboard?.writeText(document.getElementById('join').textContent);
+    e.target.textContent = 'Copied';
+    setTimeout(() => e.target.textContent = 'Copy', 1400);
+  };
+  document.getElementById('joined').onclick   = () => { state.joined = '1 joined (RTX 3090)'; next('machines'); };
+  document.getElementById('skipjoin').onclick = () => { state.joined = 'skipped'; next('machines'); };
+}
+
+/* ── 5 ─ the payoff: it answers, right here ─────────────────────────── */
+function stepDone(){
+  const spill  = providerRouting && state.key && state.key !== 'skipped';
+  const second = state.joined && state.joined !== 'skipped';
+  stage.innerHTML = `
+    <div class="step">
+      <h1>${state.model.title} is ready.</h1>
+      <p class="lede">Ask it something. This is the same model your other apps will reach.</p>
+
+      <div class="chat">
+        <div class="log" id="log">
+          <div class="msg it" style="color:var(--ink-muted)">Waiting for your first question.</div>
+        </div>
+        <div class="ask">
+          <input id="q" type="text" placeholder="Ask anything…" autocomplete="off">
+          <button class="primary" id="send">Send</button>
+        </div>
+      </div>
+
+      ${second ? `
+      <div class="dl">
+        <div class="head"><span class="who">This machine</span>
+          <span class="rate mono">${state.model.title} · serving</span></div>
+        <div class="progress"><span style="width:100%;background:var(--live-solid)"></span></div>
+      </div>
+      <div class="dl">
+        <div class="head"><span class="who">RTX 3090</span>
+          <span class="rate mono" id="rate">preparing…</span></div>
+        <div class="progress"><span id="bar"></span></div>
+      </div>` : ''}
+
+      <p class="label" style="margin:var(--s-6) 0 var(--s-2)">Use it from your phone or any other app</p>
+      <div class="handoff">
+        <div class="qr" id="qr"><span class="fallback">QR code<br>${ENDPOINT}</span></div>
+        <div>
+          <p class="unit" style="margin:0 0 var(--s-3)">
+            Scan to open Derate on your phone. Nothing to type, no IP address to copy.
+          </p>
+          <div class="endpoint" style="margin:0">
+            <code>${ENDPOINT}</code>
+            <button id="copy">Copy</button>
+          </div>
+          <p class="unit" style="margin:var(--s-2) 0 0">
+            Model name <span class="mono">${state.model.id}</span>. No other settings.
+          </p>
+        </div>
+      </div>
+
+      <div class="flowbox" style="margin:var(--s-6) 0 var(--s-5)">
+        <div class="flowline">
+          <span class="dot on"></span>
+          <span class="who">Your machine</span>
+          <span class="says">serving now</span>
+        </div>
+        ${providerRouting ? `
+        <div class="flowline">
+          <span class="dot off"></span>
+          <span class="who">OpenRouter</span>
+          <span class="says">${spill
+            ? 'standing by, takes over only when your machine is full'
+            : 'not connected — add a key in Settings to handle overflow'}</span>
+        </div>` : ''}
+      </div>
+
+      <button class="primary" id="dash">Open the dashboard</button>
+    </div>`;
+
+  document.getElementById('copy').onclick = e => {
+    navigator.clipboard?.writeText(ENDPOINT);
+    e.target.textContent = 'Copied';
+    setTimeout(() => e.target.textContent = 'Copy', 1400);
+  };
+  document.getElementById('dash').onclick = () => alert('→ the dashboard');
+
+  drawQR();
+  wireChat();
+
+  if (second) requestAnimationFrame(() => {
+    document.getElementById('bar').style.width = '64%';
+    document.getElementById('rate').textContent = '11 GB of 17 GB · 2 min left';
+  });
+}
+
+/* the first generation, faked at a believable rate */
+function wireChat(){
+  const log  = document.getElementById('log');
+  const q    = document.getElementById('q');
+  const send = document.getElementById('send');
+  let asked  = false;
+
+  const ANSWER = "Derate is running this on your own machine, so nothing you type here " +
+                 "left the house. The model is loaded in memory and answers straight from it.";
+
+  function ask(){
+    const text = q.value.trim() || 'what are you running on?';
+    q.value = ''; q.disabled = send.disabled = true;
+    if (!asked){ log.innerHTML = ''; asked = true; }
+
+    log.insertAdjacentHTML('beforeend', `<div class="msg you"></div>`);
+    log.lastElementChild.textContent = text;
+    const it = document.createElement('div');
+    it.className = 'msg it caret';
+    it.innerHTML = '<span class="tool">searched the web</span><br>';
+    log.appendChild(it);
+
+    let i = 0;
+    const tick = setInterval(() => {
+      it.insertAdjacentText('beforeend', ANSWER[i++]);
+      if (i >= ANSWER.length){
+        clearInterval(tick);
+        it.classList.remove('caret');
+        q.disabled = send.disabled = false;
+        q.focus();
+      }
+    }, 18);
+  }
+  send.onclick = ask;
+  q.onkeydown  = e => { if (e.key === 'Enter') ask(); };
+}
+
+/* The endpoint is a constant in a mockup, so the symbol is encoded ahead of
+   time and pasted in rather than fetched from a CDN: this page has to work on
+   a machine that has never had internet, which is the whole premise of the
+   product it is a mockup of. The real screen encodes at runtime, because there
+   the address is whatever the coordinator turns out to be on. */
+const QR_SVG = '<svg viewBox="0 0 29 29" width="100%" height="100%" shape-rendering="crispEdges" role="img" aria-label="QR code for http://192.168.0.71:8088/v1"><path fill="#1A1917" d="M0 0h7v1h-7zM8 0h1v1h-1zM10 0h1v1h-1zM13 0h1v1h-1zM16 0h3v1h-3zM22 0h7v1h-7zM0 1h1v1h-1zM6 1h1v1h-1zM9 1h1v1h-1zM11 1h1v1h-1zM15 1h3v1h-3zM20 1h1v1h-1zM22 1h1v1h-1zM28 1h1v1h-1zM0 2h1v1h-1zM2 2h3v1h-3zM6 2h1v1h-1zM10 2h2v1h-2zM13 2h2v1h-2zM18 2h1v1h-1zM22 2h1v1h-1zM24 2h3v1h-3zM28 2h1v1h-1zM0 3h1v1h-1zM2 3h3v1h-3zM6 3h1v1h-1zM10 3h3v1h-3zM17 3h2v1h-2zM22 3h1v1h-1zM24 3h3v1h-3zM28 3h1v1h-1zM0 4h1v1h-1zM2 4h3v1h-3zM6 4h1v1h-1zM8 4h1v1h-1zM10 4h1v1h-1zM15 4h1v1h-1zM19 4h1v1h-1zM22 4h1v1h-1zM24 4h3v1h-3zM28 4h1v1h-1zM0 5h1v1h-1zM6 5h1v1h-1zM8 5h4v1h-4zM14 5h3v1h-3zM18 5h1v1h-1zM22 5h1v1h-1zM28 5h1v1h-1zM0 6h7v1h-7zM8 6h1v1h-1zM10 6h1v1h-1zM12 6h1v1h-1zM14 6h1v1h-1zM16 6h1v1h-1zM18 6h1v1h-1zM20 6h1v1h-1zM22 6h7v1h-7zM10 7h2v1h-2zM15 7h2v1h-2zM18 7h2v1h-2zM1 8h7v1h-7zM10 8h1v1h-1zM12 8h1v1h-1zM15 8h2v1h-2zM18 8h1v1h-1zM20 8h1v1h-1zM23 8h2v1h-2zM28 8h1v1h-1zM2 9h3v1h-3zM12 9h2v1h-2zM15 9h2v1h-2zM18 9h2v1h-2zM22 9h1v1h-1zM24 9h2v1h-2zM28 9h1v1h-1zM0 10h1v1h-1zM3 10h1v1h-1zM5 10h4v1h-4zM10 10h1v1h-1zM12 10h2v1h-2zM15 10h1v1h-1zM18 10h1v1h-1zM22 10h1v1h-1zM24 10h3v1h-3zM0 11h3v1h-3zM5 11h1v1h-1zM11 11h3v1h-3zM16 11h1v1h-1zM19 11h2v1h-2zM22 11h1v1h-1zM24 11h1v1h-1zM27 11h1v1h-1zM2 12h2v1h-2zM6 12h1v1h-1zM11 12h1v1h-1zM15 12h1v1h-1zM17 12h2v1h-2zM20 12h2v1h-2zM25 12h4v1h-4zM0 13h1v1h-1zM2 13h1v1h-1zM4 13h2v1h-2zM8 13h1v1h-1zM10 13h4v1h-4zM17 13h1v1h-1zM19 13h1v1h-1zM21 13h2v1h-2zM24 13h2v1h-2zM28 13h1v1h-1zM0 14h2v1h-2zM5 14h2v1h-2zM9 14h2v1h-2zM12 14h1v1h-1zM17 14h1v1h-1zM20 14h3v1h-3zM27 14h1v1h-1zM2 15h2v1h-2zM9 15h2v1h-2zM12 15h2v1h-2zM15 15h4v1h-4zM21 15h1v1h-1zM25 15h1v1h-1zM27 15h2v1h-2zM0 16h2v1h-2zM3 16h1v1h-1zM5 16h2v1h-2zM8 16h1v1h-1zM11 16h2v1h-2zM14 16h1v1h-1zM16 16h1v1h-1zM19 16h3v1h-3zM23 16h1v1h-1zM25 16h2v1h-2zM28 16h1v1h-1zM0 17h2v1h-2zM3 17h1v1h-1zM7 17h2v1h-2zM10 17h2v1h-2zM15 17h1v1h-1zM18 17h3v1h-3zM22 17h1v1h-1zM24 17h1v1h-1zM27 17h2v1h-2zM0 18h1v1h-1zM3 18h1v1h-1zM5 18h2v1h-2zM8 18h5v1h-5zM14 18h4v1h-4zM20 18h1v1h-1zM22 18h1v1h-1zM24 18h2v1h-2zM0 19h1v1h-1zM2 19h1v1h-1zM4 19h1v1h-1zM7 19h3v1h-3zM11 19h1v1h-1zM13 19h1v1h-1zM15 19h1v1h-1zM18 19h3v1h-3zM22 19h1v1h-1zM28 19h1v1h-1zM0 20h1v1h-1zM2 20h1v1h-1zM5 20h2v1h-2zM8 20h1v1h-1zM12 20h1v1h-1zM14 20h15v1h-15zM8 21h1v1h-1zM11 21h3v1h-3zM19 21h2v1h-2zM24 21h2v1h-2zM27 21h2v1h-2zM0 22h7v1h-7zM8 22h2v1h-2zM12 22h4v1h-4zM18 22h3v1h-3zM22 22h1v1h-1zM24 22h1v1h-1zM27 22h1v1h-1zM0 23h1v1h-1zM6 23h1v1h-1zM8 23h3v1h-3zM12 23h2v1h-2zM16 23h1v1h-1zM20 23h1v1h-1zM24 23h2v1h-2zM27 23h1v1h-1zM0 24h1v1h-1zM2 24h3v1h-3zM6 24h1v1h-1zM8 24h1v1h-1zM10 24h1v1h-1zM13 24h2v1h-2zM18 24h1v1h-1zM20 24h8v1h-8zM0 25h1v1h-1zM2 25h3v1h-3zM6 25h1v1h-1zM8 25h1v1h-1zM10 25h4v1h-4zM15 25h3v1h-3zM19 25h1v1h-1zM21 25h1v1h-1zM23 25h1v1h-1zM26 25h1v1h-1zM0 26h1v1h-1zM2 26h3v1h-3zM6 26h1v1h-1zM8 26h4v1h-4zM14 26h1v1h-1zM18 26h1v1h-1zM22 26h1v1h-1zM24 26h1v1h-1zM26 26h2v1h-2zM0 27h1v1h-1zM6 27h1v1h-1zM8 27h3v1h-3zM12 27h1v1h-1zM16 27h1v1h-1zM18 27h1v1h-1zM20 27h3v1h-3zM24 27h1v1h-1zM27 27h1v1h-1zM0 28h7v1h-7zM9 28h4v1h-4zM14 28h1v1h-1zM17 28h2v1h-2zM21 28h1v1h-1zM24 28h3v1h-3z"/></svg>';
+function drawQR(){
+  const box = document.getElementById('qr');
+  if (box) box.innerHTML = QR_SVG;
+}
+
+/* ── flow control ───────────────────────────────────────────────────── */
+const ALL = {
+  machine:  stepMachine,
+  cloud:    stepCloud,
+  model:    stepModel,
+  machines: stepMachines,
+  done:     stepDone,
+};
+function order(){
+  return providerRouting
+    ? ['machine','cloud','model','machines','done']
+    : ['machine','model','machines','done'];
+}
+function next(from){
+  const o = order();
+  go(o[o.indexOf(from) + 1]);
+}
+function go(name){
+  const o = order();
+  if (name === undefined || name === 0) name = 'machine';
+  const i = o.indexOf(name);
+  /* rewinding through the ledger clears everything after that point */
+  if (i <= o.indexOf('machine')) { state.node = null; }
+  if (i <= o.indexOf('cloud'))   { state.key = null; }
+  if (i <= o.indexOf('model'))   { state.model = null; }
+  if (i <= o.indexOf('machines')){ state.joined = null; }
+
+  crumb.textContent = name === 'done' ? 'ready' : `step ${i + 1} of ${o.length - 1}`;
+  drawLedger();
+  ALL[name]();
+  window.scrollTo({top:0});
+}
+
+capBtn.onclick = () => {
+  providerRouting = !providerRouting;
+  capBtn.textContent = `provider routing: ${providerRouting ? 'on' : 'off'}`;
+  go('machine');
+};
+document.getElementById('restart').onclick = () => go('machine');
+
+go('machine');
+</script>
+</body>
+</html>
