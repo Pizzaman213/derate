@@ -1,3 +1,4 @@
+// requires: fixtures HISTORY_FIXTURES -- real payloads, captured; it prints the curl lines
 // Verifier for the pure history adapters, in the same shape and for the same
 // reason as tabs/cluster/layout.check.mjs: there is no test runner in this
 // repo (AUDIT-2026-09-06.md:197, "No UI test suite exists (typecheck is the
@@ -22,10 +23,10 @@
 // imported directly, because node's ESM resolver will not resolve its
 // extensionless imports.
 
-import { execFileSync } from 'node:child_process'
+import { build as bundleWithEsbuild } from 'esbuild'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const uiRoot = join(here, '..', '..')
@@ -38,19 +39,18 @@ const bundle = join(out, 'history.mjs')
 // The hooks are not under test here -- they are three lines of
 // useKeyedResource each -- but they come along with the module, so React comes
 // with them. Only the adapters below are exercised.
-execFileSync(
-  join(uiRoot, 'node_modules', '.bin', 'esbuild'),
-  [
-    join(here, 'history.ts'),
-    '--bundle',
-    '--format=esm',
-    `--outfile=${bundle}`,
-    '--log-level=warning',
-  ],
-  { stdio: 'inherit' },
-)
+// esbuild's JS API rather than the launcher under node_modules/.bin:
+// that shim is a POSIX script with no .cmd twin, so spawning it by path
+// fails on Windows. rows.check.mjs already bundles this way.
+await bundleWithEsbuild({
+  entryPoints: [join(here, 'history.ts')],
+  bundle: true,
+  format: 'esm',
+  outfile: bundle,
+  logLevel: 'warning',
+})
 
-const H = await import(bundle)
+const H = await import(pathToFileURL(bundle).href)
 
 const FIXTURES = process.env.HISTORY_FIXTURES
 if (!FIXTURES) {
