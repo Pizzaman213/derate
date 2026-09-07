@@ -176,9 +176,9 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
                 {nodeId}
               </span>
               <ProportionBar
-                value={(live.memory_used_pct ?? 0) / 100}
+                value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}
                 tone={stale || !live.fresh ? 'muted' : 'ink'}
-                label={`${pct(live.memory_used_pct)} percent memory used on ${nodeId}`}
+                label={live.memory_used_pct == null ? `no memory reading for ${nodeId}` : `${pct(live.memory_used_pct)} percent memory used on ${nodeId}`}
               />
               <span className="mono unit" style={{ width: 34, textAlign: 'right' }}>
                 {live.memory_used_pct == null ? '—' : `${pct(live.memory_used_pct)}%`}

@@ -92,9 +92,9 @@ export function RosterSection() {
               ) : null}
 
               <ProportionBar
-                value={(live.memory_used_pct ?? 0) / 100}
+                value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}
                 tone={grey ? 'muted' : 'ink'}
-                label={`${pct(live.memory_used_pct)} percent of addressable memory in use on ${id}`}
+                label={live.memory_used_pct == null ? `no memory reading for ${id}` : `${pct(live.memory_used_pct)} percent of addressable memory in use on ${id}`}
               />
 
               <div className="unit">{names.length > 0 ? names.join(' · ') : 'no deployments'}</div>

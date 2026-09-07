@@ -168,7 +168,10 @@ function LinkRail({
   measureError: { key: string; message: string } | null
   onMeasure: (a: string, b: string) => void
 }) {
-  if (!edge.measured) {
+  // Same definition of "measured" as the graph and the chips (edgeMeasured):
+  // a measured:true edge with no figure must open the never-measured rail,
+  // not a provenance grid asserting thresholds about a number that isn't there.
+  if (!edgeMeasured(edge)) {
     return (
       <UnmeasuredLinkRail a={edge.src} b={edge.dst} measuring={measuring} measureError={measureError} onMeasure={onMeasure} />
     )
@@ -284,10 +287,10 @@ function NodeRail({
         <Big label="memory used" value={live.memory_used_pct} unit="%" width={3} stale={grey} />
       </div>
       <ProportionBar
-        value={(live.memory_used_pct ?? 0) / 100}
+        value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}
         height={6}
         tone={grey ? 'muted' : 'ink'}
-        label={`${pct(live.memory_used_pct)} percent of addressable memory in use`}
+        label={live.memory_used_pct == null ? 'no memory reading' : `${pct(live.memory_used_pct)} percent of addressable memory in use`}
       />
 
       <div className="row">

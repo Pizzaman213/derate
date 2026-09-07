@@ -153,7 +153,13 @@ export function SpendTab() {
           </div>
           <div>
             <div className="big">{money(totalSpend)}</div>
-            <div className="unit">spent today</div>
+            {/* When no electricity rate is set, local generation is unpriced
+                and this figure is cloud spend alone — say so rather than
+                letting a partial total read as the whole (wave-2 N2). */}
+            <div className="unit">{rateSet ? 'spent today' : 'spent today · cloud only'}</div>
+            {!rateSet && totalSpend != null ? (
+              <div className="unit muted">set an electricity rate to price local generation</div>
+            ) : null}
           </div>
           <div>
             <div className="big">{totalTokens.toLocaleString()}</div>

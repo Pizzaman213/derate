@@ -4,6 +4,9 @@ import { Header } from './Header'
 import { Sheet } from './Sheet'
 import { DashboardTab } from '../tabs/DashboardTab'
 import { ClusterTab } from '../tabs/ClusterTab'
+import { SpendTab } from '../tabs/SpendTab'
+import { SettingsTab } from '../tabs/SettingsTab'
+import { Sidebar } from '../sidebar/Sidebar'
 
 export type Dest = 'dash' | 'cluster' | 'spend' | 'settings'
 
@@ -58,19 +61,16 @@ export function AppShell() {
             <ClusterTab />
           </section>
           <section role="tabpanel" hidden={dest !== 'spend'}>
-            <Placeholder label="Spend" />
+            <SpendTab />
           </section>
           <section role="tabpanel" hidden={dest !== 'settings'}>
-            <Placeholder label="Settings" />
+            <SettingsTab />
           </section>
         </main>
 
         <aside id="side">
           <div className="inner">
-            <SidebarSection title="Nodes" />
-            <SidebarSection title="Plan" />
-            <SidebarSection title="Routing" />
-            <SidebarSection title="Cost per Mtok" />
+            <Sidebar />
           </div>
         </aside>
       </div>
@@ -80,18 +80,3 @@ export function AppShell() {
   )
 }
 
-function Placeholder({ label }: { label: string }) {
-  return (
-    <div className="stage">
-      <p className="unit">{label}</p>
-    </div>
-  )
-}
-
-function SidebarSection({ title }: { title: string }) {
-  return (
-    <section>
-      <h2>{title}</h2>
-    </section>
-  )
-}

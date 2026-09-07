@@ -85,8 +85,10 @@ function shade(i: number, n: number): number {
 }
 
 interface ProportionProps {
-  /** 0..1 */
-  value: number
+  /** 0..1, or null when there is no reading -- a null renders a dashed
+   *  outline with NO fill, visually distinct from a genuine 0% (empty but
+   *  solid track). A missing value must never be pixel-identical to zero. */
+  value: number | null
   width?: number | string
   height?: number
   tone?: 'ink' | 'live' | 'warn' | 'fault' | 'muted'
@@ -116,19 +118,21 @@ export function ProportionBar({
       style={{
         width,
         height,
-        background: 'var(--panel-recessed)',
-        border: '1px solid var(--rule)',
+        background: value == null ? 'transparent' : 'var(--panel-recessed)',
+        border: value == null ? '1px dashed var(--rule)' : '1px solid var(--rule)',
         position: 'relative',
       }}
     >
-      <div
-        style={{
-          position: 'absolute',
-          inset: 0,
-          right: `${(1 - Math.max(0, Math.min(1, value))) * 100}%`,
-          background: color,
-        }}
-      />
+      {value != null ? (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            right: `${(1 - Math.max(0, Math.min(1, value))) * 100}%`,
+            background: color,
+          }}
+        />
+      ) : null}
     </div>
   )
 }
