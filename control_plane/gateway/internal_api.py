@@ -28,7 +28,7 @@ from control_plane.registry.serde import profile_from_dict
 
 from control_plane.telemetry import query as tquery
 
-from . import errors, serialize
+from . import errors, serialize, ui_detail
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.api")
@@ -355,6 +355,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         sources = {k: v.source for k, v in index.raw_strength.items()}
         circuits = ctx.breaker.opened_targets() if ctx.breaker else {}
         node_ids = {tid: index.node_ids_for(tid) for tid in index.deployments}
+        target_ids = [t.target_id for t in config.targets]
         return serialize.routing_payload(
             config,
             sources,
@@ -364,6 +365,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             flow=ctx.router.flow(config.served_name, config.policy),
             zero_weight_reasons=index.zero_weight_reason,
             node_ids=node_ids,
+            counters=ui_detail.target_counters(ctx.stats, target_ids),
+            strength_raw=ui_detail.strength_raw(index),
+            admission_blocks=ui_detail.admission_blocks(ctx.admission, target_ids),
         )
 
     @router.get("/api/routing")
@@ -415,7 +419,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception:
             log.exception("provider listing failed")
             providers = []
-        return JSONResponse([serialize.provider_payload(p) for p in providers])
+        # Computed once per request, then sliced per provider below -- never
+        # once per provider, which would repeat the underlying public_list()
+        # call for no benefit.
+        spend = ui_detail.provider_spend(ctx.deps.providers)
+        return JSONResponse(
+            [
+                serialize.provider_payload(p, spend.get(p.provider_id))
+                for p in providers
+            ]
+        )
 
     @router.post("/api/providers")
     async def add_provider(request: Request) -> Response:
@@ -438,7 +451,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "provider_add_failed",
             )
         ctx.router.rebuild(force_scores=True)
-        return JSONResponse(serialize.provider_payload(provider), status_code=201)
+        spend = ui_detail.provider_spend(ctx.deps.providers)
+        return JSONResponse(
+            serialize.provider_payload(provider, spend.get(provider.provider_id)),
+            status_code=201,
+        )
 
     @router.patch("/api/providers/{provider_id}")
     async def patch_provider(provider_id: str, request: Request) -> Response:
@@ -459,7 +476,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "provider_not_found",
             )
         ctx.router.rebuild(force_scores=True)
-        return JSONResponse(serialize.provider_payload(provider))
+        spend = ui_detail.provider_spend(ctx.deps.providers)
+        return JSONResponse(
+            serialize.provider_payload(provider, spend.get(provider.provider_id))
+        )
 
     @router.delete("/api/providers/{provider_id}")
     async def delete_provider(provider_id: str) -> Response:
@@ -496,7 +516,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "refresh_failed",
             )
         ctx.router.rebuild(force_scores=True)
-        return JSONResponse(serialize.provider_payload(provider))
+        spend = ui_detail.provider_spend(ctx.deps.providers)
+        return JSONResponse(
+            serialize.provider_payload(provider, spend.get(provider.provider_id))
+        )
 
     @router.get("/api/providers/{provider_id}/models")
     async def provider_models(provider_id: str) -> Response:

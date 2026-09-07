@@ -24,6 +24,8 @@ from control_plane.contracts import (
     RoutingConfig,
 )
 
+from . import ui_detail
+
 # Never rendered, whatever a port puts in the object.
 REDACTED = "***"
 
@@ -140,6 +142,17 @@ def link_payload(link: LinkMeasurement) -> dict:
         payload["raw_gbps"] = annotation.raw_gbps
         payload["scale_factor"] = annotation.scale_factor
         payload["notes"] = list(annotation.notes)
+        # Provenance for the UI's link-provenance rail (audit M-7): which QSFP
+        # cages were up, whose fabric view supplied that count, whether/how
+        # GPUDirect RDMA was detected, and how long the probe itself took.
+        # Same rule as the four fields above -- absent on a bare LinkMeasurement,
+        # never defaulted, because a plain contract type says nothing about how
+        # the number was obtained.
+        payload["active_ports"] = annotation.active_ports
+        payload["total_ports"] = annotation.total_ports
+        payload["ports_inspected_on"] = annotation.ports_inspected_on
+        payload["gdr_detected_by"] = annotation.gdr_detected_by
+        payload["duration_s"] = annotation.duration_s
     return payload
 
 
@@ -190,13 +203,19 @@ def provider_model_payload(model: ProviderModel) -> dict:
     }
 
 
-def provider_payload(provider: Provider) -> dict:
+def provider_payload(provider: Provider, spend: dict[str, Any] | None = None) -> dict:
     """Allowlist. ``api_key_ref`` is a reference -- an env var name or secret
     key -- and is safe to show; it is what the UI needs to tell the user which
     variable to set. Any resolved key material is rendered as ``***`` and
     nothing else, and no other field is emitted at all.
+
+    *spend* is this provider's own entry from ``ui_detail.provider_spend`` --
+    the call site fetches the whole port once per request and passes one
+    provider's slice in here, never the port itself. Absent (the default)
+    behaves exactly like a port that does not account: the nine spend keys
+    are all ``None``, never ``0``.
     """
-    return {
+    payload = {
         "provider_id": provider.provider_id,
         "kind": provider.kind.value,
         "display_name": provider.display_name,
@@ -210,6 +229,8 @@ def provider_payload(provider: Provider) -> dict:
         "last_refreshed": provider.last_refreshed,
         "models": [provider_model_payload(m) for m in provider.models],
     }
+    payload.update(ui_detail.spend_fields(spend))
+    return payload
 
 
 def routing_payload(
@@ -222,11 +243,17 @@ def routing_payload(
     flow: str | None = None,
     zero_weight_reasons: dict[str, str | None] | None = None,
     node_ids: dict[str, list[str]] | None = None,
+    counters: dict[str, dict[str, Any]] | None = None,
+    strength_raw: dict[str, float] | None = None,
+    admission_blocks: dict[str, list[str]] | None = None,
 ) -> dict:
     sources = sources or {}
     circuits = circuits or {}
     zero_weight_reasons = zero_weight_reasons or {}
     node_ids = node_ids or {}
+    counters = counters or {}
+    strength_raw = strength_raw or {}
+    admission_blocks = admission_blocks or {}
     return {
         "served_name": config.served_name,
         "policy": config.policy.value,
@@ -261,6 +288,17 @@ def routing_payload(
                 "zero_weight_reason": zero_weight_reasons.get(t.target_id),
                 # The deployment's plan node_ids for a local target, else [].
                 "node_ids": node_ids.get(t.target_id, []),
+                # Per-target request accounting (None-vs-0 semantics live in
+                # ui_detail.target_counters); absent only if the caller never
+                # asked for this target at all.
+                "counters": counters.get(t.target_id),
+                # The un-normalized score behind `strength` above. Present
+                # exactly where strength_source is: both come from the same
+                # index.raw_strength entry, one field apiece.
+                "strength_raw": strength_raw.get(t.target_id),
+                # Why this target is not admitting, sorted; null when nothing
+                # blocks it.
+                "admission_blocks": admission_blocks.get(t.target_id),
             }
             for t in config.targets
         ],
