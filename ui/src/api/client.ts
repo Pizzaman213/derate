@@ -1,12 +1,8 @@
-// The only place the UI talks to Agent G.
-//
-// Two backends behind one interface: the real HTTP surface, and the day-0
-// fixture stub. Mode is `auto` by default — probe the coordinator once, fall
-// back to fixtures if it is not there — so the UI opens and renders whether or
-// not a cluster exists. When fixtures are in use the UI says so, because
-// demo data that looks live is worse than demo data that is labelled.
+// The only place the UI talks to Agent G. Live only: the coordinator is
+// always there in the deployed shape (a Compose service, a systemd unit) and
+// a UI that opens without one is not the shape this ships in. Day-0 fixture
+// data lived here through bring-up; it is gone as of the derate port.
 
-import { fixtures, fixtureFrame } from './fixtures'
 import { scrub } from './redact'
 import type {
   Candidate,
@@ -21,15 +17,16 @@ import type {
   PlanRequest,
   PlanResponse,
   Provider,
+  ProviderPatch,
+  ProviderSpec,
   RoutingConfig,
   RoutingPolicy,
+  Settings,
+  SettingsPatch,
   Topology,
 } from './types'
 
-export type Mode = 'live' | 'fixture'
-
 export interface Backend {
-  readonly mode: Mode
   cluster(): Promise<Cluster>
   topology(): Promise<Topology>
   deployments(): Promise<DeploymentDTO[]>
@@ -41,7 +38,16 @@ export interface Backend {
   launch(req: LaunchRequest): Promise<DeploymentDTO>
   setPolicy(servedName: string, policy: RoutingPolicy): Promise<RoutingConfig>
   admit(nodeId: string): Promise<void>
+  removeNode(nodeId: string): Promise<void>
   measureLink(a: string, b: string): Promise<LinkMeasurement | void>
+  getSettings(): Promise<Settings>
+  /** 501, with a message naming why, when the patch includes a daily spend
+   *  cap and no provider port can be measured against. */
+  patchSettings(patch: SettingsPatch): Promise<Settings>
+  addProvider(spec: ProviderSpec): Promise<Provider>
+  removeProvider(providerId: string): Promise<void>
+  patchProvider(providerId: string, patch: ProviderPatch): Promise<Provider>
+  refreshProvider(providerId: string): Promise<Provider>
   /** Returns an unsubscribe. `onState` reports stream health so the UI can grey
    *  live values during a gap instead of freezing or zeroing them. */
   subscribe(
@@ -70,13 +76,28 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return scrub((await res.json()) as T)
 }
 
+/** OpenAI-shaped error bodies (gateway/errors.py): `{error:{message,...}}`.
+ *  When the body parses that way, `.message` is the sentence the gateway
+ *  actually wrote -- e.g. the 501 explaining why a daily spend cap cannot be
+ *  enforced -- rather than the raw JSON blob. `.body` keeps the untouched text
+ *  for a caller that wants more than the message. */
+function errorMessage(status: number, path: string, body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: { message?: unknown } }
+    if (typeof parsed.error?.message === 'string') return parsed.error.message
+  } catch {
+    // Not a JSON error envelope. Fall through to the raw form below.
+  }
+  return `${status} on ${path}: ${body}`
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly body: string,
     readonly path: string,
   ) {
-    super(`${status} on ${path}: ${body}`)
+    super(errorMessage(status, path, body))
   }
 }
 
@@ -160,8 +181,7 @@ function toNodeState(n: NodeWire, coordinator: string | null): NodeStateDTO {
   }
 }
 
-const httpBackend: Backend = {
-  mode: 'live',
+export const httpBackend: Backend = {
   async cluster(): Promise<Cluster> {
     // Two calls because the wire splits what the instrument reads as one thing.
     const [wire, deployments] = await Promise.all([
@@ -218,10 +238,28 @@ const httpBackend: Backend = {
     }),
   admit: (nodeId) =>
     req<void>(`/api/nodes/${encodeURIComponent(nodeId)}/admit`, { method: 'POST' }),
+  removeNode: (nodeId) =>
+    req<void>(`/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }),
   measureLink: (a, b) =>
     req<LinkMeasurement>('/api/links/measure', {
       method: 'POST',
       body: JSON.stringify({ a, b }),
+    }),
+  getSettings: () => req<Settings>('/api/settings'),
+  patchSettings: (patch) =>
+    req<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
+  addProvider: (spec) =>
+    req<Provider>('/api/providers', { method: 'POST', body: JSON.stringify(spec) }),
+  removeProvider: (providerId) =>
+    req<void>(`/api/providers/${encodeURIComponent(providerId)}`, { method: 'DELETE' }),
+  patchProvider: (providerId, patch) =>
+    req<Provider>(`/api/providers/${encodeURIComponent(providerId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  refreshProvider: (providerId) =>
+    req<Provider>(`/api/providers/${encodeURIComponent(providerId)}/refresh`, {
+      method: 'POST',
     }),
 
   subscribe(onFrame, onState) {
@@ -273,66 +311,4 @@ const httpBackend: Backend = {
       if (timer) window.clearTimeout(timer)
     }
   },
-}
-
-// ── Fixture backend ──────────────────────────────────────────────────────────
-
-const settle = <T,>(v: T): Promise<T> =>
-  new Promise((resolve) => window.setTimeout(() => resolve(scrub(v)), 40))
-
-const fixtureBackend: Backend = {
-  mode: 'fixture',
-  cluster: () => settle(fixtures.cluster()),
-  topology: () => settle(fixtures.topology()),
-  deployments: () => settle(fixtures.deployments()),
-  candidates: () => settle(fixtures.candidates()),
-  routing: () => settle(fixtures.routing()),
-  providers: () => settle(fixtures.providers()),
-  plan: (r) => settle(fixtures.plan(r)),
-  launch: (r) => settle(fixtures.launch(r)),
-  setPolicy: (name, policy) => settle(fixtures.setPolicy(name, policy)),
-  admit: async (nodeId) => {
-    fixtures.admit(nodeId)
-  },
-  measureLink: async (a, b) => {
-    // A measurement is disruptive and takes real time. Pretending it is instant
-    // would misrepresent the one action in this UI that costs something.
-    await new Promise((r) => window.setTimeout(r, 1800))
-    fixtures.measureLink(a, b)
-  },
-
-  subscribe(onFrame, onState) {
-    onState({ status: 'open' })
-    // fixtureFrame is a pure function of the timestamp, so the last minute can
-    // be replayed rather than invented: the trace is populated on open instead
-    // of taking a minute to fill. A live stream gets no backfill, because there
-    // is no history endpoint to get it from.
-    const now = Math.floor(Date.now() / 1000)
-    for (let t = now - 60; t <= now; t++) onFrame(fixtureFrame(t))
-    const id = window.setInterval(
-      () => onFrame(fixtureFrame(Math.floor(Date.now() / 1000))),
-      1000,
-    )
-    return () => window.clearInterval(id)
-  },
-}
-
-// ── Mode resolution ──────────────────────────────────────────────────────────
-
-const forced = (import.meta.env.VITE_API_MODE ?? 'auto') as 'auto' | Mode
-
-/** Resolved once at startup. `auto` probes the coordinator and falls back. */
-export async function resolveBackend(): Promise<Backend> {
-  if (forced === 'fixture') return fixtureBackend
-  if (forced === 'live') return httpBackend
-  try {
-    const res = await fetch('/api/cluster', {
-      method: 'GET',
-      signal: AbortSignal.timeout(2500),
-    })
-    if (res.ok) return httpBackend
-  } catch {
-    // No coordinator on this origin. Fixtures, and the UI will say so.
-  }
-  return fixtureBackend
 }

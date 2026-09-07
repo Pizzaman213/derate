@@ -1,0 +1,669 @@
+/* Structural chrome for the derate port, ported from
+   mockups-next/styles/derate.css (the design source of truth -- read it for
+   what any of this looks like assembled).
+
+   What did NOT come across, and why:
+
+   - The mockup's own theme-palette blocks (a bare selector for the light
+     values, plus one keyed on the theme attribute for dark). tokens.css
+     already owns the whole palette, including `prefers-color-scheme`; a
+     second copy here would be the thing that goes stale the next time only
+     one of them is edited.
+   - The universal `*{box-sizing;margin;padding}` reset and the bare `body{}`
+     rule. base.css already resets box-sizing and the body; this file adds to
+     that baseline, it does not re-lay it.
+   - The mockup's `.mono`, `.label`, `.unit` and its own muted-text shorthand
+     class, plus the bare `button`/`select`/`input` rules (and their
+     `:hover`/`:focus-visible`/`[disabled]` states) and `.readout`. base.css
+     owns all of these already -- this file's job is the chrome around them,
+     not a second definition of them. Where the mockup reached for its own
+     muted-text shorthand, the real components use base.css's `.muted`.
+
+   Four token names changed under integration and are renamed mechanically
+   everywhere below: the old recessed-surface, sunk-surface, muted-text and
+   on-fill/on-fill-dim tokens each map to one new name -- grep the wire-up
+   commit for the four `--panel-recessed`/`--panel-sunk`/`--ink-muted`/
+   `--on-fill` families if you need the old spellings.
+
+   Contrast fixes folded in at the same time (tokens.css's own doc comment
+   explains why `--panel-raised`/`--panel-overlay`/`--edge`/the `-solid` status
+   colours exist):
+     - `.sheet`'s scrim is `var(--panel-overlay)`, not a hand-rolled rgba.
+     - `.card` sits on `var(--panel-raised)` with `var(--shadow-raised))`, the
+       same "above the page" treatment every other dialog uses.
+     - The meter/track classes (`.bar`, `.budget`, `.split`, `.phase`) get an
+       `inset 1px var(--edge)` keyline, since a track that cannot be seen is a
+       proportion with no denominator.
+     - Any status colour a caller puts on a `.dot` or a filled meter should be
+       `--live-solid`/`--warn-solid`/`--fault-solid` with `--on-signal` text
+       (nothing in this file sets one directly -- those are inline, per
+       instance, in the component that fills a `.dot`); running *text* stays
+       on the plain `--live`/`--warn`/`--fault` trio, as `.verdict.bad` and
+       `.swapbar` already do below. */
+
+.ghost {
+  border: none;
+  background: none;
+  padding: 5px 7px;
+}
+.ghost:hover {
+  background: var(--panel-sunk);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--rule);
+}
+.dest {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}
+.dest button {
+  border: none;
+  background: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 6px 13px;
+  color: var(--ink-muted);
+}
+.dest button[aria-selected='true'] {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+
+.wrap {
+  --rail: var(--sidebar-w);
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr var(--rail);
+  transition: grid-template-columns 0.18s ease;
+}
+.wrap.narrow {
+  --rail: 0px;
+}
+@media (max-width: 1200px) {
+  .wrap {
+    --rail: 260px;
+  }
+  aside .inner {
+    width: 260px;
+  }
+}
+@media (max-width: 980px) {
+  .wrap {
+    grid-template-columns: 1fr;
+  }
+  main {
+    border-right: none;
+  }
+  aside {
+    max-height: none;
+    border-top: 1px solid var(--rule);
+  }
+  aside .inner {
+    width: auto;
+    max-height: none;
+  }
+  header {
+    flex-wrap: wrap;
+  }
+  .dest {
+    margin-left: 0;
+    order: 9;
+    width: 100%;
+  }
+  .rail {
+    display: none;
+  }
+}
+@media (max-width: 760px) {
+  .quad {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .deprow {
+    grid-template-columns: 1fr 72px 58px;
+  }
+  .deprow svg {
+    display: none;
+  }
+}
+
+main {
+  padding: 20px 22px;
+  border-right: 1px solid var(--rule);
+  overflow: hidden;
+  min-height: calc(100vh - 55px);
+}
+aside {
+  background: var(--panel-recessed);
+  overflow: hidden;
+  max-height: calc(100vh - 55px);
+}
+aside .inner {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  width: var(--sidebar-w);
+  overflow-y: auto;
+  max-height: calc(100vh - 55px);
+}
+aside section {
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 13px;
+}
+aside section:last-child {
+  border: none;
+}
+
+/* pull tab: a grip on the seam that grows into a handle under the pointer */
+.rail {
+  position: absolute;
+  top: 50%;
+  right: var(--rail);
+  height: 168px;
+  width: 24px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  transform: translateY(-50%);
+  transition: right 0.18s ease;
+}
+.rail .tab {
+  width: 6px;
+  height: 46px;
+  padding: 0;
+  border: none;
+  border-radius: 3px 0 0 3px;
+  background: var(--rule);
+  color: var(--ink-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    width 0.16s ease,
+    height 0.16s ease,
+    background 0.16s ease,
+    color 0.16s ease;
+}
+.rail .tab svg {
+  opacity: 0;
+  transition:
+    opacity 0.16s ease,
+    transform 0.18s ease;
+}
+.rail:hover .tab,
+.rail .tab:focus-visible {
+  width: 18px;
+  height: 66px;
+  background: var(--panel-recessed);
+  border: 1px solid var(--rule);
+  border-right: none;
+  color: var(--ink);
+}
+.rail:hover .tab svg,
+.rail .tab:focus-visible svg {
+  opacity: 1;
+}
+.wrap.narrow .rail .tab svg {
+  transform: rotate(180deg);
+}
+@media (hover: none) {
+  .rail .tab {
+    width: 18px;
+    height: 66px;
+    background: var(--panel-recessed);
+    border: 1px solid var(--rule);
+    border-right: none;
+  }
+  .rail .tab svg {
+    opacity: 1;
+  }
+}
+
+h2 {
+  font-size: var(--size-label);
+  font-weight: 500;
+  color: var(--ink-muted);
+  margin-bottom: 9px;
+}
+h3 {
+  font-size: var(--size-body);
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.stage {
+  background: var(--panel-recessed);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.stage.bare {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+}
+.bararea {
+  display: flex;
+  gap: 7px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  padding-bottom: 13px;
+  margin-bottom: 13px;
+  border-bottom: 1px solid var(--rule);
+}
+.fld {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fld label {
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+}
+.fld input,
+.fld select {
+  padding: 5px 8px;
+}
+
+.big {
+  font-family: 'IBM Plex Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 42px;
+  font-weight: 500;
+  line-height: 1;
+}
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 4px 0;
+}
+.row .mono {
+  font-size: var(--size-mono-body);
+}
+
+.slot {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--size-unit);
+  padding: 2px 0;
+}
+.bar {
+  flex: 1;
+  height: 15px;
+  background: var(--panel-sunk);
+  border-radius: 2px;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.bar i {
+  display: block;
+  height: 100%;
+  background: var(--fill);
+}
+.bar.free {
+  background: none;
+  box-shadow: none;
+  border: 1px dashed var(--rule);
+}
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.pill {
+  display: inline-block;
+  font-size: var(--size-unit);
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  color: var(--ink-muted);
+}
+
+.why {
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+  margin-top: var(--s-2);
+  padding-left: 10px;
+  border-left: 2px solid var(--rule);
+  display: none;
+}
+.why.on {
+  display: block;
+}
+.why div {
+  padding: 3px 0;
+}
+
+.verdict {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: var(--s-3);
+  margin-bottom: 13px;
+  font-size: var(--size-label);
+  display: none;
+  background: var(--panel);
+}
+.verdict.on {
+  display: block;
+}
+.verdict.bad {
+  border-color: var(--fault);
+}
+.vhead {
+  font-weight: 500;
+  margin-bottom: 7px;
+}
+.budget {
+  display: flex;
+  height: 20px;
+  border-radius: 2px;
+  overflow: hidden;
+  margin: var(--s-2) 0;
+  background: var(--panel-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.budget span {
+  display: block;
+  height: 100%;
+}
+.legend {
+  display: flex;
+  gap: 13px;
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+  flex-wrap: wrap;
+  align-items: center;
+}
+.legend b {
+  font-weight: 400;
+  color: var(--ink);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--size-label);
+}
+th {
+  text-align: left;
+  font-weight: 500;
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--rule);
+}
+td {
+  padding: var(--s-2);
+  border-bottom: 1px solid var(--rule);
+}
+td.num {
+  text-align: right;
+  font-family: 'IBM Plex Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+tr:last-child td {
+  border: none;
+}
+
+.deprow {
+  display: grid;
+  grid-template-columns: 150px 78px 1fr 74px 62px;
+  gap: var(--s-3);
+  align-items: center;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--rule);
+  cursor: pointer;
+}
+.deprow:last-child {
+  border: none;
+}
+.deprow:hover {
+  background: var(--panel-sunk);
+}
+.deprow.sel {
+  background: var(--panel-sunk);
+}
+
+.card2 {
+  background: var(--panel-recessed);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 15px 17px;
+  margin-bottom: 14px;
+}
+.split {
+  display: flex;
+  height: 26px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--panel-sunk);
+  margin: 10px 0;
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.split span {
+  display: flex;
+  align-items: center;
+  padding-left: var(--s-2);
+  font-size: var(--size-unit);
+  font-family: 'IBM Plex Mono', monospace;
+}
+.sw {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 0;
+}
+.sw input {
+  width: auto;
+  cursor: pointer;
+}
+.soon {
+  opacity: 0.5;
+}
+.soon .pill {
+  border-style: dashed;
+}
+
+svg text {
+  font-family: 'IBM Plex Sans', sans-serif;
+}
+svg text.m {
+  font-family: 'IBM Plex Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+.node,
+.name {
+  cursor: pointer;
+}
+.node:hover > rect:first-of-type,
+.name:hover > rect:first-of-type {
+  stroke: var(--ink);
+  stroke-width: 2;
+}
+
+.sheet {
+  position: fixed;
+  inset: 0;
+  background: var(--panel-overlay);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 9;
+}
+.sheet.on {
+  display: flex;
+}
+.card {
+  background: var(--panel-raised);
+  box-shadow: var(--shadow-raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 20px;
+  width: 440px;
+  max-width: 92vw;
+}
+.card.wide {
+  width: 700px;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+.sub {
+  font-size: var(--size-micro);
+  font-weight: 500;
+  color: var(--ink-muted);
+  letter-spacing: 0.04em;
+  margin: var(--s-4) 0 var(--s-2);
+  padding-top: 11px;
+  border-top: 1px solid var(--rule);
+}
+.quad {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 14px;
+}
+.quad .readout {
+  font-size: 21px;
+}
+.dets {
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.deprow:hover .dets,
+.deprow.sel .dets {
+  opacity: 1;
+}
+.throttle {
+  width: 100%;
+  margin: 6px 0 2px;
+}
+.cmd {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: var(--size-unit);
+  line-height: 1.55;
+  white-space: pre;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin-top: var(--s-2);
+}
+.cmd .ovr {
+  background: var(--panel-sunk);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+.phase {
+  display: flex;
+  height: 22px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--panel-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  margin: var(--s-2) 0 var(--s-1);
+}
+.phase span {
+  display: flex;
+  align-items: center;
+  padding-left: 7px;
+  font-size: var(--size-micro);
+  font-family: 'IBM Plex Mono', monospace;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.chips {
+  display: flex;
+  gap: var(--s-half);
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+.chips button {
+  font-size: var(--size-unit);
+  padding: 4px 10px;
+  border-radius: var(--radius);
+}
+.chips button[aria-pressed='true'] {
+  background: var(--fill);
+  color: var(--on-fill);
+  border-color: var(--fill);
+}
+.swapbar {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  margin-bottom: var(--s-3);
+  font-size: var(--size-label);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.swapbar.on {
+  display: flex;
+}
+.subs {
+  display: flex;
+  gap: 2px;
+  margin: 0 0 14px;
+  border-bottom: 1px solid var(--rule);
+}
+.subs button {
+  border: none;
+  background: none;
+  border-radius: 0;
+  padding: 6px 12px;
+  color: var(--ink-muted);
+  border-bottom: 2px solid transparent;
+  font-size: var(--size-label);
+}
+.subs button[aria-selected='true'] {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+.chartgrid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--s-4);
+}
+@media (max-width: 900px) {
+  .chartgrid {
+    grid-template-columns: 1fr;
+  }
+}
+.chart {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--panel);
+}
+.chart h4 {
+  font-size: var(--size-unit);
+  font-weight: 500;
+  margin: 0 0 2px;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.chart h4 .now {
+  font-family: 'IBM Plex Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--size-body);
+}
+.chart .ax {
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+}

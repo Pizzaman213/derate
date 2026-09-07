@@ -1,13 +1,9 @@
-// The model picker and the fixture-scenario registry: declarative data with no
-// demo-generation logic attached, so it can sit underneath both build modes.
+// The model picker: declarative data with no demo-generation logic attached.
 //
-// PlanView needs a curated model list whether the backend is live or fixture;
-// App's fixture controls need a list of scenario ids and labels only while in
-// fixture mode. Neither needs the state machine that actually manufactures
-// fixture data (that stays in fixtures.ts, which imports the lists below).
-// fixtures.ts imports from this module, never the reverse -- a live build
-// that never reaches fixtures.ts still has everything PlanView and App's
-// non-fixture surface import.
+// PlanView needs a curated model list whether or not anything is deployed yet.
+// The fixture-scenario registry that used to live alongside this (for the
+// day-0 fixture backend's demo-world switcher) is gone as of the derate port
+// -- the UI is live-only now, so there is no "which fixture world" to pick.
 
 export interface CuratedModel {
   model_id: string
@@ -47,16 +43,4 @@ export const CURATED_MODELS: CuratedModel[] = [
     default_context: 32768,
     default_concurrency: 16,
   },
-]
-
-/** Which fixture world to serve. The failure states are designed screens, so
- *  the stub has to be able to produce them on demand. Fixture mode only --
- *  kept here because it is registry data the fixture-mode picker renders, not
- *  part of the state machine that builds each scenario's fixture data. */
-export type Scenario = 'nominal' | 'single-node' | 'node-down'
-
-export const SCENARIOS: { id: Scenario; label: string }[] = [
-  { id: 'nominal', label: 'Two Sparks serving' },
-  { id: 'single-node', label: 'One node, nothing running' },
-  { id: 'node-down', label: 'spark-02 unreachable' },
 ]
