@@ -106,7 +106,7 @@ class MetricsHub:
             for node in nodes:
                 # Against physical memory, matching the architecture doc's
                 # topology payload. See serialize.node_payload.
-                total = node.profile.total_memory or 0
+                total = node.profile.total_memory or node.memory_total or 0
                 used_pct = (
                     round(node.memory_used / total * 100.0, 1) if total else None
                 )

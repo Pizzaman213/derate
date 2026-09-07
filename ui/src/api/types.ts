@@ -188,6 +188,10 @@ export interface NodeStateDTO {
    *  `last_seen` and a frozen `sample_ts`. */
   sample_ts?: number | null
   memory_used: number
+  /** What `memory_used` is a fraction of, measured rather than probed. On a GPU
+   *  node prefer `profile.addressable_memory`; this is what a machine with no
+   *  GPU has instead, and 0 when nothing has been sampled. */
+  memory_total: number
   /** null when the node has never reported telemetry. A live-looking zero is
    *  worse than an honest blank, so this is never defaulted on the way in. */
   power_watts: number | null
@@ -440,6 +444,15 @@ export interface CapacityBlock {
 /** The single field the UI reads to decide what Serve may do. Which verdict
  *  governs is the backend's decision, not the client's -- handing the client
  *  two verdicts to choose between is how the two answers drift apart. */
+export interface ServeRequirement {
+  /** The `LaunchRequest` field this unlocks, sent as `true` only once a person
+   *  has read the sentence and ticked the box. */
+  param: string
+  /** The server's own sentence for why the permission is needed. Rendered
+   *  verbatim -- it is the claim the checkbox sits under. */
+  reason: string
+}
+
 export interface ServeDecision {
   allowed: boolean
   verdict: Verdict | null
@@ -448,6 +461,64 @@ export interface ServeDecision {
   override_required: boolean
   override_param: string | null
   unavailable_reason: string | null
+  /** Every permission this launch needs, each with its own sentence. When
+   *  present it is the COMPLETE list and supersedes the two legacy fields --
+   *  the live-memory gate appears here too, as `allow_over_live_memory`.
+   *
+   *  It exists because `allowed: false` can express only one gate and only a
+   *  memory one: pooling unlike hardware is a permission an operator grants
+   *  while the fit itself passes. `allowed` keeps its old meaning exactly (the
+   *  fit gate passed) and is no longer sufficient on its own.
+   *
+   *  Absent -- not empty -- on a gateway that predates it. */
+  overrides?: ServeRequirement[]
+}
+
+/** What became of degrees the operator set by hand, and whose choice the
+ *  effective ones were. */
+export interface PlanDegrees {
+  source: 'planner' | 'operator'
+  tensor_parallel: number
+  pipeline_parallel: number
+  expert_parallel: number
+  data_parallel: number
+  /** The recommendation's own rejection line for the shape that was chosen
+   *  instead, whole. null when the planner never rejected it -- a shape can
+   *  rank second without being argued against, which is not a warning.
+   *
+   *  Matched server-side, because the labels it matches on ("TP=2",
+   *  "TP=2/PP=2", "single node") are the planner's vocabulary. Prefix-matching
+   *  `plan.rejected` here would be a second copy of that vocabulary, and it
+   *  would break silently the first time a label changed. */
+  rejection: string | null
+}
+
+/** Which machines were asked for, which are used, and whether they are alike. */
+export interface PlacementBlock {
+  mode: 'planner' | 'operator'
+  /** null when the planner chose. Never `[]` -- an empty selection is a 400. */
+  requested_node_ids: string[] | null
+  node_ids: string[]
+  /** Named but carrying no rank. Only reachable when the degrees were left to
+   *  the planner; naming both and under-filling is refused outright. */
+  unused_node_ids: string[]
+  mixed_hardware: boolean
+  warnings: string[]
+}
+
+/** One legal shape on this node set: degrees and hosts, no prose.
+ *
+ *  Deliberately carries neither `reason` nor `rejected` -- a rejection list per
+ *  shape is kilobytes of text to populate a hint, and choosing one triggers a
+ *  re-plan that returns its full planner prose anyway. */
+export interface PlanAlternative {
+  kind: ParallelismKind
+  world_size: number
+  tensor_parallel: number
+  pipeline_parallel: number
+  expert_parallel: number
+  data_parallel: number
+  node_ids: string[]
 }
 
 export interface PlanResponse {
@@ -467,6 +538,19 @@ export interface PlanResponse {
    *  config estimate". Qualifies how trustworthy the plan/fit above are;
    *  render verbatim alongside fit.warnings, never folded into it. */
   resolver_warnings: string[]
+
+  /** Whose choice the machines were, and which of them carry a rank. Absent on
+   *  a gateway that predates manual placement. */
+  placement?: PlacementBlock
+  /** Whose choice the degrees were. `source` is the explicit "you overruled
+   *  me" signal -- read it rather than comparing plans. */
+  degrees?: PlanDegrees
+  /** The planner's own pick over the SAME node set, reason and rejected list
+   *  intact, so an overruled recommendation stays on screen. Always sent by a
+   *  gateway that has it, whether or not it differs from `plan`. */
+  recommended_plan?: ParallelismPlan | null
+  /** Every legal shape on this node set, for the degree hints. */
+  alternatives?: PlanAlternative[]
 }
 
 export interface LaunchRequest {
@@ -478,6 +562,25 @@ export interface LaunchRequest {
   /** Named for exactly what it overrides. Sent only when a person has read
    *  the sentence naming the measured figure and chosen to proceed. */
   allow_over_live_memory?: boolean
+  /** The second override, same rule. Independent of the one above: neither
+   *  implies the other, and both must be sent when both gates apply. */
+  allow_mixed_hardware?: boolean
+  node_ids?: string[]
+  parallelism?: ParallelismRequest
+}
+
+/** Degrees the operator set by hand.
+ *
+ *  A key omitted from this object means **1**, not "whatever the planner would
+ *  have picked": defaulting to the recommendation would make the launched shape
+ *  depend on a recommendation nobody saw, and one that can change between the
+ *  preview round trip and the launch round trip. Degrees are owned as a set --
+ *  send the object or omit it. */
+export interface ParallelismRequest {
+  tensor_parallel?: number
+  pipeline_parallel?: number
+  expert_parallel?: number
+  data_parallel?: number
 }
 
 export interface PlanRequest {
@@ -496,6 +599,15 @@ export interface PlanRequest {
    *  To launch a quantized model, send that variant repository's own id as
    *  `model_id` — a quantization is a different repository, not a flag. */
   dtype?: string
+
+  /** Exactly the machines to plan across, in order -- the first is the
+   *  pipeline head. Absent means the planner picks, which is what every
+   *  request sent before this field existed meant. Never `[]`: an explicit
+   *  empty selection is a 400, because silently reading it as "the planner
+   *  picks" would substitute a placement nobody asked for. */
+  node_ids?: string[]
+  /** Absent means the planner picks the degrees. */
+  parallelism?: ParallelismRequest
 }
 
 /** Which endpoint family a served model answers on. Mirrors

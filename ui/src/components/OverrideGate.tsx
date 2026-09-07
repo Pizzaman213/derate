@@ -13,7 +13,13 @@
  *  whose text does not name the measurement it is waiving can be ticked
  *  without reading it, which is the failure this gate exists to prevent. The
  *  button does not appear until it is ticked, so the override is always a
- *  second, deliberate act. */
+ *  second, deliberate act.
+ *
+ *  `onLaunch` is optional because a launch can need more than one permission
+ *  at once. When several gates are stacked, each renders its own claim and its
+ *  own checkbox but none renders a button, and the caller puts one button
+ *  below the stack that appears only when every box is ticked -- one launch,
+ *  one button, however many permissions it took. */
 export function OverrideGate({
   reason,
   sentence,
@@ -31,8 +37,9 @@ export function OverrideGate({
   sentence: string
   checked: boolean
   onChange: (v: boolean) => void
-  onLaunch: () => void
-  launching: boolean
+  /** Omit when this gate is one of several: the caller owns the button. */
+  onLaunch?: () => void
+  launching?: boolean
   launchLabel?: string
 }) {
   return (
@@ -54,7 +61,7 @@ export function OverrideGate({
           {sentence}
         </span>
       </label>
-      {checked ? (
+      {checked && onLaunch ? (
         <div>
           <button onClick={onLaunch} disabled={launching}>
             {launching ? 'Launching…' : launchLabel}

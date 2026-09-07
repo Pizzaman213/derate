@@ -21,6 +21,11 @@ export function HardwareRows({ node }: { node: NodeStateDTO }) {
 
   const guardrail = mem?.guardrail ?? 0.9
   const usable = Math.trunc(p.addressable_memory * guardrail)
+  // A machine with no GPU has no addressable memory to be a fraction of. Its
+  // sample carries the host total instead, which is the only pool it has --
+  // and dividing by the absent one left this row reading "0.0 of 0.0 GiB".
+  const noGpu = p.gpu_count === 0
+  const inUseTotal = p.addressable_memory || node.memory_total
 
   return (
     <>
@@ -56,9 +61,11 @@ export function HardwareRows({ node }: { node: NodeStateDTO }) {
         </span>
       </div>
       <div className="row">
-        <span>in use</span>
+        <span>{noGpu ? 'host memory in use' : 'in use'}</span>
         <span className="mono">
-          {gbytes(node.memory_used, 1)} of {gbytes(p.addressable_memory, 1)} GiB
+          {inUseTotal > 0
+            ? `${gbytes(node.memory_used, 1)} of ${gbytes(inUseTotal, 1)} GiB`
+            : '—'}
           {mem?.memory_severity && mem.memory_severity !== 'ok' ? (
             <span className="unit" style={{ color: 'var(--warn)' }}>
               {' '}

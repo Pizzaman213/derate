@@ -44,6 +44,14 @@ class NodeState:
     power_watts: float
     temperature_c: float
     utilization_pct: float
+    # Live denominator for memory_used, from the sample rather than the probe.
+    # A machine with no GPU has profile.total_memory 0 -- there is no GPU memory
+    # to describe -- but it does have host RAM, and with no total to divide by
+    # its memory readout is a permanent em dash. Additive to section 4.1, and
+    # deliberately NOT folded into profile.total_memory: that field is summed
+    # into cluster-wide totals, where host RAM no model can reach does not
+    # belong. 0 means nothing has been sampled yet.
+    memory_total: int = 0  # bytes, live
     # unix ts of the last applied telemetry sample; 0.0 when there has never
     # been one. Deliberately not ``last_seen``: the health loop refreshes that
     # on every answered /agent/health, so a node whose nvidia-smi is gone --

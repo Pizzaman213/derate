@@ -3396,6 +3396,41 @@ def test_node_payload_reports_power_as_unknown_when_there_is_no_gpu():
     assert node["util_pct"] == 12.5
 
 
+def test_node_payload_measures_memory_against_the_live_total_when_there_is_no_gpu():
+    """Otherwise the memory readout is a permanent em dash.
+
+    profile.total_memory is 0 on a machine with no GPU and must stay 0 -- it is
+    summed into cluster-wide totals, where host RAM no model can reach does not
+    belong. The denominator comes from the node's own sample instead.
+    """
+    from tests.fixtures import node_state
+
+    state = node_state(_no_gpu_profile())
+    state.memory_used = 2 * GIB
+    state.memory_total = 8 * GIB
+    deps = build_deps(registry=FakeRegistry([state]))
+    with TestClient(create_app(deps)) as client:
+        node = client.get("/api/nodes").json()[0]
+
+    assert node["memory_used_pct"] == 25.0
+    assert node["memory_total"] == 8 * GIB
+    # The GPU figure stays absent rather than borrowing the host's.
+    assert node["total_memory"] == 0
+    assert node["addressable_memory"] == 0
+
+
+def test_node_payload_memory_is_unknown_until_something_is_sampled():
+    from tests.fixtures import node_state
+
+    state = node_state(_no_gpu_profile())
+    state.memory_used = 0
+    state.memory_total = 0
+    deps = build_deps(registry=FakeRegistry([state]))
+    with TestClient(create_app(deps)) as client:
+        node = client.get("/api/nodes").json()[0]
+    assert node["memory_used_pct"] is None
+
+
 def test_node_payload_reports_temperature_as_unknown_only_when_absent():
     """A running board does not sit at exactly 0.0 C; that is a missing sensor."""
     from tests.fixtures import node_state

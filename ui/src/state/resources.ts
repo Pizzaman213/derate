@@ -46,7 +46,14 @@ export const useNodeProcesses = (nodeId: string) =>
 // moves over hours, not seconds. There is no stream to fall back on -- disk is
 // not sampled anywhere -- so this hook is the only source and it still does not
 // need to be fast.
-export const useStorage = () => useResource((b) => b.storage(), 30000)
+// `enabled` exists because the dashboard's model picker wants the downloaded
+// list, and one call here fans out to every node and walks a directory on
+// each. Mounting it unconditionally would make every dashboard visitor trigger
+// a cluster-wide disk walk every 30s to populate a menu they may never open.
+// Same shape as `useNodeProcesses` below: resolve an empty payload rather than
+// skip the hook, since hooks cannot be called conditionally.
+export const useStorage = (enabled = true) =>
+  useResource((b) => (enabled ? b.storage() : Promise.resolve(null)), 30000)
 
 // The capacity walk resolves models against the hub and is memoised server
 // side; polling it hard would buy nothing and cost the hub.

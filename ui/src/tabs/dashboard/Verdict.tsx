@@ -1,4 +1,9 @@
-import type { FitResult, PlanResponse, ServeDecision, Verdict as VerdictWord } from '../../api/types'
+import type {
+  FitResult,
+  PlanResponse,
+  ServeRequirement,
+  Verdict as VerdictWord,
+} from '../../api/types'
 import { Lamp } from '../../components/Lamp'
 import { Readout } from '../../components/Readout'
 import { SegmentBar, type Segment } from '../../components/Bars'
@@ -14,11 +19,14 @@ interface Props {
   onUseMaxContext: (c: number) => void
   onLaunch: () => void
   launching: boolean
-  /** The operator has read the sentence and chosen to launch anyway. Owned by
-   *  PlannerBar so it can be cleared on every replan: an override must never
-   *  outlive the number it was granted against. */
-  override: boolean
-  onOverride: (v: boolean) => void
+  /** Every permission this launch needs, already resolved from `serve` by
+   *  PlannerBar (which also has to send them). */
+  gates: ServeRequirement[]
+  /** Which of them have been ticked. Owned by PlannerBar so it can be cleared
+   *  on every replan: an override must never outlive the number it was granted
+   *  against. */
+  granted: Record<string, boolean>
+  onGrant: (param: string, value: boolean) => void
 }
 
 const VERDICT_COPY: Record<VerdictWord, { word: string; signal: 'live' | 'warn' | 'fault' }> = {
@@ -33,7 +41,7 @@ const VERDICT_COPY: Record<VerdictWord, { word: string; signal: 'live' | 'warn' 
  *  what the machine can actually hand out right now -- and lets the backend's
  *  `serve` decision say which of them governs the button. */
 export function Verdict({
-  result, checking, error, context, onUseMaxContext, onLaunch, launching, override, onOverride,
+  result, checking, error, context, onUseMaxContext, onLaunch, launching, gates, granted, onGrant,
 }: Props) {
   const p = result.plan
   const fit = result.fit
@@ -62,8 +70,15 @@ export function Verdict({
   // refusal would red-flag every model on an older coordinator -- so fall
   // back to the static verdict, which is exactly what such a gateway means.
   const legacy = serve == null
-  const canServe = legacy ? fit != null && fit.verdict !== 'wont_fit' : serve.allowed === true
-  const needsOverride = !legacy && serve.override_required === true
+  const fitPassed = legacy ? fit != null && fit.verdict !== 'wont_fit' : serve.allowed === true
+  // A refusal with nothing on offer: no button, just the reason. A static
+  // WONT_FIT is this -- the model does not fit the hardware at all, and no
+  // tick produces a launch.
+  const refusedOutright = !fitPassed && gates.length === 0
+  // Serve appears once every gate on offer has been ticked. With no gates
+  // (the normal case) this is `fitPassed`, exactly as before.
+  const canServe = !refusedOutright && gates.every((g) => granted[g.param] === true)
+  const needsOverride = gates.length > 0 && !canServe
 
   // Prefer the live figure: the most context that fits on an idle machine is
   // not an offer anybody can act on right now.
@@ -76,6 +91,26 @@ export function Verdict({
         <span>{planShortFromDegrees(p)}</span>
         <Readout value={p.measured_link_gbps} decimals={1} width={5} unit="GB/s link" />
       </div>
+
+      {/* The planner's argument against the shape that was chosen anyway,
+          whole. The mockup abbreviated this to "link 10.2 GB/s below 40 GB/s
+          threshold"; the real line names the exchange count and the bytes per
+          step, and it is the sentence that says WHY this is likely to be
+          wrong. Rendering planner strings entire is structural here, so the
+          frame is the mockup's and the words are the planner's. */}
+      {result.degrees?.rejection ? (
+        <div className="swapbar on" style={{ alignItems: 'flex-start' }}>
+          <span aria-hidden className="mono" style={{ color: 'var(--warn)' }}>
+            ⚠
+          </span>
+          <span style={{ display: 'grid', gap: 4 }}>
+            <Verbatim text={result.degrees.rejection} size="label" />
+            <span className="label" style={{ fontWeight: 500, color: 'var(--warn)' }}>
+              Overruling.
+            </span>
+          </span>
+        </div>
+      ) : null}
 
       {/* Two verdicts, each with its own lamp. The static row never says a
           bare "fits": an unqualified "fits" is the claim that let a launch
@@ -113,6 +148,12 @@ export function Verdict({
 
       <div className="unit" style={{ margin: '6px 0 10px' }}>
         {p.node_ids.length} {p.node_ids.length === 1 ? 'machine' : 'machines'}: {p.node_ids.join(', ')}
+        {/* The line already names the machines; whose choice they were is the
+            other half of the fact. */}
+        {result.placement?.mode === 'operator' ? ' · chosen by you' : ''}
+        {result.placement?.unused_node_ids?.length
+          ? ` · ${result.placement.unused_node_ids.join(', ')} carries no rank`
+          : ''}
       </div>
 
       {result.resolver_warnings.length > 0 ? (
@@ -220,7 +261,11 @@ export function Verdict({
         {canServe ? (
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
             <button onClick={onLaunch} disabled={launching}>
-              {launching ? 'Launching…' : 'Serve'}
+              {launching
+                ? 'Launching…'
+                : gates.length > 0
+                  ? 'Serve anyway'
+                  : 'Serve'}
             </button>
             {shown.verdict === 'fits_degraded' && shown.predicted_decode_tps != null ? (
               <span className="label" style={{ fontWeight: 400, color: 'var(--warn)' }}>
@@ -229,15 +274,27 @@ export function Verdict({
             ) : null}
           </div>
         ) : needsOverride ? (
-          <LiveMemoryOverride
-            serve={serve}
-            live={live}
-            staticCeiling={fit?.usable_per_node ?? null}
-            checked={override}
-            onChange={onOverride}
-            onLaunch={onLaunch}
-            launching={launching}
-          />
+          <div style={{ display: 'grid', gap: 12 }}>
+            {gates.map((g) => (
+              <OverrideGate
+                key={g.param}
+                reason={g.reason}
+                sentence={claimFor(g, live, fit?.usable_per_node ?? null, p)}
+                checked={granted[g.param] === true}
+                onChange={(v) => onGrant(g.param, v)}
+              />
+            ))}
+            {/* One launch, one button, however many permissions it took. */}
+            <div>
+              <button onClick={onLaunch} disabled>
+                {gates.length === 1
+                  ? 'Serve anyway'
+                  : `Serve anyway — ${
+                      gates.filter((g) => granted[g.param] === true).length
+                    } of ${gates.length} agreed`}
+              </button>
+            </div>
+          </div>
         ) : (
           <p className="label" style={{ margin: 0, fontWeight: 400, color: 'var(--fault)' }}>
             {serve?.reason ?? fit?.reason ?? 'This will not fit.'}
@@ -316,42 +373,41 @@ function VerdictRow({
  *  and the honest shape for one is a sentence you have to read to reach the
  *  button. Every figure in it comes off the wire, so it changes as the
  *  machine does. */
-/** The live-memory refusal, with the sentence this screen can write.
+/** What ticking a given box means, in the first person, naming the figures it
+ *  waives.
  *
- *  The dry run knows both budgets before anything is sent, so it can name the
- *  measured figure and the ceiling that is not reachable right now. The
- *  rendering is the shared gate's; only this sentence is local, because it is
- *  the part that depends on having a plan in hand. */
-function LiveMemoryOverride({
-  serve, live, staticCeiling, checked, onChange, onLaunch, launching,
-}: {
-  serve: ServeDecision
-  live: FitResult | null
-  staticCeiling: number | null
-  checked: boolean
-  onChange: (v: boolean) => void
-  onLaunch: () => void
-  launching: boolean
-}) {
-  const sentence = live
-    ? `Serve anyway. I am overriding the live fit gate, which measured ` +
-      `${gbytes(live.usable_per_node, 1)} GB allocatable and refused` +
-      (staticCeiling != null
-        ? `. The ${gbytes(staticCeiling, 1)} GB static ceiling is not reachable right now.`
-        : '.')
-    : `Serve anyway. There is no live memory reading, so nothing has checked ` +
-      `whether this fits on the machine as it is right now — only on idle hardware.`
-
-  return (
-    <OverrideGate
-      reason={serve.reason}
-      sentence={sentence}
-      checked={checked}
-      onChange={onChange}
-      onLaunch={onLaunch}
-      launching={launching}
-    />
-  )
+ *  Composed here rather than sent by the server on purpose: it is a claim the
+ *  operator is making, not a message they are dismissing, and it reads that way
+ *  only if it is written in their voice. The server's own sentence renders
+ *  verbatim directly above it either way.
+ *
+ *  The default branch matters as much as the named ones. A gateway that adds a
+ *  fourth gate tomorrow still gets an honest, blocking control here instead of
+ *  this client silently launching past a permission it did not recognise. */
+function claimFor(
+  gate: ServeRequirement,
+  live: FitResult | null,
+  staticCeiling: number | null,
+  plan: PlanResponse['plan'],
+): string {
+  if (gate.param === 'allow_over_live_memory') {
+    return live
+      ? `Serve anyway. I am overriding the live fit gate, which measured ` +
+          `${gbytes(live.usable_per_node, 1)} GB allocatable and refused` +
+          (staticCeiling != null
+            ? `. The ${gbytes(staticCeiling, 1)} GB static ceiling is not reachable right now.`
+            : '.')
+      : `Serve anyway. There is no live memory reading, so nothing has checked ` +
+          `whether this fits on the machine as it is right now — only on idle hardware.`
+  }
+  if (gate.param === 'allow_mixed_hardware') {
+    return (
+      `Pool them anyway. I am putting ${plan.node_ids.join(' and ')} in one ` +
+      `deployment even though they are not alike, and every request will run ` +
+      `at the speed of the slowest one.`
+    )
+  }
+  return 'Launch anyway. I have read the reason above and am overriding it.'
 }
 
 /** No verdict at all. The plan is real and worth showing; the absence of a

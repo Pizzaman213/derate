@@ -7,6 +7,10 @@ absent; everything else runs anywhere.
 
 from __future__ import annotations
 
+import pathlib
+
+import dataclasses
+
 import asyncio
 import json
 import os
@@ -43,6 +47,7 @@ from control_plane.deploy import (  # noqa: E402
     backend_origin,
 )
 from control_plane.deploy import events as ev  # noqa: E402
+from control_plane.deploy import recipes  # noqa: E402
 from control_plane.deploy.flags import KNOBS_BY_NAME  # noqa: E402
 from control_plane.deploy.fsm import LEGAL, SERVING, TERMINAL  # noqa: E402
 from control_plane.deploy.recipes import materialize, synthesize  # noqa: E402
@@ -2200,3 +2205,71 @@ def test_bare_yaml_null_spellings_are_rejected_as_command_values():
         "a",
     ):
         _check_command_safe(good, "model_id")
+
+
+# ==========================================================================
+# Acceptance: an operator-chosen placement reaches sparkrun as chosen.
+#
+# Verified against sparkrun 0.2.40 with --dry-run: `--tp`/`--pp` are passed
+# through independently of `--hosts`, and a degree that does not fill the host
+# list is launched as given without complaint. That is why the gateway refuses
+# an under-filled selection itself -- nothing downstream will.
+# ==========================================================================
+
+
+def test_operator_ordered_hosts_reach_sparkrun_in_that_order(tmp_path):
+    """The first node is the pipeline head. Sorting anywhere would move it."""
+    adapter = FakeAdapter(
+        FakeRegistry(fx.SPARK_01, fx.SPARK_02), recipe_dir=tmp_path / "recipes"
+    )
+    plan = dataclasses.replace(
+        fx.pp2_plan(), node_ids=[fx.SPARK_02.node_id, fx.SPARK_01.node_id]
+    )
+    argv = adapter.render_command(plan, fx.GPT_OSS_120B, "vllm", 65536, 512)
+
+    assert argv[argv.index("--hosts") + 1] == "%s,%s" % (
+        fx.SPARK_02.address,
+        fx.SPARK_01.address,
+    )
+
+
+def test_manual_degrees_reach_both_the_recipe_and_the_command_line(tmp_path):
+    """Keeps manual degrees from quietly becoming a lie.
+
+    Three hops carry them -- the sparkrun CLI flags, the recipe `defaults:`,
+    and the runtime command template -- and a manual degree is only honest if
+    all three agree. If `flags.py` is ever edited, this is what notices.
+    """
+    adapter = FakeAdapter(
+        FakeRegistry(fx.SPARK_01, fx.SPARK_02), recipe_dir=tmp_path / "recipes"
+    )
+    plan = dataclasses.replace(
+        fx.pp2_plan(),
+        kind=ParallelismKind.TENSOR,
+        tensor_parallel=2,
+        pipeline_parallel=1,
+    )
+    argv = adapter.render_command(plan, fx.GPT_OSS_120B, "vllm", 65536, 512)
+
+    assert argv[argv.index("--tp") + 1] == "2"
+    assert argv[argv.index("--pp") + 1] == "1"
+
+    # `render_command` is pure and writes nothing, so the recipe is
+    # synthesized here rather than read back off disk.
+    recipe = recipes.synthesize(
+        fx.GPT_OSS_120B,
+        plan,
+        "vllm",
+        65536,
+        512,
+        "gpt-oss-120b",
+        port=8100,
+        gpu_memory_utilization=0.90,
+        recipe_dir=tmp_path / "recipes",
+    ).content
+    assert "tensor_parallel: 2" in recipe
+    assert "pipeline_parallel: 1" in recipe
+    # The template has to actually interpolate them, or the flags above are
+    # accepted and silently do nothing.
+    assert "--tensor-parallel-size {tensor_parallel}" in recipe
+    assert "--pipeline-parallel-size {pipeline_parallel}" in recipe

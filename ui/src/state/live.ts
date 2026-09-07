@@ -68,15 +68,18 @@ export function nodeLive(
       fresh: true,
     }
   }
-  const addressable = node.profile.addressable_memory
+  // Addressable first: on a GPU node that is the pool anything can be planned
+  // into. A node that probed as UNKNOWN -- no nvidia-smi, so no GPU name and no
+  // GPU memory at all -- has none, and falls back to the live host total from
+  // its own sample. Both can be 0, and dividing by 0 yields Infinity, which
+  // renders as a percentage and reads as a catastrophic reading rather than as
+  // the absent one it is, so the guard stays.
+  const denominator = node.profile.addressable_memory || node.memory_total
   return {
     power_w: node.power_watts,
     temp_c: node.temperature_c,
-    // Guarded: a node that probed as UNKNOWN -- no nvidia-smi, so no GPU name
-    // and no memory at all -- has addressable_memory 0, and dividing by it
-    // yields Infinity, which renders as a percentage and reads as a
-    // catastrophic reading rather than as the absent one it is.
-    memory_used_pct: addressable > 0 ? (node.memory_used / addressable) * 100 : null,
+    memory_used_pct:
+      denominator > 0 ? (node.memory_used / denominator) * 100 : null,
     util_pct: node.utilization_pct,
     fresh: false,
   }

@@ -42,10 +42,14 @@ def profile_from_dict(data: dict) -> NodeProfile:
 
 
 def memory_used_pct(state: NodeState) -> float:
-    addressable = state.profile.addressable_memory
-    if addressable <= 0:
+    # Addressable first: on a GPU node that is the pool anything can be planned
+    # into. A machine with no GPU has none, and falls back to the live host
+    # total from its own sample -- otherwise its memory readout is a permanent
+    # 0 that looks like an idle machine rather than an unmeasured one.
+    denominator = state.profile.addressable_memory or state.memory_total
+    if denominator <= 0:
         return 0.0
-    pct = 100.0 * state.memory_used / addressable
+    pct = 100.0 * state.memory_used / denominator
     return round(min(pct, 100.0), 1)  # GB10: pool total can exceed addressable, so cap the reported figure at 100
 
 
@@ -59,6 +63,7 @@ def state_to_dict(state: NodeState) -> dict:
         # different answers and only one of them is real.
         "sample_ts": state.sample_ts or None,
         "memory_used": state.memory_used,
+        "memory_total": state.memory_total,
         "memory_used_pct": memory_used_pct(state),
         "power_w": round(state.power_watts, 1),
         "temp_c": round(state.temperature_c, 1),

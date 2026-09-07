@@ -29,7 +29,6 @@ const SOURCE_LABEL: Record<SettingSource, string> = {
 }
 
 const NOT_BUILT: [string, string][] = [
-  ['Manual placement', 'the planner has no placement field'],
   ['Link utilisation', 'no bytes-on-the-wire telemetry exists'],
   ['Managed remote node tier', 'a target is local or a provider; there is no third kind'],
   ['Prefix cache hit rate', 'the backend reports null for it'],
@@ -42,6 +41,10 @@ const NOT_BUILT: [string, string][] = [
 //: below exists precisely because these get built by accident, so building one
 //: on purpose has to be visible and dated, not tidied away.
 const SCOPE_CHANGED: [string, string][] = [
+  [
+    'Manual placement',
+    'built after all \u2014 a machine picker and manual TP/PP, with the planner\u2019s recommendation and its own rejection line kept on screen. agents/E-planner.md always specified a recommendation, not a lock. Amended 2026-09-07',
+  ],
   [
     'Model catalog browser',
     'built after all \u2014 browse, quantizations and fit. 00-architecture.md \u00a71 amended 2026-09-07',

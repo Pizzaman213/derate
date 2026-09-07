@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useCapacity, useCatalog, useCluster, useProviders, useStorage } from '../state/resources'
+import {
+  useCapacity,
+  useCatalog,
+  useCluster,
+  useProviders,
+  useQuantTable,
+  useStorage,
+} from '../state/resources'
 import { useBackend } from '../state/backend'
 import type { ModelSearchResponse } from '../api/types'
 import { useSelection } from '../state/selection'
 import { QuantTableCard } from './models/QuantTableCard'
 import { CatalogList } from './models/CatalogList'
+import { CardGrid } from './models/CardGrid'
 import {
   cacheIndex,
   capacityIndex,
@@ -16,6 +24,9 @@ import {
   providerRows,
   runningRows,
   SORTS,
+  FORMATS,
+  matchesFormat,
+  type Format,
   type ModelRow,
   type Origin,
   type Sort,
@@ -30,6 +41,9 @@ const SOURCES: { id: Origin; label: string }[] = [
 ]
 
 const SOURCE_KEY = 'derate.models.source'
+const VIEW_KEY = 'derate.models.view'
+
+type View = 'cards' | 'rows'
 
 /** Models: what you could run here, and what each quantization of it costs.
  *
@@ -64,6 +78,14 @@ export function ModelsTab() {
   const [context, setContext] = useState(8192)
   const [concurrency, setConcurrency] = useState(1)
   const [sort, setSort] = useState<Sort>('fit')
+  const [format, setFormat] = useState<Format>('all')
+  // Cards to browse, rows to compare. Remembered, because which one somebody
+  // wants depends on what they came here to do and that does not change
+  // between visits.
+  const [view, setView] = useState<View>(
+    () => (window.localStorage.getItem(VIEW_KEY) as View | null) ?? 'cards',
+  )
+  const quantTable = useQuantTable()
 
   // Debounced before it becomes a request: the capacity walk resolves every
   // catalogue model against the hub, and firing one per keystroke while
@@ -170,11 +192,10 @@ export function ModelsTab() {
     // The hub search already applied the query; filtering again would drop
     // rows the hub matched on a field the row does not show.
     const needle = source === 'hub' ? '' : query.trim()
-    return groupRows(
-      needle ? rows.filter((r) => matches(r, needle)) : rows,
-      sort,
-    )
-  }, [rows, query, source, sort])
+    let kept = needle ? rows.filter((r) => matches(r, needle)) : rows
+    if (format !== 'all') kept = kept.filter((r) => matchesFormat(r, format))
+    return groupRows(kept, sort)
+  }, [rows, query, source, sort, format])
 
   const status =
     source === 'catalog'
@@ -186,6 +207,17 @@ export function ModelsTab() {
           : source === 'running'
             ? cluster
             : providers
+
+  /** Adopt the numbers a curated entry is normally served at, so the ladder's
+   *  verdicts are taken at something sensible rather than at whatever was last
+   *  typed into the fields above. */
+  const open = (row: ModelRow) => {
+    const ctx = row.default_context ?? context
+    const seqs = row.default_concurrency ?? concurrency
+    if (row.default_context) setContext(ctx)
+    if (row.default_concurrency) setConcurrency(seqs)
+    openSheet({ kind: 'model', id: row.model_id, context: ctx, concurrency: seqs })
+  }
 
   return (
     <div style={{ display: 'grid', gap: 'var(--s-4)' }}>
@@ -214,27 +246,80 @@ export function ModelsTab() {
           ))}
         </div>
 
-        <div className="bararea">
-          <div className="fld" style={{ flex: 1, minWidth: 200 }}>
-            <label htmlFor="mt-q">Search</label>
+        {/* The pill toolbar: search, the two filters, the sort, and the view
+            toggle on the right. Context and sequences stay as plain fields --
+            they are the question every verdict is answered at, not a filter,
+            and dressing them as one would hide that. */}
+        <div className="mbar">
+          <div className="mbar-search">
+            <span className="mbar-icon" aria-hidden>
+              &#8981;
+            </span>
             <input
               id="mt-q"
+              aria-label="Search models"
               value={query}
-              placeholder={source === 'hub' ? 'search HuggingFace' : 'name, id, quantization or tag'}
+              placeholder={source === 'hub' ? 'Search HuggingFace' : 'Search models'}
               spellCheck={false}
               onChange={(e) => setQuery(e.target.value)}
             />
+            {query ? (
+              <button
+                type="button"
+                className="mbar-clear"
+                aria-label="Clear search"
+                onClick={() => setQuery('')}
+              >
+                &#10005;
+              </button>
+            ) : null}
           </div>
-          <div className="fld">
-            <label htmlFor="mt-sort">Sort</label>
-            <select id="mt-sort" value={sort} onChange={(e) => setSort(e.target.value as Sort)}>
-              {SORTS.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.label}
-                </option>
-              ))}
-            </select>
+
+          <select
+            aria-label="Format filter"
+            value={format}
+            onChange={(e) => setFormat(e.target.value as Format)}
+          >
+            {FORMATS.map((f) => (
+              <option key={f.id} value={f.id}>
+                {f.label}
+              </option>
+            ))}
+          </select>
+
+          <select
+            aria-label="Sort models"
+            value={sort}
+            onChange={(e) => setSort(e.target.value as Sort)}
+          >
+            {SORTS.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.label}
+              </option>
+            ))}
+          </select>
+
+          <div className="mview" role="radiogroup" aria-label="View">
+            {(['cards', 'rows'] as View[]).map((v) => (
+              <button
+                key={v}
+                type="button"
+                role="radio"
+                aria-checked={view === v}
+                aria-pressed={view === v}
+                onClick={() => {
+                  setView(v)
+                  window.localStorage.setItem(VIEW_KEY, v)
+                }}
+              >
+                <span aria-hidden>{v === 'cards' ? '\u25a6' : '\u25a4'}</span>
+                <span className="sr-only">{v}</span>
+              </button>
+            ))}
           </div>
+        </div>
+
+        <div className="bararea">
           <div className="fld" style={{ width: 96 }}>
             <label htmlFor="mt-ctx">Context</label>
             <input
@@ -312,27 +397,26 @@ export function ModelsTab() {
             </>
           ) : null}
 
-          <CatalogList
-            groups={groups}
-            loading={status.loading}
-            error={status.error}
-            emptyNote={emptyNote(source, query)}
-            onOpen={(row) => {
-              // A curated entry carries the numbers it is normally served at;
-              // adopt them so the ladder's verdicts are taken at something
-              // sensible rather than at whatever was last typed.
-              const ctx = row.default_context ?? context
-              const seqs = row.default_concurrency ?? concurrency
-              if (row.default_context) setContext(ctx)
-              if (row.default_concurrency) setConcurrency(seqs)
-              openSheet({
-                kind: 'model',
-                id: row.model_id,
-                context: ctx,
-                concurrency: seqs,
-              })
-            }}
-          />
+          {/* Cards to browse, rows to compare. Same rows, same banding, same
+              verdicts underneath -- only the shape of the thing you scan. */}
+          {view === 'cards' ? (
+            <CardGrid
+              groups={groups}
+              table={quantTable.data}
+              loading={status.loading}
+              error={status.error}
+              emptyNote={emptyNote(source, query)}
+              onOpen={open}
+            />
+          ) : (
+            <CatalogList
+              groups={groups}
+              loading={status.loading}
+              error={status.error}
+              emptyNote={emptyNote(source, query)}
+              onOpen={open}
+            />
+          )}
         </div>
       </div>
 

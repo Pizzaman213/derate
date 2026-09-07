@@ -119,6 +119,23 @@ not zeroed. The lamp goes hollow so it stops claiming freshness, and the trace
 breaks rather than drawing a straight line across the gap. Reconnect is
 exponential backoff from 1 s to 30 s, with no reload.
 
+**The planner is a recommendation, not a lock.** The machines and the
+parallelism degrees are the operator's to set. When they overrule it, the
+planner's own rejection line for the shape they chose stays on screen, whole --
+not the abbreviation the mockup drew, because that line names the exchange count
+and the bytes per step and it is the sentence that says why the choice is likely
+to be wrong. What is *not* overridable is the arithmetic: an overruled shape
+goes back through `POST /api/plan`, and the verdict, the breakdown and the Serve
+button all describe the shape that will actually launch. Sending no machines and
+no degrees is byte for byte the request this bar sent before the fields existed.
+
+**A launch can need more than one permission.** `serve.overrides` is the list,
+each entry with the server's own sentence; each renders as a checkbox whose
+label is the claim, and one Serve button appears below the stack when every box
+is ticked. One launch, one button, however many permissions it took. A gate this
+client does not recognise still renders and still blocks, so a newer coordinator
+can add one without this client launching past it.
+
 **No API key is rendered and there is no reveal control.** `src/api/redact.ts`
 scrubs every response on the way in as a backstop; `api_key_ref` is an
 environment variable name and is kept, anything key-shaped is replaced. Do not

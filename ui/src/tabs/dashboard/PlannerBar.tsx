@@ -1,7 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
-import type { PlanResponse } from '../../api/types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ParallelismRequest, PlanResponse } from '../../api/types'
 import { useBackend } from '../../state/backend'
-import { useCatalog } from '../../state/resources'
+import { useCatalog, useCluster, useStorage } from '../../state/resources'
+import { DegreeFields } from './DegreeFields'
+import { MachinePicker } from './MachinePicker'
+import { modelGroups } from './modelOptions'
 import { Verdict } from './Verdict'
 
 const CUSTOM = '__custom__'
@@ -14,9 +17,22 @@ const CUSTOM = '__custom__'
  *  hand-rolled shapes, the USABLE constant, the launch-command mirror. The fit
  *  gate is the only thing allowed to say whether a model fits; duplicating its
  *  arithmetic here would be a second answer that can disagree with the real
- *  one. There is also no manual "Plan" button and no "Place on" field: replanning
- *  on every keystroke makes the button pointless, and placement is the
- *  planner's call, not a field a person fills in. */
+ *  one. There is still no manual "Plan" button: replanning on every keystroke
+ *  makes it pointless.
+ *
+ *  Placement and the degrees ARE fields, as of 2026-09-07. This reverses what
+ *  this comment used to say ("placement is the planner's call, not a field a
+ *  person fills in") and restores what `agents/E-planner.md` specified all
+ *  along: "`alternatives` returns every legal plan ranked, so the UI can offer
+ *  an override. The user can always override; you are a recommendation with
+ *  reasoning, not a lock." The planner still ranks, still writes the reason,
+ *  and its own pick comes back in `recommended_plan` whenever it is overruled.
+ *
+ *  What is NOT overridable is the arithmetic. An overruled shape is sent back
+ *  through `POST /api/plan`, and the verdict, the breakdown and the Serve
+ *  button all describe the shape that will actually launch. Sending no machines
+ *  and no degrees is byte for byte the request this bar sent before the fields
+ *  existed. */
 export function PlannerBar() {
   const { backend, invalidate } = useBackend()
   // `GET /api/catalog`, not a copy of it. The same list used to live in
@@ -44,9 +60,35 @@ export function PlannerBar() {
   const [checking, setChecking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [launching, setLaunching] = useState(false)
-  // An override is granted against one measurement. It is cleared on every
-  // replan below, so it can never outlive the number that justified it.
-  const [override, setOverride] = useState(false)
+  // Every override granted against this measurement, keyed by the launch field
+  // it unlocks. Cleared wholesale on every replan below, so none can outlive
+  // the number that justified it. A record rather than a boolean because a
+  // launch can need more than one permission at once.
+  const [granted, setGranted] = useState<Record<string, boolean>>({})
+
+  // null means "the planner picks", and sends no field at all. Only an explicit
+  // toggle materialises a value -- which is what makes "a request with neither
+  // is exactly the old request" true by construction rather than by care.
+  //
+  // These MUST stay plain state. Deriving either through a `useMemo` with
+  // unstable inputs, defaulting one inline to `[]`, or rebuilding it on each
+  // 5s cluster poll gives it a new identity every render, and the debounced
+  // effect below -- which has both in its dependency array -- then refires
+  // forever. Sixty seconds of an untouched dashboard must produce exactly one
+  // POST /api/plan.
+  const [nodeIds, setNodeIds] = useState<string[] | null>(null)
+  const [degrees, setDegrees] = useState<ParallelismRequest | null>(null)
+
+  const cluster = useCluster()
+  const nodes = useMemo(() => cluster.data?.nodes ?? [], [cluster.data])
+
+  // The cache walk fans out to every node and walks a directory on each. Gated
+  // behind first contact with the model field so a dashboard nobody is
+  // planning on never triggers one. Same shape as `useNodeProcesses`, which
+  // resolves an empty payload rather than being skipped -- hooks cannot be
+  // called conditionally.
+  const [cacheWanted, setCacheWanted] = useState(false)
+  const storage = useStorage(cacheWanted)
 
   const seq = useRef(0)
   const adopted = useRef(false)
@@ -80,10 +122,19 @@ export function PlannerBar() {
     }
     const mine = ++seq.current
     setChecking(true)
-    setOverride(false)
+    setGranted({})
     const id = window.setTimeout(() => {
       backend
-        .plan({ model_id: modelId, context, concurrency, target })
+        .plan({
+          model_id: modelId,
+          context,
+          concurrency,
+          target,
+          // Spread, never sent as null: absence is the contract for "the
+          // planner picks", and an explicit null would be a different request.
+          ...(nodeIds ? { node_ids: nodeIds } : {}),
+          ...(degrees ? { parallelism: degrees } : {}),
+        })
         .then((r) => {
           if (seq.current !== mine) return
           setResult(r)
@@ -99,7 +150,55 @@ export function PlannerBar() {
         })
     }, 450)
     return () => window.clearTimeout(id)
-  }, [backend, modelId, context, concurrency, target])
+    // `runtime` is deliberately absent: it changes what launches, not what
+    // fits, so replanning on it would be a round trip for an unchanged answer.
+    // `nodeIds` and `degrees` both change the sizing, so both belong here --
+    // see the identity warning where they are declared.
+  }, [backend, modelId, context, concurrency, target, nodeIds, degrees])
+
+  // A ticked machine can leave the cluster. Drop it rather than planning
+  // against a name nothing answers to -- the same fallback `selection.tsx`
+  // applies to a deployment that stops being served.
+  //
+  // The `every` short-circuit is not an optimisation. Without it this hands
+  // `setNodeIds` a freshly built array on every 5s cluster poll, which refires
+  // the debounced effect above, forever.
+  useEffect(() => {
+    if (nodeIds == null) return
+    const live = new Set(nodes.map((n) => n.profile.node_id))
+    if (nodeIds.every((id) => live.has(id))) return
+    const kept = nodeIds.filter((id) => live.has(id))
+    setNodeIds(kept.length ? kept : null)
+  }, [nodes, nodeIds])
+
+  // The permissions this launch needs, from the backend. `overrides` is the
+  // complete list when present; the older single-gate pair is the fallback for
+  // a gateway that predates it, and no gates at all is the normal case.
+  const groups = useMemo(
+    () =>
+      modelGroups({
+        curated: models,
+        deployments: cluster.data?.deployments ?? [],
+        storage: storage.data?.nodes ?? null,
+        selected: isCustom ? null : curatedId || null,
+      }),
+    [models, cluster.data, storage.data, isCustom, curatedId],
+  )
+
+  const serve = result?.serve
+  const gates = useMemo(
+    () =>
+      serve?.overrides ??
+      (serve?.override_required
+        ? [
+            {
+              param: serve.override_param ?? 'allow_over_live_memory',
+              reason: serve.reason,
+            },
+          ]
+        : []),
+    [serve],
+  )
 
   const launch = async () => {
     if (!result) return
@@ -111,9 +210,19 @@ export function PlannerBar() {
         concurrency,
         target,
         runtime,
-        // Sent only when someone has read the sentence naming the measured
-        // figure and ticked the box.
-        ...(override ? { allow_over_live_memory: true } : {}),
+        ...(nodeIds ? { node_ids: nodeIds } : {}),
+        ...(degrees ? { parallelism: degrees } : {}),
+        // One key per gate the backend itself published, sent only where
+        // someone has read that gate's sentence and ticked it. Driven off the
+        // published list rather than a fixed set of names, so a gateway that
+        // adds a third gate tomorrow works with no change here -- and filtered
+        // against the current result, so a key granted against a previous plan
+        // can never ride along with this one.
+        ...Object.fromEntries(
+          gates
+            .filter((g) => granted[g.param] === true)
+            .map((g) => [g.param, true]),
+        ),
       })
       invalidate()
     } catch (e) {
@@ -139,19 +248,29 @@ export function PlannerBar() {
               }
               setIsCustom(false)
               setCuratedId(v)
-              const m = models.find((x) => x.model_id === v)
-              if (m) {
-                setContext(m.default_context)
-                setConcurrency(m.default_concurrency)
-              }
+              // A serving model carries its real configured numbers, not a
+              // guess; a cached one carries none, and changes nothing.
+              const m = groups.flatMap((g) => g.options).find((x) => x.model_id === v)
+              if (m?.default_context) setContext(m.default_context)
+              if (m?.default_concurrency) setConcurrency(m.default_concurrency)
             }}
+            onFocus={() => setCacheWanted(true)}
+            onPointerDown={() => setCacheWanted(true)}
           >
             {/* Empty until the catalogue lands. A hardcoded placeholder here
                 would be a fifth copy of the list. */}
-            {models.map((m) => (
-              <option key={m.model_id} value={m.model_id}>
-                {m.label}
-              </option>
+            {groups.map((g) => (
+              <optgroup key={g.label} label={g.label}>
+                {g.options.map((m) => (
+                  <option
+                    key={`${g.label}:${m.model_id}`}
+                    value={m.model_id}
+                    disabled={m.disabled}
+                  >
+                    {m.detail ? `${m.label} — ${m.detail}` : m.label}
+                  </option>
+                ))}
+              </optgroup>
             ))}
             <option value={CUSTOM}>Custom HuggingFace ID…</option>
           </select>
@@ -201,6 +320,22 @@ export function PlannerBar() {
           />
         </div>
 
+        <MachinePicker
+          nodes={nodes}
+          plannerChose={result?.plan.node_ids ?? null}
+          placement={result?.placement ?? null}
+          chosen={nodeIds}
+          onChange={setNodeIds}
+        />
+
+        <DegreeFields
+          degrees={degrees}
+          onChange={setDegrees}
+          effective={result?.plan ?? null}
+          recommended={result?.recommended_plan ?? null}
+          overruled={result?.degrees?.source === 'operator'}
+        />
+
         <div className="fld">
           <label htmlFor="pb-target">Optimise for</label>
           <select id="pb-target" value={target} onChange={(e) => setTarget(e.target.value as 'throughput' | 'latency')}>
@@ -227,8 +362,11 @@ export function PlannerBar() {
           onUseMaxContext={setContext}
           onLaunch={() => void launch()}
           launching={launching}
-          override={override}
-          onOverride={setOverride}
+          gates={gates}
+          granted={granted}
+          onGrant={(param: string, value: boolean) =>
+            setGranted((g) => ({ ...g, [param]: value }))
+          }
         />
       ) : !modelId ? (
         <p className="unit" style={{ margin: '13px 0 0' }}>

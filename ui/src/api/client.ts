@@ -318,6 +318,9 @@ interface NodeWire {
   last_seen: number
   sample_ts?: number | null
   memory_used: number
+  /** Live denominator for `memory_used`, from the node's own sample. 0 until
+   *  one arrives, and 0 forever on a node whose telemetry never reports one. */
+  memory_total?: number
   power_w: number | null
   temp_c: number | null
   util_pct: number | null
@@ -359,6 +362,7 @@ function toNodeState(n: NodeWire, coordinator: string | null): NodeStateDTO {
     // readings rather than presenting a frozen one as current.
     sample_ts: n.sample_ts ?? null,
     memory_used: n.memory_used,
+    memory_total: n.memory_total ?? 0,
     // A missing reading stays missing. Defaulting to 0 would draw a live-
     // looking zero for a node that has simply never reported telemetry.
     power_watts: n.power_w,

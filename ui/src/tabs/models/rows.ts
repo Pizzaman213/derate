@@ -460,3 +460,33 @@ export function matches(row: ModelRow, needle: string): boolean {
     row.tags.some((t) => t.toLowerCase().includes(n))
   )
 }
+
+// ── Format ───────────────────────────────────────────────────────────────────
+
+/** Studio's format dropdown, in derate's terms.
+ *
+ *  Theirs offers GGUF and Checkpoint because llama.cpp makes both real. Here
+ *  GGUF is the format nothing loads, so the filter earns its place for the
+ *  opposite reason: it is how somebody looks at only the rows a runtime here
+ *  could actually take, or only the ones it could not. */
+export type Format = 'all' | 'checkpoint' | 'gguf'
+
+export const FORMATS: { id: Format; label: string }[] = [
+  { id: 'all', label: 'all formats' },
+  { id: 'checkpoint', label: 'checkpoint' },
+  { id: 'gguf', label: 'GGUF' },
+]
+
+/** Whether a row is GGUF, from the only signals a listing carries: the tags
+ *  the hub returned and the name the publisher chose. A guess, and it drives a
+ *  filter rather than a verdict. */
+export function isGguf(row: ModelRow): boolean {
+  if (row.tags.some((t) => t.toLowerCase() === 'gguf')) return true
+  const hay = `${row.model_id} ${row.quantHint ?? ''} ${row.dtype ?? ''}`.toLowerCase()
+  return hay.includes('gguf')
+}
+
+export function matchesFormat(row: ModelRow, format: Format): boolean {
+  if (format === 'all') return true
+  return format === 'gguf' ? isGguf(row) : !isGguf(row)
+}

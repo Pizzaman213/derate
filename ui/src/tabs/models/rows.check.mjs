@@ -16,9 +16,18 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const out = join(mkdtempSync(join(tmpdir(), 'rows-')), 'rows.mjs')
-await build({ entryPoints: [new URL('rows.ts', import.meta.url).pathname], bundle: true, format: 'esm', outfile: out, logLevel: 'silent' })
-const R = await import(out)
+const dir = mkdtempSync(join(tmpdir(), 'rows-'))
+const bundle = async (name) => {
+  const out = join(dir, `${name}.mjs`)
+  await build({
+    entryPoints: [new URL(`${name}.ts`, import.meta.url).pathname],
+    bundle: true, format: 'esm', outfile: out, logLevel: 'silent',
+  })
+  return import(out)
+}
+const R = await bundle('rows')
+const S = await bundle('support')
+const O = await bundle('owner')
 const get = async (p) => (await fetch(`http://localhost:8088${p}`)).json()
 
 const [capacity, storage, catalog, hits, ladder] = await Promise.all([
@@ -71,6 +80,33 @@ check(new Set(hub.map(R.band)).size === 1 && R.band(hub[0]) === 'unchecked', 'ev
 
 // --- filter
 check(R.catalogRows(catalog, cap, cache).filter(r => R.matches(r, 'mxfp4')).length === 1, 'the filter reaches quantization text')
+
+// --- the card's red dot, read off the server's own runtime table
+const table = await get('/api/models/quant-table')
+const row = (over) => ({
+  model_id: 'x/y', label: 'y', origin: 'hub', group: 'x', verdict: null, reason: null,
+  basis: null, predicted_decode_tps: null, headroom: null, total_params: null, dtype: null,
+  requantized: false, warnings: [], cachedOn: [], bytesOnDisk: null, downloads: null,
+  likes: null, gated: null, tags: [], pipelineTag: null, quantHint: null, detail: '',
+  remote: false, state: null, runtime: null, ...over,
+})
+console.log('\n--- support classification (from /api/models/quant-table) ---')
+const gguf = S.classifySupport(row({ tags: ['gguf'], model_id: 'unsloth/Qwen3-30B-A3B-GGUF' }), table)
+check(gguf.status === 'unsupported' && /llama\.cpp/.test(gguf.reason), 'a GGUF repo is marked unsupported, citing the missing llama.cpp runtime')
+check(S.classifySupport(row({ quantHint: 'gptq_int4' }), table).status === 'ok', 'a GPTQ-Int4 repo is not marked unsupported')
+check(S.classifySupport(row({ quantHint: 'bf16' }), table).status === 'ok', 'plain bf16 is not marked unsupported')
+const tts = S.classifySupport(row({ pipelineTag: 'text-to-speech' }), table)
+check(tts.status === 'unsupported' && /text-to-speech/.test(tts.reason), 'a text-to-speech model is marked with its task named')
+// An undetectable quantization answers "unknown", not "fine" -- and only
+// "unsupported" draws the red dot, so an unknown row is simply unmarked.
+check(S.classifySupport(row({ pipelineTag: 'text-generation' }), table).status !== 'unsupported', 'a text-generation model with no detectable quantization is left unmarked')
+check(S.classifySupport(row({}), null).status === 'unknown', 'with no quant table, support is unknown rather than assumed fine')
+
+console.log('\n--- owner identity ---')
+check(O.ownerAccent('Qwen') === O.ownerAccent('Qwen'), 'an accent is stable for the same publisher')
+check(O.ownerAccent('Qwen') !== O.ownerAccent('openai'), 'different publishers get different accents')
+check(O.ownerInitials('deepseek-ai') === 'DA' && O.ownerInitials('Qwen') === 'QW', 'initials read from the publisher name')
+check(O.isFirstParty('openai') && !O.isFirstParty('MaziyarPanahi'), 'the verified check marks the team that trained it')
 
 console.log(`\n${fail === 0 ? 'all checks passed' : fail + ' FAILED'}`)
 process.exit(fail ? 1 : 0)

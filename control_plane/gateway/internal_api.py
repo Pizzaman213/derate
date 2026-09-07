@@ -29,6 +29,7 @@ from control_plane.contracts import (
 )
 from control_plane.providers import UnknownProviderError
 from control_plane.planner import (
+    Candidate,
     IllegalDegrees,
     homogeneous_groups,
     pooling_note,
@@ -210,6 +211,24 @@ def _legal_degrees(shape, node_count: int) -> dict[str, list[int]]:
         "pipeline_parallel": sorted(valid_pp_degrees(shape, node_count)),
         "expert_parallel": sorted(valid_ep_degrees(shape, node_count)),
     }
+
+
+def _rejection_for(recommended, plan) -> str | None:
+    """The recommendation's rejection line for the shape actually planned.
+
+    None when the planner never rejected it -- the shape may simply have ranked
+    second, which is not a warning -- or when the plan IS the recommendation.
+    """
+    if recommended is plan:
+        return None
+    label = Candidate(
+        tp=plan.tensor_parallel,
+        pp=plan.pipeline_parallel,
+        ep=plan.expert_parallel,
+        dp=plan.data_parallel,
+    ).label()
+    prefix = f"{label}:"
+    return next((r for r in recommended.rejected if r.startswith(prefix)), None)
 
 
 def _rank_plans(
@@ -1437,6 +1456,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             "pipeline_parallel": plan.pipeline_parallel,
             "expert_parallel": plan.expert_parallel,
             "data_parallel": plan.data_parallel,
+            # The recommendation's own line about the shape that was chosen
+            # instead, matched here because the label vocabulary is the
+            # planner's ("TP=2", "TP=2/PP=2", "single node"). A client
+            # prefix-matching `rejected` would be a second implementation of
+            # that vocabulary, and it would break silently the first time a
+            # label changed.
+            "rejection": _rejection_for(recommended, plan),
         }
 
         return _PlanOutcome(

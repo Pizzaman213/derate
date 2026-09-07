@@ -851,3 +851,314 @@ svg text.m {
     padding-right: 0;
   }
 }
+
+/* A field-sized disclosure panel. `--panel-raised` was already reserved for
+   "dialog, popover" in the token layer; this is the first thing to use it. */
+.popwrap {
+  position: relative;
+}
+.pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 5;
+  min-width: 260px;
+  /* `main` is overflow:hidden, so an unbounded panel on a wide cluster would
+     be clipped at the bottom of the viewport rather than scrolling. */
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel-raised);
+  border: 1px solid var(--rule);
+  box-shadow: var(--shadow-raised);
+  padding: 8px;
+}
+.pop .poprow {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 5px 4px;
+  cursor: pointer;
+}
+.pop .poprow.off {
+  cursor: not-allowed;
+  color: var(--ink-muted);
+}
+.pop .popfoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid var(--rule);
+  margin-top: 6px;
+  padding-top: 6px;
+}
+
+/* ── Model cards ────────────────────────────────────────────────────────────
+ *
+ * The picker's browse view. Geometry follows Unsloth Studio's hub card --
+ * 204x128, avatar left, name at two lines, numbers on the bottom edge -- which
+ * is what makes a few hundred models scannable rather than exhausting.
+ * Written from that behaviour; their stylesheet is AGPL-3.0-only and none of
+ * it is copied.
+ *
+ * `--accent` is set per card in JS: the publisher's own logo colour when the
+ * avatar could be read, a hashed palette hue otherwise. It is the one
+ * decorative colour in this codebase and it is confined to these rules. The
+ * status dots on the card still use the three signal colours, and nothing
+ * here reassigns them.
+ */
+
+.mgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(204px, 1fr));
+  gap: var(--s-3);
+  padding: var(--s-3) 0 var(--s-4);
+}
+
+.mcard {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 128px;
+  padding: 12px 12px 11px;
+  text-align: left;
+  overflow: hidden;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  cursor: pointer;
+  isolation: isolate;
+}
+
+/* The aura. One soft ellipse of the accent, positioned per card from a hash of
+ * the model id, so a grid does not look stamped from one template and also
+ * never moves between renders. Behind the content, never over it. */
+.mcard::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(
+      42% 58% at var(--glow-x) var(--glow-y),
+      color-mix(in srgb, var(--accent) 26%, transparent),
+      transparent 70%
+    );
+  opacity: 0.85;
+  transition: opacity var(--dur) var(--ease);
+}
+
+.mcard:hover {
+  border-color: var(--rule-strong);
+}
+.mcard:hover::before {
+  opacity: 1;
+}
+.mcard:focus-visible {
+  outline: var(--focus);
+  outline-offset: 2px;
+}
+
+.mcard-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mcard-avatar {
+  position: relative;
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.12);
+}
+.mcard-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.mcard-initials {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  /* The tile is the accent at full strength, so the monogram is the light
+   * side of the pair regardless of which hue landed here. */
+  color: rgb(255 255 255 / 0.94);
+}
+
+.mcard-id {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: block;
+}
+.mcard-name {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 13.5px;
+  line-height: 16px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.mcard-owner {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 15px;
+  color: var(--ink-muted);
+}
+.mcard-owner-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcard-verified {
+  flex: 0 0 auto;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.mcard-dots {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
+.mcard-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.mcard-glyph {
+  font-size: 11px;
+  line-height: 1;
+  color: var(--warn);
+}
+
+.mcard-foot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 10px;
+  min-width: 0;
+}
+.mcard-stats {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--size-mono-unit, 11px);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-muted);
+}
+.mcard-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+.mcard-chip {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--panel-recessed);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+/* ── Toolbar controls ─────────────────────────────────────────────────────── */
+
+/* The pill search field and pill dropdowns Studio uses across the hub. Applied
+ * only inside the models toolbar so nothing else in the app changes shape. */
+.mbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-3) 0 var(--s-2);
+}
+.mbar-search {
+  position: relative;
+  flex: 1 1 220px;
+  min-width: 180px;
+}
+.mbar-search input {
+  width: 100%;
+  height: 34px;
+  padding: 0 34px 0 32px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--panel-recessed);
+}
+.mbar-search .mbar-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ink-muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+.mbar-search .mbar-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--ink-muted);
+}
+.mbar select {
+  height: 34px;
+  border-radius: 999px;
+  padding: 0 var(--s-2);
+  background: var(--panel-recessed);
+}
+
+/* Cards-or-rows, the same two-position toggle Studio uses for models-or-datasets. */
+.mview {
+  display: inline-flex;
+  align-items: center;
+  height: 34px;
+  padding: 3px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--panel-recessed);
+  flex: 0 0 auto;
+}
+.mview button {
+  border: 0;
+  border-radius: 999px;
+  height: 26px;
+  padding: 0 11px;
+  color: var(--ink-muted);
+  background: transparent;
+}
+.mview button[aria-pressed='true'] {
+  background: var(--fill);
+  color: var(--on-fill);
+}

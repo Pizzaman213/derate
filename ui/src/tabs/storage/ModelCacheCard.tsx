@@ -5,6 +5,7 @@ import { ProportionBar } from '../../components/Bars'
 import { Verbatim } from '../../components/Verbatim'
 import { relativeTime } from '../../format'
 import type { CachedModel, NodeStorage } from '../../api/types'
+import { folderFor } from '../../api/modelcache'
 
 const GiB = 1024 ** 3
 
@@ -15,12 +16,6 @@ function sizeLabel(b: number | null | undefined): string {
   return `${(b / 1024).toFixed(0)} KB`
 }
 
-/** Encoded folder name for a served model, so the "in use" marking in the
- *  browser matches the one the server refuses on. Decoding the other way is
- *  ambiguous whenever a model name contains a double hyphen. */
-function folderFor(modelId: string): string {
-  return `models--${modelId.trim().replace(/\//g, '--')}`
-}
 
 function NodeCache({
   node,

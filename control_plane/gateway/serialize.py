@@ -86,7 +86,11 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
     # and the topology payload in the architecture doc both use. Admission
     # control deliberately uses addressable memory instead: that is the slice
     # the GPU can actually reach and the one Agent D budgets a fit against.
-    total = profile.total_memory or 0
+    # Physical GPU memory first, matching the architecture doc's topology
+    # payload. A machine with no GPU has none, and falls back to the live host
+    # total its own sample carries -- without a denominator its memory readout
+    # is a permanent em dash, which reads as broken rather than as absent.
+    total = profile.total_memory or state.memory_total or 0
     no_gpu = profile.gpu_count == 0
     eligible, ineligible_reason = _eligibility(state.healthy, profile.device_class)
     return {
@@ -101,6 +105,11 @@ def node_payload(state: NodeState, label: str | None = None) -> dict:
         "gpu_name": profile.gpu_name,
         "gpu_count": profile.gpu_count,
         "total_memory": profile.total_memory,
+        # Live, from the sample, and 0 until one arrives. Separate from
+        # total_memory on purpose: that one is GPU memory and is summed into
+        # cluster-wide totals, and host RAM no model can reach must not land
+        # in that sum.
+        "memory_total": state.memory_total,
         "addressable_memory": profile.addressable_memory,
         "memory_bandwidth_gbps": profile.memory_bandwidth_gbps,
         "compute_capability": profile.compute_capability,

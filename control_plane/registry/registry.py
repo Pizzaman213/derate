@@ -831,6 +831,7 @@ class Registry:
             )
         self._telemetry.record(node_id, sample)
         state.memory_used = sample.memory_used
+        state.memory_total = sample.memory_total
         state.power_watts = sample.power_watts
         state.temperature_c = sample.temperature_c
         state.utilization_pct = sample.utilization_pct
