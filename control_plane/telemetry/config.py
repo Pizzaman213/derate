@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from control_plane.paths import data_dir as _data_dir
+
 DAY_S = 24 * 3600.0
 
 #: Subdirectory of the data root that holds both databases.
@@ -123,6 +125,29 @@ LOG_SHIP_LEVEL = "INFO"
 #: megabyte of one is not.
 LOG_MESSAGE_MAX_CHARS = 8192
 
+#: Journalled only if asked for. Not wrong, just enormous: one row per HTTP
+#: request, and the coordinator polls every node's agent at 1 Hz for telemetry
+#: plus health and journal drains on top. Measured on a three-node cluster,
+#: these two were **99.6%** of the log stream and 81% of every row in the
+#: archive, and the journal was reaching its byte cap in ~30 hours against a
+#: 72-hour retention -- which trims by dropping the oldest rows and writing a
+#: gap marker, so access logging was eating the coordinator-outage window the
+#: journal exists to provide.
+#:
+#: Nothing is lost that is worth keeping. Every ``/v1/*`` request is already a
+#: row in ``requests`` with tokens, TTFT, decode, duration, cost and retry
+#: reason; an access line is a strictly poorer record of the traffic that
+#: matters and the only record of the traffic that does not. ``uvicorn.error``
+#: is deliberately NOT here -- startup, shutdown and crash lines live there.
+#:
+#: Prefixes, matched the same way ``EXCLUDED_LOGGERS`` is. Set
+#: ``DERATE_TELEMETRY_QUIET_LOGGERS`` to a comma-separated list to change it,
+#: or to the empty string to record everything again.
+NOISY_LOGGERS = (
+    "uvicorn.access",
+    "httpx",
+)
+
 
 def data_dir() -> Path:
     """The data root.
@@ -133,7 +158,7 @@ def data_dir() -> Path:
     ``DERATE_DATA`` and entrypoint.sh bridges the two; reading the shell
     name here would split them the moment anyone overrides one.
     """
-    return Path(os.environ.get("DERATE_DATA_DIR", "/data"))
+    return _data_dir()
 
 
 def telemetry_dir(root: Path | str | None = None) -> Path:
@@ -188,6 +213,20 @@ def retention_days() -> float:
 
 def log_ship_level() -> str:
     return os.environ.get("DERATE_TELEMETRY_LOG_LEVEL", LOG_SHIP_LEVEL).upper()
+
+
+def quiet_loggers() -> tuple[str, ...]:
+    """Logger prefixes not written to the journal.
+
+    Read by the log handler, and by ``/api/history/logs`` as its default
+    ``exclude`` -- one list, so a window that predates the handler change reads
+    the same as one recorded after it. An explicitly empty value means "record
+    and return everything", which is the pre-change behaviour.
+    """
+    raw = os.environ.get("DERATE_TELEMETRY_QUIET_LOGGERS")
+    if raw is None:
+        return NOISY_LOGGERS
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def journal_max_bytes() -> int:

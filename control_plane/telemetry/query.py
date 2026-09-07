@@ -302,6 +302,7 @@ def logs(
     logger: str = "",
     q: str = "",
     node_id: str = "",
+    exclude: tuple[str, ...] | list[str] | None = None,
     from_ts: Any = None,
     to_ts: Any = None,
     limit: int = 500,
@@ -309,6 +310,16 @@ def logs(
     frm, to = resolve_window(from_ts, to_ts)
     limit = max(1, min(int(limit), config.QUERY_MAX_ROWS))
     filters, args = "", []
+    # The only negation on this surface. `logger` is a prefix filter and an
+    # inclusive one, so "everything except the access log" was inexpressible --
+    # which mattered because the handler now declines to record those loggers,
+    # and a window recorded before that change would otherwise still read as
+    # a wall of them. Same prefix semantics, opposite sign.
+    for prefix in exclude or ():
+        if not prefix:
+            continue
+        filters += " AND logger NOT LIKE ?"
+        args.append(prefix + "%")
     if level:
         # A level filter means "this and worse", which is what someone asking
         # for warnings actually wants.

@@ -12,9 +12,13 @@ that covers the gateway's loggers at all: they are named `gateway.proxy`,
 `gateway.router` and so on -- outside the `control_plane.` hierarchy entirely --
 and nothing redacts them today.
 
-Volume is the risk. Logs are the one stream with no natural bound, so the
+Volume is the risk, and the first three mitigations were not enough. The
 default floor is INFO, DEBUG is opt-in, and a single message is truncated
-rather than allowed to carry a megabyte of traceback into the archive.
+rather than allowed to carry a megabyte of traceback into the archive -- but
+access lines ARE INFO, so the floor admitted every one of them, and measurement
+put them at 99.6% of the stream. The fourth mitigation is a name filter,
+``config.NOISY_LOGGERS``: a level is the wrong axis for a logger that is
+individually cheap and collectively enormous.
 """
 
 from __future__ import annotations
@@ -25,8 +29,10 @@ from typing import Any
 from . import config
 from .records import NULL_SINK, TelemetrySink
 
-#: Never journalled. The journal's own writer logs through this handler, and
-#: recording those records would be a loop that only ends when the disk fills.
+#: Never journalled, at any setting. The journal's own writer logs through this
+#: handler, and recording those records would be a loop that only ends when the
+#: disk fills. This is correctness; ``config.NOISY_LOGGERS`` below is volume,
+#: and the two are kept apart so neither gets relaxed for the other's reason.
 EXCLUDED_LOGGERS = (
     "control_plane.telemetry",
     "asyncio",
@@ -43,15 +49,24 @@ class JournalLogHandler(logging.Handler):
         level: str | int = config.LOG_SHIP_LEVEL,
         redactor: Any = None,
         max_chars: int = config.LOG_MESSAGE_MAX_CHARS,
+        quiet: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(level=level)
         self._sink = sink
         self._redactor = redactor
         self._max_chars = max_chars
+        # Resolved once, here, rather than read from the environment per
+        # record: this runs on the request path.
+        self._quiet = config.quiet_loggers() if quiet is None else quiet
 
     def emit(self, record: logging.LogRecord) -> None:
         name = record.name or ""
         if name.startswith(EXCLUDED_LOGGERS):
+            return
+        # Checked before the message is even rendered. `getMessage()` does the
+        # %-formatting, and at 17 records a second that were all going to be
+        # dropped it is the most expensive thing in this method.
+        if self._quiet and name.startswith(self._quiet):
             return
         try:
             message = record.getMessage()
@@ -97,6 +112,7 @@ def install(
     level: str | None = None,
     redactor: Any = None,
     root: logging.Logger | None = None,
+    quiet: tuple[str, ...] | None = None,
 ) -> JournalLogHandler | None:
     """Attach the handler to the root logger. Idempotent.
 
@@ -112,11 +128,18 @@ def install(
         if isinstance(existing, JournalLogHandler):
             return existing
     handler = JournalLogHandler(
-        sink, level=level or config.log_ship_level(), redactor=redactor
+        sink, level=level or config.log_ship_level(), redactor=redactor, quiet=quiet
     )
     root.addHandler(handler)
-    # uvicorn's access and error loggers do not propagate to root, so the
-    # handler has to be put on them directly or every HTTP line is lost.
+    # uvicorn's access and error loggers do not propagate to root when uvicorn
+    # installs its own config, so the handler is put on them directly too.
+    # In the deployed shape this is a no-op -- both entrypoints pass
+    # log_config=None, which leaves propagate True and the root handler sees
+    # them anyway -- but it is what makes `uvicorn.error` reachable if that
+    # ever changes. `uvicorn.access` stays in the loop rather than being
+    # dropped here: whether its records are RECORDED is config.quiet_loggers()'s
+    # decision in emit(), and making it the attachment's decision too would put
+    # the same policy in two places that can disagree.
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logger = logging.getLogger(name)
         if not logger.propagate and handler not in logger.handlers:
