@@ -9,7 +9,7 @@ recipe is accepted, exits zero, and runs TP=1/PP=1.
 We therefore synthesize a recipe per deployment whose command template
 references every knob the planner and fit gate decided on. The synthesized
 file is deterministic: same inputs, same bytes, same path. That keeps
-render_command pure and makes the rendered command safe for Agent H to show.
+render_command pure and makes the rendered command safe for the UI to show.
 """
 
 from __future__ import annotations
@@ -184,7 +184,11 @@ def container_image(spec: RuntimeSpec, env: dict[str, str] | None = None) -> str
 
 
 def _serve_command(
-    spec: RuntimeSpec, plan: ParallelismPlan, extra_args: tuple[str, ...] = ()
+    spec: RuntimeSpec,
+    plan: ParallelismPlan,
+    extra_args: tuple[str, ...] = (),
+    *,
+    kv_cache_memory_bytes: int | None = None,
 ) -> str:
     """The command template, with conditional flags baked in.
 
@@ -200,6 +204,13 @@ def _serve_command(
     command = spec.command_template
     if plan.expert_parallel > 1 and spec.expert_parallel_arg:
         command += " \\\n    %s" % spec.expert_parallel_arg
+    # Same reason as expert parallel: no {if} in a recipe, so a flag that is
+    # only sometimes wanted is appended here. Sometimes, because a runtime
+    # that cannot be told its KV size has no such flag, and because a caller
+    # without a fit breakdown to quote has no number to put in it -- and a
+    # wrong number here is allocated exactly, unlike a fraction.
+    if kv_cache_memory_bytes and spec.kv_cache_bytes_arg:
+        command += " \\\n    %s" % spec.kv_cache_bytes_arg
     if extra_args:
         command += " \\\n    %s" % " ".join(extra_args)
     return command
@@ -247,6 +258,7 @@ def synthesize(
     *,
     port: int,
     gpu_memory_utilization: float,
+    kv_cache_memory_bytes: int | None = None,
     recipe_dir: Path,
     image: str | None = None,
     extra_args: tuple[str, ...] = (),
@@ -289,6 +301,8 @@ def synthesize(
         (spec.max_seqs_key, max_concurrent_seqs),
         ("gpu_memory_utilization", "%.2f" % gpu_memory_utilization),
     ]
+    if kv_cache_memory_bytes and spec.kv_cache_bytes_arg:
+        defaults.append(("kv_cache_memory_bytes", int(kv_cache_memory_bytes)))
     if plan.expert_parallel > 1:
         defaults.append(("expert_parallel", plan.expert_parallel))
     if plan.data_parallel > 1:
@@ -338,7 +352,9 @@ def synthesize(
     body = (
         _custom_serve_command(spec, custom_command)
         if custom_command
-        else _serve_command(spec, plan, extra_args)
+        else _serve_command(
+            spec, plan, extra_args, kv_cache_memory_bytes=kv_cache_memory_bytes
+        )
     )
     lines += ["  %s\n" % line for line in body.splitlines()]
 

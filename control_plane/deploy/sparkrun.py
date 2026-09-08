@@ -7,9 +7,9 @@ of the above.
 
 We also ignore sparkrun's fit estimate completely. `sparkrun run` prints a
 "VRAM Estimation" block ending in "DGX Spark fit: YES"; it is advisory, it
-does not block, and its utilization figures are known to be wrong. Agent D's
-FitResult is the only verdict that gates a launch. This module never parses
-that block.
+does not block, and its utilization figures are known to be wrong. The fit
+calculator's FitResult is the only verdict that gates a launch. This module
+never parses that block.
 
 Verified against sparkrun 0.2.40.
 """
@@ -50,7 +50,7 @@ HEAD_HOST_RE = re.compile(r"^\s*Head:\s+(\S+)\s*$", re.MULTILINE)
 TARGET_HOST_RE = re.compile(r"^\s*Target:\s+(\S+)\s*$", re.MULTILINE)
 
 #: Signatures that mean the runtime ran out of memory rather than failing for
-#: some ordinary reason. Used to tag the calibration event Agent D wants.
+#: some ordinary reason. Used to tag the calibration event the fit calculator wants.
 OOM_SIGNATURES = (
     "out of memory",
     "cuda error: out of memory",
@@ -65,8 +65,8 @@ OOM_SIGNATURES = (
     # Read off a real failed launch on a GB10, and exactly the miss the fit
     # gate wants told about -- the static ceiling said the model fit, and less
     # than half the pool was actually free because the OS shares it. Without
-    # this the launch was tagged an ordinary failure and Agent D learned
-    # nothing from the one case it is calibrated by.
+    # this the launch was tagged an ordinary failure and the fit calculator
+    # learned nothing from the one case it is calibrated by.
     "is less than desired gpu memory utilization",
 )
 
@@ -256,6 +256,7 @@ class SparkrunAdapter:
         served_name: str | None = None,
         port: int | None = None,
         gpu_memory_utilization: float | None = None,
+        kv_cache_memory_bytes: int | None = None,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
     ) -> RecipeSpec:
@@ -277,6 +278,11 @@ class SparkrunAdapter:
                 if gpu_memory_utilization is None
                 else gpu_memory_utilization
             ),
+            # No adapter-level default, unlike the share above: this one is a
+            # byte count the fit gate computed for this model at this context,
+            # and there is no sensible constant to fall back to. Absent, the
+            # runtime sizes its own cache exactly as it did before.
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
             recipe_dir=self.recipe_dir,
             extra_args=extra_args,
             custom_command=custom_command,
@@ -294,11 +300,12 @@ class SparkrunAdapter:
         port: int | None = None,
         recipe: RecipeSpec | None = None,
         gpu_memory_utilization: float | None = None,
+        kv_cache_memory_bytes: int | None = None,
         extra_args: tuple[str, ...] = (),
     ) -> list[str]:
         """The exact argv that will run. Pure: no subprocess, no filesystem.
 
-        Agent H shows this to the user before they commit, so it must be the
+        The UI shows this to the user before they commit, so it must be the
         real thing, including --no-follow. Deterministic for a given plan,
         shape, runtime, context, concurrency, port and extra_args.
         """
@@ -307,7 +314,8 @@ class SparkrunAdapter:
         chosen_port = port if port is not None else self.base_port
         recipe = recipe or self.recipe_for(
             plan, shape, runtime, ctx, max_seqs, served_name=name, port=chosen_port,
-            gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
+            gpu_memory_utilization=gpu_memory_utilization,
+            kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
         )
 
         values: dict[str, Any] = {
@@ -361,6 +369,7 @@ class SparkrunAdapter:
         served_name: str | None = None,
         port: int | None = None,
         gpu_memory_utilization: float | None = None,
+        kv_cache_memory_bytes: int | None = None,
         on_output: Callable[[str], None] | None = None,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
@@ -383,7 +392,8 @@ class SparkrunAdapter:
         chosen_port = port if port is not None else self.base_port
         recipe = self.recipe_for(
             plan, shape, runtime, ctx, max_seqs, served_name=name, port=chosen_port,
-            gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
+            gpu_memory_utilization=gpu_memory_utilization,
+            kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
             custom_command=custom_command,
         )
         materialize(recipe)
@@ -391,6 +401,7 @@ class SparkrunAdapter:
             plan, shape, runtime, ctx, max_seqs,
             served_name=name, port=chosen_port, recipe=recipe,
             gpu_memory_utilization=gpu_memory_utilization,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
         )
         hosts = self.hosts_for(plan.node_ids)
 

@@ -990,6 +990,32 @@ class DeploymentManager:
                 buffer.append(line)
         self._note_progress(record, read(line))
 
+    def _launch_kv_cache_bytes(self, record: _Record) -> int | None:
+        """The KV cache to reserve outright, instead of one derived by profiling.
+
+        `fit.breakdown.kv_cache` is what the gate approved this launch against
+        -- this model, this context, this concurrency, per node -- and until
+        now no runtime was ever told it. vLLM worked its own out as `device
+        total x utilization` minus the DEVICE's free-memory drop across its own
+        profiling, which is a number about whatever else the box was doing:
+        a neighbour allocating in that window is billed here until the budget
+        goes negative, and a neighbour *releasing* trips an assert. Both were
+        seen on spark-26af in one afternoon, on identical commands minutes
+        apart. Given the figure, the runtime skips that derivation entirely.
+
+        Zero or missing returns None, and the runtime sizes its own cache as
+        before: an embedding model has no KV cache, and a fit record without a
+        breakdown is not a licence to ask for nothing -- which is what a
+        literal zero would mean to the flag.
+        """
+        breakdown = getattr(record.deployment.fit, "breakdown", None)
+        kv = getattr(breakdown, "kv_cache", 0) if breakdown is not None else 0
+        try:
+            kv = int(kv)
+        except (TypeError, ValueError):
+            return None
+        return kv if kv > 0 else None
+
     def _launch_utilization(self, record: _Record) -> float | None:
         """What share of the device this launch should ask the runtime for.
 
@@ -1063,8 +1089,13 @@ class DeploymentManager:
         Returns False if *deadline* passes first, which the caller turns into a
         refusal rather than a launch into a busy profiler.
 
-        The lift is deliberately not here: see `_launch_worker` for why the
-        real answer is `--kv-cache-memory`, which this vLLM already takes.
+        Still here after `--kv-cache-memory-bytes` landed, and for a narrower
+        reason: vLLM no longer derives a budget at all, but sglang and the tts
+        server still profile, and vLLM's startup check -- free >= total x
+        utilization -- can still be lost to a neighbour that allocates first.
+        That failure is fast and legible where the old one cost two minutes,
+        so taking this gate off is now a small change rather than a risky one.
+        It wants proving on hardware first.
         """
         with self._starting_cv:
             while any(node in self._starting for node in node_ids):
@@ -1097,15 +1128,12 @@ class DeploymentManager:
         # _hold_starting for the arithmetic that makes two of them fatal to
         # each other.
         #
-        # The lift, when it is wanted: this vLLM takes `--kv-cache-memory`,
-        # and `determine_available_memory` returns that figure directly
+        # That lift has since landed: `_launch_kv_cache_bytes` below passes
+        # `--kv-cache-memory-bytes`, so vLLM returns the fit gate's own figure
         # ("skipped memory profiling ... does not respect the
         # gpu_memory_utilization config") instead of deriving one from the
-        # device's free-memory delta. The fit gate already computes exactly
-        # that number -- `fit.breakdown.kv_cache` -- so passing it makes a
-        # launch's budget independent of what its neighbours are doing, and
-        # this gate can come off. It is a change to the recipe template and to
-        # what the runtimes accept, so it is not the hotfix.
+        # device's free-memory delta. What remains for this gate is sglang and
+        # the tts server, which still profile, and vLLM's own startup check.
         nodes = tuple(sorted(set(deployment.plan.node_ids)))
         if not self._hold_starting(nodes, deadline):
             self._fail_launch(
@@ -1133,6 +1161,7 @@ class DeploymentManager:
         # After the gate, not before: this reads what the device has free, and
         # the answer is worthless while another engine is mid-profile.
         share = self._launch_utilization(record)
+        kv_bytes = self._launch_kv_cache_bytes(record)
         if share is not None:
             logger.info(
                 "launching %s at %.2f of the device (%.1f GiB is what the plan "
@@ -1151,6 +1180,10 @@ class DeploymentManager:
                 served_name=deployment.served_name,
                 port=port,
                 gpu_memory_utilization=share,
+                # The cache the plan costed, asked for by name. See
+                # _launch_kv_cache_bytes: this is what takes the launch's
+                # budget out of the hands of whatever else is on the device.
+                kv_cache_memory_bytes=kv_bytes,
                 # Everything before the container exists is inside this call:
                 # the image pull and the weights. Read it as it is printed or
                 # it is not readable at all -- the output is in a pipe until

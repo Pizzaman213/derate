@@ -128,6 +128,10 @@ class FakeAdapter(SparkrunAdapter):
         #: of the launch budget inside the launcher the way a real image pull
         #: and weight download do.
         self.launch_delay = 0.0
+        #: The recipe body rendered for each launch. The real adapter writes
+        #: it to disk; this keeps it where a test can read what the runtime
+        #: was actually asked for.
+        self.recipes: list[str] = []
         self._counter = 0
         # M-16: cluster ids whose check-job a wedged host cannot answer.
         # is_running() must read this as unknown (None), not as False.
@@ -138,7 +142,8 @@ class FakeAdapter(SparkrunAdapter):
 
     def launch(
         self, plan, shape, runtime, ctx, max_seqs, *, served_name=None, port=None,
-        gpu_memory_utilization=None, on_output=None, extra_args=(), custom_command=(),
+        gpu_memory_utilization=None, kv_cache_memory_bytes=None, on_output=None,
+        extra_args=(), custom_command=(),
     ):
         if self.fail_with is not None:
             raise self.fail_with
@@ -158,9 +163,14 @@ class FakeAdapter(SparkrunAdapter):
         # a utilization nothing ever checks.
         recipe = self.recipe_for(
             plan, shape, runtime, ctx, max_seqs, served_name=served_name, port=port,
-            gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
+            gpu_memory_utilization=gpu_memory_utilization,
+            # Rendered exactly as the real adapter renders it, for the same
+            # reason the share above is: a fake that dropped the KV budget
+            # would let the manager pass a number nothing ever checks.
+            kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
             custom_command=custom_command,
         )
+        self.recipes.append(recipe.content)
         materialize(recipe)
         argv = self.render_command(
             plan, shape, runtime, ctx, max_seqs, served_name=served_name, port=port,
@@ -2757,6 +2767,84 @@ def test_the_image_installs_the_binaries_sparkrun_shells_out_to():
     # Both architectures resolve, or the arm64 half of the manifest is an
     # image that cannot launch anything.
     assert "x86_64" in directives and "aarch64" in directives
+
+
+def test_the_vllm_recipe_asks_for_the_kv_cache_the_plan_costed(tmp_path):
+    """The number the fit gate approved, handed to the runtime by name.
+
+    vLLM's own sizing is `device total x utilization` minus the DEVICE's
+    free-memory drop across its profiling -- a number about whatever else is
+    on the box. A neighbour allocating in that window is billed here until the
+    budget goes negative ("No available memory for the cache blocks"); one
+    releasing trips an assert ("Error in memory profiling"). Given this flag,
+    determine_available_memory returns the figure and reaches neither.
+    """
+    from control_plane.deploy.recipes import synthesize
+
+    spec = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "vllm", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.42,
+        kv_cache_memory_bytes=17 * fx.GIB, recipe_dir=tmp_path,
+    )
+
+    assert "kv_cache_memory_bytes: %d" % (17 * fx.GIB) in spec.content
+    assert "--kv-cache-memory-bytes {kv_cache_memory_bytes}" in spec.content
+    # The share still goes too: it is what the runtime's startup free-memory
+    # check reads, and that check is the one that fails fast on a full box.
+    assert "--gpu-memory-utilization {gpu_memory_utilization}" in spec.content
+
+
+def test_no_budget_renders_exactly_what_it_always_did(tmp_path):
+    """Absent, the runtime sizes its own cache as before. An embedding model
+    has no KV cache at all, and a zero here would be a request for none."""
+    from control_plane.deploy.recipes import synthesize
+
+    spec = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "vllm", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.42, recipe_dir=tmp_path,
+    )
+
+    assert "kv-cache-memory" not in spec.content
+    assert "kv_cache_memory_bytes" not in spec.content
+
+
+def test_a_runtime_that_cannot_be_told_its_kv_size_is_not_told(tmp_path):
+    """sglang has no such flag, and the tts server is derate's own. A knob
+    invented for one runtime must not appear in another's command line."""
+    from control_plane.deploy.recipes import synthesize
+
+    for runtime in ("sglang", "tts"):
+        spec = synthesize(
+            fx.QWEN3_30B_A3B, fx.single_node_plan(), runtime, 8192, 64, "m",
+            port=8100, gpu_memory_utilization=0.42,
+            kv_cache_memory_bytes=17 * fx.GIB, recipe_dir=tmp_path,
+        )
+        assert "kv-cache-memory" not in spec.content, runtime
+        assert "kv_cache_memory_bytes" not in spec.content, runtime
+
+
+def test_the_manager_hands_the_runtime_the_fit_gates_own_number(tmp_path):
+    """End to end: what the gate budgeted is what the recipe asks for."""
+    fit = fx.fits()
+    fit.breakdown.kv_cache = 9 * fx.GIB
+    manager = make_manager(tmp_path, probe=FakeProbe())
+
+    dep = manager.launch(fx.QWEN3_30B_A3B, fx.single_node_plan(), fit, "vllm", 8192, 64)
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+
+    assert manager.adapter.recipes, "no recipe was rendered"
+    assert "kv_cache_memory_bytes: %d" % (9 * fx.GIB) in manager.adapter.recipes[-1]
+
+
+def test_a_model_with_no_kv_cache_asks_for_nothing(tmp_path):
+    """Zero is not a budget of zero -- it is the absence of one. Sending it
+    would tell the runtime to allocate no cache at all."""
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    fit = fx.fits()
+    fit.breakdown.kv_cache = 0
+    record = type("R", (), {"deployment": type("D", (), {"fit": fit})()})()
+
+    assert manager._launch_kv_cache_bytes(record) is None
 
 
 def _terminal_dep(i: int) -> Deployment:
