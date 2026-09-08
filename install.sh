@@ -332,31 +332,6 @@ fi
 
 ensure_docker
 
-# ---------------------------------------------------------------------------
-# Upgrade in place
-#
-# Pull first, destroy second. The other order -- which this script used to use
-# -- removes a working node and only then discovers the registry is
-# unreachable, leaving the machine with nothing running and nothing to run.
-# ---------------------------------------------------------------------------
-
-# A locally built or `docker load`-ed image is a first-class case, not an
-# error: a lab cluster has no registry, and the tag somebody built on the
-# coordinator is on that machine and nowhere else. So a failed pull is fatal
-# only when this machine does not already have the image.
-info "pulling $IMAGE"
-if ! $DOCKER pull "$IMAGE" >/dev/null 2>&1; then
-    if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
-        info "could not pull $IMAGE; using the copy already on this machine"
-    else
-        info "could not pull $IMAGE, and this machine has no local copy."
-        info "Copy it from a machine that has it:"
-        info "  docker save $IMAGE | gzip > node.tgz   # there"
-        info "  gunzip -c node.tgz | sudo docker load  # here"
-        die "no image to run"
-    fi
-fi
-
 # Every container on this machine that is an instance of this node, whatever it
 # is called. Three ways in, because an install can be older than any one of
 # them: the label this script now stamps on what it creates, the fixed name it
@@ -376,6 +351,99 @@ existing_nodes() {
 }
 
 OLD_NODES="$(existing_nodes)"
+
+# ---------------------------------------------------------------------------
+# The ports
+#
+# The container runs on host networking, so $PORT and $AGENT_PORT are this
+# machine's own ports and whatever already holds one wins. The node then dies
+# in uvicorn with EADDRINUSE -- and because `--restart unless-stopped` starts
+# it again immediately, a crash loop reads as a running container, so the wait
+# at the bottom of this script sat out its whole timeout and printed a
+# traceback whose only useful line had already scrolled past the tail. Ask
+# before pulling an image and destroying a working node for a run that cannot
+# bind.
+# ---------------------------------------------------------------------------
+
+# The listening address when something holds the port, nothing when it is
+# free, and nothing when this machine has no way to tell. Not knowing must not
+# become a refusal: without ss or netstat the run below is still attempted and
+# diagnose() still reads the bind error out of the container's logs.
+port_listener() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { print $4; exit }'
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { print $4; exit }'
+    fi
+}
+
+# $1 = port, $2 = the flag that moves it, $3 = seconds to wait for it to clear
+# (a socket does not always disappear the instant `docker rm` returns). Says
+# what is wrong and returns 0 when the port is taken.
+port_conflict() {
+    _waited_port=0
+    _held="$(port_listener "$1")"
+    while [ -n "$_held" ] && [ "$_waited_port" -lt "${3:-0}" ]; do
+        sleep 1
+        _waited_port=$((_waited_port + 1))
+        _held="$(port_listener "$1")"
+    done
+    [ -n "$_held" ] || return 1
+    info "port $1 is already in use on this machine ($_held is listening)."
+    info "The node uses host networking, so it binds this machine's own ports"
+    info "and cannot have that one. Re-run with $2 <free port>, or free it."
+    return 0
+}
+
+# $1 = seconds to wait for each port. Dies naming every port that is taken,
+# not just the first: being sent back twice for two ports is worse than once.
+require_ports() {
+    _conflict=0
+    if port_conflict "$PORT" --port "$1"; then _conflict=1; fi
+    if port_conflict "$AGENT_PORT" --agent-port "$1"; then _conflict=1; fi
+    [ "$_conflict" -eq 0 ] || return 1
+    return 0
+}
+
+# A node already running here holds these ports itself and is about to be
+# replaced, so this early question is only asked when there is nothing of ours
+# to remove. It is asked again below, unconditionally, once the old container
+# is gone.
+if [ -z "$OLD_NODES" ]; then
+    require_ports 0 || die "nothing on this machine was changed."
+fi
+
+# ---------------------------------------------------------------------------
+# Upgrade in place
+#
+# Pull first, destroy second. The other order -- which this script used to use
+# -- removes a working node and only then discovers the registry is
+# unreachable, leaving the machine with nothing running and nothing to run.
+# ---------------------------------------------------------------------------
+
+# A locally built or `docker load`-ed image is a first-class case, not an
+# error: a lab cluster has no registry, and the tag somebody built on the
+# coordinator is on that machine and nowhere else. So a failed pull is fatal
+# only when this machine does not already have the image.
+#
+# Docker's own progress goes to the terminal rather than to /dev/null. A
+# silent pull is indistinguishable from a hung one -- this line was the last
+# thing on screen for as long as the download took, with nothing to say whether
+# it was moving -- and when a pull fails, docker's message ("manifest unknown",
+# "denied") is the only thing that says why. Both were being discarded.
+info "pulling $IMAGE"
+if ! $DOCKER pull "$IMAGE" >&2; then
+    if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
+        info "could not pull $IMAGE; using the copy already on this machine"
+    else
+        info "could not pull $IMAGE, and this machine has no local copy."
+        info "Copy it from a machine that has it:"
+        info "  docker save $IMAGE | gzip > node.tgz   # there"
+        info "  gunzip -c node.tgz | sudo docker load  # here"
+        die "no image to run"
+    fi
+fi
+
 if [ -n "$OLD_NODES" ]; then
     for id in $OLD_NODES; do
         was="$($DOCKER inspect -f '{{.Name}} ({{.State.Status}})' "$id" 2>/dev/null \
@@ -389,6 +457,11 @@ if [ -n "$OLD_NODES" ]; then
     # shellcheck disable=SC2086
     $DOCKER rm -f $OLD_NODES >/dev/null 2>&1 || true
 fi
+
+# The old node's sockets are released asynchronously, so this waits rather than
+# racing it. Anything still holding a port now belongs to somebody else, and no
+# amount of restarting will change that.
+require_ports 10 || die "the node was not started."
 
 # Docker's own message is the only useful thing to say about a failed start, so
 # it is kept rather than discarded -- but it cannot go straight to the terminal,
@@ -453,18 +526,61 @@ probe() {
     fi
 }
 
+# Why the node is not up, in the order the answer is worth having. A bind
+# failure is named rather than shown, because the line that explains it --
+# uvicorn's OSError -- is some ninety frames of asyncio traceback above the end
+# of the log it produces, so a tail of the last thirty lines printed every
+# frame and none of the cause. The whole log is searched, and the tail is only
+# the fallback for a failure this script does not recognise.
+diagnose() {
+    _bind="$($DOCKER logs "$CONTAINER" 2>&1 | grep -m1 'address already in use' || true)"
+    if [ -n "$_bind" ]; then
+        _p="$(printf '%s' "$_bind" | sed -n 's/.*, \([0-9]\{1,5\}\)).*/\1/p')"
+        info "the node cannot bind port ${_p:-$PORT}: something else on this"
+        info "machine is already listening on it. Docker says the container is"
+        info "running because it keeps restarting it; it exits every time."
+        info "  $_bind"
+        if [ "${_p:-$PORT}" = "$AGENT_PORT" ]; then
+            info "Re-run with --agent-port <free port>, or free that port."
+        else
+            info "Re-run with --port <free port>, or free that port."
+        fi
+        info "The container is left in place; --uninstall removes it."
+        return 0
+    fi
+    info "its logs:"
+    $DOCKER logs --tail 60 "$CONTAINER" >&2 || true
+}
+
 info "waiting for the node to come up"
 waited=0
 until probe "http://127.0.0.1:$AGENT_PORT/agent/health"; do
+    # A crash loop reads as a running container. `--restart unless-stopped`
+    # brings the node back the moment it exits, so the exited-check below never
+    # fires for one that dies on startup -- which is how a node that was dead
+    # three seconds in was waited on for the full timeout. The restart counter
+    # is the thing that tells them apart, and one restart is already an answer:
+    # nothing about waiting longer changes what the next start will do.
+    #
+    # Anything that is not a number is treated as no restarts: a docker too
+    # old to answer, or one that answers with nothing, must leave the wait
+    # below intact rather than turning `[ "" -gt 0 ]` into a failed install.
+    restarted="$($DOCKER inspect -f '{{.RestartCount}}' "$CONTAINER" 2>/dev/null || true)"
+    case "$restarted" in ''|*[!0-9]*) restarted=0 ;; esac
+    if [ "$restarted" -gt 0 ]; then
+        info "the node is restarting in a loop, so it is not going to come up."
+        diagnose
+        exit 1
+    fi
     if [ "$waited" -ge "$HEALTH_TIMEOUT" ]; then
         info "the node did not answer /agent/health within ${HEALTH_TIMEOUT}s."
-        info "it may still be starting. Its logs:"
-        $DOCKER logs --tail 30 "$CONTAINER" >&2 || true
+        info "it may still be starting."
+        diagnose
         exit 1
     fi
     if ! $DOCKER ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-        info "the container exited. Its logs:"
-        $DOCKER logs --tail 40 "$CONTAINER" >&2 || true
+        info "the container exited."
+        diagnose
         exit 1
     fi
     sleep 2

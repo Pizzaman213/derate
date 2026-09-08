@@ -75,12 +75,20 @@ LABEL org.opencontainers.image.title="derate/node" \
 ENV DERATE_BUILD="${DERATE_BUILD}"
 
 # openssh-client: sparkrun drives the cluster over SSH.
+# git: sparkrun's recipe registry is a git clone and its RegistryManager shells
+#      out to the binary -- ensure_initialized() -> update() -> _clone_or_pull()
+#      -> subprocess.run(["git", ...]). Without it every launch from inside this
+#      image dies with FileNotFoundError: 'git' before it has read a recipe,
+#      which is a traceback about subprocess rather than about a missing
+#      package. It is only invisible when derate runs from a checkout, where
+#      the developer's machine has git and the registry is already cloned.
 # iproute2: interface inspection for the host-networking preflight and for
 #           reporting ConnectX-7 topology.
 # curl: the container healthcheck.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       openssh-client \
+      git \
       iproute2 \
       curl \
       ca-certificates \

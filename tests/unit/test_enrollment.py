@@ -21,6 +21,7 @@ import os
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -619,7 +620,33 @@ def gpu_path(tmp_path, present: bool) -> str:
     return str(bin_dir)
 
 
-def fake_docker(tmp_path, responses=None):
+def fake_ports(tmp_path, *listening):
+    """An `ss` on PATH that reports exactly these ports as listening.
+
+    Before it pulls an image or destroys a running node, install.sh asks this
+    machine whether $PORT and $AGENT_PORT are free -- and the machine running
+    the tests has its own opinion about :8080. On the development box
+    something else holds it, which turns every install test into a refusal
+    that is correct about the box and says nothing about the script. So the
+    answer is stubbed like docker's and curl's, empty by default, and the
+    tests about a conflict are the ones that name a port.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    rows = "".join(
+        f"LISTEN 0      4096              0.0.0.0:{port}          0.0.0.0:*\n"
+        for port in listening
+    )
+    # netstat too: it is the fallback for a machine without ss, and leaving it
+    # real would make this stub depend on which of the two the box happens to
+    # have -- the exact thing the docstring above is about.
+    for name in ("ss", "netstat"):
+        (bin_dir / name).write_text(f"#!/bin/sh\ncat <<'EOF'\n{rows}EOF\n")
+        (bin_dir / name).chmod(0o755)
+    return bin_dir
+
+
+def fake_docker(tmp_path, responses=None, listening=()):
     """A `docker` on PATH that records its argv and answers canned queries.
 
     Prepended to the real PATH rather than replacing it: install.sh shells out
@@ -651,6 +678,7 @@ def fake_docker(tmp_path, responses=None):
     (bin_dir / "docker").chmod(0o755)
     (bin_dir / "curl").write_text("#!/bin/sh\nexit 0\n")
     (bin_dir / "curl").chmod(0o755)
+    fake_ports(tmp_path, *listening)
     return f"{bin_dir}:{os.environ['PATH']}", log
 
 
@@ -725,6 +753,90 @@ def test_keep_images_leaves_superseded_images_alone(tmp_path):
     sh("--keep-images", "--join", "http://10.0.0.1:8080", "--token", "ej_x", path=path)
 
     assert not any(c.startswith("rmi ") for c in docker_calls(log))
+
+
+def test_install_refuses_a_port_something_else_already_holds(tmp_path):
+    """Refuse before the pull, rather than crash-loop after it.
+
+    The container is on host networking, so :8080 is the machine's own port and
+    whatever already has it wins. The node then dies in uvicorn with EADDRINUSE
+    -- and because `--restart unless-stopped` puts it back immediately, a crash
+    loop reads as a running container, so the wait at the end of the script sat
+    out its whole timeout before printing a traceback whose only useful line
+    had already scrolled past the tail. This is that whole failure, asked as a
+    question first: nothing is pulled, nothing is removed.
+    """
+    path, log = fake_docker(tmp_path, listening=(8080,))
+    result = sh(path=path)
+
+    calls = docker_calls(log)
+    assert result.returncode != 0
+    assert not any(c.startswith("pull ") for c in calls), calls
+    assert not any(c.startswith("rm -f") for c in calls), calls
+    assert "port 8080 is already in use" in result.stderr, result.stderr
+    assert "--port" in result.stderr, result.stderr
+
+
+def test_a_busy_agent_port_names_the_flag_that_moves_it(tmp_path):
+    """--port would not have helped, and being sent back twice is the failure."""
+    path, _ = fake_docker(tmp_path, listening=(8081,))
+    result = sh(path=path)
+
+    assert result.returncode != 0
+    assert "port 8081 is already in use" in result.stderr, result.stderr
+    assert "--agent-port" in result.stderr, result.stderr
+
+
+def test_both_busy_ports_are_named_in_one_run(tmp_path):
+    path, _ = fake_docker(tmp_path, listening=(8080, 8081))
+    result = sh(path=path)
+
+    assert "port 8080 is already in use" in result.stderr, result.stderr
+    assert "port 8081 is already in use" in result.stderr, result.stderr
+
+
+def test_the_pull_is_not_silent(tmp_path):
+    """Docker's own output is the only thing that says why a pull failed.
+
+    It was going to /dev/null along with the progress, which made a slow pull
+    and a hung one identical on screen and hid "manifest unknown" entirely.
+    """
+    path, _ = fake_docker(tmp_path, {"pull ": "latest: Pulling from pizzaman213/derate/node\n"})
+    result = sh(path=path)
+
+    assert "Pulling from pizzaman213/derate/node" in result.stdout + result.stderr
+
+
+def test_a_restarting_node_is_diagnosed_instead_of_waited_out(tmp_path):
+    """A crash loop is not a slow start, and docker reports both as running.
+
+    The restart counter is what separates them. The bind error is then named
+    rather than shown: uvicorn's OSError is some ninety frames of asyncio
+    traceback above the end of the log it produces, so the tail this used to
+    print carried every frame and none of the cause.
+    """
+    bind = (
+        "OSError: [Errno 98] error while attempting to bind on address "
+        "('0.0.0.0', 8080): [errno 98] address already in use"
+    )
+    path, _ = fake_docker(tmp_path, {
+        "inspect -f {{.RestartCount}}": "4\n",
+        "logs ": bind + "\n" + "\n".join("  File asyncio" for _ in range(120)) + "\n",
+    })
+    # The health probe never answers: that is the state this is about.
+    (tmp_path / "bin" / "curl").write_text("#!/bin/sh\nexit 1\n")
+
+    started = time.monotonic()
+    result = sh(path=path)
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert "restarting in a loop" in result.stderr, result.stderr
+    assert "cannot bind port 8080" in result.stderr, result.stderr
+    assert "--port" in result.stderr, result.stderr
+    # HEALTH_TIMEOUT is 60s. Waiting it out for a node that is already dead is
+    # the bug, so the speed is the assertion.
+    assert elapsed < 20, elapsed
 
 
 def test_the_script_is_valid_posix_sh():
