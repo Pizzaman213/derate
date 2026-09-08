@@ -523,7 +523,7 @@ def _agent_backed_manager(tmp_path, agent):
     flag, because that is what the second tier actually changes: sparkrun keeps
     saying "running" until the process is gone from the machine.
     """
-    from tests import test_deploy as td
+    from tests.unit import test_deploy as td
 
     class Reg(td.FakeRegistry):
         def agent_urls(self, include_local=False):
@@ -561,7 +561,7 @@ def test_a_stop_sparkrun_will_not_confirm_is_killed_on_its_nodes(tmp_path):
     """Today's behaviour was to give up and record the orphan. The workload
     then holds the pool forever and the fit gate plans around it."""
     from control_plane.deploy import events as ev
-    from tests import test_deploy as td
+    from tests.unit import test_deploy as td
 
     with FakeAgent([]) as agent:
         manager = _agent_backed_manager(tmp_path, agent)
@@ -593,7 +593,7 @@ def test_a_stop_sparkrun_will_not_confirm_is_killed_on_its_nodes(tmp_path):
 def test_a_process_belonging_to_another_deployment_is_not_swept_up(tmp_path):
     """The tier signals this deployment's processes, not everything on the
     node. A second model serving from the same box must survive."""
-    from tests import test_deploy as td
+    from tests.unit import test_deploy as td
 
     with FakeAgent([]) as agent:
         manager = _agent_backed_manager(tmp_path, agent)
@@ -620,7 +620,7 @@ def test_the_tier_is_skipped_when_the_registry_cannot_be_asked(tmp_path):
     """Unit wiring and the stub ports have no agent_urls/cluster_token. The
     old behaviour has to survive that untouched -- it is what every existing
     stop test exercises."""
-    from tests import test_deploy as td
+    from tests.unit import test_deploy as td
 
     manager = td.make_manager(tmp_path)  # plain FakeRegistry: neither method
     try:
