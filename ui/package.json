@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "check": "node check.mjs"
+    "check": "node check.mjs",
+    "screens": "node src/shell/screens.check.mjs --capture-only"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.1.1",
@@ -24,6 +25,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "esbuild": "^0.21.5",
+    "playwright-core": "^1.63.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
   }

@@ -3,3 +3,9 @@ dist/
 *.tsbuildinfo
 layout-preview.svg
 .history-check-*/
+
+# Generated so a screen can be looked at without a browser (layout-preview.svg)
+# or with one (screens/, written by src/shell/screens.check.mjs). Both are
+# output, both are regenerated on demand, neither is reviewable in a diff.
+src/tabs/cluster/loading-preview.svg
+screens/
