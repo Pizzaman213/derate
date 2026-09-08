@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/derate-lockup-dark.svg">
-    <img src="docs/brand/derate-lockup.svg" width="280" alt="derate">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/derate-banner-dark.svg">
+    <img src="docs/brand/derate-banner.svg" width="100%" alt="derate — I want it to be simple to run multiple models on your own machine, without recoding the API.">
   </picture>
 </p>
 
@@ -12,136 +12,14 @@ Planning and orchestration for DGX Spark clusters. Measures the interconnect, de
 ## How it works
 
 derate does not run inference. vLLM and SGLang do that, and NVIDIA's `sparkrun`
-sets up the fabric and launches the processes. derate owns the four decisions in
-front of them, and every one is made from a measurement rather than a default.
+sets up the fabric and launches the processes. derate measures the interconnect,
+resolves the model to a shape, plans the parallelism from the two, refuses
+launches that will not fit — naming the term that blew the budget and the change
+that would work — and fronts the result behind one endpoint. Every one of those
+is decided from a measurement rather than a default. `00-architecture.md` has
+the reasoning; `CONTRACTS.md` has the numbers.
 
-### It measures the link
-
-`control_plane/links/` runs a ladder and labels each rung honestly for what it
-is:
-
-1. **nccl-tests** — `all_reduce_perf` and `sendrecv_perf` across the pair. The
-   real answer, because it is the same code path an inference runtime takes.
-   Both collectives are run: all-reduce governs whether tensor parallel is
-   viable, sendrecv governs pipeline stage handoff and KV transfer, and the two
-   differ enough that deriving one from the other would be guessing.
-2. **ib_write_bw** — raw RDMA, scaled and flagged as an estimate. Reporting raw
-   RDMA as if it were NCCL bandwidth is precisely the error that makes the
-   ecosystem's defaults wrong here.
-3. **TCP** — wire throughput on the data-plane interface. Coarse, flagged, and
-   still better than nothing.
-
-If all three fail it returns nothing at all. A missing measurement is a state
-the planner handles; a fabricated one produces a plan that silently
-underperforms. Measurement is serialised, because two collectives running over
-the same fabric at once would each report the other's interference as the
-link's speed. Reads never block on it.
-
-### It resolves the model to a shape
-
-`control_plane/resolver/` turns a HuggingFace id into a `ModelShape`: layer
-count, hidden size, attention and KV head counts, total against active
-parameters, quantization. Every field is either read from real metadata or
-carries a warning saying it was not — the memory arithmetic and the parallelism
-choice are both wrong if the KV head count or the active parameter count is
-wrong here.
-
-The mapper never asks a runtime anything, so a shape cannot depend on which
-image happens to be installed. `python3 -m tests.model_sweep` proves that by
-resolving the whole corpus a second time with the image's registry recorded.
-
-### It plans the parallelism from those two facts
-
-Legality first, because it is not a matter of taste: a tensor-parallel degree
-that does not divide `num_attention_heads` and `num_kv_heads` fails at model
-load, so the planner never emits one. Then arithmetic.
-`control_plane/planner/comm.py` computes what each strategy actually moves per
-decode step, and the plan quotes its own numbers back:
-
-```
-PP=2 across spark-01 and spark-02: measured all-reduce is 10.2 GB/s, below the
-40 GB/s threshold where tensor parallel becomes competitive, and at concurrency
-16 pipeline moves 262 KB per step over 1 exchange against tensor parallel's
-41.9 MB over 160 exchanges.
-```
-
-Rejected strategies are kept, not discarded, each with the reason it lost:
-
-```
-TP=2: measured all-reduce 10.2 GB/s is below the 40 GB/s threshold; 2
-all-reduces per layer across 80 layers is 160 cross-node exchanges and 41.9 MB
-per step, which would dominate at concurrency 16
-```
-
-That is the whole disagreement with NVIDIA's own playbook, which specifies
-tensor parallel for two Sparks. At the bandwidth the link actually delivers,
-pipeline parallel wins batched serving by roughly 2.2x.
-
-### It refuses launches that will not fit
-
-`control_plane/fit/` is a blocking gate, not an estimate. Per rank:
-
-```
-weights + kv_cache + activations + comm_buffers + replicated
-    + framework_overhead  <=  usable memory
-```
-
-Everything else in this space estimates and then lets you launch anyway. This
-refuses, and a refusal names the term that blew the budget and the specific
-change that would work:
-
-```
-Won't fit: weights alone are 131.4 GiB per rank against 107.7 GiB usable (90%
-of 119.7 GiB addressable on NVIDIA GB10). Over budget by 65.1 GiB in total.
-Context and concurrency cannot fix this at bf16 on 1 rank — it needs 2 nodes or
-requantize to fp8 (65.7 GiB per rank).
-```
-
-It also refuses things that *would* load, when loading is not the same as
-working:
-
-```
-Loads with 19.1 GiB to spare, but predicted decode is 1.0 tok/s, under the 10
-tok/s usability threshold. Bandwidth bound: 143.8 GB moves per decoded token at
-273 GB/s. Adding nodes will not fix this — a smaller quantization, a smaller
-model, or an MoE with fewer active parameters will.
-```
-
-Both of those are this repo's own output against its fixtures, not
-illustrations. They render through the UI verbatim: never truncated, re-cased
-or summarised, because rewriting a refusal destroys the thing that made it
-useful.
-
-The budget prefers what a node can hand out *now* and falls back to the static
-ceiling when there is no live reading — it never refuses for want of one. On
-GB10 that distinction is the whole game: memory is unified, `nvidia-smi`
-reports aggregate memory as N/A, and the addressable ceiling overstates what is
-actually free by roughly 10x because the operating system spends from the same
-pool.
-
-### It launches, and says which of the slow things it is on
-
-A launch goes `preparing → downloading → loading → starting → serving`, and
-`control_plane/deploy/progress.py` classifies it from literal markers sparkrun
-and the runtime print, showing their line verbatim. `serving` is not read off a
-log line: the health probe decides it, because a runtime claiming to be ready
-is not the same as a port that answers.
-
-The slow parts are not slow in the order you would guess. Measured on a 0.5B
-launch with image and weights already local: CUDA graph capture 40s+, the
-python/vLLM import ~26s (twice — once for the API server, once for the engine
-fork), sparkrun prep and `docker run` ~19s, cold `torch.compile` 7.5s, and
-**weight load 5.6s**. The shard-counting progress bar everyone writes covers
-the cheapest step.
-
-The fit gate's arithmetic is also what sizes the launch.
-`--gpu-memory-utilization` is not a limit — vLLM reads it as a claim on the
-whole device and refuses to start unless that share is free right now — so a
-constant asks for the same slice of the machine for a 0.5B model as for a 120B
-one, and dies on any node with neighbours. `control_plane/deploy/utilization.py`
-derives it from the fit breakdown instead, capped by what is free.
-
-### It fronts everything behind one endpoint
+## One endpoint
 
 `control_plane/gateway/` is the only HTTP surface: 77 routes on the
 coordinator, of which `/v1/models`, `/v1/chat/completions`, `/v1/completions`,
@@ -170,7 +48,7 @@ and one container serve both roles, decided at runtime — there is no separate
 worker build, which is why **Install** below is nearly the same line twice.
 
 Nodes are not assumed to be identical. The fit gate budgets against the
-smallest one under whichever basis is in force, and a machine that cannot carry
+smallest one, and a machine that cannot carry
 a tensor- or pipeline-parallel rank — a Mac, a Windows box, anything not
 launching through `sparkrun` — says so in the roster rather than implying
 otherwise.
