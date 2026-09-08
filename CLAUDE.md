@@ -4,7 +4,7 @@ Planning and orchestration for DGX Spark clusters: measures the interconnect,
 derives the parallelism plan from it, refuses launches that will run out of
 memory, and fronts every model behind one OpenAI endpoint.
 
-**To look a contract up, read `CONTRACTS.md`.** It is generated from the code --
+**To look a contract up, read `docs/CONTRACTS.md`.** It is generated from the code --
 every type, enum, constant, derived fact, route and environment variable -- and
 a test fails when it goes stale, so it cannot be wrong in a way the code is not.
 
@@ -13,7 +13,7 @@ a test fails when it goes stale, so it cannot be wrong in a way the code is not.
 the file-ownership map and the per-workstream briefs for the initial parallel-
 agent build; the build is done, they went stale against each other, and they
 were removed rather than kept as a source of superseded answers.
-`README.md` is the pitch and the install path; `CONTRACTS.md` is the frozen
+`README.md` is the pitch and the install path; `docs/CONTRACTS.md` is the frozen
 facts. Git history carries the reasoning now. This file is the part that is
 only useful while you are editing.
 
@@ -65,7 +65,7 @@ When a contract, a route or an environment variable moves, regenerate:
 ```bash
 python3 -m control_plane.contracts.manifest --write   # types, enums, constants, derived facts, env
 python3 -m control_plane.contracts.routes --write     # every route both apps answer
-python3 -m control_plane.contracts.document --write   # CONTRACTS.md, from the two above
+python3 -m control_plane.contracts.document --write   # docs/CONTRACTS.md, from the two above
 ```
 
 `tests/test_contracts_manifest.py` fails when any of the three is stale, and

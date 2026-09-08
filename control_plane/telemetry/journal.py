@@ -159,7 +159,7 @@ class Journal:
         # config.journal_max_bytes(), not the bare constant. The constant was
         # the default here and nothing ever called the reader, so
         # DERATE_TELEMETRY_MAX_BYTES did nothing at all despite being
-        # documented in CONTRACTS.md -- and it is the first knob an operator
+        # documented in docs/CONTRACTS.md -- and it is the first knob an operator
         # reaches for when a journal is misbehaving.
         max_bytes: int | None = None,
         trim_interval_s: float = config.JOURNAL_TRIM_INTERVAL_S,

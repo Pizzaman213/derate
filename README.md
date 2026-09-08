@@ -42,7 +42,7 @@ resolves the model to a shape, plans the parallelism from the two, refuses
 launches that will not fit — naming the term that blew the budget and the change
 that would work — and fronts the result behind one endpoint. Every one of those
 is decided from a measurement rather than a default. `00-architecture.md` has
-the reasoning; `CONTRACTS.md` has the numbers.
+the reasoning; `docs/CONTRACTS.md` has the numbers.
 
 ## Install
 

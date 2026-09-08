@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import manifest, routes
 
-DOCUMENT_PATH = Path(__file__).resolve().parents[2] / "CONTRACTS.md"
+DOCUMENT_PATH = Path(__file__).resolve().parents[2] / "docs" / "CONTRACTS.md"
 
 _HEADER = """# Contracts, as the code has them
 

@@ -262,7 +262,7 @@ def test_a_journal_written_before_the_fix_is_converted(tmp_path):
 
 
 def test_the_journal_size_cap_is_settable_from_the_environment(monkeypatch):
-    """DERATE_TELEMETRY_MAX_BYTES is documented in CONTRACTS.md and did
+    """DERATE_TELEMETRY_MAX_BYTES is documented in docs/CONTRACTS.md and did
     nothing: the reader had no callers, because the constant was the default.
     It is the first knob anyone reaches for when a journal misbehaves."""
     from control_plane.telemetry import config as tconfig
