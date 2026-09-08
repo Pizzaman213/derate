@@ -125,11 +125,11 @@ def build_commands(origin: str, token: str) -> dict[str, str]:
 
     There were two more, ``native`` and ``windows``, and both were
     ``pipx install derate``. **That name on PyPI is somebody else's** -- "a
-    machine wide rate limiter", coincidentally also at version 0.1.0 -- so the
-    line installed an unrelated project onto the laptop of whoever was adding
-    their first node, and looked like it had worked. Nothing rendered them,
-    which is how it survived. Do not put a platform back in this dict without
-    an installer that has been run on that platform.
+    machine wide rate limiter", at version 0.1.0 -- so the line installed an
+    unrelated project onto the laptop of whoever was adding their first node,
+    and looked like it had worked. Nothing rendered them, which is how it
+    survived. Do not put a platform back in this dict without an installer
+    that has been run on that platform.
     """
     return {"docker": build_command(origin, token)}
 

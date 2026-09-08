@@ -209,7 +209,8 @@ no git binary, no repository, a 2 s timeout and a non-zero exit are all the same
 answer. `same_build()` returns `True` for two unknowns -- not comparable is not a
 reportable difference -- and `skew_note()` returns a sentence only when both
 builds are known and differ. The package version from `pyproject.toml` is
-deliberately not a fallback; it has been `0.1.0` for the life of the project.
+deliberately not a fallback; it moves when a release is cut, not when a build
+is made.
 
 ## `fsutil.py`
 
@@ -409,8 +410,8 @@ no error either way.
 ## Deliberately not built
 
 **A package-version fallback in `version.py`.** `pyproject.toml` would answer
-"which build" with `0.1.0`, a string true of every build ever made -- the exact
-failure this module exists to end, in a more confident voice.
+"which build" with a release number, a string true of every build carrying it
+-- the exact failure this module exists to end, in a more confident voice.
 
 **A third byte formatter, and a second one folded away.**
 `planner/comm.py::human_bytes` stays where it is: it formats per-step transfer

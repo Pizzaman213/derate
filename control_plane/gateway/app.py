@@ -485,7 +485,7 @@ def create_app(
 
     app = FastAPI(
         title="Derate Gateway",
-        version="0.1.0",
+        version="0.0.1",
         lifespan=lifespan,
         # The UI and OpenAI clients both talk to this; the surface is the
         # contract in 00-architecture.md, not a generated schema. /redoc is
