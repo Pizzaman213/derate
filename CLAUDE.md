@@ -144,12 +144,16 @@ control_plane/logfiles.py  node.log and proxy.log, in one folder
 control_plane/node.py      the real entry point: one process, role at runtime
 ui/                        the screen. See ui/README.md, which is thorough.
 tests/                     pytest. tests/load/ is a harness, not a suite.
-docs/brand/                the README's banner and bare lockup. The mark is a
-                           COPY of the one Header.tsx draws and the colours are
-                           copies of tokens.css, so change either and rerun
-                           `python3 docs/brand/build.py`, which derives the
-                           lockup's proportions from the header's own CSS and
-                           outlines the wordmark so no font has to be installed.
+docs/screenshots/          every image the README shows, and one README over
+                           both halves of it. The eight PNGs are promoted by hand
+                           out of ui/screens/ after `npm run screens`.
+                           brand/ under it is the banner and bare lockup: the
+                           mark is a COPY of the one Header.tsx draws and the
+                           colours are copies of tokens.css, so change either and
+                           rerun `python3 docs/screenshots/brand/build.py`, which
+                           derives the lockup's proportions from the header's own
+                           CSS and outlines the wordmark so no font has to be
+                           installed.
 ```
 
 ## Rules that are not style

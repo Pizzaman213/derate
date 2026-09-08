@@ -1,6 +1,6 @@
 """Regenerate the README's brand art.
 
-    python3 docs/brand/build.py
+    python3 docs/screenshots/brand/build.py
 
 Writes four files: the bare lockup (`derate-lockup{,-dark}.svg`) and the banner
 the README heads with (`derate-banner{,-dark}.svg`), which is the same lockup on
@@ -33,7 +33,24 @@ from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent.parent
+
+
+def _repo_root(start: Path) -> Path:
+    """Walk up until the checkout's own marker turns up.
+
+    A counted `.parent.parent` is right for exactly one location, and this
+    folder has already moved once -- up one level, under `docs/screenshots/` --
+    which silently repointed FONTS at `docs/ui/node_modules/` and left the
+    build unable to find a font it was standing three directories away from.
+    Searching for the marker means the next move costs nothing.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    raise SystemExit(f"no pyproject.toml above {start}: not inside the checkout")
+
+
+REPO = _repo_root(HERE)
 FONTS = REPO / "ui/node_modules/@fontsource/ibm-plex-sans/files"
 
 TEXT = "derate"      # lowercase, as the header's own wordmark and ui/index.html

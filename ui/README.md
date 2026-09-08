@@ -668,3 +668,322 @@ The picked model is `?dep=`, the app's selected deployment, rather than a
 second private notion of the same thing -- the row set and `selDep` have the
 same domain, so `/chat?dep=<served name>` opens on that model the way
 `/cluster?node=` opens on that machine.
+
+## The folder itself
+
+Everything above describes what the app does. This part describes the folder
+that builds it and gates it: six npm scripts, one runner that discovers its own
+suite rather than listing it, three tsconfigs of which only two check anything,
+and two mockup trees that are tracked in git, never built and never served.
+
+## Files at the top of `ui/`
+
+| File | Lines | What it owns |
+|---|---|---|
+| `check.mjs` | 184 | the whole UI suite -- discovery, one probe per requirement, three separate columns |
+| `index.html` | 13 | the Vite entry: `#root`, `color-scheme: light dark`, `/src/main.tsx` |
+| `package.json` | 32 | the six scripts, and the dependency set the image installs |
+| `package-lock.json` | 1809 | tracked, because the image build runs `npm ci` |
+| `vite.config.ts` | 27 | the dev proxy -- `/api` with `ws: true`, `/v1` -- and `dist/` with sourcemaps |
+| `tsconfig.json` | 4 | a solution file with `"files": []`; the reason a bare `tsc --noEmit` checks nothing |
+| `tsconfig.app.json` | 21 | the only project that covers `src/`: strict, `noUncheckedIndexedAccess` |
+| `tsconfig.node.json` | 15 | covers `vite.config.ts` and nothing else in the folder |
+| `.gitignore` | 11 | which previews and captures are output rather than source |
+| `layout-preview.svg` | 0 | not source: the floor at eight cluster sizes, written by `layout.check.mjs` |
+
+## `check.mjs`
+
+The runner, and the reason `npm run check` means something. `walk(src)` recurses
+for `*.check.mjs` and sorts what it finds -- 21 verifiers today -- because a
+hard-coded list stops covering a verifier the moment somebody adds or renames
+one, which is the same failure as not having the verifier at all. The list it
+replaced lived in the project's working notes and had drifted to naming ten of
+the seventeen then in the tree, several of which were not in the repo.
+
+`requirement()` reads the first 4096 bytes of each file for a `// requires:`
+line. `coordinator` fetches `$DERATE_CHECK_ORIGIN/api/topology` (default
+`http://localhost:8088`) on a 2 s `AbortSignal.timeout`; `python` runs
+`python3 -c 'import sys'`; `browser` calls `findBrowser()`; `fixtures $NAME`
+asks whether that variable is set; no line at all means hermetic. Ten verifiers
+declare something, eleven declare nothing. Each requirement is probed once and
+memoised by key, so six coordinator verifiers cost one request.
+
+Three behaviours are load-bearing. **An unknown requirement is `fatal` -- a
+FAIL, never a skip**: somebody invented a word, and quietly not running the file
+is the wrong answer to that. **A skip is its own column, named, never folded
+into the passes**; `--strict` (or `DERATE_CHECK_STRICT=1`) turns each one into a
+failure. And the last thing the file does is compare `passed + failed + skipped`
+against the verifiers it chose, printing `refusing to report a result` and
+exiting 1 when they disagree -- the one way a runner can lie about having run.
+
+A positional argument filters by substring against the path; matching nothing
+exits 1 with `no verifier matches`, rather than reporting zero passed.
+
+## `index.html`
+
+Thirteen lines: a `#root` div and `<script type="module" src="/src/main.tsx">`.
+Vite rewrites it into `dist/index.html` with the hashed asset tags, and those
+hrefs are absolute (`/assets/index-<hash>.js`), which is what lets the
+coordinator answer `/models/meta-llama/Llama-3.1-8B` with this same document --
+see `_UIStatics.get_response` under **URLs** above. `<meta name="color-scheme"
+content="light dark">` is the only theming that exists before any stylesheet
+loads; it gets the browser's own scrollbars and form controls right on the first
+paint, and `theme.ts` takes over by swapping `data-theme` on the root element.
+`src/shell/screens.check.mjs` asserts that `#root` has height on every
+destination, because "it mounted" is not a type and a blank page passes both a
+green `tsc` and every pure-function verifier.
+
+## `package.json`
+
+Six scripts, and `build` is the one worth reading: `tsc -b && vite build`, so a
+build fails on a type error before it emits anything. `typecheck` is
+`tsc -b --noEmit`, `check` is `node check.mjs`, `screens` is
+`node src/shell/screens.check.mjs --capture-only` -- the same verifier as under
+`npm run check`, with its assertions turned off so it only writes PNGs. `dev`
+and `preview` are bare Vite.
+
+Seven runtime dependencies: `react` and `react-dom` 18.3, the two `@fontsource`
+IBM Plex families (self-hosted, never a CDN), `@xterm/xterm` with
+`@xterm/addon-fit`, and `uplot`. The last two are argued for above and not
+re-argued here. In devDependencies, two are there for the gate rather than the
+build: `esbuild`, which `src/check/harness.mjs` uses to bundle a TS module so
+node can import it, and `playwright-core`, which is the dependency instead of
+`playwright` precisely because it never downloads a browser.
+
+## `package-lock.json`
+
+Tracked, and the thing that makes the image's bundle reproducible: stage 1 of
+the repo-root `Dockerfile` runs `npm ci --no-audit --no-fund` and falls back to
+`npm install` when that fails. The fallback is why a missing lockfile would not
+break the image build -- it would silently make every dependency resolve to
+whatever was newest on the day the image was built, on a bundle that is then
+copied to `/opt/derate/ui/dist` and served to every operator.
+
+## `vite.config.ts`
+
+The dev server on 5173 and its two proxies. `/api` and `/v1` go to
+`$DERATE_GATEWAY`, defaulting to `http://localhost:8080`; production has no
+proxy at all, because the coordinator serves the built assets from its own
+origin and both prefixes are same-origin there.
+
+**`ws: true` on `/api` stopped being optional when the node terminal landed.**
+`http-proxy` does not forward an HTTP `Upgrade` without it, so the shell socket
+fails its handshake under `npm run dev` and the terminal simply never connects
+-- with no `/api` error anywhere to trace it to. Production is unaffected either
+way, which is exactly what makes the bug hard to find from the deployed shape.
+
+`process` is hand-declared at the top rather than pulling in `@types/node` for
+one variable. `build` sets `outDir: 'dist'` and `sourcemap: true`, so `dist/`
+carries a `.map` beside every chunk.
+
+## `tsconfig.json`
+
+Four lines: `{"files": [], "references": [...]}`. **A bare `npx tsc --noEmit`
+therefore resolves no sources and exits 0 on any tree, including one that does
+not compile.** The two gates that do work are `npm run typecheck` (`tsc -b`,
+which follows the references) and `npx tsc -b --force`. The `--force` matters on
+a second run: each referenced project writes a `tsbuildinfo` under
+`node_modules/.tmp/`, so an incremental build that believes it is up to date
+prints nothing and looks identical to a clean pass.
+
+## `tsconfig.app.json`
+
+`include: ["src"]`, and the only project that ever looks at the application.
+`strict`, plus `noUnusedLocals`, `noUnusedParameters`,
+`noFallthroughCasesInSwitch` and `noUncheckedIndexedAccess` -- the last is the
+one that shapes the code, because it makes every `rows[i]` a `T | undefined` and
+every array lookup in the layout and table code say what it does when the index
+is off the end. `jsx: react-jsx`, `moduleResolution: bundler`,
+`allowImportingTsExtensions` and `noEmit` are the Vite-shaped half; `noEmit` is
+why `tsc -b` is a checker here and never a compiler.
+
+## `tsconfig.node.json`
+
+`include: ["vite.config.ts"]`, and that is the whole project. Its `lib` is
+`ES2023` with no DOM, which is the reason `vite.config.ts` declares `process`
+for itself rather than being handed node's globals. Nothing else in the folder
+is covered by it -- `check.mjs` and the 21 `*.check.mjs` files are JavaScript,
+`allowJs` is set in neither project, and they are checked by being run.
+
+## `.gitignore`
+
+Eleven lines, and it is the file that says which artefacts in this folder are
+output. `node_modules/`, `dist/`, `*.tsbuildinfo`, `layout-preview.svg`,
+`.history-check-*/`, `src/tabs/cluster/loading-preview.svg` and `screens/`. Its
+own comment states the rule for the two preview SVGs and `screens/`:
+generated so a screen can be looked at without a browser (`layout-preview.svg`,
+`src/tabs/cluster/loading-preview.svg`) or with one (`screens/`, written by
+`src/shell/screens.check.mjs`), regenerated on demand, and not reviewable in a
+diff. What is deliberately *not* ignored is `mockups/` and
+`mockups-next/`, which is the whole of the next section.
+
+## `layout-preview.svg`
+
+The one file at this level that is not source and is on disk anyway: 65 KB of
+SVG on a single line, which is why `wc -l` says 0. `layout.check.mjs` writes it
+on every run, stacking the cluster floor at 1, 2, 3, 4, 6, 9, 12 and 16
+machines so the density tiers can be eyeballed with no cluster and no browser.
+It exists because there is nothing else to look at: `api/fixtures.ts` was
+deleted in 7626319 and `VITE_API_MODE` no longer exists, so a shape the live
+cluster is not currently in has no other way of being seen. Rendered at
+`K = 12 / 9` off the authored units, so the preview is the size that ships.
+Delete it freely -- it is in `.gitignore` and the next verifier run puts it
+back.
+
+## The folder map
+
+`src/` is the application, and each of its folders documents itself:
+
+| Folder | What it is |
+|---|---|
+| [`src/api/`](./src/api/README.md) | the wire: types mirrored from the frozen contracts, the client, and the credential scrub |
+| [`src/check/`](./src/check/README.md) | `load()` and `report()`, the two chores every verifier used to hand-roll, and where the Chromium is |
+| [`src/components/`](./src/components/README.md) | the primitives every screen is built from -- `Readout`, `Lamp`, `Verbatim`, `SegmentBar`/`ProportionBar` out of `Bars.tsx`, `Section`/`Disclosure` out of `Panel.tsx` |
+| [`src/inspectors/`](./src/inspectors/README.md) | the two detail surfaces: a deployment, and a machine |
+| [`src/shell/`](./src/shell/README.md) | header, app shell, the one sheet, and the verifier that opens the real screens |
+| [`src/sidebar/`](./src/sidebar/README.md) | roster, plan, routing, activity, cost |
+| [`src/state/`](./src/state/README.md) | polled resources, the 1 Hz metrics stream, the URL scheme, and selection |
+| [`src/styles/`](./src/styles/README.md) | the token layer, the reset, and the ported structural chrome |
+| [`src/tabs/`](./src/tabs/README.md) | one folder per destination, plus the screen component that composes it |
+
+Four files sit loose in `src/`, under no folder of their own, and
+[`src/README.md`](./src/README.md) is where they are documented: `main.tsx`,
+which is the font and stylesheet imports plus the provider order and nothing
+else (`RouterProvider` outermost, because the URL decides what mounts);
+`format.ts`, whose `fmt` returns an em dash for a missing reading and never a
+zero; `theme.ts`, which stores `derate.theme` in `localStorage` and applies dark
+as a `data-theme` swap that touches no component; and `vite-env.d.ts`, one
+reference line.
+
+The rest of the top level is generated or installed, and none of it is in git:
+`dist/` (the bundle, and the deployment), `screens/` (the PNGs plus
+`console.txt`), `layout-preview.svg` (written by
+`src/tabs/cluster/layout.check.mjs`), `node_modules/`, and the
+`.history-check-*/` scratch directories.
+
+## The mockups are tracked, and nothing imports them
+
+`mockups/` (`derate.html`, 1407 lines, and `first-run.html`, 604) and
+`mockups-next/` (`derate.html` plus ten scripts and two stylesheets) are 25
+tracked files that are never built, never bundled and never served. They are the
+design reference: `src/styles/derate.css` calls `mockups-next/styles/derate.css`
+"the design source of truth -- read it for what any of this looks like
+assembled".
+
+**Fourteen source files carry a `Ported from mockups-next/...` header**, naming
+the mockup function they came from *and* what did not survive the port. That
+second half is the part worth copying when you add one:
+`sidebar/PlanSection.tsx` records that the mockup's `#whyBox` was hand-written
+markup keyed on a fixture's shape, and that the real deployment carries
+`plan.reason` and `plan.rejected` instead, so the markup was dropped rather than
+translated. Twenty-two source files name a mockup path somewhere, so eight
+cite one in a comment without carrying the ported-from header.
+
+Both trees vendor their own woff2 copies of IBM Plex under `fonts/`, and the
+HTML says why in a comment at the top: the gateway binds to the LAN, so a Google
+Fonts `<link>` cannot resolve on a LAN-only or air-gapped box -- it blocks first
+paint until it times out, then falls back to a system stack and loses the
+tabular figures this whole instrument panel depends on. `mockups-next/js/` is
+classic scripts and deliberately not ES modules, because every generated
+`onclick=` in it resolves against global scope.
+
+## The seam with the coordinator
+
+`dist/` is the only artefact this folder ships. `control_plane/gateway/app.py`
+mounts it last, at `/`, from `settings.ui_dir` (`DERATE_UI_DIR`) -- last because
+Starlette matches in registration order and a mount at `/` shadows every router
+registered below it. The mount reads the directory per request, so a rebuild
+into `dist/` is live on a running coordinator with no restart; equal hashes
+between `dist/index.html` and what `GET /` actually serves is the only proof
+that it landed.
+
+In the image, stage 1 of the repo-root `Dockerfile` runs `npm ci && npm run
+build`, copies `dist/` to `/opt/derate/ui/dist`, and the runtime stage sets
+`DERATE_UI_DIR=/opt/derate/ui/dist`. `SKIP_UI=1` swaps in a two-line placeholder
+`index.html` instead; a release build never sets it, because a UI that does not
+compile should fail the image.
+
+```bash
+DERATE_GATEWAY=http://localhost:8088 npm run dev     # dev: proxy to a real coordinator
+npx vite build && curl -s localhost:8088/ | grep -o 'assets/index-[^"]*\.js'   # deployed: same hash or it did not land
+```
+
+## More things that look like details and are not
+
+**`npx vite build` bundles without typechecking, and that is a feature in a
+shared checkout.** `npm run build` is `tsc -b && vite build`, so it fails on a
+peer's in-flight type error in a file you never touched. Running the bundler
+alone tells you whether the breakage is yours. It is not a substitute for the
+gate -- it emits a `dist/` from code `tsc -b` would refuse.
+
+**A verifier declares one requirement, and `screens.check.mjs` needs three.**
+The `// requires:` grammar is one word plus an optional argument, and the
+argument is only read by `fixtures`. `// requires: browser coordinator` at the
+top of `src/shell/screens.check.mjs` therefore probes the browser and caches the
+answer under the key `browser:coordinator`; the coordinator half is never
+probed, and the python3 it shells out to for the server's own `Redactor` is not
+declared at all. On a machine with a browser and no gateway that verifier fails
+from its own `fetch` rather than skipping.
+
+**The `screens/` PNGs are the only thing here that sees what shipped.** Every
+other verifier checks a pure function -- the URL scheme, the graph layout, the
+quantization ladder, the QR encoder -- which is the right shape for most of what
+goes wrong and leaves the whole render untouched. `screens.check.mjs` enumerates
+`DESTINATIONS` out of `state/routes.ts` rather than listing paths, and
+`DESTINATIONS` is itself `Object.keys(SEGMENT)` rather than a list written
+beside it. The header this replaced already claimed "one per destination in
+state/routes.ts" while walking a literal array, and `/speech` was invisible to
+the only verifier that opens a browser for as long as that was true. Seven
+destinations today, and the stale `speech.png` is still sitting in `screens/`.
+
+**Off-site failures are recorded and deliberately not gated.** The screens
+transcript lands in `screens/console.txt`, one line per destination with the
+`#root` height, the console error count and the non-2xx asset count. Publisher
+avatars come from huggingface.co and 429 in bulk; failing the gate on somebody
+else's rate limit would make the run's colour a fact about the network.
+
+**`.history-check-*/` is in the ui root on purpose, not in `/tmp`.**
+`src/state/history.check.mjs` bundles `history.ts`, which reaches React through
+`state/backend`, and a bundle in `/tmp` has no `node_modules` above it to
+resolve that from. The directory is `mkdtemp`ed and removed by the last line of
+the file, so every one still on disk is a run that was killed or that threw --
+there were eleven when this was written.
+
+## Failure behaviour
+
+- **No coordinator on `$DERATE_CHECK_ORIGIN`.** Six verifiers skip, each named
+  with `no coordinator on <origin>`; `--strict` makes each a failure. The
+  screens verifier is the exception above and fails instead.
+- **No Chromium in the Playwright cache.** `findBrowser()` returns the reason
+  and nothing is downloaded -- a gate that reaches for the network to decide
+  whether it can run fails for reasons that have nothing to do with the code.
+- **`$HISTORY_FIXTURES` unset.** One skip. Run on its own, that verifier prints
+  the four `curl` lines that capture the payloads.
+- **No `python3`.** `api/contracts.check.mjs` and
+  `tabs/settings/keyfield.check.mjs` skip; both compute their expectations by
+  running the server's own Python, so there is nothing to fall back to.
+- **A filter matching nothing.** Exit 1 and `no verifier matches <args>`, never
+  a green run over an empty set.
+- **Discovery and accounting disagree.** `refusing to report a result`, exit 1.
+- **`dist/` absent when the coordinator starts.** One warning,
+  `DERATE_UI_DIR=... does not exist; not serving the UI`, and the API stays up.
+  The UI is optional to the gateway; every test and the day-0 stub run with no
+  UI directory at all.
+
+## Four things this folder deliberately does not have
+
+**A test runner.** No vitest, no jest, no jsdom. The `*.check.mjs` files are the
+suite and each exists because a specific class of bug is invisible to types;
+`check.mjs` runs them and `src/check/harness.mjs` is the prelude a new one
+starts from. Add to them rather than trusting a green `tsc`.
+
+**A browser download step.** `playwright-core` over `playwright`, an explicit
+`executablePath`, and use-what-is-here.
+
+**A CDN, for anything.** Fonts are vendored through `@fontsource` in the app and
+as woff2 files in both mockup trees, for the reason the mockup comment gives.
+
+**A second data path for "no cluster".** `src/api/fixtures.ts` and
+`VITE_API_MODE` went with the derate port and are argued about under **Running
+before there is a cluster** above; the dev proxy pointed at a real coordinator
+is what replaced them.

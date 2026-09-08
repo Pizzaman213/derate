@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/derate-banner-dark.svg">
-    <img src="docs/brand/derate-banner.svg" width="100%" alt="derate — I want it to be simple to run multiple models on your own machine, without recoding the API.">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/brand/derate-banner-dark.svg">
+    <img src="docs/screenshots/brand/derate-banner.svg" width="100%" alt="derate — I want it to be simple to run multiple models on your own machine, without recoding the API.">
   </picture>
 </p>
 
@@ -9,11 +9,15 @@ I started this while bringing up an agent swarm for Jarvis, my self-hosted codin
 
 Planning and orchestration for DGX Spark clusters, for any model you want to run. It measures how fast your machines actually talk to each other, works out from that how to split a model across them, refuses launches that would run out of memory, and puts every model behind a single endpoint.
 
-## The demo
+## How it works
 
-Two machines, two `curl` lines — **Install** below is both of them. The second joins the first and appears as a member. Launch a model that will not fit on one. The plan panel says pipeline parallel, names the measured 10.2 GB/s link as the reason, and lists tensor parallel as rejected.
-
-That is the sixty seconds: it measures the link, disagrees with the vendor playbook, and shows the arithmetic it disagreed on.
+derate does not run inference. vLLM and SGLang do that, and NVIDIA's `sparkrun`
+sets up the fabric and launches the processes. derate measures the interconnect,
+resolves the model to a shape, plans the parallelism from the two, refuses
+launches that will not fit — naming the term that blew the budget and the change
+that would work — and fronts the result behind one endpoint. Every one of those
+is decided from a measurement rather than a default. `00-architecture.md` has
+the reasoning; `docs/CONTRACTS.md` has the numbers.
 
 ## Screenshots
 
@@ -33,16 +37,6 @@ That is the sixty seconds: it measures the link, disagrees with the vendor playb
 </table>
 
 More: [`models`](docs/screenshots/models.png) (fit verdicts against every model on the hub), [`settings`](docs/screenshots/settings.png) (coordinator, cluster, and node config).
-
-## How it works
-
-derate does not run inference. vLLM and SGLang do that, and NVIDIA's `sparkrun`
-sets up the fabric and launches the processes. derate measures the interconnect,
-resolves the model to a shape, plans the parallelism from the two, refuses
-launches that will not fit — naming the term that blew the budget and the change
-that would work — and fronts the result behind one endpoint. Every one of those
-is decided from a measurement rather than a default. `00-architecture.md` has
-the reasoning; `docs/CONTRACTS.md` has the numbers.
 
 ## Install
 
