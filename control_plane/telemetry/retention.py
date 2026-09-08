@@ -43,6 +43,12 @@ REROLL_WINDOW_S = 900.0
 #: a month of rows in memory.
 CHUNK_S = 86400.0
 
+#: Days one size-enforcement pass will evict before leaving the rest to the
+#: next compaction. A backstop, not a policy: the raw horizons are 7 and 30
+#: days, so a real eviction never comes close. It exists because the journal's
+#: version of the same loop, trusting only its file measure, ran forever.
+MAX_EVICT_DAYS = 400
+
 _SAMPLE_ROLL_1M = """
 INSERT OR REPLACE INTO rollup_samples(
   step, node_id, bucket, n,
@@ -100,14 +106,38 @@ def compact(archive: Archive, now: float | None = None) -> dict[str, Any]:
     # slowing each down.
     with archive.lock:
         conn = archive.conn
+        _ensure_incremental_vacuum(conn, archive.path)
         if roll_to > roll_from:
             report["rolled_1m"] = _roll(conn, archive, roll_from, roll_to, STEP_1M)
             report["rolled_1h"] = _roll(conn, archive, roll_from, roll_to, STEP_1H)
 
         report["deleted"] = _expire(conn, now)
         report["size_trimmed"] = _enforce_size(archive, now)
-        conn.execute("PRAGMA incremental_vacuum")
+        conn.execute("PRAGMA incremental_vacuum").fetchall()
     return report
+
+
+def _ensure_incremental_vacuum(conn, path) -> None:
+    """Convert an archive written before archive.py::connect had its pragmas
+    in the right order. Once, on the first compaction rather than at open.
+
+    Here and not in ``Archive.__init__`` because of what it costs: measured,
+    a 238 MB archive VACUUMs in 0.72s, which extrapolates to roughly 48
+    seconds at ``ARCHIVE_MAX_BYTES``. The archive is opened inside
+    ``start_node``, before the gateway answers anything, and a coordinator
+    that takes a silent minute to boot is a worse bug than the one being
+    fixed. Compaction already runs on a worker thread under this lock.
+
+    Never raises: this is the tidy-up, not the work.
+    """
+    try:
+        if conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+            return
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        conn.execute("VACUUM")  # cannot run inside a transaction
+        log.info("telemetry archive at %s converted to incremental auto-vacuum", path)
+    except Exception as exc:
+        log.warning("could not convert %s to incremental auto-vacuum: %s", path, exc)
 
 
 # -- rollups -----------------------------------------------------------------
@@ -247,6 +277,12 @@ def _expire(conn, now: float) -> dict[str, int]:
         ("requests", "ts", config.REQUESTS_RAW_RETENTION_S * scale),
         ("events", "ts", config.EVENTS_RETENTION_S * scale),
         ("logs", "ts", config.LOGS_RETENTION_S * scale),
+        # `gaps` had no horizon at all -- the one table that grew forever.
+        # It is not a detail: _envelope() returns every gap overlapping a
+        # window on *every* history query, so an accumulation of them is
+        # payload on every poll of every screen. Aged out with `events`,
+        # whose window it is describing holes in.
+        ("gaps", "to_ts", config.EVENTS_RETENTION_S * scale),
     )
     deleted: dict[str, int] = {}
     for table, column, window in horizons:
@@ -254,6 +290,14 @@ def _expire(conn, now: float) -> dict[str, int]:
         n = conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,)).rowcount
         if n:
             deleted[table] = n
+    # Zero-width gaps, which are not a fact about anything. The journal used
+    # to emit one per evicted batch and, once its table was empty, one per lap
+    # around a loop re-discarding its own marker -- 772 of the 773 rows in the
+    # live archive. The journal no longer writes them; this clears what it
+    # already wrote, and the row renders as "0 min missing" until it goes.
+    n = conn.execute("DELETE FROM gaps WHERE to_ts <= from_ts").rowcount
+    if n:
+        deleted["gaps_degenerate"] = n
     # Rollup horizons are deliberately not scaled. They cost almost nothing,
     # and someone shortening the raw window to save disk wants a shorter raw
     # window, not a shorter memory.
@@ -279,12 +323,15 @@ def _enforce_size(archive: Archive, now: float) -> int:
     """
     conn = archive.conn
     dropped = 0
-    while _file_bytes(conn) > config.ARCHIVE_MAX_BYTES:
+    for _ in range(MAX_EVICT_DAYS):
+        if _file_bytes(conn) <= config.ARCHIVE_MAX_BYTES:
+            break
         row = conn.execute("SELECT MIN(ts) AS t FROM samples").fetchone()
         oldest = row["t"] if row else None
         if oldest is None:
             return dropped
         stop = _floor(oldest, int(config.DAY_S)) + config.DAY_S
+        before = dropped
         conn.execute("BEGIN IMMEDIATE")
         try:
             for table in ("samples", "requests", "logs"):
@@ -299,7 +346,13 @@ def _enforce_size(archive: Archive, now: float) -> int:
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        conn.execute("PRAGMA incremental_vacuum")
+        conn.execute("PRAGMA incremental_vacuum").fetchall()
+        if dropped == before:
+            # That day held no raw rows, so evicting the next one will not
+            # shrink the file either. Stop on progress rather than on the
+            # file measure -- the journal's version of this loop spun forever
+            # because it trusted the measure alone.
+            break
         log.warning(
             "telemetry archive hit its size cap; dropped raw rows before %.0f "
             "(rollups kept)",

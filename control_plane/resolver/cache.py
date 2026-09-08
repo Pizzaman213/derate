@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from control_plane.contracts import ModelShape
+from control_plane.paths import data_dir
 
 from .types import (
     ParamSource,
@@ -39,7 +40,15 @@ from .types import (
 #: Bump when the serialized form or the arithmetic behind it changes, so stale
 #: entries are ignored rather than deserialized into a shape that means
 #: something different now.
-SCHEMA_VERSION = 3
+#:
+#: 4 is such a change without a field moving. A cached resolution stores facts
+#: about the model AND this build's opinions about it -- the support verdict
+#: per runtime, and the warning lines derived from it -- so a build that adds a
+#: runtime reads yesterday's answer and reports that nothing can load a model
+#: it now serves. The entries would have expired on their own within the TTL;
+#: this makes it immediate, which matters because the stale reading is
+#: `launchable: false` on exactly the models the new runtime exists for.
+SCHEMA_VERSION = 4
 
 DEFAULT_TTL_SECONDS = float(os.environ.get("DERATE_RESOLVER_TTL", 24 * 3600))
 
@@ -54,14 +63,26 @@ def _is_pinned_commit(revision: str) -> bool:
 
 
 def default_cache_dir() -> Path:
-    """``/data`` in the container, the user cache otherwise."""
+    """Under the data root, unless ``DERATE_CACHE_DIR`` names somewhere else.
+
+    This used to answer the question itself: check ``/data``, fall back to
+    ``~/.cache/derate``. ``control_plane/paths.py`` is that logic generalised --
+    its docstring says so, naming this function as where it came from -- but
+    this one was never moved onto it, so the two disagreed. With no override
+    and no writable ``/data``, the estate went to the platform's
+    application-state directory and the resolver's cache stayed in
+    ``~/.cache``: an operator who set ``DERATE_DATA_DIR`` to move everything
+    found this left behind, reachable only through a differently-named
+    variable.
+
+    ``DERATE_CACHE_DIR`` still wins, and still means what it always did -- a
+    cache is the one part of the estate somebody has a real reason to put on a
+    different disk from the rest.
+    """
     override = os.environ.get("DERATE_CACHE_DIR")
     if override:
         return Path(override).expanduser() / "resolver"
-    data = Path("/data")
-    if data.is_dir() and os.access(data, os.W_OK):
-        return data / "cache" / "resolver"
-    return Path.home() / ".cache" / "derate" / "resolver"
+    return data_dir() / "cache" / "resolver"
 
 
 def cache_key(model_id: str, revision: str, dtype: str | None) -> str:
@@ -79,7 +100,12 @@ def to_dict(res: Resolution) -> dict[str, Any]:
         "support": {
             "architectures": list(res.support.architectures),
             "runtimes": [
-                {"runtime": r.runtime, "level": r.level.value, "reason": r.reason}
+                {
+                    "runtime": r.runtime,
+                    "level": r.level.value,
+                    "reason": r.reason,
+                    "version": r.version,
+                }
                 for r in res.support.runtimes
             ],
             "quant": asdict(res.support.quant),
@@ -105,7 +131,10 @@ def from_dict(data: dict[str, Any]) -> Resolution:
             architectures=tuple(support.get("architectures", ())),
             runtimes=tuple(
                 RuntimeSupport(
-                    runtime=r["runtime"], level=SupportLevel(r["level"]), reason=r["reason"]
+                    runtime=r["runtime"],
+                    level=SupportLevel(r["level"]),
+                    reason=r["reason"],
+                    version=r.get("version"),
                 )
                 for r in support.get("runtimes", [])
             ),

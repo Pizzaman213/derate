@@ -129,7 +129,13 @@ class Router:
     def rebuild(self, *, force_scores: bool = False) -> TargetIndex:
         now = time.monotonic()
         deployments = self._safe(self._deployments.list, [])
-        providers = self._safe(self._providers.list, [])
+        # `servable` carries only the models the operator switched on, so the
+        # allowlist lands in the target index -- and therefore in /v1/models,
+        # routing, /api/topology and the chat picker -- at one seam rather than
+        # being re-applied at each. Duck-typed like every other optional port
+        # operation here: a port without it serves its whole catalogue, which
+        # is what every port did before the allowlist existed.
+        providers = self._safe(getattr(self._providers, "servable", self._providers.list), [])
         nodes = self._safe(self._registry.list_nodes, [])
 
         index = build_index(

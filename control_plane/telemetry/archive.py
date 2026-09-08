@@ -215,10 +215,16 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(
         str(path), timeout=30.0, isolation_level=None, check_same_thread=False
     )
+    # BEFORE journal_mode, which fixes the page size and makes a later
+    # auto_vacuum change a no-op that reports no error. See the same note in
+    # journal.py::_connect, where getting this order wrong evicted the whole
+    # journal on every trim. An existing archive is converted by
+    # retention.py, not here: a VACUUM at the 16 GiB ceiling is ~48s and this
+    # runs inside start_node, before the gateway answers anything.
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -240,10 +246,27 @@ class Archive:
         )
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:  # pragma: no cover
-            pass
+        """Close the connection, but not out from under a writer.
+
+        Every other path through this class takes :attr:`lock` before touching
+        :attr:`conn`; this one did not, and the gap is a segfault rather than
+        an exception. `ingest` runs its whole transaction inside the lock on a
+        telemetry pool thread, and `TelemetryService.stop` calls this from the
+        gateway lifespan -- so shutting down while a poll was mid-INSERT freed
+        the sqlite3 connection under the C extension still executing on it.
+        That crashed the test suite intermittently, from
+        `app.py::lifespan` -> `service.py::stop` -> here, with a worker parked
+        in `ingest`.
+
+        Closing a connection a blocked writer already captured is safe on its
+        own: sqlite3 raises ProgrammingError on a closed handle. It is closing
+        it *during* a statement that is not.
+        """
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:  # pragma: no cover
+                pass
 
     @property
     def conn(self) -> sqlite3.Connection:

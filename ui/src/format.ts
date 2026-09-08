@@ -47,16 +47,63 @@ export function shortGpu(name: string): string {
   return name.replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '')
 }
 
+/** What to call a machine that has no GPU name to show.
+ *
+ *  Every surface that prints hardware does `shortGpu(gpu_name) || device_class`
+ *  and so printed the wire value raw — which meant a Raspberry Pi's row read
+ *  "unknown", the same word the roster used for a DGX Spark whose container
+ *  was started without `--gpus`. The probe now tells those two apart
+ *  (`DeviceClass.CPU` vs `UNKNOWN`), and this is where that distinction has to
+ *  survive into the sentence the operator actually reads: "CPU only" is a
+ *  description of the machine, "unidentified" is an admission about the probe.
+ *
+ *  An unrecognised value passes through as itself rather than becoming
+ *  "unidentified": a class this build predates is not the same as one the
+ *  coordinator could not read, and inventing the stronger claim would hide a
+ *  version skew behind a hardware fault. */
+export function deviceClassLabel(cls: string | undefined): string {
+  switch (cls) {
+    case 'gb10':
+      return 'GB10'
+    case 'discrete':
+      return 'discrete GPU'
+    case 'apple':
+      return 'Apple silicon'
+    case 'cpu':
+      return 'CPU only'
+    case 'unknown':
+      return 'unidentified'
+    default:
+      return cls ?? ''
+  }
+}
+
+/** The plan caption, spelled exactly as the server spells it.
+ *
+ *  A port of `control_plane/gateway/internal_api.py::_plan_label`, and it had
+ *  drifted twice over: it never read `data_parallel`, and it joined with ' · '
+ *  where the server joins with ' + '. The cluster floor plates render the
+ *  server's own string (TopologyDeployment.plan) while every other screen
+ *  rendered this one, so one deployment with DP > 1 read as two different
+ *  plans depending which screen you were on -- against a project rule that
+ *  planner strings are the product and are rendered verbatim.
+ *
+ *  `ui/src/api/contracts.check.mjs` runs the Python over a matrix of degrees
+ *  and diffs it against this function, so the port cannot drift again in
+ *  silence. Prefer a caption the server sent; this is for the call sites that
+ *  hold degrees and no string. */
 export function planShortFromDegrees(p: {
   tensor_parallel: number
   pipeline_parallel: number
   expert_parallel: number
+  data_parallel?: number
 }): string {
   const parts: string[] = []
   if (p.tensor_parallel > 1) parts.push(`TP ${p.tensor_parallel}`)
   if (p.pipeline_parallel > 1) parts.push(`PP ${p.pipeline_parallel}`)
   if (p.expert_parallel > 1) parts.push(`EP ${p.expert_parallel}`)
-  return parts.length ? parts.join(' · ') : 'single node'
+  if ((p.data_parallel ?? 1) > 1) parts.push(`DP ${p.data_parallel}`)
+  return parts.length ? parts.join(' + ') : 'single node'
 }
 
 export function relativeTime(unixSeconds: number, now = Date.now() / 1000): string {
@@ -64,6 +111,26 @@ export function relativeTime(unixSeconds: number, now = Date.now() / 1000): stri
   if (d < 60) return `${d}s ago`
   if (d < 3600) return `${Math.round(d / 60)}m ago`
   return `${Math.round(d / 3600)}h ago`
+}
+
+/** A remaining time that something else measured, worded for a caption.
+ *
+ *  Deliberately vague at the top end and honest at the bottom: the estimates
+ *  this renders come from tqdm, which extrapolates from throughput so far, so
+ *  "3m 47s" would be spurious precision on a number that moves every second.
+ *  Rounded to minutes above a minute, and "under a minute" below one rather
+ *  than a countdown of seconds that will be wrong before it is read.
+ *
+ *  null in, null out: no estimate is not an estimate of zero, and every caller
+ *  is expected to say nothing rather than say "0s left". */
+export function remainingLabel(seconds: number | null | undefined): string | null {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return null
+  if (seconds < 60) return 'under a minute left'
+  const mins = Math.round(seconds / 60)
+  if (mins < 60) return `about ${mins} min left`
+  const hours = Math.floor(mins / 60)
+  const rest = mins % 60
+  return rest === 0 ? `about ${hours} h left` : `about ${hours} h ${rest} min left`
 }
 
 /** A byte count at a scale that shows it.

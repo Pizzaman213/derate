@@ -3,7 +3,7 @@ import type { QuantTable } from '../../api/types'
 import { Lamp } from '../../components/Lamp'
 import { sizeLabel } from '../../format'
 import { dominantColor } from './dominant'
-import { avatarUrl, hashString, isFirstParty, ownerAccent, ownerInitials } from './owner'
+import { avatarUrl, isFirstParty, ownerAccent, ownerInitials } from './owner'
 import type { ModelRow } from './rows'
 import { classifySupport } from './support'
 
@@ -28,11 +28,13 @@ import { classifySupport } from './support'
 export function ModelCard({
   row,
   table,
+  canPull = false,
   onOpen,
   current,
 }: {
   row: ModelRow
   table: QuantTable | null
+  canPull?: boolean
   onOpen: (row: ModelRow) => void
   current?: boolean
 }) {
@@ -43,7 +45,10 @@ export function ModelCard({
   const owner = slash > 0 ? row.model_id.slice(0, slash) : ''
   const repo = slash > 0 ? row.model_id.slice(slash + 1) : row.model_id
 
-  const support = useMemo(() => classifySupport(row, table), [row, table])
+  const support = useMemo(
+    () => classifySupport(row, table, canPull),
+    [row, table, canPull],
+  )
   const url = avatarUrl(owner)
   const dominant = dominantColor(url)
   const accent = dominant ?? ownerAccent(owner)
@@ -72,12 +77,6 @@ export function ModelCard({
       : null,
   ].filter(Boolean) as { key: string; signal: 'live' | 'warn' | 'fault'; label: string }[]
 
-  // A deterministic aura position per card, so a grid does not look stamped
-  // from one template but also never moves between renders.
-  const h = hashString(row.model_id)
-  const glowX = 12 + (h % 76)
-  const glowY = 6 + ((h >>> 8) % 44)
-
   const size =
     row.total_params != null
       ? `${(row.total_params / 1e9).toFixed(row.total_params >= 1e11 ? 0 : 1)}B`
@@ -98,21 +97,19 @@ export function ModelCard({
       aria-label={description}
       title={dots.length ? dots.map((d) => d.label).join('\n\n') : undefined}
       onClick={() => onOpen(row)}
-      style={
-        {
-          '--accent': accent,
-          '--glow-x': `${glowX}%`,
-          '--glow-y': `${glowY}%`,
-        } as React.CSSProperties
-      }
+      style={{ '--accent': accent } as React.CSSProperties}
     >
       <span className="mcard-top">
-        <span className="mcard-avatar" style={{ background: accent }}>
-          {url ? (
-            <img src={url} alt="" loading="lazy" decoding="async" />
-          ) : (
-            <span className="mcard-initials">{ownerInitials(owner || repo)}</span>
-          )}
+        {/* The wrapper is what the aura hangs off: the avatar itself clips, and
+            the glow has to bleed past it. See `.mcard-mark` in derate.css. */}
+        <span className="mcard-mark">
+          <span className="mcard-avatar" style={{ background: accent }}>
+            {url ? (
+              <img src={url} alt="" loading="lazy" decoding="async" />
+            ) : (
+              <span className="mcard-initials">{ownerInitials(owner || repo)}</span>
+            )}
+          </span>
         </span>
 
         <span className="mcard-id">

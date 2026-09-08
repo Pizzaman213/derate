@@ -9,8 +9,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# The only thing a key ever renders as.
-REDACTED = "***"
+from control_plane.paths import data_dir as _data_dir
+
+# The only thing a key ever renders as. Defined in control_plane/redaction.py
+# with the scrubber that writes it, and re-exported here because this is where
+# the provider subsystem has always looked for it.
+from control_plane.redaction import REDACTED  # noqa: F401
 
 PROVIDERS_FILE = "providers.json"
 SECRETS_FILE = "secrets.json"
@@ -60,8 +64,13 @@ COST_BLEND_OUTPUT_WEIGHT = 0.75
 
 
 def data_dir() -> Path:
-    """Where persistent state lives. ``/data`` in the container."""
-    return Path(os.environ.get("DERATE_DATA_DIR", "/data"))
+    """Where persistent state lives. ``/data`` in the container.
+
+    Delegates so that a native install on macOS or Windows, which has no
+    writable ``/data``, still lands somewhere the secrets file survives a
+    restart. See ``control_plane/paths.py``.
+    """
+    return _data_dir()
 
 
 #: Fraction of a machine's free memory a pulled model's weights may occupy.

@@ -22,15 +22,15 @@ a confirm dialog, rather than a missing one on a stray holding the whole pool.
 
 from __future__ import annotations
 
-from control_plane.contracts import DeploymentState
 from control_plane.procmatch import matches_deployment
+
+from . import states
 
 # Terminal deployments no longer own anything. A process still running under a
 # STOPPED record is exactly the orphan this feature exists to clear, so it must
-# come back killable.
-_LIVE_STATES = frozenset(
-    s for s in DeploymentState if s not in (DeploymentState.STOPPED, DeploymentState.FAILED)
-)
+# come back killable. The complement is formed in ``states`` rather than here,
+# so this module and the router cannot disagree about which states are over.
+_LIVE_STATES = states.LIVE
 
 
 def attribute(

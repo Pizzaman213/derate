@@ -9,6 +9,21 @@ import type { SafeMetricsFrame } from './useMetrics'
 /** Presentation thresholds for the warn lamp. Pressure, not failure: the node
  *  is serving, and it is close to a limit somebody should know about. */
 export const HOT_C = 80
+
+/** Fallback only, and on a different metric than the server's.
+ *
+ *  `/api/memory` already computes the answer -- `memory_severity`, from
+ *  `memory_warn_pct` (90) and `memory_critical_pct` (95) measured against
+ *  `memory_pressure_pct`, which is the only figure that accounts for both the
+ *  foreign load on a unified-memory node and the host reserve. capacity_api.py
+ *  says in as many words that pressure is "the one to colour on".
+ *
+ *  This number is not that. It is a raw `memory_used_pct` threshold invented
+ *  here, and it lit the lamp at a level nothing else in the app agreed with.
+ *  It survives because a caller without the memory report in scope still needs
+ *  an answer -- pass `severity` and this is not consulted at all. Do not tune
+ *  it to match 90: the metrics are different, so the numbers should not be
+ *  equal, and pretending otherwise would hide the remaining gap. */
 export const MEMORY_PRESSURE_PCT = 92
 
 /** How old a node's own telemetry sample may get before its live readings stop
@@ -99,10 +114,18 @@ export function nodeLive(
 export function nodeSignal(
   node: NodeStateDTO,
   live: NodeLive,
+  /** This node's `memory_severity` from `/api/memory`, when the caller has it.
+   *  The server computed it from the pressure figure and its own thresholds,
+   *  so it is the answer; `undefined` means nobody asked, and only then does
+   *  the local fallback above get a say. `null` is a node the report covers
+   *  but could not measure, which is not a warning either. */
+  severity?: 'ok' | 'warning' | 'critical' | null,
 ): 'live' | 'warn' | 'fault' {
   if (node.state === 'unreachable' || !node.healthy) return 'fault'
   if ((live.temp_c ?? 0) >= HOT_C) return 'warn'
-  if ((live.memory_used_pct ?? 0) >= MEMORY_PRESSURE_PCT) return 'warn'
+  if (severity !== undefined) {
+    if (severity === 'warning' || severity === 'critical') return 'warn'
+  } else if ((live.memory_used_pct ?? 0) >= MEMORY_PRESSURE_PCT) return 'warn'
   if (node.state === 'degraded') return 'warn'
   return 'live'
 }

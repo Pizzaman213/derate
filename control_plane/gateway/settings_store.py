@@ -1,6 +1,6 @@
 """Persistence for the handful of settings a human may change at runtime.
 
-`GatewaySettings` has 41 fields. Exactly three of them are things an operator
+`GatewaySettings` has 42 fields. Exactly four of them are things an operator
 sets and expects to survive a restart; the rest are code-level tunables whose
 values are a decision, not a preference. So this persists an explicit allowlist
 rather than the dataclass: persisting all of them would let a stale file on disk
@@ -15,8 +15,10 @@ inert -- a control that looks wired and is not, which is the exact failure mode
 audit finding H-8 is about.
 
 Write is atomic and 0600, mirroring `providers/store.py`: same mkstemp in the
-target directory, same fchmod before any content, same os.replace. A crash
-between the two leaves the old file intact, never a half-written one.
+target directory, same hardening before any content, same os.replace. A crash
+between the two leaves the old file intact, never a half-written one. The mode
+goes through `control_plane/fsutil.py`, which is where the platforms that
+cannot enforce one say so rather than pretending.
 """
 
 from __future__ import annotations
@@ -29,6 +31,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from control_plane.paths import data_dir as _data_dir
+
+from control_plane import fsutil
+
 log = logging.getLogger("gateway.settings_store")
 
 #: Bumped when the on-disk shape changes. Present from the first version,
@@ -39,6 +45,7 @@ SettingKey = Literal[
     "electricity_rate_usd_per_kwh",
     "local_only",
     "daily_spend_cap_usd",
+    "auto_restart_crashed_deployments",
 ]
 
 #: The allowlist. A key not named here cannot reach the file, whatever a caller
@@ -47,6 +54,7 @@ MUTABLE_FIELDS: tuple[SettingKey, ...] = (
     "electricity_rate_usd_per_kwh",
     "local_only",
     "daily_spend_cap_usd",
+    "auto_restart_crashed_deployments",
 )
 
 Source = Literal["file", "env", "default"]
@@ -70,8 +78,8 @@ class Resolved:
 
 
 def data_dir() -> Path:
-    """Where the volume is mounted. Same env var the providers store reads."""
-    return Path(os.environ.get("DERATE_DATA_DIR", "/data"))
+    """Where the volume is mounted. Same resolver every component reads."""
+    return _data_dir()
 
 
 def settings_path(root: Path | None = None) -> Path:
@@ -81,7 +89,7 @@ def settings_path(root: Path | None = None) -> Path:
 def _coerce(key: str, value: Any) -> Any:
     """Validate one field. Raises SettingsError with a reason, never silently
     coerces a nonsense value into a plausible one."""
-    if key == "local_only":
+    if key in ("local_only", "auto_restart_crashed_deployments"):
         if not isinstance(value, bool):
             raise SettingsError(f"{key} must be true or false, got {type(value).__name__}")
         return value
@@ -169,7 +177,7 @@ class SettingsStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".settings-")
         try:
-            os.fchmod(fd, 0o600)
+            fsutil.harden_fd(fd, self.path)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
             os.replace(tmp, self.path)

@@ -59,6 +59,47 @@
      and the least salient mark on the drawing was the wrong call. */
   --flow: #4A6FA5;
 
+  /* The return leg: output tokens leaving. `--flow` is spent on "a request in
+     flight" and must stay spent on it, so these are their own pair -- both
+     clear of the three signal hues, so a token block can never be read as a
+     verdict. Streamed and buffered differ by hue AND by block width, so the
+     distinction survives a greyscale screenshot. Filled marks, not text, so
+     the bar is SC 1.4.11's 3:1 rather than 4.5:1; measured against --panel
+     these are 4.04:1 and 4.18:1 light, 8.65:1 and 7.31:1 dark, which puts
+     them beside --flow's own 4.22:1 rather than under it. */
+  --stream: #377A86;
+  --batch: #7A62A9;
+
+  /* Identity, not status. `--tag-*` colours a chat turn by WHICH MODEL it went
+     to, in a tab where the model changes between turns -- see
+     tabs/chat/tags.ts, which owns the assignment and the reasoning. Four hues,
+     each also used dashed, for eight identities; a ninth model is drawn
+     plainly rather than repeating a hue, because a wrong mark says "the same
+     model" and an absent one says "read the name".
+
+     THE ORDER IS THE USE ORDER, NOT THE SPECTRUM. A first draft ran
+     blue-teal-violet-magenta, which is how a ramp is normally written and put
+     the two closest hues on the two commonest slots: a two-model transcript
+     came out blue against teal, 29 degrees apart, and the screenshot of it is
+     the reason this paragraph exists -- the rule was correct, both models were
+     coloured, and no one could tell at a glance, which is the entire feature.
+     So the ramp is ordered blue, magenta, teal, violet: the two-model case is
+     the 100-degree pair and the worst pair anywhere is 43. Reordering these
+     lines re-pairs them, so do not tidy them into spectrum order.
+
+     Deliberately clear of --live/--warn/--fault -- nothing is within 42
+     degrees of a status hue, because a model's identity must never be readable
+     as a verdict on it. Distinct from --flow/--stream/--batch as tokens too:
+     those mean something about a request, these mean nothing but "the same one
+     as that block". They are the label TEXT as well as the rule, so the bar is
+     SC 1.4.3's 4.5:1 and not 3:1 -- 5.28 to 5.81:1 light, 7.20 to 8.67:1 dark,
+     which also leaves room under them for the 6% tint the block carries. All
+     four numbers are asserted by tabs/chat/tags.check.mjs. */
+  --tag-1: #3A51B0;
+  --tag-2: #9C2E70;
+  --tag-3: #0B6A6A;
+  --tag-4: #7D42A4;
+
   /* Type */
   --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
@@ -139,6 +180,13 @@
     --on-signal: #191817;
 
     --flow: #7FA3D4;
+    --stream: #79C0CE;
+    --batch: #B49BDB;
+
+    --tag-1: #8CA4E2;
+    --tag-2: #E88AC0;
+    --tag-3: #54C6C6;
+    --tag-4: #C298E4;
   }
 }
 
@@ -169,4 +217,11 @@
   --on-signal: #191817;
 
   --flow: #7FA3D4;
+  --stream: #79C0CE;
+  --batch: #B49BDB;
+
+  --tag-1: #8CA4E2;
+  --tag-2: #E88AC0;
+  --tag-3: #54C6C6;
+  --tag-4: #C298E4;
 }

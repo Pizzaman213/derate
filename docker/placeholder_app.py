@@ -21,7 +21,11 @@ import sys
 import threading
 
 PORT = int(os.environ.get("DERATE_PORT", "8080"))
-AGENT_PORT = int(os.environ.get("DERATE_AGENT_PORT", str(PORT)))
+# 8081, the same default registry/config.py::DEFAULT_AGENT_PORT carries and
+# the Dockerfile sets. Defaulting it to PORT instead made the two equal
+# whenever only DERATE_PORT was named, which quietly turned the "serve on
+# both" branch below into serving on one.
+AGENT_PORT = int(os.environ.get("DERATE_AGENT_PORT", "8081"))
 ROLE = os.environ.get("DERATE_ROLE", "auto")
 
 PAGE = """<!doctype html><meta charset=utf-8><title>derate</title>

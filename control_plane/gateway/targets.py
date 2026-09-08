@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 
 from control_plane.contracts import (
     Deployment,
-    DeploymentState,
     Modality,
     NodeProfile,
     NodeState,
@@ -22,6 +21,7 @@ from control_plane.contracts import (
     TargetKind,
 )
 
+from . import states
 from .settings import GatewaySettings
 from .stats import StatsRegistry
 from .strength import (
@@ -32,7 +32,9 @@ from .strength import (
 )
 
 # Deployment states that can answer a request. Anything else is not a target.
-ROUTABLE_STATES = (DeploymentState.READY, DeploymentState.DEGRADED)
+# ``states`` is the gateway's one spelling of this; the name stays because the
+# routing code reads better for it.
+ROUTABLE_STATES = states.SERVING
 
 
 def local_cost_per_mtok(
@@ -125,7 +127,7 @@ def build_index(
 
     for dep in deployments:
         if dep.state not in ROUTABLE_STATES or not dep.backend_url:
-            if dep.state not in (DeploymentState.STOPPED, DeploymentState.FAILED):
+            if dep.state not in states.TERMINAL:
                 index.pending.setdefault(dep.served_name, []).append(dep)
             continue
 

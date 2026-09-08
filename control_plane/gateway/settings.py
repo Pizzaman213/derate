@@ -47,6 +47,20 @@ class GatewaySettings:
     upstream_connect_timeout_s: float = 5.0
     upstream_read_timeout_s: float | None = None
     upstream_pool_limit: int = 256
+    # Per-origin ceiling. One pool shared by every target means one slow or
+    # leaking backend can consume every slot and take the others down with it:
+    # on 2026-09-08 a 30B model's abandoned streams filled all 256 and a 0.5B
+    # that had leaked nothing stopped answering 65 ms later. A client per origin
+    # keeps that blast radius to the backend that earned it.
+    upstream_per_origin_limit: int = 64
+    # How long an origin's client may go unused before it is closed. Every
+    # launch takes a fresh port, so without this the client map grows for the
+    # life of the process.
+    upstream_client_idle_s: float = 300.0
+    # How often the proxy looks for upstream responses nothing will ever close
+    # and for idle origin clients. Nothing here is urgent -- the grace period it
+    # enforces is measured in tens of seconds -- so this is deliberately slow.
+    upstream_janitor_interval_s: float = 5.0
 
     # --- startup ---
     # Startup must not block on a slow or unreachable node. Every step below
@@ -78,6 +92,14 @@ class GatewaySettings:
     # None means no cap; 0.0 means spend nothing. Two different instructions,
     # and a form whose empty field yields 0.0 would silently swap them.
     daily_spend_cap_usd: float | None = None
+    # A deployment that crashes (fatal runtime marker, exited container, a
+    # health probe that stops answering) relaunches itself, up to
+    # MAX_RESTART_ATTEMPTS with backoff (restart.py). Never fires for an
+    # operator-requested stop -- manager.py tags that case with its own
+    # "stopped during launch" reason, which the restart coordinator excludes.
+    # Defaults on: a crashed model nobody is watching should come back on its
+    # own rather than sit FAILED until someone happens to notice.
+    auto_restart_crashed_deployments: bool = True
 
     # --- admission control ---
     admission_reconcile_interval_s: float = 0.5
@@ -99,7 +121,23 @@ class GatewaySettings:
     failover_max_attempts: int = 2
     # Wall-clock ceiling on the whole chain, so a slow chain of dying nodes
     # cannot outlive a client's own timeout.
+    #
+    # It bounds the chain only BEFORE a response is committed. Once headers are
+    # on the wire the budget is attempts, not seconds, and `_make_reopen` in
+    # openai_api.py deliberately does not consult this. The reason is arithmetic:
+    # a 30B's prefill is 76-130s, so this deadline expires long before its first
+    # byte, and enforcing it there would refuse recovery for exactly the slow
+    # requests that recovery is worth most to. A client that has already waited
+    # two minutes wants the answer, not a 502 for punctuality.
     failover_deadline_s: float = 30.0
+    # Race a second target when the first has produced no byte within this
+    # long, and take whichever answers first. None disables it, which is the
+    # default and the right one for most clusters: a hedge buys latency with a
+    # whole extra inference, so it only pays between targets of comparable
+    # strength -- replicas of one model on similar machines. `hedge_candidate`
+    # refuses the rest, and refuses outright under LOCAL_FIRST, where sending
+    # to the remote is a saturation decision rather than a speed one.
+    hedge_after_s: float | None = None
     # Consecutive transport failures before the gateway benches a target on its
     # own account. Three, because the deploy manager needs two health polls
     # (~10s) to reach the same conclusion and one failure is a coincidence.
@@ -132,6 +170,12 @@ class GatewaySettings:
     # still be in hand. So the cap is a real limit rather than a formality.
     # 25 MiB is what OpenAI accepts, which is the number a client will expect.
     max_audio_upload_bytes: int = 25 * 1024 * 1024
+
+    # --- request body ---
+    # A multimodal chat body can carry a base64 image or audio clip inline and
+    # is not reliably smaller than an audio upload, so it gets the same cap
+    # and the same reasoning: 25 MiB is what OpenAI accepts.
+    max_json_body_bytes: int = 25 * 1024 * 1024
 
     # --- parking ---
     # When a model's only nodes have just died, hold the request this long for

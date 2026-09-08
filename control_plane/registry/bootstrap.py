@@ -61,6 +61,9 @@ class RoleDecision:
     # cluster token, handed over once so this node keeps working after the
     # enrollment token expires. The caller must persist it.
     cluster_token: str | None = None
+    # Which of the credentials this node holds the coordinator actually took.
+    # None when no join happened at all.
+    token_used: str | None = None
 
     @property
     def is_coordinator(self) -> bool:
@@ -93,6 +96,47 @@ async def post_join(
         if "403" in str(exc):
             raise JoinRejected(f"coordinator rejected our token: {exc}") from exc
         raise
+
+
+async def join_with_held_credentials(
+    join: Callable[..., Awaitable[dict]],
+    url: str,
+    config: RegistryConfig,
+    profile: NodeProfile,
+    agent_url: str,
+) -> tuple[dict, str | None]:
+    """Present what this machine holds, and let the coordinator pick.
+
+    A node can legitimately be holding two credentials at once: the enrollment
+    token it was installed with -- which ``install.sh`` bakes into the container
+    environment permanently, so it is presented on every restart forever -- and
+    the permanent cluster token the coordinator handed it in exchange for that
+    one. After the first hour the enrollment token is spent, and because
+    ``handle_join`` checks the token *before* it checks membership, presenting
+    it 403s the node out of a cluster it is already a member of.
+
+    Preferring the stored token instead would break the opposite case, which is
+    just as real: a *fresh* enrollment token carried to this machine to re-home
+    it onto a different cluster, where the stored one is the wrong cluster's and
+    will be refused. Nothing on this side can tell those apart -- so try the
+    deliberate one first and fall back to the held one, and let the far end
+    settle it.
+
+    Returns the join response and the token that earned it, so the caller can
+    stop paying for the rejection next time.
+    """
+    try:
+        return await join(url, config.token, profile, agent_url), config.token
+    except JoinRejected:
+        fallback = config.fallback_token
+        if not fallback or fallback == config.token:
+            raise
+        log.info(
+            "%s rejected the token we were given; retrying with the permanent "
+            "cluster token this node adopted earlier",
+            url,
+        )
+        return await join(url, fallback, profile, agent_url), fallback
 
 
 def adopt_cluster_token(config: RegistryConfig, result: dict | None) -> RegistryConfig:
@@ -144,7 +188,9 @@ async def resolve_role(
     if config.join_address:
         url = normalize_agent_url(config.join_address, config.coordinator_port)
         try:
-            result = await join(url, config.token, profile, agent_url)
+            result, token_used = await join_with_held_credentials(
+                join, url, config, profile, agent_url
+            )
         except JoinRejected as exc:
             # A rejection proves the NAMED coordinator exists and answered --
             # the same fact the discovered path treats as "stay a worker and
@@ -174,6 +220,7 @@ async def resolve_role(
             cluster_id=(result or {}).get("cluster_id"),
             status=(result or {}).get("status"),
             cluster_token=(result or {}).get("cluster_token"),
+            token_used=token_used,
         )
 
     peers = await browse(MDNS_BROWSE_SECONDS, profile.node_id)
@@ -183,7 +230,9 @@ async def resolve_role(
     for peer in coordinators:
         url = f"http://{peer.address}:{config.coordinator_port}"
         try:
-            result = await join(url, config.token, profile, agent_url)
+            result, token_used = await join_with_held_credentials(
+                join, url, config, profile, agent_url
+            )
             return RoleDecision(
                 ROLE_WORKER,
                 url,
@@ -192,6 +241,7 @@ async def resolve_role(
                 cluster_id=(result or {}).get("cluster_id") or peer.cluster_id,
                 status=(result or {}).get("status"),
                 cluster_token=(result or {}).get("cluster_token"),
+                token_used=token_used,
             )
         except JoinRejected:
             # Someone else's cluster on the same subnet -- or the same
@@ -245,6 +295,104 @@ def resolve_role_sync(*args, **kwargs) -> RoleDecision:
     return asyncio.run(resolve_role(*args, **kwargs))
 
 
+@dataclass(frozen=True)
+class Announcement:
+    """The outcome of one re-announcement. Never a role decision."""
+
+    ok: bool
+    coordinator_url: str | None
+    result: dict | None
+    reason: str
+    token_used: str | None = None
+
+
+async def reannounce(
+    config: RegistryConfig,
+    profile: NodeProfile,
+    agent_url: str,
+    coordinator_url: str | None,
+    browse: Callable[..., Awaitable[list[DiscoveredPeer]]] = browse_async,
+    join: Callable[..., Awaitable[dict]] = post_join,
+) -> Announcement:
+    """Tell the coordinator where we are and what we are, again.
+
+    ``resolve_role`` runs once and the role is sticky, which is deliberate --
+    there is no election here and this function does not add one. It is the
+    other missing half: after a node is admitted, steady state was entirely
+    coordinator-pull, so a member had no way to say anything ever again. Three
+    ordinary events therefore had no recovery path:
+
+    * the node's address changed, and the coordinator kept dialling the old one
+      until the node's container happened to restart;
+    * the coordinator was restarted with an empty roster, and every worker sat
+      there healthy and unlisted;
+    * the coordinator was replaced by another machine, and the cluster had to be
+      rebuilt by hand.
+
+    All three are the same fix: re-run the join. ``Registry.handle_join`` with a
+    valid token already moves ``agent_url``, refreshes the profile, clears the
+    miss counter and persists, and it is idempotent -- so this needs nothing new
+    on the coordinator side.
+
+    It is not a way to fake health, either. ``handle_join`` probes back before it
+    accepts anything, so a node that can reach the coordinator but cannot be
+    reached *back* has its announcement rejected and stays unhealthy. The
+    direction that gets asserted is the direction that was proved.
+
+    Tries the coordinator we know about first, then anything mDNS can find. It
+    never decides to coordinate: a worker whose coordinator is gone waits for one
+    to come back rather than splitting the subnet in two.
+    """
+    tried: list[str] = []
+
+    async def attempt(url: str) -> Announcement | None:
+        tried.append(url)
+        try:
+            result, token_used = await join_with_held_credentials(
+                join, url, config, profile, agent_url
+            )
+        except JoinRejected as exc:
+            log.warning("re-announcement to %s was rejected: %s", url, exc)
+            return None
+        except ProbeFailed as exc:
+            log.debug("re-announcement to %s did not land: %s", url, exc)
+            return None
+        return Announcement(
+            True, url, result, f"re-announced to {url}", token_used=token_used
+        )
+
+    if coordinator_url:
+        landed = await attempt(coordinator_url)
+        if landed is not None:
+            return landed
+
+    # The known coordinator did not answer, or turned us away. Look for one:
+    # this is how a *replacement* coordinator is found, which is the whole
+    # reason the browse is here rather than just retrying one address.
+    try:
+        peers = await browse(MDNS_BROWSE_SECONDS, profile.node_id)
+    except Exception as exc:  # a browse failure is not a reason to stop trying
+        log.debug("re-announcement browse failed: %s", exc)
+        peers = []
+
+    for peer in peers:
+        if not peer.is_coordinator:
+            continue
+        url = f"http://{peer.address}:{config.coordinator_port}"
+        if url in tried:
+            continue
+        landed = await attempt(url)
+        if landed is not None:
+            return landed
+
+    return Announcement(
+        False,
+        coordinator_url,
+        None,
+        f"no coordinator accepted a re-announcement (tried {', '.join(tried) or 'nothing'})",
+    )
+
+
 async def rejoin_until_admitted(
     decision: RoleDecision,
     config: RegistryConfig,
@@ -272,7 +420,9 @@ async def rejoin_until_admitted(
         return None
     while should_continue():
         try:
-            result = await join(url, config.token, profile, agent_url)
+            result, token_used = await join_with_held_credentials(
+                join, url, config, profile, agent_url
+            )
         except JoinRejected as exc:
             log.warning(
                 "still not admitted by %s (%s); retrying in %.0fs",
@@ -289,6 +439,10 @@ async def rejoin_until_admitted(
 
         # Before the status check: an admission carries the permanent token
         # with it, and the next iteration of this loop must present that one.
+        # Same for a credential that only worked as the fallback -- there is no
+        # reason to keep paying for the rejection that got us here.
+        if token_used and token_used != config.token:
+            config = dataclasses.replace(config, token=token_used)
         config = adopt_cluster_token(config, result)
 
         if (result or {}).get("status") == "member":

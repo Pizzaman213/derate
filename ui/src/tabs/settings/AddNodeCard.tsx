@@ -271,7 +271,16 @@ export function AddNodeCard() {
               <button
                 style={{ padding: '3px 8px', marginLeft: 'auto' }}
                 onClick={() => void admit(c.node_id)}
-                disabled={busy === c.node_id || c.eligible === false}
+                /* Not gated on c.eligible. The reason above says the device
+                   class could not be confirmed, and serialize._eligibility is
+                   explicit that this is "cannot confirm" rather than an
+                   exclusion "the system does not enforce" -- nothing in the
+                   planner or the fit gate filters placement on device class.
+                   Disabling the button turned that hedge into a refusal, and
+                   it is the refusal that a GPU-less machine -- a Mac, a Pi --
+                   hits on the one path a human drives. The operator is told
+                   what we could not confirm and admits anyway. */
+                disabled={busy === c.node_id}
               >
                 {busy === c.node_id ? 'Adding…' : 'Admit'}
               </button>

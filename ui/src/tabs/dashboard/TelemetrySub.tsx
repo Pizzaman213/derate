@@ -3,7 +3,7 @@ import type { SelectionApi } from '../../state/selection'
 import type { TelemetrySeries } from '../../state/useTelemetry'
 import { fromState, nodeName } from '../../state/names'
 import { utilLabel } from '../../state/live'
-import { Chart } from './Chart'
+import { Chart, ChartGrid } from './Chart'
 
 interface Props {
   nodes: NodeStateDTO[]
@@ -37,10 +37,10 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
 
       <section>
         <h2>Cluster</h2>
-        <div className="chartgrid">
+        <ChartGrid>
           <Chart title="Throughput, all models" unit="tok/s" points={telemetry.clusterTps} />
           <Chart title="Power drawn" unit="W" points={telemetry.clusterPower} />
-        </div>
+        </ChartGrid>
       </section>
 
       <section>
@@ -58,7 +58,7 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
           ))}
         </div>
         {selectedNode ? (
-          <div className="chartgrid">
+          <ChartGrid>
             <Chart
               title={`${nodeName(fromState(selectedNode))} · power`}
               unit="W"
@@ -79,7 +79,7 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
               unit="%"
               points={telemetry.nodeUtil[selectedNode.profile.node_id] ?? []}
             />
-          </div>
+          </ChartGrid>
         ) : (
           <p className="unit" style={{ margin: 0 }}>
             Select a Spark above to see its charts.
@@ -95,7 +95,7 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
             : 'Nothing is being served.'}
         </p>
         {selection.selDep ? (
-          <div className="chartgrid">
+          <ChartGrid>
             <Chart
               title={`${selection.selDep} · aggregate throughput`}
               unit="tok/s"
@@ -111,7 +111,7 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
               unit="reqs"
               points={telemetry.depQueue[selection.selDep] ?? []}
             />
-          </div>
+          </ChartGrid>
         ) : null}
       </section>
     </div>

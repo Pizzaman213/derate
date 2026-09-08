@@ -29,6 +29,16 @@ log = logging.getLogger("gateway.ui_detail")
 
 #: Emitted for a provider when the port does no accounting. Named individually
 #: rather than built by a loop so this file is greppable for each key.
+#:
+#: **Adding a key here: it is `None`, not `0`.** The pull toward `0` is
+#: strongest for the ones that are plainly counters, and that is exactly where
+#: it does the most damage -- a count that partitions `requests_today` states
+#: something about the traffic, not just about itself. `unpriced_requests_today`
+#: at 0 says "we watched every request and could price them all";
+#: `metered_requests_today` at 0 says "we watched, and the provider priced none
+#: of them". Over a port that watched nothing, both are false sentences, and
+#: the Spend screen renders them as confident ones: it reads these two to call
+#: a figure a charge or a forecast, and a stub has issued neither.
 _UNKNOWN_SPEND: dict[str, Any] = {
     "admitting": None,
     "admission_block": None,
@@ -37,14 +47,22 @@ _UNKNOWN_SPEND: dict[str, Any] = {
     "tokens_today": None,
     "requests_today": None,
     "unpriced_requests_today": None,
+    "metered_requests_today": None,
     "retry_in_s": None,
     "model_count": None,
+    "catalogue_count": None,
+    "models_chosen": None,
 }
 
-#: The eight keys copied out of `provider_public_dict`. Copied one at a time by
+#: The twelve keys copied out of `provider_public_dict`. Copied one at a time by
 #: name -- the dict is never merged, never `update()`d, never iterated -- so
 #: `serialize.provider_payload` stays an allowlist and a new field appearing
 #: upstream cannot reach the wire by accident.
+#:
+#: The last three are not spend -- two counts and one boolean -- and ride here
+#: because this is the sanctioned way through: `aliases` is the cautionary case,
+#: settable and persisted for months while never reaching the wire, because
+#: nothing named it in a list like this one.
 _SPEND_KEYS = (
     "admitting",
     "admission_block",
@@ -53,8 +71,11 @@ _SPEND_KEYS = (
     "tokens_today",
     "requests_today",
     "unpriced_requests_today",
+    "metered_requests_today",
     "retry_in_s",
     "model_count",
+    "catalogue_count",
+    "models_chosen",
 )
 
 
@@ -100,7 +121,7 @@ def provider_spend(port: Any) -> dict[str, dict[str, Any]]:
 
 
 def spend_fields(spend: dict[str, Any] | None) -> dict[str, Any]:
-    """The nine keys for one provider, all `None` when there is no accounting."""
+    """The twelve keys for one provider, all `None` when there is no accounting."""
     if not spend:
         return dict(_UNKNOWN_SPEND)
     return {key: spend.get(key) for key in _SPEND_KEYS}

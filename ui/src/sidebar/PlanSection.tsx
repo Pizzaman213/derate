@@ -4,6 +4,7 @@ import { useCluster } from '../state/resources'
 import { Disclosure } from '../components/Panel'
 import { Verbatim, VerbatimList } from '../components/Verbatim'
 import { fmt, planShortFromDegrees } from '../format'
+import { runners } from '../tabs/cluster/layout'
 
 // Ported from mockups-next/js/sidebar.js `sidebar()`'s plan block. The
 // mockup's `#whyBox` is hand-written markup keyed on a fixture's `span`/`solo`
@@ -15,9 +16,14 @@ export function PlanSection() {
   const cluster = useCluster()
   const [open, setOpen] = useState(false)
 
-  const dep = selDep
-    ? (cluster.data?.deployments.find((d) => d.served_name === selDep) ?? null)
-    : null
+  // The ledger keeps every attempt, so one served name can match several rows.
+  // This block says "Nothing is being served" when it finds none, so the one
+  // it wants is a live one -- a failed attempt's plan is not what the cluster
+  // is running, and showing it here would attribute machines to nobody.
+  const named = selDep
+    ? (cluster.data?.deployments.filter((d) => d.served_name === selDep) ?? [])
+    : []
+  const dep = runners(named)[0] ?? null
 
   if (!dep) {
     return (

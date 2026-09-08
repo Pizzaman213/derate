@@ -12,24 +12,29 @@
 // two decisions -- which paths to draw on, and how long a flight lasts -- are
 // `collapseFlows` and `flightMs`, which are.
 
-import { execFileSync } from 'node:child_process'
+import { build as bundleWithEsbuild } from 'esbuild'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const uiRoot = join(here, '..', '..', '..')
 const out = mkdtempSync(join(tmpdir(), 'particles-check-'))
 const bundle = join(out, 'particles.mjs')
 
-execFileSync(
-  join(uiRoot, 'node_modules', '.bin', 'esbuild'),
-  [join(here, 'particles.ts'), '--bundle', '--format=esm', `--outfile=${bundle}`, '--log-level=warning'],
-  { stdio: 'inherit' },
-)
+// esbuild's JS API rather than the launcher under node_modules/.bin:
+// that shim is a POSIX script with no .cmd twin, so spawning it by path
+// fails on Windows. rows.check.mjs already bundles this way.
+await bundleWithEsbuild({
+  entryPoints: [join(here, 'particles.ts')],
+  bundle: true,
+  format: 'esm',
+  outfile: bundle,
+  logLevel: 'warning',
+})
 
-const P = await import(bundle)
+const P = await import(pathToFileURL(bundle).href)
 
 let failures = 0
 let checks = 0
@@ -168,6 +173,152 @@ function tick(t) {
   const flows = [flow('m#P', 2, 1), flow('m#P', 1, 4)]
   P.collapseFlows(flows, paths)
   ok(flows[0].inflight === 2 && flows[0].meanDurationS === 1, "collapsing does not mutate the caller's flows")
+}
+
+// ── Which targets contribute a block at all ──────────────────────────────────
+//
+// The rule this pins is the one that made the animation invisible: flows are
+// built for EVERY served name, not for the selected one. It also pins which of
+// the two counters is read, which is a cadence question no type can hold.
+{
+  const target = (target_id, kind, outstanding, extra = {}) => ({
+    target_id,
+    kind,
+    backend_url: '',
+    weight: 1,
+    outstanding,
+    healthy: true,
+    admitting: true,
+    strength: 1,
+    cost_per_mtok: 0,
+    node_ids: [],
+    counters: { mean_duration_s: null },
+    ...extra,
+  })
+  const routing = [
+    { served_name: 'local-name', targets: [target('d-a', 'local', 4)] },
+    { served_name: 'remote-name', targets: [target('openrouter:x', 'remote', 2)] },
+  ]
+
+  const all = P.targetFlows(routing, [], false)
+  ok(all.length === 2, 'every served name contributes a flow, not just one')
+  ok(
+    all.some((f) => f.pathKey === 'local-name#L:d-a'),
+    'a local target flies its own deployment path',
+  )
+  ok(
+    all.some((f) => f.pathKey === 'remote-name#P'),
+    'a remote target flies the drop into the provider box',
+  )
+
+  // Nothing here filters by what was drawn -- collapseFlows does that, and the
+  // two together are what let a 312-model provider cost one map and no ink.
+  const undrawn = P.collapseFlows(all, { 'local-name#L:d-a': [] })
+  ok(undrawn.size === 1, 'a flow for a name with no band is dropped downstream, not upstream')
+
+  // The 1 Hz frame wins over the 5s poll for a local target...
+  const fresh = P.targetFlows(routing, [{ deployment_id: 'd-a', queue_depth: 9 }], false)
+  ok(fresh[0].inflight === 9, 'a live queue_depth beats the slower outstanding count')
+  // ...and stops winning the moment it stops arriving.
+  const gone = P.targetFlows(routing, [{ deployment_id: 'd-a', queue_depth: 9 }], true)
+  ok(gone[0].inflight === 4, 'a stale frame falls back to outstanding rather than freezing')
+  // A remote target has no deployment frame to read, so it never takes one.
+  const remoteFresh = P.targetFlows(routing, [{ deployment_id: 'openrouter:x', queue_depth: 9 }], false)
+  ok(remoteFresh[1].inflight === 2, 'a remote target reads outstanding, never a deployment frame')
+
+  // A coordinator too old to carry counters is not a zero.
+  ok(all[0].meanDurationS === null, 'no measured duration is null, never a made-up default')
+}
+
+// ── The return leg: a rate becomes a block rate, and is capped ──────────────
+//
+// The inbound side's bug was a metronome. The outbound side's would be a rate
+// that silently rounds to zero on a slow band, or one that spawns a solid bar
+// on a fast one -- so both ends of the curve are pinned here.
+{
+  ok(P.blocksPerSec(0) === 0, 'nothing measured emits nothing')
+  ok(P.blocksPerSec(null) === 0 && P.blocksPerSec(undefined) === 0, 'no reading is not a rate')
+  ok(P.blocksPerSec(Number.NaN) === 0 && P.blocksPerSec(-5) === 0, 'NaN and a negative are not rates')
+  ok(P.blocksPerSec(0.4) === 0, 'a trickle under one token a second draws nothing')
+  ok(P.blocksPerSec(1) === P.STREAM_MIN_HZ, 'the slowest measurable rate is the slowest drawn one')
+  ok(P.blocksPerSec(3000) === P.STREAM_MAX_HZ, 'a 3000 tok/s deployment does not spawn 3000 blocks')
+  ok(P.blocksPerSec(1e9) === P.STREAM_MAX_HZ, 'and neither does anything else')
+
+  const ladder = [1, 10, 100, 1000, 5000].map(P.blocksPerSec)
+  ok(ladder.every((v, i) => i === 0 || v >= ladder[i - 1]), 'a faster band never draws slower')
+  ok(ladder.every((v) => v <= P.STREAM_MAX_HZ), 'nothing escapes the cap')
+  ok(P.STREAM_MAX_HZ * (P.TOPUP_MS / 1000) <= 1, 'the cap is at most one block per path per tick')
+}
+
+// ── The emission accumulator ────────────────────────────────────────────────
+{
+  let c = 0
+  let fired = 0
+  for (let i = 0; i < 50; i++) {
+    const r = P.streamCredit(c, 0, P.TOPUP_MS)
+    c = r.credit
+    if (r.emit) fired++
+  }
+  ok(fired === 0 && c === 0, 'an idle band emits nothing and banks nothing')
+
+  c = 0
+  fired = 0
+  for (let i = 0; i < 10; i++) {
+    const r = P.streamCredit(c, 5000, P.TOPUP_MS)
+    c = r.credit
+    if (r.emit) fired++
+  }
+  ok(fired === 10, 'a saturated band emits once a tick, and never twice')
+
+  // The whole reason the credit exists: 1 tok/s is 0.5 Hz, which is a tenth of
+  // a block per 200ms tick. Rounding that per tick would draw nothing, forever,
+  // on a band that is genuinely serving.
+  c = 0
+  fired = 0
+  for (let i = 0; i < 100; i++) {
+    const r = P.streamCredit(c, 1, P.TOPUP_MS)
+    c = r.credit
+    if (r.emit) fired++
+  }
+  ok(fired === 10, 'a slow band emits at its own rate rather than not at all')
+
+  ok(P.streamCredit(0, 0, 60_000).credit === 0, 'a long idle gap banks no backlog')
+  ok(
+    P.streamCredit(0.9, 5000, 60_000).credit <= P.STREAM_CREDIT_MAX,
+    'credit is capped whatever the gap, so waking does not fire a burst',
+  )
+}
+
+// ── Streamed, batched, and the honesty of not knowing ───────────────────────
+{
+  ok(P.streamingRatio([]) === null, 'no rows is not a ratio')
+  ok(P.streamingRatio([{}, {}]) === null, 'rows with no streaming column are not a ratio')
+  ok(P.streamingRatio([{ streaming: 1 }, { streaming: 0 }]) === 0.5, 'the ratio is over rows that say')
+  ok(P.streamingRatio([{ streaming: 1 }, {}]) === 1, 'an absent flag is not a false')
+
+  ok(P.mostlyStreaming(null) === null, 'no ratio is not a verdict')
+  ok(P.mostlyStreaming(0.6) === true && P.mostlyStreaming(0.2) === false, 'a majority decides it')
+
+  const tones = [P.streamTone(true), P.streamTone(false), P.streamTone(null)]
+  ok(new Set(tones).size === 3, 'streamed, batched and unknown are three different colours')
+  ok(!tones.includes('var(--flow)'), 'none of them is the request-in-flight blue')
+  ok(P.streamTone(null) === 'var(--ink-muted)', 'unknown paints the no-reading grey, never a default')
+  ok(
+    P.streamBlockWidth(true) !== P.streamBlockWidth(false),
+    'and the difference survives a greyscale screenshot',
+  )
+}
+
+// ── Which path an out-block flies ───────────────────────────────────────────
+{
+  const paths = { 'd-a#OUT': [{ x: 0, y: 0 }], 'remote:x#OUT': [{ x: 0, y: 0 }] }
+  const s = (pathKey, tokensPerSec) => ({ pathKey, tokensPerSec, streaming: true })
+  const kept = P.collapseStreams([s('d-a#OUT', 10), s('nope#OUT', 999)], paths)
+  ok(
+    kept.length === 1 && kept[0].pathKey === 'd-a#OUT',
+    'a band with no drawn return leg is dropped, never redirected',
+  )
+  ok(P.collapseStreams([s('d-a#OUT', 0)], paths).length === 0, 'a band producing nothing streams nothing')
 }
 
 console.log('particles.check')

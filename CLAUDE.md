@@ -8,14 +8,14 @@ memory, and fronts every model behind one OpenAI endpoint.
 every type, enum, constant, derived fact, route and environment variable -- and
 a test fails when it goes stale, so it cannot be wrong in a way the code is not.
 
-**Read `00-architecture.md` before changing anything structural.** It holds the
-scope, the reasoning and the file-ownership map. It is a journal: sections 1-8
-are never edited and roughly twenty-five dated appendices amend them, so reading
-it top-down gives you superseded answers. The index at the top lists every
-appendix that reverses something above it. `agents/<X>-*.md` is the brief for one
-workstream and several are now stale against those appendices; `README.md` is the
-pitch and the install path. This file is the part that is only useful while you
-are editing.
+**There is no separate architecture journal any more.** `00-architecture.md`,
+`ROADMAP.md`, `agents/*.md` and `research/*.md` were the scope, the reasoning,
+the file-ownership map and the per-workstream briefs for the initial parallel-
+agent build; the build is done, they went stale against each other, and they
+were removed rather than kept as a source of superseded answers.
+`README.md` is the pitch and the install path; `CONTRACTS.md` is the frozen
+facts. Git history carries the reasoning now. This file is the part that is
+only useful while you are editing.
 
 ## Commands
 

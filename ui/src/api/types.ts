@@ -2,7 +2,7 @@
 // These describe Agent G's HTTP surface only. Nothing here is invented: every
 // field appears in the architecture doc or in one of its example payloads.
 
-export type DeviceClass = 'gb10' | 'discrete' | 'unknown'
+export type DeviceClass = 'gb10' | 'discrete' | 'apple' | 'cpu' | 'unknown'
 export type NodeRole = 'coordinator' | 'worker'
 export type NodeHealth = 'healthy' | 'degraded' | 'unreachable'
 
@@ -171,6 +171,11 @@ export interface TopologyRemote {
   state: 'healthy' | 'unhealthy'
   admitting: boolean | null
   tokens_per_sec: number
+  /** Which endpoint family this row answers on. Absent from a coordinator
+   *  older than the key; read it as `text`. It decides which entry plate the
+   *  band hangs off on the cluster floor -- a provider's `tts-1` drawn behind
+   *  `POST /v1/chat/completions` is a picture of a request that 400s. */
+  modality?: Modality
 }
 
 export interface Topology {
@@ -216,6 +221,10 @@ export interface ProviderKindSpec {
   supports_pull: boolean
   publishes_pricing: boolean
   forwardable: boolean
+  /** Whether this kind aggregates several backend hosts per model and can be
+   *  asked which ones (`GET /api/providers/{id}/backends`), and told to pin
+   *  one (`PATCH ... {backend_pins}`). True only for OpenRouter. */
+  supports_backend_routing: boolean
   /** Set when this build cannot talk to the kind at all. The server's own
    *  sentence; render it verbatim and do not offer the kind. */
   unsupported_reason: string | null
@@ -233,6 +242,11 @@ export interface PullAccepted {
   checked_against: string
   free_bytes: number
   budget_bytes: number
+  /** Whether a size was actually weighed against a measurement. The two byte
+   *  counts above cannot say: a machine that never joined the cluster and one
+   *  that was measured with nothing free both report 0, and reporting the
+   *  first as "0 GiB free" states a measurement that never happened. */
+  gated: boolean
   state: 'pulling' | 'present'
 }
 
@@ -585,6 +599,12 @@ export interface PlanAlternative {
 
 export interface PlanResponse {
   plan: ParallelismPlan
+  /** What this verdict was taken at, which is not necessarily what was sent:
+   *  a request with no context asks the coordinator to choose one out of what
+   *  actually fits. Optional because a gateway that predates the derivation
+   *  never echoed them. */
+  context?: number
+  concurrency?: number
   /** null when the fit port is unwired -- `internal_api.py` returns
    *  `"fit": null` on that path, and this type used to claim otherwise, so
    *  every render dereferenced null and blanked the box. */
@@ -629,6 +649,21 @@ export interface LaunchRequest {
   allow_mixed_hardware?: boolean
   node_ids?: string[]
   parallelism?: ParallelismRequest
+  /** Raw CLI text, e.g. `--quantization modelopt_fp4 --kv-cache-dtype fp8`,
+   *  for a model the standard recipe doesn't cover. Launch-only, like this
+   *  whole request: it never reaches sizing or planning, only the generated
+   *  serve command, appended after every knob the plan already emits. The
+   *  gateway splits it into tokens and checks each against an allowlist —
+   *  a rejected token comes back as a 400 naming which one and why. Mutually
+   *  exclusive with custom_command. */
+  extra_args?: string
+  /** Raw CLI text that REPLACES the generated serve command instead of
+   *  appending to it: none of the plan's own TP/PP/context/concurrency/
+   *  gpu-memory-utilization flags reach the launched process, only this text
+   *  plus --host/--port/--served-model-name, which the gateway still pins
+   *  after it. Same tokenizing and allowlist as extra_args. Mutually
+   *  exclusive with it — sending both is a 400. */
+  custom_command?: string
 }
 
 /** Degrees the operator set by hand.
@@ -647,8 +682,12 @@ export interface ParallelismRequest {
 
 export interface PlanRequest {
   model_id: string
-  context: number
-  concurrency: number
+  /** Omitted on the default path, and omission is the request: the
+   *  coordinator derives a context from what actually fits, clamped to the
+   *  model's own window, and echoes what it chose. Sent only when somebody
+   *  has overridden it in the Serve panel's advanced disclosure. */
+  context?: number
+  concurrency?: number
   target: string
   /** SIZING ONLY, and deliberately absent from `LaunchRequest`.
    *
@@ -688,6 +727,18 @@ export function isAudio(m: Modality | undefined): boolean {
   return m === 'speech' || m === 'transcription'
 }
 
+/** The route each family is served on. Mirrors `ENDPOINT_FOR_MODALITY` in
+ *  `control_plane/contracts/modality.py`, and it is here rather than in the
+ *  screen that draws it because two screens now need it: the cluster floor
+ *  labels its entry plates from this, and the model pane says which route the
+ *  model it is offering to serve will answer on. */
+export const ENDPOINT_FOR_MODALITY: Record<Modality, string> = {
+  text: '/v1/chat/completions',
+  embedding: '/v1/embeddings',
+  speech: '/v1/audio/speech',
+  transcription: '/v1/audio/transcriptions',
+}
+
 // ── Deployments: GET /api/deployments ────────────────────────────────────────
 
 export interface DeploymentDTO {
@@ -705,6 +756,13 @@ export interface DeploymentDTO {
   fit: FitResult
   /** Absent from a gateway that predates the field; read it as `text`. */
   modality?: Modality
+  /** The extra CLI tokens this deployment was launched with, if any.
+   *  Absent from a gateway that predates the field; read it as none. */
+  extra_args?: string[]
+  /** The custom-command tokens this deployment was launched with, if any --
+   *  mutually exclusive with extra_args. Absent from a gateway that
+   *  predates the field; read it as none. */
+  custom_command?: string[]
 }
 
 // ── Routing: GET /api/routing, PUT /api/routing/{served_name} ────────────────
@@ -785,6 +843,30 @@ export interface ProviderModel {
   output_cost_per_mtok: number | null
 }
 
+/** One row of `GET /api/providers/{id}/models` -- the whole catalogue, which is
+ *  the ONE provider surface the allowlist does not filter, because it is the
+ *  one the allowlist is chosen from. Everywhere else in the app a provider's
+ *  `models` are only the enabled ones, filtered server-side. */
+export interface ProviderCatalogueModel extends ProviderModel {
+  enabled: boolean
+}
+
+/** One row of `GET /api/providers/{id}/backends?upstream_id=...` -- the
+ *  backend hosts OpenRouter itself can route this one model to. Live, not
+ *  cached: unlike `models`, this is fetched fresh each time it is asked for,
+ *  because the point is to see what is available right now to pin against. */
+export interface ProviderBackendOption {
+  /** The value `backend_pins` and OpenRouter's own `provider.only` expect. */
+  tag: string
+  provider_name: string
+  context_length: number | null
+  input_cost_per_mtok: number | null
+  output_cost_per_mtok: number | null
+  quantization: string | null
+  /** Whether this is the backend `backend_pins` currently forces this model to. */
+  pinned: boolean
+}
+
 export interface Provider {
   provider_id: string
   kind: ProviderKind
@@ -792,6 +874,18 @@ export interface Provider {
   base_url: string
   /** an env var NAME, never key material. Displayed as a label, value is always *** */
   api_key_ref: string
+  /** Whether `api_key_ref` resolves to anything, from the coordinator's own
+   *  `key_status()`. `null` is "this port cannot say" -- a store with no
+   *  key_status -- and must not be rendered as a missing key. `not_needed` is
+   *  a kind that takes no credential, which is not the same as one whose
+   *  credential is absent. */
+  key_state: 'set' | 'missing' | 'not_needed' | null
+  /** Which of the two places answered: an environment variable the process was
+   *  started with, or secrets.json on the coordinator. A place, never a value,
+   *  and there is no third field that could carry one. `null` whenever
+   *  `key_state` is not `set` -- and for a port that knows the state without
+   *  knowing the source. */
+  key_source: 'environment' | 'secrets.json' | null
   enabled: boolean
   priority: number
   models: ProviderModel[]
@@ -810,14 +904,39 @@ export interface Provider {
   admission_block: string | null
   daily_budget_usd: number | null
   spend_today_usd: number | null
-  tokens_today: number | null
+  /** Two counts, not one: the gateway sends `{input, output}` (providers/
+   *  serialization.py). "Tokens generated" is the output half -- the same
+   *  thing a local target's `counters.total_tokens` holds, which is completion
+   *  tokens only (gateway/proxy.py `_apply_sniffed`). */
+  tokens_today: { input: number; output: number } | null
   requests_today: number | null
   /** Requests served by a model this provider never published a price for --
    *  spend that is real but not accounted in `spend_today_usd`. */
   unpriced_requests_today: number | null
+  /** Of `requests_today`, how many the provider priced itself, in its own
+   *  response. The remainder was priced from our copy of its published rate
+   *  card, which cannot see prompt caching or a long-context tier -- so the
+   *  two are a charge and a forecast, and the Spend screen says which. */
+  metered_requests_today: number | null
   /** Seconds until a rate-limit backoff clears; null when not backed off. */
   retry_in_s: number | null
+  /** How many models this provider actually serves -- the length of `models`,
+   *  which the allowlist has already filtered. */
   model_count: number | null
+  /** How many it publishes. The gap between this and `model_count` is the
+   *  allowlist, and one number cannot express "2 of 312". */
+  catalogue_count: number | null
+  /** Whether anybody ever chose which of them to serve.
+   *
+   *  Not derivable from the two counts above: they are equal both for a record
+   *  written before the allowlist existed -- which keeps serving everything it
+   *  publishes -- and for one whose operator switched everything on. Only one
+   *  of those deserves to be told that nothing was ever chosen.
+   *
+   *  Three states, like `key_state`. `null` is "this port cannot say" -- the
+   *  shipped stub does no accounting, so every field in this group comes back
+   *  null -- and must render as no warning at all, never as "nobody chose". */
+  models_chosen: boolean | null
 }
 
 /** `POST /api/providers` body (providers/service.py `_register`). Only `kind`
@@ -828,24 +947,43 @@ export interface ProviderSpec {
   base_url?: string
   /** the NAME of an environment variable or secrets.json key -- never a key */
   api_key_ref?: string
-  display_name?: string
-  aliases?: Record<string, string>
-  daily_budget_usd?: number | null
-  enabled?: boolean
-  priority?: number
   /** the key itself. The one field in this API that carries key material, and
    *  it travels one way: the coordinator writes it to secrets.json at 0600 and
    *  persists only the reference. It is on no record and in no response. Sent
    *  alone it mints a reference; sent with `api_key_ref` it is stored under
    *  that name. */
   api_key?: string
+  display_name?: string
+  aliases?: Record<string, string>
+  daily_budget_usd?: number | null
+  enabled?: boolean
+  priority?: number
+  /** Upstream ids this provider is allowed to serve, sent as the complete set
+   *  rather than a delta. PATCH only: on POST the catalogue has not been
+   *  fetched yet, so there would be nothing to check an id against. Every id
+   *  must be one the provider publishes or the whole patch is a 400. */
+  enabled_models?: string[]
+  /** Upstream id -> the backend tag OpenRouter should be forced to for it,
+   *  sent as the complete map, like `aliases`: to clear one model's pin, send
+   *  the map without that key rather than a null value. PATCH only, and only
+   *  on a kind with `supports_backend_routing`. */
+  backend_pins?: Record<string, string>
 }
 
 /** `PATCH /api/providers/{id}` body (providers/service.py `update`). */
 export type ProviderPatch = Partial<
   Pick<
     ProviderSpec,
-    'enabled' | 'priority' | 'display_name' | 'daily_budget_usd' | 'base_url' | 'api_key_ref' | 'aliases'
+    | 'enabled'
+    | 'priority'
+    | 'display_name'
+    | 'daily_budget_usd'
+    | 'base_url'
+    | 'api_key_ref'
+    | 'api_key'
+    | 'aliases'
+    | 'enabled_models'
+    | 'backend_pins'
   >
 >
 
@@ -853,7 +991,7 @@ export type ProviderPatch = Partial<
 
 export type SettingSource = 'file' | 'env' | 'default'
 
-/** The three settings a human can change at runtime (gateway/settings_store.py
+/** The four settings a human can change at runtime (gateway/settings_store.py
  *  `MUTABLE_FIELDS`) -- everything else in `GatewaySettings` is a code-level
  *  tunable, not a preference, and has no UI control. */
 export interface Settings {
@@ -862,9 +1000,18 @@ export interface Settings {
   /** null means unset -- never rendered as "no cap", which would claim
    *  containment that is not configured. */
   daily_spend_cap_usd: number | null
+  /** Relaunch a deployment automatically after a crash (not an operator
+   *  stop), up to a small bounded number of attempts. Defaults true. */
+  auto_restart_crashed_deployments: boolean
   /** Where each value above came from, so "0.00 because nobody set it" and
    *  "0.00 because someone set it to zero" can render differently. */
-  sources: Record<'electricity_rate_usd_per_kwh' | 'local_only' | 'daily_spend_cap_usd', SettingSource>
+  sources: Record<
+    | 'electricity_rate_usd_per_kwh'
+    | 'local_only'
+    | 'daily_spend_cap_usd'
+    | 'auto_restart_crashed_deployments',
+    SettingSource
+  >
   writable: string[]
   /** The honesty gate on the cap: false when no provider port reports spend,
    *  so there is nothing to enforce the cap against. The UI renders the cap
@@ -874,7 +1021,13 @@ export interface Settings {
 }
 
 export type SettingsPatch = Partial<
-  Pick<Settings, 'electricity_rate_usd_per_kwh' | 'local_only' | 'daily_spend_cap_usd'>
+  Pick<
+    Settings,
+    | 'electricity_rate_usd_per_kwh'
+    | 'local_only'
+    | 'daily_spend_cap_usd'
+    | 'auto_restart_crashed_deployments'
+  >
 >
 
 // ── SSE: GET /api/metrics/stream ─────────────────────────────────────────────
@@ -906,6 +1059,22 @@ export interface MetricsDeploymentFrame {
   queue_depth: number | null
 }
 
+/** The same counters for a model a PROVIDER serves, off the same registry and
+ *  the same window as a deployment's. Only targets the gateway has actually
+ *  routed to appear: every model of an un-allowlisted key would be hundreds of
+ *  rows a second, and a target with no counter has served nothing, which reads
+ *  as the zero it is. */
+export interface MetricsRemoteFrame {
+  /** `<provider id>:<upstream id>`, the routing target id. */
+  target_id: string
+  provider_id: string
+  served_name: string
+  state: 'healthy' | 'unhealthy'
+  tokens_per_sec: number | null
+  ttft_ms: number | null
+  queue_depth: number | null
+}
+
 export interface MetricsFrame {
   ts: number
   cluster: MetricsClusterFrame
@@ -915,6 +1084,9 @@ export interface MetricsFrame {
    *  should see the null. */
   nodes: MetricsNodeFrame[] | null
   deployments: MetricsDeploymentFrame[] | null
+  /** null on the degraded path, absent on a coordinator older than this key.
+   *  Both mean "no figure", which is why every reader goes through `?.`. */
+  remotes?: MetricsRemoteFrame[] | null
 }
 
 // ── OpenAI surface: GET /v1/models, POST /v1/chat/completions ────────────────
@@ -937,6 +1109,91 @@ export interface ServedModel {
    *  picker cannot tell a TTS model from a chat model, which is exactly how a
    *  provider's `whisper-1` ended up offered as a chat target. */
   modality?: Modality
+}
+
+/** The containers `POST /v1/audio/speech` will encode into.
+ *
+ *  libsndfile's list, which is the tts runtime's whole encoder
+ *  (`control_plane/runtimes/tts.py::FORMATS`). `aac` is deliberately absent
+ *  rather than offered and refused: libsndfile cannot write it, and a client
+ *  that asked for AAC and got MP3 under `Content-Type: audio/aac` fails
+ *  somewhere much further away than here. A provider that accepts `aac` will
+ *  say so in its own words if somebody sends one by hand. */
+export type SpeechFormat = 'mp3' | 'wav' | 'flac' | 'opus' | 'pcm'
+
+export const SPEECH_FORMATS: readonly SpeechFormat[] = [
+  'mp3',
+  'wav',
+  'flac',
+  'opus',
+  'pcm',
+]
+
+/** One `POST /v1/audio/speech`.
+ *
+ *  `voice` absent is a real request and the default one: the model speaks in
+ *  its own voice. A named voice is a reference clip plus that clip's exact
+ *  transcript, installed on the node, and an unknown name is refused with the
+ *  list of what is there -- which is why `voices()` exists rather than a free
+ *  text field. There is no `speed` and no `stream`: the server refuses the
+ *  first (a resample moves the pitch) and has never had the second. */
+export interface SpeechRequest {
+  model: string
+  input: string
+  voice?: string
+  response_format: SpeechFormat
+}
+
+/** What came back. The bytes, and the two things only the headers know.
+ *
+ *  `sampleRate` is not decoration: `pcm` is headerless, so nothing in the file
+ *  itself says what rate to play it at, and `opus` was resampled from the
+ *  codec's 44.1 kHz to 48 kHz on the way out. `null` when the upstream did not
+ *  send the header -- a provider will not. */
+export interface SpeechResult {
+  blob: Blob
+  contentType: string
+  bytes: number
+  durationS: number | null
+  sampleRate: number | null
+  /** The trace id the gateway minted, the same one the chat readout shows. */
+  requestId: string | null
+}
+
+/** `GET /v1/audio/voices?model=`.
+ *
+ *  `skipped` is the server naming clips it declined and why -- a `.wav` with
+ *  no `.txt` transcript beside it, or one over the reference limit. It is
+ *  rendered verbatim, because it is the only thing that tells somebody how to
+ *  make the voice they installed actually appear. */
+export interface VoiceLibrary {
+  voices: string[]
+  skipped: string[]
+}
+
+/** One `POST /v1/audio/transcriptions`. Audio file in, text out.
+ *
+ *  The only request on the whole `/v1` surface that is not JSON: it is a
+ *  multipart upload, and the file is forwarded byte for byte under the
+ *  browser's own boundary.
+ *
+ *  `language` is an ISO-639-1 code and is not optional in practice on an
+ *  English-only checkpoint. vLLM runs language auto-detection when the field
+ *  is absent, and `whisper-*.en` has no language tokens to detect with, so it
+ *  fails an assertion inside the model and returns 500. It is therefore a
+ *  visible control defaulting to `en` rather than a parameter sent silently:
+ *  a multilingual checkpoint is one field away, and an English-only one does
+ *  not 500 on arrival. */
+export interface TranscriptionRequest {
+  model: string
+  file: File
+  language?: string
+}
+
+/** What came back. Text, and the id of the row that recorded it. */
+export interface TranscriptionResult {
+  text: string
+  requestId: string | null
 }
 
 export type ChatRole = 'user' | 'assistant'
@@ -1014,19 +1271,42 @@ export interface CapacitySide {
 
 export interface CapacityReport {
   probed_node: string
-  context: number
+  /** The context every row was taken at, or null when the gate chose one per
+   *  model -- in which case `CapacityRow.context` is the number to read.
+   *
+   *  Null is the DEFAULT path, not an edge case, so reaching for this field
+   *  first is the likely mistake rather than an unlikely one. Falling back to
+   *  `report.context ?? 8192` would print a figure next to a row it was not
+   *  computed for -- the same defect as a zero that reads as an observation
+   *  of something nobody watched. Read the row. */
+  context: number | null
   concurrency: number
   kv_dtype: string
+  /** The machines the rows were sized on. One by default: the coordinator's
+   *  own host. More only when `on=` named more. */
   nodes: string[]
+  /** The tensor-parallel degrees actually used, ascending. `[1]` unless the
+   *  answer was sized across several machines -- and the degree is what the
+   *  MODEL admits, not how many boxes were ticked, so three machines can still
+   *  come back as 2. */
+  tensor_parallel: number[]
+  /** Which memory the verdicts were budgeted against. `"host_memory"` means no
+   *  enrolled machine has GPU-addressable memory and the figures come from the
+   *  live host reading instead -- real numbers, about a machine that still
+   *  cannot serve. Pair it with `local_serving`. */
+  budget_basis: 'gpu' | 'host_memory'
+  /** False when nothing here can be launched on these machines whatever the
+   *  verdict says. A verdict you cannot act on must not grow a Serve button. */
+  local_serving: boolean
   measured_at: number
   excluded: { node_id: string; reason: string }[]
   unresolved: { model_id: string; reason: string }[]
   unavailable_reason: string | null
   live: CapacitySide | null
-  static?: CapacitySide
-  /** False when nothing here can be launched on these machines whatever the
-   *  verdict says. A verdict you cannot act on must not grow a Serve button. */
-  local_serving: boolean
+  /** Null under `budget_basis: "host_memory"`: the static ceiling is derived
+   *  from addressable memory, which is 0 on a machine with no GPU on purpose,
+   *  so the whole side would read 0.0 GiB beside rows that say "fits". */
+  static?: CapacitySide | null
 }
 
 export interface MemoryReportList {
@@ -1072,6 +1352,143 @@ export interface CuratedModel {
   detail: string
   default_context: number
   default_concurrency: number
+}
+
+/** One deployment of a model.
+ *
+ *  Plural on a row, because a repository can be served twice under two names
+ *  and collapsing that to one scalar loses the second.
+ *
+ *  Declared here rather than in `tabs/models/rows.ts` because it is now a wire
+ *  shape: `GET /api/models` emits exactly this. `rows.ts` re-exports it so
+ *  every existing import keeps working. */
+export interface RowDeployment {
+  deployment_id: string
+  served_name: string
+  state: DeploymentState
+  runtime: string
+  node_ids: string[]
+  last_error: string | null
+}
+
+/** One provider that serves this model. Facts read off the payload and
+ *  nothing else: no key material, not `api_key_ref`, not anything derived
+ *  from it. */
+export interface RowProvider {
+  provider_id: string
+  display_name: string
+  served_name: string
+  context_length: number | null
+  /** null is "never priced", which is a different fact from priced at zero.
+   *  Never coerce it to 0 — the wire distinguishes them deliberately. */
+  input_cost_per_mtok: number | null
+  output_cost_per_mtok: number | null
+  supports_tools: boolean
+  supports_streaming: boolean
+  healthy: boolean
+  last_error: string | null
+  admitting: boolean | null
+  admission_block: string | null
+  /** The id the allowlist is written in terms of. Optional because the
+   *  legacy `/api/providers` join did not carry it and the registry does. */
+  upstream_id?: string
+  modality?: Modality
+  /** Whether the PROVIDER is switched on, which is not the same question as
+   *  whether this model is in its allowlist — the two are filtered in
+   *  different places server side, so an allowlisted model on a disabled
+   *  provider is listed while nothing routes to it. */
+  provider_enabled?: boolean | null
+}
+
+/** A provider that publishes this model and is NOT serving it.
+ *
+ *  Deliberately its own type, and `ModelRow.offers` deliberately its own
+ *  array, rather than an `enabled` flag on `RowProvider`. `providers` means
+ *  "serves this today" and three things read it that way — the inspector's
+ *  provider facts, `support.ts`, and `rows.check.mjs`. Widening it to mean
+ *  "publishes this" would have changed what all three say without changing a
+ *  type.
+ *
+ *  It carries no health and no admission: nothing is routing to it, so a
+ *  health figure here would describe a path that does not exist. */
+export interface RowOffer {
+  provider_id: string
+  display_name: string
+  /** What it would answer to at `/v1` once switched on. Not in `servedNames`:
+   *  the row does not answer to it yet, and a search that found it there would
+   *  be claiming an endpoint that 404s. */
+  served_name: string
+  /** The id the allowlist is written in terms of. */
+  upstream_id: string
+  context_length: number | null
+  input_cost_per_mtok: number | null
+  output_cost_per_mtok: number | null
+  supports_tools: boolean
+  supports_streaming: boolean
+  modality?: Modality
+}
+
+/** Where the registry found a model. The browser's `Facet` is this plus
+ *  `'hub'`, which the server deliberately never emits: `/api/models/search`
+ *  resolves nothing, so its hits are a query's answer rather than a fact
+ *  about this cluster. */
+export type ModelFacet = 'running' | 'ondisk' | 'catalog' | 'provider' | 'offered'
+
+/** One row of `GET /api/models`.
+ *
+ *  Carries no fit answer. `verdict`, `reason`, `basis`, `predicted_decode_tps`,
+ *  `headroom`, `total_params` and `dtype` are a function of (model, context,
+ *  concurrency, node set) and stay on `/api/capacity`; a copy here would give
+ *  the screen two sources of `verdict` that can disagree. */
+export interface RegistryModel {
+  model_id: string
+  label: string
+  detail: string
+  default_context: number | null
+  default_concurrency: number | null
+  /** Deduplicated, in canonical order, never empty. */
+  where: ModelFacet[]
+  served_names: string[]
+  deployments: RowDeployment[]
+  providers: RowProvider[]
+  offers: RowOffer[]
+  cached_on: string[]
+  /** The largest figure any node reports, never the sum: two node records can
+   *  share one physical cache, and summing would double a download's size. */
+  bytes_on_disk: number | null
+}
+
+/** How one contributing feed is doing.
+ *
+ *  Load-bearing rather than decorative. The Models tab's rule is that a feed
+ *  failing greys nothing and empties nothing — it prints one line naming the
+ *  feed and the server's own sentence. Folding five fetches into one leaves
+ *  the browser with no failed request to notice, so the sentence travels
+ *  here instead. */
+export interface RegistrySource {
+  ok: boolean
+  reason: string | null
+  observed_at?: number | null
+  attempted_at?: number | null
+  rows?: number | null
+  /** Only on `cache`: which nodes could be read. A node that could not be
+   *  read is not a node holding nothing. */
+  nodes?: {
+    node_id: string
+    available: boolean
+    reason: string | null
+    observed_at: number | null
+    attempted_at: number | null
+  }[]
+}
+
+/** `GET /api/models` — every model this cluster knows about, from one place. */
+export interface ModelRegistryResponse {
+  models: RegistryModel[]
+  sources: Record<string, RegistrySource>
+  revision: number
+  schema_version: number
+  generated_at: number
 }
 
 /** Present/absent capability facts. When `present` is false every sibling is
@@ -1142,6 +1559,9 @@ export interface RuntimeSupport {
   runtime: string
   level: 'supported' | 'unverified' | 'unsupported'
   reason: string
+  /** The runtime image's own version string, when a probe has run against
+   *  it -- absent on a coordinator with no docker or no image pulled yet. */
+  version: string | null
 }
 
 /** `GET /api/models/detail`. */
@@ -1150,6 +1570,12 @@ export interface ModelDetail {
   revision: string | null
   model_type: string
   architectures: string[]
+  /** Which endpoint family this model answers on, read off its architecture.
+   *  Absent from a gateway that predates the field, and absent is `text` --
+   *  what every model was before audio existed. It decides which runtime the
+   *  Serve panel offers first and which route it says the model will answer
+   *  on, because a speech model on `vllm` is refused, not merely slow. */
+  modality?: Modality
   max_position_embeddings: number | null
   shape: PlanShape
   is_moe: boolean
@@ -1227,6 +1653,59 @@ export interface QuantVariant {
   headroom: number | null
   reason: string
   predicted_decode_tps: number | null
+  /** What this row was judged at. Null when the fit gate could not judge it at
+   *  all, which is the same condition that leaves `verdict` null. */
+  context: number | null
+  max_seqs: number | null
+  /** The same row against the hardware's own ceiling instead of against what
+   *  is free this second. Additive and NEVER governing: `verdict` and `fits`
+   *  above are still the live answer, so nothing that reads them flips.
+   *
+   *  This pair exists because the table printed two different situations
+   *  identically. "This machine cannot hold it" and "this machine is full
+   *  right now" want different actions from whoever is reading -- buy a
+   *  different box, or go and find what is resident -- and a single
+   *  "will not fit" says neither.
+   *
+   *  Optional: an older coordinator omits them. Under `host_memory` basis
+   *  there is no static side to report at all, because the static ceiling
+   *  derives from addressable memory, which is 0 there on purpose. */
+  static_verdict?: string | null
+  static_fits?: boolean | null
+  static_headroom?: number | null
+  static_reason?: string
+  static_predicted_decode_tps?: number | null
+}
+
+/** What a ladder's rows were sized against.
+ *
+ *  This exists because the answer used to be "one machine, and we are not
+ *  going to tell you which" while the board above the ladder let several be
+ *  ticked -- so the pane apologised in prose for numbers that were quietly
+ *  about something else. The caption states this instead. */
+export interface LadderBasis {
+  /** The machines the rows were sized on -- the PLACEMENT, not everything that
+   *  was ticked. A model that only splits two ways reports two of the three
+   *  boxes somebody checked, because two is where the numbers came from. */
+  nodes: string[]
+  probed_node: string | null
+  /** What the model legally admits over those machines, not how many were
+   *  ticked. Tensor parallelism has to divide the KV heads. */
+  tensor_parallel: number
+  budget_basis: 'gpu' | 'host_memory'
+  local_serving: boolean
+  /** Whether the governing verdicts were taken against a live reading or
+   *  against the static ceiling. False is not an error: `allocatable_map`
+   *  legitimately answers with nothing when no node has a telemetry sample,
+   *  and the fit gate then judges on the ceiling. The caption has to know,
+   *  or it claims a measurement nobody took. */
+  budget_is_live?: boolean
+  /** The binding (smallest) figure across the placement, which is what the
+   *  fit gate actually gates on. `allocatable_per_node` is null when no live
+   *  reading governed; `usable_per_node` is null under `host_memory` basis,
+   *  where a static ceiling would be 0 beside rows that say "fits". */
+  allocatable_per_node?: number | null
+  usable_per_node?: number | null
 }
 
 export interface VariantLadder {
@@ -1239,6 +1718,7 @@ export interface VariantLadder {
   heuristic: boolean
   note: string
   from_cache: boolean
+  sized_on: LadderBasis
 }
 
 
@@ -1349,6 +1829,61 @@ export interface ModelDeleteResult {
 
 /** One node's disk picture. `available: false` is not an empty disk — the
  *  reason says which, and the UI must never render it as free space. */
+/** `GET|POST /api/nodes/{id}/runtime`. A model runtime already listening on a
+ *  node -- an Ollama the operator started there -- which the coordinator can
+ *  adopt as a provider without anybody retyping its address.
+ *
+ *  `detected: null` is the normal answer and is NOT an error: most machines
+ *  are not running a runtime, and a GPU node has no reason to. */
+export interface NodeRuntime {
+  node_id: string
+  detected: DetectedRuntime | null
+  /** Set only when this build could not look at all (a registry with no HTTP
+   *  client). Distinct from `detected: null`, which means we looked and found
+   *  nothing. */
+  reason?: string | null
+  /** The provider this runtime is already registered as, when it is. Non-null
+   *  means there is nothing to adopt and the UI should say which provider it
+   *  is rather than offer a button that would duplicate it. */
+  provider_id?: string | null
+}
+
+export interface DetectedRuntime {
+  kind: ProviderKind
+  base_url: string
+  /** How many models it is holding. `null` when it did not say. 0 is a real
+   *  answer -- a fresh runtime with nothing pulled yet -- and reads
+   *  differently from "it would not tell us". */
+  model_count: number | null
+  /** Every model on the runtime, with whether it is loaded right now. */
+  models?: RuntimeModel[]
+  /** Whether this build can load and unload here, as opposed to only observe.
+   *  The buttons key off this, so a runtime we cannot drive never renders a
+   *  control that would do nothing. */
+  controllable?: boolean
+}
+
+export interface RuntimeModel {
+  name: string
+  /** Bytes on disk -- what the pull cost. */
+  size: number | null
+  /** Bytes in memory while loaded, `null` when it is not. On a CPU-only box
+   *  this is the resident footprint rather than VRAM, which is honestly zero
+   *  there. */
+  resident_bytes: number | null
+  /** `null` means the runtime would not say. Rendered as neither loaded nor
+   *  unloaded, rather than guessing one. */
+  resident: boolean | null
+}
+
+/** `POST /api/nodes/{id}/runtime`. `created: false` means it was already a
+ *  provider, so clicking twice is one provider rather than two. */
+export interface AdoptedRuntime {
+  node_id: string
+  provider_id: string
+  created: boolean
+}
+
 export interface NodeStorage {
   node_id: string
   root?: string
@@ -1627,31 +2162,99 @@ export interface ShellStatus {
   idle_timeout_s: number
 }
 
-/** `GET /api/setup`. Whether this coordinator has been set up, and the one
- *  machine the first screen is about.
+/** One transfer the coordinator is running, or has just finished.
  *
- *  `completed` is derived on the server, not merely a stored flag: a cluster
- *  that is serving a model or has a provider configured is set up whatever the
- *  flag says, which is what stops a wiped data directory dropping a working
- *  cluster back into onboarding. `reason` is that derivation in words, and is
- *  the answer to "why am I not being offered setup".
+ *  These arrive from `GET /api/activity` while a pull is in flight. The
+ *  provider streams `completed` alongside `total` the whole way down; before
+ *  this existed the control plane read those frames and discarded them, so a
+ *  download was one number reported once and then silence until the catalogue
+ *  happened to refresh. */
+export interface DownloadActivity {
+  pull_id: string
+  provider_id: string
+  /** The provider's display name, already resolved server-side. */
+  provider: string
+  model: string
+  completed: number
+  /** null until the upstream reports one. Never 0 -- a download of unknown
+   *  size and a download of no size are different answers, and only one of
+   *  them can honestly draw a bar. */
+  total: number | null
+  /** The upstream's own word for what it is doing ("pulling manifest",
+   *  "verifying sha256 digest"), passed through unchanged. */
+  status: string
+  error: string | null
+  done: boolean
+}
+
+/** A model that is starting but not yet serving.
  *
- *  `machine` is null on an ambiguous roster rather than a guess. The server
- *  will only name a machine it can identify -- an authoritative local node id,
- *  or a roster of exactly one -- because the first screen introduces this
- *  machine's hardware and naming the wrong one is a lie the reader cannot
- *  check. */
-export interface SetupStatus {
-  completed: boolean
-  reason: string
-  machine: NodeStateDTO | null
-  cluster: { nodes: number; healthy: number }
-  deployments: number
-  providers: number
-  /** False when no provider kind can be added and routed to. The cloud step is
-   *  then not rendered at all -- not disabled, not explained. A step nobody can
-   *  take is noise on the one screen where every word is read. */
-  provider_routing: boolean
+ *  This used to say a launch carried no percentage and never would, because
+ *  the runtime container is where the work happens and the control plane
+ *  cannot see inside it. The second half was never true: `sparkrun logs`
+ *  reaches that container, the manager reads it while the launch is in
+ *  flight, and the runtime narrates itself in there -- including a checkpoint
+ *  loader that counts its own shards. What survives from the old rule is the
+ *  part that mattered: `fraction` is null unless something measured it, and
+ *  the download, the compile and the graph capture all still report none. */
+export interface LaunchActivity {
+  deployment_id: string
+  served_name: string
+  model_id: string | null
+  runtime: string
+  state: string
+  node_ids: string[]
+  /** Which slow step it is on: 'preparing' | 'downloading' | 'loading' |
+   *  'starting'. Null before anything has been read, and deliberately not
+   *  narrowed to a union here -- the server owns this vocabulary
+   *  (control_plane/deploy/progress.py) and a UI that fails to compile
+   *  against a phase it has not heard of would be worse than one that shows
+   *  the sentence and no tick. */
+  phase: string | null
+  /** The sentence sparkrun or the runtime printed about what it is doing
+   *  ('Pulling image: ...', 'Loading safetensors checkpoint shards: 5/11'),
+   *  passed through unchanged. '' when nothing has been said yet. */
+  status: string
+  /** 0..1 only while the runtime is counting its own checkpoint shards, null
+   *  the rest of the time. Not interchangeable with 0. */
+  fraction: number | null
+  /** Seconds left, as the program doing the work estimated them about itself:
+   *  the model downloader and the checkpoint loader are both tqdm bars and
+   *  both print their own remaining time. Null for every step that counts
+   *  nothing — the image pull, the compile, the graph capture — and never
+   *  derived here from a rate. An estimate is planned around, so it may only
+   *  come from the thing being estimated. */
+  eta_s: number | null
+  /** The runtime said it was dying, in `status`. The manager fails the launch
+   *  on the same reading, so this is true only for the moment between the two
+   *  — long enough that the row must not draw it as ordinary progress. */
+  fatal: boolean
+  /** When this coordinator first saw it launching -- not when the launch
+   *  began. `Deployment.started_at` is null until the READY transition, so
+   *  there is no launch timestamp to report and this does not claim to be one.
+   *  After a restart it is when the coordinator came back. */
+  since: number
+  last_error: string | null
+}
+
+/** `GET /api/deployments/{id}/logs`. What the launcher and the backend said.
+ *
+ *  `source` is the cost of the answer, and the screen has to respect it:
+ *  `buffer` is the coordinator's own memory of a launch it is streaming right
+ *  now and may be polled; `read` is one bounded `sparkrun logs` for a
+ *  deployment nothing is following any more, and must be asked for, not
+ *  timed. `none` is a deployment with nothing to show, `unavailable` a
+ *  control plane that cannot show one at all — different answers, because one
+ *  of them is a backend that printed nothing. */
+export interface DeploymentLogs {
+  lines: string[]
+  source: 'buffer' | 'read' | 'none' | 'unavailable'
+  cluster_id?: string | null
+}
+
+export interface Activity {
+  downloads: DownloadActivity[]
+  launches: LaunchActivity[]
 }
 
 /** `GET /api/setup`. Whether this coordinator has been set up, and the one

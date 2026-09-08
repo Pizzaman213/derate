@@ -21,6 +21,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from control_plane import fsutil
+
 log = logging.getLogger(__name__)
 
 ROSTER_FILE = "registry.json"
@@ -70,7 +72,7 @@ def save_roster(data_dir: Path, members: dict, candidates: dict) -> None:
             json.dump(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_path, 0o600)
+        fsutil.harden_path(tmp_path)
         os.replace(tmp_path, path)
     except OSError as exc:
         log.warning(

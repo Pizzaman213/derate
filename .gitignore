@@ -28,6 +28,9 @@ ui/.vite/
 !.env.example
 secrets.json
 data/
+# node.log, proxy.log and their rotations. paths.py::logs_dir() puts them here
+# -- next to the code, where somebody debugging is already standing.
+logs/
 *.pem
 *.key
 

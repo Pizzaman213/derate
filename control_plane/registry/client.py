@@ -13,6 +13,11 @@ from .errors import ProbeFailed
 
 log = logging.getLogger(__name__)
 
+# One client, shared for the coordinator's lifetime, talking to every node
+# agent in the cluster. httpx's own default (100/20) is sized for a general
+# web client, not a fleet of agents this coordinator itself controls.
+_MAX_CONNECTIONS = 64
+
 
 class AgentClient(Protocol):
     """What the registry needs from the outside world. Nothing more."""
@@ -38,7 +43,12 @@ class HttpAgentClient:
         if self._client is None:
             import httpx
 
-            self._client = httpx.AsyncClient()
+            self._client = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=_MAX_CONNECTIONS,
+                    max_keepalive_connections=_MAX_CONNECTIONS,
+                )
+            )
         return self._client
 
     async def get_json(self, url: str, timeout: float) -> dict:

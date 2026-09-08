@@ -136,6 +136,30 @@ def upstream_unreachable(model: str, detail: str, tried: int) -> JSONResponse:
     )
 
 
+def upstream_pool_exhausted(model: str, tried: int) -> JSONResponse:
+    """503 when the gateway ran out of its own upstream connections.
+
+    Deliberately not `upstream_unreachable`. Nothing was learned about the
+    backend here -- we never got as far as dialling it -- and answering "no
+    upstream is reachable" for a backend that is answering in under a
+    millisecond sends whoever reads it to the wrong machine. That is exactly
+    what happened on 2026-09-08: a leak filled the pool, every model started
+    reporting its backend unreachable, and the backends were all fine.
+
+    Retryable and short: the slot frees when an in-flight request finishes.
+    """
+    attempts = "1 target" if tried == 1 else f"{tried} targets"
+    return error_response(
+        503,
+        f"The gateway has no free upstream connection for '{model}' "
+        f"(tried {attempts}). Every connection is held by a request already in "
+        "flight. Retry shortly; the backends themselves are not implicated.",
+        "server_error",
+        "upstream_pool_exhausted",
+        headers={"Retry-After": "5"},
+    )
+
+
 def _scrub(text: str, redactor) -> str:
     """Run a diagnostic through the provider redactor before it leaves.
 

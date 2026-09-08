@@ -12,6 +12,7 @@ import dataclasses
 
 import asyncio
 import json
+import os
 import socket
 import threading
 import time
@@ -175,7 +176,16 @@ class FakeDeployments:
         self.deployments = list(deployments or [])
         self.launched = []
 
-    def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=Modality.TEXT):
+    def launch(
+        self, shape, plan, fit, runtime, ctx, max_seqs, *,
+        modality=Modality.TEXT, extra_args=(), custom_command=(),
+    ):
+        if extra_args and custom_command:
+            raise ValueError(
+                "extra_args and custom_command are mutually exclusive: extra_args "
+                "appends to the generated serve command, custom_command replaces "
+                "it, and a request cannot mean both at once"
+            )
         dep = make_deployment(
             f"d-new-{len(self.launched) + 1}",
             shape.model_id,
@@ -183,6 +193,8 @@ class FakeDeployments:
             state=DeploymentState.LAUNCHING,
             context_length=ctx,
             max_concurrent_seqs=max_seqs,
+            extra_args=tuple(extra_args),
+            custom_command=tuple(custom_command),
         )
         self.launched.append(dep)
         self.deployments.append(dep)
@@ -264,6 +276,8 @@ def make_deployment(
     kv_cache_bytes=12 * GIB,
     shape_key="llama-3.3-70b",
     modality=Modality.TEXT,
+    extra_args=(),
+    custom_command=(),
 ) -> Deployment:
     fit = fits()
     fit.predicted_decode_tps = predicted_tps
@@ -287,6 +301,8 @@ def make_deployment(
         started_at=1757193600.0,
         last_error=None,
         modality=modality,
+        extra_args=tuple(extra_args),
+        custom_command=tuple(custom_command),
     )
 
 
@@ -378,6 +394,12 @@ class FakeBackend:
         self.headers: list[dict] = []
         # Raw multipart bodies, kept unparsed. See _transcriptions.
         self.uploads: list[bytes] = []
+        # Raw JSON bodies, kept unparsed alongside the parsed `requests` list,
+        # so a test can tell a re-serialization from a verbatim forward.
+        self.raw_bodies: list[bytes] = []
+        # Full URLs of GETs to /v1/audio/voices, so a test can prove the
+        # gateway asked the backend rather than answering from a guess.
+        self.voice_requests: list[str] = []
         # Set to a threading.Event to block responses. Only requests whose
         # body carries HOLD_MARKER wait on it, so a test can hold one request
         # open while still probing the gateway with others.
@@ -388,6 +410,7 @@ class FakeBackend:
                 Route("/v1/completions", self._chat, methods=["POST"]),
                 Route("/v1/embeddings", self._embeddings, methods=["POST"]),
                 Route("/v1/audio/speech", self._speech, methods=["POST"]),
+                Route("/v1/audio/voices", self._voices, methods=["GET"]),
                 Route(
                     "/v1/audio/transcriptions", self._transcriptions, methods=["POST"]
                 ),
@@ -395,7 +418,9 @@ class FakeBackend:
         )
 
     async def _record(self, request):
-        body = await request.json()
+        raw = await request.body()
+        self.raw_bodies.append(raw)
+        body = json.loads(raw)
         self.requests.append(body)
         self.headers.append(dict(request.headers))
         return body
@@ -470,15 +495,37 @@ class FakeBackend:
             headers={"content-disposition": 'attachment; filename="speech.mp3"'},
         )
 
+    async def _voices(self, request):
+        """The tts runtime's own envelope, `skipped` included.
+
+        `skipped` is the server saying which clips it declined and why -- a
+        clip with no transcript beside it, or one over the reference limit --
+        and the gateway forwarding it unaltered is what this exists to pin.
+        """
+        self.voice_requests.append(str(request.url))
+        return JSONResponse(
+            {
+                "object": "list",
+                "data": [{"id": "af"}, {"id": "narrator"}],
+                "skipped": ["ambient.wav: no ambient.txt beside it"],
+            }
+        )
+
     async def _sse(self):
         import asyncio
 
+        if self.first_chunk_delay:
+            await asyncio.sleep(self.first_chunk_delay)
         if self.die_before_first_chunk:
             # Headers are already on the wire; dropping here is what a node
             # that dies during prefill looks like from the gateway's side.
+            #
+            # The delay runs FIRST so the two compose: stalling past
+            # `upstream_header_hold_s` and then dying is the case where the
+            # gateway has committed a status line and the client still has
+            # zero body bytes. Ordering these the other way round only ever
+            # produced the easy case, where the hold has not yet expired.
             raise RuntimeError("backend died during prefill")
-        if self.first_chunk_delay:
-            await asyncio.sleep(self.first_chunk_delay)
         for i in range(self.chunks):
             if self.chunk_delay:
                 await asyncio.sleep(self.chunk_delay)
@@ -577,17 +624,30 @@ class PullableProviders(FakeProviders):
     which is the only hook the memory gate has.
     """
 
-    def __init__(self, providers=None, *, size=0, raises=None):
+    def __init__(self, providers=None, *, size=0, raises=None, frames=None):
         super().__init__(providers)
         self.size = size
         self.raises = raises
         self.pulled = []
+        #: Frames to replay through on_progress, as the real stream does.
+        self.frames = frames or []
+        #: Held open, a transfer can be inspected while it is still running --
+        #: which is the only state /api/activity exists to report, and one that
+        #: a fake completing instantly can never produce.
+        self.gate = asyncio.Event()
+        self.gate.set()
+        self.started = asyncio.Event()
 
-    async def pull(self, provider_id, model, *, on_size=None):
+    async def pull(self, provider_id, model, *, on_size=None, on_progress=None):
         if self.raises is not None:
             raise self.raises
         if on_size is not None and self.size:
             on_size(self.size)
+        self.started.set()
+        for frame in self.frames:
+            if on_progress is not None:
+                on_progress(frame)
+        await self.gate.wait()
         self.pulled.append((provider_id, model))
         return {"provider_id": provider_id, "model": model, "digest": "sha256:x"}
 
@@ -674,6 +734,37 @@ def test_a_pull_onto_a_machine_that_never_joined_is_not_refused():
     assert providers.pulled == [("openrouter", "huge:latest")]
 
 
+def test_the_reply_says_whether_a_gate_actually_ran():
+    """`budget_bytes: 0` cannot tell an unjudged pull from a judged one.
+
+    A box that never joined and a box with nothing free both report zero. The
+    first went unweighed; the second was weighed and had no room. Reporting
+    them identically means the screen either invents a measurement that never
+    happened or hides one that did -- and the unmeasured case is the common
+    one, since the kind's own default base_url is loopback, which can never
+    match a roster entry.
+    """
+    deps, _providers, node_id = _pull_setup(size=100 * 1024**2, free_bytes=2 * GIB)
+    with TestClient(create_app(deps)) as client:
+        judged = client.post(
+            "/api/providers/openrouter/pull", json={"model": "small:latest"}
+        ).json()
+    assert judged["gated"] is True
+    assert judged["checked_against"] == node_id
+
+    # Same route, same shape of reply, no measurement behind it.
+    deps, _providers, _ = _pull_setup(
+        size=99 * GIB, free_bytes=GIB, address="10.9.9.9"
+    )
+    deps.registry = FakeRegistry([])
+    with TestClient(create_app(deps)) as client:
+        unjudged = client.post(
+            "/api/providers/openrouter/pull", json={"model": "huge:latest"}
+        ).json()
+    assert unjudged["gated"] is False
+    assert unjudged["free_bytes"] == 0 and unjudged["budget_bytes"] == 0
+
+
 def test_pulling_onto_a_kind_that_hosts_nothing_says_so():
     from control_plane.providers.errors import PullUnsupportedError
 
@@ -696,6 +787,373 @@ def test_a_pull_needs_a_model_name():
         reply = client.post("/api/providers/openrouter/pull", json={"model": "  "})
     assert reply.status_code == 400
     assert reply.json()["error"]["code"] == "model_required"
+
+
+# -- /api/activity ---------------------------------------------------------
+#
+# What is arriving. Before this endpoint a pull was one number in a 202 and
+# then silence, and a launch was up to READY_TIMEOUT_S of `launching` with no
+# figure anywhere -- while the rail beside it said "Nothing is being served."
+
+
+def _reset_activity():
+    """The registry is process-local, so tests must not leak into each other."""
+    from control_plane.gateway import internal_api
+
+    internal_api._DOWNLOADS.clear()
+    internal_api._LAUNCH_SEEN.clear()
+
+
+def test_activity_is_empty_when_nothing_is_arriving():
+    _reset_activity()
+    deps, _, _ = _pull_setup(size=0, free_bytes=GIB)
+    with TestClient(create_app(deps)) as client:
+        reply = client.get("/api/activity")
+    assert reply.status_code == 200
+    assert reply.json() == {"downloads": [], "launches": []}
+
+
+def test_a_running_transfer_reports_how_far_along_it_is():
+    """The whole point: a number that moves, from frames that were discarded."""
+    _reset_activity()
+    deps, providers, _ = _pull_setup(size=4096, free_bytes=GIB)
+    providers.frames = [
+        {"status": "pulling manifest"},
+        {"status": "pulling sha256:ab", "total": 4096, "completed": 1024},
+    ]
+    providers.gate.clear()  # hold the transfer open
+    with TestClient(create_app(deps)) as client:
+        accepted = client.post(
+            "/api/providers/openrouter/pull", json={"model": "qwen2.5:0.5b"}
+        )
+        assert accepted.status_code == 202, accepted.text
+        pull_id = accepted.json()["pull_id"]
+        assert pull_id, "an accepted transfer must be addressable"
+
+        body = client.get("/api/activity").json()
+
+    assert len(body["downloads"]) == 1
+    row = body["downloads"][0]
+    assert row["pull_id"] == pull_id
+    assert row["model"] == "qwen2.5:0.5b"
+    assert row["completed"] == 1024
+    assert row["total"] == 4096
+    # The upstream's own sentence, not a paraphrase of it.
+    assert row["status"] == "pulling sha256:ab"
+    assert row["done"] is False
+    assert row["error"] is None
+
+
+def test_a_transfer_with_no_size_yet_reports_no_total_rather_than_zero():
+    """A download nothing has measured is not a download of nothing.
+
+    `total: 0` would draw a full, solid, empty bar and state a measurement that
+    never happened. The UI's ProportionBar draws null and 0 differently on
+    exactly this rule.
+    """
+    _reset_activity()
+    deps, providers, _ = _pull_setup(size=4096, free_bytes=GIB)
+    providers.frames = [{"status": "pulling manifest"}]
+    providers.gate.clear()
+    with TestClient(create_app(deps)) as client:
+        client.post("/api/providers/openrouter/pull", json={"model": "m"})
+        row = client.get("/api/activity").json()["downloads"][0]
+    # The gate saw a size, so this one has a total. What must never appear is a
+    # completed count invented before a frame reported one.
+    assert row["completed"] == 0
+    assert row["status"] == "pulling manifest"
+
+
+def test_a_pull_that_downloaded_nothing_is_not_listed_as_a_transfer():
+    """Already upstream means no transfer, so there is nothing to show."""
+    _reset_activity()
+    deps, _, _ = _pull_setup(size=0, free_bytes=GIB)
+    with TestClient(create_app(deps)) as client:
+        accepted = client.post("/api/providers/openrouter/pull", json={"model": "m"})
+        assert accepted.json()["state"] == "present"
+        assert accepted.json()["pull_id"] is None
+        assert client.get("/api/activity").json()["downloads"] == []
+
+
+def test_a_refused_pull_never_appears():
+    """A refusal downloaded nothing. A bar for it would be a bar for a
+    transfer that was stopped at its first byte."""
+    _reset_activity()
+    deps, _, _ = _pull_setup(size=3 * GIB, free_bytes=GIB)
+    with TestClient(create_app(deps)) as client:
+        refused = client.post("/api/providers/openrouter/pull", json={"model": "m"})
+        assert refused.status_code == 409
+        assert client.get("/api/activity").json()["downloads"] == []
+
+
+def test_a_failed_transfer_says_so_instead_of_disappearing():
+    """The case that cost somebody four minutes of debugging their own code.
+
+    A download that stops has to say it stopped. Vanishing silently is the
+    behaviour this whole surface exists to end.
+    """
+    _reset_activity()
+    deps, providers, _ = _pull_setup(size=4096, free_bytes=GIB)
+
+    async def explode(provider_id, model, *, on_size=None, on_progress=None):
+        on_size(4096)
+        raise RuntimeError("connection reset by peer")
+
+    providers.pull = explode
+    with TestClient(create_app(deps)) as client:
+        assert client.post(
+            "/api/providers/openrouter/pull", json={"model": "m"}
+        ).status_code == 202
+        rows = client.get("/api/activity").json()["downloads"]
+
+    assert len(rows) == 1
+    assert rows[0]["done"] is True
+    assert "connection reset by peer" in rows[0]["error"]
+
+
+def test_a_transfer_cut_off_partway_is_not_reported_as_finished():
+    """Found live, and the reason this check exists at all.
+
+    A truncated stream ends CLEANLY: the upstream closes the connection, the
+    frame loop runs out of lines, and the background task returns with no
+    exception. Treating "it did not raise" as "the weights arrived" filled the
+    bar to 4.00/4.00 GiB for a transfer that was watched stopping at 0.30 GiB
+    -- a completed download that never happened, which is the exact invented
+    figure this whole surface exists to avoid printing.
+    """
+    _reset_activity()
+    deps, providers, _ = _pull_setup(size=4 * GIB, free_bytes=100 * GIB)
+
+    async def cut_off(provider_id, model, *, on_size=None, on_progress=None):
+        on_size(4 * GIB)
+        on_progress({"status": "pulling sha256:ab", "total": 4 * GIB,
+                     "completed": 300 * 1024**2})
+        # and then the far end simply stops talking. No exception.
+        return {"provider_id": provider_id, "model": model, "digest": ""}
+
+    providers.pull = cut_off
+    with TestClient(create_app(deps)) as client:
+        client.post("/api/providers/openrouter/pull", json={"model": "m"})
+        row = client.get("/api/activity").json()["downloads"][0]
+
+    assert row["error"], "a transfer that stopped partway must say so"
+    assert "0.3 GiB of 4.0 GiB" in row["error"]
+    # The figure it actually reached, never rounded up to the total.
+    assert row["completed"] == 300 * 1024**2
+
+
+def test_a_last_frame_a_few_bytes_short_still_counts_as_finished():
+    """The other half of the same judgement. Reported sizes jitter, and a bar
+    frozen at 99.98% forever reads as a hang."""
+    _reset_activity()
+    deps, providers, _ = _pull_setup(size=4 * GIB, free_bytes=100 * GIB)
+
+    async def almost(provider_id, model, *, on_size=None, on_progress=None):
+        on_size(4 * GIB)
+        on_progress({"total": 4 * GIB, "completed": 4 * GIB - 512})
+        return {"provider_id": provider_id, "model": model, "digest": "sha256:x"}
+
+    providers.pull = almost
+    with TestClient(create_app(deps)) as client:
+        client.post("/api/providers/openrouter/pull", json={"model": "m"})
+        row = client.get("/api/activity").json()["downloads"][0]
+
+    assert row["error"] is None
+    assert row["completed"] == row["total"]
+
+
+def test_a_provider_that_reports_only_a_total_is_not_called_truncated():
+    """No `completed` frame at all is no evidence either way, and must not be
+    read as evidence of a transfer that was cut off."""
+    _reset_activity()
+    deps, providers, _ = _pull_setup(size=4 * GIB, free_bytes=100 * GIB)
+
+    async def silent(provider_id, model, *, on_size=None, on_progress=None):
+        on_size(4 * GIB)
+        on_progress({"status": "pulling"})
+        return {"provider_id": provider_id, "model": model, "digest": "sha256:x"}
+
+    providers.pull = silent
+    with TestClient(create_app(deps)) as client:
+        client.post("/api/providers/openrouter/pull", json={"model": "m"})
+        row = client.get("/api/activity").json()["downloads"][0]
+
+    assert row["error"] is None
+
+
+def _every_state():
+    """One deployment per lifecycle state, so the filter is asked about all of
+    them rather than the two that happened to be in a fixture."""
+    return FakeDeployments(
+        [
+            make_deployment(f"d-{state.value}", state.value,
+                            backend_url="http://spark-01:8000/v1", state=state)
+            for state in DeploymentState
+        ]
+    )
+
+
+def test_only_a_model_that_is_arriving_counts_as_activity():
+    """A launch is up to half an hour with no number on any screen -- but a
+    model that is serving, stopping or finished is not arriving, and the rail's
+    other sections already describe those."""
+    _reset_activity()
+    deps = build_deps(deployments=_every_state())
+    with TestClient(create_app(deps)) as client:
+        body = client.get("/api/activity").json()
+
+    listed = {row["deployment_id"] for row in body["launches"]}
+    arriving = {DeploymentState.PLANNED, DeploymentState.LAUNCHING}
+    for state in DeploymentState:
+        dep_id = f"d-{state.value}"
+        if state in arriving:
+            assert dep_id in listed, f"{state.value} is arriving and must be listed"
+        else:
+            assert dep_id not in listed, f"{state.value} is not arriving"
+    # A degraded model is up and serving badly, which the plan and routing
+    # sections already report. Pinned because it is the tempting mistake.
+    assert "d-degraded" not in listed
+
+
+def test_a_launch_carries_no_percentage_of_its_own():
+    """A deployment record measures nothing, and this endpoint invents nothing.
+
+    The phase fields below come from the manager reading the launcher and the
+    backend's log. A port that does not offer them -- every stub, and this
+    fake -- reports no phase and no fraction, which is what the screen drew
+    before there was one. What must never appear is a figure derived here from
+    a record that contains no measurement.
+    """
+    _reset_activity()
+    deps = build_deps(deployments=_every_state())
+    with TestClient(create_app(deps)) as client:
+        launches = client.get("/api/activity").json()["launches"]
+    assert launches, "the fixture is expected to have something launching"
+    for row in launches:
+        assert "completed" not in row
+        assert "total" not in row
+        assert "progress" not in row
+        assert row["phase"] is None
+        assert row["status"] == ""
+        assert row["fraction"] is None
+        # `since` is when this coordinator first saw it, not when it launched:
+        # Deployment.started_at is None until READY, so there is no launch
+        # timestamp to report and the field does not claim to be one.
+        assert row["since"] > 0
+
+
+def test_a_launch_reports_the_phase_the_manager_read():
+    """The other half: when the manager has read one, it reaches the screen.
+
+    Verbatim, including the runtime's own shard count -- that pair is the one
+    measurement anything in a launch reports, and re-deriving or rounding it
+    here would replace a fact with an estimate.
+    """
+    _reset_activity()
+    deployments = _every_state()
+    launching = "d-%s" % DeploymentState.LAUNCHING.value
+    deployments.progress = lambda: {
+        launching: {
+            "phase": "loading",
+            "status": "Loading safetensors checkpoint shards:  50% Completed | 1/2",
+            "fraction": 0.5,
+            "source": "runtime",
+        }
+    }
+    with TestClient(create_app(build_deps(deployments=deployments))) as client:
+        rows = client.get("/api/activity").json()["launches"]
+
+    row = next(r for r in rows if r["deployment_id"] == launching)
+    assert row["phase"] == "loading"
+    assert row["status"] == "Loading safetensors checkpoint shards:  50% Completed | 1/2"
+    assert row["fraction"] == 0.5
+    # A deployment the manager said nothing about is not given somebody else's
+    # phase.
+    others = [r for r in rows if r["deployment_id"] != launching]
+    assert others, "the fixture is expected to have more than one arriving"
+    assert all(r["phase"] is None for r in others)
+
+
+def test_the_log_route_says_which_source_answered():
+    """The sheet has to know what it may poll.
+
+    `buffer` is the coordinator repeating lines it is already streaming and
+    costs nothing; `read` is one bounded `sparkrun logs`, which follows and
+    has to be cut off, so it is fetched on a click and never on a timer. A
+    route that returned lines without saying which would get the expensive one
+    polled every two seconds.
+    """
+    _reset_activity()
+    deployments = _every_state()
+    launching = "d-%s" % DeploymentState.LAUNCHING.value
+    deployments.log_tail = lambda deployment_id, limit=500: (
+        {"lines": ["[2/6] Building image", "Capturing CUDA graphs"], "source": "buffer"}
+        if deployment_id == launching
+        else {"lines": [], "source": "none"}
+    )
+    with TestClient(create_app(build_deps(deployments=deployments))) as client:
+        body = client.get("/api/deployments/%s/logs" % launching).json()
+        missing = client.get("/api/deployments/d-nope/logs")
+
+    assert body["source"] == "buffer"
+    assert body["lines"][0] == "[2/6] Building image"
+    # A deployment that is not here is a 404, not an empty log -- which would
+    # read as a backend that printed nothing.
+    assert missing.status_code == 404
+
+
+def test_a_control_plane_that_cannot_read_a_log_says_so():
+    """`unavailable` and `none` are different answers.
+
+    One is a stub port with no way to reach a container; the other is a real
+    one with nothing to show. Collapsing them would tell somebody their
+    backend printed nothing when in fact nobody looked.
+    """
+    _reset_activity()
+    deployments = _every_state()  # no log_tail on this fake
+    with TestClient(create_app(build_deps(deployments=deployments))) as client:
+        body = client.get(
+            "/api/deployments/d-%s/logs" % DeploymentState.LAUNCHING.value
+        ).json()
+    assert body == {"lines": [], "source": "unavailable"}
+
+
+def test_a_manager_that_cannot_report_a_phase_does_not_break_the_endpoint():
+    """The activity rail is the one screen that draws during an incident.
+
+    `progress` is reached through a getattr, so a port without it degrades --
+    and one that raises must degrade the same way rather than take the whole
+    payload down, including the downloads beside it.
+    """
+    _reset_activity()
+    deployments = _every_state()
+
+    def angry():
+        raise RuntimeError("the manager is wedged")
+
+    deployments.progress = angry
+    with TestClient(create_app(build_deps(deployments=deployments))) as client:
+        body = client.get("/api/activity").json()
+
+    assert body["launches"], "a wedged progress read must not empty the rail"
+    assert all(row["phase"] is None for row in body["launches"])
+
+
+def test_activity_is_reachable_even_when_the_ui_is_mounted(tmp_path):
+    """The trap every new route has to be tested against: a StaticFiles mount
+    at "/" answers index.html for anything registered below it."""
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<!doctype html><title>derate</title>")
+    app = create_app(
+        build_deps(),
+        settings=GatewaySettings(cluster_id="c-test", ui_dir=str(ui)),
+    )
+    with TestClient(app) as client:
+        reply = client.get("/api/activity")
+    assert reply.status_code == 200
+    assert reply.headers["content-type"].startswith("application/json")
+    assert "downloads" in reply.json()
 
 
 def test_the_native_api_is_addressed_by_stripping_the_openai_shim():
@@ -746,6 +1204,107 @@ def test_provider_kinds_carries_no_key_material():
     with TestClient(create_app(build_deps())) as client:
         body = client.get("/api/providers/kinds").text
     assert "api_key" not in body and "sk-" not in body
+
+
+# ── The provider mark on the cluster screen ─────────────────────────────────
+
+
+def _logo_app(monkeypatch, tmp_path, body=b"\x89PNG\r\n\x1a\n", content_type="image/png"):
+    """A gateway whose logo fetches are answered from memory, not the network."""
+    from control_plane.providers import logos
+
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    logos_seen = []
+
+    async def fake_fetch(provider):
+        logos_seen.append(provider.provider_id)
+        return (body, content_type) if body else None
+
+    monkeypatch.setattr(logos, "fetch_logo", fake_fetch)
+    import control_plane.gateway.internal_api as api
+
+    monkeypatch.setattr(api, "_LOGOS", logos.LogoCache(tmp_path / "logos"))
+    return create_app(build_deps(providers=FakeProviders([make_provider()]))), logos_seen
+
+
+def test_a_provider_logo_is_served_by_the_coordinator(monkeypatch, tmp_path):
+    """The browser is frequently the one machine with no egress -- a laptop on
+    the lab LAN pointed at a coordinator that has it. So the coordinator
+    fetches and this route serves, rather than the page reaching out."""
+    app, seen = _logo_app(monkeypatch, tmp_path)
+    with TestClient(app) as client:
+        # Cold: an immediate 404 while the fetch is kicked off behind it. A
+        # screen never waits on a picture.
+        first = client.get("/api/providers/openrouter/logo")
+        assert first.status_code == 404
+        for _ in range(50):
+            reply = client.get("/api/providers/openrouter/logo")
+            if reply.status_code == 200:
+                break
+            time.sleep(0.02)
+    assert reply.status_code == 200, reply.text
+    assert reply.headers["content-type"].startswith("image/png")
+    assert reply.content == b"\x89PNG\r\n\x1a\n"
+    assert "max-age" in reply.headers.get("cache-control", "")
+    assert seen == ["openrouter"], "one fetch, not one per request"
+
+
+def test_a_provider_with_no_mark_stays_a_404_and_is_not_refetched(monkeypatch, tmp_path):
+    """404 is an ordinary answer here: the Cluster tab draws a monogram tile
+    underneath, so a miss is simply never painted over. Without the negative
+    cache it would also be a network request per repaint."""
+    app, seen = _logo_app(monkeypatch, tmp_path, body=None)
+    with TestClient(app) as client:
+        for _ in range(30):
+            client.get("/api/providers/openrouter/logo")
+            time.sleep(0.01)
+        final = client.get("/api/providers/openrouter/logo")
+    assert final.status_code == 404
+    assert len(seen) == 1, f"a miss must be remembered, saw {len(seen)} fetches"
+
+
+def test_an_unknown_provider_logo_is_a_404_naming_the_provider(monkeypatch, tmp_path):
+    app, _ = _logo_app(monkeypatch, tmp_path)
+    with TestClient(app) as client:
+        reply = client.get("/api/providers/nope/logo")
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "provider_not_found"
+
+
+def test_the_logo_route_is_reachable_even_when_the_ui_is_mounted(tmp_path):
+    """The trap every new route has to be tested against: a StaticFiles mount
+    at "/" answers index.html for anything registered below it -- and an <img>
+    handed an HTML document renders as a broken picture, not as an error."""
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<!doctype html><title>derate</title>")
+    app = create_app(
+        build_deps(providers=FakeProviders([make_provider()])),
+        settings=GatewaySettings(cluster_id="c-test", ui_dir=str(ui)),
+    )
+    with TestClient(app) as client:
+        reply = client.get("/api/providers/openrouter/logo")
+    assert reply.status_code == 404
+    assert not reply.headers["content-type"].startswith("text/html")
+
+
+def test_the_logo_route_declares_a_path_parameter_not_a_query_field():
+    """The deferred-import convention in this file has demoted a path param to
+    a query field before, which reaches an operator as a 404 that looks exactly
+    like a provider that does not exist."""
+    with TestClient(create_app(build_deps())) as client:
+        spec = client.get("/api/openapi.json").json()
+    params = spec["paths"]["/api/providers/{provider_id}/logo"]["get"]["parameters"]
+    assert [p["in"] for p in params] == ["path"]
+
+
+def test_the_logo_route_answers_without_any_ports_wired():
+    """The day-0 stub provider store has no `get`. This route must resolve a
+    provider the way the rest of the surface does, not assume a richer port."""
+    with TestClient(create_app(GatewayDeps())) as bare:
+        reply = bare.get("/api/providers/openrouter/logo")
+    assert reply.status_code == 404
+    assert reply.status_code != 500
 
 
 def test_startup_does_not_block_on_a_slow_node():
@@ -813,6 +1372,32 @@ def test_unmodified_openai_client_lists_models_and_completes_a_chat():
             )
     assert reply.status_code == 200
     assert reply.json()["choices"][0]["message"]["content"] == "hello"
+
+
+def test_a_local_request_is_forwarded_byte_for_byte():
+    """No model rewrite is needed for a local target, so the client's own
+    bytes should reach the backend unchanged rather than being re-serialized
+    from the parsed dict -- which would reformat this body's spacing and the
+    trailing zero on 1.0."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [make_deployment("d-1", "llama-3.3-70b", backend_url=running.base_url)]
+            )
+        )
+        sent = (
+            b'{"model":  "llama-3.3-70b", "temperature": 1.0, '
+            b'"messages": [{"role": "user", "content": "hello"}]}'
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/chat/completions",
+                content=sent,
+                headers={"content-type": "application/json"},
+            )
+    assert reply.status_code == 200
+    assert backend.raw_bodies[0] == sent
 
 
 def test_client_never_learns_which_node_answered():
@@ -985,6 +1570,111 @@ def test_speech_requests_carry_no_stream_field():
                 "/v1/audio/speech", json={"model": "kokoro", "input": "hi"}
             )
     assert "stream" not in backend.requests[0]
+
+
+def test_voices_are_listed_from_the_deployment_that_has_them():
+    """The one question a caller cannot guess the answer to.
+
+    A voice is a `<name>.wav` beside a `<name>.txt`, an unknown name is
+    refused by design, and until this route existed nothing outside the
+    container could enumerate them -- so the refusal was unanswerable. The
+    runtime's envelope comes back whole, `skipped` included, because that
+    array is the server explaining which clips it declined.
+    """
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [
+                    make_deployment(
+                        "d-1",
+                        "kokoro",
+                        backend_url=running.base_url,
+                        modality=Modality.SPEECH,
+                    )
+                ]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.get("/v1/audio/voices", params={"model": "kokoro"})
+    assert reply.status_code == 200
+    body = reply.json()
+    assert [v["id"] for v in body["data"]] == ["af", "narrator"]
+    # Not summarised, not dropped: the reason a clip was declined is the only
+    # thing that tells somebody how to fix it.
+    assert body["skipped"] == ["ambient.wav: no ambient.txt beside it"]
+    assert backend.voice_requests and backend.voice_requests[0].endswith(
+        "/v1/audio/voices"
+    )
+
+
+def test_voices_needs_a_model_and_refuses_a_text_one():
+    """Both halves of "which deployment", asked before anything is sent.
+
+    The name is a query parameter here rather than a body field, which is the
+    one thing about this route that is not like the others -- so the missing
+    case has to be its own refusal rather than falling out of JSON parsing.
+    And a text model gets the same `wrong_modality` it would get on
+    /v1/audio/speech: the guard is the endpoint's, not the body's.
+    """
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [
+                    make_deployment("d-1", "qwen", backend_url=running.base_url),
+                    make_deployment(
+                        "d-2",
+                        "kokoro",
+                        backend_url=running.base_url,
+                        modality=Modality.SPEECH,
+                    ),
+                ]
+            )
+        )
+        with TestClient(create_app(deps)) as client:
+            missing = client.get("/v1/audio/voices")
+            wrong = client.get("/v1/audio/voices", params={"model": "qwen"})
+            unknown = client.get("/v1/audio/voices", params={"model": "nope"})
+
+    assert missing.status_code == 400
+    assert missing.json()["error"]["code"] == "missing_model"
+
+    assert wrong.status_code == 400
+    err = wrong.json()["error"]
+    assert err["code"] == "wrong_modality"
+    # It names the endpoint that would have worked, which is the whole point
+    # of this refusal existing rather than a bare 400.
+    assert err["correct_endpoint"] == "/v1/chat/completions"
+
+    # A name nothing serves is still a 404 that lists what does, exactly as it
+    # is on every other route. Nothing was reached to find that out.
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "model_not_found"
+    assert not backend.voice_requests
+
+
+def test_a_providers_speech_model_has_no_voice_library_to_list():
+    """Refused with the mechanism, not with somebody else's 404.
+
+    No provider implements this route. Forwarding to one would return whatever
+    their API says about an unknown path, which tells the reader nothing about
+    why derate could not answer -- and the answer is a real one: the clips
+    live on a node, so a model served only from a provider has none here.
+    """
+    provider = make_provider(
+        served_name="tts-1", upstream_id="tts-1", modality=Modality.SPEECH
+    )
+    deps = build_deps(providers=FakeProviders([provider]))
+    with TestClient(create_app(deps)) as client:
+        reply = client.get("/v1/audio/voices", params={"model": "tts-1"})
+
+    assert reply.status_code == 400
+    err = reply.json()["error"]
+    assert err["code"] == "no_local_target"
+    # It says what to do instead, both ways: deploy it here, or send no voice
+    # at all -- which is a real request, and the model speaks in its own.
+    assert "without one" in err["message"]
 
 
 def test_a_speech_model_is_refused_on_the_chat_endpoint():
@@ -1161,6 +1851,21 @@ def test_an_oversized_upload_is_refused_rather_than_buffered():
     assert reply.json()["error"]["code"] == "payload_too_large"
 
 
+def test_an_oversized_json_body_is_refused_rather_than_buffered():
+    """The JSON endpoints get the same cap as the audio upload, for the same
+    reason: a multimodal chat body is not reliably smaller than an upload."""
+    settings = GatewaySettings(max_json_body_bytes=1024)
+    deps = build_deps(settings=settings)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/v1/chat/completions",
+            content=b'{"model": "llama-3.3-70b", "pad": "' + b"x" * 4096 + b'"}',
+            headers={"content-type": "application/json"},
+        )
+    assert reply.status_code == 413
+    assert reply.json()["error"]["code"] == "payload_too_large"
+
+
 def test_a_transcription_model_is_refused_on_the_speech_endpoint():
     """The two audio families are distinct from each other, not just from text."""
     deps = build_deps(
@@ -1246,6 +1951,198 @@ def test_a_remote_transcription_gets_the_provider_name_for_the_model():
     assert b'name="model"\r\n\r\nwhisper-1\r\n' in sent
     assert b"whisper-1-1" not in sent  # spliced, not appended to
     assert audio in sent
+
+
+# ---------------------------------------------------------------------------
+# the round trip, against real models
+#
+# Everything above proves the gateway forwards an upload without touching it.
+# None of it proves a word ever comes back: the backend is a fixture that
+# answers a constant, and it would answer the same constant if the runtime on
+# the other end could not decode audio at all -- which, until
+# docker/audio.Dockerfile, is exactly what the pinned vLLM image could not do.
+#
+# So this one uses no fixture. derate's own tts runtime says a sentence,
+# Whisper reads it back, and both are launched through the ordinary API by the
+# ordinary planner and fit gate. The reference clip is generated rather than
+# committed, which is why there is no .wav in this repository: the two audio
+# endpoints are each other's test data.
+# ---------------------------------------------------------------------------
+
+#: Common words, and the project's own line. A rarer sentence would test the
+#: vocabulary of whatever checkpoint is loaded rather than the path through
+#: the gateway.
+SPOKEN = "the link is measured, not assumed"
+
+#: Where a coordinator is, if one is running. Same convention as the UI
+#: verifiers' DERATE_CHECK_ORIGIN: this test drives the real HTTP API the way
+#: an operator would, rather than assembling a control plane in-process.
+E2E_ORIGIN = os.environ.get("DERATE_E2E_ORIGIN", "http://localhost:8088")
+
+#: A clip kept between runs, so a reroll of the Whisper half does not pay for
+#: the tts launch again. Delete it to re-record.
+E2E_AUDIO = os.environ.get("DERATE_TEST_AUDIO", "")
+
+
+def _words(text: str) -> set[str]:
+    """Casefolded words, punctuation stripped.
+
+    The assertion is a word set and not an equality: Whisper capitalises and
+    punctuates to its own taste, and the reference here is synthetic speech.
+    Comparing strings would make this a test of transcript formatting, which
+    is not the claim -- the claim is that the words survived the round trip.
+    """
+    return {w.strip(".,!?;:\"'").casefold() for w in text.split()} - {""}
+
+
+def _deployments(origin: str) -> list[dict]:
+    reply = httpx.get(origin + "/api/deployments", timeout=30)
+    reply.raise_for_status()
+    return reply.json()
+
+
+#: A launch that died because the cluster could not get the image. Narrow on
+#: purpose: this is the one launch failure that is a fact about the machines
+#: rather than about the code, and everything else must stay a failure. Both
+#: model images derate publishes itself are pinned by tag and neither is on a
+#: node until somebody pushes them -- see docker/README.md -- so on a cluster
+#: where that has not happened yet, this test has nothing to say.
+_IMAGE_MISSING = ("manifest unknown", "image distribution failed",
+                  "failed to ensure local image", "pull access denied")
+
+
+def _wait_ready(origin: str, deployment_id: str, timeout: float) -> dict:
+    """Poll until READY, or fail with the record's own last_error.
+
+    A launch is minutes and the interesting failures all happen inside it, so
+    the refusal a person needs is the one the deployment recorded -- not
+    "timed out".
+    """
+    deadline = time.monotonic() + timeout
+    last = {}
+    while time.monotonic() < deadline:
+        rows = [d for d in _deployments(origin) if d["deployment_id"] == deployment_id]
+        if rows:
+            last = rows[0]
+            if last["state"] == "ready":
+                return last
+            if last["state"] in ("failed", "stopped"):
+                why = last.get("last_error") or ""
+                if any(m in why.lower() for m in _IMAGE_MISSING):
+                    pytest.skip("this cluster cannot get the image for %s: %s"
+                                % (deployment_id, why.strip()[:400]))
+                pytest.fail("%s went %s: %s" % (deployment_id, last["state"], why))
+        time.sleep(5)
+    pytest.fail("%s never became ready in %.0fs; last state %r"
+                % (deployment_id, timeout, last.get("state")))
+
+
+def _launch(origin: str, model_id: str, runtime: str) -> dict:
+    """Launch, or skip saying why. A refusal here is not a failing test.
+
+    The fit gate refusing for want of memory on a machine somebody else is
+    using is the expected answer, not a defect: this is one GB10 and the
+    launch is competing with whatever else is on it.
+    """
+    reply = httpx.post(origin + "/api/deployments", timeout=300, json={
+        "model_id": model_id, "runtime": runtime, "concurrency": 1,
+    })
+    if reply.status_code >= 400:
+        error = reply.json().get("error", {})
+        code = error.get("code", reply.status_code)
+        if code in ("live_memory_insufficient", "wont_fit", "launch_failed"):
+            pytest.skip("cannot launch %s here: %s" % (model_id, error.get("message")))
+        pytest.fail("launching %s: %s" % (model_id, reply.text[:2000]))
+    return reply.json()
+
+
+def _stop(origin: str, deployment_id: str) -> None:
+    try:
+        httpx.delete(origin + "/api/deployments/" + deployment_id, timeout=120)
+    except Exception:  # teardown must not mask the reason the test failed
+        pass
+
+
+def _require_coordinator() -> str:
+    origin = E2E_ORIGIN.rstrip("/")
+    try:
+        httpx.get(origin + "/v1/models", timeout=5).raise_for_status()
+    except Exception as exc:
+        pytest.skip("no coordinator on %s (%s); set DERATE_E2E_ORIGIN"
+                    % (origin, type(exc).__name__))
+    return origin
+
+
+def _speak(origin: str, sentence: str) -> bytes:
+    """The reference clip: derate's own tts runtime, through the gateway.
+
+    wav rather than the default mp3 -- both ends read it natively and an
+    encoder in the middle is a second thing that can fail.
+    """
+    if E2E_AUDIO and os.path.exists(E2E_AUDIO):
+        return open(E2E_AUDIO, "rb").read()
+
+    launched = _launch(origin, "Audio8/Audio8-TTS-Preview-0.6b", "tts")
+    dep = launched["deployment_id"]
+    try:
+        record = _wait_ready(origin, dep, timeout=1800)
+        reply = httpx.post(origin + "/v1/audio/speech", timeout=300, json={
+            "model": record["served_name"], "input": sentence,
+            "response_format": "wav",
+        })
+        reply.raise_for_status()
+        clip = reply.content
+    finally:
+        # Sequentially, not side by side. This is one machine, and holding two
+        # checkpoints resident to save a few minutes is how the second launch
+        # gets refused by the fit gate for memory the first one is holding.
+        _stop(origin, dep)
+
+    assert clip.startswith(b"RIFF"), "the speech endpoint did not return a WAV"
+    if E2E_AUDIO:
+        open(E2E_AUDIO, "wb").write(clip)
+    return clip
+
+
+@pytest.mark.slow
+def test_whisper_transcribes_what_the_tts_runtime_just_said():
+    """The words go out through one audio endpoint and come back through the
+    other, and nothing in between is a fixture.
+
+    This is the test that would have caught an image with no audio decoder.
+    Every gate in this project passed that image: the architecture is in
+    vLLM's support table, the fit gate said it fit, the health check said the
+    server was serving and `/v1/models` said it answered transcription. The
+    only thing that fails is asking it to transcribe.
+    """
+    origin = _require_coordinator()
+    clip = _speak(origin, SPOKEN)
+
+    launched = _launch(origin, "openai/whisper-base.en", "vllm")
+    dep = launched["deployment_id"]
+    try:
+        record = _wait_ready(origin, dep, timeout=1800)
+        assert record["modality"] == "transcription", (
+            "launched as %r, so the gateway would keep it off the transcription "
+            "route entirely" % record["modality"]
+        )
+        reply = httpx.post(
+            origin + "/v1/audio/transcriptions", timeout=300,
+            data={"model": record["served_name"]},
+            files={"file": ("spoken.wav", clip, "audio/wav")},
+        )
+    finally:
+        _stop(origin, dep)
+
+    assert reply.status_code == 200, reply.text[:2000]
+    text = reply.json()["text"]
+    assert text.strip(), "a 200 with no text is not a transcription"
+
+    heard, said = _words(text), _words(SPOKEN)
+    assert said <= heard, (
+        "Whisper heard %r; the words it missed from %r were %s"
+        % (text, SPOKEN, sorted(said - heard))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1922,6 +2819,57 @@ def test_routing_endpoint_rejects_an_unknown_policy_and_model():
         ).status_code == 404
 
 
+def test_deleting_a_routing_override_restores_the_auto_policy():
+    """PUT is not its own inverse; only DELETE gets ``auto_selected`` back.
+
+    Anything that pins a policy for the duration of a run -- a load test that
+    wants the router to stop taking turns -- has to be able to put it back
+    exactly, and re-PUTting the resolved policy does not do that.
+    """
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+
+        def config():
+            return next(
+                c for c in client.get("/api/routing").json()
+                if c["served_name"] == "llama-3.3-70b"
+            )
+
+        before = config()
+        assert before["auto_selected"] is True
+
+        pinned = client.put("/api/routing/llama-3.3-70b", json={"policy": "round_robin"})
+        assert pinned.status_code == 200
+        assert pinned.json()["policy"] == "round_robin"
+        assert pinned.json()["auto_selected"] is False
+
+        # What a caller without DELETE is reduced to: restating the policy the
+        # model resolved to before. It leaves the override behind, which is the
+        # whole reason this route exists.
+        restated = client.put(
+            "/api/routing/llama-3.3-70b", json={"policy": before["policy"]}
+        )
+        assert restated.json()["policy"] == before["policy"]
+        assert restated.json()["auto_selected"] is False
+
+        cleared = client.delete("/api/routing/llama-3.3-70b")
+        assert cleared.status_code == 200
+        assert cleared.json()["auto_selected"] is True
+        assert cleared.json()["policy"] == before["policy"]
+        assert cleared.json()["auto_reason"] == before["auto_reason"]
+        assert config()["auto_selected"] is True
+
+
+def test_deleting_a_routing_override_is_idempotent_and_404s_on_an_unknown_model():
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+        first = client.delete("/api/routing/llama-3.3-70b")
+        assert first.status_code == 200
+        assert first.json()["auto_selected"] is True
+        assert client.delete("/api/routing/llama-3.3-70b").status_code == 200
+        gone = client.delete("/api/routing/nope")
+        assert gone.status_code == 404
+        assert "nope" in gone.json()["error"]["message"]
+
+
 def test_routing_endpoint_exposes_live_weights_and_their_source():
     deps = build_deps(deployments=two_unequal_replicas(42.0, 12.0))
     with TestClient(create_app(deps)) as client:
@@ -2352,9 +3300,75 @@ def test_metrics_stream_sustains_its_cadence_to_multiple_subscribers():
         gaps = [b[0] - a[0] for a, b in zip(events, events[1:])]
         assert all(g < interval * 3 for g in gaps), (index, gaps)
         payload = events[-1][1]
-        assert set(payload) == {"ts", "cluster", "nodes", "deployments"}
+        assert set(payload) == {"ts", "cluster", "nodes", "deployments", "remotes"}
         assert payload["deployments"][0]["deployment_id"] == "d-a"
         assert payload["nodes"][0]["node_id"] == "spark-01"
+
+
+def test_a_provider_model_reports_throughput_on_the_same_frame_as_a_deployment():
+    """The cluster screen draws a remote-served name with the same band as a
+    local one and reads both figures off this frame. Joining /api/topology's
+    copy instead would tick five times slower on the same drawing."""
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+
+    stats = StatsRegistry()
+    stats.get("d-a").complete(tokens=100, duration_s=1.0)
+    stats.get("openrouter:qwen/qwen3-30b-a3b").complete(tokens=40, duration_s=1.0)
+
+    hub = MetricsHub(
+        registry=FakeRegistry(),
+        deployments=FakeDeployments(
+            [make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")]
+        ),
+        stats=stats,
+        settings=GatewaySettings(),
+        providers=FakeProviders([make_provider()]),
+    )
+    event = hub.snapshot()
+
+    remote = event["remotes"][0]
+    assert remote["target_id"] == "openrouter:qwen/qwen3-30b-a3b"
+    assert remote["provider_id"] == "openrouter"
+    assert remote["served_name"] == "qwen3-30b-a3b"
+    assert remote["state"] == "healthy"
+    # The same counters under the same names, so one reader can read both.
+    assert set(remote) == (set(event["deployments"][0]) - {"deployment_id"}) | {
+        "target_id",
+        "provider_id",
+        "served_name",
+    }
+
+
+def test_a_provider_model_nobody_has_routed_to_is_not_on_the_frame():
+    """An un-allowlisted key is several hundred models. This payload goes out
+    once a second, and a target with no counter has served nothing."""
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+
+    hub = MetricsHub(
+        registry=FakeRegistry(),
+        deployments=FakeDeployments(),
+        stats=StatsRegistry(),
+        settings=GatewaySettings(),
+        providers=FakeProviders([make_provider()]),
+    )
+    assert hub.snapshot()["remotes"] == []
+
+
+def test_a_coordinator_with_no_provider_port_reports_no_remotes_rather_than_none():
+    """Null is the degraded path -- the source raised -- and must stay
+    distinguishable from a hub wired without providers at all."""
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+
+    hub = MetricsHub(
+        registry=FakeRegistry(),
+        deployments=FakeDeployments(),
+        stats=StatsRegistry(),
+        settings=GatewaySettings(),
+    )
+    assert hub.snapshot()["remotes"] is None
 
 
 def test_the_default_metrics_cadence_is_one_hertz():
@@ -3192,6 +4206,171 @@ def test_the_default_stub_providers_support_patch_and_delete():
 
 
 # ---------------------------------------------------------------------------
+# adding a provider over HTTP: the key travels one way, in the request body
+# ---------------------------------------------------------------------------
+
+
+def _real_providers(tmp_path, env=None):
+    """A real ProviderService over a mocked upstream.
+
+    ``FakeProviders.add`` raises NotImplementedError, which is why POST
+    /api/providers had no HTTP-level coverage at all: neither its 201 body nor
+    its error wrapping was reachable through the fake.
+    """
+    from control_plane.providers import ProviderService, SecretStore
+
+    def handler(request):
+        if request.method == "GET" and request.url.path.endswith("/models"):
+            return httpx.Response(
+                200, json={"data": [{"id": "qwen/qwen3-30b-a3b", "context_length": 32768}]}
+            )
+        return httpx.Response(404, json={"error": {"message": "nope"}})
+
+    return ProviderService(
+        data_path=tmp_path,
+        secrets=SecretStore(tmp_path / "secrets.json", env=env or {}),
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_posting_a_pasted_key_stores_it_and_answers_with_the_reference(tmp_path, caplog):
+    """The key goes up in the body, into secrets.json, and no further."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    providers = _real_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        reply = client.post(
+            "/api/providers", json={"kind": "openrouter", "api_key": SECRET_KEY}
+        )
+
+    assert reply.status_code == 201
+    body = reply.json()
+    assert body["api_key"] == "***"
+    assert body["api_key_ref"] == "DERATE_OPENROUTER_API_KEY"
+
+    assert SECRET_KEY not in reply.text
+    assert SECRET_KEY not in caplog.text
+    stored = json.loads((tmp_path / "secrets.json").read_text())
+    assert stored["DERATE_OPENROUTER_API_KEY"] == SECRET_KEY
+    assert SECRET_KEY not in (tmp_path / "providers.json").read_text()
+
+
+def test_posting_a_key_into_the_reference_field_is_a_400_naming_the_field_that_works(tmp_path):
+    """The refusal an operator actually hits. Tested at the service layer since
+    it was written; the sentence the route wraps around it was not."""
+    providers = _real_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        reply = client.post(
+            "/api/providers", json={"kind": "openrouter", "api_key_ref": SECRET_KEY}
+        )
+
+    assert reply.status_code == 400
+    error = reply.json()["error"]
+    assert error["code"] == "provider_add_failed"
+    assert error["message"].startswith("Could not add provider.")
+    assert "NAME of an environment variable" in error["message"]
+    assert "api_key" in error["message"]
+    # The refusal cannot carry the key it is refusing.
+    assert SECRET_KEY not in reply.text
+
+
+def test_patching_a_key_into_the_reference_field_is_a_400_not_a_500(tmp_path):
+    """POST has caught this since it was written; PATCH had no handler at all,
+    so the same mistake surfaced as a framework 500 with the sentence buried in
+    a traceback instead of a 400 carrying it."""
+    providers = _real_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        added = client.post(
+            "/api/providers", json={"kind": "openrouter", "api_key": SECRET_KEY}
+        )
+        assert added.status_code == 201
+        reply = client.patch(
+            "/api/providers/openrouter", json={"api_key_ref": SECRET_KEY}
+        )
+
+    assert reply.status_code == 400
+    error = reply.json()["error"]
+    assert error["code"] == "provider_update_failed"
+    assert "NAME of an environment variable" in error["message"]
+    assert SECRET_KEY not in reply.text
+
+
+def test_secret_refs_lists_names_and_never_values(tmp_path):
+    """Names are the one part of a secret that is safe to show -- they are
+    already rendered in every provider listing -- and they are what makes
+    naming a reference a choice from what exists."""
+    providers = _real_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        assert client.get("/api/providers/secret-refs").json() == {"refs": []}
+        client.post("/api/providers", json={"kind": "openrouter", "api_key": SECRET_KEY})
+        reply = client.get("/api/providers/secret-refs")
+
+    assert reply.status_code == 200
+    assert reply.json() == {"refs": ["DERATE_OPENROUTER_API_KEY"]}
+    assert SECRET_KEY not in reply.text
+
+
+def test_secret_refs_degrades_when_the_port_keeps_no_secrets():
+    """The stub port has no secret store. A form that cannot autocomplete is
+    not a reason to 500."""
+    with TestClient(create_app()) as client:
+        reply = client.get("/api/providers/secret-refs")
+    assert reply.status_code == 200
+    assert reply.json() == {"refs": []}
+
+
+def test_the_stub_surface_answers_a_pasted_key_with_a_reference_too():
+    """The day-0 build is where somebody first meets the paste field.
+
+    The stub has no secrets file and writes nothing, but it must do the visible
+    half. Dropping ``api_key`` answered 201 with an empty reference and a
+    key_state of "not_needed" -- a paste path that reads as having silently
+    done nothing, on the one surface where nobody has a coordinator to check.
+    """
+    with TestClient(create_app()) as client:
+        reply = client.post(
+            "/api/providers",
+            json={"kind": "openrouter", "api_key": SECRET_KEY},
+        )
+
+    assert reply.status_code == 201
+    body = reply.json()
+    assert body["api_key_ref"] == f"DERATE_{body['provider_id'].upper().replace('-', '_')}_API_KEY"
+    assert body["key_state"] == "set"
+    assert body["api_key"] == "***"
+    assert SECRET_KEY not in reply.text
+
+
+def test_the_stub_surface_refuses_a_key_in_the_reference_field_in_the_same_words():
+    """The screen, not just the storage. A stub that accepts what the real
+    coordinator refuses teaches the add form the opposite lesson: the field
+    learns what it takes from the 400 it comes back as."""
+    with TestClient(create_app()) as client:
+        reply = client.post(
+            "/api/providers",
+            json={"kind": "openrouter", "api_key_ref": SECRET_KEY},
+        )
+
+    assert reply.status_code == 400
+    error = reply.json()["error"]
+    assert error["code"] == "provider_add_failed"
+    assert "NAME of an environment variable" in error["message"]
+    assert SECRET_KEY not in reply.text
+
+
+def test_the_stub_surface_takes_the_kinds_default_base_url():
+    """"Leave it blank for the default" is what the add form offers, and the
+    stub read spec["base_url"] -- so the form's own default path came back as a
+    400 whose message was the word KeyError."""
+    with TestClient(create_app()) as client:
+        reply = client.post("/api/providers", json={"kind": "openrouter"})
+
+    assert reply.status_code == 201
+    assert reply.json()["base_url"] == "https://openrouter.ai/api/v1"
+
+
+# ---------------------------------------------------------------------------
 # plan and deployments: fit_unavailable, runtime_unsupported, launch ValueError
 # ---------------------------------------------------------------------------
 
@@ -3258,11 +4437,72 @@ def test_create_deployment_refuses_an_unsupported_runtime():
     assert deployments.launched == []
 
 
+def test_plan_reflects_an_unsupported_runtime_before_any_launch_is_attempted():
+    """The dry run has to agree with the launch it is drawing a button for.
+
+    Before this, `/api/plan` never asked `supported_by` at all, so the fit box
+    could say "fits, click Serve" about an architecture the runtime does not
+    implement -- and the click always failed with `runtime_unsupported`. The
+    UI has no other signal: `Verdict.tsx` reads exactly `serve.allowed`.
+    """
+
+    class UnsupportingResolver(StubResolver):
+        def supported_by(self, shape, runtime):
+            return False, f"{runtime} has no adapter for this architecture"
+
+    deps = build_deps()
+    deps.resolver = UnsupportingResolver()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/plan",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct", "runtime": "sglang"},
+        )
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["serve"]["allowed"] is False
+    assert body["serve"]["reason"] == "sglang has no adapter for this architecture"
+    # Not overridable: no tick on this screen ever unblocks a runtime that
+    # cannot load the architecture at all.
+    assert body["serve"]["overrides"] == []
+    assert body["serve"]["override_required"] is False
+    # Independent of the fit verdict, which the stub resolver's shape still
+    # passes -- an unsupported architecture is a refusal fit can't see.
+    assert body["fit"]["verdict"] == "fits"
+
+
+def test_create_deployment_refuses_a_sharded_plan_on_a_runtime_that_cannot_shard():
+    """The tts runtime is one process holding one checkpoint.
+
+    A plan carrying TP or PP passes the fit gate -- per-rank arithmetic makes
+    a sharded model fit MORE easily -- so nothing before this point objects.
+    Past it the machines are committed and the same fact becomes a FAILED
+    record with a health timeout in front of it, which is why the refusal is
+    here and is a 400.
+    """
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            # No degrees named: the plan the planner itself chose is PP=2,
+            # which is the case that matters. Nothing the caller typed is
+            # wrong -- the runtime simply cannot run what was planned.
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "runtime": "tts",
+            },
+        )
+    assert reply.status_code == 400, reply.text
+    assert reply.json()["error"]["code"] == "runtime_cannot_shard"
+    assert "cannot shard" in reply.json()["error"]["message"]
+    assert deployments.launched == []
+
+
 def test_create_deployment_maps_a_launch_value_error_to_400():
     """M-11: a launch-time input validation error is a 400, not a 502."""
 
     class RejectingDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=()):
             raise ValueError("model id is not a safe command argument")
 
     deployments = RejectingDeployments()
@@ -3276,6 +4516,64 @@ def test_create_deployment_maps_a_launch_value_error_to_400():
     assert reply.json()["error"]["code"] == "invalid_request"
     assert "not a safe command argument" in reply.json()["error"]["message"]
     assert deployments.launched == []
+
+
+def test_a_launch_onto_a_node_already_running_the_model_is_a_409():
+    """The deployment rule, as the caller sees it.
+
+    502 was the old answer, because DuplicateDeployment reached the catch-all:
+    an operator picking a machine that was already busy with this model got
+    "Launch failed" and a server-error type, as though the coordinator had
+    broken. It is a conflict with what is running, it names its own way out,
+    and an unchanged retry works once that deployment is stopped -- which is
+    the same shape as the live-memory 409 beside it.
+    """
+    from control_plane.deploy import DuplicateDeployment
+
+    running = make_deployment(
+        "d-running", "llama-3.3-70b", backend_url="http://n1:8000/v1"
+    )
+
+    class OccupiedDeployments(FakeDeployments):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=()):
+            raise DuplicateDeployment(running, clash="model")
+
+    deps = build_deps(deployments=OccupiedDeployments())
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+        )
+    assert reply.status_code == 409
+    body = reply.json()
+    assert body["error"]["code"] == "already_deployed"
+    assert body["error"]["type"] == "invalid_request_error"
+    # The manager's sentence, unedited -- it is the only thing on the page that
+    # says which deployment to stop.
+    assert body["error"]["message"] == str(DuplicateDeployment(running, clash="model"))
+    assert "spark-01" in body["error"]["message"]
+    assert body["clash"] == "model"
+    # And the deployment in the way, so the screen can link to it.
+    assert body["conflict"]["deployment_id"] == "d-running"
+    assert body["conflict"]["node_ids"] == ["spark-01"]
+    assert body["plan"] and body["fit"]
+
+
+def test_a_launch_that_really_did_fail_is_still_a_502():
+    """The 409 is keyed on the conflict, not on any exception reaching here."""
+
+    class BrokenDeployments(FakeDeployments):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=()):
+            raise RuntimeError("sparkrun exited 1")
+
+    deps = build_deps(deployments=BrokenDeployments())
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+        )
+    assert reply.status_code == 502
+    assert reply.json()["error"]["code"] == "launch_failed"
 
 
 def test_plan_and_deployment_use_resolve_full_when_the_resolver_exposes_it():
@@ -3538,13 +4836,42 @@ def test_node_payload_is_ineligible_when_device_class_is_unrecognized():
     )
 
 
+def test_a_node_with_no_gpu_is_eligible_rather_than_unconfirmable():
+    """A Raspberry Pi is identified hardware, and the roster used to hedge.
+
+    It reported `device_class: unknown`, which the gateway turned into "cannot
+    confirm this hardware is eligible to join the pool" -- said about a machine
+    the probe had in fact identified, next to real host telemetry it was
+    reporting at the time. A CPU node is eligible: it joins, it is admitted, it
+    can front a provider. What it cannot do is carry a rank, and that refusal
+    belongs to `addressable_memory == 0` and is made where a placement is
+    actually attempted, naming the real reason.
+    """
+    from tests.fixtures import node_state
+
+    deps = build_deps(registry=FakeRegistry([node_state(_no_gpu_profile())]))
+    with TestClient(create_app(deps)) as client:
+        node = client.get("/api/nodes").json()[0]
+    assert node["eligible"] is True
+    assert node["ineligible_reason"] is None
+    assert node["device_class"] == "cpu"
+    # Unchanged, and the reason the tick is still withheld on the Models board.
+    assert node["addressable_memory"] == 0
+
+
 def _no_gpu_profile():
-    """What probe_local returns on a machine with no nvidia-smi: zeroed, never
-    partial. addressable_memory stays 0, so the fit gate still refuses it."""
+    """What probe_local returns on a machine it found no GPU on: zeroed, never
+    partial. addressable_memory stays 0, so the fit gate still refuses it.
+
+    DeviceClass.CPU and not UNKNOWN: the probe looked for nvidia-smi, for an
+    Apple chip, and for NVIDIA hardware the driver would admit to without
+    nvidia-smi, and came back with a fact rather than a gap. UNKNOWN is still
+    what a machine gets when one of those looks was inconclusive.
+    """
     from dataclasses import replace
 
     return replace(
-        make_node_profile(device_class=DeviceClass.UNKNOWN),
+        make_node_profile(device_class=DeviceClass.CPU),
         gpu_name="",
         gpu_count=0,
         total_memory=0,
@@ -3849,6 +5176,131 @@ def test_launch_without_a_dtype_is_untouched_by_the_guard():
             ), body
 
 
+def test_launch_with_extra_args_reaches_the_deployment_manager():
+    """Unlike dtype, extra_args is launch-only but not sizing-relevant, so it
+    is expected to flow straight through to a successful launch."""
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "extra_args": "--quantization modelopt_fp4 --trust-remote-code",
+            },
+        )
+    assert reply.status_code == 201, reply.text
+    assert reply.json()["extra_args"] == [
+        "--quantization", "modelopt_fp4", "--trust-remote-code",
+    ]
+
+
+def test_launch_without_extra_args_is_untouched_by_the_field():
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        for body in (
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "extra_args": None},
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "extra_args": ""},
+        ):
+            reply = client.post("/api/deployments", json=body)
+            assert reply.status_code == 201, body
+            assert reply.json()["extra_args"] == []
+
+
+def test_launch_refuses_a_non_string_extra_args():
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "extra_args": ["--quantization", "modelopt_fp4"],
+            },
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_request"
+
+
+def test_launch_refuses_unparsable_extra_args():
+    """Unbalanced quoting is a 400 naming the parse failure, not a 500."""
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "extra_args": "--foo 'unterminated",
+            },
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_request"
+
+
+def test_launch_forwards_extra_args_to_the_deployment_manager_which_may_reject_them():
+    """The M-22 allowlist itself lives in deploy/recipes.py and is exercised
+    against the real DeploymentManager in test_deploy.py; here only the
+    plumbing is pinned -- a ValueError the manager raises over a token it
+    rejects reaches the caller as a 400 naming it, the same path
+    test_create_deployment_maps_a_launch_value_error_to_400 pins generically."""
+
+    class RejectingOnExtraArgs(FakeDeployments):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, extra_args=(), **kw):
+            assert extra_args == ("--foo;curl",)
+            raise ValueError("extra_args[0] is not safe to substitute into the launch command")
+
+    deps = build_deps(deployments=RejectingOnExtraArgs())
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "extra_args": "--foo;curl",
+            },
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_request"
+    assert "extra_args" in reply.json()["error"]["message"]
+
+
+def test_launch_forwards_custom_command_to_the_deployment_manager():
+    """Same plumbing as extra_args, mirrored for the field that replaces the
+    generated command rather than appending to it."""
+
+    class RecordingDeployments(FakeDeployments):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, custom_command=(), **kw):
+            assert custom_command == ("--gpu-memory-utilization", "0.5")
+            return super().launch(shape, plan, fit, runtime, ctx, max_seqs, custom_command=custom_command, **kw)
+
+    deps = build_deps(deployments=RecordingDeployments())
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "custom_command": "--gpu-memory-utilization 0.5",
+            },
+        )
+    assert reply.status_code == 201, reply.text
+    assert reply.json()["custom_command"] == ["--gpu-memory-utilization", "0.5"]
+
+
+def test_sending_extra_args_and_custom_command_together_is_a_400():
+    deps = build_deps(deployments=FakeDeployments())
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "extra_args": "--quantization modelopt_fp4",
+                "custom_command": "--gpu-memory-utilization 0.5",
+            },
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_request"
+    assert "mutually exclusive" in reply.json()["error"]["message"]
+
+
 def test_a_gguf_model_is_refused_at_launch_by_the_runtime_support_gate():
     """Pins the second layer, which is currently load-bearing by accident.
 
@@ -4132,3 +5584,618 @@ def test_a_machine_with_no_memory_cannot_be_named_as_a_serving_node():
     body = response.json()
     assert body["error"]["code"] == "node_has_no_memory"
     assert body["unusable_node_ids"] == ["unprobed"]
+
+
+def _catalogue_providers(tmp_path, *, count=4):
+    """A real ProviderService whose upstream publishes several models.
+
+    `_real_providers` publishes one and resolves no key, which is right for the
+    add-form tests it was written for and useless for an allowlist: there has
+    to be more on offer than you switch on, or "only the chosen ones" is not
+    something the test can tell apart from "all of them".
+    """
+    from control_plane.providers import ProviderService, SecretStore
+
+    ref, key = "OPENROUTER_API_KEY", "sk-or-v1-catalogueproviderstestkey0123456789"
+
+    def handler(request):
+        if request.method == "GET" and request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={"data": [
+                    {"id": f"vendor/model-{i}", "context_length": 32768}
+                    for i in range(count)
+                ]},
+            )
+        return httpx.Response(404, json={"error": {"message": "nope"}})
+
+    return ProviderService(
+        data_path=tmp_path,
+        secrets=SecretStore(tmp_path / "secrets.json", env={ref: key}),
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_adding_a_provider_adds_no_servable_names_until_two_are_enabled(tmp_path):
+    """The whole feature, end to end over HTTP.
+
+    Adding a provider used to make its entire catalogue servable in one call.
+    Now nothing is, until somebody picks -- and then exactly what they picked.
+    """
+    providers = _catalogue_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        before = {m["id"] for m in client.get("/v1/models").json()["data"]}
+        added = client.post(
+            "/api/providers", json={"kind": "openrouter", "api_key_ref": "OPENROUTER_API_KEY"}
+        )
+        assert added.status_code == 201
+        provider_id = added.json()["provider_id"]
+
+        # Nothing new is servable, and the listing the UI reads shows no models.
+        assert {m["id"] for m in client.get("/v1/models").json()["data"]} == before
+        listed = client.get("/api/providers").json()[0]
+        assert listed["models"] == []
+        assert listed["model_count"] == 0
+
+        # The catalogue is still offered, every row switched off.
+        catalogue = client.get(f"/api/providers/{provider_id}/models").json()
+        assert len(catalogue) >= 2
+        assert not any(m["enabled"] for m in catalogue)
+        assert listed["catalogue_count"] == len(catalogue)
+
+        chosen = [m["upstream_id"] for m in catalogue[:2]]
+        patched = client.patch(
+            f"/api/providers/{provider_id}", json={"enabled_models": chosen}
+        )
+        assert patched.status_code == 200
+
+        # Exactly two new servable names, with no restart.
+        after = {m["id"] for m in client.get("/v1/models").json()["data"]}
+        served = {m["served_name"] for m in catalogue if m["upstream_id"] in chosen}
+        assert after - before == served
+        assert len(after - before) == 2
+
+        # And nothing else from that provider appears in the listing the UI reads.
+        listed = client.get("/api/providers").json()[0]
+        assert {m["upstream_id"] for m in listed["models"]} == set(chosen)
+        assert listed["model_count"] == 2
+        enabled = {m["upstream_id"] for m in
+                   client.get(f"/api/providers/{provider_id}/models").json() if m["enabled"]}
+        assert enabled == set(chosen)
+
+
+def test_models_chosen_reaches_the_wire_through_the_spend_allowlist(tmp_path):
+    """A field not named in `ui_detail._SPEND_KEYS` never arrives.
+
+    That tuple is a copy-by-name allowlist, and `aliases` is the cautionary
+    case: settable and persisted for months while every screen showed nothing,
+    because nothing listed it. This pins the new boolean against that.
+
+    It says what the two counts cannot. `model_count == catalogue_count` holds
+    both for a record that predates the allowlist and for one whose operator
+    switched everything on, and only one of those deserves to be told that
+    nobody ever chose.
+    """
+    providers = _catalogue_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        added = client.post(
+            "/api/providers", json={"kind": "openrouter", "api_key_ref": "OPENROUTER_API_KEY"}
+        )
+        provider_id = added.json()["provider_id"]
+
+        listed = client.get("/api/providers").json()[0]
+        # Chosen, even though the choice was "nothing at all": `add()` writes
+        # an empty frozenset, which is a decision and not the absence of one.
+        assert listed["models_chosen"] is True
+        assert listed["model_count"] == 0
+
+        catalogue = client.get(f"/api/providers/{provider_id}/models").json()
+        client.patch(
+            f"/api/providers/{provider_id}",
+            json={"enabled_models": [m["upstream_id"] for m in catalogue]},
+        )
+        listed = client.get("/api/providers").json()[0]
+        assert listed["models_chosen"] is True
+        # Everything on -- the counts now say exactly what a legacy record's
+        # counts say, and the boolean is the only thing that still differs.
+        assert listed["model_count"] == listed["catalogue_count"] == len(catalogue)
+
+
+def test_enabling_a_model_the_provider_does_not_publish_is_a_400(tmp_path):
+    providers = _catalogue_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        added = client.post(
+            "/api/providers", json={"kind": "openrouter", "api_key_ref": "OPENROUTER_API_KEY"}
+        )
+        reply = client.patch(
+            f"/api/providers/{added.json()['provider_id']}",
+            json={"enabled_models": ["nobody/such-model"]},
+        )
+
+    assert reply.status_code == 400
+    assert "nobody/such-model" in reply.json()["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# upstream connection lifetime
+#
+# The bug this section exists for: on 2026-09-08 the gateway leaked 256 upstream
+# sockets -- exactly `upstream_pool_limit` -- into CLOSE-WAIT and then could not
+# reach any backend at all. Nothing in the suite could see it, because the
+# accounting was correct the whole time: `settle()` is synchronous and ran, so
+# `outstanding` read 0 while every connection was held.
+# ---------------------------------------------------------------------------
+
+
+def test_an_upstream_is_closed_even_from_inside_a_cancelled_scope():
+    """The invariant the leak turned on, stated on its own.
+
+    Starlette cancels the anyio scope a StreamingResponse body runs in the
+    moment the client hangs up, and an anyio cancel scope is *level*-triggered:
+    every later `await` inside it raises CancelledError at once. So the bare
+    `await response.aclose()` that used to sit in proxy.py's `finally` never
+    ran, httpx never got the connection back, and the socket stayed open for
+    the life of the process.
+
+    The first half of this test is the bug; the second is the fix. If anybody
+    ever unwraps `close_quietly`, the first assertion is what tells them what
+    they just re-broke.
+    """
+    import anyio
+
+    from control_plane.gateway.proxy import close_quietly
+
+    class Upstream:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            await anyio.lowlevel.checkpoint()
+            self.closed = True
+
+    async def scenario():
+        naive, shielded = Upstream(), Upstream()
+
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            try:
+                await naive.aclose()
+            except anyio.get_cancelled_exc_class():
+                pass
+            await close_quietly(shielded)
+
+        return naive.closed, shielded.closed
+
+    naive_closed, shielded_closed = anyio.run(scenario)
+    assert not naive_closed, (
+        "an unshielded aclose inside a cancelled scope is exactly the leak; "
+        "if this now passes, anyio's semantics changed and the shield's "
+        "reasoning needs rechecking rather than deleting"
+    )
+    assert shielded_closed, "close_quietly must survive the cancelled scope"
+
+
+def test_close_quietly_never_raises():
+    """It runs on paths already carrying an exception worth more than its own."""
+    import anyio
+
+    from control_plane.gateway.proxy import close_quietly
+
+    class Broken:
+        async def aclose(self):
+            raise RuntimeError("the transport is gone")
+
+    anyio.run(close_quietly, Broken())
+
+
+def test_the_janitor_closes_an_upstream_whose_body_was_never_read():
+    """The second leak path: a generator that never started has no `finally`.
+
+    Starlette sends the response line before it first iterates a
+    StreamingResponse, so a client that vanishes in between leaves the body
+    generator constructed and never started -- and an unstarted async generator
+    runs no cleanup when it is collected. Shielding cannot help there, because
+    there is nothing to shield.
+    """
+    import anyio
+
+    from control_plane.gateway.proxy import UpstreamProxy
+    from control_plane.gateway.settings import GatewaySettings
+
+    class Upstream:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    cancelled: list[bool] = []
+
+    class Peek:
+        def cancel(self):
+            cancelled.append(True)
+
+    proxy = UpstreamProxy(GatewaySettings())
+    stranded, streaming = Upstream(), Upstream()
+    proxy._track(stranded).pending = Peek()
+    proxy._track(streaming).started = True
+
+    # Not yet: inside the grace period nothing is touched at all.
+    anyio.run(proxy._reap)
+    assert not stranded.closed, "a young response may simply not have begun yet"
+
+    for entry in proxy._open.values():
+        entry.opened_at -= 60.0
+    anyio.run(proxy._reap)
+
+    assert stranded.closed, "nothing else was ever going to close this one"
+    assert cancelled == [True], (
+        "the first-chunk peek outlives the header hold and is only ever awaited "
+        "inside the generator; reaping without cancelling it leaves a task "
+        "holding the response and retiring with an exception nobody retrieves"
+    )
+    assert not streaming.closed, (
+        "a running stream is never reaped on age -- that would be a read "
+        "timeout by the back door, and upstream_read_timeout_s is None on "
+        "purpose so a slow decode can take as long as it takes"
+    )
+
+
+def test_pool_exhaustion_is_not_a_verdict_about_the_backend():
+    """A PoolTimeout must not bench a target, and must not claim it is down.
+
+    This is the failure that took the whole gateway out on 2026-09-08. One
+    model's leaked connections filled the shared pool; every other model then
+    got a PoolTimeout, which `forward` counted as a transport failure. Three of
+    those benched a backend answering /health in under a millisecond, and the
+    half-open probe died on the same empty pool and re-benched it -- for as long
+    as anybody kept asking.
+
+    Both halves are asserted here, because either one alone is still broken: a
+    503 that names the real condition, and a circuit that never opens.
+    """
+    settings = GatewaySettings()
+    settings.upstream_per_origin_limit = 1  # one slot, so the second request waits
+    settings.upstream_connect_timeout_s = 0.3  # ...and gives up quickly
+
+    backend = FakeBackend()
+    backend.hold = threading.Event()
+
+    with RunningBackend(backend) as running:
+        deps = build_deps(
+            settings=settings,
+            deployments=FakeDeployments(
+                [make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url)]
+            ),
+        )
+        app = create_app(deps)
+        with TestClient(app) as client:
+            held = {
+                "model": "llama-3.3-70b",
+                "messages": [{"role": "user", "content": HOLD_MARKER}],
+            }
+            payload = {
+                "model": "llama-3.3-70b",
+                "messages": [{"role": "user", "content": "x"}],
+            }
+
+            def occupy():
+                client.post("/v1/chat/completions", json=held)
+
+            worker = threading.Thread(target=occupy)
+            worker.start()
+            try:
+                time.sleep(0.3)  # let it take the only connection
+
+                statuses = []
+                for _ in range(4):
+                    reply = client.post("/v1/chat/completions", json=payload)
+                    statuses.append(reply.status_code)
+                    body = reply.json()
+
+                assert statuses == [503] * 4, statuses
+                assert body["error"]["code"] == "upstream_pool_exhausted", body
+                assert "not implicated" in body["error"]["message"], (
+                    "the refusal must not send whoever reads it to a backend "
+                    "that is answering perfectly well"
+                )
+
+                breaker = app.state.ctx.breaker
+                assert breaker.opened_targets() == {}, (
+                    "four pool timeouts, well past the failure threshold, and "
+                    "the backend was healthy for every one of them"
+                )
+            finally:
+                backend.hold.set()
+                worker.join(timeout=15)
+
+
+def test_one_origin_cannot_exhaust_another_origins_pool():
+    """The 30B's leak is why the 0.5B stopped answering 65 ms later.
+
+    One `AsyncClient` for every target made `max_connections` a cluster-wide
+    resource, so a single backend could spend all of it. A client per origin is
+    what keeps the blast radius to the backend that earned it.
+    """
+    settings = GatewaySettings()
+    settings.upstream_per_origin_limit = 1
+    settings.upstream_connect_timeout_s = 0.3
+
+    busy, quiet = FakeBackend(), FakeBackend()
+    busy.hold = threading.Event()
+
+    with RunningBackend(busy) as busy_running, RunningBackend(quiet) as quiet_running:
+        deps = build_deps(
+            settings=settings,
+            deployments=FakeDeployments(
+                [
+                    make_deployment("d-busy", "busy", backend_url=busy_running.base_url),
+                    make_deployment("d-quiet", "quiet", backend_url=quiet_running.base_url),
+                ]
+            ),
+        )
+        with TestClient(create_app(deps)) as client:
+            def occupy():
+                client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "busy",
+                        "messages": [{"role": "user", "content": HOLD_MARKER}],
+                    },
+                )
+
+            worker = threading.Thread(target=occupy)
+            worker.start()
+            try:
+                time.sleep(0.3)
+
+                blocked = client.post(
+                    "/v1/chat/completions",
+                    json={"model": "busy", "messages": [{"role": "user", "content": "x"}]},
+                )
+                assert blocked.status_code == 503, "the busy origin is out of slots"
+
+                spared = client.post(
+                    "/v1/chat/completions",
+                    json={"model": "quiet", "messages": [{"role": "user", "content": "x"}]},
+                )
+                assert spared.status_code == 200, (
+                    "a backend that leaked nothing must not go down with the "
+                    "one that did"
+                )
+            finally:
+                busy.hold.set()
+                worker.join(timeout=15)
+
+
+# ---------------------------------------------------------------------------
+# recovery is decided by bytes, not by a clock
+#
+# `upstream_header_hold_s` bounds how long the response line is held for the
+# first chunk. Past it the gateway used to give up on failover entirely -- the
+# comment said the attempt "stops being retryable from here" -- even though the
+# client had seen a status line and zero body bytes. On the live cluster that
+# timer fired 130,815 times, every one of them the 30B whose prefill is 76-130s
+# and none of them the 0.5B which answers in 5s: the fast model was always
+# protected and the slow one never was.
+# ---------------------------------------------------------------------------
+
+
+def _hold(seconds: float) -> GatewaySettings:
+    settings = GatewaySettings()
+    settings.upstream_header_hold_s = seconds
+    return settings
+
+
+def test_a_committed_response_is_finished_by_another_target():
+    """Headers already sent, zero body bytes, upstream dies -- and it recovers.
+
+    This is the case the 10s timer used to abandon. Nothing the client has seen
+    is contradicted by streaming somebody else's body underneath the same status
+    line, so the request is still recoverable and the client never learns.
+    """
+    stalls = FakeBackend(first_chunk_delay=1.0, die_before_first_chunk=True)
+    live = FakeBackend()
+
+    with RunningBackend(stalls) as a, RunningBackend(live) as b:
+        deps = build_deps(
+            settings=_hold(0.2),  # commit the headers long before it dies
+            deployments=two_replicas(a.base_url, b.base_url),
+        )
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/chat/completions", json={**CHAT, "stream": True}
+            )
+
+    assert reply.status_code == 200, reply.text
+    assert len(stalls.requests) == 1 and len(live.requests) == 1, (
+        "both targets should have been asked: the first died, the second finished"
+    )
+    # The whole stream, from the replacement, under the first target's headers.
+    assert "tok0" in reply.text and "tok4" in reply.text
+    assert "[DONE]" in reply.text
+    assert "died" not in reply.text and "d-a" not in reply.text, (
+        "the client must not learn that a node died under it"
+    )
+
+
+def test_a_stream_the_client_has_begun_reading_is_never_swapped():
+    """The counterpart, and the rule that must not bend.
+
+    Once a body byte has reached the client the response is committed in a way
+    a status line is not: finishing it from another target would splice two
+    different completions into one. Rule 1 -- never rewrite a body already
+    being read -- outranks recovery.
+    """
+    dies_midway = FakeBackend(chunks=3, chunk_delay=0.05)
+    live = FakeBackend()
+
+    async def _truncated(self):
+        yield b'data: {"choices":[{"delta":{"content":"tok0"}}]}\n\n'
+        raise RuntimeError("died after the client saw a byte")
+
+    dies_midway._sse = _truncated.__get__(dies_midway, FakeBackend)
+
+    with RunningBackend(dies_midway) as a, RunningBackend(live) as b:
+        deps = build_deps(
+            settings=_hold(5.0),
+            deployments=two_replicas(a.base_url, b.base_url),
+        )
+        with TestClient(create_app(deps)) as client:
+            try:
+                reply = client.post(
+                    "/v1/chat/completions", json={**CHAT, "stream": True}
+                )
+                body = reply.text
+            except Exception:
+                body = "tok0"  # a broken stream is an acceptable outcome here
+
+    assert "tok0" in body
+    assert "[DONE]" not in body, "a truncated stream must stay truncated"
+    assert not live.requests, (
+        "the second target must never be asked to finish a body the client "
+        "has already begun reading"
+    )
+
+
+# ---------------------------------------------------------------------------
+# hedging
+#
+# Off by default. It buys latency with a whole extra inference, so it is worth
+# it only between targets of comparable strength, and the loser must be given
+# back or every hedged request leaks what the 2026-09-08 outage leaked.
+# ---------------------------------------------------------------------------
+
+
+def test_hedging_is_off_unless_asked_for():
+    """Nobody pays for a second inference they did not ask for."""
+    assert GatewaySettings().hedge_after_s is None
+
+    slow = FakeBackend(first_chunk_delay=0.6)
+    idle = FakeBackend()
+    with RunningBackend(slow) as a, RunningBackend(idle) as b:
+        deps = build_deps(deployments=two_replicas(a.base_url, b.base_url))
+        with TestClient(create_app(deps)) as client:
+            assert client.post(
+                "/v1/chat/completions", json={**CHAT, "stream": True}
+            ).status_code == 200
+
+    assert not idle.requests, "the second target must not be touched by default"
+
+
+def test_a_stalled_leader_is_raced_and_the_loser_is_given_back():
+    """The whole point, and the part that must not leak.
+
+    The loser's body generator is never started, so nothing would settle its
+    accounting, release its KV commitment or return its connection. If
+    `Attempt.discard` is not called, `outstanding` stays above zero forever.
+    """
+    settings = GatewaySettings()
+    settings.hedge_after_s = 0.15
+    settings.upstream_header_hold_s = 5.0
+
+    slow = FakeBackend(first_chunk_delay=2.0)
+    quick = FakeBackend()
+
+    with RunningBackend(slow) as a, RunningBackend(quick) as b:
+        deps = build_deps(
+            settings=settings, deployments=two_replicas(a.base_url, b.base_url)
+        )
+        app = create_app(deps)
+        with TestClient(app) as client:
+            reply = client.post(
+                "/v1/chat/completions", json={**CHAT, "stream": True}
+            )
+            assert reply.status_code == 200, reply.text
+            assert "tok0" in reply.text and "[DONE]" in reply.text
+
+            stats = app.state.ctx.stats
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not stats.outstanding("d-a") and not stats.outstanding("d-b"):
+                    break
+                time.sleep(0.05)
+
+    assert len(slow.requests) == 1 and len(quick.requests) == 1, (
+        "both targets should have been asked -- that is what a hedge is"
+    )
+    assert stats.outstanding("d-a") == 0 and stats.outstanding("d-b") == 0, (
+        "the hedged loser was never given back; its commitment is stranded"
+    )
+
+
+def test_a_hedge_is_refused_where_it_would_be_a_spill_decision():
+    """LOCAL_FIRST's remote is the overflow valve, not a speed option.
+
+    Hedging onto it would turn "the cluster is saturated" into "the cluster was
+    slow this once", and on a metered provider that is a doubled bill.
+    """
+    from control_plane.contracts import (
+        RouteTarget,
+        RoutingConfig,
+        RoutingPolicy,
+        TargetKind,
+    )
+
+    from control_plane.gateway import policies
+
+    def target(tid, kind, strength):
+        return RouteTarget(
+            target_id=tid, kind=kind, backend_url="http://x/v1", weight=1.0,
+            outstanding=0, healthy=True, admitting=True, strength=strength,
+            cost_per_mtok=None,
+        )
+
+    local = target("d-a", TargetKind.LOCAL, 1.0)
+    remote = target("p:m", TargetKind.REMOTE, 1.0)
+    settings = GatewaySettings()
+
+    spill = RoutingConfig(
+        served_name="m", policy=RoutingPolicy.LOCAL_FIRST,
+        targets=[local, remote], sticky_ttl_s=0.0,
+    )
+    assert policies.hedge_candidate(spill, local, settings) is None
+
+    balanced = RoutingConfig(
+        served_name="m", policy=RoutingPolicy.LEAST_OUTSTANDING,
+        targets=[local, remote], sticky_ttl_s=0.0,
+    )
+    assert policies.hedge_candidate(balanced, local, settings) is remote
+
+
+def test_a_hedge_is_refused_onto_a_target_that_cannot_win():
+    """Below the weak-target floor a hedge loses every race for free."""
+    from control_plane.contracts import (
+        RouteTarget,
+        RoutingConfig,
+        RoutingPolicy,
+        TargetKind,
+    )
+
+    from control_plane.gateway import policies
+
+    def target(tid, strength):
+        return RouteTarget(
+            target_id=tid, kind=TargetKind.LOCAL, backend_url="http://x/v1",
+            weight=1.0, outstanding=0, healthy=True, admitting=True,
+            strength=strength, cost_per_mtok=None,
+        )
+
+    settings = GatewaySettings()
+    strong = target("d-a", 1.0)
+    feeble = target("d-b", settings.weak_target_floor / 2)
+
+    config = RoutingConfig(
+        served_name="m", policy=RoutingPolicy.LEAST_OUTSTANDING,
+        targets=[strong, feeble], sticky_ttl_s=0.0,
+    )
+    assert policies.hedge_candidate(config, strong, settings) is None, (
+        "the floor that holds a weak replica as failover-only is the same "
+        "line that says it is not worth racing"
+    )
+    # And the same rule has to be askable about a target somebody else chose.
+    # `_claim` runs the policy and the breaker, so the target routing actually
+    # hands back need not be the one `hedge_candidate` picked -- gating only
+    # the pick would let this one through the floor it exists to enforce.
+    assert not policies.may_hedge(config, strong, feeble, settings)
+    assert policies.may_hedge(config, strong, target("d-c", 1.0), settings)

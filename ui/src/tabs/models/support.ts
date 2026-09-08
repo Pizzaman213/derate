@@ -24,23 +24,46 @@ export interface SupportVerdict {
 const OK: SupportVerdict = { status: 'ok', reason: null }
 const UNKNOWN: SupportVerdict = { status: 'unknown', reason: null }
 
-/** Tasks no runtime here serves. Generation is what vLLM and SGLang do; a
- *  diffusion or classification checkpoint is a different program entirely. */
+/** Tasks a runtime here serves. Generation is what vLLM and SGLang do; a
+ *  diffusion or classification checkpoint is a different program entirely.
+ *
+ *  `text-to-speech` is here because it stopped being true that nothing serves
+ *  it: the `tts` runtime does, on `/v1/audio/speech`. Whether this particular
+ *  checkpoint loads is a narrower question than its pipeline tag, and the one
+ *  the support table answers -- so a TTS model whose architecture is not in
+ *  `TTS_ARCHITECTURES` still gets its red dot, from the runtime rows, with the
+ *  architecture named. What it must not get is a dot for being TTS at all. */
 const SERVABLE_PIPELINES = new Set([
   'text-generation',
   'text2text-generation',
   'image-text-to-text',
   'any-to-any',
   'conversational',
+  'text-to-speech',
 ])
 
-export function classifySupport(row: ModelRow, table: QuantTable | null): SupportVerdict {
-  if (row.remote) return OK
+export function classifySupport(
+  row: ModelRow,
+  table: QuantTable | null,
+  /** Whether any provider is configured that can be told to fetch weights.
+   *  Defaults false, so a caller that has not been taught about providers gets
+   *  exactly the sentences it got before. */
+  canPull = false,
+): SupportVerdict {
+  if (row.remoteOnly) return OK
+  // Same argument. Nothing here is going to load a model that exists in this
+  // list only because a provider publishes it, so "no runtime here takes this
+  // format" is an answer to a question nobody asked -- and drawing a red dot
+  // beside a model one click from being served reads as a refusal.
+  if (row.unservedOnly) return OK
 
   if (row.pipelineTag && !SERVABLE_PIPELINES.has(row.pipelineTag)) {
+    // Left as it stands, deliberately. A provider does not rescue this one:
+    // Ollama does not serve text-to-speech or reranking either, so naming it
+    // here would offer a route that ends the same way.
     return {
       status: 'unsupported',
-      reason: `This is a ${row.pipelineTag} model. Neither vllm nor sglang serves that task here.`,
+      reason: `This is a ${row.pipelineTag} model. No runtime here serves that task.`,
     }
   }
 
@@ -54,9 +77,18 @@ export function classifySupport(row: ModelRow, table: QuantTable | null): Suppor
   // outright, because both serve templates take a repository path and there is
   // no llama.cpp runtime on this cluster.
   if (entry.family === 'gguf') {
+    // The status stays `unsupported` and the sentence keeps its first half:
+    // nothing on this cluster launches a llama.cpp format, which is still
+    // true and is still what the red dot means. With a pullable provider
+    // configured it is no longer the whole story, so the route out is
+    // appended rather than replacing what was there.
     return {
       status: 'unsupported',
-      reason: `${entry.key} is a llama.cpp format. Neither vllm nor sglang is verified to load it, and there is no llama.cpp runtime here.`,
+      reason:
+        `${entry.key} is a llama.cpp format. Neither vllm nor sglang is verified to load it, and there is no llama.cpp runtime here.` +
+        (canPull
+          ? ' Open the model and pick the ollama runtime to pull a GGUF onto a provider instead.'
+          : ''),
     }
   }
 

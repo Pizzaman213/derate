@@ -1,7 +1,8 @@
 import type { NodeStateDTO } from '../../api/types'
-import { Chart } from '../../tabs/dashboard/Chart'
+import { Chart, ChartGrid } from '../../tabs/dashboard/Chart'
 import { useTelemetrySeries } from '../../state/telemetry'
 import {
+  nodeBand,
   nodeSeries,
   resolutionNote,
   useNodeHistory,
@@ -41,16 +42,69 @@ export function NodeCharts({
   const util = fromLive ? live.nodeUtil[nodeId] ?? [] : nodeSeries(h, 'util', total)
   const mem = fromLive ? live.nodeMem[nodeId] ?? [] : nodeSeries(h, 'mem', total)
 
+  // The bucket maxima, where the window has any. On `live` and on a raw
+  // window every point is already its own maximum, so `nodeBand` returns null
+  // and the four charts draw a bare line exactly as before.
+  const bands = fromLive
+    ? null
+    : {
+        power: nodeBand(h, 'power', total),
+        temp: nodeBand(h, 'temp', total),
+        util: nodeBand(h, 'util', total),
+        mem: nodeBand(h, 'mem', total),
+      }
+
   const note = (points: number) => (fromLive ? undefined : resolutionNote(h, points))
+  // Only the archive knows where its holes are; the live ring has no memory of
+  // having missed anything, which is exactly the difference Provenance spells
+  // out underneath and the hatching now draws.
+  const env = fromLive ? null : h
+
+  // "avg" and "peak" rather than "avg" and "max": the axis line reads
+  // `min 6 avg ... max 61 peak`, where both halves are true of a DIFFERENT
+  // series -- the lowest bucket average, and the highest reading inside any
+  // bucket. Labelling the upper one "max" made it stutter to "max 61 max".
+  const common = { envelope: env, bandLabel: 'peak', lowLabel: 'avg' } as const
 
   return (
     <>
-      <div className="chartgrid">
-        <Chart title="Power drawn" unit="W" points={power} note={note(power.length)} />
-        <Chart title="Temperature" unit="°C" points={temp} note={note(temp.length)} />
-        <Chart title={utilLabel(node.profile)} unit="%" points={util} note={note(util.length)} />
-        <Chart title="Memory used" unit="%" points={mem} note={note(mem.length)} />
-      </div>
+      {/* A grid, not a div: one crosshair across all four, so a spike in power
+          can be read against the temperature, utilisation and memory of the
+          same instant instead of four separate guesses at where the eye was. */}
+      <ChartGrid>
+        <Chart
+          title="Power drawn"
+          unit="W"
+          points={power}
+          note={note(power.length)}
+          band={bands?.power ?? undefined}
+          {...common}
+        />
+        <Chart
+          title="Temperature"
+          unit="°C"
+          points={temp}
+          note={note(temp.length)}
+          band={bands?.temp ?? undefined}
+          {...common}
+        />
+        <Chart
+          title={utilLabel(node.profile)}
+          unit="%"
+          points={util}
+          note={note(util.length)}
+          band={bands?.util ?? undefined}
+          {...common}
+        />
+        <Chart
+          title="Memory used"
+          unit="%"
+          points={mem}
+          note={note(mem.length)}
+          band={bands?.mem ?? undefined}
+          {...common}
+        />
+      </ChartGrid>
       <div style={{ marginTop: 8 }}>
         <Provenance window={window} resource={history} />
       </div>

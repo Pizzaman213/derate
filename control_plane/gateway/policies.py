@@ -64,6 +64,60 @@ def _is_saturated(target: RouteTarget, state: PolicyState) -> bool:
     return target.outstanding >= cap
 
 
+def hedge_candidate(
+    config,
+    leader: RouteTarget,
+    settings,
+    exclude: set[str] | None = None,
+) -> RouteTarget | None:
+    """A target worth racing the leader against, or None to send nothing.
+
+    Hedging spends a whole extra inference to save latency, so it has to be
+    refused far more often than it is taken. Two refusals, both deliberate:
+
+    **Never under LOCAL_FIRST.** There the remote is the overflow valve --
+    "the cluster is preferred and the remote provider is the overflow valve",
+    per `Router.auto_policy_explained`. Spilling is a decision that means the
+    local pool is saturated. A hedge would spill on every slow request instead,
+    turning a deliberate policy into routine double-dispatch and, on a metered
+    provider, into a doubled bill.
+
+    **Never onto a target that cannot win.** `weak_target_floor` already draws
+    the line at which a local replica is held as failover only; a hedge below it
+    loses every race and burns the capacity to learn nothing. Reusing that
+    threshold keeps one definition of "too weak to bother with" rather than
+    inventing a second.
+
+    Returns the strongest eligible alternative, which is the only one with a
+    real chance of beating a leader that has already had a head start.
+    """
+    skip = exclude or set()
+    pool = [
+        t
+        for t in eligible(config.targets)
+        if t.target_id != leader.target_id and t.target_id not in skip
+    ]
+    if not pool:
+        return None
+    best = max(pool, key=lambda t: (t.strength, t.target_id))
+    return best if may_hedge(config, leader, best, settings) else None
+
+
+def may_hedge(config, leader: RouteTarget, candidate: RouteTarget, settings) -> bool:
+    """Whether racing *candidate* against *leader* is allowed at all.
+
+    The rule lives here, in one predicate, because it is asked twice: once to
+    pick a candidate and once to check the target routing actually claimed --
+    which need not be the one picked, since selection runs the policy and the
+    breaker, not this. Gating only the first would let the second slip past.
+    """
+    if config.policy is RoutingPolicy.LOCAL_FIRST:
+        return False
+    if candidate.target_id == leader.target_id:
+        return False
+    return candidate.strength >= leader.strength * settings.weak_target_floor
+
+
 def prefix_hash(prefix_key: str) -> int:
     return int.from_bytes(hashlib.sha256(prefix_key.encode()).digest()[:8], "big")
 

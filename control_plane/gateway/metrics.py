@@ -26,11 +26,13 @@ class MetricsHub:
         deployments,
         stats: StatsRegistry,
         settings: GatewaySettings,
+        providers=None,
     ) -> None:
         self._registry = registry
         self._deployments = deployments
         self._stats = stats
         self._settings = settings
+        self._providers = providers
         self._subscribers: set[asyncio.Queue] = set()
         self._task: asyncio.Task | None = None
         self._latest: dict[str, Any] | None = None
@@ -155,6 +157,48 @@ class MetricsHub:
             log.exception("deployment list unavailable for metrics")
             deployments_payload = None
 
+        # Models a provider serves, counted exactly as a deployment is one
+        # block up: same registry, same window, same rounding. The cluster
+        # screen draws a remote-served name with the same band as a local one
+        # and reads its throughput from here, so the two figures have to come
+        # from one place or the band above and the band below tick at
+        # different rates for no reason a viewer could work out.
+        #
+        # Only targets the registry has actually seen. Every model of an
+        # un-allowlisted OpenRouter key is several hundred rows, and this
+        # payload goes out once a second -- a target nobody has routed to has
+        # no counter to report and the UI reads its absence as the zero it is.
+        remotes_payload: list[dict] | None
+        try:
+            if self._providers is None:
+                remotes_payload = None
+            else:
+                remotes_payload = []
+                servable = getattr(self._providers, "servable", self._providers.list)
+                for provider in servable():
+                    for model in provider.models:
+                        # The same id gateway/targets.py builds a remote
+                        # RouteTarget from, which is what the stats are keyed
+                        # by and what the UI's band carries.
+                        target_id = f"{provider.provider_id}:{model.upstream_id}"
+                        st = self._stats.peek(target_id)
+                        if st is None:
+                            continue
+                        remotes_payload.append(
+                            {
+                                "target_id": target_id,
+                                "provider_id": provider.provider_id,
+                                "served_name": model.served_name,
+                                "state": "healthy" if provider.healthy else "unhealthy",
+                                "tokens_per_sec": round(st.tokens_per_sec(window, now), 1),
+                                "ttft_ms": round(st.ttft_ms, 1) if st.ttft_ms else None,
+                                "queue_depth": st.outstanding,
+                            }
+                        )
+        except Exception:
+            log.exception("provider list unavailable for metrics")
+            remotes_payload = None
+
         return {
             "ts": now,
             "cluster": {
@@ -166,4 +210,5 @@ class MetricsHub:
             },
             "nodes": nodes_payload,
             "deployments": deployments_payload,
+            "remotes": remotes_payload,
         }

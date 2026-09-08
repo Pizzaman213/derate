@@ -1,6 +1,7 @@
 import type { Cluster, MetricsNodeFrame } from '../../api/types'
 import { Readout } from '../../components/Readout'
 import { gbNum } from '../../format'
+import { runners } from '../cluster/layout'
 import type { SafeMetricsFrame } from '../../state/useMetrics'
 
 interface Props {
@@ -48,20 +49,27 @@ function Tile({
   )
 }
 
-/** Sum of each deployment's latest reported rate. `null` (not 0) when there
- *  are deployments but the stream has not said anything about any of them yet
- *  -- an honest "no reading" beats a confident zero the frame never sent. Zero
- *  deployments is a real, known zero and renders as one. */
+/** Sum of each running deployment's latest reported rate. `null` (not 0) when
+ *  something is up but the stream has not said anything about any of it yet
+ *  -- an honest "no reading" beats a confident zero the frame never sent.
+ *  Nothing running is a real, known zero and renders as one.
+ *
+ *  Counted over `runners()`, not over the raw list: `/api/deployments` keeps
+ *  every attempt, and a cluster whose rows are all stopped or failed is not
+ *  "no reading yet", it is nought tokens per second. Before the filter those
+ *  dead rows held the tile at an em dash for as long as the ledger kept
+ *  them. */
 function totalTps(
   deployments: Cluster['deployments'] | null,
   frame: SafeMetricsFrame | null,
 ): number | null {
   if (!deployments) return null
-  if (deployments.length === 0) return 0
+  const live = runners(deployments)
+  if (live.length === 0) return 0
   if (!frame) return null
   let sum = 0
   let any = false
-  for (const d of deployments) {
+  for (const d of live) {
     const v = frame.deployments.find((x) => x.deployment_id === d.deployment_id)?.tokens_per_sec
     if (v != null) {
       sum += v

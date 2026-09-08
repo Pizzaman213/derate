@@ -1,11 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "derate"
 version = "0.1.0"
 description = "Planning and orchestration for DGX Spark clusters"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+# Kept in step with requirements.txt, which the Dockerfile installs directly.
+# Both lists exist on purpose: the image pins from requirements.txt without
+# building this package, and a native `pip install .` on a laptop has no
+# Dockerfile to read. They must be changed together.
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "websockets==15.0.1",
+    "httpx==0.28.1",
+    "pydantic==2.10.4",
+    "zeroconf==0.136.2",
+    "PyYAML==6.0.3",
+    "requests==2.34.2",
+    # Host facts -- memory, CPU, process liveness and process kill -- on the
+    # two platforms with no /proc. The Linux readers stay as they are; see
+    # registry/hostfacts.py for why this is not used to replace them.
+    "psutil>=6.0",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=9", "ruff"]
+
+[project.scripts]
+# The native install path. `python -m control_plane.node` still works and is
+# what the container entrypoint execs; this exists so that a machine with no
+# Docker has something to type.
+derate = "control_plane.node:main"
+
+[tool.setuptools.packages.find]
+include = ["control_plane*"]
 
 [tool.pytest.ini_options]
 # Every agent runs pytest from the repo root. Without this, `control_plane`

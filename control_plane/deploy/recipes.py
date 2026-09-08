@@ -15,11 +15,13 @@ render_command pure and makes the rendered command safe for Agent H to show.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from control_plane.contracts import ModelShape, ParallelismPlan
 
@@ -108,6 +110,41 @@ def _check_yaml_safe(value: str, field: str) -> None:
         )
 
 
+#: M-22, third variant. Extra-arg tokens are not identifiers -- they are the
+#: caller's own runtime flags (``--quantization``, ``modelopt_fp4``, a
+#: ``--flag=value`` pair) -- so this grammar is wider than _COMMAND_SAFE's
+#: (it admits a leading ``-``/``--`` and an ``=``) but the reason for it is
+#: identical: each token lands, one per continuation line, inside the
+#: recipe's ``command: |`` block, which sparkrun runs under ``bash -c``
+#: inside a privileged, host-networked container. An allowlist, not a
+#: blocklist, for the same reason _check_command_safe is one: the blocklist
+#: for ``bash -c`` is unbounded.
+_EXTRA_ARG_SAFE = re.compile(r"\A-{0,2}[A-Za-z0-9_./~][A-Za-z0-9_.:/~=,+-]*\Z")
+
+
+def _check_extra_arg_safe(token: str, index: int, field: str) -> None:
+    if not token or not _EXTRA_ARG_SAFE.match(token):
+        raise ValueError(
+            "%s[%d] is not safe to substitute into the launch "
+            "command: %r. Expected an optional leading - or --, then "
+            "letters, digits, and . _ - : / ~ = , + only." % (field, index, token)
+        )
+
+
+def check_extra_args_safe(extra_args: Sequence[str], field: str = "extra_args") -> None:
+    """Run the M-22 check on every caller-supplied CLI token.
+
+    Mirrors check_recipe_identifiers: called both by synthesize() and by
+    DeploymentManager.launch() before any record exists, so the two call
+    sites can never drift on what "safe" means. The same grammar covers
+    *extra_args* (appended after the generated command) and *custom_command*
+    (replaces it) -- both land, one token per continuation line, in the same
+    ``command: |`` block, so *field* only changes which name an error names.
+    """
+    for index, token in enumerate(extra_args):
+        _check_extra_arg_safe(token, index, field)
+
+
 def check_recipe_identifiers(model_id: str, served_name: str) -> None:
     """Run every M-22 safety check on the two identifiers that reach both
     the recipe YAML and the rendered command.
@@ -146,17 +183,57 @@ def container_image(spec: RuntimeSpec, env: dict[str, str] | None = None) -> str
     return env.get(spec.default_image_env) or spec.default_image
 
 
-def _serve_command(spec: RuntimeSpec, plan: ParallelismPlan) -> str:
+def _serve_command(
+    spec: RuntimeSpec, plan: ParallelismPlan, extra_args: tuple[str, ...] = ()
+) -> str:
     """The command template, with conditional flags baked in.
 
     Conditionals cannot be templated -- there is no ``{if}`` in a recipe --
     so expert parallel is appended at synthesis time. Everything with a
     numeric value stays a ``{placeholder}`` so the sparkrun CLI overrides in
     render_command actually bind.
+
+    *extra_args* must already have passed check_extra_args_safe -- this
+    function does not check them again, exactly like the model_id/served_name
+    values it also trusts by this point.
     """
     command = spec.command_template
     if plan.expert_parallel > 1 and spec.expert_parallel_arg:
         command += " \\\n    %s" % spec.expert_parallel_arg
+    if extra_args:
+        command += " \\\n    %s" % " ".join(extra_args)
+    return command
+
+
+def _custom_serve_command(spec: RuntimeSpec, custom_command: tuple[str, ...]) -> str:
+    """The command when the operator supplies the whole runtime invocation
+    in place of the plan-derived flags ``_serve_command`` builds.
+
+    Only ``{model}`` -- still the fit gate's own resolved id, never operator
+    text, so a custom launch cannot start a different model than the one the
+    Verdict card judged -- and the three flags the gateway needs to route to
+    this deployment survive: host, port, served_model_name. They are
+    appended LAST, not first, so they win however each runtime's own
+    argument parser resolves a repeated flag (every one of them, being an
+    ordinary argparse table, takes the last occurrence) even if the
+    operator's own text happens to repeat one of them.
+
+    Nothing else the planner decided -- tensor/pipeline parallel, context,
+    concurrency, gpu_memory_utilization -- reaches this command at all: the
+    Verdict card still shows what the fit gate computed for them, but here
+    that is informational, not what launches.
+
+    *custom_command* must already have passed check_extra_args_safe, exactly
+    like *extra_args* in ``_serve_command``.
+    """
+    command = spec.custom_command_prefix
+    if custom_command:
+        command += " \\\n    %s" % " ".join(custom_command)
+    command += (
+        " \\\n    --host {host}"
+        " \\\n    --port {port}"
+        " \\\n    --served-model-name {served_model_name}"
+    )
     return command
 
 
@@ -172,6 +249,8 @@ def synthesize(
     gpu_memory_utilization: float,
     recipe_dir: Path,
     image: str | None = None,
+    extra_args: tuple[str, ...] = (),
+    custom_command: tuple[str, ...] = (),
 ) -> RecipeSpec:
     """Build the recipe for one deployment. Pure: touches no filesystem."""
     # M-22: shape.model_id and served_name both flow from an API request
@@ -182,6 +261,19 @@ def synthesize(
     # through defaults below. check_recipe_identifiers runs both the YAML
     # check and the stricter command-grammar check on each.
     check_recipe_identifiers(shape.model_id, served_name)
+    # extra_args and custom_command are the third M-22 surface: caller-supplied
+    # CLI tokens that reach the command block directly (see
+    # check_extra_args_safe). They are alternatives, not a pair -- one appends
+    # to the generated command, the other replaces it, and sending both would
+    # leave it ambiguous which the operator actually meant.
+    check_extra_args_safe(extra_args)
+    check_extra_args_safe(custom_command, field="custom_command")
+    if extra_args and custom_command:
+        raise ValueError(
+            "extra_args and custom_command are mutually exclusive: extra_args "
+            "appends to the generated serve command, custom_command replaces "
+            "it, and a request cannot mean both at once"
+        )
 
     spec = runtime_spec(runtime)
     img = image or container_image(spec)
@@ -212,12 +304,43 @@ def synthesize(
         "metadata:\n",
         "  description: derate %s, %s\n" % (served_name, plan.kind.value),
         "  derate_plan: %s\n" % _plan_summary(plan),
+    ]
+    if custom_command:
+        # Same quoting reasoning as derate_extra_args below.
+        lines.append(
+            "  derate_custom_command: %s\n" % json.dumps(" ".join(custom_command))
+        )
+    elif extra_args:
+        # JSON-quoted rather than a plain scalar: extra_args routinely start
+        # with "-" or "--", which plain-scalar YAML would read as a block
+        # sequence indicator rather than the start of an ordinary value (see
+        # _YAML_LEADING_DANGEROUS above). A double-quoted YAML scalar has no
+        # such leading-character ambiguity, and JSON's quoting is valid YAML.
+        lines.append(
+            "  derate_extra_args: %s\n" % json.dumps(" ".join(extra_args))
+        )
+    lines += [
         "\n",
         "defaults:\n",
     ]
     lines += ["  %s: %s\n" % (k, v) for k, v in defaults]
+    # Where this runtime's compiled artifacts go, when it has any. sparkrun
+    # merges a recipe's `env:` into the container's environment ahead of its
+    # own additions (runtimes/base.py) and the docker executor emits each as
+    # `-e`, so this is the supported channel for it -- and the only one, since
+    # the recipe format has no way to ask for a volume. Not run through the
+    # safety checks above on purpose: unlike model_id and served_name these are
+    # module constants from flags.py and never touch a request.
+    if spec.cache_env:
+        lines += ["\n", "env:\n"]
+        lines += ["  %s: %s\n" % (k, v) for k, v in spec.cache_env]
     lines += ["\n", "command: |\n"]
-    lines += ["  %s\n" % line for line in _serve_command(spec, plan).splitlines()]
+    body = (
+        _custom_serve_command(spec, custom_command)
+        if custom_command
+        else _serve_command(spec, plan, extra_args)
+    )
+    lines += ["  %s\n" % line for line in body.splitlines()]
 
     content = "".join(lines)
     name = "%s-%s-%s.yaml" % (

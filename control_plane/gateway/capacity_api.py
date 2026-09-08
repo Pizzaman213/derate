@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter
@@ -47,6 +48,46 @@ _VARIANTS_TTL_S = 600.0
 #: answers. The client debounces too; this stops several browsers undoing that.
 _SEARCH_TIMEOUT_S = 6.0
 _SEARCH_TTL_S = 60.0
+
+#: How many explicitly-named models one `/api/capacity?models=` may answer.
+#:
+#: Deliberately not `MAX_CATALOG_MODELS`, which bounds a different question:
+#: that one caps a fixed curated walk, this one caps a set a client chose. The
+#: merged model list asks for about ten at a time, so eight would push two rows
+#: into an "unresolved" sentence on every single call.
+MAX_CAPACITY_MODELS = 12
+
+#: Resolves run concurrently, but not unboundedly: `HubClient` shares one
+#: `requests.Session`, and an unauthenticated hub answers a wide fan-out with a
+#: 429 -- which would turn "which of these fit" into "the hub said no" for the
+#: whole screen. Four sits inside urllib3's default pool of ten, so no
+#: connection is discarded, and twelve ids clear in three waves.
+_RESOLVE_FANOUT = 4
+
+#: One deadline for a whole batch, not per model. `_DETAIL_TIMEOUT_S` is one
+#: model's budget; three waves of that would be 36s behind a polling client.
+#: Crucially this DEGRADES: resolves that finished still produce rows, and the
+#: stragglers are reported. A whole-request 504 would throw away verdicts
+#: already in hand -- and with no HF_TOKEN, one permanently-gated id would take
+#: every other answer down with it on every call.
+_CAPACITY_TIMEOUT_S = 15.0
+
+#: Resolutions, memoised. `ShapeCache` already caches on disk for 24h, but a
+#: disk hit still deserialises JSON and rebuilds a Resolution per model per
+#: poll; this makes the hot path allocation-only.
+_RESOLVE_TTL_S = 600.0
+
+#: Resolutions that FAILED. The load-bearing one: `ShapeCache` never caches a
+#: failure, so today every call pays a fresh hub round trip for a repo that
+#: will never stop failing -- `meta-llama/*` with no HF_TOKEN is permanent, and
+#: it is walked on every capacity request.
+#:
+#: Much shorter than the positive TTL, on purpose. A failure is a thing an
+#: operator FIXES: sets a token, accepts a licence, corrects a typo. A screen
+#: still repeating a refusal that has already been dealt with is a worse bug
+#: than a few extra hub calls. Timeouts are not stored at all -- a hub that was
+#: slow once is not a hub that is broken.
+_RESOLVE_FAIL_TTL_S = 120.0
 
 
 def create_router(ctx: GatewayContext) -> APIRouter:
@@ -411,8 +452,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return JSONResponse(body)
 
     @router.get("/api/models/variants")
-    async def model_variants(model_id: str = "", context: int = 8192,
-                             concurrency: int = 1) -> Response:
+    async def model_variants(
+        model_id: str = "",
+        context: int | None = None,
+        concurrency: int | None = None,
+        on: str = "",
+    ) -> Response:
         """Every obtainable quantization of a model, and which one to pick.
 
         The verdicts come from the same fit gate a launch goes through, fed each
@@ -424,7 +469,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         fits and can actually be served here. Recommending the biggest thing
         that fits would keep pointing at GGUF files nothing in this cluster can
         load.
+
+        ``on=`` names the machines to size against -- the same comma-separated
+        spelling the UI keeps in `?on=`. Absent, the coordinator's own host.
+        ``context=`` and ``concurrency=`` are optional, and absent means "the
+        gate chooses", per variant row.
         """
+        max_seqs = concurrency if concurrency and concurrency > 0 else 1
         from control_plane.resolver.types import (
             MetadataUnavailable,
             ModelNotFound,
@@ -446,6 +497,35 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "resolver_lacks_variants",
             )
 
+        def _fail(status: int, message: str, type_: str, code: str, *, store: bool):
+            """One exit for every enumeration failure.
+
+            ``store`` is what separates a failure worth remembering from one
+            that is already cheap to re-ask. A replayed failure says so, and
+            carries `Retry-After`, so a client that offers a retry can tell the
+            difference between "tried again and it still fails" and a button
+            that appeared to do nothing.
+            """
+            if store:
+                _variant_fail_cache.put(model_id, (status, message, type_, code))
+            return errors.error_response(
+                status, message, type_, code,
+                headers={"Retry-After": f"{_VARIANT_FAIL_TTL_S:.0f}"} if store else None,
+                from_cache=False,
+            )
+
+        # A failure inside the window is replayed rather than re-run. Checked
+        # before the success cache only because the two are disjoint: a model
+        # never has both.
+        failed = _variant_fail_cache.get(model_id)
+        if failed is not None:
+            status, message, type_, code = failed
+            return errors.error_response(
+                status, message, type_, code,
+                headers={"Retry-After": f"{_VARIANT_FAIL_TTL_S:.0f}"},
+                from_cache=True,
+            )
+
         cached = _variant_cache.get(model_id)
         if cached is None:
             try:
@@ -454,36 +534,43 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     timeout=_VARIANTS_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
-                return errors.error_response(
+                return _fail(
                     504,
                     f"Enumerating quantizations of {model_id!r} took longer than "
                     f"{_VARIANTS_TIMEOUT_S:.0f}s.",
                     "server_error",
                     "variants_timeout",
+                    store=True,
                 )
             except ModelNotFound as exc:
-                return errors.error_response(
-                    404, str(exc), "invalid_request_error", "model_not_found"
+                # Not stored: this fails on the first listing and is already
+                # cheap, and a repo that appears on the hub should show up on
+                # the next click rather than a minute later.
+                return _fail(
+                    404, str(exc), "invalid_request_error", "model_not_found",
+                    store=False,
                 )
             except (MetadataUnavailable, UnsupportedArchitecture) as exc:
-                return errors.error_response(
-                    502, str(exc), "server_error", "metadata_unavailable"
+                return _fail(
+                    502, str(exc), "server_error", "metadata_unavailable",
+                    store=False,
                 )
             except Exception as exc:
                 log.exception("variant enumeration failed for %s", model_id)
-                return errors.error_response(
+                return _fail(
                     502,
                     f"Could not list quantizations of {model_id!r}: "
                     f"{type(exc).__name__}.",
                     "server_error",
                     "variants_failed",
+                    store=True,
                 )
             _variant_cache.put(model_id, variants)
         else:
             variants = cached
 
-        rows = await asyncio.to_thread(
-            _variant_verdicts, ctx, model_id, variants, context, concurrency
+        rows, sized_on = await asyncio.to_thread(
+            _variant_verdicts, ctx, model_id, variants, context, max_seqs, on
         )
         recommended = _recommend(rows)
         return JSONResponse(
@@ -491,6 +578,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "model_id": model_id,
                 "variants": rows,
                 "recommended": recommended,
+                # What the rows above were sized against: which machines, at
+                # what degree, on which budget. On the wire so the screen can
+                # state it instead of apologising for not knowing it.
+                "sized_on": sized_on,
                 # Not decoration. available_quants' own docstring: names are the
                 # only signal most quantizers leave, so this is a shortlist to
                 # offer a person, not a promise that each one loads.
@@ -506,18 +597,49 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.get("/api/capacity")
     async def capacity(
-        context: int = 8192,
-        concurrency: int = 1,
+        context: int | None = None,
+        concurrency: int | None = None,
         kv_dtype: str = "",
         basis: str = "both",
+        models: str = "",
+        on: str = "",
     ) -> Response:
         """The largest model that runs here, under the live budget and under
-        the static ceiling, so the difference between them is visible."""
+        the static ceiling, so the difference between them is visible.
+
+        ``models=`` names a set explicitly and REPLACES the curated walk, so a
+        client browsing search results can get a verdict for a model nobody
+        curated. It replaces rather than extends because the caller already has
+        `/api/catalog` and can ask for both in one request; appending four
+        curated resolves to every keystroke-driven call would triple the hub
+        cost of a list that is mostly cache hits.
+
+        ``on=`` scopes the answer to named machines -- the same comma-separated
+        spelling the UI keeps in `?on=`, so the verdict a person is shown is
+        taken on the machines they ticked rather than on one this endpoint
+        chose for them.
+
+        ``context=`` and ``concurrency=`` are now OPTIONAL, and their absence
+        is a different question from a value: absent means "choose one per
+        model", which is what makes this endpoint answerable on a fresh install
+        with nothing configured. An explicit value is still honoured verbatim.
+        Each row therefore reports the numbers it was judged at, because with a
+        derived context one number at the top no longer describes every row.
+
+        The payload is the same either way -- same keys, same `unresolved[]`,
+        same two sides -- because a second shape is a second thing to keep in
+        step with the fit gate, which is this project's one stated failure mode.
+        """
         from control_plane.fit.capacity import largest_runnable
         from control_plane.fit.catalog import CURATED_MODELS
         from . import livefit
 
+        max_seqs = concurrency if concurrency and concurrency > 0 else 1
         profiles = _profiles()
+        wanted_ids, unknown_ids = _parse_node_scope(on, profiles)
+        if wanted_ids is not None:
+            profiles = [p for p in profiles if p.node_id in wanted_ids]
+
         # A node reporting no addressable memory at all cannot hold anything,
         # and leaving it in makes every min() zero -- which would report a
         # static budget of 0.0 GiB beside rows that say "fits".
@@ -531,87 +653,142 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             for p in profiles
             if p.addressable_memory <= 0
         ]
+
+        # No machine here has a GPU budget. That used to be a 503, on the
+        # reasoning that there was nothing to measure against -- but on a
+        # single GPU-less coordinator, which is what a fresh install on a Pi or
+        # a laptop is, that made every model row on the screen permanently
+        # "not checked" and the models screen useless. Answer from the live
+        # host reading instead, and say plainly what the budget is.
+        host_basis = False
+        host_budget: dict[str, int] = {}
+        if not usable_profiles:
+            host_budget = _host_budget(ctx, profiles)
+            if host_budget:
+                host_basis = True
+                usable_profiles = [p for p in profiles if p.node_id in host_budget]
+                skipped = [e for e in skipped if e["node_id"] not in host_budget]
+
         if not usable_profiles:
             return errors.error_response(
                 503,
-                "No healthy node reports any addressable memory, so there is "
-                "nothing to measure capacity against.",
+                "No enrolled machine reports any memory to measure against -- "
+                "neither GPU-addressable memory nor a host reading. Join a "
+                "node, or add a remote provider and serve from there.",
                 "server_error",
                 "no_nodes",
             )
-        # Probe the largest node: capacity is "what is the biggest thing this
-        # cluster can run", and answering it against the smallest machine
-        # would understate the cluster for no reason.
-        profiles = sorted(
-            usable_profiles, key=lambda p: p.addressable_memory, reverse=True
-        )
+
+        profiles = _order_profiles(ctx, usable_profiles)
+        if wanted_ids is None:
+            # Nothing was named, so this is a question about ONE machine --
+            # the coordinator's own host. Sharding across whatever happens to
+            # be enrolled would answer "what could this cluster run if it were
+            # replanned around this model", which is the planner's question and
+            # needs a target and a link measurement. `on=` is how somebody asks
+            # the other one.
+            profiles = profiles[:1]
 
         kv = kv_dtype or ctx.settings.default_kv_dtype
-        budgets, excluded, unavailable = livefit.allocatable_map(
-            ctx.deps.registry, [p.node_id for p in profiles]
-        )
-        budgets, zero_excluded = livefit.drop_zero_addressable(profiles, budgets)
-        excluded = excluded + zero_excluded + skipped
+        if host_basis:
+            # The live budget IS the host reading here; asking the registry for
+            # an allocatable figure would answer about a GPU that is not there.
+            budgets = dict(host_budget)
+            excluded, unavailable = [], None
+        else:
+            budgets, excluded, unavailable = livefit.allocatable_map(
+                ctx.deps.registry, [p.node_id for p in profiles]
+            )
+            budgets, zero_excluded = livefit.drop_zero_addressable(profiles, budgets)
+            excluded = excluded + zero_excluded
+        excluded = excluded + skipped + unknown_ids
 
         # Resolve first, once, and report what could not be resolved rather
         # than dropping it silently from an answer that claims completeness.
-        shapes: list = []
-        unresolved: list[dict] = []
-        for model in list(CURATED_MODELS)[:MAX_CATALOG_MODELS]:
-            try:
-                resolved = await asyncio.to_thread(
-                    _resolve, ctx, model.model_id
-                )
-            except Exception as exc:
-                unresolved.append(
-                    {
-                        "model_id": model.model_id,
-                        "reason": errors.detail(exc),
-                    }
-                )
-                continue
-            shape, weight_bytes = resolved
-            shapes.append((shape, model.label, weight_bytes))
+        #
+        # A named id is its own label. Prettifying it here -- `id.split("/")[-1]`
+        # or similar -- would be a second naming rule competing with the one the
+        # client already applies to its own rows.
+        if models.strip():
+            named, over_cap = _parse_models(models)
+            wanted = [(model_id, model_id) for model_id in named]
+        else:
+            wanted = [
+                (m.model_id, m.label) for m in list(CURATED_MODELS)[:MAX_CATALOG_MODELS]
+            ]
+            over_cap = []
+
+        shapes, unresolved, natives = await _resolve_many(ctx, wanted)
+        unresolved.extend(over_cap)
+
+        plan_for = _plan_for(ctx, profiles)
+        # The degree is a property of the model, so it is only knowable per
+        # row. Reported as the set actually used rather than as the set asked
+        # for: a client that ticked three machines and got TP=1 has to be able
+        # to say so instead of implying a three-way split that never happened.
+        tp_used = sorted(
+            {plan_for(shape).tensor_parallel for shape, _l, _w in shapes}
+        ) if plan_for and shapes else [1]
+
+        host_note = (
+            f"sized against the host memory {profiles[0].node_id} reports, "
+            f"not against GPU memory: no GPU was found on it. Nothing here "
+            f"can be launched on this machine -- serve it from a provider."
+        ) if host_basis else None
 
         out: dict[str, Any] = {
             "probed_node": profiles[0].node_id,
+            # Null when the fit gate chose per model. The client must read the
+            # number off each row in that case; one number here would describe
+            # whichever row happened to be first.
             "context": context,
-            "concurrency": concurrency,
+            "concurrency": max_seqs,
             "kv_dtype": kv,
             "nodes": [p.node_id for p in profiles],
+            "tensor_parallel": tp_used,
+            "budget_basis": "host_memory" if host_basis else "gpu",
+            "local_serving": not host_basis,
             "measured_at": time.time(),
             "excluded": excluded,
             "unresolved": unresolved,
             "unavailable_reason": unavailable,
         }
 
-        if basis in ("live", "both") and budgets:
+        async def _side(allocatable):
             rows, best = await asyncio.to_thread(
                 largest_runnable, shapes, profiles,
-                context=context, max_seqs=concurrency, kv_dtype=kv,
-                allocatable=budgets,
+                context=context, max_seqs=max_seqs, kv_dtype=kv,
+                allocatable=allocatable, plan_for=plan_for,
+                native_context=natives,
             )
-            out["live"] = {
-                "allocatable_per_node": budgets.get(
-                    profiles[0].node_id, min(budgets.values())
-                ),
-                "rows": [_row_payload(r) for r in rows],
-                "best": _row_payload(best) if best else None,
+            return {
+                "rows": [_row_payload(r, host_note) for r in rows],
+                "best": _row_payload(best, host_note) if best else None,
             }
+
+        if basis in ("live", "both") and budgets:
+            side = await _side(budgets)
+            side["allocatable_per_node"] = budgets.get(
+                profiles[0].node_id, min(budgets.values())
+            )
+            out["live"] = side
         elif basis in ("live", "both"):
             out["live"] = None
 
         if basis in ("static", "both"):
-            rows, best = await asyncio.to_thread(
-                largest_runnable, shapes, profiles,
-                context=context, max_seqs=concurrency, kv_dtype=kv,
-                allocatable=None,
-            )
-            out["static"] = {
-                "usable_per_node": profiles[0].usable_memory(DEFAULT_GUARDRAIL),
-                "rows": [_row_payload(r) for r in rows],
-                "best": _row_payload(best) if best else None,
-            }
+            if host_basis:
+                # There is no static side to report. The static ceiling is
+                # derived from addressable memory, which is 0 here on purpose,
+                # so every figure on this side would be 0.0 GiB beside rows
+                # that say "fits" -- the exact confusion the zero-addressable
+                # filter above exists to prevent.
+                out["static"] = None
+            else:
+                side = await _side(None)
+                side["usable_per_node"] = profiles[0].usable_memory(
+                    DEFAULT_GUARDRAIL
+                )
+                out["static"] = side
 
         return JSONResponse(out)
 
@@ -645,40 +822,111 @@ class _TTLCache:
             self._items.pop(oldest, None)
         self._items[key] = (time.monotonic(), value)
 
+    def clear(self) -> None:
+        """Drop everything. These caches are module-global, so without this a
+        test that warms one changes the answer a later test gets."""
+        self._items.clear()
+
 
 _variant_cache = _TTLCache(_VARIANTS_TTL_S)
 _search_cache = _TTLCache(_SEARCH_TTL_S, limit=128)
+#: Enumerations that FAILED, so a retry is cheap.
+#:
+#: ``_variant_cache`` is only ever written on success, which meant a model
+#: whose enumeration timed out paid the full 20s on every retry, for ever --
+#: and a person watching a spinner fail clicks again. Short-lived on purpose:
+#: a failure is a thing an operator fixes (sets HF_TOKEN, accepts a licence),
+#: and a screen still repeating a refusal that has been dealt with is a worse
+#: bug than a few extra hub calls. `ModelNotFound` is deliberately NOT stored
+#: -- it fails on the first listing and is already cheap.
+_VARIANT_FAIL_TTL_S = 60.0
+_variant_fail_cache = _TTLCache(_VARIANT_FAIL_TTL_S, limit=64)
 
 
 def _variant_verdicts(
-    ctx: GatewayContext, model_id: str, variants: list, context: int, concurrency: int
-) -> list[dict]:
-    """Ask the real fit gate about each variant, at its own dtype and size.
+    ctx: GatewayContext,
+    model_id: str,
+    variants: list,
+    context: int | None,
+    concurrency: int,
+    on: str = "",
+) -> tuple[list[dict], dict]:
+    """(one row per variant, what the rows were sized against).
 
-    Runs through ``largest_runnable`` with an empty ladder, so each variant is
+    Ask the real fit gate about each variant, at its own dtype and size. Runs
+    through ``largest_runnable`` with an empty ladder, so each variant is
     checked as it actually ships rather than being walked down to something
     else -- the ladder here *is* the variant list, and re-quantizing a row
     would answer a question nobody asked.
+
+    The second return value is the whole point of this signature. These rows
+    used to be sized on one machine, silently, while the board above them let
+    somebody tick several -- and the screen apologised for the gap in prose
+    instead of closing it. ``on=`` closes it: the rows are sized on the
+    machines that were named, at the widest degree the model legally admits
+    across them, and the basis travels back so the caption can state it as a
+    fact rather than hedge.
     """
     import dataclasses
 
     from control_plane.contracts.quant import QUANT_INFO
-    from control_plane.fit.capacity import largest_runnable
+    from control_plane.fit.capacity import (
+        _single_node_plan as _single_ladder_plan,
+        ladder_context,
+        largest_runnable,
+    )
+
+    def _quality(dtype: str) -> float:
+        """Bits per weight, for ordering the variants best-first.
+
+        The ladder arrives in the hub's order and is ranked for display later
+        by fit. The context has to be derived before any of that, so it needs
+        its own ordering, and quality is the one that matters: the derivation
+        takes the best scheme that still leaves a workable window.
+        """
+        info = QUANT_INFO.get(dtype)
+        return info.bits_per_weight if info else 0.0
 
     from . import livefit
 
     try:
-        base_shape, _ = _resolve(ctx, model_id)
+        base_shape, _, base_window = _resolve(ctx, model_id)
     except Exception:
         log.exception("could not resolve %s for variant verdicts", model_id)
         base_shape = None
+        base_window = None
 
-    profiles = [
-        p for p in _profiles_of(ctx) if p.addressable_memory > 0
-    ]
-    profiles.sort(key=lambda p: p.addressable_memory, reverse=True)
+    all_profiles = _profiles_of(ctx)
+    wanted_ids, _unknown = _parse_node_scope(on, all_profiles)
+    if wanted_ids is not None:
+        all_profiles = [p for p in all_profiles if p.node_id in wanted_ids]
+
+    profiles = [p for p in all_profiles if p.addressable_memory > 0]
+    # Same fallback as `/api/capacity`, for the same reason: on a machine with
+    # no GPU the ladder is the only thing that can say how big these files are
+    # and whether the box could hold them at all, and a blank column says
+    # nothing. `local_serving` below is what stops it growing a Serve button.
+    host_basis = False
+    if not profiles:
+        host_budget = _host_budget(ctx, all_profiles)
+        if host_budget:
+            host_basis = True
+            profiles = [p for p in all_profiles if p.node_id in host_budget]
+
+    profiles = _order_profiles(ctx, profiles)
+    # Every GPU node, unless somebody named a subset. NOT the `[:1]` clamp that
+    # `/api/capacity` keeps: that endpoint answers "what can this machine run",
+    # and widening it there would silently turn it into the planner's question.
+    # This ladder answers "which published variant of THIS model should I pull",
+    # which is a question about the cluster the operator actually has -- a
+    # two-Spark roster answered as one Spark reports refusals for variants the
+    # pair holds at TP=2. The degree still comes from `_plan_for`, i.e. from
+    # `valid_tp_degrees`, so a model that only splits one way is judged on one
+    # machine however many are enrolled.
     allocatable = None
-    if profiles:
+    if profiles and host_basis:
+        allocatable = _host_budget(ctx, profiles)
+    elif profiles:
         try:
             allocatable, _, _ = livefit.allocatable_map(
                 ctx.deps.registry, [p.node_id for p in profiles]
@@ -686,8 +934,64 @@ def _variant_verdicts(
         except Exception:
             log.exception("live budget unavailable; falling back to the ceiling")
 
+    plan_for = _plan_for(ctx, profiles)
+    basis = {
+        # Filled in from the PLACEMENT below, once there is one. Empty until
+        # then, and empty is the honest answer when the model could not be
+        # resolved: no walk happened, every row reports "not checked", and
+        # naming machines beside that would describe a probe nobody ran. It
+        # also keeps the invariant the caption relies on -- the node list and
+        # the degree always describe the same placement -- which the widened
+        # default would otherwise break by listing the whole roster at TP=1.
+        "nodes": [],
+        "probed_node": None,
+        "budget_basis": "host_memory" if host_basis else "gpu",
+        "local_serving": bool(profiles) and not host_basis,
+        "tensor_parallel": 1,
+        # The two denominators, so the caption can name the number the verdicts
+        # were taken against instead of leaving the reader to assume it was the
+        # nameplate. Filled in below against the PLACEMENT, not the candidate
+        # set, and both are the binding (smallest) figure across it -- which is
+        # what `FitCalculator._budget` actually gates on.
+        "allocatable_per_node": None,
+        "usable_per_node": None,
+        "budget_is_live": bool(allocatable),
+    }
+
     verdicts: dict[str, Any] = {}
+    # The same rows judged against the hardware's own ceiling instead of what
+    # is free this second. Empty when there is no second question to ask: no
+    # live budget (the one walk already IS the static one), or `host_basis`.
+    static_verdicts: dict[str, Any] = {}
     if base_shape is not None and profiles:
+        # One placement for the whole ladder: every row is the same model at a
+        # different precision, and the legal degrees come from the head counts,
+        # which no quantization changes.
+        placement = (
+            plan_for(base_shape)
+            if plan_for is not None
+            else _single_ladder_plan([profiles[0].node_id])
+        )
+        # The placement, not the candidate set. Somebody who ticks three
+        # machines for a model that only splits two ways has two machines under
+        # it, and reporting all three would restate the mismatch this parameter
+        # exists to remove.
+        basis["tensor_parallel"] = placement.tensor_parallel
+        basis["nodes"] = list(placement.node_ids)
+        basis["probed_node"] = placement.node_ids[0]
+        placed = [p for p in profiles if p.node_id in set(placement.node_ids)]
+        if allocatable:
+            budgets = [
+                allocatable[p.node_id]
+                for p in placed
+                if p.node_id in allocatable
+            ]
+            if budgets:
+                basis["allocatable_per_node"] = min(budgets)
+        if placed and not host_basis:
+            basis["usable_per_node"] = min(
+                p.usable_memory(DEFAULT_GUARDRAIL) for p in placed
+            )
         shapes = []
         for index, variant in enumerate(variants):
             shapes.append(
@@ -697,23 +1001,88 @@ def _variant_verdicts(
                     variant.file_bytes,
                 )
             )
-        try:
-            rows, _ = largest_runnable(
-                shapes,
+        # ONE context for the whole list, when the caller named none.
+        #
+        # `largest_runnable` is called with an empty ladder here -- each
+        # variant is checked as it actually ships, never walked down to
+        # something else -- so its own per-model derivation would fire once per
+        # ROW and hand every row a different context. That is four questions
+        # printed as one table: "fits at 31744" beside "fits at 32256", with
+        # headroom figures underneath that cannot be read against each other.
+        # Derive once, over the same variants in quality order, and hold it
+        # fixed down the list, which is what makes the column comparable.
+        row_context = context
+        if row_context is None:
+            rungs = sorted(
+                (
+                    (shape, str(index), weight_bytes)
+                    for index, (shape, _label, weight_bytes) in enumerate(shapes)
+                ),
+                key=lambda rung: -_quality(rung[0].dtype),
+            )
+            row_context, _rung = ladder_context(
+                rungs,
                 profiles,
-                context=context,
+                placement,
                 max_seqs=concurrency,
                 kv_dtype=ctx.settings.default_kv_dtype,
                 allocatable=allocatable,
-                ladder=(),
+                native_window=base_window,
             )
-            verdicts = {row.label: row for row in rows}
+
+        def _side(budget):
+            """One walk of the whole ladder against one budget.
+
+            Same shape `/api/capacity` uses for its `live`/`static` pair, so
+            there are two implementations of "judge these shapes" in this file
+            and not three. `row_context` is closed over deliberately: BOTH
+            sides are judged at the one context derived above, on the governing
+            budget. Deriving it per side would print a live headroom taken at
+            one window beside a static headroom taken at another, and the two
+            columns could not be read against each other -- the same failure
+            `ladder_context` exists to prevent within a single side.
+            """
+            rows, _ = largest_runnable(
+                shapes,
+                profiles,
+                context=row_context,
+                max_seqs=concurrency,
+                kv_dtype=ctx.settings.default_kv_dtype,
+                allocatable=budget,
+                ladder=(),
+                plan_for=plan_for,
+            )
+            return {row.label: row for row in rows}
+
+        try:
+            verdicts = _side(allocatable)
         except Exception:
             log.exception("capacity walk failed for %s variants", model_id)
+
+        # The static side, and only where it means something. Under
+        # `host_basis` the static ceiling derives from addressable memory,
+        # which is 0 on purpose there, so every figure on that side would be
+        # "0.0 GiB" printed beside rows that say "fits" -- the exact confusion
+        # `/api/capacity` suppresses it for.
+        #
+        # With no live reading there is no second question: the walk above was
+        # ALREADY taken against the ceiling. Mirror it rather than reporting
+        # None, so "does the hardware hold this at all" has an answer whenever
+        # one exists. Left None, a screen asking that question would render
+        # "unknown" over a verdict it was holding.
+        if not host_basis:
+            if allocatable:
+                try:
+                    static_verdicts = _side(None)
+                except Exception:
+                    log.exception("static walk failed for %s variants", model_id)
+            else:
+                static_verdicts = verdicts
 
     out: list[dict] = []
     for index, variant in enumerate(variants):
         row = verdicts.get(str(index))
+        spec = static_verdicts.get(str(index))
         info = QUANT_INFO.get(variant.dtype)
         out.append(
             {
@@ -740,9 +1109,28 @@ def _variant_verdicts(
                 "headroom": row.headroom if row else None,
                 "reason": row.reason if row else "",
                 "predicted_decode_tps": row.predicted_decode_tps if row else None,
+                # What this row was judged at. The caller named no context on
+                # the default path, so the gate chose one -- and a verdict
+                # whose question is not on screen beside it is not checkable.
+                "context": row.context if row else None,
+                "max_seqs": row.max_seqs if row else None,
+                # The same row against the static ceiling. Additive, and never
+                # the governing answer: `verdict`/`fits` above keep meaning
+                # exactly what they meant, so nothing that reads them flips.
+                # This is here to separate two sentences the screen used to
+                # print identically -- "this machine cannot hold it" and "this
+                # machine is full right now" -- which want different actions
+                # from whoever is reading. None when no static side was walked.
+                "static_verdict": spec.verdict if spec else None,
+                "static_fits": spec.fits if spec else None,
+                "static_headroom": spec.headroom if spec else None,
+                "static_reason": spec.reason if spec else "",
+                "static_predicted_decode_tps": (
+                    spec.predicted_decode_tps if spec else None
+                ),
             }
         )
-    return _ranked(out)
+    return _ranked(out), basis
 
 
 #: Fit tiers, best first. ``Verdict`` has exactly three and the ordering
@@ -827,6 +1215,114 @@ def _profiles_of(ctx: GatewayContext) -> list:
         return []
 
 
+def _coordinator_id(ctx: GatewayContext) -> str | None:
+    """This machine's own node id.
+
+    ``Registry.local_node_id`` is the authoritative field -- it is set from
+    the profile the coordinator probed of itself. ``coordinator_node_id``
+    on settings is the fallback and only a fallback: ``app.py`` derives it
+    from ``list_nodes()[0]``, whose order nothing guarantees, so it names
+    the right machine only by luck on a multi-node roster.
+    """
+    local = getattr(ctx.deps.registry, "local_node_id", None)
+    if isinstance(local, str) and local:
+        return local
+    return ctx.settings.coordinator_node_id
+
+
+def _order_profiles(ctx: GatewayContext, profiles: list) -> list:
+    """The machines to probe, the one the answer is ABOUT first.
+
+    The order matters because ``probed_node``, the live denominator and the
+    static denominator are all read off ``profiles[0]``.
+
+    1. the coordinator's own host, when it has a budget. This is the
+       machine somebody looking at a fresh install is standing in front of,
+       and answering about a different one -- with nothing on screen saying
+       which -- is how a verdict becomes untrustworthy.
+    2. otherwise the largest by addressable memory, which is what this
+       always did: capacity is "what is the biggest thing this cluster can
+       run", and answering it against the smallest machine would understate
+       the cluster for no reason.
+
+    The rest follow in descending size either way, so a multi-node probe
+    still shards onto the roomiest machines it was given.
+    """
+    ordered = sorted(profiles, key=lambda p: p.addressable_memory, reverse=True)
+    local = _coordinator_id(ctx)
+    for index, profile in enumerate(ordered):
+        if profile.node_id == local:
+            return [ordered.pop(index)] + ordered
+    return ordered
+
+
+def _plan_for(ctx: GatewayContext, profiles: list):
+    """A per-shape placement across ``profiles``, or None for one machine.
+
+    None means "let the fit gate use its single-node probe", which is the
+    answer whenever there is one machine to talk about -- the overwhelming
+    majority of requests, and the path that must not grow a planner call.
+
+    The degree comes from the planner port's ``valid_tp_degrees``, not from
+    ``len(profiles)``: tensor parallelism has to divide both the query and
+    the KV heads, so three machines take a model at TP=1 however many boxes
+    somebody ticked. Reporting a fit at a degree the runtime would refuse
+    to start at is exactly the class of answer this project does not give.
+    """
+    node_ids = [p.node_id for p in profiles]
+    if len(node_ids) < 2:
+        return None
+    from control_plane.fit.capacity import probe_plan
+
+    legal = getattr(ctx.deps.planner, "valid_tp_degrees", None)
+
+    def build(shape):
+        degrees = {1}
+        if callable(legal):
+            try:
+                degrees = set(legal(shape, len(node_ids))) or {1}
+            except Exception:
+                log.exception("valid_tp_degrees failed for %s", shape.model_id)
+                degrees = {1}
+        tp = max(d for d in degrees if 1 <= d <= len(node_ids))
+        return probe_plan(node_ids, tp)
+
+    return build
+
+
+def _host_budget(ctx: GatewayContext, profiles: list) -> dict[str, int]:
+    """Host memory, for machines the fit gate has no GPU budget for.
+
+    ``NodeProfile.addressable_memory`` is 0 on a machine ``nvidia-smi`` did
+    not answer for, and that 0 is deliberate: it is what the fit gate
+    budgets against, so RAM no model can reach must not appear in it. That
+    rule is kept -- nothing here writes to a profile that outlives the
+    request.
+
+    What it does instead is answer the question anyway, from the LIVE host
+    reading the node already reports -- ``NodeState.memory_total``, read
+    straight off the roster rather than through ``memory_report``, which
+    does not carry it. The distinction between that and a static slice of
+    host RAM matters: a static ceiling is a fabricated number the planner
+    would then place a rank on, whereas this is a measurement, and it is
+    reported as a budget the caller is told not to launch against.
+    """
+    wanted = {p.node_id for p in profiles}
+    out: dict[str, int] = {}
+    try:
+        states = ctx.deps.registry.healthy_nodes()
+    except Exception:
+        log.exception("registry unavailable")
+        return out
+    for state in states:
+        node_id = state.profile.node_id
+        if node_id not in wanted:
+            continue
+        total = int(getattr(state, "memory_total", 0) or 0)
+        if total > 0:
+            out[node_id] = total
+    return out
+
 def _quant_node_check(ctx: GatewayContext, resolution: Any) -> dict:
     """Can the nodes we actually have run this scheme?
 
@@ -887,16 +1383,203 @@ def _quant_node_check(ctx: GatewayContext, resolution: Any) -> dict:
 
 
 def _resolve(ctx: GatewayContext, model_id: str):
-    """Shape plus measured weight bytes, preferring resolve_full when the port
-    has it -- the same preference internal_api's planning path applies."""
+    """(shape, measured weight bytes, the model's own context window).
+
+    Prefers ``resolve_full`` when the port has it -- the same preference
+    internal_api's planning path applies.
+
+    The window is the third element because the fit gate now chooses a context
+    when the caller names none, and a choice made without knowing the model's
+    own limit is a number vLLM would refuse to start with. It lives on
+    ``Resolution`` and not on ``ModelShape`` (a frozen contract), so a port
+    that only implements ``resolve`` reports None and the caller falls back.
+    """
     full = getattr(ctx.deps.resolver, "resolve_full", None)
     if callable(full):
         resolution = full(model_id, None)
-        return resolution.shape, resolution.effective_weight_bytes()
-    return ctx.deps.resolver.resolve(model_id, None), None
+        return (
+            resolution.shape,
+            resolution.effective_weight_bytes(),
+            getattr(resolution, "max_position_embeddings", None),
+        )
+    return ctx.deps.resolver.resolve(model_id, None), None, None
 
 
-def _row_payload(row) -> dict:
+def _parse_node_scope(
+    raw: str, profiles: list
+) -> tuple[set[str] | None, list[dict]]:
+    """``on=`` into (the ids to keep, entries for ids nobody here has).
+
+    None -- not an empty set -- when nothing was named, because "every machine"
+    and "no machine" are different questions and collapsing them would silently
+    answer the first when somebody asked the second.
+
+    An id that matches no enrolled machine is REPORTED in ``excluded[]`` rather
+    than ignored. A stale `?on=` in a bookmarked URL otherwise narrows the
+    answer to nothing and looks like a cluster that lost its nodes.
+    """
+    named = [chunk.strip() for chunk in (raw or "").split(",")]
+    named = [n for n in named if n]
+    if not named:
+        return None, []
+    known = {p.node_id for p in profiles}
+    unknown = [
+        {
+            "node_id": node_id,
+            "reason": "named in `on=` but no healthy node here has that id",
+        }
+        for node_id in dict.fromkeys(named)
+        if node_id not in known
+    ]
+    return set(named), unknown
+
+
+def _parse_models(raw: str) -> tuple[list[str], list[dict]]:
+    """``models=`` into (ids to walk, entries for ids we will not walk).
+
+    Case-sensitive de-duplication, preserving first-seen order. Two spellings
+    are two ids to the hub, and folding them would answer a question about
+    ``qwen/qwen3`` under the row for ``Qwen/Qwen3`` -- an identity inference,
+    which is not this endpoint's to make.
+
+    Ids past the cap are REPORTED, never silently dropped: they go back as
+    ``unresolved`` entries, which is the field a client already renders as "why
+    this row has no verdict". A truncated list that does not say it was
+    truncated reads as a complete answer.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for chunk in (raw or "").split(","):
+        model_id = chunk.strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        ids.append(model_id)
+
+    over = ids[MAX_CAPACITY_MODELS:]
+    return ids[:MAX_CAPACITY_MODELS], [
+        {
+            "model_id": model_id,
+            "reason": (
+                f"not checked: this request named {len(ids)} models and the "
+                f"capacity probe answers at most {MAX_CAPACITY_MODELS} at a time"
+            ),
+        }
+        for model_id in over
+    ]
+
+
+_resolve_cache = _TTLCache(_RESOLVE_TTL_S, limit=256)
+_resolve_fail_cache = _TTLCache(_RESOLVE_FAIL_TTL_S, limit=256)
+
+
+def _resolve_memo(ctx: GatewayContext, model_id: str):
+    """`_resolve`, with both outcomes remembered.
+
+    Raises the stored sentence rather than a stored exception: the sentence is
+    what `unresolved[]` carries, and re-raising a pickled cause chain would
+    only invite somebody to inspect a type that is no longer live.
+    """
+    hit = _resolve_cache.get(model_id)
+    if hit is not None:
+        return hit
+    failed = _resolve_fail_cache.get(model_id)
+    if failed is not None:
+        raise _CachedResolveFailure(failed)
+    try:
+        resolved = _resolve(ctx, model_id)
+    except Exception as exc:
+        _resolve_fail_cache.put(model_id, errors.detail(exc))
+        raise
+    _resolve_cache.put(model_id, resolved)
+    return resolved
+
+
+class _CachedResolveFailure(Exception):
+    """A resolve that already failed inside the negative TTL."""
+
+
+async def _resolve_many(
+    ctx: GatewayContext,
+    wanted: list[tuple[str, str]],
+    *,
+    timeout: float = _CAPACITY_TIMEOUT_S,
+) -> tuple[list[tuple], list[dict], dict[str, int | None]]:
+    """(shapes for `largest_runnable`, unresolved entries, context windows).
+
+    ``wanted`` is (model_id, label). Bounded fan-out, one shared deadline, and
+    it degrades: whatever resolved inside the window produces rows, and
+    everything else is reported with a sentence. Nothing is ever guessed at and
+    nothing is ever dropped -- every id in goes out in exactly one of the two
+    lists.
+
+    Returns each model's own context window alongside, keyed by LABEL to match
+    what ``largest_runnable`` wants: the variant ladder walks one model under
+    several labels, so the model id is not a key there.
+    """
+    if not wanted:
+        return [], [], {}
+
+    gate = asyncio.Semaphore(_RESOLVE_FANOUT)
+
+    async def one(model_id: str):
+        async with gate:
+            return await asyncio.to_thread(_resolve_memo, ctx, model_id)
+
+    tasks = {asyncio.ensure_future(one(mid)): (mid, label) for mid, label in wanted}
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    shapes: list[tuple] = []
+    unresolved: list[dict] = []
+    natives: dict[str, int | None] = {}
+    # Iterate `wanted`, not `done`: the answer's order must be the order that
+    # was asked for, whatever order the hub replied in.
+    for task, (model_id, label) in tasks.items():
+        if task not in done:
+            unresolved.append({
+                "model_id": model_id,
+                "reason": (
+                    f"the hub did not answer within {timeout:.0f}s, so this "
+                    "model has no verdict"
+                ),
+            })
+            continue
+        exc = task.exception()
+        if exc is not None:
+            reason = (
+                exc.args[0]
+                if isinstance(exc, _CachedResolveFailure)
+                else errors.detail(exc)
+            )
+            unresolved.append({"model_id": model_id, "reason": reason})
+            continue
+        shape, weight_bytes, max_positions = task.result()
+        # The answer is keyed by the QUESTION. A resolver that canonicalises an
+        # id -- follows a hub redirect, folds case -- would otherwise return a
+        # row the caller cannot find, and a client joining these rows by the id
+        # it asked for would leave that model "checking" for ever. Logged when
+        # they differ so a redirect stays observable rather than silently
+        # renamed; nothing else about the shape is touched.
+        if shape.model_id != model_id:
+            log.info(
+                "capacity: %r resolved as %r; reporting under the id asked for",
+                model_id, shape.model_id,
+            )
+            shape = replace(shape, model_id=model_id)
+        shapes.append((shape, label, weight_bytes))
+        natives[label] = max_positions
+    return shapes, unresolved, natives
+
+
+def _row_payload(row, extra_warning: str | None = None) -> dict:
+    warnings = list(row.warnings)
+    if extra_warning:
+        warnings.append(extra_warning)
     return {
         "model_id": row.model_id,
         "label": row.label,
@@ -910,5 +1593,9 @@ def _row_payload(row) -> dict:
         "headroom": row.headroom,
         "predicted_decode_tps": row.predicted_decode_tps,
         "reason": row.reason,
-        "warnings": row.warnings,
+        "warnings": warnings,
+        # What this row was judged at. Per row, because the fit gate chooses
+        # per model when the caller names no context.
+        "context": row.context,
+        "max_seqs": row.max_seqs,
     }

@@ -5,17 +5,21 @@ import { Lamp } from '../../components/Lamp'
 import { Readout } from '../../components/Readout'
 import { Verbatim } from '../../components/Verbatim'
 import { nodeLive, nodeSignal, utilLabel } from '../../state/live'
-import { shortGpu } from '../../format'
+import { useMemoryReport } from '../../state/resources'
+import { deviceClassLabel, shortGpu } from '../../format'
 import { fromState, nodeName } from '../../state/names'
 import type { HistoryWindow } from '../../state/history'
 import { WindowChips } from './WindowChips'
 import { NodeCharts } from './NodeCharts'
 import { HardwareRows } from './HardwareRows'
 import { Interconnect } from './Interconnect'
+import { runners } from '../../tabs/cluster/layout'
 import { ServingBlock } from './ServingBlock'
 import { RequestsTable } from './RequestsTable'
 import { EventsAndLogs } from './EventsAndLogs'
 import { ResidentProcesses } from './ResidentProcesses'
+import { NodeRuntimeCard } from './NodeRuntimeCard'
+import { NodeTerminal } from './Terminal'
 import { RenameNode } from './RenameNode'
 
 interface Props {
@@ -32,7 +36,8 @@ interface Props {
  *  Left column is what the machine IS: its live readouts, its four traces, its
  *  hardware, its links to the other machines. Right column is what it is
  *  DOING: every model it serves with that model's own numbers, the requests
- *  that ran here, what happened to it, and what is holding its GPU.
+ *  that ran here, what happened to it, what is holding its GPU, and -- when
+ *  none of those said enough -- a prompt on the machine itself.
  *
  *  The window chips at the top govern the whole page. `live` is the 60-second
  *  ring this browser accumulates from the 1 Hz frame; the rest come off the
@@ -49,13 +54,47 @@ interface Props {
  *  nothing on the wire to throttle. */
 export function NodeInspector({ node, deployments, routing, frame, stale, onClose }: Props) {
   const [window, setWindow] = useState<HistoryWindow>('live')
+  const memoryReport = useMemoryReport()
 
   const p = node.profile
   const live = nodeLive(node, frame, stale)
-  const signal = nodeSignal(node, live)
+  // The server's verdict, not a threshold of ours: HardwareRows below already
+  // renders this exact field, and the lamp disagreeing with the line under it
+  // was the whole defect.
+  const severity = memoryReport.data?.nodes.find((n) => n.node_id === node.profile.node_id)
+    ?.memory_severity
+  const signal = nodeSignal(node, live, severity)
   const grey = signal === 'fault' || !live.fresh
   const unified = p.device_class === 'gb10'
-  const here = deployments.filter((d) => d.node_ids.includes(p.node_id))
+  // The one-line hardware summary under the name. Every part is dropped when
+  // there is nothing true to put in it: a Raspberry Pi read
+  // "· discrete · 0.0 GB/s" -- a memory topology it does not have, and a
+  // bandwidth of exactly zero, which `probe.bandwidth_for` returns to mean
+  // "we do not know this part" and which reads here as a measured bus.
+  // `unified` above stays GB10-only on purpose: the sentence it guards is
+  // about the static ceiling overstating what nvidia-smi can account for,
+  // which is a GB10 fact rather than a unified-memory one.
+  const topology =
+    p.device_class === 'gb10' || p.device_class === 'apple'
+      ? 'unified memory'
+      : p.device_class === 'discrete'
+        ? 'discrete'
+        : null
+  const summary = [
+    shortGpu(p.gpu_name) || deviceClassLabel(p.device_class),
+    topology,
+    p.memory_bandwidth_gbps > 0 ? `${p.memory_bandwidth_gbps.toFixed(1)} GB/s` : null,
+  ].filter(Boolean)
+  // What this machine is running NOW, not everything it has ever been asked to
+  // run. `/api/deployments` is a ledger: it keeps every attempt for a week, so
+  // nine failed tries at four models are nine rows all naming this node, and
+  // each one drew a full serving block -- lamp, plan line, four readouts and
+  // three charts -- for a container that does not exist. `runners()` is the
+  // floor's and the dashboard strip's, deliberately not a fourth spelling of
+  // the same set: a machine cannot be serving something here and idle there.
+  // A finished attempt still says what went wrong, on the Models screen, which
+  // is the surface that bands a row by its verdict.
+  const here = runners(deployments).filter((d) => d.node_ids.includes(p.node_id))
 
   return (
     <div>
@@ -82,8 +121,7 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
           </span>
         </div>
         <div className="unit" style={{ marginTop: 4 }}>
-          {shortGpu(p.gpu_name)} · {unified ? 'unified memory' : 'discrete'} ·{' '}
-          {p.memory_bandwidth_gbps.toFixed(1)} GB/s
+          {summary.join(' · ')}
         </div>
       </div>
 
@@ -147,7 +185,15 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
 
           <ResidentProcesses nodeId={p.node_id} />
 
+          {/* Renders only when something is actually listening, so this is
+              silent on the machines where it would be noise. */}
+          <NodeRuntimeCard nodeId={p.node_id} />
+
           <EventsAndLogs nodeId={p.node_id} window={window} />
+
+          {/* Last in the column, and the escalation from everything above
+              it: the recorded lines did not say enough, so go and look. */}
+          <NodeTerminal nodeId={p.node_id} />
         </div>
       </div>
     </div>

@@ -8,7 +8,16 @@ uvicorn[standard]==0.34.0
 # realtime with an ImportError at connect time.
 websockets==15.0.1
 httpx==0.28.1
+# Already pulled in by starlette, but gateway/proxy.py imports it directly for
+# `CancelScope(shield=True)`: a streamed response must still close its upstream
+# connection when the client hangs up, and the scope it is running in is already
+# cancelled by then. asyncio.shield does not cover an anyio cancellation.
+anyio==4.14.2
 pydantic==2.10.4
 zeroconf==0.136.2
 PyYAML==6.0.3
 requests==2.34.2
+# Host facts on the two platforms with no /proc: memory, CPU utilisation,
+# process liveness and process kill. The Linux readers are unchanged and do
+# not go through it -- see control_plane/registry/hostfacts.py.
+psutil==7.2.2

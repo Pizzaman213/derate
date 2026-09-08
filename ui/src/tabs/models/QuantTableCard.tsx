@@ -11,6 +11,11 @@ import { useQuantTable } from '../../state/resources'
 export function QuantTableCard() {
   const table = useQuantTable()
   const [open, setOpen] = useState(false)
+  // Read off the payload, never typed here. There were two columns and three
+  // runtimes the day `tts` landed, and a hardcoded pair does not render as a
+  // missing column -- it renders as a complete table that quietly omits one
+  // of the answers the caption promises. Order is the gateway's own.
+  const runtimes = Object.keys(table.data?.schemes[0]?.runtimes ?? {})
 
   return (
     <div className="card2">
@@ -47,8 +52,9 @@ export function QuantTableCard() {
                 <th style={{ textAlign: 'right' }}>bytes/param</th>
                 <th>Family</th>
                 <th>Silicon</th>
-                <th>vllm</th>
-                <th>sglang</th>
+                {runtimes.map((name) => (
+                  <th key={name}>{name}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
@@ -63,8 +69,11 @@ export function QuantTableCard() {
                       ? 'any'
                       : `sm_${s.native_compute_capability}${s.emulated_below_native ? ' (emulated below)' : ''}`}
                   </td>
-                  <td className="unit">{s.runtimes['vllm'] ?? '—'}</td>
-                  <td className="unit">{s.runtimes['sglang'] ?? '—'}</td>
+                  {runtimes.map((name) => (
+                    <td key={name} className="unit">
+                      {s.runtimes[name] ?? '—'}
+                    </td>
+                  ))}
                 </tr>
               ))}
             </tbody>

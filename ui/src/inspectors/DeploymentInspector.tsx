@@ -8,7 +8,10 @@ import { ProportionBar } from '../components/Bars'
 import { Verbatim, VerbatimList } from '../components/Verbatim'
 import { nodeLive } from '../state/live'
 import { fromState, nameIndex } from '../state/names'
-import { fmt, fmtUnit, pct, planShortFromDegrees, relativeTime } from '../format'
+import { useActivity } from '../state/resources'
+import { LAUNCH_PHASES, phaseLabel, phaseRank } from '../state/launchPhase'
+import { DeploymentLog } from './DeploymentLog'
+import { fmt, fmtUnit, pct, planShortFromDegrees, relativeTime, remainingLabel } from '../format'
 
 interface Props {
   dep: DeploymentDTO
@@ -23,6 +26,136 @@ interface Props {
 function targetLabel(t: RouteTarget): string {
   if (t.kind === 'local' && t.node_ids && t.node_ids.length > 0) return t.node_ids.join(' + ')
   return t.target_id
+}
+
+/** What a launch is doing, on the sheet that is open on that launch.
+ *
+ *  This replaces the latency and throughput block while a deployment is still
+ *  arriving, because that block had nothing to say about one: `0 tok/s
+ *  aggregate`, `— tok/s per stream`, `— ms to first token`, `0 queued now`
+ *  and "Not yet observed." are five ways of reporting silence about a model
+ *  that is in fact busy, for up to half an hour, doing four different things
+ *  in sequence. The two zeros were the worst of it -- a deployment that has
+ *  not started cannot be serving at zero tokens a second, and nothing on the
+ *  sheet said which of "starting" and "stalled" it was looking at.
+ *
+ *  Everything below is read, not inferred: the server classifies the launch
+ *  from sparkrun's output and the backend's own log
+ *  (`control_plane/deploy/progress.py`) and this draws what it says. The
+ *  ladder is the same one the first-run wizard walks, from the same module,
+ *  so the two screens cannot drift into two vocabularies.
+ *
+ *  Mounted only while the deployment is arriving, which is what keeps
+ *  `/api/activity` off this sheet for the READY case that is most of them.
+ */
+function Starting({ dep }: { dep: DeploymentDTO }) {
+  const activity = useActivity()
+  const row = (activity.data?.launches ?? []).find(
+    (l) => l.deployment_id === dep.deployment_id,
+  )
+  const at = phaseRank(row?.phase)
+  const fraction =
+    row?.fraction != null && Number.isFinite(row.fraction)
+      ? Math.max(0, Math.min(1, row.fraction))
+      : null
+  const remaining = remainingLabel(row?.eta_s)
+
+  return (
+    <>
+      <div className="sub" style={{ border: 'none', paddingTop: 0 }}>
+        what it is doing
+      </div>
+
+      {/* Filled only while the runtime is counting its own checkpoint shards.
+          The pull, the download, the compile and the graph capture report no
+          denominator, so the track is drawn open for them rather than filled
+          at a rate this screen would have had to invent. */}
+      <ProportionBar
+        value={fraction}
+        tone={row?.fatal ? 'fault' : 'ink'}
+        label={
+          fraction == null
+            ? `${dep.served_name} is starting, with no progress figure to report`
+            : `${Math.round(fraction * 100)} percent of ${dep.served_name} loaded onto the GPU`
+        }
+      />
+
+      <ul
+        style={{
+          listStyle: 'none',
+          margin: '8px 0 0',
+          padding: 0,
+          display: 'grid',
+          gap: 6,
+        }}
+      >
+        {LAUNCH_PHASES.map((phase, i) => {
+          // Reached, current, still ahead. When the server has not named a
+          // phase yet, `at` is -1 and every step is ahead -- which is true,
+          // and better than ticking one on the assumption that a launch that
+          // has said nothing must at least have started.
+          const state = at < 0 ? 'todo' : i < at ? 'done' : i === at ? 'now' : 'todo'
+          return (
+            <li
+              key={phase}
+              className="label"
+              style={{
+                fontWeight: state === 'now' ? 500 : 400,
+                color: state === 'todo' ? 'var(--ink-muted)' : 'var(--ink)',
+                display: 'grid',
+                gridTemplateColumns: '10px 1fr',
+                gap: 6,
+              }}
+            >
+              <span aria-hidden="true" className="mono">
+                {state === 'done' ? '✓' : state === 'now' ? '●' : '○'}
+              </span>
+              <span>{phaseLabel(phase)}</span>
+            </li>
+          )
+        })}
+      </ul>
+
+      {/* sparkrun's line or the runtime's, exactly as it arrived: "Pulling
+          image: ghcr.io/...", "Loading safetensors checkpoint shards: 5/11",
+          "Capturing CUDA graphs". More specific than the step above it, and
+          the only thing on the sheet that distinguishes one four-minute
+          silence from another. */}
+      {row?.status ? (
+        <div style={{ marginTop: 8 }}>
+          <Verbatim text={row.status} size="unit" />
+        </div>
+      ) : null}
+
+      <div className="unit" style={{ marginTop: 6 }}>
+        {row
+          ? // Not "launching for 4m": `since` is when this coordinator first
+            // saw it, and after a restart that is when the coordinator came
+            // back rather than when the launch began.
+            `Seen starting ${relativeTime(row.since)}. `
+          : 'Nothing has been read from this launch yet. '}
+        {/* The estimate, when there is one, said out loud with whose it is.
+            Two of the four steps count themselves -- the downloader and the
+            checkpoint loader are both progress bars and both print their own
+            remaining time -- and the other two report no total at all, so
+            they get silence rather than a number this screen extrapolated. */}
+        {remaining ? (
+          <>
+            <strong style={{ fontWeight: 500 }}>{remaining}</strong>, by the{' '}
+            {row?.phase === 'downloading' ? 'downloader' : 'runtime'}&rsquo;s own count
+            of the step it is on — not of the whole launch.{' '}
+          </>
+        ) : (
+          <>
+            No estimate: nothing reports a total for this step.{' '}
+          </>
+        )}
+        The first launch of a model on a machine is the slow one: the runtime
+        container and the weights are fetched once, and the engine compiles and
+        captures CUDA graphs into a cache that later launches reuse.
+      </div>
+    </>
+  )
 }
 
 /** Local generation has no published price -- it is derived from what was
@@ -63,6 +196,10 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
   const audio = isAudio(dep.modality)
   const degraded = dep.state === 'degraded'
   const serving = dep.state === 'ready' || degraded
+  // On its way in. The same allowlist /api/activity uses, and for the same
+  // reason it is an allowlist: DEGRADED is up and serving badly, STOPPING is
+  // leaving, and neither is arriving.
+  const arriving = dep.state === 'planned' || dep.state === 'launching'
   const rate = settings?.electricity_rate_usd_per_kwh ?? 0
 
   const { backend, invalidate } = useBackend()
@@ -98,7 +235,15 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Lamp signal={degraded ? 'warn' : serving ? 'live' : 'fault'} label={dep.state} />
+          {/* Arriving is amber, not red. A launch drew the fault lamp for the
+              whole of its startup because the expression only knew "serving"
+              and "not serving" -- so a model doing exactly what it was asked
+              to do, for up to half an hour, was reported as broken, beside a
+              stop button. The rail has always drawn this state as warn. */}
+          <Lamp
+            signal={degraded || arriving || dep.state === 'stopping' ? 'warn' : serving ? 'live' : 'fault'}
+            label={dep.state}
+          />
           <span className="label mono" style={{ fontSize: 17 }}>
             {dep.served_name}
           </span>
@@ -138,121 +283,146 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
         </div>
       ) : null}
 
-      <div className="sub" style={{ border: 'none', paddingTop: 0 }}>
-        latency and throughput
-      </div>
-      {audio ? (
+      {/* Two columns. Left is the deployment; right is its backend log, which
+          was a disclosure under all of this and is now beside it -- during a
+          launch the log IS the sheet, and it was the one thing below the fold.
+          The column is sticky, so it holds while this one scrolls. */}
+      <div className="depgrid" style={{ marginTop: 12 }}>
+        <div>
+        {arriving ? <Starting dep={dep} /> : (
+        <>
+        <div className="sub" style={{ border: 'none', paddingTop: 0 }}>
+          latency and throughput
+        </div>
+        {audio ? (
+          <div className="unit">
+            Every reading here is denominated in tokens — aggregate and per-stream decode rate, time between
+            tokens, time to first token. A {dep.modality} deployment produces audio, so none of them exist for
+            it. They are absent rather than zero: the control plane measures no audio-side rate today, and a 0
+            would read as a stalled deployment.
+          </div>
+        ) : (
+        <>
+        <div className="quad">
+          <Quad value={depFrame?.tokens_per_sec ?? null} unit="tok/s aggregate, all streams" />
+          <Quad value={decodeTps} unit="tok/s per stream" />
+          <Quad value={decodeTps && decodeTps > 0 ? 1000 / decodeTps : null} decimals={1} unit="ms between tokens" />
+          <Quad value={ttft} unit="ms to first token" />
+          <Quad value={depFrame?.queue_depth ?? null} unit="queued now" />
+        </div>
         <div className="unit">
-          Every reading here is denominated in tokens — aggregate and per-stream decode rate, time between
-          tokens, time to first token. A {dep.modality} deployment produces audio, so none of them exist for
-          it. They are absent rather than zero: the control plane measures no audio-side rate today, and a 0
-          would read as a stalled deployment.
+          Aggregate is a trailing-window sum across every stream; per stream is one request&apos;s own decode
+          rate, averaged over requests — they answer different questions and only match at concurrency 1. Mean
+          request {fmt(meanDuration, 1)} s. All are exponential moving averages; the control plane keeps no
+          percentiles. For a non-streaming response there is no first-token boundary, so per-stream decode
+          falls back to whole-request duration and silently includes prefill.
         </div>
-      ) : (
-      <>
-      <div className="quad">
-        <Quad value={depFrame?.tokens_per_sec ?? null} unit="tok/s aggregate, all streams" />
-        <Quad value={decodeTps} unit="tok/s per stream" />
-        <Quad value={decodeTps && decodeTps > 0 ? 1000 / decodeTps : null} decimals={1} unit="ms between tokens" />
-        <Quad value={ttft} unit="ms to first token" />
-        <Quad value={depFrame?.queue_depth ?? null} unit="queued now" />
-      </div>
-      <div className="unit">
-        Aggregate is a trailing-window sum across every stream; per stream is one request&apos;s own decode
-        rate, averaged over requests — they answer different questions and only match at concurrency 1. Mean
-        request {fmt(meanDuration, 1)} s. All are exponential moving averages; the control plane keeps no
-        percentiles. For a non-streaming response there is no first-token boundary, so per-stream decode
-        falls back to whole-request duration and silently includes prefill.
-      </div>
 
-      <div className="sub">where a request&apos;s time goes</div>
-      {ttft != null && meanDuration != null ? (
-        <PhaseBar ttftMs={ttft} meanDurationS={meanDuration} />
-      ) : (
-        <div className="unit">Not yet observed.</div>
-      )}
-      </>
-      )}
+        <div className="sub">where a request&apos;s time goes</div>
+        {ttft != null && meanDuration != null ? (
+          <PhaseBar ttftMs={ttft} meanDurationS={meanDuration} />
+        ) : (
+          <div className="unit">Not yet observed.</div>
+        )}
+        </>
+        )}
+        </>
+        )}
 
-      <div className="sub">targets{cfg ? ` · ${cfg.policy.replace(/_/g, ' ')}` : ''}</div>
-      {targets.length === 0 ? (
-        <div className="unit">—</div>
-      ) : (
-        <div style={{ overflowX: 'auto' }}>
-          <table>
-            <thead>
-              <tr>
-                <th>Target</th>
-                <th>Kind</th>
-                <th style={{ textAlign: 'right' }}>Share</th>
-                <th style={{ textAlign: 'right' }}>In flight</th>
-                <th style={{ textAlign: 'right' }}>Strength</th>
-                <th style={{ textAlign: 'right' }}>$/Mtok</th>
-                <th style={{ textAlign: 'right' }}>Requests</th>
-              </tr>
-            </thead>
-            <tbody>
-              {targets.map((t) => (
-                <TargetRow key={t.target_id} target={t} nodes={nodes} frame={frame} stale={stale} rate={rate} />
-              ))}
-            </tbody>
-          </table>
+        <div className="sub">targets{cfg ? ` · ${cfg.policy.replace(/_/g, ' ')}` : ''}</div>
+        {targets.length === 0 ? (
+          <div className="unit">—</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Target</th>
+                  <th>Kind</th>
+                  <th style={{ textAlign: 'right' }}>Share</th>
+                  <th style={{ textAlign: 'right' }}>In flight</th>
+                  <th style={{ textAlign: 'right' }}>Strength</th>
+                  <th style={{ textAlign: 'right' }}>$/Mtok</th>
+                  <th style={{ textAlign: 'right' }}>Requests</th>
+                </tr>
+              </thead>
+              <tbody>
+                {targets.map((t) => (
+                  <TargetRow key={t.target_id} target={t} nodes={nodes} frame={frame} stale={stale} rate={rate} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="sub">placement</div>
+        <div className="row">
+          <span>Plan</span>
+          <span className="mono">{planShortFromDegrees(dep.plan)}</span>
         </div>
-      )}
-
-      <div className="sub">placement</div>
-      <div className="row">
-        <span>Plan</span>
-        <span className="mono">{planShortFromDegrees(dep.plan)}</span>
-      </div>
-      <div className="row">
-        <span>Nodes</span>
-        <span className="mono">{dep.node_ids.map(name).join(', ') || '—'}</span>
-      </div>
-      <div className="row">
-        <span>Measured all-reduce</span>
-        <span className="mono">{dep.node_ids.length >= 2 ? fmtUnit(dep.plan.measured_link_gbps, 1, 'GB/s') : '—'}</span>
-      </div>
-      <div className="why on" style={{ marginTop: 8 }}>
-        <Verbatim text={dep.plan.reason} size="label" />
-        {dep.plan.rejected.length > 0 ? (
-          <div style={{ marginTop: 6 }}>
-            <div className="mut">Rejected</div>
-            <VerbatimList items={dep.plan.rejected} />
+        <div className="row">
+          <span>Nodes</span>
+          <span className="mono">{dep.node_ids.map(name).join(', ') || '—'}</span>
+        </div>
+        <div className="row">
+          <span>Measured all-reduce</span>
+          <span className="mono">{dep.node_ids.length >= 2 ? fmtUnit(dep.plan.measured_link_gbps, 1, 'GB/s') : '—'}</span>
+        </div>
+        <div className="why on" style={{ marginTop: 8 }}>
+          <Verbatim text={dep.plan.reason} size="label" />
+          {dep.plan.rejected.length > 0 ? (
+            <div style={{ marginTop: 6 }}>
+              <div className="mut">Rejected</div>
+              <VerbatimList items={dep.plan.rejected} />
+            </div>
+          ) : null}
+        </div>
+        {dep.fit.warnings.length > 0 ? (
+          <div className="why on" style={{ marginTop: 8 }}>
+            <VerbatimList items={dep.fit.warnings} />
           </div>
         ) : null}
-      </div>
-      {dep.fit.warnings.length > 0 ? (
-        <div className="why on" style={{ marginTop: 8 }}>
-          <VerbatimList items={dep.fit.warnings} />
-        </div>
-      ) : null}
 
-      <div className="sub">memory on each node</div>
-      {dep.node_ids.length === 0 ? (
-        <div className="unit">—</div>
-      ) : (
-        dep.node_ids.map((nodeId) => {
-          const n = nodes.find((x) => x.profile.node_id === nodeId)
-          if (!n) return null
-          const live = nodeLive(n, frame, stale)
-          return (
-            <div key={nodeId} className="slot">
-              <span className="mono unit" style={{ width: 84 }}>
-                {name(nodeId)}
-              </span>
-              <ProportionBar
-                value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}
-                tone={stale || !live.fresh ? 'muted' : 'ink'}
-                label={live.memory_used_pct == null ? `no memory reading for ${nodeId}` : `${pct(live.memory_used_pct)} percent memory used on ${nodeId}`}
-              />
-              <span className="mono unit" style={{ width: 34, textAlign: 'right' }}>
-                {live.memory_used_pct == null ? '—' : `${pct(live.memory_used_pct)}%`}
-              </span>
-            </div>
-          )
-        })
-      )}
+        <div className="sub">memory on each node</div>
+        {dep.node_ids.length === 0 ? (
+          <div className="unit">—</div>
+        ) : (
+          dep.node_ids.map((nodeId) => {
+            const n = nodes.find((x) => x.profile.node_id === nodeId)
+            if (!n) return null
+            const live = nodeLive(n, frame, stale)
+            return (
+              <div key={nodeId} className="slot">
+                <span className="mono unit" style={{ width: 84 }}>
+                  {name(nodeId)}
+                </span>
+                <ProportionBar
+                  value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}
+                  tone={stale || !live.fresh ? 'muted' : 'ink'}
+                  label={live.memory_used_pct == null ? `no memory reading for ${nodeId}` : `${pct(live.memory_used_pct)} percent memory used on ${nodeId}`}
+                />
+                <span className="mono unit" style={{ width: 34, textAlign: 'right' }}>
+                  {live.memory_used_pct == null ? '—' : `${pct(live.memory_used_pct)}%`}
+                </span>
+              </div>
+            )
+          })
+        )}
+
+        </div>
+
+        <aside className="deplogcol">
+          <DeploymentLog
+            deploymentId={dep.deployment_id}
+            // Free to show whenever the coordinator is still following this
+            // deployment, which is every state but a quietly stopped one. A
+            // stopped one costs a `sparkrun logs` on the machine, so it is
+            // asked for -- unless it left a reason behind, which is exactly
+            // when somebody opened this sheet to read the log.
+            autoOpen={dep.state !== 'stopped' || dep.last_error != null}
+          />
+        </aside>
+      </div>
     </div>
   )
 }

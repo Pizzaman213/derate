@@ -8,52 +8,193 @@ time, five minutes in.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from control_plane.contracts import ModelShape, NodeProfile
+from control_plane.contracts import ENDPOINT_FOR_MODALITY, Modality, ModelShape, NodeProfile
 from control_plane.contracts.quant import quant_info
 
 from .types import QuantRequirement, RuntimeSupport, SupportLevel, SupportVerdict
 
-#: Architectures each runtime is known to load. Not exhaustive -- both projects
-#: add models weekly -- so an absent name is reported as unverified, not as a
-#: refusal. A name that is present and known broken is reported as unsupported.
+#: Architectures the vllm runtime can load, read out of the image this project
+#: launches -- ghcr.io/spark-arena/dgx-vllm-eugr-nightly, vLLM
+#: 0.28.1rc1.dev462+g9ca97b28b.d20260906, torch 2.13.0+cu130, transformers
+#: 5.16.1, read on 2026-09-07.
+#:
+#: Generated from that image rather than curated by hand, because a hand-kept
+#: list goes stale in the one direction nobody notices: it keeps refusing
+#: models that started working. `Gemma4ForConditionalGeneration` was refused
+#: with "not in vllm's supported architecture list" while the pinned image had
+#: been able to load it all along. An absent name is not a hedge here --
+#: `evaluate_runtime` returns UNSUPPORTED, `RuntimeSupport.ok` is False, and
+#: `internal_api` turns that into a 400 `runtime_unsupported` -- so every name
+#: missing from this set is a model this build will not launch.
+#:
+#: Regenerate against a new image, and paste what it prints:
+#:
+#:     docker run --rm --entrypoint python3 "$DERATE_VLLM_IMAGE" -c '
+#:     import vllm.model_executor.models.registry as r
+#:     cat = lambda n: set(getattr(r, n))
+#:     pooling = (cat("_EMBEDDING_MODELS") | cat("_REWARD_MODELS")
+#:                | cat("_SEQUENCE_CLASSIFICATION_MODELS")
+#:                | cat("_TOKEN_CLASSIFICATION_MODELS")
+#:                | cat("_LATE_INTERACTION_MODELS"))
+#:     generative = cat("_TEXT_GENERATION_MODELS") | cat("_MULTIMODAL_MODELS")
+#:     print(sorted(set(r._VLLM_MODELS) - cat("_SPECULATIVE_DECODING_MODELS")
+#:                  - cat("_TRANSFORMERS_BACKEND_MODELS") - (pooling - generative)))'
+#:
+#: That is the registry's servable set, and each subtraction is a claim this
+#: table would otherwise make wrongly. Draft heads go: `Gemma4MTPModel` and
+#: `Gemma4DSparkModel` are speculators a real model loads, not servers. The
+#: generic transformers-backend wrappers go: `TransformersForCausalLM` is an
+#: implementation vLLM picks, never a name in a checkpoint's config.json.
+#: Pooling-only models go -- embedding, reward, classification -- but only
+#: those with no generative path, since vLLM registers `GlmForCausalLM` and
+#: `DeciLMForCausalLM` in both places and they chat. Anything vLLM has since
+#: dropped (`_PREVIOUSLY_SUPPORTED_MODELS`) is absent by construction, which
+#: is how thirteen names left this set: `MllamaForConditionalGeneration` --
+#: Llama 3.2 Vision -- was listed here, and this image cannot load it.
+#:
+#: Loadable is the only claim the set makes. Speech models are in it too, and
+#: vLLM answers those on /v1/audio/transcriptions rather than
+#: /v1/chat/completions; AUDIO_ARCHITECTURES below is what decides the route.
+#: Being loadable and being answerable on the chat route are separate claims,
+#: and keeping them separate is what stops a transcription-only checkpoint
+#: from being offered as a chat model.
 VLLM_ARCHITECTURES: frozenset[str] = frozenset(
     {
-        "AquilaForCausalLM", "ArcticForCausalLM", "BaiChuanForCausalLM", "BaichuanForCausalLM",
-        "BloomForCausalLM", "ChatGLMModel", "CohereForCausalLM", "Cohere2ForCausalLM",
-        "DbrxForCausalLM", "DeciLMForCausalLM", "DeepseekForCausalLM", "DeepseekV2ForCausalLM",
-        "DeepseekV3ForCausalLM", "ExaoneForCausalLM", "FalconForCausalLM", "GemmaForCausalLM",
-        "Gemma2ForCausalLM", "Gemma3ForCausalLM", "Gemma3ForConditionalGeneration",
-        "GlmForCausalLM", "Glm4ForCausalLM", "Glm4vForConditionalGeneration",
-        "GPT2LMHeadModel", "GPTBigCodeForCausalLM", "GPTJForCausalLM", "GPTNeoXForCausalLM",
-        "GptOssForCausalLM", "GraniteForCausalLM", "GraniteMoeForCausalLM",
-        "InternLM2ForCausalLM", "InternLMForCausalLM", "InternVLChatModel",
-        "JAISLMHeadModel", "JambaForCausalLM", "LlamaForCausalLM",
-        "Llama4ForConditionalGeneration", "LlavaForConditionalGeneration",
-        "LlavaNextForConditionalGeneration", "MiniCPMForCausalLM", "MiniCPM3ForCausalLM",
-        "MiniMaxText01ForCausalLM", "MistralForCausalLM", "Mistral3ForConditionalGeneration",
-        "MixtralForCausalLM", "MllamaForConditionalGeneration", "MPTForCausalLM",
-        "NemotronForCausalLM", "OlmoForCausalLM", "Olmo2ForCausalLM", "OlmoeForCausalLM",
-        "OPTForCausalLM", "OrionForCausalLM", "PersimmonForCausalLM", "PhiForCausalLM",
-        "Phi3ForCausalLM", "Phi3SmallForCausalLM", "Phi3VForCausalLM", "PhiMoEForCausalLM",
-        "PixtralForConditionalGeneration", "QWenLMHeadModel", "Qwen2ForCausalLM",
-        "Qwen2MoeForCausalLM", "Qwen2VLForConditionalGeneration",
-        "Qwen2_5_VLForConditionalGeneration", "Qwen3ForCausalLM", "Qwen3MoeForCausalLM",
+        "AXK1ForCausalLM", "AfmoeForCausalLM", "ApertusForCausalLM", "ArceeForCausalLM",
+        "AriaForConditionalGeneration", "AudioFlamingo3ForConditionalGeneration",
+        "BagelForConditionalGeneration", "BailingMoeForCausalLM", "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM", "BailingMoeV3ForCausalLM", "BeeForConditionalGeneration",
+        "Blip2ForConditionalGeneration", "BloomForCausalLM", "ChatGLMForConditionalGeneration",
+        "ChatGLMModel", "Cohere2ForCausalLM", "Cohere2MoeForCausalLM",
+        "Cohere2VisionForConditionalGeneration", "CohereAsrForConditionalGeneration",
+        "CohereForCausalLM", "Cosmos3EdgeForConditionalGeneration",
+        "Cosmos3ForConditionalGeneration", "CwmForCausalLM", "DbrxForCausalLM",
+        "DeciLMForCausalLM", "DeepseekForCausalLM", "DeepseekOCR2ForCausalLM",
+        "DeepseekOCRForCausalLM", "DeepseekV2ForCausalLM", "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration",
+        "DeepseekVLV2ForCausalLM", "DiffusionGemmaForBlockDiffusion", "Dots3NoteForCausalLM",
+        "DotsOCRForCausalLM", "Eagle2_5_VLForConditionalGeneration",
+        "Emu3ForConditionalGeneration", "Ernie4_5ForCausalLM", "Ernie4_5_MoeForCausalLM",
+        "Ernie4_5_VLMoeForConditionalGeneration", "Exaone4ForCausalLM",
+        "Exaone4_5_ForConditionalGeneration", "ExaoneForCausalLM", "ExaoneMoeForCausalLM",
+        "FalconForCausalLM", "FalconH1ForCausalLM", "FalconMambaForCausalLM",
+        "FireRedASR2ForConditionalGeneration", "FlexOlmoForCausalLM",
+        "FunASRForConditionalGeneration", "FunAudioChatForConditionalGeneration",
+        "GLM4VForCausalLM", "GPT2LMHeadModel", "GPTBigCodeForCausalLM", "GPTJForCausalLM",
+        "GPTNeoXForCausalLM", "Gemma2ForCausalLM", "Gemma3ForCausalLM",
+        "Gemma3ForConditionalGeneration", "Gemma3nForCausalLM",
+        "Gemma3nForConditionalGeneration", "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration", "Gemma4UnifiedForConditionalGeneration",
+        "GemmaForCausalLM", "Glm4ForCausalLM", "Glm4MoeForCausalLM", "Glm4MoeLiteForCausalLM",
+        "Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration",
+        "Glm5NextForCausalLM", "Glm5NextForConditionalGeneration",
+        "GlmAsrForConditionalGeneration", "GlmForCausalLM", "GlmMoeDsaForCausalLM",
+        "GlmOcrForConditionalGeneration", "GptOssForCausalLM",
+        "Granite4VisionForConditionalGeneration", "GraniteForCausalLM", "GraniteMoeForCausalLM",
+        "GraniteMoeHybridForCausalLM", "GraniteMoeSWAForCausalLM",
+        "GraniteMoeSharedForCausalLM", "GraniteSWAForCausalLM",
+        "GraniteSpeechForConditionalGeneration", "GraniteSpeechPlusForConditionalGeneration",
+        "H2OVLChatModel", "HCXVisionV2ForCausalLM", "HYV3ForCausalLM", "HYV4ForCausalLM",
+        "HfMoondream", "HrmTextForCausalLM", "HunYuanDenseV1ForCausalLM",
+        "HunYuanMoEV1ForCausalLM", "HunYuanVLForConditionalGeneration",
+        "HyperCLOVAXForCausalLM", "IQuestCoderForCausalLM", "IQuestLoopCoderForCausalLM",
+        "Idefics3ForConditionalGeneration", "InklingForCausalLM",
+        "InklingForConditionalGeneration", "InternLM2ForCausalLM", "InternLM3ForCausalLM",
+        "InternS1ForConditionalGeneration", "InternS1ProForConditionalGeneration",
+        "InternS2MobiusForConditionalGeneration", "InternS2PreviewForConditionalGeneration",
+        "InternVLChatModel", "InternVLForConditionalGeneration",
+        "IsaacForConditionalGeneration", "Jais2ForCausalLM", "JambaForCausalLM",
+        "K2HorizonForCausalLM", "KananaVForConditionalGeneration",
+        "KeyeForConditionalGeneration", "KeyeVL1_5ForConditionalGeneration",
+        "KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration",
+        "KimiLinearForCausalLM", "KimiVLForConditionalGeneration", "LLaMAForCausalLM",
+        "LagunaForCausalLM", "Lfm2ForCausalLM", "Lfm2MoeForCausalLM",
+        "Lfm2VlForConditionalGeneration", "LightOnOCRForConditionalGeneration",
+        "Llama4ForCausalLM", "Llama4ForConditionalGeneration", "LlamaForCausalLM",
+        "Llama_Nemotron_Nano_VL", "LlavaForConditionalGeneration",
+        "LlavaNextForConditionalGeneration", "LlavaNextVideoForConditionalGeneration",
+        "LlavaOnevision2ForConditionalGeneration", "LlavaOnevisionForConditionalGeneration",
+        "LongcatFlashForCausalLM", "LongcatFlashNgramForCausalLM", "Mamba2ForCausalLM",
+        "MambaForCausalLM", "MellumForCausalLM", "MiDashengLMModel", "MiMoForCausalLM",
+        "MiMoV2FlashForCausalLM", "MiMoV2ForCausalLM", "MiMoV2OmniForCausalLM",
+        "MiniCPM3ForCausalLM", "MiniCPMForCausalLM", "MiniCPMO", "MiniCPMV",
+        "MiniCPMV4_6ForConditionalGeneration", "MiniMaxM2ForCausalLM",
+        "MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration",
+        "Ministral3ForCausalLM", "Mistral3ForConditionalGeneration", "MistralForCausalLM",
+        "MistralLarge3ForCausalLM", "MixtralForCausalLM", "Molmo2ForConditionalGeneration",
+        "MolmoForCausalLM", "Moondream3ForCausalLM", "MoonshotKimiaForCausalLM",
+        "MossAudioModel", "MossTranscribeDiarizeForConditionalGeneration",
+        "MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration", "NVLM_D",
+        "NemotronForCausalLM", "NemotronHForCausalLM", "NemotronHPuzzleForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3", "NemotronH_Nano_VL_V2",
+        "NemotronH_Omni_Reasoning_V3", "NemotronH_Super_Omni_Reasoning_V3",
+        "NemotronParseForConditionalGeneration", "OPTForCausalLM", "Olmo2ForCausalLM",
+        "Olmo3ForCausalLM", "OlmoForCausalLM", "OlmoHybridForCausalLM", "OlmoeForCausalLM",
+        "OpenCUAForConditionalGeneration", "OpenPanguVLForConditionalGeneration",
+        "OpenVLAForActionPrediction", "OrionForCausalLM", "Ovis", "Ovis2_5",
+        "Ovis2_6ForCausalLM", "Ovis2_6_MoeForCausalLM", "PaddleOCRVLForConditionalGeneration",
+        "PaliGemmaForConditionalGeneration", "PanguEmbeddedForCausalLM",
+        "PanguProMoEV2ForCausalLM", "PanguUltraMoEForCausalLM", "Param2MoEForCausalLM",
+        "Phi3ForCausalLM", "Phi3VForCausalLM", "Phi4ForCausalLMV", "Phi4MMForCausalLM",
+        "PhiForCausalLM", "PhiMoEForCausalLM", "PixtralForConditionalGeneration",
+        "Plamo3ForCausalLM", "QianfanOCRForConditionalGeneration",
+        "Qwen2AudioForConditionalGeneration", "Qwen2ForCausalLM", "Qwen2MoeForCausalLM",
+        "Qwen2VLForConditionalGeneration", "Qwen2_5OmniForConditionalGeneration",
+        "Qwen2_5OmniModel", "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration", "Qwen3ASRRealtimeGeneration", "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM", "Qwen3NextForCausalLM", "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration",
-        "SolarForCausalLM", "StableLmForCausalLM", "Starcoder2ForCausalLM",
-        "TeleChat2ForCausalLM", "XverseForCausalLM", "Zamba2ForCausalLM",
-        # Speech. vLLM serves these on /v1/audio/transcriptions rather than
-        # /v1/chat/completions, which is why a deployment carries a Modality:
-        # being loadable and being answerable on the chat route are different
-        # claims, and this set only makes the first one. SGLang has no
-        # transcription server, so they are deliberately absent from its set.
-        "WhisperForConditionalGeneration",
-        "Qwen2AudioForConditionalGeneration",
-        "VoxtralForConditionalGeneration",
+        "Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration", "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration", "RForConditionalGeneration", "Rnj1ForCausalLM",
+        "SarvamMLAForCausalLM", "SarvamMoEForCausalLM", "SeedOssForCausalLM",
+        "SkyworkR1VChatModel", "SmolLM3ForCausalLM", "SmolVLMForConditionalGeneration",
+        "SolarForCausalLM", "StableLmForCausalLM", "Starcoder2ForCausalLM", "Step1ForCausalLM",
+        "Step3TextForCausalLM", "Step3VLForConditionalGeneration", "Step3p5ForCausalLM",
+        "Step3p7ForConditionalGeneration", "StepVLForConditionalGeneration",
+        "TeleChat2ForCausalLM", "TeleChat3ForCausalLM", "TeleFLMForCausalLM", "UltravoxModel",
+        "UnlimitedOCRForCausalLM", "VaultGemmaForCausalLM",
+        "VibeVoiceAsrForConditionalGeneration", "VoxtralForConditionalGeneration",
+        "VoxtralRealtimeGeneration", "WhisperForConditionalGeneration", "Zamba2ForCausalLM",
     }
 )
 
+#: In the registry above, and empirically not the same claim as loadable.
+#: Being registered only means the class exists in vllm's model executor;
+#: nothing about that proves a forward pass completes on this build. This
+#: table is for the gap between those two claims, and it is populated the same
+#: way the registry itself is kept honest -- somebody watched a launch die and
+#: wrote down what it said, never a guess about what might be shaky.
+#:
+#: Keyed by architecture, not by model id: the failure lives in the runtime's
+#: code for that class, not in any one checkpoint's weights, so every model
+#: that resolves to this architecture inherits the same crash. A version is
+#: named in the value because the underlying bug may be fixed by a later
+#: image; re-check before trusting an old entry here against a new one.
+VLLM_KNOWN_BROKEN: dict[str, str] = {
+    "DiffusionGemmaForBlockDiffusion": (
+        "gets past every earlier gate -- weights load, torch.compile "
+        "succeeds -- and dies in CUDA graph capture warmup: "
+        "vllm/model_executor/models/diffusion_gemma.py's prepare_attn hands "
+        "FlashInfer's prefill plan() a tensor-shaped causal mask for this "
+        "architecture's mixed causal/bidirectional attention, and this "
+        "build's compiled binding rejects it -- \"TypeError: Mismatched type "
+        "on argument #14 ... Expected `bool` but got `ffi.Tensor`\". vLLM's "
+        "own backend selector logs intent to exclude FlashInfer for this "
+        "architecture and picks it anyway. Observed on 4 consecutive "
+        "launches of google/diffusiongemma-26B-A4B-it against vllm "
+        "0.28.1rc1.dev486+gd875ff5ba.d20260907, 2026-09-07."
+    ),
+}
+
+#: SGLang's, still hand-kept: the pinned image is
+#: scitrera/dgx-spark-sglang:0.5.9-t5 and it is not on the box this was
+#: written on, so there is no registry to read and no honest way to generate
+#: this the way the vllm set above is generated. It is therefore stale in the
+#: direction that refuses working models -- Gemma 4 is the current example --
+#: and a name added here has to come from a launch somebody watched.
 SGLANG_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "BaichuanForCausalLM", "ChatGLMModel", "CohereForCausalLM", "DbrxForCausalLM",
@@ -73,6 +214,27 @@ SGLANG_ARCHITECTURES: frozenset[str] = frozenset(
     }
 )
 
+#: Architectures ``control_plane/runtimes/tts.py`` can load and drive.
+#:
+#: Narrower than "text-to-speech models", and deliberately so. That server is a
+#: transformers loader that calls exactly three things on the checkpoint --
+#: ``processor(text=..., reference_audio=..., reference_text=...)``,
+#: ``model.generate() -> codes`` and ``model.decode_audio(codes)`` -- so what
+#: belongs here is not "a TTS model" but "a checkpoint whose own remote code
+#: answers those three calls". A name goes in after somebody has run it
+#: through that server, never because the model card says TTS: a model listed
+#: here and not loadable is a launch that passes every gate and dies at load,
+#: which is the failure the support table exists to prevent.
+TTS_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        # DualAR: a slow transformer emitting one semantic token per audio
+        # frame, a fast one emitting that frame's codebooks, and a bundled
+        # 44.1 kHz codec. Verified on a GB10 against
+        # Audio8/Audio8-TTS-Preview-0.6b.
+        "ArkttsModel",
+    }
+)
+
 #: Architectures this build knows are speech models, and which endpoint family
 #: each answers. The resolver reports it; the deployment manager records it on
 #: the Deployment so the gateway can route on it. Absent means text, which is
@@ -81,6 +243,30 @@ AUDIO_ARCHITECTURES: dict[str, str] = {
     "WhisperForConditionalGeneration": "transcription",
     "Qwen2AudioForConditionalGeneration": "transcription",
     "VoxtralForConditionalGeneration": "transcription",
+    # The rest of the transcription-only architectures the pinned vLLM image
+    # carries, added with the VLLM_ARCHITECTURES sync above and for the same
+    # reason: that set now claims every ASR model vLLM registers is loadable,
+    # and a loadable speech model with no row here reads as text and gets
+    # offered on /v1/chat/completions, which is a launch that clears every
+    # gate and fails on the first request.
+    #
+    # Only the ones vLLM marks `supports_transcription_only` are here. The
+    # image also loads GlmAsr, GraniteSpeech, Qwen3ASR, Qwen3OmniMoe,
+    # MoonshotKimia and Gemma3n, all of which transcribe *and* chat; those
+    # stay on the chat route, because taking a chat model off it is the
+    # louder failure of the two.
+    "CohereAsrForConditionalGeneration": "transcription",
+    "FireRedASR2ForConditionalGeneration": "transcription",
+    "FunASRForConditionalGeneration": "transcription",
+    "MossTranscribeDiarizeForConditionalGeneration": "transcription",
+    # NeMo's Parakeet TDT, transformers-native port (nvidia/parakeet-tdt-0.6b-v3
+    # ships it; v2 predates the port and is NeMo-only, no config.json).
+    "ParakeetForTDT": "transcription",
+    # Synthesis, the other direction: text in, audio out, answered on
+    # /v1/audio/speech. Every architecture the tts runtime loads is one of
+    # these by construction -- that runtime serves no other route -- so the
+    # two sets are kept in step below rather than typed twice.
+    **{name: "speech" for name in TTS_ARCHITECTURES},
 }
 
 
@@ -143,17 +329,101 @@ _SGLANG_QUANTS: dict[str, SupportLevel] = {
 }
 
 
+#: The tts runtime loads through transformers, in the checkpoint's own dtype.
+#: There is no quantization path at all: no GPTQ or AWQ kernel is involved,
+#: and GGUF is llama.cpp's format for a llama.cpp backend. Stated key by key
+#: rather than left to the default, so the table reads as a decision.
+_TTS_QUANTS: dict[str, SupportLevel] = {
+    "fp32": SupportLevel.SUPPORTED,
+    "fp16": SupportLevel.SUPPORTED,
+    "bf16": SupportLevel.SUPPORTED,
+    "fp8": SupportLevel.UNSUPPORTED,
+    "int8": SupportLevel.UNSUPPORTED,
+    "awq_int4": SupportLevel.UNSUPPORTED,
+    "gptq_int4": SupportLevel.UNSUPPORTED,
+    "nf4": SupportLevel.UNSUPPORTED,
+    "mxfp4": SupportLevel.UNSUPPORTED,
+    "nvfp4": SupportLevel.UNSUPPORTED,
+    "q8_0": SupportLevel.UNSUPPORTED, "q6_k": SupportLevel.UNSUPPORTED,
+    "q5_k_m": SupportLevel.UNSUPPORTED, "q4_k_m": SupportLevel.UNSUPPORTED,
+    "q4_0": SupportLevel.UNSUPPORTED, "q3_k_m": SupportLevel.UNSUPPORTED,
+    "q2_k": SupportLevel.UNSUPPORTED,
+    "q4_1": SupportLevel.UNSUPPORTED, "q5_0": SupportLevel.UNSUPPORTED,
+    "q5_1": SupportLevel.UNSUPPORTED, "q2_k_s": SupportLevel.UNSUPPORTED,
+    "iq1_s": SupportLevel.UNSUPPORTED, "iq1_m": SupportLevel.UNSUPPORTED,
+    "iq2_xxs": SupportLevel.UNSUPPORTED, "iq2_xs": SupportLevel.UNSUPPORTED,
+    "iq2_s": SupportLevel.UNSUPPORTED, "iq2_m": SupportLevel.UNSUPPORTED,
+    "iq3_xxs": SupportLevel.UNSUPPORTED, "iq3_xs": SupportLevel.UNSUPPORTED,
+    "iq3_s": SupportLevel.UNSUPPORTED, "iq3_m": SupportLevel.UNSUPPORTED,
+    "iq4_xs": SupportLevel.UNSUPPORTED, "iq4_nl": SupportLevel.UNSUPPORTED,
+}
+
+
 @dataclass(frozen=True)
 class RuntimeProfile:
     name: str
     architectures: frozenset[str]
     quants: dict[str, SupportLevel]
+    #: Registered but empirically broken, architecture -> what was observed.
+    #: Empty for every runtime but vllm today, because nobody has watched
+    #: sglang or tts fail this way yet.
+    known_broken: dict[str, str] = field(default_factory=dict)
 
 
 RUNTIMES: dict[str, RuntimeProfile] = {
-    "vllm": RuntimeProfile("vllm", VLLM_ARCHITECTURES, _VLLM_QUANTS),
+    "vllm": RuntimeProfile("vllm", VLLM_ARCHITECTURES, _VLLM_QUANTS, VLLM_KNOWN_BROKEN),
     "sglang": RuntimeProfile("sglang", SGLANG_ARCHITECTURES, _SGLANG_QUANTS),
+    # The third runtime, and the only one derate wrote itself. It exists
+    # because neither of the two above serves /v1/audio/speech, so a
+    # text-to-speech checkpoint had nowhere to run at all -- not "ran badly",
+    # nowhere. control_plane/runtimes/tts.py.
+    "tts": RuntimeProfile("tts", TTS_ARCHITECTURES, _TTS_QUANTS),
 }
+
+
+#: What a runtime image said about itself, when one has been asked.
+#:
+#: The frozensets above are a hand-copied claim about somebody else's
+#: software and they go stale in the one direction nobody notices: they keep
+#: refusing models that started working. `imageprobe.py` reads vLLM's own
+#: registry out of the image this build launches, and what it finds is
+#: recorded here and preferred over the static table for every question this
+#: module answers.
+#:
+#: Empty is the normal state on a machine with no docker or no image pulled,
+#: and it costs nothing but the older answer -- which is why `probed` is a
+#: lookup with a fallback rather than a branch every caller has to remember.
+_PROBED: dict[str, "object"] = {}
+
+
+def record_probe(found) -> None:
+    """Adopt an `imageprobe.ImageProbe`, replacing any earlier one.
+
+    Duck-typed rather than imported so `support` keeps its independence: this
+    module is imported by the fit and launch paths on every node, and the
+    probe is a coordinator-side convenience that not every one of them has a
+    docker socket to run.
+    """
+    _PROBED[found.runtime.strip().lower()] = found
+
+
+def clear_probes() -> None:
+    _PROBED.clear()
+
+
+def probed(runtime: str):
+    """The probe for *runtime*, or None when nobody has asked its image."""
+    return _PROBED.get(runtime.strip().lower())
+
+
+def architectures_for(runtime: str) -> frozenset[str]:
+    """What *runtime* loads: the image's answer when there is one, else ours."""
+    key = runtime.strip().lower()
+    found = _PROBED.get(key)
+    if found is not None:
+        return found.architectures
+    profile = RUNTIMES.get(key)
+    return profile.architectures if profile is not None else frozenset()
 
 
 #: GGUF names its architectures in ggml's lowercase style. Map them onto the
@@ -200,6 +470,30 @@ def normalize_architecture(name: str) -> str:
     return GGUF_ARCHITECTURE_NAMES.get(name.strip().lower(), name)
 
 
+def runtimes_serving(architectures) -> list[str]:
+    """Every runtime in this build that lists one of these architectures."""
+    return [
+        name
+        for name in RUNTIMES
+        if any(a in architectures_for(name) for a in architectures or ())
+    ]
+
+
+def _elsewhere(architectures: tuple[str, ...], excluding: str) -> str:
+    """`; the tts runtime loads it, on /v1/audio/speech`, or nothing.
+
+    A refusal names what to change. "Not in vllm's list" is true and leaves
+    the reader with no next move; the model in front of them may be perfectly
+    servable one control away, and this is the only place that knows it.
+    """
+    others = [name for name in runtimes_serving(architectures) if name != excluding]
+    if not others:
+        return ""
+    endpoint = ENDPOINT_FOR_MODALITY.get(Modality(modality_for(architectures)))
+    where = f", on {endpoint}" if endpoint and endpoint != "/v1/chat/completions" else ""
+    return f"; the {others[0]} runtime loads it{where}"
+
+
 def quant_requirement(dtype: str) -> QuantRequirement:
     info = quant_info(dtype)
     return QuantRequirement(
@@ -220,6 +514,18 @@ def evaluate_runtime(
         return RuntimeSupport(key, SupportLevel.UNVERIFIED, f"unknown runtime {runtime!r}")
 
     architectures = tuple(normalize_architecture(a) for a in architectures)
+    # The image's own registry when it has been read, the static table when
+    # it has not. `found` is also what decides how a refusal is worded below:
+    # "not in our list" and "not in the registry of the image we launch" are
+    # different strengths of claim and the operator has to be able to tell
+    # them apart.
+    found = _PROBED.get(key)
+    known_architectures = found.architectures if found is not None else profile.architectures
+    #: The image's own version string, when a probe has run. Carried on every
+    #: verdict below, not only the ones whose reason happens to mention it, so
+    #: the UI can show "checked against 0.28.1rc1.dev486" next to a model that
+    #: was never refused a word about which build okayed it.
+    version = found.version if found is not None else None
     quant_level = profile.quants.get(dtype, SupportLevel.UNSUPPORTED)
     if quant_level is SupportLevel.UNSUPPORTED:
         return RuntimeSupport(
@@ -231,14 +537,22 @@ def evaluate_runtime(
                 if quant_info(dtype).family == "gguf"
                 else ""
             ),
+            version,
         )
 
-    known = [a for a in architectures if a in profile.architectures]
+    known = [a for a in architectures if a in known_architectures]
+    broken = profile.known_broken.get(known[0]) if known else None
     if not architectures:
         arch_level, arch_reason = (
             SupportLevel.UNVERIFIED,
             "no architecture on record for this shape, so runtime support is "
             "unverified; resolve the model id first and the check becomes exact",
+        )
+    elif broken is not None:
+        arch_level, arch_reason = (
+            SupportLevel.UNSUPPORTED,
+            f"{profile.name} lists {known[0]} in its registry but it does "
+            f"not actually run: {broken}",
         )
     elif known:
         arch_level, arch_reason = (
@@ -246,22 +560,29 @@ def evaluate_runtime(
             f"{profile.name} supports {known[0]}",
         )
     else:
+        where = (
+            f"the model registry of {found.provenance}, the image this build "
+            f"launches"
+            if found is not None
+            else f"{profile.name}'s supported architecture list"
+        )
         arch_level, arch_reason = (
             SupportLevel.UNSUPPORTED,
-            f"{architectures[0]} is not in {profile.name}'s supported architecture list",
+            f"{architectures[0]} is not in {where}{_elsewhere(architectures, key)}",
         )
 
     if arch_level is SupportLevel.UNSUPPORTED:
-        return RuntimeSupport(key, SupportLevel.UNSUPPORTED, arch_reason)
+        return RuntimeSupport(key, SupportLevel.UNSUPPORTED, arch_reason, version)
     if quant_level is SupportLevel.UNVERIFIED:
         return RuntimeSupport(
             key,
             SupportLevel.UNVERIFIED,
             f"{arch_reason}, but {profile.name}'s {dtype} path is experimental",
+            version,
         )
     if arch_level is SupportLevel.UNVERIFIED:
-        return RuntimeSupport(key, SupportLevel.UNVERIFIED, arch_reason)
-    return RuntimeSupport(key, SupportLevel.SUPPORTED, f"{arch_reason} at {dtype}")
+        return RuntimeSupport(key, SupportLevel.UNVERIFIED, arch_reason, version)
+    return RuntimeSupport(key, SupportLevel.SUPPORTED, f"{arch_reason} at {dtype}", version)
 
 
 def build_verdict(architectures: tuple[str, ...], dtype: str) -> SupportVerdict:

@@ -36,6 +36,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from control_plane.paths import data_dir as _data_dir
+
+from control_plane import fsutil
+
 log = logging.getLogger(__name__)
 
 ENROLLMENT_FILE = "enrollments.json"
@@ -106,10 +110,11 @@ class EnrollmentStore:
 
     def __init__(
         self,
-        data_dir: Path | str = Path("/data"),
+        data_dir: Path | str | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self._path = Path(data_dir) / ENROLLMENT_FILE
+        root = Path(data_dir) if data_dir is not None else _data_dir()
+        self._path = root / ENROLLMENT_FILE
         self._clock = clock
         self._tokens: dict[str, EnrollmentToken] = {}
         self._load()
@@ -166,7 +171,7 @@ class EnrollmentStore:
             fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as handle:
                 json.dump(payload, handle)
-            os.chmod(self._path, 0o600)
+            fsutil.harden_path(self._path)
         except OSError as exc:
             log.warning(
                 "could not persist enrollment tokens to %s (%s); they will not "

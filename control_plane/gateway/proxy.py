@@ -17,7 +17,9 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
+import anyio
 import httpx
 from starlette.responses import Response, StreamingResponse
 
@@ -29,6 +31,7 @@ from control_plane.providers.errors import (
     ProviderNotAdmittingError,
     UpstreamError,
 )
+from control_plane.redaction import Redactor
 
 from control_plane.providers.usage import UsageSniffer
 
@@ -60,6 +63,11 @@ _DONE_MARKER = b"[DONE]"
 # the backend; a server error means we reached it and it broke.
 RETRY_TRANSPORT = "transport"
 RETRY_SERVER_ERROR = "http_5xx"
+# The gateway ran out of upstream connections. Neither of the above: we never
+# reached the backend, but that says nothing about whether the backend is there.
+# Kept apart from "transport" so the breaker can ignore it and so history can
+# tell an exhausted pool from a dead node after the fact.
+RETRY_POOL = "pool_exhausted"
 
 # ProviderService.open_upstream() has one contract for every failure to reach
 # an upstream: raise UpstreamError, always -- never let a raw httpx.HTTPError
@@ -72,7 +80,22 @@ RETRY_SERVER_ERROR = "http_5xx"
 # on it is how forward_provider tells "never reached it" from "reached it
 # and it answered 502" apart without providers.py needing to say so any
 # other way.
+class _Discarded(Exception):
+    """Thrown into a provider upstream that nobody is going to read.
+
+    `ProviderService.open_upstream` records `note_success` and the request's
+    spend in the code *after* its yield. Exiting it cleanly would therefore
+    bill a hedge that lost, and vouch for a transfer that never happened.
+    Throwing skips both, without the connect-time paths that would mark the
+    provider unreachable -- it answered fine; we simply changed our mind.
+    """
+
+
 _SYNTHETIC_TRANSPORT_PREFIX = "could not reach upstream: "
+
+#: The one wrapped class that is not a verdict about the upstream. Matched by
+#: name because that is all `_synthetic_transport_error_class` recovers.
+_POOL_TIMEOUT_CLASS = httpx.PoolTimeout.__name__
 
 
 def _synthetic_transport_error_class(exc: UpstreamError) -> str | None:
@@ -114,6 +137,14 @@ class Attempt:
     # Set for RETRY_TRANSPORT: the exception class name, and nothing more.
     # A transport failure has no backend words to preserve.
     error: str = ""
+    #: Throw this attempt away without ever streaming it. Set only when the
+    #: attempt carries a live upstream, and it is what makes a hedge safe:
+    #: the loser's body generator is never started, so its `finally` -- the
+    #: thing that settles accounting, releases the KV commitment and returns
+    #: the connection -- would never run. Discarding does all three by hand.
+    #: Without it, every hedged request leaks exactly what the 2026-09-08
+    #: outage leaked.
+    discard: object = None
 
 
 @dataclass
@@ -248,6 +279,90 @@ def _forward_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
 
+def _scrub_upstream_body(body: bytes, api_key: str | None) -> bytes:
+    """Never let *api_key* -- or anything shaped like one -- reach a client.
+
+    ``forward()`` attaches a raw resolved key to the outgoing request (rule 3
+    up top: never let a provider API key escape). ``ProviderService
+    .open_upstream`` covers the same risk with a ``Redactor`` that has
+    remembered every key it has ever resolved; this path only ever knows the
+    one key it just used, so a ``Redactor`` scoped to this single call is
+    exactly as much as there is to scrub.
+    """
+    redactor = Redactor()
+    redactor.remember(api_key)
+    return redactor.scrub_bytes(body)
+
+
+#: How long an upstream response may sit with its body generator never started
+#: before the janitor closes it. Starlette begins iterating a StreamingResponse
+#: immediately after it sends the response line, so a generator that has not
+#: started within this long is never going to start. Deliberately not a read
+#: timeout: a *running* stream is never touched however long it takes, which is
+#: the promise `upstream_read_timeout_s = None` makes.
+_UNSTARTED_GRACE_S = 30.0
+
+
+@dataclass
+class _OpenUpstream:
+    """One upstream response this proxy opened and has not yet closed.
+
+    ``started`` flips the first time the body generator yields a chunk. It is
+    the whole point of the record: a generator that started owns its own
+    cleanup, and one that never started has no ``finally`` to run.
+    """
+
+    response: object
+    opened_at: float
+    started: bool = False
+    #: The first-chunk peek, when it outlived the header hold and was handed to
+    #: the generator to finish awaiting. If the generator never runs, nobody
+    #: ever awaits it: it keeps the response alive and, left alone, retires with
+    #: an exception nothing retrieves. Reaping cancels it first.
+    pending: object = None
+
+
+def _origin_of(url: str) -> str:
+    """`http://host:8101/v1/chat/completions` -> `http://host:8101`.
+
+    A connection pool is per origin, so that is the key. Falls back to the whole
+    URL rather than guessing when it does not parse, which costs an extra client
+    and never mixes two origins into one pool.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.scheme or not parts.netloc:
+        return url
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+async def close_quietly(response) -> None:
+    """Close an upstream response even when the surrounding scope is cancelled.
+
+    Starlette cancels the scope a ``StreamingResponse`` body runs in the moment
+    the client hangs up, and an anyio cancel scope is *level*-triggered: every
+    subsequent ``await`` inside it raises ``CancelledError`` at once. So an
+    unshielded ``await response.aclose()`` in a ``finally`` never actually runs.
+    httpx never gets the connection back, and the socket stays in CLOSE-WAIT for
+    the life of the process -- 256 of those is one exhausted pool and a gateway
+    that cannot reach *any* backend, including the ones that never leaked.
+
+    ``asyncio.shield`` does not help here: the cancellation comes from the anyio
+    scope, not from ``Task.cancel``, so the shielded await is re-cancelled at its
+    first checkpoint just the same.
+
+    Never raises. This runs on cleanup paths that are already carrying an
+    exception worth more than this one.
+    """
+    with anyio.CancelScope(shield=True):
+        try:
+            await response.aclose()
+        except Exception:
+            log.debug("could not close an upstream response", exc_info=True)
+
+
 async def _read_bounded(response: httpx.Response, limit: int = _BodyAccounting.LIMIT) -> bytes:
     """Drain a server error body so it can be replayed later, capped.
 
@@ -264,7 +379,7 @@ async def _read_bounded(response: httpx.Response, limit: int = _BodyAccounting.L
     except httpx.HTTPError:
         pass  # a truncated error body still says more than none
     finally:
-        await response.aclose()
+        await close_quietly(response)
     return bytes(buf)
 
 
@@ -283,32 +398,134 @@ class UpstreamProxy:
         self._owns_client = client is None
         self._breaker = breaker
         self._sink = sink or NULL_SINK
+        # origin -> (client, last used). One pool per origin, so a backend that
+        # exhausts its slots cannot take the others with it.
+        self._clients: dict[str, tuple[httpx.AsyncClient, float]] = {}
+        # Every upstream response this proxy has opened and not yet closed.
+        # `close_quietly` covers the response whose body generator ran and was
+        # cancelled; this covers the one whose generator was never started at
+        # all, which has no `finally` to run. See `_reap`.
+        self._open: dict[int, _OpenUpstream] = {}
+        self._janitor: asyncio.Task | None = None
 
     async def start(self) -> None:
-        if self._client is None:
-            timeout = httpx.Timeout(
-                connect=self._settings.upstream_connect_timeout_s,
-                read=self._settings.upstream_read_timeout_s,
-                write=self._settings.upstream_connect_timeout_s,
-                pool=self._settings.upstream_connect_timeout_s,
-            )
-            limits = httpx.Limits(
-                max_connections=self._settings.upstream_pool_limit,
-                max_keepalive_connections=self._settings.upstream_pool_limit,
-            )
-            self._client = httpx.AsyncClient(timeout=timeout, limits=limits)
+        if self._janitor is None:
+            self._janitor = asyncio.create_task(self._janitor_loop())
 
     async def stop(self) -> None:
+        if self._janitor is not None:
+            self._janitor.cancel()
+            try:
+                await self._janitor
+            except asyncio.CancelledError:
+                pass
+            self._janitor = None
+        for entry in list(self._open.values()):
+            await close_quietly(entry.response)
+        self._open.clear()
+        for client, _ in self._clients.values():
+            await client.aclose()
+        self._clients.clear()
         if self._client is not None and self._owns_client:
             await self._client.aclose()
         if self._owns_client:
             self._client = None
 
+    # -- clients -----------------------------------------------------------
+
+    def client_for(self, url: str) -> httpx.AsyncClient:
+        """The client for this URL's origin, created on first use.
+
+        An injected client (tests, and anything that wants one pool) is always
+        used as-is: the caller has said which pool it wants.
+        """
+        if self._client is not None:
+            return self._client
+        origin = _origin_of(url)
+        existing = self._clients.get(origin)
+        now = time.monotonic()
+        if existing is not None:
+            self._clients[origin] = (existing[0], now)
+            return existing[0]
+        timeout = httpx.Timeout(
+            connect=self._settings.upstream_connect_timeout_s,
+            read=self._settings.upstream_read_timeout_s,
+            write=self._settings.upstream_connect_timeout_s,
+            pool=self._settings.upstream_connect_timeout_s,
+        )
+        limits = httpx.Limits(
+            max_connections=self._settings.upstream_per_origin_limit,
+            max_keepalive_connections=self._settings.upstream_per_origin_limit,
+        )
+        client = httpx.AsyncClient(timeout=timeout, limits=limits)
+        self._clients[origin] = (client, now)
+        return client
+
     @property
     def client(self) -> httpx.AsyncClient:
+        """The injected client, for callers that still expect exactly one.
+
+        Kept because ``forward_provider``'s upstream is opened by
+        ``ProviderService`` with its own client; only the direct path routes
+        through ``client_for``.
+        """
         if self._client is None:
-            raise RuntimeError("UpstreamProxy.start() was not called")
+            raise RuntimeError("UpstreamProxy has no single client; use client_for()")
         return self._client
+
+    # -- open upstream responses -------------------------------------------
+
+    def _track(self, response) -> _OpenUpstream:
+        entry = _OpenUpstream(response=response, opened_at=time.monotonic())
+        self._open[id(response)] = entry
+        return entry
+
+    def _release(self, response) -> None:
+        self._open.pop(id(response), None)
+
+    async def _janitor_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._settings.upstream_janitor_interval_s)
+                await self._reap()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a janitor that dies stops reclaiming anything
+                log.exception("upstream janitor failed")
+
+    async def _reap(self) -> None:
+        """Close what nothing else will, and drop clients nobody is using.
+
+        Only responses whose body generator was *never started* are closed. A
+        running stream is left alone however long it takes -- reaping on age
+        would be a read timeout by the back door, and `upstream_read_timeout_s`
+        is None on purpose. Starlette starts iterating a StreamingResponse right
+        after it sends the response line, so a generator still unstarted after
+        `_UNSTARTED_GRACE_S` never will be: its client went away between the
+        headers and the first chunk.
+        """
+        now = time.monotonic()
+        for key, entry in list(self._open.items()):
+            if entry.started or now - entry.opened_at < _UNSTARTED_GRACE_S:
+                continue
+            self._open.pop(key, None)
+            log.warning(
+                "closing an upstream response whose body was never read (%.0fs)",
+                now - entry.opened_at,
+            )
+            if entry.pending is not None:
+                entry.pending.cancel()
+            await close_quietly(entry.response)
+
+        idle = self._settings.upstream_client_idle_s
+        for origin, (client, last_used) in list(self._clients.items()):
+            if now - last_used < idle:
+                continue
+            self._clients.pop(origin, None)
+            try:
+                await client.aclose()
+            except Exception:
+                log.debug("could not close the client for %s", origin, exc_info=True)
 
     # -- circuit breaker ---------------------------------------------------
     #
@@ -352,11 +569,28 @@ class UpstreamProxy:
         content: bytes | None = None,
         content_type: str | None = None,
         count_tokens: bool = True,
+        reopen=None,
     ) -> Attempt:
         """One target's turn. Returns an :class:`Attempt`, not a response.
 
         The caller decides whether a retryable attempt is worth handing to
         another target; this method only reports what happened.
+
+        ``reopen`` is what keeps a *committed* response recoverable. Headers go
+        out once the hold budget expires (see below), and before this existed
+        that also ended the request's protection -- the comment there said the
+        attempt "stops being retryable from here". But at that moment the client
+        has a status line and **zero body bytes**, so nothing it has seen would
+        be contradicted by streaming a different target's body. When the awaited
+        callable is supplied and the upstream dies with nothing yielded yet, the
+        generator asks for a replacement and carries on; the client sees one
+        uninterrupted response and never learns.
+
+        Protection therefore tracks bytes, not a clock. That matters because
+        the clock got it backwards: `upstream_header_hold_s` is 10s, so on this
+        cluster 130,815 requests crossed it -- every one of them the 30B, whose
+        prefill is 76-130s, and none of them the 0.5B, which answers in 5s. The
+        fast model was always protected and the slow one never was.
         """
         target = selection.target
         url = target.backend_url.rstrip("/") + path
@@ -438,14 +672,35 @@ class UpstreamProxy:
             if on_finish is not None:
                 on_finish()
 
+        client = self.client_for(url)
         if content is not None:
-            request = self.client.build_request(
+            request = client.build_request(
                 "POST", url, content=content, headers=headers
             )
         else:
-            request = self.client.build_request("POST", url, json=body, headers=headers)
+            request = client.build_request("POST", url, json=body, headers=headers)
         try:
-            response = await self.client.send(request, stream=True)
+            response = await client.send(request, stream=True)
+        except httpx.PoolTimeout as exc:
+            # Our own pool would not hand out a slot. That is a fact about this
+            # gateway, not about the backend -- which may well be answering in
+            # under a millisecond -- so the breaker must not hear about it. It
+            # benched two healthy targets on 2026-09-08 and then re-benched them
+            # forever, because the half-open probe died on the same empty pool.
+            settle(
+                None,
+                failed=True,
+                retry_reason=RETRY_POOL,
+                error_class=type(exc).__name__,
+            )
+            self._abandon_probe(target.target_id)
+            log.warning("no upstream connection available for %s", url)
+            return Attempt(
+                retryable=True,
+                reason=RETRY_POOL,
+                target_id=target.target_id,
+                error=type(exc).__name__,
+            )
         except httpx.HTTPError as exc:
             settle(
                 None,
@@ -462,12 +717,22 @@ class UpstreamProxy:
                 target_id=target.target_id,
                 error=type(exc).__name__,
             )
+        except BaseException:
+            # Cancellation, in the window between admission committing this
+            # request's KV and there being a response to track. Nothing else
+            # would ever settle it. httpx failures are handled above, so this
+            # only ever sees a caller changing its mind -- a losing hedge.
+            settle(None, failed=True, error_class="Discarded")
+            raise
+
+        tracked = self._track(response)
 
         # It answered, so the transport is fine whatever it went on to say.
         self._note_transport_success(target.target_id)
 
         if response.status_code >= 500:
-            captured = await _read_bounded(response)
+            captured = _scrub_upstream_body(await _read_bounded(response), api_key)
+            self._release(response)
             settle(
                 None,
                 failed=True,
@@ -488,6 +753,30 @@ class UpstreamProxy:
                 body=captured,
             )
 
+        if response.status_code >= 400:
+            # Not retryable -- the client's own request was wrong, not this
+            # target -- and small enough to buffer without trading away rule
+            # 1's "do not buffer streams", which exists for a long-lived
+            # completion or audio body, not a JSON error object. This is the
+            # shape rule 3 actually has to catch: a 401 that echoes "Invalid
+            # API key sk-..." would otherwise stream straight through
+            # unredacted, since only >=500 was ever captured before now.
+            captured = _scrub_upstream_body(await _read_bounded(response), api_key)
+            self._release(response)
+            settle(
+                accounting.finish(time.monotonic()),
+                failed=False,
+                status=response.status_code,
+            )
+            return Attempt(
+                response=Response(
+                    content=captured,
+                    status_code=response.status_code,
+                    headers=_forward_response_headers(response.headers),
+                ),
+                target_id=target.target_id,
+            )
+
         # Hold the response line until the first body chunk lands, so a node
         # that dies during prefill is still someone else's to answer. One chunk
         # is held, never the stream, so rule 1 is intact: the client's first
@@ -502,7 +791,21 @@ class UpstreamProxy:
         # asyncio.wait rather than wait_for: a timeout must leave the read
         # running. wait_for would cancel it mid-read and corrupt the stream,
         # and a slow first token is a long prefill, not a failure.
-        await asyncio.wait({pending}, timeout=self._settings.upstream_header_hold_s)
+        try:
+            await asyncio.wait(
+                {pending}, timeout=self._settings.upstream_header_hold_s
+            )
+        except BaseException:
+            # This is where a losing hedge is cancelled: waiting on a first
+            # chunk that is never going to be wanted. The upstream is already
+            # open and tracked, and nothing downstream will ever start the body
+            # generator that would settle it, so the cleanup has to happen here
+            # or the attempt strands its KV commitment and its connection.
+            pending.cancel()
+            settle(None, failed=True, error_class="Discarded")
+            self._release(response)
+            await close_quietly(response)
+            raise
 
         first: bytes | None = None
         held = pending
@@ -513,7 +816,8 @@ class UpstreamProxy:
             except StopAsyncIteration:
                 first = None  # an empty body is an answer, not a failure
             except httpx.HTTPError as exc:
-                await response.aclose()
+                self._release(response)
+                await close_quietly(response)
                 settle(
                     None,
                     failed=True,
@@ -542,7 +846,23 @@ class UpstreamProxy:
                 self._settings.upstream_header_hold_s,
             )
 
+        tracked.pending = held
+
+        sent_content_type = _forward_response_headers(response.headers).get(
+            "content-type"
+        )
+
         async def stream_body():
+            # The generator is running, so its `finally` below owns the close
+            # and the janitor must keep its hands off. Set before the first
+            # await: a cancellation between here and the first chunk still
+            # unwinds through that `finally`.
+            tracked.started = True
+            # Bytes the CLIENT has seen. Not bytes read from the upstream:
+            # the difference is the whole recovery window, because a response
+            # whose headers are committed but whose body is still empty can
+            # still be finished by somebody else without the client noticing.
+            committed = 0
             try:
                 opening = first
                 if held is not None:
@@ -556,26 +876,71 @@ class UpstreamProxy:
                     # marker split across the peek boundary is still counted
                     # exactly once.
                     accounting.note_chunk(opening, time.monotonic())
+                    committed += len(opening)
                     yield opening
                 async for chunk in stream:
                     accounting.note_chunk(chunk, time.monotonic())
+                    committed += len(chunk)
                     yield chunk
                 settle(
                     accounting.finish(time.monotonic()),
                     failed=False,
                     status=response.status_code,
                 )
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 self._note_transport_failure(target.target_id)
-                raise
+                if committed or reopen is None:
+                    # Rule 1: a body the client has already begun reading is
+                    # never rewritten. Past the first byte this is somebody
+                    # else's stream only in the sense that it is broken.
+                    raise
+                replacement = await reopen(sent_content_type)
+                if replacement is None:
+                    raise
+                log.info(
+                    "%s died before the client saw a byte; finishing from "
+                    "another target",
+                    target.target_id,
+                )
+                # Settle and let go of the dead one here rather than in the
+                # `finally`: the replacement owns the rest of this response,
+                # and its own generator carries its own accounting, breaker
+                # verdict, KV commitment and cleanup. settle/_release/
+                # close_quietly are all idempotent, so the finally below is a
+                # no-op after this.
+                settle(
+                    None,
+                    failed=True,
+                    retry_reason=RETRY_TRANSPORT,
+                    error_class=type(exc).__name__,
+                )
+                self._release(response)
+                await close_quietly(response)
+                async for chunk in replacement:
+                    committed += len(chunk)
+                    yield chunk
             finally:
                 # A client that hangs up raises GeneratorExit or CancelledError,
                 # both of which derive from BaseException and so never reached
                 # an `except Exception`. settle() is idempotent, so settling
                 # here is a no-op after a clean finish and is the only thing
                 # that releases the KV commitment of an abandoned stream.
+                #
+                # settle() is synchronous and the close is not, which is exactly
+                # how this leaked for months while the books stayed straight:
+                # under Starlette's disconnect the surrounding anyio scope is
+                # already cancelled, so a bare `await response.aclose()` raises
+                # at its first checkpoint and the connection is never returned.
+                # `close_quietly` shields it. Do not unwrap it.
                 settle(None, failed=True, error_class="ClientDisconnected")
-                await response.aclose()
+                self._release(response)
+                await close_quietly(response)
+
+        async def discard() -> None:
+            """Undo an attempt nobody will read. See `Attempt.discard`."""
+            settle(None, failed=True, error_class="Discarded")
+            self._release(response)
+            await close_quietly(response)
 
         return Attempt(
             response=StreamingResponse(
@@ -584,6 +949,7 @@ class UpstreamProxy:
                 headers=_forward_response_headers(response.headers),
             ),
             target_id=target.target_id,
+            discard=discard,
         )
 
     async def forward_provider(
@@ -601,8 +967,13 @@ class UpstreamProxy:
         selection=None,
         trace=None,
         attempt_no: int = 0,
+        reopen=None,
     ) -> Attempt | None:
         """One target's turn, routed through a provider's own ``open_upstream``.
+
+        ``reopen`` behaves exactly as it does in :meth:`forward` -- see that
+        docstring. A provider stream is if anything more worth recovering: it
+        crosses a network we do not own.
 
         This is what makes a provider's backoff, spend accounting, auth
         handling and budget enforcement actually run on live traffic (audit
@@ -728,6 +1099,27 @@ class UpstreamProxy:
             )
         except UpstreamError as exc:
             transport_class = _synthetic_transport_error_class(exc)
+            if transport_class == _POOL_TIMEOUT_CLASS:
+                # The provider's own pool, not the provider. Same reasoning as
+                # the direct path: no breaker verdict, because nothing here is
+                # evidence about whether the upstream is up.
+                settle(
+                    None,
+                    failed=True,
+                    retry_reason=RETRY_POOL,
+                    error_class=transport_class,
+                )
+                self._abandon_probe(target.target_id)
+                log.warning(
+                    "no upstream connection available for provider %s (%s)",
+                    provider_id, upstream_id,
+                )
+                return Attempt(
+                    retryable=True,
+                    reason=RETRY_POOL,
+                    target_id=target.target_id,
+                    error=transport_class,
+                )
             if transport_class is not None:
                 # ProviderService could not reach the upstream at all and has
                 # no way to say so except by raising UpstreamError -- its
@@ -792,6 +1184,25 @@ class UpstreamProxy:
             # Try someone else rather than fail the whole request on it.
             settle(None, failed=True)
             return None
+        except httpx.PoolTimeout as exc:
+            # Same split as the direct path, for the same reason.
+            settle(
+                None,
+                failed=True,
+                retry_reason=RETRY_POOL,
+                error_class=type(exc).__name__,
+            )
+            self._abandon_probe(target.target_id)
+            log.warning(
+                "no upstream connection available for provider %s (%s)",
+                provider_id, upstream_id,
+            )
+            return Attempt(
+                retryable=True,
+                reason=RETRY_POOL,
+                target_id=target.target_id,
+                error=type(exc).__name__,
+            )
         except httpx.HTTPError as exc:
             # Defensive: ProviderService itself never lets a raw httpx error
             # escape __aenter__ (it wraps every one as UpstreamError above),
@@ -817,17 +1228,62 @@ class UpstreamProxy:
 
         self._note_transport_success(target.target_id)
 
+        sent_content_type = upstream.headers.get("content-type") if upstream.headers else None
+
         async def stream_body():
             exc_info: tuple = (None, None, None)
+            # See `forward`: bytes the CLIENT has seen, which is what decides
+            # whether this response can still be finished by somebody else.
+            committed = 0
+            # Set once the handover has already run this upstream's teardown.
+            # `__aexit__` is not re-entrant: calling it twice throws into a
+            # generator that has already finished.
+            torn_down = False
             try:
                 async for chunk in upstream.body:
                     accounting.note_chunk(chunk, time.monotonic())
+                    committed += len(chunk)
                     yield chunk
                 settle(
                     accounting.finish(time.monotonic()),
                     failed=False,
                     status=upstream.status_code,
                 )
+            except httpx.HTTPError as exc:
+                if committed or reopen is None:
+                    exc_info = (type(exc), exc, exc.__traceback__)
+                    self._note_transport_failure(target.target_id)
+                    raise
+                replacement = await reopen(sent_content_type)
+                if replacement is None:
+                    exc_info = (type(exc), exc, exc.__traceback__)
+                    self._note_transport_failure(target.target_id)
+                    raise
+                self._note_transport_failure(target.target_id)
+                log.info(
+                    "provider %s died before the client saw a byte; finishing "
+                    "from another target",
+                    provider_id,
+                )
+                # The provider's context manager still has to hear the real
+                # exception -- passing None would tell open_upstream this
+                # transfer finished cleanly and it would record spend and call
+                # note_success for one that did not.
+                settle(
+                    None,
+                    failed=True,
+                    retry_reason=RETRY_TRANSPORT,
+                    error_class=type(exc).__name__,
+                )
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await manager.__aexit__(type(exc), exc, exc.__traceback__)
+                    except Exception:
+                        log.debug("provider teardown failed", exc_info=True)
+                torn_down = True
+                async for chunk in replacement:
+                    committed += len(chunk)
+                    yield chunk
             except BaseException as exc:
                 # A client disconnect raises GeneratorExit or CancelledError
                 # here, both of which derive from BaseException and so never
@@ -848,8 +1304,33 @@ class UpstreamProxy:
                 # settle() is idempotent, so this is a no-op after a clean
                 # finish and is the only thing that releases the commitment
                 # of an abandoned stream otherwise.
+                #
+                # Shielded for the same reason as the direct path's close: a
+                # client disconnect leaves this generator running inside an
+                # already-cancelled anyio scope, where an unshielded await
+                # raises at once and the provider's context manager never gets
+                # to release its connection.
                 settle(None, failed=True)
-                await manager.__aexit__(*exc_info)
+                if not torn_down:
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await manager.__aexit__(*exc_info)
+                        except Exception:
+                            log.debug(
+                                "provider upstream teardown failed", exc_info=True
+                            )
+
+        async def discard() -> None:
+            """Undo an attempt nobody will read. See `Attempt.discard`."""
+            settle(None, failed=True, error_class="Discarded")
+            reason = _Discarded("hedge lost")
+            with anyio.CancelScope(shield=True):
+                try:
+                    await manager.__aexit__(type(reason), reason, None)
+                except _Discarded:
+                    pass  # ours, and it has done its job
+                except Exception:
+                    log.debug("provider teardown failed", exc_info=True)
 
         return Attempt(
             response=StreamingResponse(
@@ -859,4 +1340,5 @@ class UpstreamProxy:
                 headers=upstream.headers,
             ),
             target_id=target.target_id,
+            discard=discard,
         )

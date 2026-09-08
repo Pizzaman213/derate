@@ -32,14 +32,28 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
 
-from . import capacity_api, enroll_api, internal_api, openai_api, setup_api, ui_api
+from . import (
+    capacity_api,
+    enroll_api,
+    internal_api,
+    openai_api,
+    runtime_api,
+    setup_api,
+    shell_api,
+    ui_api,
+)
+from control_plane.inventory import api as inventory_api
+
 from .admission import AdmissionController
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
+from .csrf import is_cross_site_write
 from .deps import GatewayContext, GatewayDeps
+from .errors import error_response
 from .metrics import MetricsHub
 from .parking import ParkingLot
 from .proxy import UpstreamProxy
+from .restart import RestartCoordinator
 from .router import Router
 from .settings import GatewaySettings
 from .stats import StatsRegistry
@@ -77,6 +91,65 @@ async def _optional_step(
     except Exception as exc:
         ctx.degraded_startup.append(f"{label}: {type(exc).__name__}")
         log.warning("startup: %s failed (%s), continuing degraded", label, exc)
+
+
+def _resolve_coordinator_node(ctx: GatewayContext, deps) -> str | None:
+    """Which node is the machine this gateway is running on.
+
+    Only reached when the composition root did not say. ``node.py`` does say --
+    it passes ``coordinator_node_id=runtime.profile.node_id`` because it knows
+    the answer -- so in the real coordinator none of this runs. What reaches
+    here is a gateway composed some other way, and the point of the ladder is
+    that each rung is a better answer than the guess it replaces.
+
+    1. ``registry.local_node_id``. The registry it was handed already knows
+       which member is its own host. This beats the old ``list_nodes()[0]``
+       outright: that read whichever member happened to be first in a dict, so
+       a persisted roster that led with a worker named that worker as the
+       coordinator (verifier N-8). Same bug, one layer down from where node.py
+       fixed it, and it was reachable by anything that is not node.py.
+
+    2. Nothing enrolled at all, but the registry can enroll its own host --
+       so ask it to. A coordinator serving a roster with no entry for the
+       machine it is running on has every downstream surface either empty or
+       refusing, and it is the shape a fresh install takes.
+
+    3. The old guess, kept for a registry that offers neither.
+
+    Duck-typed throughout, and that is what keeps it honest on a stub: the
+    day-0 ``StubRegistry`` and the test doubles have neither attribute, so they
+    fall to rung 3, find no nodes, and return None exactly as before. A stub
+    surface must not invent a node -- it has no host to speak for.
+    """
+    registry = deps.registry
+    try:
+        local = getattr(registry, "local_node_id", None)
+        if local:
+            return str(local)
+
+        if not registry.list_nodes():
+            enroll = getattr(registry, "enroll_local", None)
+            if callable(enroll):
+                state = enroll()
+                if state is not None:
+                    # Worth saying out loud. Reaching here means the process
+                    # that built this gateway did not enroll its own host, and
+                    # the next person to compose one should find that out from
+                    # a startup event rather than from an empty roster.
+                    ctx.degraded_startup.append(
+                        "registry: self-enrolled the local node at startup"
+                    )
+                    log.warning(
+                        "registry had no nodes; enrolled the local host %s",
+                        state.profile.node_id,
+                    )
+                    return state.profile.node_id
+            return None
+
+        return deps.registry.list_nodes()[0].profile.node_id
+    except Exception:
+        log.warning("could not determine coordinator node")
+        return None
 
 
 async def _best_effort_shutdown(label: str, owner, *names: str) -> None:
@@ -283,6 +356,7 @@ def create_app(
         deployments=deps.deployments,
         stats=stats,
         settings=settings,
+        providers=deps.providers,
     )
 
     ctx = GatewayContext(
@@ -300,6 +374,22 @@ def create_app(
         events=events,
     )
     ctx.telemetry = telemetry
+
+    # Needs `ctx` itself (it calls _plan_and_fit(ctx, ...) and ctx.router on a
+    # successful relaunch), so it is built after GatewayContext rather than
+    # alongside the services passed into it above.
+    restart = RestartCoordinator(ctx)
+
+    # The model registry. Guarded because it is a convenience over stores that
+    # are all still readable without it: a coordinator that cannot open the
+    # database must still serve, and /api/models says why rather than 500ing.
+    try:
+        from control_plane.inventory import ModelInventory
+        from control_plane.paths import data_path
+
+        ctx.inventory = ModelInventory(data_path("models.db"))
+    except Exception:
+        log.exception("model registry unavailable; /api/models will say so")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -322,16 +412,12 @@ def create_app(
         await _optional_step(ctx, "providers", deps.providers, "start", "refresh_loop")
 
         if settings.coordinator_node_id is None:
-            try:
-                nodes = deps.registry.list_nodes()
-                if nodes:
-                    settings.coordinator_node_id = nodes[0].profile.node_id
-            except Exception:
-                log.warning("could not determine coordinator node")
+            settings.coordinator_node_id = _resolve_coordinator_node(ctx, deps)
 
         await proxy.start()
         await admission.start()
         await router.start()
+        await restart.start()
         await metrics.start()
         # Started last, and given the registry as its source of agent URLs, so
         # it only ever polls nodes the registry already knows are members.
@@ -385,6 +471,7 @@ def create_app(
             # both sides rather than answering.
             parking.close()
             await metrics.stop()
+            await restart.stop()
             await router.stop()
             await admission.stop()
             await proxy.stop()
@@ -431,6 +518,33 @@ def create_app(
             "CORS enabled for %s", ", ".join(settings.allowed_origins)
         )
 
+    # Unconditional, unlike CORS above: this is what protects the default,
+    # same-origin deployment that never sets DERATE_ALLOWED_ORIGINS and so
+    # never installs CORSMiddleware at all -- without it, a page open in any
+    # browser on the LAN could blind-POST to every unauthenticated /api route
+    # the moment its tab happened to be able to reach the coordinator. See
+    # csrf.py for the reasoning.
+    @app.middleware("http")
+    async def _csrf_guard(request, call_next):
+        origin = request.headers.get("origin")
+        if is_cross_site_write(
+            method=request.method,
+            path=request.url.path,
+            origin=origin,
+            request_scheme=request.url.scheme,
+            request_netloc=request.url.netloc,
+            allowed_origins=settings.allowed_origins,
+        ):
+            return error_response(
+                403,
+                f"Cross-origin write refused: {origin!r} does not match this "
+                "gateway. Add it to DERATE_ALLOWED_ORIGINS if it should be "
+                "allowed to change cluster state.",
+                "invalid_request_error",
+                "cross_origin_write_refused",
+            )
+        return await call_next(request)
+
     app.include_router(openai_api.create_router(ctx))
     app.include_router(internal_api.create_router(ctx))
     # Above the StaticFiles mount below, and it must stay there: a Starlette
@@ -444,6 +558,20 @@ def create_app(
     # Same rule again: /api/memory and /api/capacity are JSON, and below the
     # mount they would answer index.html to a fetch that expects a report.
     app.include_router(capacity_api.create_router(ctx))
+    # Below capacity_api on purpose. That router owns four literal paths under
+    # /api/models/, and registering a sibling above them is how one of them
+    # would one day start answering the wrong handler. This one adds only the
+    # bare /api/models, which collides with nothing -- the ordering is belt
+    # and braces, and tests/test_inventory_api.py pins it.
+    app.include_router(inventory_api.create_router(ctx))
+    # Same rule again. A GPU-less node cannot carry a rank but can host a
+    # runtime, and this is the pair of routes that finds one and adopts it.
+    app.include_router(runtime_api.create_router(ctx))
+    # Same rule once more, and a WebSocket does not escape it -- /v1/realtime
+    # is registered above the mount for exactly this reason. The router itself
+    # decides whether the socket route exists at all; the status route is
+    # always there so the UI can say why it does not.
+    app.include_router(shell_api.create_router(ctx))
     # Same rule, and this is the one it would be worst to get wrong: /api/setup
     # is the FIRST call a freshly installed UI makes, so below the mount a new
     # cluster's very first screen would parse index.html as JSON and show

@@ -66,6 +66,23 @@ GPT_OSS_120B = ModelShape(
     layers_with_full_attention=18,
 )
 
+#: A DualAR text-to-speech checkpoint: the shape derate's own tts runtime was
+#: written against, and the reason that runtime exists -- neither vLLM nor
+#: SGLang has a /v1/audio/speech at all. Real figures, from
+#: Audio8/Audio8-TTS-Preview-0.6b, including the 2048-position packed window
+#: that text, reference audio and generated speech all share.
+AUDIO8_TTS_0_6B = ModelShape(
+    model_id="Audio8/Audio8-TTS-Preview-0.6b",
+    num_layers=24,
+    hidden_size=896,
+    num_attention_heads=14,
+    num_kv_heads=2,
+    vocab_size=155776,
+    total_params=601_159_424,
+    dtype="bf16",
+    head_dim=64,
+)
+
 QWEN3_30B_A3B = ModelShape(
     model_id="Qwen/Qwen3-30B-A3B",
     num_layers=48,

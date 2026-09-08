@@ -34,10 +34,12 @@ TOKEN=""
 NAME=""
 DRY_RUN=0
 UNINSTALL=0
+LEAVE=0
 GPU=1
 PURGE=0
 KEEP_IMAGES=0
 INSTALL_DOCKER=0
+INSTALL_OLLAMA=0
 HEALTH_TIMEOUT=60
 
 usage() {
@@ -57,12 +59,26 @@ Options
   --port PORT         coordinator/UI port (default: 8080)
   --agent-port PORT   node agent port (default: 8081)
   --install-docker    install Docker with get.docker.com if it is missing
-  --no-gpu            do not pass the GPU into the container. The node joins
-                      but probes as unidentified hardware and the planner
-                      will not place work on it.
+  --install-ollama    also install Ollama on this machine and bind it to the
+                      LAN, so a node with no GPU can serve a small model over
+                      the network. Opt-in for the same reason --install-docker
+                      is: this script does not install daemons you did not ask
+                      for. The node itself does not need it.
+  --no-gpu            do not pass the GPU into the container. On a machine
+                      that has one the node then probes as unidentified
+                      hardware; on a machine that has none -- a Pi, a NAS, a
+                      spare box -- it probes as a CPU node, which is what it
+                      is. Neither is given a rank by the planner.
   --dry-run           print the docker command that would run, and stop
   --uninstall         stop and remove the container (keeps the data volume)
   --purge             with --uninstall, also delete the data volume
+  --leave             forget the cluster this machine belongs to -- drops the
+                      cluster id and token, keeps this node's own identity and
+                      everything else in the volume. Use it before moving a
+                      machine to a different cluster, or the node keeps
+                      presenting the old cluster's token and is turned away.
+                      Without --uninstall it restarts the node afterwards, so
+                      it comes back looking for a cluster to join.
   --keep-images       do not reclaim derate images the upgrade superseded
   -h, --help          this
 USAGE
@@ -92,11 +108,13 @@ while [ $# -gt 0 ]; do
         --agent-port)   need_value "$1" "${2:-}"; AGENT_PORT="$2"; shift 2 ;;
         --agent-port=*) AGENT_PORT="${1#*=}"; shift ;;
         --install-docker) INSTALL_DOCKER=1; shift ;;
+        --install-ollama) INSTALL_OLLAMA=1; shift ;;
         --no-gpu)       GPU=0; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
         --purge)        PURGE=1; shift ;;
         --keep-images)  KEEP_IMAGES=1; shift ;;
+        --leave)        LEAVE=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown option '$1'. Try --help." ;;
     esac
@@ -150,8 +168,34 @@ ensure_docker() {
 # Uninstall
 # ---------------------------------------------------------------------------
 
+# Forgetting a cluster is not the same as forgetting the machine. `node.json`
+# is this box's own identity and it stays: a machine that comes back keeps its
+# place, its label and its position on the cluster floor. `cluster.json` is the
+# membership -- the id and the shared token -- and that is what has to go, or
+# the node keeps presenting the old cluster's credential to the new one and is
+# rejected by it.
+leave_cluster() {
+    ensure_docker
+    if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+        $DOCKER exec "$CONTAINER" rm -f /data/cluster.json >/dev/null 2>&1 \
+            && info "forgot the cluster (kept this node's identity)" \
+            || info "this node did not belong to a cluster"
+    else
+        info "no $CONTAINER container: nothing to forget"
+    fi
+}
+
+if [ "$LEAVE" -eq 1 ] && [ "$UNINSTALL" -eq 0 ]; then
+    leave_cluster
+    $DOCKER restart "$CONTAINER" >/dev/null 2>&1 \
+        && info "restarted $CONTAINER; it is looking for a cluster to join" \
+        || true
+    exit 0
+fi
+
 if [ "$UNINSTALL" -eq 1 ]; then
     ensure_docker
+    [ "$LEAVE" -eq 0 ] || leave_cluster
     if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
         $DOCKER rm -f "$CONTAINER" >/dev/null
         info "removed the $CONTAINER container"
@@ -172,8 +216,22 @@ fi
 # Compose the run
 # ---------------------------------------------------------------------------
 
+# This installer installs a *container*, and the flags below are Linux-host
+# features: Docker Desktop's --network host does not reach the LAN, --gpus
+# needs the NVIDIA container toolkit, and --pid=host has no host to name. So
+# this is not a check that could be relaxed -- it is the wrong installer for
+# those machines, and they have a right one. Say which, rather than stopping.
 [ "$(uname -s)" = "Linux" ] || [ "$DRY_RUN" -eq 1 ] || die \
-    "derate nodes run on Linux. This is $(uname -s)."
+    "derate's container runs on Linux, and this is $(uname -s).
+Install it natively instead:
+    pipx install derate && derate
+To join an existing cluster, add its address and an enrollment token:
+    DERATE_JOIN=http://<coordinator>:8080 DERATE_TOKEN=ej_... derate
+Settings -> Add a node on the coordinator composes that line for you.
+A machine installed this way is a full cluster member: it is discovered, it
+reports its hardware and it can serve models through a local runtime. It
+cannot carry a tensor- or pipeline-parallel rank, because that is launched
+through sparkrun onto Linux GPU nodes."
 
 # Host networking is not optional: mDNS is multicast and does not cross a
 # bridge, and the agent needs the real interfaces to report the ConnectX-7
@@ -212,12 +270,21 @@ set -- "$@" "$IMAGE"
 # honour --gpus has to be retried without it, and rebuilding the whole argument
 # list in POSIX sh to drop two flags is worse than composing them separately.
 #
-# Without them the container has no nvidia-smi, and a node with no nvidia-smi
-# probes as DeviceClass.UNKNOWN: no device class, no GPU name, zero memory,
-# zero power, zero temperature. It still joins, still reports healthy, still
-# appears in the roster -- as hardware the coordinator says it cannot confirm
-# is eligible. That is the worst shape a failure can take here, because nothing
-# looks broken; the node is simply, quietly, never planned onto.
+# Without them the container has no nvidia-smi, and on a machine that has a
+# GPU that is DeviceClass.UNKNOWN: no device class, no GPU name, zero memory.
+# It still joins, still reports healthy, still appears in the roster -- as
+# hardware the coordinator says it cannot confirm is eligible. That is the
+# worst shape a failure can take here, because nothing looks broken; the node
+# is simply, quietly, never planned onto.
+#
+# What makes that verdict survivable is that the probe does not reach it from
+# the absence of nvidia-smi alone: registry/probe.py also reads
+# /proc/driver/nvidia and the PCI vendor ids, and BOTH are visible from inside
+# a container started without these flags -- the proc entry belongs to the
+# loaded driver, the bus is the host's. So a GPU machine missing the container
+# toolkit still reads as unidentified, which is what keeps this failure
+# findable, while a machine that genuinely has no GPU reads as DeviceClass.CPU
+# and is a cluster member in good standing.
 #
 # --pid=host belongs to the same flag, not to a separate appetite for
 # privilege. On GB10 every aggregate FB memory field reads [N/A] and
@@ -349,18 +416,20 @@ if ! run_node "$@" >/dev/null 2>"$RUN_ERR"; then
     if [ "$HAS_DRIVER" -eq 1 ]; then
         info "this machine has an NVIDIA driver but Docker could not pass the GPU"
         info "into the container, so the node started without it. It joins and"
-        info "reports healthy, but it probes as unidentified hardware -- no GPU"
-        info "name, no memory, no power, no temperature -- and the planner will not"
-        info "place work on it. Install the NVIDIA container toolkit and re-run:"
+        info "reports healthy, and it reports host memory, temperature and CPU --"
+        info "but the probe can see the driver and not the GPU, so it records"
+        info "unidentified hardware and the planner will not place work on it."
+        info "Install the NVIDIA container toolkit and re-run:"
         info "  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
     else
-        info "Docker could not pass a GPU into the container, and this machine"
-        info "has no NVIDIA driver on PATH, so there may be no GPU to pass. The"
-        info "node started without it: it joins and reports healthy, but it"
-        info "probes as unidentified hardware -- no GPU name, no memory, no"
-        info "power, no temperature -- and the planner will not place work on"
-        info "it. If this machine does have an NVIDIA GPU, install the driver"
-        info "and the container toolkit and re-run. If it does not, pass"
+        info "Docker could not pass a GPU into the container, and this machine has"
+        info "no NVIDIA driver on PATH. The node started without it, and what it"
+        info "then reports depends on what is actually here. If there is no NVIDIA"
+        info "hardware at all -- a Pi, a NAS, a spare box -- it probes as a CPU"
+        info "node: a cluster member with real host telemetry, which can front a"
+        info "provider but will not be given a rank. If there IS a card, the probe"
+        info "finds it on the PCI bus and records unidentified hardware instead;"
+        info "install the driver and the container toolkit and re-run. Pass"
         info "--no-gpu to skip this attempt and this message."
     fi
 fi
@@ -401,6 +470,98 @@ until probe "http://127.0.0.1:$AGENT_PORT/agent/health"; do
     sleep 2
     waited=$((waited + 2))
 done
+
+# Ollama, when it was asked for. After the node is confirmed up, deliberately:
+# this is an extra, and a machine whose node did not start has a worse problem
+# than a missing runtime.
+#
+# A node with no GPU cannot be given a rank -- the planner will not place a
+# model on it and the fit gate refuses, because there is no GPU memory to
+# budget. What such a machine CAN do is run a small model itself and be routed
+# to as a provider. That is what this installs; the node does not need it and
+# never calls it.
+#
+# Bound to 0.0.0.0 on purpose. Ollama listens on 127.0.0.1 by default, which is
+# correct for a laptop and useless here: the coordinator is on another machine
+# and would find nothing. This is the one setting that decides whether the
+# runtime is reachable at all, so it is set here rather than left as an
+# instruction somebody has to find.
+install_ollama() {
+    if command -v ollama >/dev/null 2>&1; then
+        info "ollama is already installed"
+    else
+        info "installing Ollama via ollama.com/install.sh"
+        command -v curl >/dev/null 2>&1 || die "curl is needed to install Ollama."
+        curl -fsSL https://ollama.com/install.sh | sh || \
+            die "the Ollama installer failed. Install it yourself and re-run with --install-ollama."
+    fi
+
+    # systemd is how the vendor script installs it. Without systemd we have no
+    # supported way to make the bind address stick across a reboot, and saying
+    # so beats writing a unit file for an init system we did not detect.
+    if ! command -v systemctl >/dev/null 2>&1; then
+        info "ollama is installed, but this machine has no systemctl, so its"
+        info "listen address was not changed. It will only answer on localhost"
+        info "and the coordinator will not find it. Set OLLAMA_HOST=0.0.0.0:11434"
+        info "in however this machine starts services."
+        return 0
+    fi
+
+    SUDO=""
+    [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+    OLLAMA_DROPIN=/etc/systemd/system/ollama.service.d
+    info "binding ollama to 0.0.0.0:11434 so the coordinator can reach it"
+    $SUDO mkdir -p "$OLLAMA_DROPIN" || die "could not write $OLLAMA_DROPIN"
+    # A drop-in rather than an edit of the unit: the vendor's installer owns
+    # ollama.service and will overwrite it on upgrade. This survives that.
+    printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0:11434"\n' \
+        | $SUDO tee "$OLLAMA_DROPIN/derate.conf" >/dev/null \
+        || die "could not write the ollama drop-in"
+    $SUDO systemctl daemon-reload || true
+    $SUDO systemctl enable --now ollama >/dev/null 2>&1 || true
+    $SUDO systemctl restart ollama || die "ollama would not restart. Check: systemctl status ollama"
+
+    # Confirm it is actually answering on the LAN address, not just running.
+    # "installed" and "reachable" are different claims and only the second one
+    # is what the coordinator needs.
+    waited=0
+    until probe "http://127.0.0.1:11434/api/tags"; do
+        if [ "$waited" -ge 30 ]; then
+            info "ollama was installed but is not answering on 11434 yet."
+            info "check: systemctl status ollama"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    info "ollama is up on 0.0.0.0:11434"
+    info "open this node in the UI and use 'Add as a provider' to route to it"
+}
+
+if [ "$INSTALL_OLLAMA" -eq 1 ]; then
+    install_ollama
+fi
+
+# Which build is now on this machine. Read off the container, not out of this
+# script: the container inherits the image's labels and it is the thing that is
+# actually running, so this cannot drift from the truth the roster will report.
+# `with` rather than a bare `index` so an image built before the label existed
+# prints nothing instead of a template's idea of nothing.
+INSTALLED_BUILD=$(
+    $DOCKER inspect \
+        -f '{{with index .Config.Labels "org.opencontainers.image.revision"}}{{.}}{{end}}' \
+        "$CONTAINER" 2>/dev/null || true
+)
+if [ -n "$INSTALLED_BUILD" ]; then
+    info "installed build $INSTALLED_BUILD"
+else
+    # The branch that earns its place. An image built without DERATE_BUILD
+    # carries no stamp, and this node will sit in the roster with its build
+    # unknown -- which reads as a mystery box rather than as an unstamped
+    # build. Saying it here costs nothing; discovering it from a roster three
+    # days later costs an afternoon.
+    info "installed an image with no build stamp; the roster will show this node's build as unknown"
+fi
 
 # The node answered /agent/health, so the image it is running is known good and
 # the ones it replaced are dead weight -- a derate image is ~300 MB and an

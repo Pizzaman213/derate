@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReachReport } from '../api/types'
-import { useCluster, useRouting, useTopology } from '../state/resources'
+import type { Point } from './cluster/layout'
+import { useCluster, useProviders, useRouting, useTopology } from '../state/resources'
 import { useBackend } from '../state/backend'
 import { nameIndex } from '../state/names'
 import { ClusterGraph, type ClusterGraphHandle } from './cluster/ClusterGraph'
 import { GraphToolbar } from './cluster/GraphToolbar'
 import { SelectionRail } from './cluster/SelectionRail'
-import { clearOrder, readOrder, writeOrder } from './cluster/order'
+import {
+  clearArrangement,
+  isArranged,
+  readArrangement,
+  writeArrangement,
+  NO_ARRANGEMENT,
+  type Arrangement,
+} from './cluster/order'
 
 const EMPTY_TOPOLOGY = { cluster_id: '', coordinator: '', nodes: [], edges: [], deployments: [] }
 
@@ -19,6 +27,7 @@ export function ClusterTab() {
   const cluster = useCluster()
   const topology = useTopology()
   const routing = useRouting()
+  const providers = useProviders()
   const { backend, invalidate } = useBackend()
 
   const [measuring, setMeasuring] = useState<string | null>(null)
@@ -33,27 +42,55 @@ export function ClusterTab() {
   const zoomLabelRef = useRef<HTMLSpanElement>(null)
 
   const clusterId = topology.data?.cluster_id ?? ''
-  const [order, setOrder] = useState<string[] | null>(null)
+  // Which slot each machine is dealt, and how far it has been dragged off it.
+  // One piece of state because they are one preference: the floor's
+  // arrangement, saved the moment it changes and restored on the next visit.
+  const [arrangement, setArrangement] = useState<Arrangement>(NO_ARRANGEMENT)
   const [live, setLive] = useState('')
+
+  /** The current arrangement, readable from the two writers below without
+   *  putting it in their dependency arrays. Both are handed to `ClusterGraph`,
+   *  which keys its pointer and key listeners on them -- a new identity per
+   *  drop would tear those listeners down and rebuild them on every move. */
+  const arrangementRef = useRef(arrangement)
+  arrangementRef.current = arrangement
 
   // The arrangement is per cluster, and the cluster id is not known until the
   // first poll answers.
   useEffect(() => {
-    setOrder(clusterId ? readOrder(clusterId) : null)
+    setArrangement(clusterId ? readArrangement(clusterId) : NO_ARRANGEMENT)
   }, [clusterId])
 
-  const reorder = useCallback(
-    (next: string[]) => {
-      setOrder(next)
-      if (clusterId) writeOrder(clusterId, next)
+  // Every write goes through here, so "auto-saves" is a property of the state
+  // rather than something each caller has to remember: there is no path that
+  // changes the floor on screen without the store agreeing with it.
+  const save = useCallback(
+    (next: Arrangement) => {
+      setArrangement(next)
+      if (clusterId) writeArrangement(clusterId, next)
     },
     [clusterId],
   )
 
+  const reorder = useCallback(
+    (order: string[]) => save({ ...arrangementRef.current, order }),
+    [save],
+  )
+
+  const move = useCallback(
+    (nodeId: string, offset: Point | null) => {
+      const offsets = { ...arrangementRef.current.offsets }
+      if (offset) offsets[nodeId] = offset
+      else delete offsets[nodeId]
+      save({ ...arrangementRef.current, offsets })
+    },
+    [save],
+  )
+
   const resetLayout = useCallback(() => {
-    setOrder(null)
-    if (clusterId) clearOrder(clusterId)
-    setLive('Machines put back in their default order.')
+    setArrangement(NO_ARRANGEMENT)
+    if (clusterId) clearArrangement(clusterId)
+    setLive('Machines put back where they started.')
   }, [clusterId])
 
   const measure = async (a: string, b: string) => {
@@ -101,24 +138,31 @@ export function ClusterTab() {
       <GraphToolbar
         graphRef={graphRef}
         zoomLabelRef={zoomLabelRef}
-        rearranged={order != null}
+        rearranged={isArranged(arrangement)}
         onResetLayout={resetLayout}
       />
 
       {/* The drawing takes whatever is left between the toolbar and the two
-          reference blocks below, and sits in the middle of it. */}
-      <div className="floor">
-        <ClusterGraph
-          ref={graphRef}
-          deployments={cluster.data?.deployments ?? []}
-          topology={topology.data ?? EMPTY_TOPOLOGY}
-          nodes={cluster.data?.nodes ?? []}
-          routing={routing.data ?? []}
-          zoomLabelRef={zoomLabelRef}
-          order={order}
-          onReorder={reorder}
-          announce={setLive}
-        />
+          reference blocks below, and sits in the middle of it. `.floorcard`
+          is what carries the growing, because the card is now the flex item
+          and the floor inside it is not. */}
+      <div className="card2 floorcard">
+        <div className="floor">
+          <ClusterGraph
+            ref={graphRef}
+            deployments={cluster.data?.deployments ?? []}
+            topology={topology.data ?? EMPTY_TOPOLOGY}
+            nodes={cluster.data?.nodes ?? []}
+            routing={routing.data ?? []}
+            providers={providers.data ?? []}
+            zoomLabelRef={zoomLabelRef}
+            order={arrangement.order}
+            onReorder={reorder}
+            offsets={arrangement.offsets}
+            onMove={move}
+            announce={setLive}
+          />
+        </div>
       </div>
 
       <p aria-live="polite" className="sr-only">
@@ -127,8 +171,15 @@ export function ClusterTab() {
 
       {/* The rail and the legend are the reference desk, so .clusterstage pins
           them to the bottom of the destination instead of letting them trail
-          the drawing. Nothing above them moves when a link is selected. */}
-      <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--rule)' }}>
+          the drawing. Nothing above them moves when a link is selected.
+
+          Each is its own block rather than a hairline rule under the drawing:
+          three regions on one bare surface read as one thing with dividers in
+          it, and every other surface in the product -- Storage, Settings, the
+          sidebar's sections -- is a flat list of separate blocks. The rule was
+          already there and this destination was the exception. */}
+      <div className="card2">
+        <h3>Links</h3>
         <SelectionRail
           edges={topology.data?.edges ?? []}
           measurements={cluster.data?.links ?? []}
@@ -147,33 +198,39 @@ export function ClusterTab() {
       </div>
 
       {/* One meaning per channel. Width is measured bandwidth; a dash is
-          never-measured or a boundary crossing; colour means something is
-          wrong, which is why a healthy plate has none. */}
-      <div className="legend" style={{ marginTop: 11, paddingTop: 11, borderTop: '1px solid var(--rule)' }}>
-        <span>
-          <b>thick</b> measured all-reduce, against the 40 GB/s tensor-parallel threshold
-        </span>
-        <span>
-          <b>dashed</b> never measured, and carrying no figure
-        </span>
-        <span>
-          <b>inset meter</b> memory used
-        </span>
-        <span>
-          <b>plate border</b> amber or red when the machine needs looking at
-        </span>
-        <span>
-          <b>band</b> one deployment across the machines it occupies
-        </span>
-        <span>
-          <b>thin dashed</b> crosses the routing boundary, no measured fabric
-        </span>
-        <span>
-          <b>outlined</b> third party
-        </span>
-        <span>
-          <b>blue</b> request in flight
-        </span>
+          never-measured and nothing else now that the routing boundary is
+          gone; colour means something is wrong, which is why a healthy plate
+          has none -- with the traffic blocks below as the one deliberate
+          exception, and they are traffic, not state. */}
+      <div className="card2">
+        <h3>Legend</h3>
+        <div className="legend">
+          <span>
+            <b>thick</b> measured all-reduce, against the 40 GB/s tensor-parallel threshold
+          </span>
+          <span>
+            <b>dashed</b> never measured, and carrying no figure
+          </span>
+          <span>
+            <b>inset meter</b> memory used
+          </span>
+          <span>
+            <b>plate border</b> amber or red when the machine needs looking at
+          </span>
+          <span>
+            <b>band</b> one deployment across the machines it occupies
+          </span>
+          <span>
+            <b>provider logo</b> each row's own mark — the one thing on that box that still isn't yours
+          </span>
+          <span>
+            <b>blue</b> one block, one request in flight
+          </span>
+          <span>
+            <b>teal / violet</b> output tokens leaving — teal when this name's last 15 minutes of
+            requests mostly streamed, violet when they mostly did not, grey when nothing recorded
+          </span>
+        </div>
       </div>
     </div>
   )

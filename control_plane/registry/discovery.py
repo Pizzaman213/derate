@@ -125,6 +125,32 @@ class Advertiser:
             self.stop()
             return False
 
+    def readvertise(self, address: str, role: str | None = None) -> bool:
+        """Re-register at a new address. False when nothing needed doing.
+
+        The record is built once, in ``start()``, from the address this node had
+        at boot. A machine that changes IP -- a new DHCP lease, a move to another
+        subnet, a second interface winning the default route -- therefore kept
+        advertising an address it no longer answers on, and the next node to
+        browse would try to join a coordinator that is not there. Withdrawing and
+        re-registering is the only way: ``start()`` returns early while ``_info``
+        is set, so calling it again is a no-op by itself.
+        """
+        if address == self.address and (role is None or role == self.role):
+            return False
+        log.info(
+            "re-advertising %s at %s (was %s)", self.node_id, address, self.address
+        )
+        was_active = self.active
+        self.stop()
+        self.address = address
+        if role is not None:
+            self.role = role
+        # Only re-register if we were registered: an advertiser that never
+        # started (no zeroconf, or a failed bind) must not be started by a
+        # change of address it was not announcing in the first place.
+        return self.start() if was_active else False
+
     def stop(self) -> None:
         if self._zc is not None:
             try:

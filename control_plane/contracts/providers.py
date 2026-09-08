@@ -18,7 +18,12 @@ class ProviderKind(str, Enum):
     ANTHROPIC = "anthropic"
     TOGETHER = "together"
     GROQ = "groq"
-    OLLAMA = "ollama"  # another box on the LAN, not ours to orchestrate
+    # Another box on the LAN. We do not launch, supervise or kill anything on
+    # it -- but we do ask it to fetch a model by name (POST
+    # /api/providers/{id}/pull), which the original annotation here said we
+    # never would. See 00-architecture.md, "serving on a provider", which
+    # reverses that one line deliberately and narrowly.
+    OLLAMA = "ollama"
     CUSTOM = "custom"  # any OpenAI-compatible base_url
 
 

@@ -32,13 +32,14 @@ def store(tmp_path):
 # ==========================================================================
 
 
-def test_the_writable_set_is_exactly_three_fields():
-    """GatewaySettings has 41 fields. Persisting all of them would let a stale
+def test_the_writable_set_is_exactly_four_fields():
+    """GatewaySettings has 42 fields. Persisting all of them would let a stale
     file pin a code default forever."""
     assert MUTABLE_FIELDS == (
         "electricity_rate_usd_per_kwh",
         "local_only",
         "daily_spend_cap_usd",
+        "auto_restart_crashed_deployments",
     )
 
 
@@ -101,6 +102,8 @@ def test_a_zero_rate_round_trips_as_zero_not_as_absent(store):
         ("daily_spend_cap_usd", "5.00"),
         ("local_only", "true"),
         ("local_only", 1),
+        ("auto_restart_crashed_deployments", "true"),
+        ("auto_restart_crashed_deployments", 1),
     ],
 )
 def test_bad_values_are_refused_with_a_reason(store, key, value):
@@ -216,7 +219,15 @@ def test_the_environment_beats_the_default():
 def test_every_field_reports_a_source_even_when_unset():
     """The UI has to tell '0.00 because nobody set it' from '0.00 because
     someone set it to zero'."""
-    resolved = resolve({}, {}, {"electricity_rate_usd_per_kwh": 0.0, "local_only": False})
+    resolved = resolve(
+        {},
+        {},
+        {
+            "electricity_rate_usd_per_kwh": 0.0,
+            "local_only": False,
+            "auto_restart_crashed_deployments": True,
+        },
+    )
     assert set(resolved) == set(MUTABLE_FIELDS)
     assert all(r.source == "default" for r in resolved.values())
     assert resolved["daily_spend_cap_usd"].value is None

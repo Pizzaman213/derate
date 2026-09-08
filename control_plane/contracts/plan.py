@@ -70,7 +70,7 @@ class FitResult:
     usable_per_node: int
     headroom: int
     reason: str
-    limiting_term: str  # "weights"|"kv_cache"|"bandwidth"|"combined"
+    limiting_term: str  # "weights"|"kv_cache"|"bandwidth"|"combined"|"context"
     max_context_that_fits: int | None
     predicted_decode_tps: float | None
     warnings: list[str] = field(default_factory=list)
@@ -100,3 +100,11 @@ class FitRequest:
     # total_params * bytes_per_param (that consumption lands in a later
     # package).
     weight_bytes: int | None = None
+    # The model's own max_position_embeddings (or equivalent), when the
+    # resolver found one. A context past this is not a memory question --
+    # vLLM's own config validation refuses to start regardless of how much
+    # GPU is free -- so the fit gate must refuse it before a launch reaches
+    # the runtime, not report a `max_context_that_fits` the model itself
+    # cannot serve. None when the resolver could not determine one, which
+    # must never be read as "no limit": callers pass it through unclamped.
+    native_window: int | None = None

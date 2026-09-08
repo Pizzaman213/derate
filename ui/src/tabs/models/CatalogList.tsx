@@ -1,6 +1,8 @@
 import { Lamp } from '../../components/Lamp'
 import { Verbatim } from '../../components/Verbatim'
 import { gbytes } from '../../format'
+import { BandHeading, useBandCollapse } from './BandSection'
+import { band, deploymentSignal } from './rows'
 import type { Band, Group, ModelRow } from './rows'
 
 /** The list: fit-banded sections, one row per model.
@@ -21,6 +23,7 @@ export function CatalogList({
   onOpen,
   selectedId,
   compact,
+  expandAll = false,
 }: {
   groups: Group[]
   loading: boolean
@@ -32,7 +35,11 @@ export function CatalogList({
   /** Master-pane width. Four columns do not fit in 360px, so the row stacks:
    *  name on one line, everything describing it on the next. */
   compact?: boolean
+  /** Force every collapsible band open. True while a search is running, so a
+   *  needle that matched inside the collapsed band shows what it matched. */
+  expandAll?: boolean
 }) {
+  const collapse = useBandCollapse(expandAll)
   if (error) {
     return (
       <p
@@ -53,22 +60,23 @@ export function CatalogList({
         <section key={`${g.band}::${g.title}`}>
           {/* The count is on the heading, not implied by the rows: a band that
               does not say its size reads as a short one. */}
-          <div
-            className="sub"
-            style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}
-          >
-            <span>{g.title}</span>
-            <span className="unit">{g.rows.length}</span>
-          </div>
-          {g.rows.map((row) => (
-            <Row
-              key={row.key}
-              row={row}
-              onOpen={onOpen}
-              current={row.model_id === selectedId}
-              compact={compact}
-            />
-          ))}
+          <BandHeading
+            group={g}
+            collapsible={collapse.collapsible(g.band)}
+            open={collapse.isOpen(g.band)}
+            onToggle={() => collapse.toggle(g.band)}
+          />
+          {collapse.isOpen(g.band)
+            ? g.rows.map((row) => (
+                <Row
+                  key={row.key}
+                  row={row}
+                  onOpen={onOpen}
+                  current={row.model_id === selectedId}
+                  compact={compact}
+                />
+              ))
+            : null}
         </section>
       ))}
     </div>
@@ -76,11 +84,18 @@ export function CatalogList({
 }
 
 const LAMP: Record<Band, { signal: 'live' | 'warn' | 'fault' | 'idle'; label: string }> = {
+  // `running` is a placeholder: a serving row reads its lamp off the
+  // deployment's own state below, because "ready" and "degraded" are different
+  // things and one colour for both would hide a failing launch.
+  running: { signal: 'live', label: 'running here' },
   fits: { signal: 'live', label: 'fits' },
   degraded: { signal: 'warn', label: 'loads, but decode is slow' },
   wont: { signal: 'fault', label: 'will not fit' },
   unchecked: { signal: 'idle', label: 'not checked' },
-  plain: { signal: 'idle', label: '' },
+  elsewhere: { signal: 'idle', label: 'runs on a provider, not here' },
+  // Not a verdict either. Nothing here refused this model -- nobody has asked
+  // it to serve it, which is a fact about a choice and not about the hardware.
+  unserved: { signal: 'idle', label: 'not served' },
 }
 
 const COLUMNS = 'minmax(0, 1.2fr) minmax(0, 1.6fr) auto auto'
@@ -97,7 +112,16 @@ function Row({
   current?: boolean
   compact?: boolean
 }) {
-  const lamp = LAMP[bandOf(row)]
+  const b = band(row)
+  const live = row.deployments.find((d) => d.state === 'ready') ?? row.deployments[0]
+  const lamp =
+    b === 'running' && live
+      ? { signal: deploymentSignal(live.state), label: live.state }
+      : row.checking
+        // Not a verdict and not a colour: a checking row has no answer yet, so
+        // the lamp keeps the shape "unchecked" draws and only the word changes.
+        ? { signal: 'idle' as const, label: 'checking' }
+        : LAMP[b]
   const cells = compact ? (
     <>
       <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -135,29 +159,22 @@ function Row({
       </span>
 
       <span className="unit" style={{ whiteSpace: 'nowrap' }}>
-        {row.remote ? 'remote' : row.state ? row.state : 'quantizations ▸'}
+        {live
+          ? live.state
+          : row.checking
+            ? 'checking…'
+            : row.remoteOnly
+              ? 'details ▸'
+              : 'quantizations ▸'}
       </span>
     </>
   )
 
-  // A provider's model is served by somebody else's hardware; there is nothing
-  // here to resolve it against, so it is not a control at all rather than a
-  // control that does nothing.
-  if (row.remote) {
-    return (
-      <div
-        className="deprow"
-        style={{
-          gridTemplateColumns: compact ? COLUMNS_COMPACT : COLUMNS,
-          cursor: 'default',
-        }}
-        aria-disabled
-      >
-        {cells}
-      </div>
-    )
-  }
-
+  // Every row opens, provider-only ones included. There is nothing local to
+  // resolve them against, but "who serves this, at what context, at what
+  // price, and why is there no local verdict" is a real answer and the pane
+  // gives it. A row that looked identical to its neighbours and silently did
+  // nothing when clicked was the worse option.
   return (
     <>
       <button
@@ -194,20 +211,6 @@ function Row({
   )
 }
 
-function bandOf(row: ModelRow): Band {
-  if (row.origin === 'running' || row.origin === 'providers') return 'plain'
-  switch (row.verdict) {
-    case 'fits':
-      return 'fits'
-    case 'fits_degraded':
-      return 'degraded'
-    case 'wont_fit':
-      return 'wont'
-    default:
-      return 'unchecked'
-  }
-}
-
 /** The descriptive half of the row. Assembled here rather than upstream so the
  *  list can still sort and band on the parts. */
 function Facts({ row }: { row: ModelRow }) {
@@ -216,7 +219,18 @@ function Facts({ row }: { row: ModelRow }) {
   if (row.requantized && row.dtype) parts.push(`requantized to ${row.dtype}`)
   if (row.quantHint) parts.push(row.quantHint)
   if (row.pipelineTag) parts.push(row.pipelineTag)
-  if (row.runtime) parts.push(row.runtime)
+  for (const d of row.deployments) if (d.runtime) parts.push(d.runtime)
+  // Who publishes it without serving it, and on what terms. The price is the
+  // whole of what switching it on costs, so it belongs on the row rather than
+  // only behind a click. Null prices print as "not priced", never as $0 -- the
+  // wire keeps "never published a price" and "free" apart on purpose.
+  for (const o of row.offers) {
+    parts.push(
+      o.input_cost_per_mtok != null && o.output_cost_per_mtok != null
+        ? `${o.display_name} · $${o.input_cost_per_mtok.toFixed(2)} / $${o.output_cost_per_mtok.toFixed(2)} per Mtok`
+        : `${o.display_name} · not priced`,
+    )
+  }
   if (row.downloads != null) parts.push(`${row.downloads.toLocaleString()} downloads`)
   if (row.likes != null && row.likes > 0) parts.push(`${row.likes.toLocaleString()} likes`)
 
@@ -242,9 +256,7 @@ function Facts({ row }: { row: ModelRow }) {
               is to show what is actually there. */}
           <span className="pill">
             on {row.cachedOn.length === 1 ? row.cachedOn[0] : `${row.cachedOn.length} nodes`}
-            {row.origin !== 'ondevice' && row.bytesOnDisk != null
-              ? ` · ${gbytes(row.bytesOnDisk)} GiB`
-              : ''}
+            {row.bytesOnDisk != null ? ` · ${gbytes(row.bytesOnDisk)} GiB` : ''}
           </span>
         </>
       ) : null}
@@ -256,11 +268,8 @@ function Facts({ row }: { row: ModelRow }) {
 function Numbers({ row }: { row: ModelRow }) {
   const bits: string[] = []
   if (row.total_params != null) bits.push(`${(row.total_params / 1e9).toFixed(1)}B`)
-  // The badge beside it already carries the on-disk figure for every other
-  // source; here the row IS the cache entry, so this is the only place it goes.
-  if (row.origin === 'ondevice' && row.bytesOnDisk != null) {
-    bits.push(`${gbytes(row.bytesOnDisk)} GiB`)
-  }
+  // The on-disk figure lives on the "on <node>" pill, which every row with
+  // cached weights now carries -- one place, not two.
   if (row.predicted_decode_tps != null) bits.push(`${row.predicted_decode_tps.toFixed(0)} tok/s`)
   return <>{bits.join(' · ')}</>
 }

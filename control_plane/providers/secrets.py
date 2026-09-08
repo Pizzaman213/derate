@@ -21,119 +21,33 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import stat
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-from .config import REDACTED, SECRETS_FILE, data_dir
+from .config import SECRETS_FILE, data_dir
+
+from control_plane import fsutil
 
 log = logging.getLogger(__name__)
 
-# Token shapes common enough to be worth catching even when we never resolved
-# them ourselves. Conservative: a known vendor prefix plus a long opaque tail.
-_KEY_PATTERNS = [
-    re.compile(r"\bsk-or-v1-[A-Za-z0-9_\-]{16,}"),
-    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{16,}"),
-    re.compile(r"\bsk-proj-[A-Za-z0-9_\-]{16,}"),
-    re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"\bgsk_[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"\bhf_[A-Za-z0-9]{20,}"),
-    re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{20,}"),
-    re.compile(r"(?i)\b(api[-_]?key|access[-_]?token)\s*[=:]\s*[\"']?[A-Za-z0-9._\-]{20,}"),
-]
-
-# Minimum length before we bother scrubbing a literal. Below this a "secret"
-# is more likely to be a substring of ordinary prose than a credential.
-_MIN_SCRUB_LEN = 8
-
-
-class SecretsError(Exception):
-    """Something is wrong with the secret store itself, not with a lookup."""
-
-
-def looks_like_secret(value: str) -> bool:
-    """True when a string looks like key material rather than a reference.
-
-    Used to reject a provider spec where somebody pasted the key into
-    ``api_key_ref`` or into ``base_url``. That mistake would otherwise put a
-    live key into every listing, since a reference is safe to display.
-    """
-    if not value:
-        return False
-    if any(p.search(value) for p in _KEY_PATTERNS):
-        return True
-    # An env var name is short, uppercase-ish, and has no long random run.
-    # Anything with 32+ contiguous mixed-case-and-digit characters is a key.
-    return bool(re.search(r"[A-Za-z0-9_\-]{32,}", value) and re.search(r"\d", value)
-                and re.search(r"[a-z]", value) and re.search(r"[A-Z0-9]", value))
-
-
-class Redactor:
-    """Scrubs known and probable key material out of text.
-
-    One instance is shared by the store, the service, and the log filter, so a
-    value resolved once is scrubbed everywhere afterwards.
-    """
-
-    def __init__(self) -> None:
-        self._values: set[str] = set()
-
-    def remember(self, value: str | None) -> None:
-        if value and len(value) >= _MIN_SCRUB_LEN:
-            self._values.add(value)
-
-    def scrub(self, text: str) -> str:
-        if not text:
-            return text
-        # Longest first, so an overlapping prefix cannot leave a tail behind.
-        for value in sorted(self._values, key=len, reverse=True):
-            if value in text:
-                text = text.replace(value, REDACTED)
-        for pattern in _KEY_PATTERNS:
-            text = pattern.sub(REDACTED, text)
-        return text
-
-    def scrub_bytes(self, raw: bytes) -> bytes:
-        return self.scrub(raw.decode("utf-8", "replace")).encode("utf-8")
-
-    def contains_secret(self, text: str) -> bool:
-        """True if any *remembered* value appears verbatim in the text.
-
-        Deliberately narrower than :meth:`scrub`: this answers "did we leak a
-        key we hold", which is the question the assertion below wants.
-        """
-        return any(v in text for v in self._values)
-
-    def assert_clean(self, text: str, where: str) -> None:
-        """Raise rather than emit key material. Used on every serialization path."""
-        if self.contains_secret(text):
-            raise SecretsError(f"refusing to emit key material in {where}")
-
-
-class SecretRedactingFilter(logging.Filter):
-    """Attach to any logger that could touch provider material.
-
-    We do not log request bodies at all, but a stray exception message is
-    exactly the sort of thing that carries a key into a log file.
-    """
-
-    def __init__(self, redactor: Redactor) -> None:
-        super().__init__()
-        self._redactor = redactor
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            message = record.getMessage()
-        except Exception:  # pragma: no cover - a broken record is not our problem
-            return True
-        scrubbed = self._redactor.scrub(message)
-        if scrubbed != message:
-            record.msg = scrubbed
-            record.args = ()
-        return True
+# -- redaction ---------------------------------------------------------------
+#
+# Moved to ``control_plane/redaction.py`` and re-exported here, unchanged.
+# ``logfiles.py`` needs the scrubber on every node, and a worker importing this
+# package would pull httpx and the whole provider stack that ``node.py``'s
+# docstring promises the worker path never touches. Every existing import site
+# -- ``from .secrets import Redactor``, ``from control_plane.providers import
+# looks_like_secret`` -- still resolves through these names.
+from control_plane.redaction import (  # noqa: F401
+    REDACTED,
+    Redactor,
+    SecretRedactingFilter,
+    SecretsError,
+    has_known_key_shape,
+    looks_like_secret,
+)
 
 
 class SecretStore:
@@ -199,6 +113,22 @@ class SecretStore:
     def has(self, ref: str) -> bool:
         return self.get(ref) is not None
 
+    def env_ref(self, ref: str) -> str | None:
+        """The *environment's* value for a reference, or None.
+
+        Exposed separately from :meth:`get` because the environment takes
+        precedence over the file. A caller about to :meth:`put` needs to know
+        whether the name it is writing to is already shadowed -- after the
+        write, ``get`` returns the environment's value and the question can no
+        longer be asked.
+        """
+        if not ref:
+            return None
+        value = self._env.get(ref)
+        if value is not None:
+            self.redactor.remember(value)
+        return value
+
     def get(self, ref: str) -> str | None:
         """Resolve a reference, or None. Never logs, never raises on a miss."""
         if not ref:
@@ -219,7 +149,7 @@ class SecretStore:
         current[ref] = value
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".secrets-")
         try:
-            os.fchmod(fd, 0o600)
+            fsutil.harden_fd(fd, self.path)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(current, fh, indent=2, sort_keys=True)
             os.replace(tmp, self.path)
@@ -227,7 +157,7 @@ class SecretStore:
             with contextlib_suppress():
                 os.unlink(tmp)
             raise
-        os.chmod(self.path, 0o600)
+        fsutil.harden_path(self.path)
         self.redactor.remember(value)
         self._cache_mtime = None
         log.info("stored secret under reference %s", ref)  # the name, never the value
@@ -238,11 +168,11 @@ class SecretStore:
             return False
         del current[ref]
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".secrets-")
-        os.fchmod(fd, 0o600)
+        fsutil.harden_fd(fd, self.path)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(current, fh, indent=2, sort_keys=True)
         os.replace(tmp, self.path)
-        os.chmod(self.path, 0o600)
+        fsutil.harden_path(self.path)
         self._cache_mtime = None
         return True
 

@@ -5,10 +5,12 @@
  *  pictures. Reimplemented from that behaviour; their implementation is
  *  AGPL-3.0-only and is not the source of any line here.
  *
- *  `cdn-avatars.huggingface.co` answers `access-control-allow-origin: *`, so a
- *  canvas read is not tainted and this needs no proxy. When it is tainted
- *  anyway -- a mirror, an offline cluster, a cache without the header -- the
- *  read throws, this returns null, and the card keeps its hashed palette
+ *  The avatar is served by the coordinator itself now (`owner.ts`), so the
+ *  canvas read is same-origin and cannot be tainted at all -- it used to
+ *  depend on `cdn-avatars.huggingface.co` sending
+ *  `access-control-allow-origin: *`, which was true but was somebody else's
+ *  header to change. The guard stays anyway: when a read throws, or the image
+ *  never arrives, this returns null and the card keeps its hashed palette
  *  colour. Never a blank card and never a thrown error. */
 
 const cache = new Map<string, string | null>()

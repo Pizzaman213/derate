@@ -42,7 +42,7 @@ from .config import (
     WRITE_TIMEOUT_S,
     data_dir,
 )
-from .discovery import parse_models, recognized_envelope
+from .discovery import parse_endpoints, parse_models, recognized_envelope
 from .errors import (
     PullRefusedError,
     PullUnsupportedError,
@@ -55,7 +55,13 @@ from .errors import (
 )
 from .kinds import KindSpec, auth_headers, join_url, native_base, spec_for
 from .runtime import ProviderRuntime, jittered_delay, parse_retry_after
-from .secrets import Redactor, SecretRedactingFilter, SecretStore, looks_like_secret
+from .secrets import (
+    Redactor,
+    SecretRedactingFilter,
+    SecretStore,
+    has_known_key_shape,
+    looks_like_secret,
+)
 from .serialization import assert_no_key_material, provider_public_dict
 from .store import ProviderStore
 from .usage import UsageSniffer
@@ -77,7 +83,61 @@ def _screen_free_text(value: str, field: str) -> None:
             "REFERENCE (an env var or secrets.json name), never the key"
         )
 
+def _screen_passthrough(value: str, field: str) -> None:
+    """Refuse key-shaped material in a field that is forwarded, not stored.
+
+    Narrower than :func:`_screen_free_text` on purpose. A model name is not a
+    credential slot: it is handed to the upstream and never persisted or
+    echoed in a listing, so the entropy fallback buys nothing here and costs
+    every GGUF repository whose name happens to carry a 32-character run --
+    all 96 variants of Mistral-Small-24B-Instruct-2501, none of Qwen2.5's.
+    A pasted key is still caught by its vendor prefix.
+    """
+    if has_known_key_shape(value):
+        raise ValueError(
+            f"{field} looks like it contains key material; it is sent on to "
+            "the provider, so pass the model's name and keep credentials in "
+            "the provider's api_key_ref"
+        )
+
+
 _ID_SAFE = re.compile(r"[^a-z0-9._-]+")
+
+#: The shape of a reference derate mints for itself when a key is pasted rather
+#: than named. The prefix marks the secrets.json entry as ours, which is the
+#: only reason removing a provider can safely delete it: an operator's own name
+#: may be shared with something else and is never touched.
+MINTED_REF_PREFIX = "DERATE_"
+MINTED_REF_SUFFIX = "_API_KEY"
+#: The UI reads a reference as a *name* only up to this length and renders
+#: anything longer as key material (``ui/src/api/redact.ts``). A minted name
+#: that overflowed would display as ``***`` -- derate's own reference, hidden
+#: from the operator as though it had leaked.
+_MAX_REF_LEN = 64
+_REF_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
+
+#: The refusal for a key pasted into the field that takes a name. One string
+#: rather than three copies kept word-for-word by hand: add, update and the
+#: day-0 stub all screen the same field for the same mistake, and a refusal
+#: that reads differently in each reads as three different rules.
+KEY_IN_REF_FIELD = (
+    "api_key_ref must be the NAME of an environment variable or "
+    "secrets.json key, not the key itself -- send the key as "
+    '"api_key" and it will be stored in secrets.json under a '
+    "reference for you"
+)
+
+
+def minted_ref(provider_id: str) -> str:
+    """The secrets.json name a pasted key is stored under for this provider.
+
+    Uppercase throughout, which is also what keeps it clear of
+    :func:`looks_like_secret`: that predicate wants a long run containing both
+    cases and a digit, and a name shaped like this has no lowercase at all.
+    """
+    stem = _REF_UNSAFE.sub("_", provider_id).strip("_").upper() or "PROVIDER"
+    budget = _MAX_REF_LEN - len(MINTED_REF_PREFIX) - len(MINTED_REF_SUFFIX)
+    return f"{MINTED_REF_PREFIX}{stem[:budget]}{MINTED_REF_SUFFIX}"
 
 #: Endpoints whose request body has a `stream` field. Everything else -- today
 #: that means /v1/audio/speech and /v1/audio/transcriptions -- must not have one
@@ -229,9 +289,23 @@ class ProviderService:
         if self._entries:
             log.info("loaded %d provider(s) from disk", len(self._entries))
 
-    @staticmethod
-    def _sync(entry: _Entry) -> _Entry:
-        """Mirror live runtime state onto the contract record before it is read."""
+    def _sync(self, entry: _Entry) -> _Entry:
+        """Mirror live runtime state onto the contract record before it is read.
+
+        This is also where a failed provider goes half-open. `healthy` is what
+        routing selects on (`gateway/targets.py`), so leaving it False forever
+        made the block prevent its own cure: an unhealthy provider was never
+        offered a request, and a successful request was the only thing that
+        could mark it healthy again. One transient timeout took a box off the
+        air for six hours -- until the next model-list refresh -- while it
+        answered pings in 11 ms.
+
+        Once the backoff expires we stop *asserting* it is down and let one
+        request find out, exactly as the gateway's circuit breaker does at
+        half-open. `last_error` is deliberately left in place, so a screen can
+        still say what went wrong while the probe is out.
+        """
+        entry.runtime.half_open(self._now())
         entry.provider.healthy = entry.runtime.healthy
         entry.provider.last_error = entry.runtime.last_error
         entry.provider.last_refreshed = entry.runtime.last_refreshed
@@ -277,6 +351,27 @@ class ProviderService:
         )
         return False
 
+    def _store_key(self, ref: str, value: str) -> None:
+        """Write a pasted key to secrets.json under ``ref``.
+
+        The one thing this has to get right beyond the write itself:
+        :meth:`SecretStore.get` reads the environment *before* the file, so an
+        environment variable sharing this name would silently win over what was
+        just stored and the provider would authenticate with a key nobody here
+        chose. Check first and refuse, naming the variable and never its value.
+        Checking before the write rather than after also means the refused call
+        leaves no inert entry in the file.
+        """
+        shadow = self.secrets.env_ref(ref)
+        if shadow is not None and shadow != value:
+            raise ValueError(
+                f"an environment variable named {ref} already resolves to a "
+                "different value and takes precedence over secrets.json, so "
+                "the key would be stored and then ignored; choose another "
+                "reference name or unset it"
+            )
+        self.secrets.put(ref, value)
+
     def resolve_key(self, provider_id: str) -> str:
         """Request time only. The one place a value is ever produced."""
         entry = self._entry(provider_id)
@@ -286,6 +381,35 @@ class ProviderService:
         if value is None:
             raise MissingKeyError(provider_id, entry.provider.api_key_ref)
         return value
+
+    def key_status(self, provider_id: str) -> dict:
+        """Whether this provider's credential resolves, and from where.
+
+        The honest answer to "is the key set?" in a product that has no reveal
+        control and is not getting one. A reference is a name, and a name plus
+        which of the two places answered to it is the whole of what can be said
+        without producing key material: no value, no length, no prefix.
+
+        The provenance is worth naming rather than collapsing into a boolean,
+        because the two are not equally ours. A key in secrets.json is one this
+        coordinator wrote and can replace. A key in the environment belongs to
+        whatever started the process: pasting a replacement does not overwrite
+        it -- :meth:`update` mints a reference and moves the provider onto it,
+        and the variable stops being what authenticates. That is worth knowing
+        before the paste, not after.
+        """
+        entry = self._entry(provider_id)
+        ref = entry.provider.api_key_ref
+        if not entry.spec.requires_key and not ref:
+            return {"key_state": "not_needed", "key_source": None}
+        if not ref:
+            return {"key_state": "missing", "key_source": None}
+        # Environment first, because that is the order resolution uses.
+        if self.secrets.env_ref(ref) is not None:
+            return {"key_state": "set", "key_source": "environment"}
+        if self.secrets.has(ref):
+            return {"key_state": "set", "key_source": "secrets.json"}
+        return {"key_state": "missing", "key_source": None}
 
     # -- registry ----------------------------------------------------------
 
@@ -339,16 +463,20 @@ class ProviderService:
                 "environment variable or secrets.json and reference it by name"
             )
 
+        # Read a pasted key before anything below can raise. The route handler
+        # logs the exception and formats its text into the response, and the
+        # redactor can only scrub a value it already holds.
+        api_key = str(spec.get("api_key") or "").strip()
+        self.redactor.remember(api_key)
+
         api_key_ref = str(spec.get("api_key_ref") or "").strip()
         if looks_like_secret(api_key_ref):
             # The whole design rests on this field being a name. A key here
-            # would be displayed everywhere a reference safely can be.
-            raise ValueError(
-                "api_key_ref must be the NAME of an environment variable or "
-                "secrets.json key, not the key itself"
-            )
-        if kind_spec.requires_key and not api_key_ref:
-            raise ValueError(f"{kind.value} needs an api_key_ref")
+            # would be displayed everywhere a reference safely can be. There
+            # is somewhere to put the key now, so the refusal says where.
+            raise ValueError(KEY_IN_REF_FIELD)
+        if kind_spec.requires_key and not api_key_ref and not api_key:
+            raise ValueError(f"{kind.value} needs an api_key or an api_key_ref")
 
         provider_id = str(spec.get("provider_id") or "").strip() or self._mint_id(kind)
         if provider_id in self._entries:
@@ -364,6 +492,12 @@ class ProviderService:
         for alias_key, alias_value in aliases.items():
             _screen_free_text(alias_key, "aliases key")
             _screen_free_text(alias_value, f"aliases[{alias_key!r}]")
+        # Last, so a spec refused by any screen above leaves no secret behind:
+        # an explicit reference names where to put the key, otherwise mint one.
+        if api_key:
+            api_key_ref = api_key_ref or minted_ref(provider_id)
+            self._store_key(api_key_ref, api_key)
+
         budget = spec.get("daily_budget_usd")
         provider = Provider(
             provider_id=provider_id,
@@ -382,6 +516,11 @@ class ProviderService:
             provider_id=provider_id,
             daily_budget_usd=None if budget is None else float(budget),
             aliases=aliases,
+            # A new provider serves nothing until somebody says otherwise.
+            # Deliberately not settable from the spec: the catalogue is empty
+            # until the initial refresh returns, so there would be nothing to
+            # check a requested id against and no way to refuse a wrong one.
+            enabled_models=frozenset(),
         )
         entry = _Entry(provider=provider, runtime=runtime, spec=kind_spec)
         self._entries[provider_id] = entry
@@ -396,6 +535,7 @@ class ProviderService:
         model: str,
         *,
         on_size: Callable[[int], None] | None = None,
+        on_progress: Callable[[dict], None] | None = None,
     ) -> dict:
         """Tell a self-hosted provider to fetch *model*, then re-read its catalogue.
 
@@ -405,6 +545,18 @@ class ProviderService:
         the weights are too big for the machine. ``on_size`` is called once with
         that total; raising from it aborts the transfer, which is how the
         caller's memory gate refuses without first filling somebody's SD card.
+
+        ``on_progress`` is called with every frame, and is how a caller watches
+        a transfer rather than only judging it. The frames carry ``completed``
+        alongside ``total`` the whole way down, so the progress was always
+        arriving here -- until this existed the loop read it and dropped it on
+        the floor, and a pull was a single number reported once followed by
+        minutes of silence. It is deliberately handed the raw frame: ``status``
+        is the upstream's own sentence ("pulling manifest", "verifying sha256
+        digest") and paraphrasing it here would put a second, worse vocabulary
+        in front of the one the server actually used. Unlike ``on_size`` it is
+        not a gate -- it must not raise, and anything it raises will abort the
+        transfer exactly as ``on_size`` does.
 
         The native API, not the OpenAI-compatible one -- pulling is not in that
         spec. ``pull_path`` names it per kind so nothing here assumes Ollama.
@@ -418,7 +570,7 @@ class ProviderService:
         model = model.strip()
         if not model:
             raise ValueError("pull needs a model name")
-        _screen_free_text(model, "model")
+        _screen_passthrough(model, "model")
 
         url = join_url(native_base(entry.provider.base_url), entry.spec.pull_path)
         client = self._client()
@@ -453,6 +605,11 @@ class ProviderService:
                         on_size(int(total))
                 if frame.get("digest"):
                     digest = str(frame["digest"])
+                # After the gate, never before it: a refused pull downloaded
+                # nothing, and reporting a frame from it would put a bar on
+                # screen for a transfer that was aborted at its first byte.
+                if on_progress is not None:
+                    on_progress(frame)
 
         # The catalogue is what makes the model routable; without this the pull
         # succeeds and nothing can address it until the refresh loop comes round.
@@ -491,7 +648,25 @@ class ProviderService:
         if "api_key_ref" in patch:
             ref = str(patch["api_key_ref"]).strip()
             if looks_like_secret(ref):
-                raise ValueError("api_key_ref must be a reference, not a key")
+                # Word for word what the add path says. The same mistake got a
+                # shorter, different sentence here, which read as a different
+                # rule rather than the same one.
+                raise ValueError(KEY_IN_REF_FIELD)
+            entry.provider.api_key_ref = ref
+        if "api_key" in patch:
+            # Rotating a key in place. Reuse the reference the provider already
+            # has when derate minted it, so everything pointing at that name
+            # keeps working; mint one when the provider was configured against
+            # an operator's own reference, which is not ours to overwrite. A
+            # reference named in this same patch wins over both.
+            api_key = str(patch["api_key"] or "").strip()
+            self.redactor.remember(api_key)
+            if not api_key:
+                raise ValueError("api_key must not be empty")
+            ref = entry.provider.api_key_ref
+            if "api_key_ref" not in patch and ref != minted_ref(provider_id):
+                ref = minted_ref(provider_id)
+            self._store_key(ref, api_key)
             entry.provider.api_key_ref = ref
         if "aliases" in patch:
             aliases = {str(k): str(v) for k, v in (patch["aliases"] or {}).items()}
@@ -500,14 +675,28 @@ class ProviderService:
                 _screen_free_text(alias_value, f"aliases[{alias_key!r}]")
             entry.runtime.aliases = aliases
             self._apply_aliases(entry)
-        if entry.provider.enabled:
+        if "enabled_models" in patch:
+            entry.runtime.enabled_models = self._screen_allowlist(entry, patch["enabled_models"])
+        if "backend_pins" in patch:
+            entry.runtime.backend_pins = self._screen_backend_pins(entry, patch["backend_pins"])
+        # auto_disabled too, not just enabled: a provider switched off *because*
+        # its reference did not resolve is exactly the one a new key should
+        # bring back, and it is disabled by definition. An operator who turned
+        # it off by hand stays off.
+        if entry.provider.enabled or entry.auto_disabled:
             self._check_key(entry)
         self._persist()
         return self.get(provider_id)
 
     def remove(self, provider_id: str) -> None:
-        self._entry(provider_id)
+        entry = self._entry(provider_id)
+        ref = entry.provider.api_key_ref
         del self._entries[provider_id]
+        # Only a reference derate minted for this provider. An operator's own
+        # name may be an environment variable, or shared with something else,
+        # and deleting it is not what removing a provider asked for.
+        if ref and ref == minted_ref(provider_id):
+            self.secrets.delete(ref)
         self._persist()
         log.info("removed provider %s", provider_id)
 
@@ -516,6 +705,108 @@ class ProviderService:
             model.served_name = entry.runtime.aliases.get(model.upstream_id, model.upstream_id)
         entry.provider.models.sort(key=lambda m: m.served_name)
         entry.reindex()
+
+    # -- the allowlist -----------------------------------------------------
+
+    @staticmethod
+    def _screen_allowlist(entry: _Entry, value: object) -> frozenset[str]:
+        """Validate a requested allowlist against what the provider publishes.
+
+        Membership in the live catalogue is the whole check, and it is a
+        stronger guard than the key screens the other free-text fields get: an
+        id has to have been published by the upstream before it can be stored,
+        and no API key ever will be. That matters because the obvious screen is
+        the wrong one here -- ``_screen_free_text``'s entropy fallback is what
+        refused all 96 variants of Mistral-Small-24B-Instruct-2501, and a
+        model id is exactly the shape it gets wrong.
+
+        Refusing names the ids rather than the count, because the fix is to
+        stop asking for that model and you cannot do that without knowing which.
+        """
+        wanted = {str(item) for item in (value or [])}
+        unknown = sorted(wanted - {m.upstream_id for m in entry.provider.models})
+        if unknown:
+            shown = ", ".join(unknown[:3])
+            more = f" (and {len(unknown) - 3} more)" if len(unknown) > 3 else ""
+            raise ValueError(
+                f"{entry.provider.provider_id} does not publish {shown}{more}; "
+                "enable only models from its own catalogue"
+            )
+        return frozenset(wanted)
+
+    @staticmethod
+    def _screen_backend_pins(entry: _Entry, value: object) -> dict[str, str]:
+        """Merge a requested backend-pin update into what is already pinned.
+
+        One model at a time, unlike ``aliases`` and ``enabled_models``: the
+        control that writes this is per-model, on the Models tab, and must
+        not have to know every other model's pin on the same provider just to
+        avoid erasing it by omission. An empty string clears that model's pin
+        -- "" can never be a real backend tag -- rather than needing a
+        separate delete form.
+
+        Membership is checked against the model list, the same guard
+        ``_screen_allowlist`` uses and for the same reason; the backend *tag*
+        itself is not checked against a live endpoints call, the same
+        tradeoff ``enabled_models`` makes against pricing already accepted as
+        a forecast rather than a fact.
+        """
+        if not entry.spec.supports_backend_routing:
+            raise ValueError(
+                f"{entry.provider.provider_id} does not aggregate backend hosts per model; "
+                "backend_pins does not apply"
+            )
+        updates = {str(k): str(v) for k, v in (value or {}).items()}
+        unknown = sorted(set(updates) - {m.upstream_id for m in entry.provider.models})
+        if unknown:
+            shown = ", ".join(unknown[:3])
+            more = f" (and {len(unknown) - 3} more)" if len(unknown) > 3 else ""
+            raise ValueError(
+                f"{entry.provider.provider_id} does not publish {shown}{more}; "
+                "pin a backend only for a model from its own catalogue"
+            )
+        pins = dict(entry.runtime.backend_pins)
+        for upstream_id, tag in updates.items():
+            if tag:
+                pins[upstream_id] = tag
+            else:
+                pins.pop(upstream_id, None)
+        return pins
+
+    def servable(self) -> list[Provider]:
+        """Every provider, carrying only the models it is allowed to serve.
+
+        The routing- and UI-facing view, and the one seam that makes the
+        allowlist real: the gateway builds its target index from this, and
+        ``GET /api/providers`` renders it, so a model switched off here leaves
+        ``/v1/models``, the chat picker, the models list and the cluster graph
+        together rather than one at a time.
+
+        ``list()`` deliberately still returns the whole catalogue -- something
+        has to, or nothing could offer the operator a model to switch on.
+        """
+        out: list[Provider] = []
+        for entry in self._sorted():
+            provider = copy.deepcopy(self._sync(entry).provider)
+            provider.models = [m for m in provider.models if entry.runtime.serves(m.upstream_id)]
+            out.append(provider)
+        return out
+
+    def catalogue(self, provider_id: str) -> list[dict]:
+        """Everything this provider publishes, each row saying whether it is on.
+
+        ``GET /api/providers/{id}/models``. The one surface that is not
+        filtered, because it is the one the operator chooses from.
+        """
+        from .serialization import model_public_dict
+
+        entry = self._entry(provider_id)
+        payload = [
+            {**model_public_dict(m), "enabled": entry.runtime.serves(m.upstream_id)}
+            for m in entry.provider.models
+        ]
+        assert_no_key_material(payload, self.redactor, "GET /api/providers/{id}/models")
+        return payload
 
     # -- discovery ---------------------------------------------------------
 
@@ -635,15 +926,74 @@ class ProviderService:
             except ProviderError as exc:
                 log.warning("refresh of %s failed: %s", provider_id, exc)
 
+    # -- backend routing -----------------------------------------------------
+
+    async def list_backends_async(
+        self,
+        provider_id: str,
+        upstream_id: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> list[dict]:
+        """This model's backend hosts, as OpenRouter's own endpoints call sees them.
+
+        Live, not cached: the point of asking is to see what is available
+        right now to pin against, unlike the model list itself, which is
+        served from the last refresh. Only a kind that aggregates several
+        backend hosts per model supports this at all.
+        """
+        entry = self._entry(provider_id)
+        if not entry.spec.supports_backend_routing:
+            raise AdapterUnsupportedError(
+                f"provider {provider_id!r} does not aggregate backend hosts per model"
+            )
+        author, _, slug = upstream_id.partition("/")
+        if not slug:
+            raise UpstreamError(provider_id, 400, f"{upstream_id!r} is not an author/slug id")
+        key = self.resolve_key(provider_id)
+        headers = auth_headers(entry.spec, key)
+        headers["Accept"] = "application/json"
+        client = client or self._client()
+        url = join_url(entry.provider.base_url, f"models/{author}/{slug}/endpoints")
+        try:
+            response = await client.get(url, headers=headers, timeout=DISCOVERY_TIMEOUT_S)
+        except httpx.HTTPError as exc:
+            raise UpstreamError(
+                provider_id, 502, f"could not reach {url}: {type(exc).__name__}"
+            ) from None
+        if response.status_code >= 400:
+            message = self._error_message(response.status_code, response.content)
+            raise UpstreamError(provider_id, response.status_code, message)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise UpstreamError(provider_id, 502, "endpoints list was not JSON") from None
+        rows = parse_endpoints(payload)
+        pin = entry.runtime.backend_pins.get(upstream_id)
+        for row in rows:
+            row["pinned"] = row["tag"] == pin
+        return rows
+
+    def list_backends(self, provider_id: str, upstream_id: str) -> list[dict]:
+        """Synchronous wrapper, for a caller with no event loop."""
+        return self._run_sync(lambda: self.list_backends_async(provider_id, upstream_id))
+
     # -- models ------------------------------------------------------------
 
     def models(self) -> list[tuple[str, ProviderModel]]:
-        """(provider_id, model) for every enabled provider, in priority order."""
+        """(provider_id, model) for every enabled provider, in priority order.
+
+        Allowlisted, on the same reasoning as the ``enabled`` check beside it:
+        this answers "what could a request be routed to", and a model nobody
+        switched on is not one of them.
+        """
         out: list[tuple[str, ProviderModel]] = []
         for entry in self._sorted():
             if not entry.provider.enabled:
                 continue
             for model in entry.provider.models:
+                if not entry.runtime.serves(model.upstream_id):
+                    continue
                 out.append((entry.provider.provider_id, copy.deepcopy(model)))
         return out
 
@@ -733,6 +1083,8 @@ class ProviderService:
                 continue
             admitting = entry.runtime.admitting(now)
             for model in entry.provider.models:
+                if not entry.runtime.serves(model.upstream_id):
+                    continue
                 targets.append(
                     RouteTarget(
                         target_id=self.target_id(entry.provider.provider_id, model.upstream_id),
@@ -760,6 +1112,8 @@ class ProviderService:
             if not entry.provider.enabled:
                 continue
             for model in entry.provider.models:
+                if not entry.runtime.serves(model.upstream_id):
+                    continue
                 target = index.get(self.target_id(entry.provider.provider_id, model.upstream_id))
                 if target is not None:
                     by_name.setdefault(model.served_name, []).append(target)
@@ -779,6 +1133,14 @@ class ProviderService:
         now = self._now()
         if not entry.provider.enabled:
             raise ProviderNotAdmittingError(provider_id, "provider is disabled")
+        # The routing index that chose this target is cached for its own TTL,
+        # so a request can arrive for a model the operator switched off a
+        # moment ago. Refusing here costs a dict lookup and is the difference
+        # between a stale index and a billed call to a model nobody enabled.
+        if not entry.runtime.serves(upstream_id):
+            raise ProviderNotAdmittingError(
+                provider_id, f"{upstream_id} is not enabled on this provider"
+            )
         # Rate limit and budget are hard stops. Merely unhealthy is not: a
         # provider recovers on the next request that succeeds.
         if entry.runtime.rate_limited(now):
@@ -792,7 +1154,6 @@ class ProviderService:
                 provider_id,
                 f"daily budget of ${entry.runtime.daily_budget_usd:.2f} reached",
             )
-
         key = self.resolve_key(provider_id)
         headers = auth_headers(entry.spec, key)
         headers["Content-Type"] = "application/json"
@@ -800,6 +1161,14 @@ class ProviderService:
 
         payload = dict(body)
         payload["model"] = upstream_id
+        if entry.spec.supports_backend_routing and "provider" not in payload:
+            pin = entry.runtime.backend_pins.get(upstream_id)
+            if pin:
+                # Constrain OpenRouter to exactly the backend host the
+                # operator chose. A caller that already sent its own
+                # `provider` field is left alone -- see the `stream_options`
+                # guard just below for the same deference.
+                payload["provider"] = {"only": [pin]}
         # Only where the endpoint actually has a `stream` field. /v1/audio/speech
         # does not, and a strict upstream answers 400 for an unknown one -- so
         # injecting it unconditionally would break every audio request that ever
@@ -807,7 +1176,14 @@ class ProviderService:
         if _accepts_stream(endpoint):
             payload["stream"] = bool(stream)
         model = entry.models_by_upstream.get(upstream_id)
-        priced = model is not None and self.blended_cost(model) is not None
+        # Either way of pricing counts. A kind that meters its own cost reports
+        # one for every model it serves, including the ones whose published
+        # `pricing` reads -1 for "varies" -- gating on the rate card alone would
+        # decline to ask for usage on exactly the models we cannot price without
+        # it.
+        priced = entry.spec.meters_cost or (
+            model is not None and self.blended_cost(model) is not None
+        )
         if (
             stream
             and priced
@@ -836,8 +1212,8 @@ class ProviderService:
         The gateway uses this when it wants to mirror the upstream's status
         code and content type. :meth:`forward` is the plain byte-stream form.
         """
-        entry, url, headers, payload = self._prepare(
-            provider_id, upstream_id, body, stream, endpoint
+        entry, url, headers, payload = await asyncio.to_thread(
+            self._prepare, provider_id, upstream_id, body, stream, endpoint
         )
         client = self._client()
         timeout = httpx.Timeout(
@@ -848,7 +1224,7 @@ class ProviderService:
         )
         runtime = entry.runtime
         runtime.outstanding[upstream_id] += 1
-        sniffer = UsageSniffer(stream=stream)
+        sniffer = UsageSniffer(stream=stream, metered=entry.spec.meters_cost)
         try:
             attempt = 0
             while True:
@@ -1002,6 +1378,7 @@ class ProviderService:
             usage.output_tokens,
             model.input_cost_per_mtok if model else None,
             model.output_cost_per_mtok if model else None,
+            metered_cost_usd=usage.cost_usd,
         )
         entry.runtime.prune_spend(self._now())
         if cost:

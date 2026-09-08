@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
+from control_plane.humanize import binary_bytes
 from control_plane.contracts import (
     BYTES_PER_PARAM,
     COMM_BUFFER_BYTES,
@@ -51,6 +52,8 @@ from .kv import (
 )
 
 GIB = 1024**3
+MIB = 1024**2
+KIB = 1024
 
 
 # --------------------------------------------------------------------------
@@ -58,8 +61,34 @@ GIB = 1024**3
 # --------------------------------------------------------------------------
 
 
-def _gib(n: float) -> str:
-    return f"{n / GIB:.1f} GiB"
+#: A byte count in the largest binary unit that does not round it away. Lives
+#: in ``control_plane/humanize.py`` because the gateway's download strings need
+#: the same ladder and had grown a one-line divide that did not have it.
+_gib = binary_bytes
+
+
+def _gib_vs(a: float, b: float) -> tuple[str, str]:
+    """Two byte counts that will be printed side by side, at a precision that
+    tells them apart.
+
+    "15.6 GiB per rank ... against 15.6 GiB left" is a true statement and an
+    unreadable one: the two differ by less than the rounding, so the sentence
+    appears to say a thing does not fit inside itself. Widen the precision until
+    the strings differ, and only then give up and print both the same -- which
+    at that point means they really are the same number.
+    """
+    for places in (1, 2):
+        left = f"{a / GIB:.{places}f} GiB"
+        right = f"{b / GIB:.{places}f} GiB"
+        if left != right:
+            return left, right
+    # Closer than a hundredth of a GiB. Two figures that far apart are equal for
+    # every purpose a reader has, and chasing the difference into more decimals
+    # or smaller units ("15936 MiB against 15936 MiB") trades a readable number
+    # for a wider one that still looks identical. Print them plainly and let the
+    # overage clause carry the difference -- it is exact, and it is the sentence
+    # that says what to change.
+    return _gib(a), _gib(b)
 
 
 def _options(fixes: list[str], *, capitalize: bool = False) -> str:
@@ -509,6 +538,42 @@ class FitCalculator:
                 budget_basis=basis,
             )
 
+        # Memory has nothing against this request, but a context past the
+        # model's own trained window is not a memory question at all -- the
+        # runtime's own config validation refuses to start regardless of how
+        # much GPU is free (a launch here died with `max_model_len (780800)
+        # is greater than ... max_position_embeddings (40960.0)`, thirty
+        # minutes into a readiness wait, because nothing upstream of the
+        # runtime knew to say no first). Checked after headroom, not before:
+        # a model whose weights alone do not fit is refused for that reason
+        # first, since a smaller context would not fix it either, and
+        # `_diagnose` already owns that priority order.
+        if (
+            req.native_window is not None
+            and req.native_window > 0
+            and req.context_length > req.native_window
+        ):
+            return FitResult(
+                verdict=Verdict.WONT_FIT,
+                breakdown=breakdown,
+                usable_per_node=usable,
+                headroom=headroom,
+                reason=(
+                    f"Won't fit: {req.context_length} tokens of context was "
+                    f"requested, but {shape.model_id} was trained on {req.native_window}"
+                    f" -- the runtime refuses to start past a model's own "
+                    f"max_position_embeddings, however much memory is free. "
+                    f"Lower context to at most {req.native_window}."
+                ),
+                limiting_term="context",
+                max_context_that_fits=_reported_context(
+                    min(max_ctx, req.native_window)
+                ),
+                predicted_decode_tps=tps,
+                warnings=_dedup(warnings),
+                budget_basis=basis,
+            )
+
         if tps < DEGRADED_TPS_THRESHOLD:
             bytes_per_token = (
                 shape.effective_active_params * shape.bytes_per_param() + kv_read
@@ -782,6 +847,20 @@ class FitCalculator:
     ) -> str:
         # Under a live budget the static ceiling is not available, so a node
         # count derived from it would name a number that still OOMs.
+        if node.addressable_memory <= 0:
+            # This machine has no GPU at all, so it does not become one by
+            # being bought twice. The search below would walk to the cap and
+            # return -1, and rendering that as a node count sends somebody
+            # shopping for hardware that cannot run this at any quantity -- a
+            # remedy nobody evaluated, stated as a number.
+            #
+            # Keyed on the machine's ADDRESSABLE ceiling, never on the budget
+            # in force: under a live basis the budget is what the node can
+            # hand out this second, and a GB10 whose pool is momentarily full
+            # is a machine that plainly does have GPU memory. Saying otherwise
+            # about real hardware would be a worse lie than the one this
+            # branch exists to remove.
+            return "a machine with GPU memory; no number of these holds it"
         n = min_nodes_required(
             req.shape,
             node,
@@ -793,7 +872,13 @@ class FitCalculator:
             usable=usable,
         )
         if n < 0:
-            return f"more than {MAX_SEARCH_NODES} nodes"
+            # -1 does not mean "more of these". `min_nodes_required`'s own
+            # docstring: it means "a different machine or a smaller
+            # quantization, not more Sparks". Rendering it as "more than 64
+            # nodes" named the single remedy the search had just ruled out.
+            # The quantization half is left to `_suggest_quant`, which is
+            # appended beside this and has actually checked whether one fits.
+            return "a different machine"
         return f"{n} node{'s' if n != 1 else ''}"
 
     def _suggest_quant(
@@ -846,13 +931,23 @@ class FitCalculator:
         if suggestion:
             name, size = suggestion
             fixes.append(f"requantize to {name} ({_gib(size)} per rank)")
-        where = (
-            f"on {node.node_id}; its {self.guardrail:.0%} static ceiling is "
-            f"{_gib(node.usable_memory(self.guardrail))}"
-            if live
-            else f"{self.guardrail:.0%} of {_gib(node.addressable_memory)} "
-            f"addressable on {node.gpu_name}"
-        )
+        if live:
+            where = (
+                f"on {node.node_id}; its {self.guardrail:.0%} static ceiling is "
+                f"{_gib(node.usable_memory(self.guardrail))}"
+            )
+        elif node.addressable_memory <= 0:
+            # No GPU was found on this machine, so there is no ceiling for a
+            # percentage to be of. The general branch rendered "90% of 0.0 GiB
+            # addressable on " -- with an empty device name, because
+            # `gpu_name` is "" on such a profile -- which describes a GPU with
+            # nothing left rather than a machine that has no GPU.
+            where = f"{node.node_id} has no GPU memory at all"
+        else:
+            where = (
+                f"{self.guardrail:.0%} of {_gib(node.addressable_memory)} "
+                f"addressable on {node.gpu_name or node.node_id}"
+            )
         return (
             f"Won't fit: weights alone are {_gib(held)} per rank{replicated_note} "
             f"against {_gib(usable)} {_budget_word(basis)} "
@@ -902,10 +997,14 @@ class FitCalculator:
             f"{self._nodes_phrase(req, node, usable if basis == 'live' else None)}"
         )
 
+        # The two figures are printed against each other, so they are rendered
+        # against each other: at one decimal a near miss shows the same number
+        # twice and reads as "15.6 does not fit in 15.6".
+        need, have = _gib_vs(breakdown.kv_cache, kv_budget)
         return (
             f"Over budget by {_gib(over)}. KV cache is the problem: "
-            f"{_gib(breakdown.kv_cache)} per rank at {req.context_length} tokens "
-            f"x {req.max_concurrent_seqs} sequences, against {_gib(kv_budget)} "
+            f"{need} per rank at {req.context_length} tokens "
+            f"x {req.max_concurrent_seqs} sequences, against {have} "
             f"left after weights, activations and overhead"
             f"{' on the machine as it is right now' if basis == 'live' else ''}. "
             f"{_options(fixes, capitalize=True)}."

@@ -13,6 +13,7 @@ values when the gateway runs outside the repo.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from control_plane.contracts import (
     Deployment,
@@ -26,7 +27,7 @@ from control_plane.contracts import (
     ProviderKind,
     ProviderModel,
 )
-from control_plane.providers import UnknownProviderError
+from control_plane.providers import UnknownProviderError, looks_like_secret, spec_for
 from control_plane.registry import NodeNotFound
 
 try:  # shared day-0 fixtures: the same numbers every other agent tests against
@@ -271,7 +272,8 @@ class StubDeployments:
         ]
 
     def launch(
-        self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=Modality.TEXT
+        self, shape, plan, fit, runtime, ctx, max_seqs, *,
+        modality=Modality.TEXT, extra_args=(), custom_command=(),
     ) -> Deployment:
         dep = _deployment(
             f"d-{len(self._deployments) + 1}",
@@ -342,17 +344,48 @@ class StubProviders:
                 last_refreshed=time.time(),
             )
         ]
+        #: provider_id -> the models switched on, or absent for a provider that
+        #: predates the allowlist and therefore serves all of them. Held beside
+        #: the records rather than on them: `Provider` is a frozen contract and
+        #: the real service keeps this on `ProviderRuntime` for the same reason.
+        self._enabled_models: dict[str, frozenset[str]] = {}
 
     def list(self) -> list[Provider]:
         return list(self._providers)
 
     def add(self, spec: dict) -> Provider:
+        # The same two screens the real service applies, in the same order and
+        # with the same sentence. A stub that accepts what the coordinator
+        # refuses is not a rehearsal of it: the add form learns what the key
+        # fields mean from the 400 it gets back, and against this surface it
+        # would learn the opposite.
+        from control_plane.providers.service import KEY_IN_REF_FIELD, minted_ref
+
+        kind = ProviderKind(spec.get("kind", "custom"))
+        api_key = str(spec.get("api_key") or "").strip()
+        api_key_ref = str(spec.get("api_key_ref") or "").strip()
+        if looks_like_secret(api_key_ref):
+            raise ValueError(KEY_IN_REF_FIELD)
+        provider_id = spec.get("provider_id") or f"p-{len(self._providers) + 1}"
+        # A stub has no secrets file to write to, so it does the visible half:
+        # the reference the real service would have stored the key under. Off
+        # this provider's own id, not the kind, because that is the name the
+        # row's "Replace key" control predicts when it PATCHes later.
+        # Dropping the field instead answered 201 with an empty reference and a
+        # key_state of "not_needed", which reads as a paste path that silently
+        # does nothing -- the one failure this surface exists to not have.
+        if api_key and not api_key_ref:
+            api_key_ref = minted_ref(provider_id)
         provider = Provider(
-            provider_id=spec.get("provider_id") or f"p-{len(self._providers) + 1}",
-            kind=ProviderKind(spec.get("kind", "custom")),
+            provider_id=provider_id,
+            kind=kind,
             display_name=spec.get("display_name", "Custom"),
-            base_url=spec["base_url"],
-            api_key_ref=spec.get("api_key_ref", ""),
+            # The kind's default, the way the real service fills it. Reading
+            # spec["base_url"] instead made the add form's own "leave it blank
+            # and take the default" a KeyError, and a KeyError is not a
+            # sentence naming what to change.
+            base_url=spec.get("base_url") or spec_for(kind).base_url,
+            api_key_ref=api_key_ref,
             enabled=spec.get("enabled", True),
             priority=spec.get("priority", 100),
             models=[],
@@ -388,7 +421,71 @@ class StubProviders:
             provider.base_url = str(patch["base_url"])
         if "api_key_ref" in patch:
             provider.api_key_ref = str(patch["api_key_ref"])
+        if "api_key" in patch:
+            # A stub has no secrets file to write to, so it does the visible
+            # half: the reference the real service would have stored under.
+            # Dropping the field instead would report a rotation to a UI that
+            # then shows the same key state it showed before.
+            from control_plane.providers.service import minted_ref
+
+            if "api_key_ref" not in patch:
+                provider.api_key_ref = minted_ref(provider_id)
+        if "enabled_models" in patch:
+            wanted = {str(m) for m in (patch["enabled_models"] or [])}
+            unknown = sorted(wanted - {m.upstream_id for m in provider.models})
+            if unknown:
+                raise ValueError(
+                    f"{provider_id} does not publish {', '.join(unknown[:3])}"
+                )
+            self._enabled_models[provider_id] = frozenset(wanted)
         return provider
+
+    def servable(self) -> list[Provider]:
+        """The providers, carrying only the models switched on.
+
+        The stub's two models both start on, because this provider was here
+        before the allowlist was and the rule for such a record is that it
+        keeps serving everything. Demonstrating an empty cluster would make
+        the day-0 surface show nothing at all.
+        """
+        out = []
+        for provider in self._providers:
+            allowed = self._enabled_models.get(provider.provider_id)
+            clone = replace(
+                provider,
+                models=[
+                    m for m in provider.models
+                    if allowed is None or m.upstream_id in allowed
+                ],
+            )
+            out.append(clone)
+        return out
+
+    def catalogue(self, provider_id: str) -> list[dict]:
+        """Every model, each saying whether it is switched on."""
+        from control_plane.gateway import serialize
+
+        provider = self._find(provider_id)
+        allowed = self._enabled_models.get(provider_id)
+        return [
+            {
+                **serialize.provider_model_payload(m),
+                "enabled": allowed is None or m.upstream_id in allowed,
+            }
+            for m in provider.models
+        ]
+
+    def key_status(self, provider_id: str) -> dict:
+        """Whether the credential resolves. A stub's always does.
+
+        No source: there is no environment and no secrets.json behind this,
+        and naming one of them would be a claim about a file that does not
+        exist. The UI renders a state without a place.
+        """
+        provider = self._find(provider_id)
+        if not provider.api_key_ref:
+            return {"key_state": "not_needed", "key_source": None}
+        return {"key_state": "set", "key_source": None}
 
     def remove(self, provider_id: str) -> None:
         provider = self._find(provider_id)

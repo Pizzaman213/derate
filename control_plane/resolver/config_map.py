@@ -13,7 +13,27 @@ from typing import Any
 
 # Sub-config keys that hold the language model when the top level is a wrapper
 # around a multimodal composite (Gemma 3, Llama 4, Llava, Qwen-Omni).
-_TEXT_CONFIG_KEYS = ("text_config", "language_config", "llm_config", "decoder")
+#
+# `thinker_config` and `talker_config` are in that order on purpose. A
+# Qwen-Omni checkpoint has both: the thinker is the stack that answers
+# /v1/chat/completions and the talker is the one that emits speech tokens, so
+# the thinker is the shape a served model should be sized by.
+#
+# This list is not the whole answer and is not meant to be. It is a hand-kept
+# list of somebody else's key names, and it failed the way such lists always
+# fail -- `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` keeps its stack under
+# `talker_config` and was refused outright. `_discover_stacks` below is the
+# part that does not need a name.
+_TEXT_CONFIG_KEYS = (
+    "text_config", "language_config", "llm_config", "decoder",
+    "thinker_config", "talker_config",
+)
+
+#: How deep `_discover_stacks` looks. Qwen-Omni buries the stack that matters
+#: two levels down (`thinker_config.text_config`), so 1 is not enough; 3 is
+#: past every composite anyone has published and stops the walk from wandering
+#: into `id2label` and `rope_parameters`.
+_MAX_STACK_DEPTH = 3
 _VISION_CONFIG_KEYS = ("vision_config", "vision_tower_config", "visual", "vit_config")
 
 _LAYER_KEYS = ("num_hidden_layers", "n_layer", "n_layers", "num_layers", "num_blocks")
@@ -35,6 +55,14 @@ _KV_HEAD_KEYS = (
     "num_query_groups",  # Nemotron / Megatron lineage
     "multi_query_group_num",  # ChatGLM
     "attention_kv_heads",
+    # gpt-fast's ModelArgs, which the DualAR speech checkpoints inherited from
+    # Fish Speech: `n_head` queries against `n_local_heads` key/value heads,
+    # sized in the projection as (n_head + 2 * n_local_heads) * head_dim. The
+    # name reads like a tensor-parallel shard count and is not one -- no
+    # published config states a sharded head count, because the shard is
+    # chosen at launch. Without it a 14-head/2-KV-head model was charged as
+    # multi-head and its KV cache came out seven times too large.
+    "n_local_heads",
 )
 _VOCAB_KEYS = ("vocab_size", "padded_vocab_size", "n_vocab")
 _HEAD_DIM_KEYS = ("head_dim", "attention_head_dim", "kv_channels", "d_head")
@@ -61,6 +89,11 @@ _EXPERT_TOPK_KEYS = (
     "n_experts_per_tok",
     "expert_used_count",
     "topk",
+    # Gemma 4's spelling, DiffusionGemma included. Absent from this list, a
+    # config that states `top_k_experts: 8` fell through to the assumed 2 --
+    # a four-fold understatement of active parameters, on a model whose own
+    # config said the number plainly.
+    "top_k_experts",
 )
 _MOE_INTERMEDIATE_KEYS = (
     "moe_intermediate_size",
@@ -98,18 +131,99 @@ def _int(value: Any) -> int | None:
     return None
 
 
+def _is_stack(config: dict[str, Any]) -> bool:
+    """Does this dict describe a transformer stack we can size?
+
+    All three fields, under any spelling the mapper already understands, so a
+    sub-config written with ``n_layer``/``n_embd``/``n_head`` is found on the
+    same terms as one written the modern way.
+    """
+    return all(
+        _first(config, keys) is not None
+        for keys in (_LAYER_KEYS, _HIDDEN_KEYS, _HEAD_KEYS)
+    )
+
+
+def _merged(root: dict[str, Any], sub: dict[str, Any]) -> dict[str, Any]:
+    """*sub*, over the root's scalars.
+
+    Some wrappers keep ``vocab_size`` or ``torch_dtype`` outside the stack, so
+    the top level stays a fallback -- but only its scalars, or a sibling
+    sub-config's fields would leak in and be read as this stack's.
+    """
+    merged = {k: v for k, v in root.items() if not isinstance(v, dict)}
+    merged.update(sub)
+    return merged
+
+
+def _named_stack(config: dict[str, Any]) -> dict[str, Any] | None:
+    """The stack under a key we know by name, descending when it wraps again.
+
+    `thinker_config` is why the descent exists: it holds no shape fields
+    itself, its own `text_config` does. One level of recursion covers that and
+    every other wrapper-around-a-wrapper published so far.
+    """
+    for key in _TEXT_CONFIG_KEYS:
+        sub = config.get(key)
+        if not isinstance(sub, dict):
+            continue
+        if _is_stack(sub):
+            return sub
+        inner = _named_stack(sub)
+        if inner is not None:
+            return _merged(sub, inner)
+    return None
+
+
+def _discover_stacks(
+    config: dict[str, Any], path: str = "", depth: int = 0
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every transformer stack in *config*, by dotted path, deepest included.
+
+    The fallback for a wrapper nobody has taught this module about. It is
+    reached only where `map_config` used to raise, so it cannot change a model
+    that already resolves -- it can only turn a refusal into a shape.
+    """
+    found: list[tuple[str, dict[str, Any]]] = []
+    if depth > _MAX_STACK_DEPTH:
+        return found
+    for key, sub in config.items():
+        if not isinstance(sub, dict) or not sub:
+            continue
+        here = f"{path}.{key}" if path else key
+        if _is_stack(sub):
+            found.append((here, sub))
+        found.extend(_discover_stacks(sub, here, depth + 1))
+    return found
+
+
+def _stack_size(sub: dict[str, Any]) -> int:
+    """Layers times width, the ranking used to pick between stacks.
+
+    Crude on purpose, and it is the number that matters: it is monotonic in
+    both of the dimensions that drive KV cache per token, and it is what
+    separates a model's own stack from the auxiliary heads bolted beside it.
+    """
+    layers = _int(_first(sub, _LAYER_KEYS)) or 0
+    hidden = _int(_first(sub, _HIDDEN_KEYS)) or 0
+    return layers * hidden
+
+
+def _describe(path: str, sub: dict[str, Any]) -> str:
+    layers = _int(_first(sub, _LAYER_KEYS)) or 0
+    hidden = _int(_first(sub, _HIDDEN_KEYS)) or 0
+    return f"{path!r} ({layers} x {hidden})"
+
+
 def text_config(config: dict[str, Any]) -> dict[str, Any]:
     """The language-model config, unwrapped from any multimodal wrapper.
 
     Top-level keys are kept as a fallback: some wrappers put ``vocab_size`` or
     ``torch_dtype`` outside ``text_config``.
     """
-    for key in _TEXT_CONFIG_KEYS:
-        sub = config.get(key)
-        if isinstance(sub, dict) and _first(sub, _LAYER_KEYS) is not None:
-            merged = {k: v for k, v in config.items() if not isinstance(v, dict)}
-            merged.update(sub)
-            return merged
+    named = _named_stack(config)
+    if named is not None:
+        return _merged(config, named)
     return config
 
 
@@ -196,6 +310,53 @@ def map_config(config: dict[str, Any]) -> Mapped:
             )
 
     if num_layers is None or hidden_size is None or num_heads is None:
+        # No key we know by name held a stack. Go and look for one.
+        #
+        # Reached only here, which is the safety property worth stating: this
+        # branch is the one that used to raise, so discovery cannot change the
+        # shape of a model that already resolves -- it can only turn a refusal
+        # into an answer.
+        #
+        # The ranking is what makes it safe to guess. Qwen3-Omni is the case
+        # that decides the design: the stack it serves from is
+        # `thinker_config.text_config`, 48 layers of 2048 with 128 experts,
+        # while the only candidate one level down is `code2wav_config`, an
+        # 8-layer vocoder. Taking the first or the shallowest match would
+        # charge a 30B mixture-of-experts as a small vocoder, and the fit gate
+        # -- the thing this project exists for -- would wave through a launch
+        # that runs out of memory. Largest wins, and the largest is right.
+        candidates = _discover_stacks(config)
+        if candidates:
+            path, chosen = max(candidates, key=lambda item: _stack_size(item[1]))
+            cfg = _merged(config, chosen)
+            num_layers = _int(_first(cfg, _LAYER_KEYS))
+            hidden_size = _int(_first(cfg, _HIDDEN_KEYS))
+            num_heads = _int(_first(cfg, _HEAD_KEYS))
+            note = (
+                f"shape read from {_describe(path, chosen)}: no top-level "
+                f"field named a language model, so this config was searched "
+                f"for one"
+            )
+            rejected = [
+                _describe(other, sub)
+                for other, sub in sorted(
+                    candidates, key=lambda item: -_stack_size(item[1])
+                )
+                if other != path
+            ]
+            if rejected:
+                note += (
+                    f". It holds more than one transformer stack and the "
+                    f"largest was chosen; not used: {', '.join(rejected)}"
+                )
+            # Said plainly because the number it changes is the one this
+            # project refuses launches over: KV cache per token comes from the
+            # stack named here, and if the wrong one was picked the fit
+            # verdict is wrong in the same proportion.
+            note += ". KV cache per token is charged against the stack named here"
+            warnings.append(note)
+
+    if num_layers is None or hidden_size is None or num_heads is None:
         missing = [
             name
             for name, value in (
@@ -205,7 +366,20 @@ def map_config(config: dict[str, Any]) -> Mapped:
             )
             if value is None
         ]
-        raise KeyError(f"config is missing required field(s): {', '.join(missing)}")
+        # Name what was looked in, not only what was absent. A checkpoint can
+        # reach here for two very different reasons and the operator cannot
+        # act on either without knowing which: `Systran/faster-whisper-base`
+        # is a CTranslate2 export and `minishlab/potion-base-8M` is a static
+        # embedding model with no attention at all -- neither has a stack to
+        # find, at any depth, and no amount of searching will produce one.
+        searched = len(_discover_stacks(config)) + sum(
+            1 for value in config.values() if isinstance(value, dict) and value
+        )
+        raise KeyError(
+            f"config is missing required field(s): {', '.join(missing)}"
+            f" -- searched the root and {searched} sub-config(s) and found no "
+            f"transformer stack"
+        )
 
     # Grouped-query attention. Absent means multi-head with no grouping, which
     # is num_kv_heads == num_attention_heads, not 1.

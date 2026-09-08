@@ -42,6 +42,8 @@ ADMISSION_BLOCKED = "admission_blocked"
 ADMISSION_CLEARED = "admission_cleared"
 ROUTING_SOURCE_FAILED = "routing_source_failed"
 STARTUP_DEGRADED = "startup_degraded"
+RESTART_ATTEMPTED = "restart_attempted"
+RESTART_EXHAUSTED = "restart_exhausted"
 
 
 def _new_bus():
@@ -111,3 +113,43 @@ class GatewayEvents:
     def startup_degraded(self, reasons: list[str]) -> None:
         if reasons:
             self.emit(STARTUP_DEGRADED, reasons=list(reasons))
+
+    def restart_attempted(
+        self,
+        *,
+        served_name: str,
+        previous_deployment_id: str,
+        attempt: int,
+        max_attempts: int,
+        outcome: str,
+        new_deployment_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self.emit(
+            RESTART_ATTEMPTED,
+            served_name=served_name,
+            previous_deployment_id=previous_deployment_id,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            outcome=outcome,
+            new_deployment_id=new_deployment_id,
+            reason=reason,
+        )
+
+    def restart_exhausted(
+        self,
+        *,
+        served_name: str,
+        previous_deployment_id: str,
+        attempts: int,
+        max_attempts: int,
+        last_error: str | None,
+    ) -> None:
+        self.emit(
+            RESTART_EXHAUSTED,
+            served_name=served_name,
+            previous_deployment_id=previous_deployment_id,
+            attempts=attempts,
+            max_attempts=max_attempts,
+            last_error=last_error,
+        )

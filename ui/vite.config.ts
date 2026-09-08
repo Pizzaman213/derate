@@ -14,7 +14,12 @@ export default defineConfig({
     proxy: {
       // The coordinator is on :8080 by default. DERATE_GATEWAY moves it,
       // for when :8080 is already taken on the dev machine.
-      '/api': { target: gateway, changeOrigin: true },
+      // `ws: true` on /api is not optional once the node terminal exists:
+      // http-proxy does not forward an HTTP Upgrade without it, so the socket
+      // would fail the handshake under `npm run dev` and the terminal would
+      // simply never connect -- with no /api error to trace it to. Production
+      // is unaffected either way; there is no proxy there.
+      '/api': { target: gateway, changeOrigin: true, ws: true },
       '/v1': { target: gateway, changeOrigin: true },
     },
   },

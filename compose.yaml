@@ -44,6 +44,11 @@ services:
       # Cluster token, node registry, link measurements, deployment records,
       # resolved-shape cache, synthesized recipes, telemetry journal and
       # archive.
+      #
+      # NOT the log files: paths.py::logs_dir() puts node.log and proxy.log at
+      # <project root>/logs, which in this image is /opt/derate/logs -- a layer,
+      # so `docker rm` takes them. Set DERATE_LOG_DIR=/data/logs below to keep
+      # them here with everything else.
       - derate:/data
       # The host's sparkrun config, read-only: registries, saved clusters,
       # container image defaults.
@@ -70,6 +75,10 @@ services:
       # discovery when the other node is on a different subnet.
       DERATE_JOIN: ${DERATE_JOIN:-}
       DERATE_LOG_LEVEL: ${DERATE_LOG_LEVEL:-INFO}
+      # Unset -> <project root>/logs, which is /opt/derate/logs in this image:
+      # a layer, so `docker rm` takes node.log and proxy.log with it. Set it to
+      # /data/logs to keep them on the volume above.
+      DERATE_LOG_DIR: ${DERATE_LOG_DIR:-}
       # Durable telemetry. Every node journals to /data and the coordinator
       # collects it; these bound how much of it is kept and for how long.
       DERATE_TELEMETRY: ${DERATE_TELEMETRY:-1}
@@ -77,6 +86,29 @@ services:
       DERATE_TELEMETRY_LOG_LEVEL: ${DERATE_TELEMETRY_LOG_LEVEL:-INFO}
       DERATE_TELEMETRY_MAX_BYTES: ${DERATE_TELEMETRY_MAX_BYTES:-}
       DERATE_TELEMETRY_SHIP_INTERVAL_S: ${DERATE_TELEMETRY_SHIP_INTERVAL_S:-5}
+      # Logger prefixes never written to the journal. The default pair is one
+      # row per HTTP request each, and the coordinator polls every node at
+      # 1 Hz -- measured at 99.6% of the log stream and 81% of every row in the
+      # archive, with the journal reaching its byte cap in ~30h against a 72h
+      # retention. Set to "" to record everything again.
+      DERATE_TELEMETRY_QUIET_LOGGERS: ${DERATE_TELEMETRY_QUIET_LOGGERS-uvicorn.access,httpx}
+      # An interactive root shell on this machine, reachable from the node page
+      # in the UI. OFF, and it should stay off unless you want it: the /api
+      # surface has no authentication, the gateway binds 0.0.0.0, and this
+      # container runs as root with --pid=host and the operator's SSH keys
+      # mounted -- so an enabled shell reaches the host, and through those keys
+      # the rest of the fleet. Both variables are required; the key is never
+      # returned by any route, and is generated into /data/shell.key if unset.
+      DERATE_SHELL: ${DERATE_SHELL:-0}
+      DERATE_SHELL_KEY: ${DERATE_SHELL_KEY:-}
+      # Browser origins allowed to open a shell socket. Empty means no check,
+      # which is right when the UI is served by this coordinator. Set it if you
+      # reach the UI from somewhere else: a WebSocket handshake is exempt from
+      # CORS and is never preflighted, so this is the only thing that stops a
+      # page you happen to visit opening a socket to your LAN.
+      DERATE_SHELL_ORIGINS: ${DERATE_SHELL_ORIGINS:-}
+      # Seconds of inactivity before a shell session closes itself.
+      DERATE_SHELL_IDLE_S: ${DERATE_SHELL_IDLE_S:-1800}
 
     healthcheck:
       # /agent/health exists in both roles. /api/cluster is coordinator-only

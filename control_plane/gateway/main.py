@@ -7,6 +7,8 @@ import os
 
 import uvicorn
 
+from control_plane import logfiles
+
 from .app import create_app
 from .settings import GatewaySettings
 
@@ -14,12 +16,13 @@ from .settings import GatewaySettings
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("DERATE_LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format=logfiles.LOG_FORMAT,
     )
     # basicConfig sets the root level, but the journal handler is attached
     # during app startup and wants records the root logger would otherwise
     # filter out before any handler sees them.
     logging.getLogger().setLevel(os.environ.get("DERATE_LOG_LEVEL", "INFO"))
+    logfiles.install()
     print(
         "=" * 72 + "\n"
         "STUB SURFACE -- fixture data; the real system is "

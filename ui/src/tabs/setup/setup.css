@@ -21,6 +21,11 @@
 }
 .setup-wordmark { font-weight: 500; font-size: 18px; letter-spacing: -0.3px; }
 .setup-where { margin-left: auto; }
+/* The monogram's solid stroke sits above its own bounding-box centre (the
+   faint echo stroke below it does not carry the same visual weight), so
+   centring the box against the wordmark leaves the mark looking high. Nudge
+   it down to match derate.css's header, which does the same. */
+.setup-head svg { transform: translateY(2px); }
 
 .setup-main { max-width: 660px; margin: 0 auto; padding: var(--s-7) var(--s-5) 96px; }
 
@@ -201,3 +206,118 @@
   color: var(--ink-muted);
 }
 .setup-fault { border-left-color: var(--fault); }
+
+.setup-facts .setup-ctx{display:block; font-size:11px; color:var(--ink-muted); opacity:.85}
+
+/* ── Starting a model: real progress where there is any ──────────────────────
+   Two bars, because there are two honest states and conflating them would mean
+   inventing a number. `.is-known` is a real fraction of real bytes. `.is-open`
+   is the case where nothing downstream reports byte counts -- vLLM fetches
+   through Hugging Face and the control plane never sees a total -- so it sweeps
+   to say "working" and claims no position. A determinate-looking bar creeping
+   at a made-up rate is the one thing this must not do: people read it as an
+   estimate and plan around it. */
+.setup-bar {
+  height: 6px;
+  border-radius: 2px;
+  background: var(--panel-sunk);
+  border: 1px solid var(--rule);
+  overflow: hidden;
+  margin: var(--s-3) 0 var(--s-2);
+}
+.setup-bar span { display: block; height: 100%; }
+.setup-bar .is-known {
+  background: var(--flow);
+  transition: width 600ms var(--ease, cubic-bezier(0.2, 0.7, 0.3, 1));
+}
+.setup-bar .is-open {
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--flow) 35%,
+    var(--flow) 65%,
+    transparent
+  );
+  animation: setup-sweep 1.6s ease-in-out infinite;
+}
+@keyframes setup-sweep {
+  from { transform: translateX(-110%); }
+  to   { transform: translateX(360%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Still visibly "in progress", without the movement. */
+  .setup-bar .is-open { animation: none; width: 100%; opacity: 0.45; }
+}
+
+.setup-stage {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  font-size: var(--size-label);
+}
+.setup-stage .dotting::after {
+  content: '';
+  animation: setup-dots 1.4s steps(4, end) infinite;
+}
+@keyframes setup-dots {
+  0%   { content: ''; }
+  25%  { content: '.'; }
+  50%  { content: '..'; }
+  75%  { content: '...'; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .setup-stage .dotting::after { animation: none; content: '…'; }
+}
+.setup-stage .elapsed {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+}
+
+/* The phases. A list, because it IS a sequence -- unlike most numbered UI, the
+   order here carries information the reader needs: what has happened, what is
+   happening, and what is still ahead. */
+.setup-phases {
+  list-style: none;
+  margin: var(--s-3) 0 0;
+  padding: 0;
+  display: grid;
+  gap: var(--s-1);
+}
+.setup-phase {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  font-size: var(--size-label);
+  color: var(--on-fill-dim);
+}
+.setup-phase .mark { flex: 0 0 auto; width: 1em; text-align: center; }
+.setup-phase .detail {
+  margin-left: auto;
+  font-size: var(--size-unit);
+  font-variant-numeric: tabular-nums;
+}
+.setup-phase.is-done { color: var(--on-fill); }
+.setup-phase.is-done .mark { color: var(--live-solid); }
+.setup-phase.is-now { color: var(--on-fill); font-weight: 500; }
+.setup-phase.is-todo { opacity: 0.55; }
+
+/* The launcher's or the runtime's own sentence, inside the plate: "Pulling
+   image: ghcr.io/spark-arena/...", "Loading safetensors checkpoint shards:
+   5/11". Wraps rather than clips -- a container reference is longer than the
+   plate and truncating it would hide the one part that identifies it -- and
+   breaks inside a word, because these lines are mostly paths and ids with no
+   spaces to break at. */
+.setup-log {
+  margin-top: var(--s-3);
+  /* --on-fill-dim, not --ink-muted: this sits inside .setup-plate, which
+     paints --fill and swaps ink for --on-fill. The page's muted ink on the
+     plate's ground is the pairing that disappears in one of the two themes. */
+  color: var(--on-fill-dim);
+  font-size: var(--size-unit);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}

@@ -96,6 +96,12 @@ class GatewayContext:
     sink: "object" = None
     events: "object" = None
     telemetry: "object" = None
+    # The model registry behind GET /api/models. Optional and defaulted for
+    # the same reason as the three above: every existing construction of a
+    # GatewayContext keeps working, and a coordinator that could not open the
+    # database answers that endpoint with a sentence rather than failing to
+    # start.
+    inventory: "object" = None
     started_at: float = 0.0
     degraded_startup: list[str] = field(default_factory=list)
 

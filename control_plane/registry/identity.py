@@ -14,6 +14,8 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
+from control_plane import fsutil
+
 log = logging.getLogger(__name__)
 
 CLUSTER_FILE = "cluster.json"
@@ -33,6 +35,39 @@ def new_cluster_id() -> str:
 
 def new_token() -> str:
     return secrets.token_urlsafe(24)
+
+
+def read_identity(data_dir: Path) -> ClusterIdentity | None:
+    """Read a persisted cluster identity without ever creating one.
+
+    ``load_or_create_identity`` mints and writes when nothing is on disk, which
+    is right for a coordinator and wrong for a worker: a worker that minted an
+    identity would be inventing a cluster nobody asked for. This is the read a
+    worker needs to recover the permanent token it adopted on an earlier run.
+
+    Returns None when there is no file, when it is unreadable, or when it holds
+    no token -- all "we have nothing", none of them worth failing over.
+    """
+    path = Path(data_dir) / CLUSTER_FILE
+    if not path.exists():
+        return None
+    try:
+        stored = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        log.warning("could not read %s (%s)", path, exc)
+        return None
+    if not isinstance(stored, dict):
+        log.warning("%s did not contain a JSON object", path)
+        return None
+    token = str(stored.get("token") or "")
+    if not token:
+        return None
+    return ClusterIdentity(
+        cluster_id=str(stored.get("cluster_id") or ""),
+        token=token,
+        persisted=True,
+        path=path,
+    )
 
 
 def load_or_create_identity(
@@ -73,7 +108,7 @@ def load_or_create_identity(
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
             json.dump(payload, handle)
-        os.chmod(path, 0o600)
+        fsutil.harden_path(path)
         return ClusterIdentity(resolved_id, resolved_token, persisted=True, path=path)
     except OSError as exc:
         log.warning(
@@ -108,4 +143,11 @@ def banner(identity: ClusterIdentity, ui_url: str) -> str:
         "  Same subnet, no UI: the same install command with no arguments\n"
         f"  finds this coordinator. From elsewhere, DERATE_TOKEN={identity.token}\n"
         "  joins as a candidate you then admit by hand.\n"
+        "\n"
+        "  Keep that token somewhere. It is what makes this machine\n"
+        "  replaceable: start a coordinator anywhere with DERATE_TOKEN set to\n"
+        "  it and every node presents itself again on its own. Keep this\n"
+        "  machine's /data too if you can -- with the roster the nodes come\n"
+        "  straight back as members; without it they arrive as candidates to\n"
+        "  admit, one click each. Without the token they cannot arrive at all.\n"
     )

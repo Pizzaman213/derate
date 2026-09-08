@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from control_plane.contracts import DeviceClass, NodeProfile
+from control_plane.paths import default_data_dir
 from control_plane.registry import storage
 from control_plane.registry.agent import NodeAgent, create_agent_app
 from control_plane.registry.serde import storage_to_dict
@@ -232,11 +233,18 @@ def test_a_probe_that_raises_degrades_rather_than_500ing(tmp_path, monkeypatch):
 
 
 def test_the_agent_defaults_its_root_from_the_environment(monkeypatch, tmp_path):
-    """The same env var every other component reads, with the same fallback."""
+    """The same env var every other component reads, with the same fallback.
+
+    The fallback is now shared rather than re-typed: control_plane.paths picks
+    /data when it is real and writable -- the container -- and this platform's
+    application-state directory otherwise. Asserting the literal "/data" here
+    would pass only on a machine that has one, which is the assumption the
+    resolver exists to remove.
+    """
     monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
     assert NodeAgent(profile())._data_root == tmp_path
     monkeypatch.delenv("DERATE_DATA_DIR")
-    assert NodeAgent(profile())._data_root == Path("/data")
+    assert NodeAgent(profile())._data_root == default_data_dir()
 
 
 # ---------------------------------------------------------------------------

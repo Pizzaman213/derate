@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import itertools
 import json
 import logging
+import shlex
 from functools import partial
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Query, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -28,7 +30,8 @@ from control_plane.contracts import (
     RoutingPolicy,
     Verdict,
 )
-from control_plane.providers import UnknownProviderError
+from control_plane.fit.capacity import context_for
+from control_plane.providers import AdapterUnsupportedError, UnknownProviderError, UpstreamError
 from control_plane.planner import (
     Candidate,
     IllegalDegrees,
@@ -39,12 +42,15 @@ from control_plane.planner import (
     valid_tp_degrees,
 )
 from control_plane.registry import JoinRejected, NodeNotFound
+from control_plane.version import build_id
 from control_plane.registry import modelcache, storage as registry_storage
 from control_plane.registry.serde import profile_from_dict
 
 from control_plane.telemetry import query as tquery
 
-from . import errors, gpu_procs, livefit, serialize, ui_detail
+from control_plane.humanize import binary_bytes
+
+from . import errors, gpu_procs, livefit, serialize, states, ui_detail
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.api")
@@ -378,6 +384,37 @@ def _check_every_node_used(plan, nodes, requested_nodes, requested_degrees) -> N
     )
 
 
+def _sharding_refusal(
+    runtime: str,
+    tensor_parallel: int,
+    pipeline_parallel: int,
+    expert_parallel: int = 1,
+    data_parallel: int = 1,
+):
+    """Why this runtime cannot run these degrees, or None.
+
+    Imported lazily for the reason ``_TERMINAL_STATES`` is spelled out rather
+    than imported: ``control_plane.deploy`` runs its package __init__, which
+    pulls the manager, the sparkrun adapter and the event bus into a request
+    module. An unknown runtime is not this check's to refuse -- ``supported_by``
+    above already answered that question -- so it degrades to None.
+    """
+    try:
+        from control_plane.deploy.flags import sharding_refusal
+    except Exception:
+        return None
+    try:
+        return sharding_refusal(
+            runtime,
+            tensor_parallel,
+            pipeline_parallel,
+            expert_parallel,
+            data_parallel,
+        )
+    except ValueError:
+        return None
+
+
 def _modality_of(architectures) -> Modality:
     """The endpoint family these architectures answer on.
 
@@ -402,6 +439,55 @@ def _modality_of(architectures) -> Modality:
         return Modality.TEXT
 
 
+#: One process-wide logo cache, created on first use.
+#:
+#: Not on GatewayContext: it holds no cluster state, survives nothing, and a
+#: provider's mark is the same file whichever coordinator asked for it. A
+#: module global keeps it out of a frozen contract for something cosmetic.
+_LOGOS = None
+
+
+def _logo_cache():
+    """The shared provider-logo cache.
+
+    Imported here rather than at module scope so a build without ``httpx``
+    reachable still imports the gateway: the logo path is the only thing that
+    stops working, and it degrades to a 404, which already draws correctly.
+    """
+    global _LOGOS
+    if _LOGOS is None:
+        from control_plane.providers.logos import LogoCache
+
+        _LOGOS = LogoCache()
+    return _LOGOS
+
+
+async def _warm_logo(cache, provider) -> None:
+    """Fetch one provider's mark into the cache. Never raises, never awaited.
+
+    Fire-and-forget behind an already-sent 404. The lock collapses a burst of
+    renders into one request; the miss it records on failure is what stops a
+    vendor without a favicon costing a fetch per repaint.
+    """
+    from control_plane.providers.logos import fetch_logo
+
+    lock = cache.lock_for(provider.provider_id)
+    if lock.locked():
+        return
+    async with lock:
+        try:
+            found = await fetch_logo(provider)
+        except Exception:  # noqa: BLE001 - cosmetic path
+            log.debug("logo warm failed for %s", provider.provider_id, exc_info=True)
+            cache.remember_miss(provider.provider_id, permanent=False)
+            return
+        if found is None:
+            cache.remember_miss(provider.provider_id, permanent=True)
+            return
+        body, content_type = found
+        cache.put(provider.provider_id, body, content_type)
+
+
 #: A node agent that cannot answer a read in this long is treated as down.
 _AGENT_TIMEOUT_S = 5.0
 #: SIGTERM grace (10s) plus SIGKILL wait (5s) on the agent side, plus slack.
@@ -411,13 +497,18 @@ _KILL_TIMEOUT_S = 25.0
 _DELETE_TIMEOUT_S = 120.0
 
 #: A deployment past these is not serving anything and its weights are fair
-#: game. Spelled from the contract enum rather than imported from
-#: ``deploy.fsm.TERMINAL``, because ``from control_plane.deploy import fsm``
-#: runs the package __init__ and pulls the manager, the sparkrun adapter and
-#: the event bus into the gateway's request module to obtain one frozenset.
-#: ``test_modelcache`` asserts this set and ``fsm.TERMINAL`` stay equal, so the
-#: two cannot drift apart.
-_TERMINAL_STATES = frozenset({DeploymentState.FAILED, DeploymentState.STOPPED})
+#: game. Taken from ``gateway.states``, which is the gateway's one spelling of
+#: a judgement ``deploy.fsm`` owns -- importing the original would run the
+#: deploy package __init__ and pull the manager, the sparkrun adapter and the
+#: event bus into this request module to obtain one frozenset.
+#: ``tests/test_single_source.py`` holds the two equal.
+_TERMINAL_STATES = states.TERMINAL
+
+#: The states that mean "on its way but not yet serving" -- what /api/activity
+#: reports. Deliberately an allowlist: every other state is a deployment that
+#: has arrived, is leaving, or is over, and each of those already has a section
+#: of the screen describing it.
+_ARRIVING_STATES = frozenset({DeploymentState.PLANNED, DeploymentState.LAUNCHING})
 def _agent_detail(res) -> str:
     """The sentence a node agent put in its refusal, however it wrapped it.
 
@@ -469,17 +560,129 @@ PULL_GATE_TIMEOUT_S = 30.0
 _PULLS: set = set()
 
 
-def _gib(value: int | float) -> str:
-    return f"{(value or 0) / 1024 ** 3:.1f}"
+@dataclasses.dataclass
+class _Download:
+    """One transfer, while it is happening.
+
+    The 202 this route returns says how big the download is and then the
+    request ends, so until this existed the only trace of a running pull was an
+    anonymous task in ``_PULLS`` -- nothing could be asked how far along it was,
+    and the screen had a single number reported once followed by minutes of
+    silence. ``ProviderService.pull``'s ``on_progress`` fills these in.
+
+    Deliberately process-local and deliberately not persisted. The transfer
+    itself does not survive a coordinator restart, so a record that did would
+    outlive the thing it describes and report a download that is no longer
+    running.
+    """
+
+    pull_id: str
+    provider_id: str
+    provider: str
+    model: str
+    #: None until the upstream reports one. Never 0: a download of unknown size
+    #: and a download of no size are different answers, and only one of them
+    #: can honestly draw a bar.
+    total: int | None
+    completed: int
+    #: The upstream's own word for what it is doing, passed through unchanged.
+    status: str
+    started_at: float
+    finished_at: float | None
+    error: str | None
+    #: Whether the upstream ever reported a `completed` figure. Without this a
+    #: provider that streams only a total cannot be told apart from one whose
+    #: transfer was cut off, and the two need opposite answers.
+    saw_progress: bool = False
 
 
-def _provider_host_memory(ctx, base_url: str) -> tuple[int, str]:
-    """(free bytes, node name) for the machine a provider's URL points at.
+#: Live and just-finished transfers, keyed by pull id.
+_DOWNLOADS: dict[str, _Download] = {}
+
+#: How long a finished transfer stays listed. A download that vanished the
+#: instant it completed would, on a fast local pull, never be seen at all --
+#: the screen would flicker and show nothing, which reads exactly like the
+#: silence this whole record exists to end. Long enough to notice, short enough
+#: that the rail does not accumulate history it was never meant to hold.
+_DONE_LINGER_S = 20.0
+
+#: How much of the reported total must have arrived before a transfer that
+#: ended without raising is believed to have finished. Not 1.0: reported sizes
+#: jitter by a few bytes and an exact test would call a finished transfer
+#: partial. The same fraction, for the same reason, as the UI's cache index.
+_COMPLETE_FRACTION = 0.99
+
+#: Monotonic source of pull ids. A counter rather than a random token because
+#: the id is only ever used to address a record in this process's own dict, and
+#: a predictable one is a readable test.
+_PULL_SEQ = itertools.count(1)
+
+#: When this coordinator first saw a deployment launching, by deployment id.
+#: ``Deployment.started_at`` is None until the READY transition stamps it
+#: (deploy/manager.py), so a launching deployment carries no timestamp at all
+#: and there is nothing else to subtract. Adding a field to the record would be
+#: a change to a frozen contract, which goes through the architecture doc
+#: first. After a restart this is when the coordinator came back rather than
+#: when the launch began, which is why the wire field is called `since` and the
+#: screen does not call it "launched".
+_LAUNCH_SEEN: dict[str, float] = {}
+
+
+def _sweep_downloads(now: float) -> list[_Download]:
+    """Live transfers plus those that finished within the linger window."""
+    for pull_id, rec in list(_DOWNLOADS.items()):
+        if rec.finished_at is not None and now - rec.finished_at > _DONE_LINGER_S:
+            del _DOWNLOADS[pull_id]
+    return sorted(_DOWNLOADS.values(), key=lambda r: r.started_at)
+
+
+def _gib(value: int | float | None) -> str:
+    """A byte count with its unit, from the one formatter that has the ladder.
+
+    This used to be a bare divide, which meant a download that failed in its
+    first few megabytes reported "stopped after 0.0 GiB of 4.2 GiB" -- the
+    exact rendering ``fit/calculator``'s version was written to prevent, and
+    the exact case where somebody is reading the sentence closely."""
+    return binary_bytes(value or 0)
+
+
+def _node_for_address(nodes, base_url: str):
+    """The roster node a provider's URL points at, or None.
+
+    An EXACT match on address or hostname, never a guess: no DNS resolution, no
+    subnet inference, no reverse lookup. Not in the roster means somebody
+    else's machine, which is a different thing from a machine we have simply
+    failed to recognise, and only an exact match can tell them apart.
+
+    This exists because a provider can be a machine that also joined the
+    cluster -- the Pi enrols as a GPU-less node AND registers as an Ollama
+    provider -- and in that case a model served "remotely" is running on a box
+    already drawn on the cluster screen.
+    """
+    host = urlparse(base_url).hostname or ""
+    if not host:
+        return None
+    for state in nodes:
+        if state.profile.address == host or state.profile.hostname == host:
+            return state
+    return None
+
+
+def _provider_host_memory(ctx, base_url: str) -> tuple[int, str, bool]:
+    """(free bytes, node name, measured) for the machine a provider addresses.
 
     Matched by address against the roster, because a provider is just a URL and
-    a machine only becomes measurable by having joined. (0, its host) when
-    nothing matches -- that is "unknown", not "full", and the caller must not
-    turn it into a refusal.
+    a machine only becomes measurable by having joined. (0, its host, False)
+    when nothing matches -- that is "unknown", not "full", and the caller must
+    not turn it into a refusal.
+
+    ``measured`` is the third element because the first two cannot tell the two
+    zeroes apart: a node that never joined and a node with nothing free both
+    report 0, and a caller that infers "no gate ran" from a zero would say the
+    pull went unjudged when in fact it was judged against a full disk. The
+    common case is not exotic -- the kind's default base_url is
+    ``http://localhost:11434/v1`` and loopback can never match a roster entry,
+    so the honest answer has to be carried rather than reconstructed.
 
     ``memory_total`` and ``memory_used`` are the node's live figures. On a
     machine with no GPU they are host RAM, which is exactly the pool a model
@@ -487,17 +690,17 @@ def _provider_host_memory(ctx, base_url: str) -> tuple[int, str]:
     """
     host = urlparse(base_url).hostname or ""
     if not host:
-        return 0, "that machine"
+        return 0, "that machine", False
     try:
         nodes = ctx.deps.registry.list_nodes()
     except Exception:
         log.exception("registry unavailable while sizing a pull")
-        return 0, host
-    for state in nodes:
-        if state.profile.address == host or state.profile.hostname == host:
-            free = max(0, (state.memory_total or 0) - (state.memory_used or 0))
-            return free, state.profile.node_id
-    return 0, host
+        return 0, host, False
+    state = _node_for_address(nodes, base_url)
+    if state is not None:
+        free = max(0, (state.memory_total or 0) - (state.memory_used or 0))
+        return free, state.profile.node_id, True
+    return 0, host, False
 
 
 def _not_implemented(operation: str, owner: str) -> JSONResponse:
@@ -506,6 +709,326 @@ def _not_implemented(operation: str, owner: str) -> JSONResponse:
         f"{operation} is not wired up yet: the {owner} does not expose it.",
         "server_error",
         "not_implemented",
+    )
+
+
+def _capacity_block(
+    ctx: GatewayContext,
+    plan_nodes: list,
+    budgets: dict,
+    excluded: list,
+    fit,
+    fit_live,
+) -> dict:
+    """What the memory picture was at the moment the verdict was taken.
+
+    The UI draws the live line from this and explains the refusal from it,
+    so every figure is the one the gate actually used -- not a second
+    computation that can disagree with it.
+    """
+    report = getattr(ctx.deps.registry, "memory_report", None)
+    nodes_payload = []
+    if callable(report):
+        for node in plan_nodes:
+            try:
+                one = report(node.node_id)
+            except Exception:
+                log.exception("memory_report failed for %s", node.node_id)
+                one = None
+            if one is not None:
+                nodes_payload.append(one)
+
+    binding_node = None
+    if budgets:
+        binding_node = min(budgets, key=lambda k: budgets[k])
+
+    return {
+        "basis": (fit_live or fit).budget_basis if (fit_live or fit) else None,
+        "measured_at": time.time(),
+        "allocatable_per_node": (
+            budgets[binding_node] if binding_node else None
+        ),
+        "static_per_node": fit.usable_per_node if fit else None,
+        "binding_node": binding_node,
+        "nodes": nodes_payload,
+        "excluded": excluded,
+    }
+
+
+async def _plan_and_fit(ctx: GatewayContext, payload: dict):
+    """Resolve, plan, check fit. Launches nothing.
+
+    Every port call here is potentially slow (network resolution, a
+    planner search, a fit calculation) and this runs inside an async
+    route, so each one is pushed to a worker thread rather than blocking
+    the event loop -- and with it every other in-flight request and
+    stream (M-14).
+    """
+    model_id = payload.get("model_id")
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("model_id is required")
+    # Absent is not 8192. Absent means "choose one", and the choice is
+    # made below, once the plan and the machines it lands on are known --
+    # a context picked before the placement is a number, not a fit.
+    raw_context = payload.get("context")
+    context_length = int(raw_context) if raw_context else None
+    concurrency = int(payload.get("concurrency") or 1)
+    target = payload.get("target") or "throughput"
+    kv_dtype = payload.get("kv_dtype") or ctx.settings.default_kv_dtype
+    dtype = payload.get("dtype")
+    runtime = payload.get("runtime") or "vllm"
+    requested_nodes = _parse_node_ids(payload)
+    requested_degrees = _parse_degrees(payload)
+
+    # Prefer resolve_full when the port exposes it: it carries warnings
+    # worth showing and, on mixed-precision repos, real measured weight
+    # bytes that beat total_params * bytes_per_param (H-10).
+    resolve_full = getattr(ctx.deps.resolver, "resolve_full", None)
+    resolver_warnings: list[str] = []
+    weight_bytes: int | None = None
+    modality = Modality.TEXT
+    if callable(resolve_full):
+        resolution = await asyncio.to_thread(resolve_full, model_id, dtype)
+        shape = resolution.shape
+        resolver_warnings = list(resolution.warnings)
+        weight_bytes = resolution.effective_weight_bytes()
+        modality = _modality_of(resolution.architectures)
+    else:
+        shape = await asyncio.to_thread(ctx.deps.resolver.resolve, model_id, dtype)
+
+    native_window = (
+        getattr(resolution, "max_position_embeddings", None)
+        if callable(resolve_full)
+        else None
+    )
+
+    # Same question `create_deployment` asks before it will launch --
+    # asked here too so a dry run cannot say "fits, click Serve" about an
+    # architecture the runtime does not implement at all. Without this the
+    # fit box only learns the launch was hopeless from the 400 the click
+    # itself produces, and the Serve button never stops offering it.
+    runtime_supported_by = getattr(ctx.deps.resolver, "supported_by", None)
+    runtime_ok, runtime_unsupported_reason = True, None
+    if callable(runtime_supported_by):
+        runtime_ok, runtime_unsupported_reason = await asyncio.to_thread(
+            runtime_supported_by, shape, runtime
+        )
+
+    try:
+        nodes = [n.profile for n in ctx.deps.registry.healthy_nodes()]
+    except Exception:
+        log.exception("registry unavailable while planning")
+        nodes = []
+
+    # Narrow here, before the link lookup, so `worst_all_reduce` measures
+    # only the path this deployment will actually cross. Filtering later
+    # would leave `plan.measured_link_gbps` describing a link the plan
+    # never uses.
+    placement_warnings: list[str] = []
+    if requested_nodes is not None:
+        nodes = _select_nodes(
+            ctx.deps.registry, nodes, requested_nodes, placement_warnings
+        )
+
+    link = None
+    if len(nodes) > 1:
+        try:
+            link = ctx.deps.links.worst_all_reduce([n.node_id for n in nodes])
+        except Exception:
+            log.exception("link lookup failed while planning")
+
+    # The operator named the set, so the set is the request: plan across it
+    # as given rather than narrowing to the strongest homogeneous group.
+    # Whether pooling unlike hardware is *allowed to launch* is a separate
+    # question, answered by the serve gate below -- a dry run starts
+    # nothing, so it owes an honest answer about the set it was handed.
+    pool = requested_nodes is not None
+    ranked = await asyncio.to_thread(
+        partial(
+            _rank_plans,
+            ctx.deps.planner,
+            shape,
+            nodes,
+            link,
+            target,
+            concurrency,
+            context_length=context_length,
+            kv_dtype=kv_dtype,
+            allow_mixed_hardware=pool,
+        )
+    )
+    recommended = ranked[0]
+
+    if requested_degrees is None:
+        plan = recommended
+    else:
+        plan_for = getattr(ctx.deps.planner, "plan_for", None)
+        if not callable(plan_for):
+            # The honest degrade. This planner cannot author a reason for
+            # the operator's shape, and a gateway-written `reason` would be
+            # rendered verbatim and persisted on the deployment forever.
+            raise _PlacementRefused(
+                501,
+                "this planner cannot plan operator-chosen degrees: it "
+                "exposes only the recommendation. Remove `parallelism` to "
+                "plan with the degrees it chooses.",
+                "manual_degrees_unsupported",
+                param=_DEGREES_PARAM,
+            )
+        try:
+            plan = await asyncio.to_thread(
+                partial(
+                    plan_for,
+                    shape,
+                    nodes,
+                    link,
+                    target,
+                    concurrency,
+                    context_length=context_length,
+                    kv_dtype=kv_dtype,
+                    **requested_degrees,
+                )
+            )
+        except IllegalDegrees as exc:
+            first = exc.refusals[0]
+            raise _PlacementRefused(
+                400,
+                str(exc),
+                "illegal_parallelism",
+                param=f"{_DEGREES_PARAM}.{first.axis}",
+                extra={
+                    # The planner's own sentences, one per line, so the UI
+                    # renders them through the same list it renders every
+                    # other rejection through.
+                    "rejected": [r.message for r in exc.refusals],
+                    "legal_degrees": _legal_degrees(shape, len(nodes)),
+                },
+            ) from exc
+
+    _check_every_node_used(plan, nodes, requested_nodes, requested_degrees)
+
+    plan_nodes = [n for n in nodes if n.node_id in set(plan.node_ids)] or nodes
+
+    # The live budget. Two checks, not one widened verdict: the breakdown
+    # is identical under both budgets and only the budget-dependent terms
+    # differ, so two internally consistent FitResults beat one object whose
+    # `reason` would have to describe two budgets in one sentence.
+    #
+    # Computed before the FitRequest, not after, because a context nobody
+    # named is derived against this budget: choosing it off the static
+    # ceiling would offer a window the machine cannot actually hold right
+    # now, which is the whole reason the live budget exists.
+    budgets, excluded, live_reason = livefit.allocatable_map(
+        ctx.deps.registry, [n.node_id for n in plan_nodes]
+    )
+    budgets, zero_excluded = livefit.drop_zero_addressable(plan_nodes, budgets)
+    excluded = excluded + zero_excluded
+    if not budgets and live_reason is None:
+        live_reason = "every node was excluded from the live memory budget"
+
+    if context_length is None:
+        context_length = await asyncio.to_thread(
+            partial(
+                context_for,
+                ctx.deps.fit,
+                shape,
+                plan,
+                plan_nodes,
+                max_seqs=concurrency,
+                kv_dtype=kv_dtype,
+                weight_bytes=weight_bytes,
+                allocatable=budgets or None,
+                native_window=native_window,
+            )
+        )
+
+    req = FitRequest(
+        shape=shape,
+        context_length=context_length,
+        max_concurrent_seqs=concurrency,
+        kv_dtype=kv_dtype,
+        plan=plan,
+        weight_bytes=weight_bytes,
+        native_window=native_window,
+    )
+
+    fit, fit_live, unavailable = await asyncio.to_thread(
+        livefit.dual_check, ctx.deps.fit, req, plan_nodes, budgets
+    )
+    # Pooling unlike hardware is a permission, not a fit failure: the
+    # memory can be there and the machines still not belong in one pool.
+    # It therefore rides as a serve gate rather than as `allowed: false`,
+    # and the plan above was computed across the set as given so the
+    # operator can see what they are agreeing to before agreeing to it.
+    groups = homogeneous_groups(plan_nodes)
+    mixed = requested_nodes is not None and len(groups) > 1
+    gates = []
+    if mixed:
+        gates.append(
+            {"param": _MIXED_HW_PARAM, "reason": pooling_note(groups)}
+        )
+
+    serve = livefit.serve_decision(
+        fit, fit_live, unavailable or live_reason, extra_gates=gates
+    )
+    # An unsupported architecture is a refusal no tick can unblock -- it
+    # overrides whatever the fit gate decided, never merges with it. `fit`
+    # can still pass and the model still never load.
+    if not runtime_ok:
+        serve = {
+            **serve,
+            "allowed": False,
+            "reason": runtime_unsupported_reason,
+            "override_required": False,
+            "override_param": None,
+            "overrides": [],
+        }
+    capacity = _capacity_block(ctx, plan_nodes, budgets, excluded, fit, fit_live)
+
+    used = set(plan.node_ids)
+    placement = {
+        "mode": "operator" if requested_nodes is not None else "planner",
+        "requested_node_ids": requested_nodes,
+        "node_ids": list(plan.node_ids),
+        # Named but carrying no rank. Only reachable when the operator left
+        # the degrees to the planner -- naming both and under-filling is
+        # refused outright by `_check_every_node_used`.
+        "unused_node_ids": [
+            n.node_id for n in nodes if n.node_id not in used
+        ],
+        "mixed_hardware": mixed,
+        "warnings": placement_warnings,
+    }
+    degrees = {
+        "source": "operator" if requested_degrees is not None else "planner",
+        "tensor_parallel": plan.tensor_parallel,
+        "pipeline_parallel": plan.pipeline_parallel,
+        "expert_parallel": plan.expert_parallel,
+        "data_parallel": plan.data_parallel,
+        # The recommendation's own line about the shape that was chosen
+        # instead, matched here because the label vocabulary is the
+        # planner's ("TP=2", "TP=2/PP=2", "single node"). A client
+        # prefix-matching `rejected` would be a second implementation of
+        # that vocabulary, and it would break silently the first time a
+        # label changed.
+        "rejection": _rejection_for(recommended, plan),
+    }
+
+    return _PlanOutcome(
+        shape=shape,
+        plan=plan,
+        fit=fit,
+        fit_live=fit_live,
+        capacity=capacity,
+        serve=serve,
+        context_length=context_length,
+        concurrency=concurrency,
+        resolver_warnings=resolver_warnings,
+        modality=modality,
+        placement=placement,
+        degrees=degrees,
+        recommended=recommended,
+        alternatives=[serialize.plan_degrees_payload(p) for p in ranked],
     )
 
 
@@ -536,6 +1059,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception:
             log.exception("registry labels unavailable")
             return {}
+
+    def _coordinator_build() -> str:
+        """The build this coordinator is running.
+
+        Read from the process rather than from the registry's own member row,
+        so it is right even before the first health round has recorded
+        anything, and right on a registry that tracks no builds at all.
+        """
+        return build_id()
 
     def _links_for(node_ids: list[str]):
         """Every pair, measured or not. Never emit a bandwidth figure that was
@@ -573,7 +1105,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "cluster_id": settings.cluster_id,
                 "coordinator": settings.coordinator_node_id,
                 "nodes": [
-                    serialize.node_payload(n, labels.get(n.profile.node_id))
+                    serialize.node_payload(
+                        n, labels.get(n.profile.node_id), _coordinator_build()
+                    )
                     for n in nodes
                 ],
                 "links": _links_for(node_ids),
@@ -632,7 +1166,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         node_payloads = []
         for node in nodes:
             node_id = node.profile.node_id
-            total_mem = node.profile.total_memory or 0
             strength = strength_by_node.get(node_id)
             if strength is None:
                 strength = raw_hw.get(node_id, 0.0) / top_hw if top_hw else 0.0
@@ -655,9 +1188,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "role": "coordinator"
                     if node_id == settings.coordinator_node_id
                     else "worker",
-                    "memory_used_pct": round(node.memory_used / total_mem * 100.0, 1)
-                    if total_mem
-                    else None,
+                    # From serialize, not recomputed: this row used
+                    # profile.total_memory alone and dropped the host-total
+                    # fallback, so a GPU-less node read as unmeasured here and
+                    # as a real percentage on /api/nodes, at the same instant.
+                    "memory_used_pct": serialize.memory_used_pct(node),
                     # Same rule as /api/nodes, from the same place: a machine
                     # with no GPU has no GPU power draw, and 0 W here would
                     # read as an idle one.
@@ -686,6 +1221,59 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 }
             )
 
+        # Models served by a provider rather than by a deployment.
+        #
+        # `index.remotes` has been populated since the router was written -- one
+        # entry per model of every enabled provider, created on add and needing
+        # no traffic -- and until now nothing read it. So a model routed to a
+        # provider reached the cluster screen as a substring inside the provider
+        # rail's sublabel and as nothing else: no band, no tap, no mention on
+        # any machine.
+        #
+        # `node_id` is the fact that makes this worth reporting. A provider can
+        # BE a machine on the roster, and when it is, a model running there is
+        # running on a box already on screen. Null is the ordinary case -- a
+        # provider nobody here hosts -- and must stay distinguishable from a
+        # machine we failed to match, which is why the match is exact.
+        remote_payloads = []
+        for target_id, (provider, model) in index.remotes.items():
+            host_node = _node_for_address(nodes, provider.base_url)
+            st = ctx.stats.peek(target_id)
+            target = next(
+                (
+                    t
+                    for targets in index.targets.values()
+                    for t in targets
+                    if t.target_id == target_id
+                ),
+                None,
+            )
+            remote_payloads.append(
+                {
+                    "target_id": target_id,
+                    "provider_id": provider.provider_id,
+                    "served_name": model.served_name,
+                    "upstream_id": model.upstream_id,
+                    "node_id": host_node.profile.node_id if host_node else None,
+                    # Which endpoint family this row answers on. A local band
+                    # has carried it since audio landed; without it here, a
+                    # provider's tts-1 was drawn hanging off the chat endpoint
+                    # -- a picture of routing that does not exist.
+                    "modality": model.modality.value,
+                    # From the RouteTarget, not from Provider.healthy, so this
+                    # and /api/routing cannot disagree about one fact.
+                    "state": "healthy"
+                    if (target.healthy if target is not None else provider.healthy)
+                    else "unhealthy",
+                    "admitting": target.admitting if target is not None else None,
+                    # Same call and same window as a deployment two blocks up,
+                    # so a remote row and a local row cannot report throughput
+                    # two different ways.
+                    "tokens_per_sec": round(st.tokens_per_sec(window), 1) if st else 0.0,
+                }
+            )
+        remote_payloads.sort(key=lambda r: (r["served_name"], r["target_id"]))
+
         return JSONResponse(
             {
                 "cluster_id": settings.cluster_id,
@@ -693,6 +1281,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "nodes": node_payloads,
                 "edges": _links_for([n.profile.node_id for n in nodes]),
                 "deployments": deployment_payloads,
+                "remotes": remote_payloads,
             }
         )
 
@@ -703,7 +1292,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         labels = _labels()
         return JSONResponse(
             [
-                serialize.node_payload(n, labels.get(n.profile.node_id))
+                serialize.node_payload(
+                    n, labels.get(n.profile.node_id), _coordinator_build()
+                )
                 for n in _nodes()
             ]
         )
@@ -864,7 +1455,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 404, f"No node '{node_id}'.", "invalid_request_error", "node_not_found"
             )
-        return JSONResponse(serialize.node_payload(node, _labels().get(node_id)))
+        return JSONResponse(
+            serialize.node_payload(node, _labels().get(node_id), _coordinator_build())
+        )
 
     @router.post("/api/nodes/join")
     async def join_node(request: Request) -> Response:
@@ -1105,7 +1698,81 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         index = ctx.router.index()
         return JSONResponse(_routing_payload(index, config))
 
+    @router.delete("/api/routing/{served_name}")
+    async def clear_routing(served_name: str) -> Response:
+        """Drop the explicit override and go back to what auto_policy picks.
+
+        The PUT is not its own inverse. Re-PUTting the policy a model currently
+        resolves to registers an override where there was none, which flips
+        ``auto_selected`` false and freezes the model on a policy the auto
+        ladder would otherwise have moved it off -- so anything that pins a
+        policy for the duration of a run and then puts it back needs this. It
+        is idempotent: a model that is already auto is answered, not mutated.
+        """
+        config = ctx.router.config_for(served_name)
+        if config is None:
+            return errors.error_response(
+                404, f"No model '{served_name}' is being served.",
+                "invalid_request_error", "model_not_found",
+            )
+        if not ctx.router.auto_selected(served_name):
+            ctx.router.clear_policy(served_name)
+            # Re-read: clearing the override changes the resolved policy, and
+            # the reply has to be the state the caller is left with.
+            config = ctx.router.config_for(served_name) or config
+        index = ctx.router.index()
+        return JSONResponse(_routing_payload(index, config))
+
     # -- providers ---------------------------------------------------------
+
+    def _servable(port) -> list:
+        """Providers carrying only the models they are allowed to serve.
+
+        Duck-typed on ``servable`` the way this module reaches every optional
+        port operation. A port without it -- the day-0 stub, a test double --
+        answers with its whole catalogue, which is the behaviour that predates
+        the allowlist and the only honest thing such a port can say.
+        """
+        return getattr(port, "servable", port.list)()
+
+    def _served_view(port, provider):
+        """One provider as the rest of the product sees it.
+
+        The single-provider replies (add, patch, refresh) are the same payload
+        as a row of the listing and have to agree with it. Serializing the
+        record the service handed back instead would put the entire catalogue
+        in the body beside a `model_count` of 0 -- a reply contradicting itself,
+        and 312 models on the wire the moment a provider is added.
+        """
+        try:
+            for candidate in _servable(port):
+                if candidate.provider_id == provider.provider_id:
+                    return candidate
+        except Exception:
+            log.exception("provider listing failed")
+        return provider
+
+    def _key_state(provider_id: str) -> dict | None:
+        """Whether this provider's credential resolves, and from where.
+
+        Optional like every other port method reached through ``getattr`` in
+        this module: a store that never grew ``key_status`` leaves the two
+        fields null, and the listing they ride on still answers. Null is not
+        "no key" -- the UI says so in as many words, because a Settings screen
+        that reports a missing key on a working provider is worse than one
+        that admits it does not know.
+
+        Nothing here is key material and nothing here could be: the result is
+        a state word and the name of a place, never a value.
+        """
+        status = getattr(ctx.deps.providers, "key_status", None)
+        if not callable(status):
+            return None
+        try:
+            return status(provider_id)
+        except Exception:
+            log.exception("provider key status failed")
+            return None
 
     @router.get("/api/providers/kinds")
     async def provider_kinds() -> JSONResponse:
@@ -1134,10 +1801,44 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             kinds_public(), headers={"cache-control": "public, max-age=300"}
         )
 
+    @router.get("/api/providers/secret-refs")
+    async def provider_secret_refs() -> JSONResponse:
+        """The reference *names* already present in secrets.json.
+
+        Names, never values -- ``SecretStore.refs()`` reads the keys of the
+        file and nothing else, and a name is the one part of a secret that is
+        safe to display (it is already rendered in every provider listing).
+
+        The file only. Enumerating the process environment would list the
+        names of every credential the coordinator was started with, which is
+        not this route's business even though names are not values.
+
+        This is what makes naming a reference a choice from what exists rather
+        than typing into a blind box and finding out on POST.
+        """
+        secrets = getattr(ctx.deps.providers, "secrets", None)
+        refs = getattr(secrets, "refs", None)
+        if not callable(refs):
+            return JSONResponse({"refs": []})
+        try:
+            names = [str(r) for r in refs()]
+        except Exception:
+            # An unreadable secrets file is already handled -- and logged --
+            # inside the store, which treats it as empty rather than failing.
+            # A form that cannot autocomplete is not a reason to 500.
+            log.exception("secret reference listing failed")
+            names = []
+        return JSONResponse({"refs": names})
+
     @router.get("/api/providers")
     async def list_providers() -> JSONResponse:
         try:
-            providers = ctx.deps.providers.list()
+            # The servable view, not the catalogue: every screen that reads
+            # this one endpoint -- the provider table, the models list, the
+            # inspector's "served elsewhere", the pull picker, spend -- shows
+            # only what the operator switched on, without any of them filtering.
+            # `/api/providers/{id}/models` is the one place the rest is offered.
+            providers = _servable(ctx.deps.providers)
         except Exception:
             log.exception("provider listing failed")
             providers = []
@@ -1147,7 +1848,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         spend = ui_detail.provider_spend(ctx.deps.providers)
         return JSONResponse(
             [
-                serialize.provider_payload(p, spend.get(p.provider_id))
+                serialize.provider_payload(
+                    p, spend.get(p.provider_id), _key_state(p.provider_id)
+                )
                 for p in providers
             ]
         )
@@ -1175,7 +1878,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         ctx.router.rebuild(force_scores=True)
         spend = ui_detail.provider_spend(ctx.deps.providers)
         return JSONResponse(
-            serialize.provider_payload(provider, spend.get(provider.provider_id)),
+            serialize.provider_payload(
+                _served_view(ctx.deps.providers, provider),
+                spend.get(provider.provider_id),
+                _key_state(provider.provider_id),
+            ),
             status_code=201,
         )
 
@@ -1197,10 +1904,23 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 404, f"No provider '{provider_id}'.",
                 "invalid_request_error", "provider_not_found",
             )
+        except Exception as exc:
+            # POST has caught this since it was written; PATCH did not, so the
+            # same rejected key came back as a framework 500 with the sentence
+            # buried in a traceback instead of a 400 carrying it.
+            log.exception("provider update failed")
+            return errors.error_response(
+                400, f"Could not update provider. {errors.detail(exc, _redactor())}",
+                "invalid_request_error", "provider_update_failed",
+            )
         ctx.router.rebuild(force_scores=True)
         spend = ui_detail.provider_spend(ctx.deps.providers)
         return JSONResponse(
-            serialize.provider_payload(provider, spend.get(provider.provider_id))
+            serialize.provider_payload(
+                _served_view(ctx.deps.providers, provider),
+                spend.get(provider.provider_id),
+                _key_state(provider.provider_id),
+            )
         )
 
     @router.post("/api/providers/{provider_id}/pull")
@@ -1265,19 +1985,52 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "provider_not_found",
             )
 
-        free, node_id = _provider_host_memory(ctx, provider.base_url)
+        free, node_id, measured = _provider_host_memory(ctx, provider.base_url)
         budget = int(free * PULL_HEADROOM) if free else 0
 
         loop = asyncio.get_running_loop()
         gated: asyncio.Future = loop.create_future()
 
+        pull_id = f"pull-{next(_PULL_SEQ)}"
+        record = _Download(
+            pull_id=pull_id,
+            provider_id=provider_id,
+            provider=provider.display_name,
+            model=model,
+            total=None,
+            completed=0,
+            status="",
+            started_at=time.time(),
+            finished_at=None,
+            error=None,
+        )
+
+        def on_progress(frame: dict) -> None:
+            """Fold one upstream frame into the record.
+
+            Every field is guarded because these are somebody else's JSON: a
+            frame that reports `completed` as a string, or a total that shrinks,
+            must leave the last good numbers alone rather than putting a bar
+            that jumps backwards on the screen.
+            """
+            status = frame.get("status")
+            if isinstance(status, str) and status:
+                record.status = status[:200]
+            total = frame.get("total")
+            if isinstance(total, (int, float)) and total > 0:
+                record.total = int(total)
+            completed = frame.get("completed")
+            if isinstance(completed, (int, float)) and completed >= 0:
+                record.completed = int(completed)
+                record.saw_progress = True
+
         def on_size(total: int) -> None:
             if budget and total > budget and not override:
                 exc = PullRefusedError(
                     provider_id, model, total, free,
-                    f"{model} is {_gib(total)} GiB to download and {node_id} has "
-                    f"{_gib(free)} GiB free, of which a model may use "
-                    f"{_gib(budget)} GiB -- the server process, its KV cache and "
+                    f"{model} is {_gib(total)} to download and {node_id} has "
+                    f"{_gib(free)} free, of which a model may use "
+                    f"{_gib(budget)} -- the server process, its KV cache and "
                     f"the operating system need the rest. Pick a smaller model, "
                     f"free memory on {node_id}, or send allow_over_memory to "
                     f"pull it anyway.",
@@ -1285,21 +2038,38 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 if not gated.done():
                     gated.set_exception(exc)
                 raise exc
+            record.total = total
+            # Listed from the moment the gate passes, which is the moment a
+            # transfer actually begins. Earlier would list a pull that is about
+            # to be refused; later would leave the first seconds of a long
+            # download -- the ones somebody is watching for -- unaccounted for.
+            # A pull whose weights are already upstream never reaches here, and
+            # correctly never appears: nothing is being downloaded.
+            _DOWNLOADS[pull_id] = record
             if not gated.done():
                 gated.set_result(total)
 
         async def runner():
             try:
-                return await pull(provider_id, model, on_size=on_size)
+                result = await pull(
+                    provider_id, model, on_size=on_size, on_progress=on_progress,
+                )
             except Exception as exc:
                 if not gated.done():
                     gated.set_exception(exc)
                 raise
-            else:
-                if not gated.done():
-                    # Completed without ever reporting a total: already present
-                    # upstream, so there was nothing to download.
-                    gated.set_result(0)
+            # Not an `else:` clause. It used to be one, and a `return` in the
+            # `try` above meant it never ran: a pull of a model the provider
+            # already had reported no size, nothing ever resolved the gate, and
+            # the request sat until PULL_GATE_TIMEOUT_S and answered 504 "did
+            # not report a download size" about a model that was already there.
+            # The `state: "present"` reply this line exists to produce was
+            # unreachable from the day it was written.
+            if not gated.done():
+                # Completed without ever reporting a total: already present
+                # upstream, so there was nothing to download.
+                gated.set_result(0)
+            return result
 
         def _finished(t: asyncio.Task) -> None:
             """Retire the task, and always retrieve its exception.
@@ -1312,15 +2082,46 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             -- and it lands in the journal, which is how it first showed up.
             """
             _PULLS.discard(t)
+            record.finished_at = time.time()
             if t.cancelled():
+                # The coordinator is going down, or the gate refused. Either
+                # way the transfer stopped partway and saying so is the whole
+                # point -- this is the case that cost somebody four minutes of
+                # debugging their own code before they found the SIGTERM.
+                record.error = "cancelled before it finished"
                 return
             failure = t.exception()
             if failure is not None:
+                record.error = errors.detail(failure, _redactor())
                 log.warning(
                     "pull of %r onto %s did not complete: %s",
                     model, provider_id, failure,
                 )
                 return
+            # A truncated stream ends CLEANLY. When the upstream dies partway
+            # the frame loop simply runs out of lines and this task returns
+            # normally, with no exception to report -- so "it did not raise"
+            # is not evidence that the weights arrived. Taking it as evidence
+            # filled the bar to 4.00/4.00 GiB for a transfer observed stopping
+            # at 0.30 GiB, which is precisely the invented figure this surface
+            # exists to avoid printing.
+            if (
+                record.saw_progress
+                and record.total
+                and record.completed < record.total * _COMPLETE_FRACTION
+            ):
+                record.error = (
+                    f"stopped after {_gib(record.completed)} of "
+                    f"{_gib(record.total)} -- the provider closed the "
+                    f"connection before the transfer finished. Nothing "
+                    f"resumes it; pull it again."
+                )
+                return
+            # Only now: the last frame can be a few bytes short of the total
+            # without the transfer being short, and a bar that stops at 99.98%
+            # forever reads as a hang.
+            if record.total is not None:
+                record.completed = record.total
             # Only a completed pull changes what is routable.
             ctx.router.rebuild(force_scores=True)
 
@@ -1357,10 +2158,21 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             {
                 "provider_id": provider_id,
                 "model": model,
+                # Addresses this transfer's record in /api/activity for as long
+                # as it runs. Absent when nothing is being downloaded, because
+                # there is no transfer to name.
+                "pull_id": pull_id if total else None,
                 "download_bytes": total,
                 "checked_against": node_id,
                 "free_bytes": free,
                 "budget_bytes": budget,
+                # Whether a size was actually weighed against a measurement,
+                # which `budget_bytes: 0` alone cannot say -- an unjoined box
+                # and a full one produce the same zero. Without this the UI
+                # can only report a number, and reporting "0 GiB free" for a
+                # machine nobody measured is the kind of invented headroom
+                # this project refuses to print.
+                "gated": bool(measured and budget),
                 "state": "pulling" if total else "present",
             },
             status_code=202,
@@ -1403,11 +2215,31 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         ctx.router.rebuild(force_scores=True)
         spend = ui_detail.provider_spend(ctx.deps.providers)
         return JSONResponse(
-            serialize.provider_payload(provider, spend.get(provider.provider_id))
+            serialize.provider_payload(
+                _served_view(ctx.deps.providers, provider),
+                spend.get(provider.provider_id),
+                _key_state(provider.provider_id),
+            )
         )
 
     @router.get("/api/providers/{provider_id}/models")
     async def provider_models(provider_id: str) -> Response:
+        """The whole catalogue, each model saying whether it is switched on.
+
+        The one provider surface that is not filtered by the allowlist, because
+        it is the one the allowlist is chosen from. A port too old to answer
+        `catalogue()` falls back to its plain model list, where every model
+        reads as enabled -- which is exactly what such a port serves.
+        """
+        catalogue = getattr(ctx.deps.providers, "catalogue", None)
+        if callable(catalogue):
+            try:
+                return JSONResponse(catalogue(provider_id))
+            except UnknownProviderError:
+                return errors.error_response(
+                    404, f"No provider '{provider_id}'.",
+                    "invalid_request_error", "provider_not_found",
+                )
         try:
             providers = ctx.deps.providers.list()
         except Exception:
@@ -1422,7 +2254,171 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "provider_not_found",
             )
         return JSONResponse(
-            [serialize.provider_model_payload(m) for m in provider.models]
+            [
+                {**serialize.provider_model_payload(m), "enabled": True}
+                for m in provider.models
+            ]
+        )
+
+    @router.get("/api/providers/{provider_id}/backends")
+    async def provider_backends(provider_id: str, upstream_id: str) -> Response:
+        """One model's backend hosts, for a kind that aggregates several per model.
+
+        Live, not the cached catalogue: the whole point is to see what is
+        available right now to pin against. 400 for a kind that does not
+        aggregate backends at all (`AdapterUnsupportedError`) rather than an
+        empty list, which would read as "this model has no backends" instead
+        of "this provider does not have the concept".
+        """
+        list_backends_async = getattr(ctx.deps.providers, "list_backends_async", None)
+        try:
+            if callable(list_backends_async):
+                rows = await list_backends_async(provider_id, upstream_id)
+            else:
+                rows = await asyncio.to_thread(
+                    ctx.deps.providers.list_backends, provider_id, upstream_id
+                )
+        except UnknownProviderError:
+            return errors.error_response(
+                404, f"No provider '{provider_id}'.",
+                "invalid_request_error", "provider_not_found",
+            )
+        except AdapterUnsupportedError as exc:
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "backend_routing_unsupported",
+            )
+        except UpstreamError as exc:
+            return errors.error_response(
+                exc.status_code, exc.message, "upstream_error", exc.error_code or "upstream_error",
+            )
+        except Exception as exc:
+            log.exception("backend listing failed")
+            return errors.error_response(
+                502, f"Could not list backends. {errors.detail(exc, _redactor())}",
+                "upstream_error", "backend_list_failed",
+            )
+        return JSONResponse(rows)
+
+    @router.get("/api/providers/{provider_id}/logo")
+    async def provider_logo(provider_id: str) -> Response:
+        """This provider's own mark, fetched once by the coordinator and cached.
+
+        Proxied rather than fetched by the browser so it still resolves on a
+        console with no egress of its own -- frequently the case, a laptop on
+        the lab LAN pointed at a coordinator that does have it -- and so no
+        provider domain is handed to a third party.
+
+        A 404 is an ordinary answer here, not a fault: the Cluster tab draws a
+        monogram tile underneath and the miss is simply never painted over. So
+        a cold cache answers 404 immediately and starts the fetch behind it
+        rather than holding the response open; the next render gets the mark.
+        Nothing on this path is ever allowed to make a screen wait.
+        """
+        try:
+            providers = ctx.deps.providers.list()
+        except Exception:
+            log.exception("provider listing failed")
+            providers = []
+        provider = next((p for p in providers if p.provider_id == provider_id), None)
+        if provider is None:
+            return errors.error_response(
+                404, f"No provider '{provider_id}'.",
+                "invalid_request_error", "provider_not_found",
+            )
+
+        cache = _logo_cache()
+        hit = cache.get(provider_id)
+        if hit is not None:
+            body, content_type = hit
+            return Response(
+                body,
+                media_type=content_type,
+                headers={"cache-control": "public, max-age=86400"},
+            )
+
+        if not cache.is_fresh_miss(provider_id):
+            asyncio.create_task(_warm_logo(cache, provider))
+        return errors.error_response(
+            404, f"No logo for '{provider_id}'.",
+            "invalid_request_error", "logo_not_found",
+        )
+
+    @router.get("/api/publishers/avatars")
+    async def publisher_avatars(request: Request) -> Response:
+        """Which of these model publishers have a mark, resolved once, cached.
+
+        The browser used to ask huggingface.co directly, once per publisher,
+        on every page load. A Models grid is ~45 distinct publishers and the
+        hub's unauthenticated limit is below that, so the grid 429ed itself and
+        every card fell back to two letters for the length of the backoff --
+        which is the bug this endpoint exists to remove. Here it is forty-five
+        lookups TOTAL, kept on disk, shared by every browser and surviving a
+        restart.
+
+        Batched rather than one route per publisher because the whole grid is
+        one question, and asking it as forty-five requests over a browser's six
+        connections is how the image route would starve `/api/*` behind it.
+
+        Three answers, and the third is the important one:
+
+            {"avatars": {"Qwen": "/api/publishers/Qwen/avatar", "acme": null}}
+
+        a string is ready to draw, null is "this publisher has no mark, stop
+        asking", and a name that is ABSENT is still resolving -- ask again in a
+        moment. Collapsing that third case into null is what would put a
+        publisher on letters for a day because the hub was slow once.
+        """
+        from control_plane.resolver import avatars
+
+        raw = request.query_params.get("owners", "")
+        owners = [part for part in raw.split(",") if part.strip()]
+        if not owners:
+            return JSONResponse({"avatars": {}})
+        # A cap, not a pagination scheme: the client chunks, and an unbounded
+        # list here would be an unbounded fan-out at somebody else's hub.
+        owners = owners[:64]
+
+        try:
+            found = await avatars.resolve_many(owners)
+        except Exception:  # noqa: BLE001 - cosmetic path, never a 500
+            log.debug("avatar batch failed", exc_info=True)
+            return JSONResponse({"avatars": {}})
+
+        return JSONResponse(
+            {
+                "avatars": {
+                    owner: (f"/api/publishers/{quote(owner, safe='')}/avatar" if ready else None)
+                    for owner, ready in found.items()
+                }
+            },
+            headers={"cache-control": "no-store"},
+        )
+
+    @router.get("/api/publishers/{owner}/avatar")
+    async def publisher_avatar(owner: str) -> Response:
+        """One publisher's mark, from the cache. This route never fetches.
+
+        Deliberately not the place the network is touched: on HTTP/1.1 a
+        browser opens about six connections per origin, and a grid of ninety
+        images that each waited on huggingface.co would hold all six for
+        seconds with `/api/*` queued behind them. `/api/publishers/avatars`
+        does the fetching, on one connection, and only names it reported as
+        ready are ever requested here -- so in practice this is always a hit.
+        """
+        from control_plane.resolver import avatars
+
+        name = avatars.normalize(owner)
+        hit = avatars.cache().get(name) if name else None
+        if hit is None:
+            return errors.error_response(
+                404, f"No avatar for '{owner}'.",
+                "invalid_request_error", "avatar_not_found",
+            )
+        body, content_type = hit
+        return Response(
+            body,
+            media_type=content_type,
+            headers={"cache-control": "public, max-age=86400"},
         )
 
     # -- plan and deployments ---------------------------------------------
@@ -1465,8 +2461,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 f"Could not plan{named}: the model's metadata could not be "
                 f"fetched."
             ),
+            # Not "the architecture is not supported": that asserts a cause,
+            # and this code covers two of them. A model can arrive here
+            # because no runtime loads its architecture, or because its
+            # config.json could not be sized at all -- `Qwen3-TTS` keeps its
+            # stack under `talker_config` and was reported as an unsupported
+            # architecture when the architecture was never the problem. The
+            # detail appended below is the resolver's own sentence and names
+            # which of the two it was.
             "unsupported_architecture": (
-                f"Could not plan{named}: the architecture is not supported."
+                f"Could not plan{named}: derate could not size this model."
             ),
         }.get(code, f"Could not plan{named}.")
         return errors.error_response(
@@ -1481,266 +2485,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
 
 
-    def _capacity_block(
-        plan_nodes: list,
-        budgets: dict,
-        excluded: list,
-        fit,
-        fit_live,
-    ) -> dict:
-        """What the memory picture was at the moment the verdict was taken.
-
-        The UI draws the live line from this and explains the refusal from it,
-        so every figure is the one the gate actually used -- not a second
-        computation that can disagree with it.
-        """
-        report = getattr(ctx.deps.registry, "memory_report", None)
-        nodes_payload = []
-        if callable(report):
-            for node in plan_nodes:
-                try:
-                    one = report(node.node_id)
-                except Exception:
-                    log.exception("memory_report failed for %s", node.node_id)
-                    one = None
-                if one is not None:
-                    nodes_payload.append(one)
-
-        binding_node = None
-        if budgets:
-            binding_node = min(budgets, key=lambda k: budgets[k])
-
-        return {
-            "basis": (fit_live or fit).budget_basis if (fit_live or fit) else None,
-            "measured_at": time.time(),
-            "allocatable_per_node": (
-                budgets[binding_node] if binding_node else None
-            ),
-            "static_per_node": fit.usable_per_node if fit else None,
-            "binding_node": binding_node,
-            "nodes": nodes_payload,
-            "excluded": excluded,
-        }
-
-
-    async def _plan_and_fit(payload: dict):
-        """Resolve, plan, check fit. Launches nothing.
-
-        Every port call here is potentially slow (network resolution, a
-        planner search, a fit calculation) and this runs inside an async
-        route, so each one is pushed to a worker thread rather than blocking
-        the event loop -- and with it every other in-flight request and
-        stream (M-14).
-        """
-        model_id = payload.get("model_id")
-        if not isinstance(model_id, str) or not model_id:
-            raise ValueError("model_id is required")
-        context_length = int(payload.get("context") or 8192)
-        concurrency = int(payload.get("concurrency") or 1)
-        target = payload.get("target") or "throughput"
-        kv_dtype = payload.get("kv_dtype") or settings.default_kv_dtype
-        dtype = payload.get("dtype")
-        requested_nodes = _parse_node_ids(payload)
-        requested_degrees = _parse_degrees(payload)
-
-        # Prefer resolve_full when the port exposes it: it carries warnings
-        # worth showing and, on mixed-precision repos, real measured weight
-        # bytes that beat total_params * bytes_per_param (H-10).
-        resolve_full = getattr(ctx.deps.resolver, "resolve_full", None)
-        resolver_warnings: list[str] = []
-        weight_bytes: int | None = None
-        modality = Modality.TEXT
-        if callable(resolve_full):
-            resolution = await asyncio.to_thread(resolve_full, model_id, dtype)
-            shape = resolution.shape
-            resolver_warnings = list(resolution.warnings)
-            weight_bytes = resolution.effective_weight_bytes()
-            modality = _modality_of(resolution.architectures)
-        else:
-            shape = await asyncio.to_thread(ctx.deps.resolver.resolve, model_id, dtype)
-
-        try:
-            nodes = [n.profile for n in ctx.deps.registry.healthy_nodes()]
-        except Exception:
-            log.exception("registry unavailable while planning")
-            nodes = []
-
-        # Narrow here, before the link lookup, so `worst_all_reduce` measures
-        # only the path this deployment will actually cross. Filtering later
-        # would leave `plan.measured_link_gbps` describing a link the plan
-        # never uses.
-        placement_warnings: list[str] = []
-        if requested_nodes is not None:
-            nodes = _select_nodes(
-                ctx.deps.registry, nodes, requested_nodes, placement_warnings
-            )
-
-        link = None
-        if len(nodes) > 1:
-            try:
-                link = ctx.deps.links.worst_all_reduce([n.node_id for n in nodes])
-            except Exception:
-                log.exception("link lookup failed while planning")
-
-        # The operator named the set, so the set is the request: plan across it
-        # as given rather than narrowing to the strongest homogeneous group.
-        # Whether pooling unlike hardware is *allowed to launch* is a separate
-        # question, answered by the serve gate below -- a dry run starts
-        # nothing, so it owes an honest answer about the set it was handed.
-        pool = requested_nodes is not None
-        ranked = await asyncio.to_thread(
-            partial(
-                _rank_plans,
-                ctx.deps.planner,
-                shape,
-                nodes,
-                link,
-                target,
-                concurrency,
-                context_length=context_length,
-                kv_dtype=kv_dtype,
-                allow_mixed_hardware=pool,
-            )
-        )
-        recommended = ranked[0]
-
-        if requested_degrees is None:
-            plan = recommended
-        else:
-            plan_for = getattr(ctx.deps.planner, "plan_for", None)
-            if not callable(plan_for):
-                # The honest degrade. This planner cannot author a reason for
-                # the operator's shape, and a gateway-written `reason` would be
-                # rendered verbatim and persisted on the deployment forever.
-                raise _PlacementRefused(
-                    501,
-                    "this planner cannot plan operator-chosen degrees: it "
-                    "exposes only the recommendation. Remove `parallelism` to "
-                    "plan with the degrees it chooses.",
-                    "manual_degrees_unsupported",
-                    param=_DEGREES_PARAM,
-                )
-            try:
-                plan = await asyncio.to_thread(
-                    partial(
-                        plan_for,
-                        shape,
-                        nodes,
-                        link,
-                        target,
-                        concurrency,
-                        context_length=context_length,
-                        kv_dtype=kv_dtype,
-                        **requested_degrees,
-                    )
-                )
-            except IllegalDegrees as exc:
-                first = exc.refusals[0]
-                raise _PlacementRefused(
-                    400,
-                    str(exc),
-                    "illegal_parallelism",
-                    param=f"{_DEGREES_PARAM}.{first.axis}",
-                    extra={
-                        # The planner's own sentences, one per line, so the UI
-                        # renders them through the same list it renders every
-                        # other rejection through.
-                        "rejected": [r.message for r in exc.refusals],
-                        "legal_degrees": _legal_degrees(shape, len(nodes)),
-                    },
-                ) from exc
-
-        _check_every_node_used(plan, nodes, requested_nodes, requested_degrees)
-
-        plan_nodes = [n for n in nodes if n.node_id in set(plan.node_ids)] or nodes
-        req = FitRequest(
-            shape=shape,
-            context_length=context_length,
-            max_concurrent_seqs=concurrency,
-            kv_dtype=kv_dtype,
-            plan=plan,
-            weight_bytes=weight_bytes,
-        )
-
-        # The live budget. Two checks, not one widened verdict: the breakdown
-        # is identical under both budgets and only the budget-dependent terms
-        # differ, so two internally consistent FitResults beat one object whose
-        # `reason` would have to describe two budgets in one sentence.
-        budgets, excluded, live_reason = livefit.allocatable_map(
-            ctx.deps.registry, [n.node_id for n in plan_nodes]
-        )
-        budgets, zero_excluded = livefit.drop_zero_addressable(plan_nodes, budgets)
-        excluded = excluded + zero_excluded
-        if not budgets and live_reason is None:
-            live_reason = "every node was excluded from the live memory budget"
-
-        fit, fit_live, unavailable = await asyncio.to_thread(
-            livefit.dual_check, ctx.deps.fit, req, plan_nodes, budgets
-        )
-        # Pooling unlike hardware is a permission, not a fit failure: the
-        # memory can be there and the machines still not belong in one pool.
-        # It therefore rides as a serve gate rather than as `allowed: false`,
-        # and the plan above was computed across the set as given so the
-        # operator can see what they are agreeing to before agreeing to it.
-        groups = homogeneous_groups(plan_nodes)
-        mixed = requested_nodes is not None and len(groups) > 1
-        gates = []
-        if mixed:
-            gates.append(
-                {"param": _MIXED_HW_PARAM, "reason": pooling_note(groups)}
-            )
-
-        serve = livefit.serve_decision(
-            fit, fit_live, unavailable or live_reason, extra_gates=gates
-        )
-        capacity = _capacity_block(plan_nodes, budgets, excluded, fit, fit_live)
-
-        used = set(plan.node_ids)
-        placement = {
-            "mode": "operator" if requested_nodes is not None else "planner",
-            "requested_node_ids": requested_nodes,
-            "node_ids": list(plan.node_ids),
-            # Named but carrying no rank. Only reachable when the operator left
-            # the degrees to the planner -- naming both and under-filling is
-            # refused outright by `_check_every_node_used`.
-            "unused_node_ids": [
-                n.node_id for n in nodes if n.node_id not in used
-            ],
-            "mixed_hardware": mixed,
-            "warnings": placement_warnings,
-        }
-        degrees = {
-            "source": "operator" if requested_degrees is not None else "planner",
-            "tensor_parallel": plan.tensor_parallel,
-            "pipeline_parallel": plan.pipeline_parallel,
-            "expert_parallel": plan.expert_parallel,
-            "data_parallel": plan.data_parallel,
-            # The recommendation's own line about the shape that was chosen
-            # instead, matched here because the label vocabulary is the
-            # planner's ("TP=2", "TP=2/PP=2", "single node"). A client
-            # prefix-matching `rejected` would be a second implementation of
-            # that vocabulary, and it would break silently the first time a
-            # label changed.
-            "rejection": _rejection_for(recommended, plan),
-        }
-
-        return _PlanOutcome(
-            shape=shape,
-            plan=plan,
-            fit=fit,
-            fit_live=fit_live,
-            capacity=capacity,
-            serve=serve,
-            context_length=context_length,
-            concurrency=concurrency,
-            resolver_warnings=resolver_warnings,
-            modality=modality,
-            placement=placement,
-            degrees=degrees,
-            recommended=recommended,
-            alternatives=[serialize.plan_degrees_payload(p) for p in ranked],
-        )
-
     @router.post("/api/plan")
     async def plan_endpoint(request: Request) -> Response:
         try:
@@ -1751,7 +2495,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         model_id = payload.get("model_id") if isinstance(payload, dict) else None
         try:
-            out = await _plan_and_fit(payload)
+            out = await _plan_and_fit(ctx, payload)
         except _PlacementRefused as exc:
             return exc.response()
         except ValueError as exc:
@@ -1773,6 +2517,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     serialize.fit_payload(out.fit_live) if out.fit_live else None
                 ),
                 "capacity": out.capacity,
+                # The numbers this verdict was actually taken at. Echoed
+                # because they are no longer necessarily the ones that were
+                # sent: a body with no `context` asks the coordinator to choose
+                # one from what fits, and a verdict whose question is not on
+                # screen beside it is not checkable.
+                "context": out.context_length,
+                "concurrency": out.concurrency,
                 # The one field the UI reads for the button. Which verdict
                 # governs is decided here, not in the client.
                 "serve": out.serve,
@@ -1833,8 +2584,49 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "dtype_not_launchable",
             )
+
+        # Free-text CLI tokens, for a model the standard recipe doesn't cover.
+        # Read here, not inside _plan_and_fit: unlike dtype these never touch
+        # sizing or planning, so a dry run has no reason to see them.
+        # shlex.split so a caller can paste a flag string with a quoted value
+        # ("--foo 'bar baz'") without doing any parsing itself; each resulting
+        # token is checked against the M-22 allowlist inside
+        # DeploymentManager.launch, not here. extra_args appends to the
+        # generated command; custom_command replaces it -- sending both is
+        # refused as a ValueError from launch() itself, turned into a 400 in
+        # the except block below, so the two parses below do not need to
+        # agree with each other about which one wins.
+        def _parse_cli_tokens(field: str) -> tuple[str, ...] | Response:
+            raw = payload.get(field) if isinstance(payload, dict) else None
+            if not raw:
+                return ()
+            if not isinstance(raw, str):
+                return errors.error_response(
+                    400,
+                    "%s must be a string of space-separated CLI tokens." % field,
+                    "invalid_request_error",
+                    "invalid_request",
+                )
+            try:
+                return tuple(shlex.split(raw))
+            except ValueError as exc:
+                return errors.error_response(
+                    400,
+                    "%s could not be parsed as a CLI argument string: %s"
+                    % (field, exc),
+                    "invalid_request_error",
+                    "invalid_request",
+                )
+
+        extra_args = _parse_cli_tokens("extra_args")
+        if isinstance(extra_args, Response):
+            return extra_args
+        custom_command = _parse_cli_tokens("custom_command")
+        if isinstance(custom_command, Response):
+            return custom_command
+
         try:
-            out = await _plan_and_fit(payload)
+            out = await _plan_and_fit(ctx, payload)
         except _PlacementRefused as exc:
             return exc.response()
         except ValueError as exc:
@@ -1865,6 +2657,22 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 return errors.error_response(
                     400, reason, "invalid_request_error", "runtime_unsupported"
                 )
+
+        # A runtime that cannot shard, handed a plan that shards. Checked here
+        # and not inside the launcher because this is the last place a refusal
+        # is still a 400 the caller can act on: past it, the machines are
+        # committed and the same fact becomes a FAILED record.
+        sharding_problem = _sharding_refusal(
+            runtime,
+            plan.tensor_parallel,
+            plan.pipeline_parallel,
+            plan.expert_parallel,
+            plan.data_parallel,
+        )
+        if sharding_problem:
+            return errors.error_response(
+                400, sharding_problem, "invalid_request_error", "runtime_cannot_shard"
+            )
 
         # If the verdict is WONT_FIT the launch is refused with the reason.
         # Nothing is started.
@@ -2040,15 +2848,52 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     context_length,
                     concurrency,
                     modality=out.modality,
+                    extra_args=extra_args,
+                    custom_command=custom_command,
                 )
             )
         except ValueError as exc:
-            # An input validation error -- e.g. a command-unsafe model id --
-            # not a launch that genuinely failed.
+            # An input validation error -- e.g. a command-unsafe model id, an
+            # extra_args/custom_command token check_extra_args_safe rejected,
+            # or both fields sent at once -- not a
+            # launch that genuinely failed.
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
             )
         except Exception as exc:
+            # A node in the plan already runs this model, or already answers to
+            # this served name. Duck-typed on `existing` rather than caught by
+            # class, for the reason given at _TERMINAL_STATES above: importing
+            # DuplicateDeployment means importing control_plane.deploy, which
+            # pulls the manager, the sparkrun adapter and the event bus into
+            # this request module.
+            #
+            # 409, and the same reasoning as the live-memory 409 above: the
+            # request is well formed, the conflict is with what is running now,
+            # and an unchanged retry succeeds once that deployment is stopped.
+            # Reaching the 502 instead reported an operator's own placement
+            # back to them as a server fault.
+            existing = getattr(exc, "existing", None)
+            if getattr(existing, "deployment_id", None):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": {
+                            # The manager's sentence, unedited: it names the
+                            # deployment in the way and what to do about it.
+                            "message": str(exc),
+                            "type": "invalid_request_error",
+                            "param": None,
+                            "code": "already_deployed",
+                        },
+                        # So the screen can link to the thing it must stop
+                        # rather than making the reader go and find it.
+                        "conflict": serialize.deployment_payload(existing),
+                        "clash": getattr(exc, "clash", "served_name"),
+                        "plan": serialize.plan_payload(plan),
+                        "fit": serialize.fit_payload(fit),
+                    },
+                )
             log.exception("launch failed")
             return errors.error_response(
                 502, f"Launch failed. {errors.detail(exc, _redactor())}",
@@ -2083,6 +2928,158 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         ctx.router.rebuild(force_scores=True)
         return JSONResponse({"stopping": deployment_id})
+
+    @router.get("/api/deployments/{deployment_id}/logs")
+    async def deployment_logs(deployment_id: str, tail: int = 500) -> Response:
+        """What the launcher and the backend said, for the sheet showing it.
+
+        The deployment inspector had every measurement a serving model
+        produces and nothing at all about one that is still arriving -- and
+        arriving is when somebody actually wants the log. The manager keeps
+        the lines it already streams, so while a launch is in flight this is a
+        read from memory and a screen may poll it; once it is over the same
+        route falls back to one bounded `sparkrun logs`, which is why the
+        answer says which of the two it is.
+
+        Off the event loop: the fallback shells out and blocks by design.
+        """
+        try:
+            existing = ctx.deps.deployments.get(deployment_id)
+        except Exception:
+            log.exception("deployment lookup failed")
+            existing = None
+        if existing is None:
+            return errors.error_response(
+                404, f"No deployment '{deployment_id}'.",
+                "invalid_request_error", "deployment_not_found",
+            )
+        reader = getattr(ctx.deps.deployments, "log_tail", None)
+        if not callable(reader):
+            # A port that cannot show a log says so, rather than an empty log
+            # that reads as a backend which printed nothing.
+            return JSONResponse({"lines": [], "source": "unavailable"})
+        limit = max(1, min(int(tail), 2000))
+        try:
+            answer = await asyncio.to_thread(reader, deployment_id, limit=limit)
+        except Exception as exc:
+            log.exception("reading the deployment log failed")
+            return errors.error_response(
+                502, f"Could not read the log. {errors.detail(exc, _redactor())}",
+                "server_error", "log_read_failed",
+            )
+        return JSONResponse(answer)
+
+    # -- activity ----------------------------------------------------------
+
+    @router.get("/api/activity")
+    async def activity() -> JSONResponse:
+        """What is arriving: transfers in flight, and models still starting.
+
+        Two things the product could previously only report as silence. A pull
+        was one number in a 202 followed by minutes of nothing, and a launch is
+        up to READY_TIMEOUT_S of `launching` with no number attached -- while
+        the rail beside it said "Nothing is being served" three times over.
+
+        A separate endpoint rather than a field on the metrics frame: section
+        4.8 fixes that payload and the UI codes against it, so this follows the
+        rule the history surface already established a few lines below.
+
+        Cheap on purpose, because the UI polls it every couple of seconds: a
+        process-local dict and the in-memory deployment list. No fan-out to the
+        node agents and no syscalls -- which is exactly why /api/storage, which
+        does both, is polled at thirty seconds instead.
+        """
+        now = time.time()
+
+        downloads = [
+            {
+                "pull_id": rec.pull_id,
+                "provider_id": rec.provider_id,
+                "provider": rec.provider,
+                "model": rec.model,
+                "completed": rec.completed,
+                "total": rec.total,
+                "status": rec.status,
+                "error": rec.error,
+                "done": rec.finished_at is not None,
+            }
+            for rec in _sweep_downloads(now)
+        ]
+
+        try:
+            deployments = ctx.deps.deployments.list()
+        except Exception:
+            log.exception("deployment listing failed while reading activity")
+            deployments = []
+
+        # What each launch is actually doing, read off sparkrun's output and
+        # the backend's own log by the deployment manager. Through a getattr
+        # like `handles` below it, because DeploymentPort is frozen at
+        # launch/stop/list/get: a port without this reports no phase, which is
+        # exactly what the screen drew before there was one.
+        reader = getattr(ctx.deps.deployments, "progress", None)
+        phases: dict[str, dict] = {}
+        if callable(reader):
+            try:
+                phases = reader() or {}
+            except Exception:
+                log.exception("reading launch progress failed")
+
+        launches = []
+        live_ids = set()
+        for d in deployments:
+            # An allowlist, not "everything that is not terminal". Written the
+            # other way round it let DEGRADED through, which is a model that is
+            # up and serving badly -- the plan and routing sections beside this
+            # one already describe it, and calling it activity would report a
+            # live deployment as one that had not arrived yet. STOPPING is the
+            # mirror of the same mistake: it is leaving, not arriving.
+            if d.state not in _ARRIVING_STATES:
+                continue
+            live_ids.add(d.deployment_id)
+            since = _LAUNCH_SEEN.setdefault(d.deployment_id, now)
+            phase = phases.get(d.deployment_id) or {}
+            launches.append(
+                {
+                    "deployment_id": d.deployment_id,
+                    "served_name": d.served_name,
+                    "model_id": d.shape.model_id if d.shape else None,
+                    "runtime": d.runtime,
+                    "state": d.state.value,
+                    "node_ids": list(d.plan.node_ids) if d.plan else [],
+                    "since": since,
+                    # Which of the four slow things it is on, and the sentence
+                    # whoever is doing it printed about it. Null when nothing
+                    # has been read yet -- an unstarted launch, or a runtime
+                    # whose log says nothing this build recognises.
+                    "phase": phase.get("phase"),
+                    "status": phase.get("status") or "",
+                    # A real fraction or nothing. The checkpoint-shard loader
+                    # counts its own shards; no other part of a launch reports
+                    # a denominator, and none is invented for them.
+                    "fraction": phase.get("fraction"),
+                    # Seconds left, as the downloader or the checkpoint loader
+                    # estimated it about itself. Null for every step that
+                    # counts nothing, and never filled in from a rate computed
+                    # here -- an estimate a person can plan around has to come
+                    # from the thing being estimated.
+                    "eta_s": phase.get("eta_s"),
+                    # The runtime said it was dying. The manager fails the
+                    # launch on this too, so a row carrying it is one caught
+                    # between the reading and the transition -- worth drawing
+                    # as a fault for that moment rather than as progress.
+                    "fatal": bool(phase.get("fatal")),
+                    # Whatever the manager last recorded. Usually None while a
+                    # launch is healthy; the health probe's per-poll reason is
+                    # local to _wait_for_ready and never reaches the record.
+                    "last_error": d.last_error,
+                }
+            )
+        for stale in set(_LAUNCH_SEEN) - live_ids:
+            del _LAUNCH_SEEN[stale]
+
+        launches.sort(key=lambda item: item["since"])
+        return JSONResponse({"downloads": downloads, "launches": launches})
 
     # -- metrics -----------------------------------------------------------
 
@@ -2453,7 +3450,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             "rollup_1m_s": cfg.ROLLUP_1M_RETENTION_S,
             "rollup_1h_s": cfg.ROLLUP_1H_RETENTION_S,
             "archive_max_bytes": cfg.ARCHIVE_MAX_BYTES,
-            "journal_max_bytes": cfg.JOURNAL_MAX_BYTES,
+            # The effective value, not the compiled-in default: this screen is
+            # where an operator checks whether DERATE_TELEMETRY_MAX_BYTES took.
+            "journal_max_bytes": cfg.journal_max_bytes(),
             "journal_retention_s": cfg.JOURNAL_RETENTION_S,
         }
 
@@ -2467,14 +3466,39 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 log.exception("telemetry status failed")
                 status = {"enabled": False, "reason": "status unavailable"}
 
-        return JSONResponse(
-            {
-                "nodes": node_rows,
-                "telemetry": status,
-                "retention": retention,
-                "measured_at": time.time(),
-            }
-        )
+        body = {
+            "nodes": node_rows,
+            "telemetry": status,
+            "retention": retention,
+            "measured_at": time.time(),
+        }
+
+        # Hand the weights half to the model registry, which has no fan-out of
+        # its own on purpose: walking every node's cache is the expensive part
+        # of this endpoint, and scheduling a second cluster-wide walk to
+        # populate /api/models would double it for the same answer. The
+        # direction is one-way -- storage feeds the registry, never the
+        # reverse -- or a registry refreshed on a timer would start answering
+        # this screen with a reading older than the one it just took.
+        #
+        # Guarded, and deliberately after `body` is built: a registry fault
+        # must never turn the Storage tab into a 500 over a view that can be
+        # rebuilt from stores that are all still readable.
+        inventory = getattr(ctx, "inventory", None)
+        if inventory is not None:
+            try:
+                await asyncio.to_thread(inventory.refresh_cache, body)
+                keep = {n["node_id"] for n in node_rows}
+                if keep:
+                    # Only with a roster we actually read. If list_nodes()
+                    # raised above, `nodes` is empty and every node would look
+                    # departed -- wiping the disk picture for the cluster over
+                    # one registry hiccup.
+                    await asyncio.to_thread(inventory.drop_nodes, keep)
+            except Exception:
+                log.exception("model registry could not take the storage reading")
+
+        return JSONResponse(body)
 
     @router.delete("/api/storage/nodes/{node_id}/models/{folder}")
     async def delete_cached_model(node_id: str, folder: str) -> Response:

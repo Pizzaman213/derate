@@ -6,7 +6,7 @@ The first half of this file is unit tests with no HTTP: the point of
 to serialize.py and internal_api.py -- files several sessions edit
 concurrently -- is a call site and nothing more. The second half pins that the
 call sites actually pass the right data through: a measured link's five
-annotation keys, a provider's nine spend keys, and a routing target's
+annotation keys, a provider's twelve spend keys, and a routing target's
 counters/strength_raw/admission_blocks, over real HTTP through `create_app`.
 """
 
@@ -108,12 +108,22 @@ def test_a_port_that_does_not_account_yields_null_not_zero():
         "tokens_today",
         "requests_today",
         "unpriced_requests_today",
+        "metered_requests_today",
         "retry_in_s",
         "model_count",
+        "catalogue_count",
+        "models_chosen",
     }
     for key, value in fields.items():
         assert value is None, f"{key} should be None, got {value!r}"
-        assert value != 0, f"{key} must not be zero -- a stub has not spent $0"
+        # Not just the dollar fields. A count that partitions `requests_today`
+        # makes a claim about the traffic: 0 unpriced means "we priced them
+        # all", 0 metered means "the provider priced none of them". A port that
+        # watched nothing has said neither.
+        assert value != 0, (
+            f"{key} must not be zero -- a stub has not spent $0, and has not "
+            f"watched a request go unmetered either"
+        )
 
 
 def test_honest_zeros_from_a_live_port_are_passed_through():
@@ -317,7 +327,7 @@ def test_link_payload_omits_the_five_annotation_keys_without_an_annotation():
 
 
 # ---------------------------------------------------------------------------
-# provider_payload: the nine spend keys, over /api/providers
+# provider_payload: the twelve spend keys, over /api/providers
 # ---------------------------------------------------------------------------
 
 
@@ -335,6 +345,7 @@ class AccountingProviders(FakeProviders):
                 "tokens_today": {"input": 0, "output": 0},
                 "requests_today": 0,
                 "unpriced_requests_today": 0,
+                "metered_requests_today": 0,
                 "retry_in_s": None,
                 "model_count": len(p.models),
             }
@@ -350,8 +361,16 @@ _SPEND_KEYS = (
     "tokens_today",
     "requests_today",
     "unpriced_requests_today",
+    # How many of `requests_today` the provider priced itself. Null on a port
+    # that does not account, like every other key here -- the Spend screen
+    # calls a metered figure a charge and an estimated one a forecast, and a
+    # stub has done neither.
+    "metered_requests_today",
     "retry_in_s",
     "model_count",
+    # Null, never `false`: "this port cannot say" is not "nobody chose", and a
+    # UI that collapses the two prints a false sentence over the shipped stub.
+    "models_chosen",
 )
 
 
@@ -372,6 +391,7 @@ def test_provider_spend_keys_pass_through_honest_zeros_over_http():
     assert provider["spend_today_usd"] == 0.0
     assert provider["requests_today"] == 0
     assert provider["unpriced_requests_today"] == 0
+    assert provider["metered_requests_today"] == 0
     assert provider["tokens_today"] == {"input": 0, "output": 0}
     assert provider["daily_budget_usd"] == 5.0
     assert provider["admitting"] is True
@@ -389,6 +409,44 @@ def test_provider_spend_keys_survive_the_single_provider_patch_response():
     assert patched["priority"] == 20
     assert patched["spend_today_usd"] == 0.0
     assert patched["requests_today"] == 0
+
+
+# ---------------------------------------------------------------------------
+# provider_payload: key state, the only thing a screen may say about a key
+# ---------------------------------------------------------------------------
+
+
+class KeyedProviders(FakeProviders):
+    """A port that can answer "does the reference resolve, and from where"."""
+
+    def key_status(self, provider_id: str) -> dict:
+        return {"key_state": "set", "key_source": "secrets.json"}
+
+
+def test_provider_key_state_is_null_rather_than_missing_on_a_silent_port():
+    """A port with no `key_status` cannot say, and null says exactly that.
+
+    The distinction is the whole point: reporting "missing" here would put a
+    red "no key" beside a provider that is authenticating perfectly well, on
+    nothing but the absence of a method."""
+    deps = build_deps(providers=FakeProviders([make_provider()]))
+    with TestClient(create_app(deps)) as client:
+        provider = client.get("/api/providers").json()[0]
+    assert provider["key_state"] is None
+    assert provider["key_source"] is None
+
+
+def test_provider_key_state_reaches_http_and_carries_no_key_material():
+    deps = build_deps(providers=KeyedProviders([make_provider()]))
+    with TestClient(create_app(deps)) as client:
+        listed = client.get("/api/providers").json()[0]
+        patched = client.patch("/api/providers/openrouter", json={"priority": 20}).json()
+    for provider in (listed, patched):
+        assert provider["key_state"] == "set"
+        # A place, never a value: the two sources are named files and the
+        # environment, and there is no third field for anything else.
+        assert provider["key_source"] == "secrets.json"
+        assert provider["api_key"] == "***"
 
 
 # ---------------------------------------------------------------------------

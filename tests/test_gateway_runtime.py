@@ -293,6 +293,65 @@ def test_forward_settles_exactly_once_on_a_client_disconnect():
 
 
 # ---------------------------------------------------------------------------
+# forward() must not let a resolved key escape in a 4xx error body
+# ---------------------------------------------------------------------------
+
+
+def test_forward_redacts_the_resolved_key_from_a_4xx_error_body():
+    """proxy.py's own rule 3: a REMOTE target that answers 401 by echoing the
+    bearer token it was just sent must not hand that token back to whoever
+    asked. A 401 is not retryable, so it never reached the >=500 capture
+    branch -- before this fix it streamed straight through unredacted."""
+
+    secret = "sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789"
+
+    async def run() -> None:
+        payload = json.dumps({"error": {"message": f"Invalid API key {secret}"}}).encode()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["authorization"] == f"Bearer {secret}"
+            # A real network response defers reading its body until iterated
+            # (which is what lets `stream=True` mean anything); a Response
+            # built with content=/json= is marked already-consumed at
+            # construction, so aiter_raw() raises StreamConsumed on it. The
+            # explicit stream= is what makes this fixture behave like a real
+            # one -- _ChunkStream is the same fake the SSE test above uses.
+            return httpx.Response(
+                401,
+                headers={"content-type": "application/json"},
+                stream=_ChunkStream([payload]),
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            proxy = UpstreamProxy(GatewaySettings(), client=client)
+            stats = StatsRegistry()
+            selection = SimpleNamespace(
+                target=_route_target("d-1", kind=TargetKind.REMOTE)
+            )
+
+            attempt = await proxy.forward(
+                selection=selection,
+                path="/chat/completions",
+                body={"model": "m", "messages": []},
+                client_headers={},
+                api_key=secret,
+                stats=stats,
+                streaming=False,
+            )
+
+            assert not attempt.retryable
+            assert attempt.response.status_code == 401
+            body = attempt.response.body
+            assert secret.encode() not in body
+            assert b"***" in body
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 # H-9: UpstreamProxy.forward_provider() -- the Attempt-contract adapter
 # ---------------------------------------------------------------------------
 
@@ -490,6 +549,10 @@ def test_forward_provider_transport_failure_through_the_real_provider_service(tm
                 "priority": 10,
             }
         )
+        # A provider serves nothing until its models are switched on, and this
+        # test is about what the proxy does with a transport failure, not about
+        # the allowlist refusing before the transport is ever reached.
+        service.update("openrouter", {"enabled_models": ["vendor/remote-model"]})
 
         spy = _SpyBreaker()
         proxy = UpstreamProxy(GatewaySettings(), breaker=spy)
@@ -1261,8 +1324,10 @@ def test_the_deep_path_fallback_does_not_swallow_a_missing_asset(tmp_path):
             "/assets/index-deleted.js", headers={"accept": "text/html,*/*"}
         )
         assert gone.status_code == 404
-        # Nor for a file outside /assets that a script went looking for.
-        assert client.get("/sw.js").status_code == 404
+        # Nor for a file outside /assets that a script went looking for. A
+        # script's fetch says `*/*`; only a navigation asks for a document, and
+        # that is the whole of what separates the two here.
+        assert client.get("/sw.js", headers={"accept": "*/*"}).status_code == 404
 
 
 def test_the_deep_path_fallback_leaves_the_api_surface_answering_404(tmp_path):
@@ -1359,6 +1424,83 @@ def _state(node_id, *, is_local=False) -> NodeState:
         utilization_pct=0.0,
         is_local=is_local,
     )
+
+
+class _LocalAwareRegistry(_EmptyRegistry):
+    """A registry that knows which member is its own host, as the real one does.
+
+    The rung above the old list_nodes()[0] guess: the roster deliberately leads
+    with a worker here, which is the case that made that guess wrong.
+    """
+
+    def __init__(self, local="spark-02"):
+        self.local_node_id = local
+        self._nodes = [_state("worker-99"), _state(local, is_local=True)]
+
+    def list_nodes(self):
+        return list(self._nodes)
+
+
+class _SelfEnrollingRegistry(_EmptyRegistry):
+    """Empty, but able to enroll its own host -- a fresh install."""
+
+    def __init__(self):
+        self._nodes = []
+        self.enroll_calls = 0
+
+    def list_nodes(self):
+        return list(self._nodes)
+
+    def enroll_local(self):
+        self.enroll_calls += 1
+        state = _state("pi-01", is_local=True)
+        self._nodes.append(state)
+        self.local_node_id = "pi-01"
+        return state
+
+
+def test_the_registrys_own_answer_beats_whatever_leads_the_roster():
+    """verifier N-8, one layer below where node.py fixed it: a persisted roster
+    that leads with a worker must not name that worker as the coordinator."""
+    settings = GatewaySettings()
+    registry = _LocalAwareRegistry(local="spark-02")
+    with TestClient(create_app(GatewayDeps(registry=registry, settings=settings))):
+        pass
+    assert settings.coordinator_node_id == "spark-02"
+
+
+def test_an_empty_registry_that_can_enroll_its_own_host_does():
+    """The fresh-install case: nothing in the roster, so the machine serving
+    the request enrolls itself rather than leaving every surface empty."""
+    settings = GatewaySettings()
+    registry = _SelfEnrollingRegistry()
+    with TestClient(create_app(GatewayDeps(registry=registry, settings=settings))):
+        pass
+    assert settings.coordinator_node_id == "pi-01"
+    assert registry.enroll_calls == 1
+    assert [s.profile.node_id for s in registry.list_nodes()] == ["pi-01"]
+
+
+def test_self_enrolling_at_startup_is_recorded_as_degraded():
+    """Reaching that rung means the composition root did not enroll its own
+    host. The next person to compose one should learn it from a startup event
+    rather than from an empty roster."""
+    settings = GatewaySettings()
+    deps = GatewayDeps(registry=_SelfEnrollingRegistry(), settings=settings)
+    with TestClient(create_app(deps)) as client:
+        summary = client.get("/api/cluster").json()["summary"]
+    assert any("self-enrolled" in step for step in summary["degraded_startup"])
+
+
+def test_a_registry_that_cannot_enroll_is_left_alone():
+    """A stub surface has no host to speak for, so it must not invent a node.
+    This is what keeps the day-0 StubRegistry honest."""
+    settings = GatewaySettings()
+    registry = _EmptyRegistry()
+    with TestClient(create_app(GatewayDeps(registry=registry, settings=settings))):
+        pass
+    assert settings.coordinator_node_id is None
+    assert registry.list_nodes() == []
 
 
 def test_provider_misconfiguration_returns_the_half_open_probe(tmp_path):

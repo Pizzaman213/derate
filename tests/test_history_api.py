@@ -296,6 +296,76 @@ def test_an_empty_window_is_an_empty_list_not_an_error(live):
 # ==========================================================================
 
 
+def test_the_access_log_is_excluded_by_default_and_recoverable(live):
+    """`/api/history/logs` hides what the handler no longer records.
+
+    Two windows have to read the same: one recorded before the handler learned
+    to drop uvicorn.access, and one recorded after. The route's default
+    `exclude` is the handler's own list, so they do -- and `?exclude=`
+    (present, empty) still reaches the rows already on disk, because deleting
+    them was never the point.
+    """
+    archive = live.archive
+    now = time.time()
+    _ingest(
+        archive,
+        "spark-01",
+        [
+            {
+                "kind": KIND_LOG,
+                "ts": now - 5,
+                "body": {
+                    "ts": now - 5,
+                    "level": "INFO",
+                    "logger": "uvicorn.access",
+                    "message": '127.0.0.1 - "GET /agent/telemetry HTTP/1.1" 200',
+                },
+            },
+            {
+                "kind": KIND_LOG,
+                "ts": now - 4,
+                "body": {
+                    "ts": now - 4,
+                    "level": "INFO",
+                    "logger": "httpx",
+                    "message": "HTTP Request: GET http://x/agent/telemetry",
+                },
+            },
+            {
+                "kind": KIND_LOG,
+                "ts": now - 3,
+                "body": {
+                    "ts": now - 3,
+                    "level": "WARNING",
+                    "logger": "control_plane.links.measure",
+                    "message": "no usable measurement",
+                },
+            },
+        ],
+    )
+
+    with _client(live) as client:
+        clean = client.get("/api/history/logs", params={"from": "-1h"}).json()
+        everything = client.get(
+            "/api/history/logs", params={"from": "-1h", "exclude": ""}
+        ).json()
+        narrowed = client.get(
+            "/api/history/logs", params={"from": "-1h", "exclude": "httpx"}
+        ).json()
+
+    assert [r["logger"] for r in clean["logs"]] == ["control_plane.links.measure"]
+    assert {r["logger"] for r in everything["logs"]} == {
+        "uvicorn.access",
+        "httpx",
+        "control_plane.links.measure",
+    }
+    # An explicit list replaces the default rather than adding to it.
+    assert {r["logger"] for r in narrowed["logs"]} == {
+        "uvicorn.access",
+        "control_plane.links.measure",
+    }
+
+
 def test_events_are_filterable_by_node(live):
     """`node_id` is stored and selected on every event row, but had no filter
     until the node page needed one — so "what happened on this machine" meant

@@ -69,134 +69,150 @@ export function isFirstParty(owner: string): boolean {
 
 // ── Avatar lookup ────────────────────────────────────────────────────────────
 //
-// `GET https://huggingface.co/api/organizations/{name}/overview` carries an
-// `avatarUrl`; a personal namespace answers on `/api/users/{name}/overview`
-// instead. Both are unauthenticated and rate limited, which is what every
-// precaution below is for.
+// The coordinator resolves these now, and this file asks it once for the whole
+// grid. What was here before went straight to the hub, once per publisher, on
+// every page load -- with an LRU, a six-wide semaphore and an exponential
+// backoff, all of it trying to stay under an unauthenticated rate limit that a
+// single Models grid is already over. It did not work: ~45 publishers tripped
+// the limit, the backoff doubled from a minute towards half an hour, and every
+// card sat on two letters for that whole window. It looked intermittent
+// because the limit is a burst window that recovers on its own.
+//
+// None of that machinery is needed against our own origin. `control_plane/
+// resolver/avatars.py` asks the hub once per publisher EVER, keeps the bytes
+// on disk and serves them same-origin, so the client's whole job is to name
+// the publishers on screen and read back which ones have a mark.
 
-type Entry =
-  | { kind: 'url'; url: string }
-  | { kind: 'gone' }
-  | { kind: 'retry'; until: number; failures: number }
-
-const CACHE_MAX = 256
-const RETRY_BASE_MS = 60_000
-const RETRY_MAX_MS = 30 * 60_000
-const TIMEOUT_MS = 10_000
-/** A burst of cards must not become a burst of requests: the hub rate limits an
- *  unauthenticated client hard, and a 429 poisons the whole grid. */
-const MAX_CONCURRENT = 6
-
-const cache = new Map<string, Entry>()
-const inflight = new Map<string, Promise<string | null>>()
+/** ready -> a same-origin path to draw, `null` -> this publisher has no mark. */
+const known = new Map<string, string | null>()
 const listeners = new Set<() => void>()
-let active = 0
-const queue: (() => void)[] = []
 
-function remember(owner: string, entry: Entry): void {
-  // Cheapest possible LRU: re-inserting moves a key to the end, so the first
-  // key is the oldest. A grid holds far fewer than 256 distinct owners.
-  cache.delete(owner)
-  cache.set(owner, entry)
-  if (cache.size > CACHE_MAX) {
-    const oldest = cache.keys().next().value
-    if (oldest !== undefined) cache.delete(oldest)
-  }
-}
+/** Named on screen, not yet asked about. */
+const pending = new Set<string>()
+/** Asked about and left out of the answer, which means "still resolving". */
+const unresolved = new Set<string>()
+/** How many times each publisher has been asked about and not settled. */
+const attempts = new Map<string, number>()
+let scheduled = false
+let inflight = 0
 
-function cached(owner: string): Entry | null {
-  const entry = cache.get(owner)
-  if (!entry) return null
-  // An expired backoff reports "nothing cached" so the caller retries, but the
-  // entry stays so the next failure escalates rather than restarting at 60s.
-  if (entry.kind === 'retry' && Date.now() >= entry.until) return null
-  return entry
-}
+/** How many publishers go in one request. Matches the server's own cap, which
+ *  is a bound on fan-out at the hub rather than a pagination scheme. */
+const BATCH = 64
+/** One frame's worth of card renders, coalesced. A grid mounts its cards in a
+ *  burst, so waiting a tick turns ~90 calls into one request. */
+const COALESCE_MS = 16
+/** A cold batch runs to the server's deadline and reports what it has; the
+ *  rest are asked for again. Long enough that a slow hub does not become a
+ *  poll, short enough that the marks appear while the grid is still on screen. */
+const RETRY_MS = 1500
+/** How many rounds in a row may settle nothing before this gives up. Counts
+ *  UNPRODUCTIVE rounds only: a grid of 93 publishers is two full batches and
+ *  neither is a stall, whereas a coordinator that is down answers nothing
+ *  however many times it is asked. The monogram is a perfectly good card, so
+ *  the right end state there is to stop, not to keep hammering. */
+const MAX_STALLS = 4
+let stalls = 0
 
-async function acquire(): Promise<void> {
-  if (active < MAX_CONCURRENT) {
-    active++
-    return
-  }
-  await new Promise<void>((resolve) => {
-    queue.push(() => {
-      active++
-      resolve()
-    })
-  })
-}
-
-function release(): void {
-  active--
-  queue.shift()?.()
-}
-
-async function lookup(owner: string): Promise<string | null> {
-  const controller = new AbortController()
-  const timer = window.setTimeout(() => controller.abort(), TIMEOUT_MS)
-  try {
-    for (const path of ['organizations', 'users']) {
-      const res = await fetch(
-        `https://huggingface.co/api/${path}/${encodeURIComponent(owner)}/overview`,
-        { signal: controller.signal },
-      )
-      if (res.status === 404) continue
-      if (!res.ok) throw new Error(String(res.status))
-      const data = (await res.json()) as { avatarUrl?: string }
-      if (!data.avatarUrl) continue
-      return data.avatarUrl.startsWith('http')
-        ? data.avatarUrl
-        : `https://huggingface.co${data.avatarUrl}`
-    }
-    return null
-  } finally {
-    window.clearTimeout(timer)
-  }
-}
+/** How many times ONE publisher may come back unsettled before it draws a
+ *  monogram and stops being asked for.
+ *
+ *  Separate from the stall counter, which is about the coordinator being down.
+ *  This is about the one name that never settles -- a publisher the hub keeps
+ *  rate limiting us on, say. Without it a batch where 63 of 64 resolve keeps
+ *  its counter at zero forever and polls our own coordinator for the 64th
+ *  every retry, for as long as the tab is open. */
+const MAX_ATTEMPTS = 4
 
 function notify(): void {
   for (const fn of listeners) fn()
 }
 
-/** Resolve an owner's avatar, at most once per owner, at most six at a time.
+function schedule(delay = COALESCE_MS): void {
+  if (scheduled || pending.size === 0 || stalls >= MAX_STALLS) return
+  scheduled = true
+  window.setTimeout(() => {
+    scheduled = false
+    void flush()
+  }, delay)
+}
+
+/** Ask about this publisher again, unless it has had its turns. */
+function requeue(owner: string): void {
+  const tries = (attempts.get(owner) ?? 0) + 1
+  attempts.set(owner, tries)
+  if (tries >= MAX_ATTEMPTS) known.set(owner, null)
+  else pending.add(owner)
+}
+
+async function flush(): Promise<void> {
+  if (inflight > 0 || pending.size === 0) return
+  const batch = [...pending].slice(0, BATCH)
+  batch.forEach((owner) => pending.delete(owner))
+  batch.forEach((owner) => unresolved.add(owner))
+  inflight++
+  let settled = 0
+  try {
+    const query = batch.map(encodeURIComponent).join(',')
+    const res = await fetch(`/api/publishers/avatars?owners=${query}`)
+    if (!res.ok) throw new Error(String(res.status))
+    const data = (await res.json()) as { avatars?: Record<string, string | null> }
+    const answers = data.avatars ?? {}
+    for (const owner of batch) {
+      // Present -> settled, either way. Absent -> the server is still
+      // resolving it, so it goes back in the queue rather than being recorded
+      // as a publisher without a mark.
+      if (owner in answers) {
+        known.set(owner, answers[owner] ?? null)
+        unresolved.delete(owner)
+        attempts.delete(owner)
+        settled++
+      } else {
+        unresolved.delete(owner)
+        requeue(owner)
+      }
+    }
+  } catch {
+    // Our own coordinator, not the hub. Put them back; the stall counter is
+    // what stops this if it is really down.
+    for (const owner of batch) {
+      unresolved.delete(owner)
+      requeue(owner)
+    }
+  } finally {
+    inflight--
+    // A round that answered everything it asked is not a stall, so the next
+    // chunk goes immediately; one that answered nothing waits, and enough of
+    // those in a row stop the loop.
+    stalls = settled > 0 ? 0 : stalls + 1
+    notify()
+    schedule(settled === batch.length ? COALESCE_MS : RETRY_MS)
+  }
+}
+
+/** Where this publisher's mark is served, or null while there is nothing to
+ *  draw -- which covers both "not resolved yet" and "has none".
  *
- *  Returns synchronously from cache when it can. A miss is remembered two ways:
- *  a 404 is permanent (that namespace has no avatar and never will within a
- *  session), while a timeout or a 5xx backs off and doubles, so a rate limit
- *  recovers on its own instead of hammering. */
+ *  Synchronous, and safe to call from render: a name it has not seen is queued
+ *  and the grid is told to re-render when the answer lands. Same-origin, so
+ *  there is no CORS to arrange and `dominant.ts` can read the pixels back. */
 export function avatarUrl(owner: string): string | null {
   const key = owner.trim()
   if (!key) return null
-  const entry = cached(key)
-  if (entry) return entry.kind === 'url' ? entry.url : null
-  if (inflight.has(key)) return null
-
-  const run = (async () => {
-    await acquire()
-    try {
-      const url = await lookup(key)
-      remember(key, url ? { kind: 'url', url } : { kind: 'gone' })
-      return url
-    } catch {
-      const prev = cache.get(key)
-      const failures = prev?.kind === 'retry' ? prev.failures + 1 : 1
-      remember(key, {
-        kind: 'retry',
-        failures,
-        until: Date.now() + Math.min(RETRY_BASE_MS * 2 ** (failures - 1), RETRY_MAX_MS),
-      })
-      return null
-    } finally {
-      release()
-      inflight.delete(key)
-      notify()
-    }
-  })()
-  inflight.set(key, run)
+  const entry = known.get(key)
+  if (entry !== undefined) return entry
+  if (!pending.has(key) && !unresolved.has(key)) {
+    pending.add(key)
+    // A name nobody has asked about means the grid changed, so a run of
+    // stalls stops counting against it -- otherwise a publisher scrolled to
+    // after the coordinator had a bad minute would silently never resolve.
+    stalls = 0
+  }
+  schedule()
   return null
 }
 
-/** Re-render the cards when a lookup lands. One subscription per grid rather
+/** Re-render the cards when a batch lands. One subscription per grid rather
  *  than per card: several hundred cards each holding their own state would
  *  re-render the whole grid several hundred times as the batch resolves. */
 export function subscribeAvatars(fn: () => void): () => void {

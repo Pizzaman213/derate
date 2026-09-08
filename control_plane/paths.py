@@ -106,3 +106,56 @@ def data_dir(env: Mapping[str, str] | None = None) -> Path:
 def data_path(*parts: str) -> Path:
     """``data_dir()`` joined with *parts*. For the one-liner call sites."""
     return data_dir().joinpath(*parts)
+
+
+#: The log folder's name, under whichever root holds it.
+LOGS_DIR = "logs"
+
+
+def project_root() -> Path:
+    """The directory the code was installed into: the one holding ``control_plane``.
+
+    ``/home/connor/derate`` in a source checkout, ``/opt/derate`` in the image
+    (Dockerfile ``WORKDIR /opt/derate``, with ``control_plane/`` copied under
+    it). Derived from this file's own location rather than from a cwd, because
+    the entrypoint's working directory is not the process's for long and a node
+    agent resolves this after uvicorn has been running for a week.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def logs_dir(env: Mapping[str, str] | None = None) -> Path:
+    """The one folder a derate process writes its log files into.
+
+    ``DERATE_LOG_DIR`` wins unconditionally, for the reason :func:`data_dir`
+    gives: an operator naming ``/var/log/derate`` is entitled to be obeyed, and
+    a resolver that second-guesses the name makes the variable untrustworthy.
+
+    Otherwise ``<project root>/logs`` -- next to the code, where somebody
+    debugging is already standing. That is a different choice from every other
+    writer in this module, which put its state under :func:`data_dir`, and the
+    tradeoff is worth stating: in the container the project root is
+    ``/opt/derate``, which is a layer and not the ``derate:/data`` volume, so
+    logs there do not survive ``docker rm``. A deployment that wants them to
+    sets ``DERATE_LOG_DIR=/data/logs`` and gets the old behaviour exactly.
+
+    The one thing this will not do is return somewhere unwritable. A checkout
+    on a read-only mount, or a ``control_plane`` imported out of a
+    site-packages nobody can write to, falls through to the data root -- which
+    :func:`default_data_dir` has already guaranteed is writable. A log folder
+    is not worth failing a startup over, and ``logfiles.install`` degrades to
+    stderr rather than raising if even that is gone.
+
+    Not created here -- ``data_dir`` does not create its directory either, and
+    a caller asking where the logs are should not have the side effect of
+    making somewhere to put them. :func:`control_plane.logfiles.install` is
+    what creates it, because it is the one caller that is about to write.
+    """
+    env = os.environ if env is None else env
+    named = env.get("DERATE_LOG_DIR")
+    if named:
+        return Path(named)
+    root = project_root()
+    if _usable(root):
+        return root / LOGS_DIR
+    return data_dir(env) / LOGS_DIR

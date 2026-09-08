@@ -378,6 +378,29 @@ def test_completing_setup_persists_across_a_restart(data_dir):
     assert body["reason"] == "setup was completed on this coordinator"
 
 
+def test_a_data_dir_it_cannot_write_answers_500_rather_than_raising(
+    data_dir, monkeypatch
+):
+    """The OSError branch was unreachable: it called `errors.error_response`
+    with the message first, so the three positional arguments bound to
+    (status, message, type_), `code` was never filled and `status` arrived
+    twice. The branch that exists to name an unwritable data directory raised
+    TypeError instead, and the wizard's last step 500'd with a stack trace
+    rather than the sentence written for it."""
+
+    def refuse(self):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(setup_state.SetupStore, "mark_complete", refuse)
+    with TestClient(create_app(build()), raise_server_exceptions=False) as client:
+        response = client.post("/api/setup/complete")
+    assert response.status_code == 500
+    body = response.json()["error"]
+    assert body["code"] == "setup_not_recorded"
+    assert body["type"] == "setup_error"
+    assert "data directory is" in body["message"]
+
+
 def test_a_broken_registry_still_answers(data_dir):
     """The one screen where a 500 is unaffordable: nobody has any context yet
     for what a fresh install is supposed to look like."""

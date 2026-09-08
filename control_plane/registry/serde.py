@@ -41,7 +41,44 @@ def profile_from_dict(data: dict) -> NodeProfile:
     )
 
 
+def power_reading(state: NodeState) -> float | None:
+    """GPU power draw, or unknown on a machine that has no GPU to draw it.
+
+    A machine the probe found no GPU on reports host facts (memory from
+    /proc/meminfo, temperature from /sys/class/thermal, utilisation from
+    /proc/stat) and has no GPU power draw to read at all. Emitting 0 W there
+    would read as a measurement of an idle GPU rather than as the absence of
+    one, so it goes out as unknown.
+
+    Shared rather than inlined because it was inlined here and nowhere else:
+    the 1 Hz metrics frame and the topology payload each sent `power_watts`
+    straight through, so one node answered `null` on /api/nodes and `0 W` on
+    /api/metrics/stream -- and the UI prefers the frame while it is fresh, so
+    the roster showed the reading this rule exists to suppress.
+    """
+    return None if state.profile.gpu_count == 0 else state.power_watts
+
+
+def temp_reading(state: NodeState) -> float | None:
+    """Board temperature, unknown only when nothing exposed a thermal zone.
+
+    Deliberately weaker than the power rule: a GPU-less board usually does have
+    /sys/class/thermal, and a running machine does not sit at exactly 0.0 C, so
+    a real host reading survives as itself.
+    """
+    if state.profile.gpu_count == 0 and not state.temperature_c:
+        return None
+    return state.temperature_c
+
+
 def memory_used_pct(state: NodeState) -> float:
+    # Deliberately not gateway.serialize.memory_used_pct, which divides by
+    # physical memory to match the architecture doc's topology payload. This
+    # one is the planning view and the two answer different questions on a
+    # GB10, where addressable is a slice of physical. If you are unifying
+    # duplicated code, this pair is not it -- change one only by deciding which
+    # question the endpoint is asking.
+    #
     # Addressable first: on a GPU node that is the pool anything can be planned
     # into. A machine with no GPU has none, and falls back to the live host
     # total from its own sample -- otherwise its memory readout is a permanent
@@ -65,8 +102,12 @@ def state_to_dict(state: NodeState) -> dict:
         "memory_used": state.memory_used,
         "memory_total": state.memory_total,
         "memory_used_pct": memory_used_pct(state),
-        "power_w": round(state.power_watts, 1),
-        "temp_c": round(state.temperature_c, 1),
+        # Null, not a rounded zero, on a machine with no GPU to draw power --
+        # the rule power_reading above exists for. This dict emitted a number
+        # unconditionally while the gateway's node row emitted null, for the
+        # same node from the same sample.
+        "power_w": power_reading(state),
+        "temp_c": temp_reading(state),
         "util_pct": round(state.utilization_pct, 1),
         # Whether this is the coordinator's own machine. Always false on the
         # agent surface -- a worker serving its own state is not serving the

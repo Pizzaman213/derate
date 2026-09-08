@@ -968,3 +968,203 @@ def test_concurrency_suggestions_are_verified_too(fit, label, req, nodes):
         dataclasses.replace(req, max_concurrent_seqs=suggested), nodes
     )
     assert replayed.ok, f"{label}: suggested {suggested} sequences and it did not fit"
+
+
+class TestRefusalOnAMachineWithNoGPU:
+    """The refusal a GPU-less machine gets, which is now a reachable screen.
+
+    `/api/capacity` used to 503 on such a cluster, so nobody got as far as a
+    Serve button and this string was rarely seen. It answers now, so the string
+    is on the path a person actually walks — and it was saying two false
+    things.
+    """
+
+    def _profile(self):
+        import dataclasses
+
+        from tests.fixtures import SPARK_01
+
+        return dataclasses.replace(
+            SPARK_01,
+            node_id="connor-pi",
+            gpu_name="",
+            gpu_count=0,
+            total_memory=0,
+            addressable_memory=0,
+            memory_bandwidth_gbps=0.0,
+        )
+
+    def _reason(self, fit):
+        from tests.fixtures import QWEN3_30B_A3B
+
+        node = self._profile()
+        result = fit.check(
+            request(QWEN3_30B_A3B, plan=make_plan(node_ids=[node.node_id])),
+            [node],
+        )
+        assert result.verdict is Verdict.WONT_FIT
+        return result.reason
+
+    def test_it_does_not_name_an_empty_device(self, fit):
+        """`gpu_name` is "" on a machine the probe found no GPU on, so the
+        general branch rendered "90% of 0.0 GiB addressable on " with nothing
+        after "on" -- a GPU with nothing left, rather than no GPU."""
+        reason = self._reason(fit)
+        assert "addressable on " not in reason, reason
+        assert "connor-pi has no GPU memory at all" in reason, reason
+
+    def test_it_does_not_send_somebody_shopping_for_64_machines(self, fit):
+        """The remedy trap, stated as a number.
+
+        `min_nodes_required` returns -1 here and its own docstring says that
+        means "a different machine or a smaller quantization, NOT more Sparks".
+        The phrase rendered it as "more than 64 nodes" -- the one remedy the
+        search had just ruled out, and one that can never work: a machine with
+        no memory to spend does not acquire some by being bought twice.
+        """
+        reason = self._reason(fit)
+        assert "64" not in reason, reason
+        assert "no number of these holds it" in reason, reason
+
+    def test_a_real_machine_still_gets_a_node_count(self, fit):
+        """The counts that ARE achievable must be untouched: this phrase is
+        shared with every over-budget refusal on real hardware."""
+        from tests.fixtures import DEEPSEEK_V3, SPARK_01
+
+        reason = fit.check(request(DEEPSEEK_V3), [SPARK_01]).reason
+        assert "7 nodes" in reason, reason
+        assert "NVIDIA GB10" in reason, reason
+
+
+# ---------------------------------------------------------------------------
+# A refusal never reports a quantity of nothing
+# ---------------------------------------------------------------------------
+
+
+def test_a_near_miss_never_says_it_is_over_budget_by_zero():
+    """The bug this exists for, verbatim from the screen it reached:
+
+        "Over budget by 0.0 GiB. KV cache is the problem: 15.6 GiB per rank at
+         42496 tokens x 1 sequences, against 15.6 GiB left..."
+
+    Every number in it was correct. `_gib` rendered one decimal place of GiB, so
+    an overage of a few tens of MiB rounded to zero and the two compared figures
+    rounded to each other. The sentence then says a thing does not fit, that it
+    is over by nothing, and that 15.6 does not go into 15.6 -- which reads as a
+    broken calculation rather than as the near miss it is.
+
+    Planner and fit strings are the product (CLAUDE.md). A refusal that looks
+    like arithmetic nobody checked costs more than the memory it is about.
+    """
+    from control_plane.fit.calculator import GIB, MIB, _gib, _gib_vs
+
+    # Nothing non-zero renders as zero, at any scale.
+    assert _gib(0) == "0.0 GiB", "a real zero should still look like one"
+    assert _gib(1) == "1 byte"
+    assert _gib(900) == "900 bytes"
+    assert _gib(512 * 1024) == "512 KiB"
+    assert _gib(40 * MIB) == "40 MiB"
+    assert _gib(15.6 * GIB) == "15.6 GiB"
+    for n in (1, 1024, MIB, 40 * MIB, int(0.049 * GIB)):
+        assert not _gib(n).startswith("0.0 "), f"{n} bytes rendered as zero"
+
+    # Two figures printed against each other are told apart when it is useful.
+    need, have = _gib_vs(15.62 * GIB, 15.58 * GIB)
+    assert need != have, "a 40 MiB gap must not print as the same number twice"
+    assert (need, have) == ("15.62 GiB", "15.58 GiB")
+
+    # Closer than a hundredth of a GiB, they are equal for every purpose a
+    # reader has, and the exact overage carries the difference instead. Chasing
+    # it into smaller units gives "15936 MiB against 15936 MiB", which is wider
+    # and still looks identical.
+    same_need, same_have = _gib_vs(15.6 * GIB, 15.6 * GIB + 1)
+    assert same_need == same_have == "15.6 GiB"
+
+
+class TestLadderContextSkipsRungsThatHoldNothing:
+    """`ladder_context` choosing the question the whole ladder is judged at.
+
+    The regression this class exists for: the rungs arrive best-quality first,
+    and `max_context` answers 0 for a rung whose weights alone blow the budget.
+    `_clamp_context` maps that 0 to the model's own window -- correct on the
+    single-model path, where there is no lower rung and the gate must be left
+    to refuse in its own words -- so the first rung cleared `MIN_USEFUL_CONTEXT`
+    trivially and won. A ladder of 13 GiB variants was handed the 262,144-token
+    window of a 48 GiB rung that had been refused outright, and every row then
+    refused on KV cache.
+
+    Nothing above caught it because `_walk` re-quantizes at the derived context
+    and recovers. The variant ladder passes `ladder=()` on purpose -- each
+    published file is judged as it ships -- so there is nothing to recover to.
+    """
+
+    NATIVE = 262144
+
+    def _ctx(self, rungs, allocatable=None):
+        from control_plane.fit.capacity import ladder_context
+
+        return ladder_context(
+            rungs,
+            ONE_SPARK,
+            make_plan(node_ids=(SPARK_01.node_id,)),
+            max_seqs=1,
+            kv_dtype="fp16",
+            allocatable=allocatable,
+            native_window=self.NATIVE,
+        )
+
+    def _rung(self, dtype):
+        return (dataclasses.replace(QWEN3_30B_A3B, dtype=dtype), dtype, None)
+
+    def test_a_rung_that_does_not_fit_does_not_choose_the_context(self):
+        """The bug, at its smallest. bf16 is refused for its weights alone on a
+        tight budget; it must not hand its native window to the rungs below."""
+        tight = {SPARK_01.node_id: 20 * GIB}
+        context, rung = self._ctx(
+            [self._rung("bf16"), self._rung("q4_k_m")], allocatable=tight
+        )
+        assert rung == "q4_k_m", (
+            f"chose {rung}, a rung that holds nothing on this budget"
+        )
+        assert context < self.NATIVE, (
+            f"judged the ladder at {context} tokens, the native window of a "
+            f"rung that was refused outright"
+        )
+
+    def test_the_context_is_one_the_chosen_rung_actually_holds(self):
+        """Feed it back in. A context nobody verified is not a measurement."""
+        from control_plane.fit.capacity import FitCalculator
+
+        tight = {SPARK_01.node_id: 20 * GIB}
+        context, rung = self._ctx(
+            [self._rung("bf16"), self._rung("q4_k_m")], allocatable=tight
+        )
+        result = FitCalculator().check(
+            FitRequest(
+                shape=dataclasses.replace(QWEN3_30B_A3B, dtype=rung),
+                context_length=context,
+                max_concurrent_seqs=1,
+                kv_dtype="fp16",
+                plan=make_plan(node_ids=(SPARK_01.node_id,)),
+            ),
+            ONE_SPARK,
+            allocatable=tight,
+        )
+        assert result.verdict is not Verdict.WONT_FIT, result.reason
+
+    def test_a_roomy_budget_still_takes_the_best_rung(self):
+        """The skip must not cost quality where quality is affordable."""
+        context, rung = self._ctx([self._rung("bf16"), self._rung("q4_k_m")])
+        assert rung == "bf16"
+        assert context == self.NATIVE, (
+            "clamped below the model's own window on a machine that holds it"
+        )
+
+    def test_nothing_holds_it_and_the_gate_is_left_to_say_so(self):
+        """When no rung fits at any context this returns no rung at all, so the
+        walk that follows produces the gate's own refusal -- naming the term
+        and the overflow -- rather than a sentence invented here."""
+        nothing = {SPARK_01.node_id: 1 * GIB}
+        context, rung = self._ctx([self._rung("bf16")], allocatable=nothing)
+        assert rung is None
+        assert context > 0, "a context of 0 is a refusal dressed as a choice"

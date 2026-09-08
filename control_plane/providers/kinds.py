@@ -49,9 +49,24 @@ class KindSpec:
     # OpenAI's stream_options.include_usage. Only set it where the upstream is
     # known to accept it; an unexpected field is a 400 on a strict server.
     supports_stream_usage: bool = True
+    #: Whether this kind reports what it charged, in dollars, in the response's
+    #: own ``usage`` block. Where it does, that figure is the ledger and the
+    #: published `pricing` table is only a forecast: OpenRouter's own number
+    #: already accounts for cached prompt tokens (79 of its models price those
+    #: differently), the long-context tiers 43 of them switch to above a token
+    #: threshold, and the reasoning/image/audio/web-search components -- none of
+    #: which a flat input/output pair can express. Off by default, because a
+    #: `cost` from an upstream we do not recognize is a number in an unknown
+    #: unit, and banking it would be worse than pricing from the table.
+    meters_cost: bool = False
     # False means we have no adapter for this wire format in this build.
     forwardable: bool = True
     unsupported_reason: str = ""
+    #: Whether this kind aggregates several backend hosts per model and
+    #: exposes an endpoints-listing call plus a request-time `provider` field
+    #: to pick among them. True only for OpenRouter -- no other kind here
+    #: multiplexes a model id over more than one upstream host.
+    supports_backend_routing: bool = False
 
 
 _SPECS: dict[ProviderKind, KindSpec] = {
@@ -62,6 +77,8 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         models_path="models",
         auth=AuthStyle.BEARER,
         pricing=PricingUnit.PER_TOKEN_USD,
+        meters_cost=True,
+        supports_backend_routing=True,
     ),
     ProviderKind.OPENAI: KindSpec(
         kind=ProviderKind.OPENAI,

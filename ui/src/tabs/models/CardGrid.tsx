@@ -1,5 +1,6 @@
 import { useEffect, useReducer } from 'react'
 import type { QuantTable } from '../../api/types'
+import { BandHeading, useBandCollapse } from './BandSection'
 import { subscribeDominant } from './dominant'
 import { ModelCard } from './ModelCard'
 import { subscribeAvatars } from './owner'
@@ -19,15 +20,19 @@ import type { Group, ModelRow } from './rows'
 export function CardGrid({
   groups,
   table,
+  canPull = false,
   loading,
   error,
   emptyNote,
   onOpen,
   selectedId,
   split,
+  expandAll = false,
 }: {
   groups: Group[]
   table: QuantTable | null
+  /** Whether a GGUF row has anywhere to go. See `classifySupport`. */
+  canPull?: boolean
   loading: boolean
   error: Error | null
   emptyNote: string
@@ -36,7 +41,10 @@ export function CardGrid({
   selectedId?: string | null
   /** Master-pane layout: one card per row. */
   split?: boolean
+  /** Force every collapsible band open, the way the row list does it. */
+  expandAll?: boolean
 }) {
+  const collapse = useBandCollapse(expandAll)
   const [, bump] = useReducer((n: number) => n + 1, 0)
   useEffect(() => {
     const off = [subscribeAvatars(bump), subscribeDominant(bump)]
@@ -61,24 +69,26 @@ export function CardGrid({
     <div>
       {groups.map((g) => (
         <section key={`${g.band}::${g.title}`}>
-          <div
-            className="sub"
-            style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}
-          >
-            <span>{g.title}</span>
-            <span className="unit">{g.rows.length}</span>
-          </div>
-          <div className={split ? 'mgrid split' : 'mgrid'}>
-            {g.rows.map((row) => (
-              <ModelCard
-                key={row.key}
-                row={row}
-                table={table}
-                onOpen={onOpen}
-                current={row.model_id === selectedId}
-              />
-            ))}
-          </div>
+          <BandHeading
+            group={g}
+            collapsible={collapse.collapsible(g.band)}
+            open={collapse.isOpen(g.band)}
+            onToggle={() => collapse.toggle(g.band)}
+          />
+          {collapse.isOpen(g.band) ? (
+            <div className={split ? 'mgrid split' : 'mgrid'}>
+              {g.rows.map((row) => (
+                <ModelCard
+                  key={row.key}
+                  row={row}
+                  table={table}
+                  canPull={canPull}
+                  onOpen={onOpen}
+                  current={row.model_id === selectedId}
+                />
+              ))}
+            </div>
+          ) : null}
         </section>
       ))}
     </div>

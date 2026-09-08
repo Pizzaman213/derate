@@ -63,6 +63,11 @@ class RuntimeSupport:
     runtime: str  # "vllm" | "sglang"
     level: SupportLevel
     reason: str
+    #: The runtime image's own version string, when a probe has run --
+    #: ``ImageProbe.version``. ``None`` on a machine with no docker or no
+    #: image pulled, which is the same "older answer, not a wrong one"
+    #: fallback the rest of this module already makes for the probe itself.
+    version: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -195,6 +200,20 @@ class Resolution:
     @property
     def model_id(self) -> str:
         return self.shape.model_id
+
+    @property
+    def modality(self) -> str:
+        """Which endpoint family this model answers on: text, embedding,
+        speech or transcription.
+
+        Derived rather than stored, so nothing has to be re-cached when a new
+        architecture joins the audio table -- and so a resolution written by
+        an older build reports the current answer rather than a stale one.
+        The import is function-local because ``support`` imports this module.
+        """
+        from .support import modality_for
+
+        return modality_for(self.architectures)
 
     def effective_weight_bytes(self) -> int:
         """Bytes to charge for weights. Never smaller than the dtype figure."""

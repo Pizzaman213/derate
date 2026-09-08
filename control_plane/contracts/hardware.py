@@ -14,7 +14,31 @@ from .constants import DEFAULT_GUARDRAIL
 class DeviceClass(str, Enum):
     GB10 = "gb10"  # DGX Spark, unified memory
     DISCRETE = "discrete"  # RTX 3090 and similar
+    APPLE = "apple"  # Apple Silicon: unified memory, Metal, no CUDA
+    # A machine we looked at and found no GPU on: a Raspberry Pi, a NAS, a
+    # spare x86 box. Deliberately distinct from UNKNOWN, which means "we could
+    # not look" -- a container started without --gpus has no nvidia-smi and is
+    # indistinguishable from bare metal by that test alone, and calling both of
+    # them the same thing is what let a misconfigured DGX Spark sit in the
+    # roster reading like a Pi. ``registry/probe.py`` separates them on
+    # evidence the kernel still exposes without the GPU: /proc/driver/nvidia
+    # and the PCI vendor id.
+    CPU = "cpu"
     UNKNOWN = "unknown"
+
+    @property
+    def unified_memory(self) -> bool:
+        """Whether the GPU and the OS spend the same bytes.
+
+        Added with APPLE, and deliberately narrow: this answers a question
+        about *memory topology* for anything that wants to describe the
+        machine. It is NOT a substitute for the ``is DeviceClass.GB10`` checks
+        in ``registry/telemetry.py``, which gate accounting built on GB10
+        constants and on nvidia-smi's per-process query. Those are GB10 facts,
+        not unified-memory facts, and widening them here would be the kind of
+        quiet contract change this file exists to prevent.
+        """
+        return self in (DeviceClass.GB10, DeviceClass.APPLE)
 
 
 @dataclass(frozen=True)

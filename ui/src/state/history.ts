@@ -7,6 +7,7 @@ import type {
   NodeHistorySample,
   RequestHistory,
   RequestHistoryRow,
+  ShellStatus,
 } from '../api/types'
 import type { TelemetryPoint } from './useTelemetry'
 
@@ -119,6 +120,14 @@ export function useNodeEvents(nodeId: string, window: HistoryWindow) {
   )
 }
 
+/** Whether a terminal can be opened. Effectively static for the life of the
+ *  coordinator process -- the flag is read once at startup, by design, so that
+ *  nothing arriving over the network can switch the route on -- so this is
+ *  polled at the lazy end purely to notice a restart. */
+export function useShellStatus() {
+  return useKeyedResource<ShellStatus>('shell:status', (b) => b.shellStatus(), 60_000)
+}
+
 export function useNodeLogs(nodeId: string, level: string, window: HistoryWindow) {
   const spec = window === 'live' ? null : WINDOW_SPEC[window]
   return useKeyedResource<LogHistory>(
@@ -193,6 +202,59 @@ function nodeValue(
       return num(s.util_pct ?? s.util_pct_avg)
     case 'mem': {
       const used = num(s.memory_used ?? s.memory_used_avg)
+      const total = num(s.memory_total) ?? num(memoryTotal)
+      if (used == null || total == null || total <= 0) return null
+      return (used / total) * 100
+    }
+  }
+}
+
+/** The bucket MAXIMUM for one node metric, as the upper edge of a band whose
+ *  lower edge is `nodeSeries`.
+ *
+ *  This column was being thrown away. `nodeValue` reads the average, so on the
+ *  1h and 24h windows a node that held 140 W for forty seconds inside a
+ *  one-minute bucket drew as whatever the minute averaged to -- the spike was
+ *  not smoothed, it was absent, and the chart said nothing about the fact.
+ *  Drawn as a band rather than a second line because an average and the
+ *  maximum it was rolled from are ONE quantity in two aggregations: two hues
+ *  would claim they are two things.
+ *
+ *  Null, not an empty array, for a window that has no maximum to give:
+ *  `raw` and `ring` rows are single samples, where every point already IS its
+ *  own maximum and a band would be a flat restatement of the line. Null also
+ *  for a rolled window whose maxima are entirely missing, so a band never
+ *  renders as a line pinned to the floor. */
+export function nodeBand(
+  history: NodeHistory | null,
+  field: NodeField,
+  memoryTotal?: number,
+): TelemetryPoint[] | null {
+  if (!history || bucketSeconds(history.resolution) == null) return null
+  const out: TelemetryPoint[] = []
+  let real = 0
+  for (const s of history.samples) {
+    const v = nodeMax(s, field, memoryTotal)
+    if (v != null) real += 1
+    out.push({ t: s.ts, v })
+  }
+  return real > 0 ? out : null
+}
+
+function nodeMax(
+  s: NodeHistorySample,
+  field: NodeField,
+  memoryTotal?: number,
+): number | null {
+  switch (field) {
+    case 'power':
+      return num(s.power_w_max)
+    case 'temp':
+      return num(s.temp_c_max)
+    case 'util':
+      return num(s.util_pct_max)
+    case 'mem': {
+      const used = num(s.memory_used_max)
       const total = num(s.memory_total) ?? num(memoryTotal)
       if (used == null || total == null || total <= 0) return null
       return (used / total) * 100

@@ -57,9 +57,17 @@ export function HeadroomSub({ context, concurrency }: { context: number; concurr
           <p className="unit">{capacity.loading ? 'Asking the fit gate…' : 'No answer.'}</p>
         ) : (
           <>
+            {/* `context` is null when nobody named one and the fit gate chose
+                per model. Each row then carries its own, so the caption stops
+                claiming a single number rather than printing whichever row's
+                happened to be first. */}
             <p className="unit" style={{ margin: '0 0 8px' }}>
-              At {cap.context.toLocaleString()} context and {cap.concurrency}{' '}
-              {cap.concurrency === 1 ? 'sequence' : 'sequences'}, probed on {cap.probed_node}.
+              {cap.context
+                ? `At ${cap.context.toLocaleString()} context and ${cap.concurrency} ` +
+                  `${cap.concurrency === 1 ? 'sequence' : 'sequences'}, probed on ${cap.probed_node}.`
+                : `Each at the largest context it can hold, up to its own window, ` +
+                  `by ${cap.concurrency} ${cap.concurrency === 1 ? 'sequence' : 'sequences'}, ` +
+                  `probed on ${cap.probed_node}.`}
             </p>
             <Best label="right now" side={cap.live} fallback={cap.unavailable_reason} />
             <Best label="on idle hardware" side={cap.static ?? null} fallback={null} muted />

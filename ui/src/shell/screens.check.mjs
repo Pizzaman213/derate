@@ -14,6 +14,8 @@
 //   DERATE_CHECK_ORIGIN=http://localhost:18088 node src/shell/screens.check.mjs
 //
 // It writes ui/screens/<dest>.png -- one per destination in state/routes.ts,
+// enumerated from `DESTINATIONS` there rather than listed here, so a new screen
+// is captured and asserted the first time it exists,
 // which is also the point: `layout.check.mjs` writes layout-preview.svg so a
 // shape can be eyeballed with no cluster and no browser, and this is the same
 // instinct applied to the whole app. The PNGs are how a person, or Claude,
@@ -31,7 +33,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { findBrowser } from '../check/browser.mjs'
-import { report } from '../check/harness.mjs'
+import { load, report } from '../check/harness.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const uiRoot = join(here, '..', '..')
@@ -55,12 +57,22 @@ const get = async (p) => (await fetch(`${ORIGIN}${p}`)).json()
 // Ids come off the live coordinator rather than being written down here. A
 // hardcoded model id rots the moment the cluster changes, and a verifier that
 // silently walks a 404 is worse than one that does not walk it at all.
-const [models, topology] = await Promise.all([
+const [models, topology, deployments] = await Promise.all([
   get('/api/models').catch(() => null),
   get('/api/topology').catch(() => null),
+  get('/api/deployments').catch(() => null),
 ])
 const someModel = models?.models?.[0]?.model_id ?? models?.[0]?.model_id ?? null
 const someNode = topology?.nodes?.[0]?.node_id ?? null
+// The deployment sheet is a page in its own right -- two columns, the backend
+// log filling the right one -- and like the node sheet it is a sheet over a
+// destination rather than a destination, so neither comes from routes.ts.
+// A live row is preferred: the sheet of a stopped one is mostly dashes, and
+// asking a stopped one for its log costs a `sparkrun logs` on the machine.
+const depRank = (s) =>
+  s === 'ready' ? 0 : s === 'degraded' ? 1 : s === 'launching' || s === 'planned' ? 2 : 3
+const depRows = Array.isArray(deployments) ? deployments : (deployments?.deployments ?? [])
+const someDep = [...depRows].sort((a, b) => depRank(a.state) - depRank(b.state))[0]?.served_name ?? null
 
 // Whether a secret reached the screen is asked with the server's own
 // Redactor, primed with the REAL stored values -- not with a shape heuristic
@@ -81,18 +93,24 @@ const secretScan = (text) =>
     'print(json.dumps({"known": len(values), "leaked": r.contains_secret(text)}))',
   ].join('\n')], { input: text, cwd: repoRoot, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }))
 
-const SCREENS = [
-  ['dashboard', '/dashboard'],
-  ['models', '/models'],
-  ['cluster', '/cluster'],
-  ['storage', '/storage'],
-  ['chat', '/chat'],
-  ['spend', '/spend'],
-  ['settings', '/settings'],
-  ['setup', '/setup'],
-]
+// One per destination, read out of the scheme rather than written down here.
+// This was a literal array of seven paths under a header that already claimed
+// it was "one per destination in state/routes.ts", and the two disagreed the
+// moment an eighth was added: `/speech` shipped, and the only verifier that
+// opens a real browser did not know it existed. Same rule as `check.mjs`
+// discovering verifiers instead of listing them -- a list stops covering the
+// newest thing at exactly the moment somebody adds one.
+//
+// The name is the segment, so `screens/<dest>.png` keeps the filenames it had.
+const routes = await load(import.meta.url, '../state/routes.ts')
+const blank = routes.parse('/')
+const SCREENS = routes.DESTINATIONS.map((dest) => {
+  const path = routes.href({ ...blank, dest })
+  return [path.replace(/^\//, ''), path]
+})
 if (someModel) SCREENS.push(['model-detail', `/models/${someModel}`])
 if (someNode) SCREENS.push(['node-sheet', `/cluster?open=node:${someNode}`])
+if (someDep) SCREENS.push(['dep-sheet', `/dashboard?open=dep:${encodeURIComponent(someDep)}`])
 
 mkdirSync(outDir, { recursive: true })
 

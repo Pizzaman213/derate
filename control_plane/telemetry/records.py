@@ -55,7 +55,10 @@ class RequestRecord:
     # COUNT(*) GROUP BY request_id, since each attempt writes its own row.
     attempt_no: int = 0
     attempts: int = 1
-    retry_reason: str = ""  # "" | "transport" | "http_5xx"
+    # "" | "transport" | "http_5xx" | "pool_exhausted". The last is kept apart
+    # from "transport" on purpose: it means this gateway had no free upstream
+    # connection, which is not evidence that the backend was unreachable.
+    retry_reason: str = ""
 
     # How it ended.
     status: int | None = None

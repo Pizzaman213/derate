@@ -3,10 +3,11 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   type ReactNode,
 } from 'react'
 import { useTopology } from './resources'
-import { DEFAULT_CONCURRENCY, DEFAULT_CONTEXT, useRouter } from './router'
+import { useRouter } from './router'
 import type { TopologyDeployment } from '../api/types'
 
 // Selection semantics transplanted from mockups-next/js/dashboard.js and
@@ -46,9 +47,19 @@ export type SheetTarget =
   /** A model id rather than a cluster object: the sheet resolves it
    *  itself, because a model is not something the cluster holds. The two
    *  numbers ride along because the fit verdicts in the ladder are taken
-   *  at them, and the sheet has no other way to see what the tab's fields
-   *  were set to. */
-  | { kind: 'model'; id: string; context: number; concurrency: number }
+   *  at them, and the sheet has no other way to see what was overridden.
+   *
+   *  Nullable, and passed through null rather than defaulted: null means the
+   *  coordinator picks a context per model, which is the default path. Filling
+   *  in 8192 here would make the sheet ask a narrower question than the tab
+   *  behind it, off one URL -- exactly the disagreement these two numbers were
+   *  put in the URL to prevent. */
+  | {
+      kind: 'model'
+      id: string
+      context: number | null
+      concurrency: number | null
+    }
 
 export interface SelectionApi {
   selDep: string | null
@@ -88,6 +99,8 @@ const Ctx = createContext<SelectionApi | null>(null)
 export function SelectionProvider({ children }: { children: ReactNode }) {
   const topology = useTopology()
   const deployments = topology.data?.deployments ?? []
+  // Provider-served names. Same source as the floor's remote bands.
+  const remotes = topology.data?.remotes ?? []
   const { route, navigate } = useRouter()
 
   const explicitDep = route.dep
@@ -105,8 +118,8 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
       return {
         kind: 'model',
         id: open.id,
-        context: route.context ?? DEFAULT_CONTEXT,
-        concurrency: route.concurrency ?? DEFAULT_CONCURRENCY,
+        context: route.context,
+        concurrency: route.concurrency,
       }
     }
     return { kind: open.kind, id: open.id }
@@ -115,12 +128,38 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
   // Falls back the moment the chosen name is no longer being served -- a
   // stopped deployment never leaves the sidebar pointed at a name nothing
   // answers to.
+  //
+  // A served name is holdable whether a machine here runs it or a provider
+  // does. `?dep=` used to be validated against `deployments` alone, which was
+  // right while every surface that wrote it dealt in local deployments. The
+  // chat picker now offers provider models, and the cluster floor already
+  // draws them as bands -- so a name validated only against the local half
+  // meant clicking one of those rows navigated, failed this test, and fell
+  // through to `defaultDep`, quietly selecting a DIFFERENT model with nothing
+  // on screen saying so. Silently answering a click with the wrong model is
+  // worse than not answering it.
+  //
+  // `defaultDep` stays local-only on purpose: what is SELECTABLE and what is
+  // selected BY DEFAULT are different questions, and the default belongs to a
+  // deployment this cluster is running rather than to whichever provider name
+  // happens to sort first.
   const selDep = useMemo(() => {
-    if (explicitDep != null && deployments.some((d) => d.served_name === explicitDep)) {
-      return explicitDep
-    }
+    const holds = (name: string) =>
+      deployments.some((d) => d.served_name === name) ||
+      remotes.some((r) => r.served_name === name)
+    if (explicitDep != null && holds(explicitDep)) return explicitDep
     return defaultDep(deployments)
-  }, [explicitDep, deployments])
+  }, [explicitDep, deployments, remotes])
+
+  // The two toggles need to know what is currently selected, and they read it
+  // from a ref rather than from a dependency. Every one of these callbacks is
+  // an identity ClusterGraph keys its pointer and key listeners on: taking
+  // `selNode` as a dependency would hand it a new function on every click and
+  // rebind every listener on the machine floor each time one lands.
+  const nodeRef = useRef(selNode)
+  const linkRef = useRef(selLink)
+  nodeRef.current = selNode
+  linkRef.current = selLink
 
   const selectDep = useCallback(
     (servedName: string) => navigate({ dep: servedName }, { replace: true }),
@@ -129,16 +168,19 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
 
   const selectNode = useCallback(
     (nodeId: string) =>
-      navigate({ node: selNode === nodeId ? null : nodeId, link: null }, { replace: true }),
-    [navigate, selNode],
+      navigate(
+        { node: nodeRef.current === nodeId ? null : nodeId, link: null },
+        { replace: true },
+      ),
+    [navigate],
   )
 
   const selectLink = useCallback(
     (a: string, b: string) => {
       const key = linkKey(a, b)
-      navigate({ link: selLink === key ? null : key, node: null }, { replace: true })
+      navigate({ link: linkRef.current === key ? null : key, node: null }, { replace: true })
     },
-    [navigate, selLink],
+    [navigate],
   )
 
   const pickNode = useCallback(

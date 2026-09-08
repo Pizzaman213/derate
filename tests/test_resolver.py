@@ -168,6 +168,40 @@ class TestFieldMapping:
         assert res.shape.num_kv_heads == res.shape.num_attention_heads == 12
         assert any("no num_key_value_heads" in w for w in res.warnings)
 
+    def test_gpt_fast_names_its_kv_heads_n_local_heads(self, resolver):
+        """`n_local_heads` is gpt-fast's name for the KV head count, inherited
+        by the DualAR speech checkpoints from Fish Speech.
+
+        It reads like a tensor-parallel shard count and is not one: no
+        published config states a sharded head count, because the shard is
+        chosen at launch. Without the mapping this model was charged as
+        multi-head -- fourteen KV heads where it has two, a KV cache seven
+        times too large -- and the warning about it was the only sign.
+        """
+        res = resolver.resolve_config(
+            {
+                "model_type": "arktts",
+                "architectures": ["ArkttsModel"],
+                "n_layer": 24,
+                "dim": 896,
+                "n_head": 14,
+                "n_local_heads": 2,
+                "head_dim": 64,
+                "intermediate_size": 4864,
+                "vocab_size": 155776,
+                "max_seq_len": 2048,
+                "dtype": "bfloat16",
+            },
+            "Audio8/Audio8-TTS-Preview-0.6b",
+        )
+        assert (res.shape.num_attention_heads, res.shape.num_kv_heads) == (14, 2)
+        assert not any("no num_key_value_heads" in w for w in res.warnings)
+        # The packed text+audio window, which bounds every request the server
+        # will accept. Absent, the planner would offer a context the model
+        # refuses to start a generation at.
+        assert res.max_position_embeddings == 2048
+        assert res.modality == "speech"
+
     def test_explicit_head_dim_wins_over_the_division(self, resolver):
         """GPT-OSS breaks hidden_size / num_heads: 2880 / 64 is 45, not 64."""
         shape = offline(resolver, "gpt-oss-120b", "openai/gpt-oss-120b").shape
@@ -192,6 +226,140 @@ class TestFieldMapping:
 
         with pytest.raises(UnsupportedArchitecture):
             resolver.resolve_config({"model_type": "mystery"}, "x/y")
+
+    def test_the_refusal_names_what_was_searched(self, resolver):
+        """A config reaches here for two very different reasons -- a wrapper
+        this build cannot read, or a checkpoint with no transformer in it at
+        all (a CTranslate2 export, a static embedding model) -- and the
+        operator cannot act on either without being told which."""
+        from control_plane.resolver import UnsupportedArchitecture
+
+        with pytest.raises(UnsupportedArchitecture) as caught:
+            resolver.resolve_config({"model_type": "mystery"}, "x/y")
+        assert "found no transformer stack" in str(caught.value)
+
+
+class TestCompositeConfigs:
+    """A stack under a key nobody taught this module about.
+
+    The support table stopped being a hand-kept list of somebody else's
+    architecture names; `_TEXT_CONFIG_KEYS` was the same thing one layer down,
+    a hand-kept list of somebody else's *key* names, and it failed the same
+    way -- by refusing models that were fine.
+    """
+
+    def test_a_named_wrapper_that_wraps_again_is_followed(self):
+        """`thinker_config` holds no shape fields itself; its own
+        `text_config` does. One level of descent covers that."""
+        from control_plane.resolver.config_map import map_config
+
+        mapped = map_config({
+            "model_type": "omni",
+            "thinker_config": {"text_config": {
+                "num_hidden_layers": 48, "hidden_size": 2048,
+                "num_attention_heads": 32, "num_key_value_heads": 4,
+            }},
+        })
+        assert (mapped.num_layers, mapped.hidden_size) == (48, 2048)
+
+    def test_the_thinker_outranks_the_talker(self):
+        """Both are named keys and a Qwen-Omni checkpoint has both. The
+        thinker answers /v1/chat/completions; the talker emits speech tokens,
+        so the thinker is what a served model is sized by."""
+        from control_plane.resolver.config_map import map_config
+
+        mapped = map_config({
+            "talker_config": {"num_hidden_layers": 20, "hidden_size": 1024,
+                              "num_attention_heads": 16},
+            "thinker_config": {"text_config": {
+                "num_hidden_layers": 48, "hidden_size": 2048,
+                "num_attention_heads": 32,
+            }},
+        })
+        assert mapped.num_layers == 48
+
+    def test_an_unknown_wrapper_is_searched_for_a_stack(self):
+        """`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` was refused outright for
+        keeping its stack under a key this list had never heard of."""
+        from control_plane.resolver.config_map import map_config
+
+        mapped = map_config({
+            "model_type": "novel_thing",
+            "some_unheard_of_config": {
+                "num_hidden_layers": 28, "hidden_size": 2048,
+                "num_attention_heads": 16, "num_key_value_heads": 8,
+            },
+        })
+        assert (mapped.num_layers, mapped.hidden_size, mapped.num_kv_heads) == (28, 2048, 8)
+        assert any("some_unheard_of_config" in w for w in mapped.warnings)
+
+    def test_the_largest_stack_wins_and_that_is_load_bearing(self):
+        """The case that decides the whole design.
+
+        Qwen3-Omni's served stack is `thinker_config.text_config` -- 48 layers
+        of 2048 with 128 experts -- and the only candidate one level down is
+        `code2wav_config`, an 8-layer vocoder. Searching one level, or taking
+        the first match, charges a 30B mixture-of-experts as a small vocoder,
+        and the fit gate waves through a launch that runs out of memory.
+        """
+        from control_plane.resolver.config_map import map_config
+
+        mapped = map_config({
+            "model_type": "unnamed_omni",
+            "code2wav_config": {"num_hidden_layers": 8, "hidden_size": 1024,
+                                "num_attention_heads": 16},
+            "some_talker": {
+                "code_predictor_config": {"num_hidden_layers": 5, "hidden_size": 1024,
+                                          "num_attention_heads": 16},
+                "inner": {"num_hidden_layers": 20, "hidden_size": 1024,
+                          "num_attention_heads": 16},
+            },
+            "some_thinker": {"inner": {
+                "num_hidden_layers": 48, "hidden_size": 2048,
+                "num_attention_heads": 32, "num_experts": 128,
+            }},
+        })
+        assert (mapped.num_layers, mapped.hidden_size) == (48, 2048)
+        assert mapped.num_experts == 128
+
+    def test_the_warning_names_the_pick_and_the_rejects(self):
+        """The number this changes is the one the project refuses launches
+        over, so which stack was chosen cannot be a silent decision."""
+        from control_plane.resolver.config_map import map_config
+
+        mapped = map_config({
+            "small_head": {"num_hidden_layers": 4, "hidden_size": 512,
+                           "num_attention_heads": 8},
+            "big_stack": {"num_hidden_layers": 32, "hidden_size": 4096,
+                          "num_attention_heads": 32},
+        })
+        note = next(w for w in mapped.warnings if "shape read from" in w)
+        assert "'big_stack' (32 x 4096)" in note
+        assert "'small_head' (4 x 512)" in note
+        assert "KV cache per token" in note
+
+    def test_a_config_with_no_stack_anywhere_still_refuses(self):
+        """`minishlab/potion-base-8M` is a static embedding model: no
+        attention at any depth, and no amount of searching produces one."""
+        from control_plane.resolver.config_map import map_config
+
+        with pytest.raises(KeyError):
+            map_config({"model_type": "static", "vocab": {"size": 30000}})
+
+    def test_discovery_never_reaches_a_config_that_already_resolves(self):
+        """The safety property. The search runs only in the branch that used
+        to raise, so it cannot restate a shape this module already agreed on
+        -- and a plain decoder-only config must carry no selection warning."""
+        from control_plane.resolver.config_map import map_config
+
+        mapped = map_config({
+            "num_hidden_layers": 32, "hidden_size": 4096,
+            "num_attention_heads": 32, "num_key_value_heads": 8,
+            "vision_config": {"num_hidden_layers": 64, "hidden_size": 8192,
+                              "num_attention_heads": 64},
+        })
+        assert (mapped.num_layers, mapped.hidden_size) == (32, 4096)
+        assert not any("shape read from" in w for w in mapped.warnings)
 
 
 # --------------------------------------------------------------------------
@@ -1084,6 +1252,51 @@ class TestSpeechModels:
         # reading: the model stays on the routes it was always offered on.
         assert modality_for(()) == "text"
 
+    def test_a_tts_architecture_is_speech_and_has_a_runtime_that_loads_it(self):
+        """The other direction: text in, audio out.
+
+        Both halves matter. `modality_for` is what puts the deployment on
+        /v1/audio/speech, and the support table is what lets it be launched at
+        all -- before the tts runtime existed, every TTS checkpoint was
+        refused by both runtimes and there was no third to send it to.
+        """
+        assert modality_for(("ArkttsModel",)) == "speech"
+        verdict = build_verdict(("ArkttsModel",), "bf16")
+        assert verdict.for_runtime("tts").ok
+        assert not verdict.for_runtime("vllm").ok
+        assert not verdict.for_runtime("sglang").ok
+        assert verdict.any_runtime_ok
+
+    def test_a_refusal_names_the_runtime_that_would_have_worked(self):
+        """"Not in vllm's list" is true and unactionable. The model in front of
+        the reader is servable one control away, and this is the only place
+        that knows it."""
+        reason = build_verdict(("ArkttsModel",), "bf16").for_runtime("vllm").reason
+        assert "the tts runtime loads it" in reason
+        assert "/v1/audio/speech" in reason
+        # A text model refused by sglang gets the same courtesy, without an
+        # endpoint clause -- it answers on the route it was already on.
+        text = build_verdict(("Zamba2ForCausalLM",), "bf16").for_runtime("sglang").reason
+        assert "the vllm runtime loads it" in text
+        assert "/v1/" not in text
+
+    def test_the_tts_runtime_loads_no_quantized_weights(self):
+        """It is a transformers loader: no GPTQ kernel, no AWQ kernel, no GGUF.
+        Stated so a 4-bit repository is refused here rather than at load."""
+        assert not build_verdict(("ArkttsModel",), "q4_k_m").for_runtime("tts").ok
+        assert not build_verdict(("ArkttsModel",), "awq_int4").for_runtime("tts").ok
+        assert build_verdict(("ArkttsModel",), "fp32").for_runtime("tts").ok
+
+    def test_every_tts_architecture_is_declared_speech(self):
+        """The two tables are kept in step by construction, and this is the
+        assertion that says why it matters: a runtime that serves only
+        /v1/audio/speech must not hold an architecture the router would send
+        to /v1/chat/completions."""
+        from control_plane.resolver.support import TTS_ARCHITECTURES
+
+        for name in TTS_ARCHITECTURES:
+            assert modality_for((name,)) == "speech", name
+
     def test_modality_of_reads_the_cache_and_says_text_when_it_is_cold(self, resolver):
         """`modality_of` reaches back into the shape cache, exactly as
         `supported_by` does, so a shape the cache has never seen reports text.
@@ -1539,6 +1752,97 @@ class TestQuantLadderCoverage:
         assert not gguf - set(_SGLANG_QUANTS)
 
 
+class TestArmRepackAndLSuffixes:
+    """The names that cost `Qwen/Qwen2.5-0.5B-Instruct` its whole ladder.
+
+    ``/api/models/variants`` for that model 504'd at exactly 20s, every time,
+    and never cached the failure. Ten files across six GGUF repos had names
+    ``from_name`` could not parse, so each one bought a multi-second ranged read
+    of its header -- which then returned ``None`` as well, because LLAMA_FTYPE
+    33/34/35 were absent from ``GGUF_FILE_TYPES``. Every one of them fell
+    through to the bf16 default at 2.0 bytes per parameter against a real
+    0.5625: a 3.56x over-charge on top of the timeout.
+
+    ``Q4_0_4_4`` and friends are not distinct quantizations. They are the same
+    Q4_0 blocks repacked for ARM i8mm/SVE dot products -- same bits per weight,
+    same bytes on disk, only the memory order differs. ``Q6_K_L``/``Q8_0_L`` are
+    the base scheme with embeddings left at F16, priced at the base scheme, the
+    rule already applied to ``Q2_K_L``.
+    """
+
+    #: Real file names from the six GGUF repos the resolver enumerates for
+    #: Qwen2.5-0.5B-Instruct, with the scheme each must resolve to.
+    REPACKED = [
+        ("Qwen2.5-0.5B-Instruct-Q4_0_4_4.gguf", "q4_0"),
+        ("Qwen2.5-0.5B-Instruct-Q4_0_4_8.gguf", "q4_0"),
+        ("Qwen2.5-0.5B-Instruct-Q4_0_8_8.gguf", "q4_0"),
+        ("Qwen2.5-0.5B-Instruct-i1-Q4_0_4_4.gguf", "q4_0"),
+        ("Qwen2.5-0.5B-Instruct-i1-Q4_0_8_8.gguf", "q4_0"),
+        ("Qwen2.5-0.5B-Instruct-Q6_K_L.gguf", "q6_k"),
+        ("Qwen2.5-0.5B-Instruct-Q8_0_L.gguf", "q8_0"),
+    ]
+
+    def test_every_repacked_name_is_recognised(self):
+        missed = [f for f, _ in self.REPACKED if _from_name(f) is None]
+        assert not missed, f"{len(missed)} of {len(self.REPACKED)} undetected: {missed}"
+
+    def test_each_repacked_name_resolves_to_the_base_scheme(self):
+        wrong = [
+            (f, want, _from_name(f))
+            for f, want in self.REPACKED
+            if _from_name(f) != want
+        ]
+        assert not wrong, f"misdetected: {wrong}"
+
+    def test_the_xl_rule_still_wins_over_the_new_l_rule(self):
+        """`Q6_K_XL` must not be captured by the `Q6_K_L` pattern added beside
+        it; the _XL block is deliberately ordered first."""
+        assert _from_name("model-Q6_K_XL.gguf") == "q6_k"
+        assert _from_name("model-Q8_K_XL.gguf") == "q8_0"
+
+    def test_the_plain_families_are_untouched(self):
+        for name, want in (
+            ("m-Q4_0.gguf", "q4_0"),
+            ("m-Q4_1.gguf", "q4_1"),
+            ("m-Q6_K.gguf", "q6_k"),
+            ("m-Q8_0.gguf", "q8_0"),
+            ("m-Q2_K_L.gguf", "q2_k"),
+            ("m-Q2_K_S.gguf", "q2_k_s"),
+        ):
+            assert _from_name(name) == want, name
+
+    def test_a_repacked_name_is_not_charged_at_bf16(self):
+        """The over-charge, stated as the number it actually was."""
+        key = _from_name("Qwen2.5-0.5B-Instruct-Q4_0_4_4.gguf")
+        assert key is not None
+        assert BYTES_PER_PARAM[key] == BYTES_PER_PARAM["q4_0"]
+        assert BYTES_PER_PARAM["bf16"] / BYTES_PER_PARAM[key] > 3.5
+
+    def test_the_arm_repack_ftypes_are_present(self):
+        """33/34/35 are MOSTLY_Q4_0_4_4/_4_8/_8_8. Absent, a header read
+        answered None for exactly the files whose names could not be parsed
+        either, so the read was pure cost."""
+        from control_plane.resolver.gguf import GGUF_FILE_TYPES
+
+        for ftype in (33, 34, 35):
+            assert GGUF_FILE_TYPES.get(ftype) == "q4_0"
+
+    def test_the_ternary_ftypes_stay_out(self):
+        """36/37 are TQ1_0/TQ2_0. BYTES_PER_PARAM has no ternary key, and
+        adding one is a change to the frozen contract. Absent means they fall
+        through to the bf16 default, which over-charges -- the safe direction."""
+        from control_plane.resolver.gguf import GGUF_FILE_TYPES
+
+        assert 36 not in GGUF_FILE_TYPES
+        assert 37 not in GGUF_FILE_TYPES
+
+    def test_every_mapped_ftype_names_a_real_scheme(self):
+        from control_plane.resolver.gguf import GGUF_FILE_TYPES
+
+        unknown = {k: v for k, v in GGUF_FILE_TYPES.items() if v not in BYTES_PER_PARAM}
+        assert not unknown, f"unmapped schemes: {unknown}"
+
+
 from control_plane.resolver.support import build_verdict  # noqa: E402
 from control_plane.resolver.types import (  # noqa: E402
     ParamSource,
@@ -1759,3 +2063,120 @@ class TestQuantVariants:
         variants = resolver.quant_variants("acme/Widget-7B-GGUF")
         assert [v.source for v in variants] == ["self"]
         assert resolver.client.searched == []
+
+
+class TestHeaderProbeBudget:
+    """One enumeration may not spend unbounded time reading GGUF headers.
+
+    ``Qwen/Qwen2.5-0.5B-Instruct`` 504'd because ten files across six repos had
+    names ``from_name`` could not read, and each one cost a multi-second ranged
+    read that then returned ``None`` anyway. Teaching the parser those names
+    fixed that repo; this bounds the general case, so the next repository that
+    ships something unparseable degrades instead of timing out.
+
+    The budget is per ``quant_variants`` call, not per repository -- six repos
+    at three probes each is eighteen reads, which is the original bug.
+    """
+
+    class _Hub:
+        """Two GGUF repos, each shipping files whose names say nothing."""
+
+        def __init__(self, per_repo=4):
+            self.per_repo = per_repo
+            self.searched = []
+
+        def search(self, query, limit=50):
+            self.searched.append(query)
+            return [
+                {"id": "acme/Widget-7B-GGUF", "downloads": 900, "tags": ["gguf"]},
+                {"id": "other/Widget-7B-GGUF", "downloads": 800, "tags": ["gguf"]},
+            ]
+
+        def read_range(self, model_id, filename, start, length, revision="main"):
+            blob = _special_gguf_bytes()
+            return blob[start : start + length]
+
+        def model_info(self, model_id, revision="main"):
+            from control_plane.resolver.hf import ModelInfo
+
+            files = {
+                f"Widget-7B-mystery{i}.gguf": 1_000_000_000 + i
+                for i in range(self.per_repo)
+            }
+            return ModelInfo(
+                model_id, "sha", tuple(files), None, None, (), file_sizes=files
+            )
+
+    def _resolver(self, monkeypatch, hub=None):
+        resolver = ModelResolver(client=hub or self._Hub())
+        shape = MODEL_SHAPES["llama-3.3-70b"]
+        monkeypatch.setattr(
+            resolver,
+            "resolve_full",
+            lambda mid, dtype=None: Resolution(
+                shape=shape,
+                revision="main",
+                param_source=ParamSource.CONFIG_ESTIMATE,
+                quant_source=QuantSource.TORCH_DTYPE,
+                support=build_verdict(("LlamaForCausalLM",), shape.dtype),
+            ),
+        )
+        return resolver
+
+    def _count_probes(self, monkeypatch, resolver):
+        """Count FILES probed, not ranged reads: one header walk issues several
+        reads, and the budget is denominated in files."""
+        probed: list[tuple[str, str]] = []
+        original = resolver._dtype_from_header
+
+        def spy(repo_id, filename):
+            probed.append((repo_id, filename))
+            return original(repo_id, filename)
+
+        monkeypatch.setattr(resolver, "_dtype_from_header", spy)
+        return probed
+
+    def test_one_enumeration_spends_at_most_three_header_reads(self, monkeypatch):
+        resolver = self._resolver(monkeypatch)
+        probed = self._count_probes(monkeypatch, resolver)
+        resolver.quant_variants("acme/Widget-7B")
+        assert len(probed) <= ModelResolver._MAX_HEADER_PROBES, probed
+
+    def test_the_budget_spans_repositories_rather_than_resetting(self, monkeypatch):
+        """Per-repo budgets would be 6 x 3 = 18 reads: the bug again."""
+        resolver = self._resolver(monkeypatch)
+        probed = self._count_probes(monkeypatch, resolver)
+        resolver.quant_variants("acme/Widget-7B")
+        # Three repos are enumerated. A per-repo budget would allow 3x as many.
+        assert len(probed) <= ModelResolver._MAX_HEADER_PROBES
+        assert len(probed) < 3 * ModelResolver._MAX_HEADER_PROBES
+
+    def test_every_unparseable_file_still_appears(self, monkeypatch):
+        """A spent budget must not drop a real quantization from the ladder."""
+        hub = self._Hub(per_repo=4)
+        resolver = self._resolver(monkeypatch, hub)
+        variants = resolver.quant_variants("acme/Widget-7B")
+        mystery = [v for v in variants if v.gguf_file and "mystery" in v.gguf_file]
+        # Three repos are enumerated: the model's own id plus the two the
+        # search returns, four files each.
+        assert len(mystery) == 12, f"expected 12 files across 3 repos, got {len(mystery)}"
+
+    def test_a_skipped_probe_does_not_claim_the_header_could_not_be_read(
+        self, monkeypatch
+    ):
+        """The never-claim-an-unmeasured-thing rule. A budget that ran out and
+        a header that failed are different facts and must read differently."""
+        resolver = self._resolver(monkeypatch, self._Hub(per_repo=4))
+        variants = resolver.quant_variants("acme/Widget-7B")
+        skipped = [v for v in variants if "budget" in (v.note or "")]
+        assert skipped, "no variant reported a spent budget"
+        for v in skipped:
+            assert "could not be read" not in v.note
+            assert "was not opened" in v.note
+
+    def test_a_direct_caller_is_still_unlimited(self, monkeypatch):
+        """`budget=None` keeps every existing call site and test unchanged."""
+        resolver = self._resolver(monkeypatch, self._Hub(per_repo=4))
+        probed = self._count_probes(monkeypatch, resolver)
+        resolver._gguf_file_variants("acme/Widget-7B-GGUF")
+        assert len(probed) == 4

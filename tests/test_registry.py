@@ -11,6 +11,7 @@ hardware skip themselves when it is absent.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import stat
@@ -39,20 +40,39 @@ from control_plane.registry import (
     probe_local,
     require_host_networking,
 )
+from control_plane.registry import nodeident
 from control_plane.registry import probe as probe_mod
-from control_plane.registry.bootstrap import RoleDecision, resolve_role
+from control_plane.registry.bootstrap import (
+    RoleDecision,
+    join_with_held_credentials,
+    reannounce,
+    resolve_role,
+)
 from control_plane.registry.config import (
     HEARTBEAT_INTERVAL_S,
     HEARTBEAT_MISSES_UNHEALTHY,
     HEARTBEAT_TIMEOUT_S,
+    REANNOUNCE_MAX_RETRY_S,
+    REANNOUNCE_UNPOLLED_S,
+    ROLE_COORDINATOR,
+    ROLE_WORKER,
     TELEMETRY_RING_SAMPLES,
 )
-from control_plane.registry.discovery import DiscoveredPeer
+from control_plane.registry.discovery import Advertiser, DiscoveredPeer
+from control_plane.registry.identity import (
+    ClusterIdentity,
+    load_or_create_identity,
+    read_identity,
+)
 from control_plane.registry.net import normalize_agent_url
 from control_plane.registry.probe import bandwidth_for
+from control_plane.registry import startup as startup_mod
+from control_plane.registry.bootstrap import Announcement
+from control_plane.registry.startup import recover_credentials
 from control_plane.registry.profiles import profile_supersedes
 from control_plane.registry.serde import profile_from_dict, profile_to_dict
 from control_plane.registry.telemetry import (
+    HostMemory,
     RingBuffer,
     TelemetrySample,
     TelemetryStore,
@@ -279,10 +299,21 @@ def test_bandwidth_lookup_table(name, expected):
     assert bandwidth_for(name) == expected
 
 
-def test_missing_nvidia_smi_returns_unknown_and_does_not_raise(monkeypatch):
-    """Acceptance: no nvidia-smi returns UNKNOWN and does not raise."""
+def test_missing_nvidia_smi_on_nvidia_hardware_returns_unknown(monkeypatch):
+    """Acceptance: no nvidia-smi returns UNKNOWN and does not raise.
+
+    ``nvidia_present`` is injected rather than left to the machine running the
+    tests, because it is now what decides the answer: a card the probe could
+    not read is UNKNOWN, and a machine with no card is CPU. Left implicit this
+    test would assert one thing on a GPU runner and the opposite on a laptop.
+    """
     monkeypatch.setattr(probe_mod, "run_nvidia_smi", lambda *a, **k: None)
-    profile = probe_local(node_id="headless", hostname="headless", address="10.0.0.9")
+    profile = probe_local(
+        node_id="headless",
+        hostname="headless",
+        address="10.0.0.9",
+        nvidia_present=lambda: True,
+    )
     assert profile.device_class is DeviceClass.UNKNOWN
     assert profile.total_memory == 0
     assert profile.addressable_memory == 0
@@ -290,6 +321,85 @@ def test_missing_nvidia_smi_returns_unknown_and_does_not_raise(monkeypatch):
     assert profile.gpu_count == 0
     # Still identifiable: the planner skips it, the UI can still list it.
     assert profile.node_id == "headless"
+
+
+def test_a_machine_with_no_gpu_at_all_is_cpu_not_unknown(monkeypatch):
+    """A Raspberry Pi is identified hardware, not unidentified hardware.
+
+    It probed as UNKNOWN, which the gateway renders as "device class is not
+    recognized; cannot confirm this hardware is eligible to join the pool" --
+    a hedge about hardware we had in fact looked at from three directions and
+    found no GPU on. Nothing about the machine changes here except the sentence
+    said about it, which was the only thing that was wrong.
+    """
+    monkeypatch.setattr(probe_mod, "run_nvidia_smi", lambda *a, **k: None)
+    profile = probe_local(
+        node_id="connor-pi",
+        hostname="Connor-Pi",
+        address="192.168.0.45",
+        sysctl=lambda *a, **k: None,
+        nvidia_present=lambda: False,
+        host_memory=lambda: HostMemory(
+            total=2 * GIB, available=1 * GIB, swap_used=0
+        ),
+    )
+    assert profile.device_class is DeviceClass.CPU
+    # Every memory field stays 0, exactly as on a Mac: there is no GPU pool, so
+    # the fit gate must still refuse every rank on this machine. Host RAM lives
+    # on the live NodeState.memory_total, not here, where it would be summed
+    # into cluster-wide totals.
+    assert profile.total_memory == 0
+    assert profile.addressable_memory == 0
+    assert profile.usable_memory(0.90) == 0
+    assert profile.gpu_count == 0
+    assert profile.gpu_name == ""
+    # No GPU to name means no empty parentheses in a reason line either.
+    assert profile.describe() == "connor-pi"
+
+
+def test_a_machine_that_cannot_report_its_own_memory_stays_unknown(monkeypatch):
+    """The evidence CPU requires is one host reading.
+
+    No GPU and no way to say how much RAM is here is not a CPU machine, it is
+    a machine we could not look at -- a container locked down far enough that
+    both /proc/meminfo and psutil come back empty. UNKNOWN is the honest answer
+    and it keeps it.
+    """
+    monkeypatch.setattr(probe_mod, "run_nvidia_smi", lambda *a, **k: None)
+    profile = probe_local(
+        address="10.0.0.9",
+        sysctl=lambda *a, **k: None,
+        nvidia_present=lambda: False,
+        host_memory=lambda: None,
+    )
+    assert profile.device_class is DeviceClass.UNKNOWN
+
+
+def test_nvidia_hardware_is_found_without_nvidia_smi(tmp_path):
+    """The gate that keeps a --gpus-less container distinguishable from a Pi.
+
+    Both sources survive that container: the proc entry belongs to the loaded
+    driver and the PCI bus is the host's, so neither needs the container
+    toolkit that injects nvidia-smi. Either alone is enough -- a driver can be
+    loaded with every card already handed to another container, and a card can
+    sit on the bus with nothing bound to it.
+    """
+    absent = tmp_path / "nothing"
+    driver = tmp_path / "version"
+    driver.write_text("NVRM version: NVIDIA UNIX Open Kernel Module for aarch64\n")
+
+    bus = tmp_path / "devices"
+    (bus / "0000:01:00.0").mkdir(parents=True)
+    (bus / "0000:01:00.0" / "vendor").write_text("0x10de\n")
+    other = tmp_path / "other-devices"
+    (other / "0000:00:00.0").mkdir(parents=True)
+    (other / "0000:00:00.0" / "vendor").write_text("0x1b36\n")
+
+    assert probe_mod.nvidia_hardware_present(proc=driver, pci=absent) is True
+    assert probe_mod.nvidia_hardware_present(proc=absent, pci=bus) is True
+    # A Pi: neither source says anything, and neither is an error.
+    assert probe_mod.nvidia_hardware_present(proc=absent, pci=other) is False
+    assert probe_mod.nvidia_hardware_present(proc=absent, pci=absent) is False
 
 
 def test_probe_never_raises_on_garbage(monkeypatch):
@@ -879,7 +989,12 @@ def test_a_machine_with_no_gpu_reports_host_facts_instead_of_nothing(monkeypatch
     about a GPU on that machine, but /proc/meminfo, /sys/class/thermal and
     /proc/stat all answer.
     """
-    profile = probe_local(address="192.168.0.45", rows=[])
+    profile = probe_local(
+        address="192.168.0.45",
+        rows=[],
+        sysctl=lambda *a, **k: None,
+        nvidia_present=lambda: False,
+    )
     assert profile.gpu_count == 0  # the precondition the fallback is gated on
     fake_host_memory(monkeypatch, total=8 * GIB, available=6 * GIB)
     monkeypatch.setattr(
@@ -1674,7 +1789,24 @@ def test_host_memory_reads_the_pool_and_swap(monkeypatch, tmp_path):
 
 
 def test_host_memory_survives_a_missing_meminfo(monkeypatch, tmp_path):
+    """No /proc/meminfo is a question for hostfacts, not an answer of None.
+
+    A machine without /proc is a Mac or a Windows box, not a broken Linux one,
+    and reporting nothing there is what left such a node sitting in the roster
+    with every reading blank. So the reader falls through rather than giving
+    up -- and still gives up when the fallthrough has nothing either, which is
+    the case a machine with no psutil is in.
+    """
     monkeypatch.setattr("control_plane.registry.telemetry.MEMINFO", tmp_path / "gone")
+
+    monkeypatch.setattr(
+        "control_plane.registry.hostfacts.host_memory", lambda: (64, 32, 0)
+    )
+    from control_plane.registry.telemetry import HostMemory
+
+    assert read_host_memory() == HostMemory(total=64, available=32, swap_used=0)
+
+    monkeypatch.setattr("control_plane.registry.hostfacts.host_memory", lambda: None)
     assert read_host_memory() is None
 
 
@@ -2592,12 +2724,46 @@ def test_an_unknown_probe_never_overwrites_identified_hardware():
     assert profile_supersedes(blind, SPARK_01) is False
 
 
+def test_an_identified_probe_replaces_an_unknown_one():
+    """The Pi's own case, and the direction that must land."""
+    stored = make_profile("connor-pi", device_class=DeviceClass.UNKNOWN)
+    fresh = make_profile("connor-pi", device_class=DeviceClass.CPU)
+
+    assert profile_supersedes(fresh, stored) is True
+
+
+def test_a_different_identified_class_is_believed():
+    """Only absence is filtered, never a different answer. Pulling a card is a
+    real thing that happens and the machine must be allowed to say so."""
+    fresh = make_profile("spark-01", device_class=DeviceClass.CPU)
+
+    assert profile_supersedes(fresh, SPARK_01) is True
+
+
 def test_unknown_replaces_unknown():
     """Nothing better to keep, so there is nothing to protect."""
     stored = make_profile("x", device_class=DeviceClass.UNKNOWN)
     fresh = make_profile("x", device_class=DeviceClass.UNKNOWN)
 
     assert profile_supersedes(fresh, stored) is True
+
+
+def test_a_refreshed_profile_lands_and_persists(tmp_path):
+    """The Pi, after its image is updated: unknown -> cpu without a re-join."""
+    stale = make_profile("connor-pi", device_class=DeviceClass.UNKNOWN)
+    client = FakeClient()
+    client.serve("http://10.0.0.50:8081", stale)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.50"))
+    assert registry.get_node("connor-pi").profile.device_class is DeviceClass.UNKNOWN
+
+    upgraded = make_profile("connor-pi", device_class=DeviceClass.CPU)
+    client.serve("http://10.0.0.50:8081", upgraded)
+    assert run(registry.refresh_profile("connor-pi")) is True
+
+    assert registry.get_node("connor-pi").profile.device_class is DeviceClass.CPU
+    stored = json.loads((tmp_path / "registry.json").read_text())
+    assert stored["members"]["connor-pi"]["profile"]["device_class"] == "cpu"
 
 
 def test_a_refresh_that_cannot_reach_the_node_keeps_what_we_had(tmp_path):
@@ -2663,3 +2829,635 @@ def test_an_agent_that_reports_no_build_does_not_blank_a_known_one(tmp_path):
     run(registry.check_health("spark-02"))
 
     assert registry.get_node("spark-02").build == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# Node identity: seeded from the hostname once, then kept.
+#
+# It used to be re-derived every boot, so the hostname *was* the identity and a
+# rename turned a machine into a stranger -- a fresh candidate plus an
+# undeletable unhealthy ghost holding the old label, links and placement.
+# ---------------------------------------------------------------------------
+
+
+def test_node_id_survives_a_rename(tmp_path, monkeypatch):
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "spark-01")
+    first = nodeident.load_or_create_node_id(tmp_path)
+    assert first == "spark-01"
+
+    # The machine is renamed. It is still the same machine.
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "rack-b-node-7")
+    assert nodeident.load_or_create_node_id(tmp_path) == "spark-01"
+
+
+def test_node_id_is_seeded_from_the_hostname_on_a_first_run(tmp_path, monkeypatch):
+    """Backwards compatibility: an existing cluster upgrading into this must
+    keep the id it already has, which is the slugified hostname."""
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "My-Box.local")
+    assert nodeident.load_or_create_node_id(tmp_path) == "my-box-local"
+    assert json.loads((tmp_path / "node.json").read_text())["node_id"] == "my-box-local"
+
+
+def test_an_explicit_node_id_wins_and_is_persisted(tmp_path, monkeypatch):
+    """Same rule DERATE_TOKEN follows: restarting with the variable set must
+    not silently keep the old value, and it should not have to stay set."""
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "spark-01")
+    nodeident.load_or_create_node_id(tmp_path)
+
+    assert nodeident.load_or_create_node_id(tmp_path, "rack-b-7") == "rack-b-7"
+    assert nodeident.load_or_create_node_id(tmp_path) == "rack-b-7"
+
+
+def test_node_id_keeps_its_first_seen_across_a_rewrite(tmp_path, monkeypatch):
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "spark-01")
+    nodeident.load_or_create_node_id(tmp_path)
+    created = json.loads((tmp_path / "node.json").read_text())["created"]
+
+    nodeident.load_or_create_node_id(tmp_path, "renamed")
+    assert json.loads((tmp_path / "node.json").read_text())["created"] == created
+
+
+def test_node_id_file_is_0600(tmp_path, monkeypatch):
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "spark-01")
+    nodeident.load_or_create_node_id(tmp_path)
+    mode = stat.S_IMODE((tmp_path / "node.json").stat().st_mode)
+    assert mode == 0o600
+
+
+def test_an_unwritable_data_dir_still_yields_an_id(tmp_path, monkeypatch):
+    """Degrades to the old behaviour -- hostname-derived again next boot --
+    rather than taking the node down."""
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "spark-01")
+    monkeypatch.setattr(
+        nodeident.os, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("read-only"))
+    )
+    assert nodeident.load_or_create_node_id(tmp_path) == "spark-01"
+
+
+def test_a_corrupt_node_file_is_reseeded_not_fatal(tmp_path, monkeypatch):
+    monkeypatch.setattr(nodeident.socket, "gethostname", lambda: "spark-01")
+    (tmp_path / "node.json").write_text("{not json")
+    assert nodeident.load_or_create_node_id(tmp_path) == "spark-01"
+    assert json.loads((tmp_path / "node.json").read_text())["node_id"] == "spark-01"
+
+
+# ---------------------------------------------------------------------------
+# read_identity: the read a worker needs, that never mints.
+# ---------------------------------------------------------------------------
+
+
+def test_read_identity_never_creates_a_cluster(tmp_path):
+    assert read_identity(tmp_path) is None
+    assert not (tmp_path / "cluster.json").exists()
+
+
+def test_read_identity_returns_what_was_persisted(tmp_path):
+    load_or_create_identity(tmp_path, cluster_id="c-abcd", token="tok-xyz")
+    got = read_identity(tmp_path)
+    assert got is not None
+    assert (got.cluster_id, got.token) == ("c-abcd", "tok-xyz")
+
+
+def test_read_identity_treats_a_tokenless_file_as_nothing(tmp_path):
+    (tmp_path / "cluster.json").write_text(json.dumps({"cluster_id": "c-abcd"}))
+    assert read_identity(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# Re-announcement: the outbound half of the heartbeat.
+#
+# Steady state used to be entirely coordinator-pull, so once a node was
+# admitted it never spoke again. A changed address, a coordinator restarted
+# with an empty roster, and a coordinator replaced by another machine were all
+# unrecoverable without restarting the node's container.
+# ---------------------------------------------------------------------------
+
+
+def _reannounce_config(**overrides) -> RegistryConfig:
+    return RegistryConfig(token="tok-123", coordinator_port=8080, **overrides)
+
+
+def test_reannounce_prefers_the_coordinator_we_already_know():
+    seen = []
+
+    async def join(url, token, profile, agent_url):
+        seen.append((url, token, agent_url))
+        return {"status": "member", "cluster_id": "c-abcd"}
+
+    async def browse(*a, **k):
+        raise AssertionError("should not browse while the known coordinator answers")
+
+    got = run(
+        reannounce(
+            _reannounce_config(),
+            make_profile(),
+            "http://10.0.0.11:8081",
+            "http://10.0.0.10:8080",
+            browse=browse,
+            join=join,
+        )
+    )
+    assert got.ok
+    assert got.coordinator_url == "http://10.0.0.10:8080"
+    assert seen == [("http://10.0.0.10:8080", "tok-123", "http://10.0.0.11:8081")]
+
+
+def test_reannounce_finds_a_replacement_coordinator():
+    """The recovery path the cluster did not have: the old coordinator is gone
+    and another machine is now running one."""
+
+    async def join(url, token, profile, agent_url):
+        if url == "http://10.0.0.10:8080":
+            raise ProbeFailed("connection refused")
+        return {"status": "member", "cluster_id": "c-abcd"}
+
+    async def browse(*a, **k):
+        return [DiscoveredPeer("spark-09", "coordinator", "c-abcd", "10.0.0.99", 8081)]
+
+    got = run(
+        reannounce(
+            _reannounce_config(),
+            make_profile(),
+            "http://10.0.0.11:8081",
+            "http://10.0.0.10:8080",
+            browse=browse,
+            join=join,
+        )
+    )
+    assert got.ok
+    assert got.coordinator_url == "http://10.0.0.99:8080"
+
+
+def test_reannounce_never_decides_to_coordinate():
+    """The frozen decision stands: no election, no failover. A worker whose
+    coordinator is gone waits, rather than splitting the subnet."""
+
+    async def join(url, token, profile, agent_url):
+        raise ProbeFailed("connection refused")
+
+    async def browse(*a, **k):
+        return []
+
+    got = run(
+        reannounce(
+            _reannounce_config(),
+            make_profile(),
+            "http://10.0.0.11:8081",
+            "http://10.0.0.10:8080",
+            browse=browse,
+            join=join,
+        )
+    )
+    assert not got.ok
+    assert got.result is None
+    assert not hasattr(got, "role")
+    assert "10.0.0.10" in got.reason
+
+
+def test_reannounce_does_not_retry_an_address_the_browse_repeats():
+    calls = []
+
+    async def join(url, token, profile, agent_url):
+        calls.append(url)
+        raise ProbeFailed("connection refused")
+
+    async def browse(*a, **k):
+        return [DiscoveredPeer("spark-01", "coordinator", "c-abcd", "10.0.0.10", 8081)]
+
+    run(
+        reannounce(
+            _reannounce_config(),
+            make_profile(),
+            "http://10.0.0.11:8081",
+            "http://10.0.0.10:8080",
+            browse=browse,
+            join=join,
+        )
+    )
+    assert calls == ["http://10.0.0.10:8080"]
+
+
+def test_reannounce_skips_workers_it_finds():
+    async def join(url, token, profile, agent_url):
+        raise AssertionError(f"joined a worker at {url}")
+
+    async def browse(*a, **k):
+        return [DiscoveredPeer("spark-02", "worker", "c-abcd", "10.0.0.12", 8081)]
+
+    got = run(
+        reannounce(
+            _reannounce_config(), make_profile(), "http://10.0.0.11:8081", None,
+            browse=browse, join=join,
+        )
+    )
+    assert not got.ok
+
+
+def test_a_rejected_reannouncement_is_not_an_admission():
+    """handle_join probes back before it accepts anything, so a node that can
+    reach the coordinator but cannot be reached back is turned away -- and this
+    must report that, not paper over it."""
+
+    async def join(url, token, profile, agent_url):
+        raise JoinRejected("probe-back failed")
+
+    async def browse(*a, **k):
+        return []
+
+    got = run(
+        reannounce(
+            _reannounce_config(), make_profile(), "http://10.0.0.11:8081",
+            "http://10.0.0.10:8080", browse=browse, join=join,
+        )
+    )
+    assert not got.ok
+
+
+def test_a_member_that_moved_is_rerouted_by_its_own_reannouncement(tmp_path):
+    """End to end against the real coordinator side: handle_join with a valid
+    token moves agent_url, refreshes the profile and clears the misses."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    assert registry.agent_url("spark-02") == "http://10.0.0.12:8081"
+
+    # The node picks up a new lease and says so itself.
+    moved = dataclasses.replace(SPARK_02, address="10.0.0.55")
+    client.serve("http://10.0.0.55:8081", moved)
+    run(registry.handle_join("tok-123", moved, "http://10.0.0.55:8081"))
+
+    assert registry.agent_url("spark-02") == "http://10.0.0.55:8081"
+    assert registry.get_node("spark-02").profile.address == "10.0.0.55"
+    assert registry.get_node("spark-02").healthy
+
+
+# ---------------------------------------------------------------------------
+# Advertiser.readvertise
+# ---------------------------------------------------------------------------
+
+
+def test_readvertise_is_a_noop_at_the_same_address():
+    adv = Advertiser("spark-01", "worker", "c-abcd", "10.0.0.11", 8081)
+    assert adv.readvertise("10.0.0.11") is False
+    assert adv.address == "10.0.0.11"
+
+
+def test_readvertise_moves_the_address_it_will_announce():
+    adv = Advertiser("spark-01", "worker", "c-abcd", "10.0.0.11", 8081)
+    adv.readvertise("10.0.0.55")
+    assert adv.address == "10.0.0.55"
+
+
+def test_readvertise_does_not_start_an_advertiser_that_never_started():
+    """A node with no zeroconf, or a failed bind, must not be registered by a
+    change of address it was not announcing in the first place."""
+    adv = Advertiser("spark-01", "worker", "c-abcd", "10.0.0.11", 8081)
+    assert adv.active is False
+    assert adv.readvertise("10.0.0.55") is False
+    assert adv.active is False
+
+
+# ---------------------------------------------------------------------------
+# A worker reads its cluster token back.
+#
+# adopt_cluster_token wrote it and nothing ever read it, so the write was dead
+# and the failure it exists to prevent still happened.
+# ---------------------------------------------------------------------------
+
+
+def test_a_worker_recovers_the_token_it_adopted(tmp_path):
+    """The bug: restarted with a spent enrollment token in its environment, a
+    worker presented the spent one and 403'd itself out of its own cluster --
+    handle_join checks the token before it checks membership."""
+    load_or_create_identity(tmp_path, cluster_id="c-abcd", token="permanent-tok")
+
+    recovered = recover_credentials(RegistryConfig(data_dir=tmp_path))
+
+    assert recovered.token == "permanent-tok"
+    assert recovered.cluster_id == "c-abcd"
+
+
+def test_an_environment_token_still_wins(tmp_path):
+    """It is the deployment's deliberate instruction, and it is how a machine
+    is re-homed onto a different cluster."""
+    load_or_create_identity(tmp_path, cluster_id="c-abcd", token="permanent-tok")
+
+    recovered = recover_credentials(
+        RegistryConfig(data_dir=tmp_path, token="from-the-environment")
+    )
+
+    assert recovered.token == "from-the-environment"
+
+
+def test_recovering_credentials_never_mints_a_cluster(tmp_path):
+    """A worker that minted an identity would be inventing a cluster nobody
+    asked for."""
+    recovered = recover_credentials(RegistryConfig(data_dir=tmp_path))
+
+    assert recovered.token is None
+    assert not (tmp_path / "cluster.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# The loop that decides when to re-announce.
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def make_runtime(role=ROLE_WORKER, clock=None, profile=None):
+    from control_plane.registry.agent import NodeAgent
+    from control_plane.registry.startup import NodeRuntime
+
+    clock = clock or FakeClock()
+    profile = profile or make_profile("spark-02", address="10.0.0.12")
+    advertiser = Advertiser("spark-02", role, "c-abcd", profile.address, 8081)
+    agent = NodeAgent(profile=profile, role=role, cluster_id="c-abcd", clock=clock)
+    return (
+        NodeRuntime(
+            config=RegistryConfig(token="tok-123"),
+            profile=profile,
+            decision=RoleDecision(
+                role, "http://10.0.0.10:8080", True, "test", status="member"
+            ),
+            identity=ClusterIdentity("c-abcd", "tok-123"),
+            node_agent=agent,
+            advertiser=advertiser,
+        ),
+        clock,
+        agent,
+    )
+
+
+def test_a_polled_node_says_nothing():
+    """The coordinator polls every member every heartbeat. While that is
+    happening there is nothing to announce, and a healthy cluster must run this
+    loop at zero network cost."""
+    runtime, clock, agent = make_runtime()
+    agent.note_polled()
+    clock.advance(REANNOUNCE_UNPOLLED_S - 1)
+
+    assert runtime._announce_trigger(clock.now) is None
+
+
+def test_silence_from_the_coordinator_triggers_a_reannouncement():
+    runtime, clock, agent = make_runtime()
+    agent.note_polled()
+    clock.advance(REANNOUNCE_UNPOLLED_S + 1)
+
+    reason = runtime._announce_trigger(clock.now)
+    assert reason is not None and "polled" in reason
+
+
+def test_a_node_that_was_never_polled_measures_from_boot():
+    """A worker that restarts while the coordinator is down was never a
+    candidate, so it never got a rejoin loop. Before this it waited forever."""
+    runtime, clock, agent = make_runtime()
+    assert agent.seconds_since_poll() is None
+
+    assert runtime._announce_trigger(1.0) is None
+    reason = runtime._announce_trigger(REANNOUNCE_UNPOLLED_S + 1)
+    assert reason is not None and "polled" in reason
+
+
+def test_a_changed_address_triggers_a_reannouncement_and_readvertises():
+    runtime, clock, agent = make_runtime()
+    agent.note_polled()
+    agent.profile = dataclasses.replace(agent.profile, address="10.0.0.55")
+
+    reason = runtime._announce_trigger(clock.now)
+
+    assert reason is not None and "10.0.0.55" in reason
+    assert runtime.advertiser.address == "10.0.0.55"
+    assert runtime.agent_url == "http://10.0.0.55:8081"
+
+
+def test_a_coordinator_readvertises_but_never_announces_itself():
+    """It has nobody to announce to, but its mDNS record is the one every
+    joining node browses for, so that still has to stay true."""
+    runtime, clock, agent = make_runtime(role=ROLE_COORDINATOR)
+    agent.profile = dataclasses.replace(agent.profile, address="10.0.0.55")
+
+    assert runtime._announce_trigger(REANNOUNCE_UNPOLLED_S * 10) is None
+    assert runtime.advertiser.address == "10.0.0.55"
+
+
+def test_the_loop_backs_off_while_nobody_answers(monkeypatch):
+    """The trigger stays true for as long as we are forgotten, so without a
+    floor this would be a hot loop against a dead address."""
+    runtime, clock, agent = make_runtime()
+    attempts = []
+
+    async def never_lands(config, profile, agent_url, coordinator_url, **kw):
+        attempts.append(clock.now)
+        return Announcement(False, coordinator_url, None, "nobody answered")
+
+    monkeypatch.setattr(startup_mod, "reannounce", never_lands)
+
+    ticks = {"n": 0}
+
+    async def fake_sleep(seconds):
+        clock.advance(seconds)
+        ticks["n"] += 1
+        if ticks["n"] > 60:
+            runtime._stopped = True
+
+    run(runtime._announce_loop(tick=5.0, sleep=fake_sleep, clock=clock))
+
+    assert len(attempts) >= 2, "it must keep trying"
+    gaps = [b - a for a, b in zip(attempts, attempts[1:])]
+    assert gaps == sorted(gaps), f"back-off must not shrink: {gaps}"
+    assert max(gaps) <= REANNOUNCE_MAX_RETRY_S
+
+
+def test_a_landed_reannouncement_records_the_coordinator_that_took_it(monkeypatch):
+    runtime, clock, agent = make_runtime()
+
+    async def lands(config, profile, agent_url, coordinator_url, **kw):
+        return Announcement(
+            True,
+            "http://10.0.0.99:8080",
+            {"status": "member", "cluster_id": "c-abcd"},
+            "re-announced",
+        )
+
+    monkeypatch.setattr(startup_mod, "reannounce", lands)
+
+    calls = {"n": 0}
+
+    async def fake_sleep(seconds):
+        clock.advance(seconds)
+        calls["n"] += 1
+        if calls["n"] > 1:  # one full pass, then stop
+            runtime._stopped = True
+
+    agent.note_polled()
+    clock.advance(REANNOUNCE_UNPOLLED_S + 1)
+    run(runtime._announce_loop(tick=0.0, sleep=fake_sleep, clock=clock))
+
+    assert runtime.decision.coordinator_url == "http://10.0.0.99:8080"
+    assert runtime.decision.status == "member"
+
+
+def test_a_live_rejoin_loop_owns_the_conversation():
+    """Two loops would both fire here -- a candidate is not polled, so the
+    silence trigger is true for it from boot -- and the second would only
+    duplicate the first's join."""
+    runtime, clock, agent = make_runtime()
+    runtime.decision = dataclasses.replace(runtime.decision, status="candidate")
+
+    async def forever():
+        await asyncio.Event().wait()
+
+    async def check():
+        runtime._rejoin_task = asyncio.create_task(forever())
+        await asyncio.sleep(0)
+        try:
+            return runtime._announce_trigger(REANNOUNCE_UNPOLLED_S * 10)
+        finally:
+            runtime._rejoin_task.cancel()
+
+    assert run(check()) is None
+
+
+def test_a_candidate_with_no_live_rejoin_loop_keeps_announcing():
+    """The rejoin loop exits for good the first time it is admitted, and the
+    status can go back to "candidate" afterwards -- a coordinator rebuilt from
+    nothing has never met this node and re-offers it. Gating on the status
+    would strand the node outside a cluster it can see."""
+    runtime, clock, agent = make_runtime()
+    runtime.decision = dataclasses.replace(runtime.decision, status="candidate")
+    assert runtime._rejoin_task is None
+
+    reason = runtime._announce_trigger(REANNOUNCE_UNPOLLED_S + 1)
+    assert reason is not None and "polled" in reason
+
+
+def test_a_worker_that_found_nobody_at_boot_still_announces_itself():
+    """It was never a candidate, so it never got a rejoin loop. Before this it
+    waited forever for a coordinator that had already come back."""
+    runtime, clock, agent = make_runtime()
+    runtime.decision = dataclasses.replace(
+        runtime.decision, status=None, joined=False, coordinator_url=None
+    )
+
+    reason = runtime._announce_trigger(REANNOUNCE_UNPOLLED_S + 1)
+    assert reason is not None and "polled" in reason
+
+
+# ---------------------------------------------------------------------------
+# Two credentials, and only the coordinator can say which one is right.
+#
+# install.sh bakes DERATE_TOKEN into the container environment permanently, so
+# a node installed with an enrollment token presents that same token on every
+# restart forever -- long after it is spent. handle_join checks the token
+# before it checks membership, so that 403s the node out of its own cluster.
+# ---------------------------------------------------------------------------
+
+
+def test_a_spent_enrollment_token_falls_back_to_the_permanent_one():
+    presented = []
+
+    async def join(url, token, profile, agent_url):
+        presented.append(token)
+        if token == "ej_spent_abc":
+            raise JoinRejected("invalid cluster token")
+        return {"status": "member", "cluster_id": "c-abcd"}
+
+    config = RegistryConfig(token="ej_spent_abc", fallback_token="permanent-tok")
+    result, used = run(
+        join_with_held_credentials(
+            join, "http://10.0.0.10:8080", config, make_profile(), "http://10.0.0.11:8081"
+        )
+    )
+
+    assert presented == ["ej_spent_abc", "permanent-tok"]
+    assert used == "permanent-tok"
+    assert result["status"] == "member"
+
+
+def test_a_fresh_enrollment_token_still_re_homes_the_machine():
+    """The opposite case, and just as real: an operator carried a new token to
+    this box to move it onto another cluster. The stored one is the *old*
+    cluster's and would be refused, so the deliberate one has to go first."""
+    presented = []
+
+    async def join(url, token, profile, agent_url):
+        presented.append(token)
+        if token != "ej_fresh_xyz":
+            raise JoinRejected("invalid cluster token")
+        return {"status": "member", "cluster_id": "c-new", "cluster_token": "new-perm"}
+
+    config = RegistryConfig(token="ej_fresh_xyz", fallback_token="old-cluster-tok")
+    result, used = run(
+        join_with_held_credentials(
+            join, "http://10.0.0.10:8080", config, make_profile(), "http://10.0.0.11:8081"
+        )
+    )
+
+    assert presented == ["ej_fresh_xyz"], "the fallback must not be tried once one works"
+    assert used == "ej_fresh_xyz"
+    assert result["cluster_token"] == "new-perm"
+
+
+def test_both_credentials_wrong_still_raises():
+    async def join(url, token, profile, agent_url):
+        raise JoinRejected("invalid cluster token")
+
+    config = RegistryConfig(token="wrong-a", fallback_token="wrong-b")
+    with pytest.raises(JoinRejected):
+        run(
+            join_with_held_credentials(
+                join, "http://10.0.0.10:8080", config, make_profile(),
+                "http://10.0.0.11:8081",
+            )
+        )
+
+
+def test_no_fallback_means_no_retry():
+    presented = []
+
+    async def join(url, token, profile, agent_url):
+        presented.append(token)
+        raise JoinRejected("invalid cluster token")
+
+    config = RegistryConfig(token="only-one")
+    with pytest.raises(JoinRejected):
+        run(
+            join_with_held_credentials(
+                join, "http://10.0.0.10:8080", config, make_profile(),
+                "http://10.0.0.11:8081",
+            )
+        )
+    assert presented == ["only-one"]
+
+
+def test_recovering_credentials_keeps_the_stored_token_as_a_fallback(tmp_path):
+    load_or_create_identity(tmp_path, cluster_id="c-abcd", token="permanent-tok")
+
+    recovered = recover_credentials(
+        RegistryConfig(data_dir=tmp_path, token="ej_spent_abc")
+    )
+
+    assert recovered.token == "ej_spent_abc"
+    assert recovered.fallback_token == "permanent-tok"
+
+
+def test_a_matching_stored_token_is_not_also_a_fallback(tmp_path):
+    load_or_create_identity(tmp_path, cluster_id="c-abcd", token="permanent-tok")
+
+    recovered = recover_credentials(
+        RegistryConfig(data_dir=tmp_path, token="permanent-tok")
+    )
+
+    assert recovered.fallback_token is None

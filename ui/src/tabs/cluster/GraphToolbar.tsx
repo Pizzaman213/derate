@@ -5,7 +5,8 @@ interface Props {
   graphRef: RefObject<ClusterGraphHandle>
   zoomLabelRef: RefObject<HTMLSpanElement>
   /** Only offered when there is something to reset -- a control that does
-   *  nothing is worse than no control. */
+   *  nothing is worse than no control. True once a machine has been dealt a
+   *  different slot OR dragged off the one it has. */
   rearranged: boolean
   onResetLayout: () => void
 }
@@ -24,7 +25,8 @@ export function GraphToolbar({ graphRef, zoomLabelRef, rearranged, onResetLayout
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
       <span className="unit">
-        Drag a machine to rearrange it · drag the background to pan · scroll to zoom · double-click to inspect
+        Drag a machine anywhere — it stays where you put it · drag the background to pan · scroll to
+        zoom · double-click to inspect
       </span>
       <span
         ref={zoomLabelRef}
@@ -34,7 +36,7 @@ export function GraphToolbar({ graphRef, zoomLabelRef, rearranged, onResetLayout
         100%
       </span>
       {rearranged ? (
-        <button onClick={onResetLayout} title="Put the machines back in their default order">
+        <button onClick={onResetLayout} title="Put every machine back where it started">
           Reset layout
         </button>
       ) : null}

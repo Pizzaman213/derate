@@ -170,6 +170,8 @@ def encode(d: Deployment) -> dict[str, Any]:
         "started_at": d.started_at,
         "last_error": d.last_error,
         "modality": d.modality.value,
+        "extra_args": list(d.extra_args),
+        "custom_command": list(d.custom_command),
     }
 
 
@@ -205,4 +207,8 @@ def decode(raw: dict[str, Any]) -> Deployment:
         # Absent in schema v1. A record written before modality existed was
         # necessarily a text deployment, so the default is also the truth.
         modality=Modality(raw.get("modality", Modality.TEXT.value)),
+        # Absent from a record written before this field existed, which was
+        # necessarily launched with none.
+        extra_args=tuple(raw.get("extra_args", ())),
+        custom_command=tuple(raw.get("custom_command", ())),
     )

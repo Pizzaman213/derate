@@ -59,11 +59,19 @@ from .reach import (
     unknown_leg,
 )
 from .roster import load_roster, save_roster
-from .serde import memory_used_pct, profile_from_dict, profile_to_dict, state_to_dict
+from .serde import (
+    memory_used_pct,
+    power_reading,
+    profile_from_dict,
+    profile_to_dict,
+    state_to_dict,
+    temp_reading,
+)
 from .telemetry import (
     TelemetryStore,
     TelemetrySample,
     allocatable_bytes,
+    allocatable_bytes_or_none,
     read_telemetry,
 )
 
@@ -1055,6 +1063,36 @@ class Registry:
             host_reserve=self.config.host_memory_reserve,
         )
 
+    def allocatable_or_none(
+        self, node_id: str, guardrail: float = DEFAULT_GUARDRAIL
+    ) -> int | None:
+        """:meth:`available_memory`, with absence spelled out instead of filled in.
+
+        ``available_memory`` is typed ``-> int``, so it has to answer every
+        question with a number: a node nobody has sampled gets its static
+        ceiling, and an unknown node gets ``0``. Both are fine for the memory
+        report they were written for and wrong for the fit gate, which cannot
+        see the difference between a reading and a placeholder and describes
+        whatever it gets as "allocatable right now".
+
+        ``None`` covers three cases the gate must not treat as measurements:
+        a node this registry does not have, a node nothing has sampled yet,
+        and a node whose samples have stopped. The last one matters because
+        ``_sample_node`` deliberately keeps the last reading when a node goes
+        quiet -- the health loop owns that verdict -- so a machine can answer
+        ``/agent/health`` with its telemetry frozen. An old reading of a pool
+        that is shared with an OS and with neighbours is not a fact about now.
+        """
+        state = self._members.get(node_id)
+        if state is None or not state.healthy:
+            return None
+        return allocatable_bytes_or_none(
+            state.profile,
+            self._telemetry.latest(node_id),
+            guardrail=guardrail,
+            host_reserve=self.config.host_memory_reserve,
+        )
+
     def memory_report(self, node_id: str) -> dict | None:
         """The full memory picture for one node, for the UI and for a refusal.
 
@@ -1071,7 +1109,7 @@ class Registry:
         return {
             "node_id": node_id,
             "device_class": profile.device_class.value,
-            "unified_memory": profile.device_class is DeviceClass.GB10,
+            "unified_memory": profile.device_class.unified_memory,
             "addressable": profile.addressable_memory,
             "static_ceiling": profile.usable_memory(),
             "pool_used": state.memory_used,
@@ -1105,8 +1143,11 @@ class Registry:
             nodes.append(
                 {
                     "node_id": state.profile.node_id,
-                    "power_w": round(state.power_watts, 1),
-                    "temp_c": round(state.temperature_c, 1),
+                    # Same rule as the gateway's node row, from the same
+                    # function: a machine with no GPU has no GPU power draw,
+                    # and 0 W here would read as an idle one.
+                    "power_w": power_reading(state),
+                    "temp_c": temp_reading(state),
                     "memory_used_pct": memory_used_pct(state),
                     "util_pct": round(state.utilization_pct, 1),
                     "healthy": state.healthy,
@@ -1233,7 +1274,15 @@ class Registry:
     # ------------------------------------------------------------------
 
     def nodes_payload(self) -> list[dict]:
-        """Members, serialised. What GET /api/nodes returns."""
+        """Members, serialised, for a caller holding a registry and no gateway.
+
+        **Not** what ``GET /api/nodes`` returns, whatever this docstring said
+        until now: that route builds its rows with ``gateway.serialize
+        .node_payload``, which carries eligibility, build skew and the operator
+        label this does not. Believing the old sentence meant reading this
+        function to find out what the API answers and getting a different
+        shape, with nothing to signal the mistake.
+        """
         payload = []
         for state in self._members.values():
             row = state_to_dict(state)

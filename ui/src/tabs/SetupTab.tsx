@@ -1,9 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useBackend } from '../state/backend'
 import { useRouter } from '../state/router'
+import {
+  LAUNCH_PHASES,
+  LAUNCH_PHASE_LABEL,
+  type LaunchPhase,
+} from '../state/launchPhase'
 import { Qr } from './setup/Qr'
 import './setup/setup.css'
-import type { CapacityRow, Enrollment, SetupStatus } from '../api/types'
+import type {
+  CapacityRow,
+  DeploymentDTO,
+  Enrollment,
+  SetupStatus,
+} from '../api/types'
 
 // First run.
 //
@@ -26,12 +36,81 @@ import type { CapacityRow, Enrollment, SetupStatus } from '../api/types'
 
 type StepId = 'machine' | 'cloud' | 'model' | 'machines' | 'done'
 
+/** The capacity answer, prefetched by the screen and read by the model step.
+ *
+ *  A union rather than four loose pieces of state, so "still loading" and
+ *  "answered with nothing" cannot be confused -- an empty row list is a real
+ *  answer about a machine nothing fits on, and rendering a spinner for it would
+ *  wait forever for something that already arrived. */
+type CapacityAnswer =
+  | { state: 'loading' }
+  | { state: 'error'; message: string }
+  | {
+      state: 'ready'
+      rows: CapacityRow[]
+      basis: 'live' | 'static' | null
+      servable: boolean
+      unavailable: string | null
+      unresolved: { model_id: string; reason: string }[]
+    }
+
 interface Choices {
   machine: string | null
   key: 'skipped' | 'added' | null
   model: { row: CapacityRow; launched: boolean } | null
   joined: 'skipped' | 'joined' | null
 }
+
+/** What a first run offers, smallest first. Every one of them 4-bit already.
+ *
+ *  Deliberately NOT the cluster's curated shortlist. That list exists to answer
+ *  "what can this hardware do", so it reaches for the ceiling on purpose --
+ *  gpt-oss-120b and DeepSeek-V3 are on it, and on one GB10 both come back as a
+ *  refusal. Correct answers, wrong screen: a first run that opens with two
+ *  paragraphs about being 617 GiB over budget has taught somebody that the
+ *  product mostly says no, before they have run anything at all.
+ *
+ *  So: models that fit, in a range where the choice is about what you want
+ *  rather than what is possible. One 30B at the top, because it is the biggest
+ *  thing a single Spark runs well and somebody should see that it is offered;
+ *  everything else is small enough to download over a coffee. `capacityFor`
+ *  replaces the curated walk rather than extending it, so this is the whole
+ *  list and the verdicts still come from the same gate a launch goes through.
+ *
+ *  Every id names a repository that is ALREADY int4 -- AWQ, GPTQ or
+ *  compressed-tensors w4a16 -- rather than a bf16 checkpoint the ladder steps
+ *  down from, and that is the whole point of this list. The weights are about
+ *  a quarter of the bf16 download, which is the wait a first run actually
+ *  feels: the pick is followed immediately by the runtime fetching the model,
+ *  and nothing on screen moves until it lands. Measured off the hub, for the
+ *  two ends of this list -- Qwen3-30B-A3B ships 56.9 GiB of safetensors and
+ *  its GPTQ-Int4 build 15.8 GiB; Mistral-7B-Instruct-v0.3 ships 27.0 GiB
+ *  (fp32 consolidated plus bf16 shards) against 3.9 GiB for the w4a16 one.
+ *  Two other things fall out of it, both load-bearing:
+ *
+ *  - No requantization. `_rungs` starts at a shape's native dtype, so on a
+ *    tight live budget the bf16 list came back as q8_0 / q6_k / q2_k rows --
+ *    GGUF rungs that `resolver/support.py` marks UNVERIFIED on vLLM and
+ *    UNSUPPORTED on SGLang. awq_int4 and gptq_int4 are SUPPORTED on both, so
+ *    what the screen offers is what the runtime actually loads.
+ *  - The ladder can still descend BELOW int4 if it has to; it just can no
+ *    longer climb back to bf16. This list narrows the starting rung, it does
+ *    not second-guess the gate.
+ *
+ *  meta-llama/Llama-3.1-8B-Instruct stops being the obvious omission here.
+ *  The gated repo still resolves to a 401 without an HF_TOKEN and would still
+ *  land in `unresolved` -- an apology on the first screen, for a model nobody
+ *  can fetch -- but RedHatAI's int4 redistribution of it is ungated, so the
+ *  model people ask for by name is on the list after all. Both RedHatAI ids
+ *  were checked anonymously: `gated: false`, and they resolve with no token
+ *  set on the coordinator. That is the bar for adding anything here. */
+const FIRST_RUN_MODELS = [
+  'Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4',
+  'Qwen/Qwen3-4B-AWQ',
+  'RedHatAI/Mistral-7B-Instruct-v0.3-quantized.w4a16',
+  'RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w4a16',
+  'Qwen/Qwen3-30B-A3B-GPTQ-Int4',
+]
 
 const GB = 1024 ** 3
 
@@ -61,6 +140,12 @@ export function SetupTab() {
 
   const [status, setStatus] = useState<SetupStatus | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  // Started on mount, not when the model step appears. Resolving five models
+  // means five hub round trips on a cold cache, and the person is going to
+  // spend a minute on the machine and provider steps regardless -- so the
+  // answer is usually already here by the time they ask for it. Prefetching is
+  // free: the report is read-only and nothing acts on it until they pick.
+  const [capacity, setCapacity] = useState<CapacityAnswer>({ state: 'loading' })
   const [step, setStep] = useState<StepId>('machine')
   const [chose, setChose] = useState<Choices>({
     machine: null,
@@ -75,6 +160,38 @@ export function SetupTab() {
       .setup()
       .then((s) => live && setStatus(s))
       .catch((err) => live && setLoadError(String(err?.message ?? err)))
+    return () => {
+      live = false
+    }
+  }, [backend])
+
+  useEffect(() => {
+    let live = true
+    // Null context and concurrency: that asks the coordinator to choose them
+    // per model out of what actually fits, which is the default path and the
+    // only one that gives honest verdicts on a fresh install with nothing
+    // configured. No machine list -- the default is the coordinator's own host,
+    // which is the machine this screen is about.
+    backend
+      .capacityFor(FIRST_RUN_MODELS, null, null)
+      .then((report) => {
+        if (!live) return
+        const picked = rowsOf(report)
+        setCapacity({
+          state: 'ready',
+          // Smallest first. A first run should open on the one that finishes
+          // downloading soonest, not on whichever sorts first.
+          rows: [...picked.rows].sort((a, b) => a.total_params - b.total_params),
+          basis: picked.basis,
+          servable: report.local_serving,
+          unavailable: report.unavailable_reason,
+          // Named but unresolvable -- a gated repo, a hub that did not answer.
+          // Said out loud rather than silently dropped: a list that quietly
+          // shrinks is indistinguishable from one that was always that short.
+          unresolved: report.unresolved ?? [],
+        })
+      })
+      .catch((err) => live && setCapacity({ state: 'error', message: String((err as Error)?.message ?? err) }))
     return () => {
       live = false
     }
@@ -184,6 +301,7 @@ export function SetupTab() {
 
         {step === 'model' && (
           <ModelStep
+            answer={capacity}
             onDone={(model) => {
               setChose((p) => ({ ...p, model }))
               advance('model')
@@ -448,50 +566,46 @@ function CloudStep({ onDone }: { onDone: (outcome: 'added' | 'skipped') => void 
 }
 
 function ModelStep({
+  answer,
   onDone,
 }: {
+  answer: CapacityAnswer
   onDone: (model: { row: CapacityRow; launched: boolean } | null) => void
 }) {
   const { backend, invalidate } = useBackend()
-  const [rows, setRows] = useState<CapacityRow[] | null>(null)
-  const [basis, setBasis] = useState<'live' | 'static' | null>(null)
-  const [servable, setServable] = useState(true)
-  const [unavailable, setUnavailable] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [starting, setStarting] = useState<string | null>(null)
-  const [refusal, setRefusal] = useState<string | null>(null)
+  const [launching, setLaunching] = useState<{
+    row: CapacityRow
+    deployment: DeploymentDTO | null
+    error: string | null
+  } | null>(null)
+  // How long this step has been waiting, so a slow answer can say so instead
+  // of spinning. Only ticks while there is nothing to show.
+  const [waited, setWaited] = useState(0)
 
   useEffect(() => {
-    let live = true
-    // Both arguments null: that asks the coordinator to choose a context per
-    // model from what actually fits, which is the default path and the only one
-    // that gives honest verdicts on a fresh install with nothing configured.
-    // No machine list -- the default is the coordinator's own host, which is
-    // the machine this screen is about.
-    backend
-      .capacity(null, null)
-      .then((report) => {
-        if (!live) return
-        const picked = rowsOf(report)
-        setRows(picked.rows)
-        setBasis(picked.basis)
-        setServable(report.local_serving)
-        setUnavailable(report.unavailable_reason)
-      })
-      .catch((err) => live && setError(String((err as Error)?.message ?? err)))
-    return () => {
-      live = false
-    }
-  }, [backend])
+    if (answer.state !== 'loading') return
+    const t = window.setInterval(() => setWaited((n) => n + 1), 1000)
+    return () => window.clearInterval(t)
+  }, [answer.state])
 
-  const start = async (row: CapacityRow) => {
-    setStarting(row.model_id)
-    setRefusal(null)
+  const start = (row: CapacityRow) => {
+    // Deliberately NOT awaited before rendering. `launch` returns as soon as the
+    // process is spawned -- the readiness wait runs on a thread server-side --
+    // but "as soon as" still covers a resolve, the fit gate and a process
+    // start, and until this returned the screen greyed every control out and
+    // said "Starting…" in a footnote. That reads as frozen, which is the one
+    // impression to avoid at the exact moment somebody has committed to
+    // downloading tens of gigabytes.
+    setLaunching({ row, deployment: null, error: null })
+    void run(row)
+  }
+
+  const run = async (row: CapacityRow) => {
     try {
       // The context and concurrency the verdict was taken at, not numbers this
-      // screen chose: launching at a different shape than the one that was
-      // shown "fits" would make the verdict on screen a fiction.
-      await backend.launch({
+      // screen chose: launching at a different shape than the one shown to fit
+      // would make the verdict on screen a fiction about a different request.
+      const dep = await backend.launch({
         model_id: row.model_id,
         context: row.context,
         concurrency: row.max_seqs,
@@ -502,20 +616,31 @@ function ModelStep({
         runtime: 'vllm',
       })
       invalidate()
-      onDone({ row, launched: true })
+      setLaunching((l) => (l ? { ...l, deployment: dep } : l))
     } catch (err) {
       // Verbatim. A refusal from the fit gate names what to change, and this
       // screen is not entitled to summarise it.
-      setRefusal(String((err as Error)?.message ?? err))
-      setStarting(null)
+      setLaunching((l) => (l ? { ...l, error: String((err as Error)?.message ?? err) } : l))
     }
   }
 
-  if (error) {
+  if (launching) {
+    return (
+      <LaunchProgress
+        row={launching.row}
+        deployment={launching.deployment}
+        error={launching.error}
+        onBack={() => setLaunching(null)}
+        onContinue={() => onDone({ row: launching.row, launched: true })}
+      />
+    )
+  }
+
+  if (answer.state === 'error') {
     return (
       <div className="setup-step">
         <h1>Could not work out what runs here.</h1>
-        <p className="setup-warn setup-fault">{error}</p>
+        <p className="setup-warn setup-fault">{answer.message}</p>
         <button className="btn primary" onClick={() => onDone(null)}>
           Skip for now
         </button>
@@ -523,15 +648,33 @@ function ModelStep({
     )
   }
 
-  if (!rows) {
+  if (answer.state === 'loading') {
     return (
       <div className="setup-step">
         <h1>Pick something to run.</h1>
-        <p className="setup-note">Working out what fits on this machine…</p>
+        <p className="setup-lede">
+          Reading each model&rsquo;s configuration from Hugging Face to see what fits. This
+          is a one-time lookup per model; it is cached afterwards.
+        </p>
+        {/* Named, and bounded. An indefinite spinner cannot be told apart from
+            a hung request, and this one depends on a third party being up. */}
+        {waited >= 10 && (
+          <>
+            <p className="setup-warn">
+              Still waiting after {waited} seconds. Hugging Face may be slow or
+              unreachable from this machine. Nothing is stuck on your side, and you can
+              come back to this from the Models screen.
+            </p>
+            <button className="setup-skip" onClick={() => onDone(null)}>
+              Skip &mdash; I will pick one later
+            </button>
+          </>
+        )}
       </div>
     )
   }
 
+  const { rows, basis, servable, unavailable, unresolved } = answer
   const fitting = rows.filter((r) => r.fits)
 
   return (
@@ -540,15 +683,21 @@ function ModelStep({
       <p className="setup-lede">
         {fitting.length > 0
           ? 'These fit on your machine. You can add more later, and run several at once.'
-          : 'Nothing on the shortlist fits this machine yet. You can still add a cloud provider, or another machine, and come back to this.'}
+          : 'Nothing here fits this machine yet. You can still add a cloud provider, or another machine, and come back to this.'}
       </p>
 
       {unavailable && <p className="setup-warn">{unavailable}</p>}
 
+      {unresolved.map((u) => (
+        <p className="setup-warn" key={u.model_id}>
+          <span className="mono">{u.model_id}</span> could not be read: {u.reason}
+        </p>
+      ))}
+
       {!servable && (
         <p className="setup-warn">
-          These verdicts are real, but this coordinator cannot start a model itself — it
-          has no local runtime. It can still route to a cloud provider, and to other
+          These verdicts are real, but this coordinator cannot start a model itself &mdash;
+          it has no local runtime. It can still route to a cloud provider, and to other
           machines that join it.
         </p>
       )}
@@ -558,7 +707,7 @@ function ModelStep({
           <button
             key={row.model_id}
             className="setup-pick"
-            disabled={!row.fits || !servable || starting !== null}
+            disabled={!row.fits || !servable}
             onClick={() => void start(row)}
           >
             <span>
@@ -569,7 +718,13 @@ function ModelStep({
               {/* The speed sits beside the verdict, never alone: on a row that
                   does not fit it is the rate the model WOULD decode at, which
                   is a hypothesis, and printing it on its own would read as a
-                  promise. */}
+                  promise.
+
+                  The context is printed with it because the two are not
+                  separable. Each row is judged at its own context -- the gate
+                  fills the memory each model leaves free -- so decoding one
+                  token reads a different amount of cache per row. Without the
+                  denominator these numbers look comparable and are not. */}
               {row.predicted_decode_tps !== null ? (
                 <b title="tokens per second — roughly how fast it writes. 15 or so is reading speed.">
                   {row.predicted_decode_tps.toFixed(0)} tok/sec
@@ -578,26 +733,358 @@ function ModelStep({
                 <b className="no">no estimate</b>
               )}
               {row.fits ? (row.dtype ?? 'fits') : <span className="no">will not fit</span>}
+              <span className="setup-ctx">at {Math.round(row.context / 1024)}k context</span>
             </span>
           </button>
         ))}
       </div>
 
-      {refusal && <p className="setup-warn setup-fault">{refusal}</p>}
-
       <div className="setup-row">
         <button className="setup-skip" onClick={() => onDone(null)}>
-          Skip — I will pick one later
+          Skip &mdash; I will pick one later
         </button>
       </div>
       <p className="setup-note" style={{ marginTop: 'var(--s-3)' }}>
         {basis === 'live'
-          ? 'Measured against the memory this machine can hand out right now.'
+          ? 'Measured against the memory this machine can hand out right now. '
           : basis === 'static'
-            ? 'Measured against this machine’s stated memory ceiling; no live reading yet.'
+            ? 'Measured against this machine\u2019s stated memory ceiling; no live reading yet. '
             : ''}
-        {starting ? ' Starting…' : ''}
+        Speeds are a memory-bandwidth estimate at each row\u2019s own context, not a
+        benchmark.
       </p>
+    </div>
+  )
+}
+
+/** What happens after somebody picks a model, in the phases it actually goes
+ *  through.
+ *
+ *  "launching" for four minutes is technically true and useless: it covers a
+ *  container image, a multi-gigabyte download, a load onto the GPU and an
+ *  engine that compiles itself before it will answer. They fail differently,
+ *  take different lengths of time and want different patience.
+ *
+ *  This screen used to infer the phases here, from the repo's bytes on disk:
+ *  bytes appearing meant downloading, bytes holding still for two polls meant
+ *  loading. It worked, and it was the only thing that could have worked, but
+ *  it could not tell an engine compiling from a download stalled -- both are a
+ *  number that stopped moving. The server reads the phases now, off sparkrun's
+ *  own output and the backend's own log (`/api/activity`, from
+ *  control_plane/deploy/progress.py), so this screen and the rail agree and
+ *  neither is guessing.
+ *
+ *  What stays is the byte figure, because it is the one number a person can
+ *  act on while the weights land: it is the real size of the repo in the
+ *  node's Hugging Face cache, with the rate measured between two polls of it.
+ *  There is still no percentage for it -- nothing reports the repo's final
+ *  size before it arrives -- and a bar creeping at a made-up rate gets read as
+ *  an estimate and planned around. A number that goes up, with a rate beside
+ *  it, says "working" without claiming to know when it stops.
+ */
+type Phase = LaunchPhase | 'failed'
+
+const PHASE_LABEL: Record<Phase, string> = {
+  ...LAUNCH_PHASE_LABEL,
+  failed: 'Failed',
+}
+
+const PHASE_ORDER: Phase[] = [...LAUNCH_PHASES]
+
+function LaunchProgress({
+  row,
+  deployment,
+  error,
+  onBack,
+  onContinue,
+}: {
+  row: CapacityRow
+  deployment: DeploymentDTO | null
+  error: string | null
+  onBack: () => void
+  onContinue: () => void
+}) {
+  const { backend } = useBackend()
+  const [elapsed, setElapsed] = useState(0)
+  const [phase, setPhase] = useState<Phase>('preparing')
+  const [bytes, setBytes] = useState<number | null>(null)
+  const [rate, setRate] = useState<number | null>(null)
+  const [failure, setFailure] = useState<string | null>(null)
+  const [startedAt, setStartedAt] = useState<number | null>(null)
+  // The launcher's or the runtime's own sentence about what it is doing right
+  // now, rendered exactly as it arrives.
+  const [says, setSays] = useState('')
+  // 0..1 while the runtime is counting its checkpoint shards onto the GPU, and
+  // null every other second of a launch, because nothing else reports one.
+  const [fraction, setFraction] = useState<number | null>(null)
+  // When each phase was first seen, so the stepper can show how long each took
+  // rather than one clock for the whole thing.
+  const [reached, setReached] = useState<Partial<Record<Phase, number>>>({ preparing: 0 })
+
+  useEffect(() => {
+    const t = window.setInterval(() => setElapsed((n) => n + 1), 1000)
+    return () => window.clearInterval(t)
+  }, [])
+
+  useEffect(() => {
+    if (error) return
+    let live = true
+    let timer = 0
+    let lastBytes: number | null = null
+    let lastAt = 0
+
+    const poll = async () => {
+      try {
+        // Storage only while the weights could still be arriving. It fans out
+        // to every node agent and does real syscalls there -- the rail polls
+        // it at thirty seconds for that reason -- and this screen asks every
+        // two. That was the only way to see a download before the server
+        // reported one; once the phase says the bytes have landed, the figure
+        // cannot change and the request is pure cost on the machine that is
+        // busy loading a model.
+        const wantBytes =
+          phaseRef.current === 'preparing' || phaseRef.current === 'downloading'
+        const [deps, activity, storage] = await Promise.all([
+          backend.deployments(),
+          backend.activity(),
+          wantBytes ? backend.storage() : Promise.resolve(null),
+        ])
+        if (!live) return
+
+        const mine = deps.find(
+          (d) => d.model_id === row.model_id || d.deployment_id === deployment?.deployment_id,
+        )
+        // What the server read off sparkrun and off the backend's own log.
+        const arriving = (activity.launches ?? []).find(
+          (l) =>
+            l.deployment_id === deployment?.deployment_id || l.model_id === row.model_id,
+        )
+
+        // Bytes on disk for this repo, across whichever node holds it.
+        let onDisk: number | null = null
+        for (const node of storage?.nodes ?? []) {
+          const repo = node.models?.repos?.find((r) => r.repo_id === row.model_id)
+          if (repo) onDisk = (onDisk ?? 0) + repo.bytes
+        }
+        const now = Date.now()
+        if (onDisk !== null) {
+          setBytes(onDisk)
+          // What was here before this launch touched anything. If the figure
+          // never moves off it, the weights were already cached and no download
+          // happened -- worth saying, rather than showing a download step that
+          // silently did nothing.
+          setStartedAt((b) => (b === null ? onDisk : b))
+          if (lastBytes !== null && now > lastAt) {
+            const delta = onDisk - lastBytes
+            const seconds = (now - lastAt) / 1000
+            // Only a rate while it is actually moving. A rate of zero printed
+            // beside a stalled number reads as a stall this cannot diagnose.
+            setRate(delta > 0 ? delta / seconds : null)
+          }
+          lastBytes = onDisk
+          lastAt = now
+        }
+
+        // The sentence and the shard count, straight through. Held rather
+        // than cleared when a poll brings nothing: a log tail is a window,
+        // and the caption blinking out because one read came back empty is
+        // worse than a caption a few seconds stale.
+        if (arriving?.status) setSays(arriving.status)
+        // The runtime announcing its own death arrives here a poll or two
+        // before the deployment record carries the failure, and it says more
+        // than the record will: "Free memory on device cuda:0 (49.56/121.69
+        // GiB) on startup is less than desired GPU memory utilization" names
+        // what to change. Shown as the failure immediately rather than held
+        // behind a stepper still ticking towards Serving.
+        if (arriving?.fatal && arriving.status) setFailure(arriving.status)
+        if (arriving && arriving.fraction != null) setFraction(arriving.fraction)
+        else if (arriving?.phase && arriving.phase !== 'loading') setFraction(null)
+
+        // The record's state decides the two ends; the server's reading
+        // decides the middle. A launch the activity endpoint has not picked
+        // up yet leaves the phase where it is rather than inventing one --
+        // `preparing` is where it starts, and it is true from the first
+        // second.
+        let reading: Phase | null = null
+        if (mine?.state === 'ready' || mine?.state === 'degraded') reading = 'serving'
+        else if (mine?.state === 'failed') reading = 'failed'
+        else if (arriving?.phase) reading = arriving.phase as Phase
+
+        if (reading !== null) {
+          const next = reading
+          setPhase((prev) => {
+            // Phases only go forward. A poll that lands between two writes can
+            // otherwise walk backwards, and a stepper that un-ticks a step
+            // reads as something going wrong. A phase this build has never
+            // heard of sorts to -1 and so is treated as backwards, which is
+            // the safe way to be wrong about one.
+            if (prev === 'failed' || prev === 'serving') return prev
+            const back = PHASE_ORDER.indexOf(next) < PHASE_ORDER.indexOf(prev)
+            return next === 'failed' || !back ? next : prev
+          })
+          setReached((r) => (r[next] === undefined ? { ...r, [next]: elapsedRef.current } : r))
+        }
+        if (mine?.last_error) setFailure(mine.last_error)
+      } catch {
+        // A failed poll is not worth interrupting a download for. The next one
+        // is two seconds away and the clock keeps running regardless.
+      }
+      if (live) timer = window.setTimeout(poll, 2000)
+    }
+    void poll()
+    return () => {
+      live = false
+      window.clearTimeout(timer)
+    }
+  }, [backend, row.model_id, deployment?.deployment_id, error])
+
+  // Read inside the poll without making it a dependency, which would restart
+  // the loop every second and reset the rate measurement with it.
+  const elapsedRef = useRef(0)
+  elapsedRef.current = elapsed
+  // Same reason: the poll decides whether to ask for storage from the phase it
+  // is already on, and making the phase a dependency would tear the loop down
+  // and rebuild it every time the phase moved.
+  const phaseRef = useRef<Phase>('preparing')
+  phaseRef.current = phase
+
+  const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`
+  const mbs = (n: number) => `${(n / 1024 ** 2).toFixed(0)} MB/s`
+  const clock = (n: number) => `${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}`
+
+  if (error || phase === 'failed') {
+    return (
+      <div className="setup-step">
+        <h1>{row.label} did not start.</h1>
+        {/* Verbatim. A refusal from the fit gate or the launcher names what to
+            change, and this screen is not entitled to summarise it. */}
+        <p className="setup-warn setup-fault">{error ?? failure ?? 'The launcher reported a failure.'}</p>
+        <div className="setup-row">
+          <button className="btn primary" onClick={onBack}>
+            Pick something else
+          </button>
+          <button className="setup-skip" onClick={onContinue}>
+            Carry on anyway
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  const done = phase === 'serving'
+  const at = PHASE_ORDER.indexOf(phase)
+  // Never grew past what was there when we arrived: nothing was fetched, the
+  // weights were already cached.
+  const cached =
+    startedAt !== null &&
+    bytes !== null &&
+    bytes === startedAt &&
+    at > PHASE_ORDER.indexOf('downloading')
+
+  return (
+    <div className="setup-step">
+      <h1>{done ? `${row.label} is ready.` : `Getting ${row.label} ready.`}</h1>
+      <p className="setup-lede">
+        {done
+          ? 'It is loaded and answering. You can carry on setting up.'
+          : phase === 'downloading'
+            ? 'Fetching the weights onto this machine. This runs in the background — you can carry on, or close this page and come back.'
+            : phase === 'loading'
+              ? 'The weights are on disk. Reading them onto the GPU now.'
+              : phase === 'starting'
+                ? // Not "nearly done". The engine compiles itself and captures
+                  // CUDA graphs here, and on the first launch of a model that
+                  // is minutes with no download to explain it — which is
+                  // exactly when this screen used to go quiet. Later launches
+                  // of the same model reuse what was compiled and skip most of
+                  // it.
+                  'The weights are on the GPU. The engine is compiling and capturing CUDA graphs, which is slowest the first time a model runs here.'
+                : 'Getting the machine ready: the runtime container, then the weights.'}
+      </p>
+
+      <div className="setup-plate">
+        <div className="setup-plate-name mono">{row.label}</div>
+        <div className="setup-plate-spec mono">
+          {row.dtype ?? 'native'} · {Math.round(row.context / 1024)}k context
+          {deployment?.node_ids?.length ? ` · ${deployment.node_ids.join(', ')}` : ''}
+        </div>
+
+        {/* Filled only when something measured it: done, or the runtime
+            counting its own checkpoint shards onto the GPU. Every other
+            second of a launch this is an open track, because a bar moving at
+            a rate nobody measured is read as an estimate and planned around. */}
+        <div className="setup-bar">
+          {done ? (
+            <span className="is-known" style={{ width: '100%' }} />
+          ) : fraction !== null ? (
+            <span className="is-known" style={{ width: `${Math.round(fraction * 100)}%` }} />
+          ) : (
+            <span className="is-open" />
+          )}
+        </div>
+
+        <ol className="setup-phases">
+          {PHASE_ORDER.map((p, i) => {
+            const state = done || i < at ? 'done' : i === at ? 'now' : 'todo'
+            return (
+              <li key={p} className={`setup-phase is-${state}`}>
+                <span className="mark" aria-hidden="true">
+                  {state === 'done' ? '✓' : state === 'now' ? '●' : '○'}
+                </span>
+                <span className={state === 'now' && !done ? 'dotting' : undefined}>
+                  {PHASE_LABEL[p]}
+                </span>
+                <span className="detail mono">
+                  {p === 'downloading' && bytes !== null
+                    ? cached
+                      ? `${gb(bytes)} already on disk`
+                      : `${gb(bytes)}${state === 'now' && rate ? ` · ${mbs(rate)}` : ''}`
+                    : reached[p] !== undefined
+                      ? clock(reached[p] as number)
+                      : ''}
+                </span>
+              </li>
+            )
+          })}
+        </ol>
+
+        {/* The launcher's or the runtime's own words, passed through: "Pulling
+            image: ghcr.io/...", "Loading safetensors checkpoint shards: 5/11",
+            "Capturing CUDA graphs". Every one of them is more specific than
+            the step above it, and rewriting them here would throw away the
+            only thing on this screen that says which of several minutes-long
+            things is happening right now. */}
+        {!done && says && <div className="setup-log mono">{says}</div>}
+
+        <div className="setup-stage setup-plate-spec">
+          <span className="elapsed">{clock(elapsed)} elapsed</span>
+        </div>
+      </div>
+
+      {/* Said plainly rather than left as a mystery. Somebody watching a number
+          that is not a percentage deserves to know why it is not one. */}
+      {!done && (
+        <p className="setup-note" style={{ marginBottom: 'var(--s-5)' }}>
+          The size shown is what has actually landed in this machine&rsquo;s model cache.
+          There is no percentage for the download because nothing reports its final
+          size before it finishes &mdash; the runtime fetches its own weights. The bar
+          fills only while the runtime is counting its own shards onto the GPU, which
+          is the one step of a launch that measures itself.
+        </p>
+      )}
+
+      {failure && !done && <p className="setup-warn">{failure}</p>}
+
+      <div className="setup-row">
+        <button className="btn primary" onClick={onContinue}>
+          {done ? 'Continue' : 'Continue while it loads'}
+        </button>
+        {!done && (
+          <button className="setup-skip" onClick={onBack}>
+            Pick something else instead
+          </button>
+        )}
+      </div>
     </div>
   )
 }

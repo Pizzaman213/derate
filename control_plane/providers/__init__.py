@@ -11,9 +11,15 @@ Entry points:
 - :func:`build_stub_service` is the day 0 fake, for wiring LOCAL_FIRST before
   any real key exists.
 
-Keys are never stored, logged, serialized, or echoed. ``api_key_ref`` is the
-name of an environment variable or of a key in ``/data/secrets.json`` at mode
-0600, and values are resolved at request time and nowhere else.
+Keys are never logged, serialized, or echoed, and no record carries one.
+``api_key_ref`` is the *name* of an environment variable or of a key in
+``secrets.json`` at mode 0600, and values are resolved at request time and
+nowhere else.
+
+A key can be *given*, as ``api_key`` on an add or update spec, because
+otherwise configuring a provider meant setting an environment variable on the
+coordinator's host and restarting it. It is a request field and nothing more:
+it is written to ``secrets.json`` and what lands on the record is the name.
 """
 
 from .config import REDACTED

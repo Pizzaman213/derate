@@ -9,10 +9,12 @@
 //
 // The scheme, and the rule that decides which half of a URL a thing goes in:
 //
-//   the PATH names the screen           /dashboard /models /cluster /storage
+//   the PATH names the screen           /dashboard /models /cluster
 //                                       /chat /spend /settings
 //   ...and the screen's own subject     /models/<model id>
 //   the QUERY names what is selected    ?node= ?link= ?dep= ?open= ?ctx= ?seq=
+//   ...and, on a model, the shape it is    ?on= ?tp= ?pp=
+//   being planned at
 //
 // A model id carries slashes (`meta-llama/Llama-3.1-8B`) and they are kept as
 // real path separators: `/models/meta-llama/Llama-3.1-8B` is the URL somebody
@@ -33,7 +35,6 @@ export type Dest =
   | 'dash'
   | 'models'
   | 'cluster'
-  | 'storage'
   | 'chat'
   | 'spend'
   | 'settings'
@@ -51,9 +52,18 @@ export interface SheetRef {
   id: string
 }
 
-/** 8192/1 is what `GET /api/capacity`, the client's own fallback and the models
- *  tab all default to. A route holds `null` for either number when it is at the
- *  default, so the common URL stays `/models` rather than `/models?ctx=8192`. */
+/** What the advanced fields show before anybody overrides anything.
+ *
+ *  These are NOT what a missing `?ctx=`/`?seq=` means any more, and the
+ *  difference is the whole point. Absent means "the coordinator chooses", per
+ *  model, from the fit arithmetic -- which is what lets the models screen show
+ *  real verdicts on a fresh install with nothing typed anywhere. `?ctx=8192`
+ *  means somebody asked for 8192 and every verdict is taken there instead.
+ *
+ *  So `parse('/models?ctx=8192').context` is 8192 and not null, and it round
+ *  trips: two URLs, because there are two questions. What they are here for is
+ *  the number the disclosure shows in its box before it has an answer to show,
+ *  and the client's fallback when a caller does have to name one. */
 export const DEFAULT_CONTEXT = 8192
 export const DEFAULT_CONCURRENCY = 1
 
@@ -67,20 +77,48 @@ export interface Route {
   /** The deployment the dashboard and the sidebar are "about". */
   dep: string | null
   sheet: SheetRef | null
+  /** An override, or `null` for "the coordinator chooses". Not a value with a
+   *  default: the fit gate picks a context per model from what actually fits,
+   *  clamped to the model's own window, and that is the answer on the default
+   *  path. These are only set once somebody opens the advanced disclosure. */
   context: number | null
   concurrency: number | null
+  /** The machines the operator named, sorted and deduplicated. `null` means the
+   *  planner picks and sends no `node_ids` -- the two are different requests,
+   *  so absence is preserved rather than collapsed to "every machine". */
+  on: string[] | null
+  /** The degrees the operator named. Held as a pair because `parallelism` is
+   *  adopted as a whole object (tabs/models/DegreeFields.tsx): with an
+   *  omitted key meaning 1 on the wire, "TP mine, PP the planner's" cannot be
+   *  expressed at all, so either both are here or neither is. */
+  tp: number | null
+  pp: number | null
 }
 
 const SEGMENT: Record<Dest, string> = {
   dash: 'dashboard',
   models: 'models',
   cluster: 'cluster',
-  storage: 'storage',
   chat: 'chat',
   spend: 'spend',
   settings: 'settings',
   setup: 'setup',
 }
+
+/** Every destination, at runtime.
+ *
+ *  `Dest` is a type and is gone by the time anything runs, so a verifier that
+ *  wants to walk every screen has to be handed the list -- and a hand-kept
+ *  copy of it is the exact thing `check.mjs` refuses to keep for verifiers,
+ *  for the exact reason: it stops covering the newest one the moment somebody
+ *  adds it. `screens.check.mjs` claimed to capture "one per destination in
+ *  state/routes.ts" while walking a literal array, and `/speech` was invisible
+ *  to it for as long as that was true.
+ *
+ *  Derived from `SEGMENT` rather than written beside it, because SEGMENT is
+ *  the map that has to be complete anyway: a `Dest` missing from it parses as
+ *  the dashboard and href()s to `/undefined`, silently, in both directions. */
+export const DESTINATIONS = Object.keys(SEGMENT) as Dest[]
 
 const BY_SEGMENT = new Map<string, Dest>(
   (Object.entries(SEGMENT) as [Dest, string][]).map(([dest, seg]) => [seg, dest]),
@@ -88,23 +126,62 @@ const BY_SEGMENT = new Map<string, Dest>(
 
 const SHEET_KINDS = new Set<SheetRef['kind']>(['node', 'dep', 'model'])
 
-/** `:` and `/` are legal unescaped in a query string (RFC 3986 §3.4) and a
- *  browser leaves them alone, so `?open=model:meta-llama/Llama-3.1-8B` stays
- *  readable instead of arriving as `%3A`/`%2F`. `URLSearchParams` would encode
- *  both, which is why this is hand-rolled; parsing accepts either form. */
+/** `:`, `/` and `,` are all legal unescaped in a query string (RFC 3986 §3.4)
+ *  and a browser leaves them alone, so `?open=model:meta-llama/Llama-3.1-8B`
+ *  and `?on=spark-01,spark-02` stay readable instead of arriving as `%3A`,
+ *  `%2F` and `%2C`. `URLSearchParams` would encode all three, which is why
+ *  this is hand-rolled; parsing accepts either form.
+ *
+ *  Unescaping the comma is safe for every other parameter as well: nothing
+ *  splits a query value on one except `?on=`, which is the only field whose
+ *  value is a list. */
 function enc(value: string): string {
-  return encodeURIComponent(value).replace(/%3A/g, ':').replace(/%2F/g, '/')
+  return encodeURIComponent(value)
+    .replace(/%3A/g, ':')
+    .replace(/%2F/g, '/')
+    .replace(/%2C/g, ',')
 }
 
-function positive(raw: string | null, fallback: number): number | null {
+function positive(raw: string | null): number | null {
   if (raw === null) return null
   const n = Number(raw)
   if (!Number.isFinite(n) || n <= 0) return null
-  const rounded = Math.round(n)
-  // Normalised on the way in, so `parse(href(r))` is `r` for anything this
-  // module produced: a URL that spells out the default holds no more
-  // information than one that omits it.
-  return rounded === fallback ? null : rounded
+  return Math.round(n)
+}
+
+/** A degree. Identical to `positive()` and kept separate on purpose.
+ *
+ *  Both now read absent as absent and every value as itself -- but for
+ *  different reasons, and they moved apart once already. `positive()` used to
+ *  collapse a value equal to the default to null; that was right while a
+ *  missing context meant 8192, and it was always wrong here, because `tp=1`
+ *  against a planner that wants `tp=2` is an override and collapsing it would
+ *  hand the axis back to the planner it was overruling. Merging them would
+ *  make the next change to one of those rules silently a change to both. */
+function degree(raw: string | null): number | null {
+  if (raw === null) return null
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 1) return null
+  return Math.round(n)
+}
+
+/** The machines, sorted and deduplicated so `?on=b,a` and `?on=a,b` are one
+ *  URL. Sorting matches what the machine board does before it sends
+ *  (tabs/models/board.ts `toggle`), for the same reason: two tick orders must
+ *  make one request body and one server-side memo key. An empty or all-blank value is no selection rather
+ *  than the empty selection, which the gateway answers with a 400. */
+function nodeList(raw: string | null): string[] | null {
+  if (raw === null) return null
+  const ids = [...new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))]
+  return ids.length ? ids.sort() : null
+}
+
+/** Both axes, or neither. */
+function degreePair(params: URLSearchParams): { tp: number | null; pp: number | null } {
+  const tp = degree(params.get('tp'))
+  const pp = degree(params.get('pp'))
+  if (tp === null && pp === null) return { tp: null, pp: null }
+  return { tp: tp ?? 1, pp: pp ?? 1 }
 }
 
 /** `pathname + search`, split and validated. Anything unrecognised -- a typo, a
@@ -134,6 +211,9 @@ export function parse(url: string): Route {
   }
 
   const wantsNumbers = dest === 'models' || sheet?.kind === 'model'
+  // Either axis present adopts the pair, filling the other with 1 -- the same
+  // first-touch-adopts gesture the field itself makes.
+  const degrees = wantsNumbers ? degreePair(params) : { tp: null, pp: null }
 
   return {
     dest,
@@ -142,8 +222,11 @@ export function parse(url: string): Route {
     link: params.get('link') || null,
     dep: params.get('dep') || null,
     sheet,
-    context: wantsNumbers ? positive(params.get('ctx'), DEFAULT_CONTEXT) : null,
-    concurrency: wantsNumbers ? positive(params.get('seq'), DEFAULT_CONCURRENCY) : null,
+    context: wantsNumbers ? positive(params.get('ctx')) : null,
+    concurrency: wantsNumbers ? positive(params.get('seq')) : null,
+    on: wantsNumbers ? nodeList(params.get('on')) : null,
+    tp: degrees.tp,
+    pp: degrees.pp,
   }
 }
 
@@ -166,11 +249,23 @@ export function href(route: Route): string {
   put('dep', route.dep)
   put('open', route.sheet ? `${route.sheet.kind}:${route.sheet.id}` : null)
   if (route.dest === 'models' || route.sheet?.kind === 'model') {
-    if (route.context && route.context !== DEFAULT_CONTEXT) {
-      put('ctx', String(route.context))
+    // Written whenever they are set, including at 8192/1. They used to be
+    // dropped at the default, because the default was all absence could mean.
+    // Absence now means the coordinator picks, so dropping an explicit 8192
+    // would silently rewrite "judge everything at 8192" into "judge everything
+    // at whatever fits" -- a different question, on a link somebody shared.
+    if (route.context) put('ctx', String(route.context))
+    if (route.concurrency) put('seq', String(route.concurrency))
+    // Sorted on the way out as well as in, so a route built by hand spells the
+    // same URL as one that came off the address bar.
+    if (route.on && route.on.length) {
+      put('on', [...new Set(route.on)].sort().join(','))
     }
-    if (route.concurrency && route.concurrency !== DEFAULT_CONCURRENCY) {
-      put('seq', String(route.concurrency))
+    // Written as a pair, never singly: `tp` alone would parse back as the pair
+    // {tp, 1} and stop being the route that was written down.
+    if (route.tp !== null || route.pp !== null) {
+      put('tp', String(route.tp ?? 1))
+      put('pp', String(route.pp ?? 1))
     }
   }
 

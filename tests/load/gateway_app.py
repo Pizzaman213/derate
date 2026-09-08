@@ -88,7 +88,8 @@ class LoadDeployments:
         )
 
     def launch(
-        self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=Modality.TEXT
+        self, shape, plan, fit, runtime, ctx, max_seqs, *,
+        modality=Modality.TEXT, extra_args=(),
     ) -> Deployment:
         raise NotImplementedError("the load harness does not launch deployments")
 

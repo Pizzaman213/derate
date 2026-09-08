@@ -239,3 +239,48 @@ def parse_models(
         )
     models.sort(key=lambda m: m.served_name)
     return models
+
+
+def _endpoint_entries(payload: Any) -> list[dict]:
+    """Pull the endpoint list out of an OpenRouter `.../endpoints` response.
+
+    The documented shape wraps it in ``data.endpoints``; a bare top-level
+    ``endpoints`` is accepted too, the same defensive posture as ``_entries``
+    above, since this is a second-party envelope we do not control.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    candidates = data.get("endpoints") if isinstance(data, dict) else None
+    if not isinstance(candidates, list) and isinstance(payload, dict):
+        candidates = payload.get("endpoints")
+    if not isinstance(candidates, list):
+        return []
+    return [entry for entry in candidates if isinstance(entry, dict)]
+
+
+def parse_endpoints(payload: Any) -> list[dict]:
+    """Normalize OpenRouter's per-model backend list.
+
+    Each row names the backend by its ``tag`` -- the value the request-time
+    ``provider.only``/``provider.order`` fields expect -- and by
+    ``provider_name`` for display. Pricing here is always OpenRouter's own
+    per-token unit: this call only exists for the one kind that has it.
+    """
+    rows: list[dict] = []
+    for entry in _endpoint_entries(payload):
+        tag = entry.get("tag")
+        if not isinstance(tag, str) or not tag.strip():
+            continue
+        input_cost, output_cost = _pricing(entry, PricingUnit.PER_TOKEN_USD)
+        rows.append(
+            {
+                "tag": tag,
+                "provider_name": str(entry.get("provider_name") or tag),
+                "context_length": _context_length(entry) or None,
+                "input_cost_per_mtok": input_cost,
+                "output_cost_per_mtok": output_cost,
+                "quantization": entry.get("quantization")
+                if isinstance(entry.get("quantization"), str)
+                else None,
+            }
+        )
+    return rows

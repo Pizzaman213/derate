@@ -102,6 +102,15 @@ def test_an_unset_value_is_labelled_default_not_silently_zero(client):
     assert body["daily_spend_cap_usd"] is None
 
 
+def test_auto_restart_defaults_on(client):
+    """A crashed model nobody is watching should come back on its own -- the
+    setting has to default true, not just exist."""
+    with TestClient(client()) as c:
+        body = c.get("/api/settings").json()
+    assert body["auto_restart_crashed_deployments"] is True
+    assert body["sources"]["auto_restart_crashed_deployments"] == "default"
+
+
 # ==========================================================================
 # The honesty gate on the cap
 # ==========================================================================
@@ -152,6 +161,16 @@ def test_a_write_persists_and_is_labelled_as_coming_from_the_file(client):
     assert body["local_only"] is True
     assert body["sources"]["local_only"] == "file"
     assert client.store.load()["local_only"] is True
+
+
+def test_auto_restart_can_be_toggled_off_and_persists(client):
+    with TestClient(client()) as c:
+        body = c.patch(
+            "/api/settings", json={"auto_restart_crashed_deployments": False}
+        ).json()
+    assert body["auto_restart_crashed_deployments"] is False
+    assert body["sources"]["auto_restart_crashed_deployments"] == "file"
+    assert client.store.load()["auto_restart_crashed_deployments"] is False
 
 
 def test_a_write_takes_effect_on_the_live_settings_object(client):

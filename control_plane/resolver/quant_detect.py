@@ -49,11 +49,29 @@ _NAME_PATTERNS: tuple[tuple[str, str], ...] = (
     # because "_" is a word character, so \b never fires between "k" and "_".
     (r"\bq2[._-]?k[._-]?s\b", "q2_k_s"),
     (r"\bq2[._-]?k[._-]?l\b", "q2_k"),
+    # The _L siblings of the two schemes that had no [sml] rule, for the same
+    # reason and with the same fix: bartowski ships "Q6_K_L" and "Q8_0_L",
+    # which are the base scheme with the token-embedding and output tensors
+    # left at F16. Priced at the base scheme -- the file is marginally larger,
+    # and the alternative is the bf16 default, which over-charges Q6_K by 2.5x.
+    # Below the _XL block above, so "Q6_K_XL" still matches its own rule.
+    (r"\bq6[._-]?k[._-]?l\b", "q6_k"),
+    (r"\bq8[._-]?0[._-]?l\b", "q8_0"),
     (r"\bq2[._-]?k\b", "q2_k"),
     (r"\bq3[._-]?k[._-]?[sml]\b", "q3_k_m"),
     (r"\bq3[._-]?k\b", "q3_k_m"),
     (r"\bq4[._-]?k[._-]?[sml]\b", "q4_k_m"),
     (r"\bq4[._-]?k\b", "q4_k_m"),
+    # llama.cpp's ARM repackings: Q4_0_4_4, Q4_0_4_8, Q4_0_8_8. Not distinct
+    # quantizations -- the same Q4_0 blocks interleaved for i8mm/SVE dot
+    # products, so the same 4.5 bits per weight and the same bytes on disk.
+    # Above the bare q4_0 rule because that one cannot reach them: "_" is a
+    # word character, so \b never fires after the "0" in "q4_0_4_4". Without
+    # this they fall through to the bf16 default at 2.0 bytes per parameter
+    # against a real 0.5625 -- a 3.6x over-charge -- and each one costs a
+    # multi-second ranged read of a GGUF header that cannot answer either,
+    # because LLAMA_FTYPE 33/34/35 are absent from GGUF_FILE_TYPES.
+    (r"\bq4[._-]?0[._-]?[48][._-]?[48]\b", "q4_0"),
     (r"\bq4[._-]?0\b", "q4_0"),
     (r"\bq4[._-]?1\b", "q4_1"),
     (r"\bq5[._-]?0\b", "q5_0"),

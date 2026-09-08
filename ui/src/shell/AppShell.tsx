@@ -7,7 +7,6 @@ import { Sheet } from './Sheet'
 import { DashboardTab } from '../tabs/DashboardTab'
 import { ModelsTab } from '../tabs/ModelsTab'
 import { ClusterTab } from '../tabs/ClusterTab'
-import { StorageTab } from '../tabs/StorageTab'
 import { ChatTab } from '../tabs/ChatTab'
 import { SpendTab } from '../tabs/SpendTab'
 import { SettingsTab } from '../tabs/SettingsTab'
@@ -160,9 +159,6 @@ export function AppShell() {
           </section>
           <section aria-label="Cluster" hidden={dest !== 'cluster'}>
             <ClusterTab />
-          </section>
-          <section aria-label="Storage" hidden={dest !== 'storage'}>
-            <StorageTab />
           </section>
           <section aria-label="Chat" hidden={dest !== 'chat'}>
             <ChatTab />

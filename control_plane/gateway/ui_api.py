@@ -58,7 +58,7 @@ def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> AP
     def _env_values() -> dict[str, Any]:
         """What the environment asked for.
 
-        Only the electricity rate has an env var today; the other two are new
+        Only the electricity rate has an env var today; the other three are new
         and have none. `main.py` owns env reading, so this reads the resolved
         settings object rather than `os.environ` a second time -- one place
         parses the environment, not two.
@@ -76,6 +76,7 @@ def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> AP
             "electricity_rate_usd_per_kwh": 0.0,
             "local_only": False,
             "daily_spend_cap_usd": None,
+            "auto_restart_crashed_deployments": True,
         }
 
     def _view() -> dict[str, Any]:

@@ -1,6 +1,18 @@
 import { useMemo } from 'react'
 import type { RouteTarget } from '../api/types'
 import { useProviders, useRouting, useSettings } from '../state/resources'
+import type { SpendBasis } from './spend/rows'
+import {
+  basisNote,
+  cloudSpend,
+  cloudTokens,
+  fleetSpend,
+  formatRange,
+  money,
+  publishedRange,
+  spendCaption,
+  spendNotes,
+} from './spend/rows'
 
 // Ported from mockups-next/js/spend.js. Two inventions from that file are
 // dead on arrival here: the "managed remote" tier (a target is local or a
@@ -9,6 +21,16 @@ import { useProviders, useRouting, useSettings } from '../state/resources'
 // is gone -- there is no such constant anywhere on the real wire, and a
 // tile computed from one is exactly the kind of invented number this port
 // exists to remove. "Tokens generated" replaces it with a real sum instead.
+//
+// The cloud half had the mirror-image version of the same bug for longer.
+// `spend_today_usd` is `round(runtime.spend_today(now), 6)` server-side and is
+// never None, so a provider serving models it publishes no price for reports
+// exactly the "$0.00" of one serving nothing -- and the tile said "spent
+// today" over both. `providers/runtime.py` has counted `unpriced_requests`
+// all along; `spend/rows.ts` is what reads it. Where the provider prices the
+// request itself -- OpenRouter puts a `cost` in every usage block -- that
+// figure is banked instead of our rate-card arithmetic, and `metered_requests`
+// is what lets this screen call one a charge and the other an estimate.
 //
 // Local cost is gated on the electricity rate the same way CostSection gates
 // it: RouteTarget.cost_per_mtok is server-computed and comes back as a real
@@ -35,17 +57,18 @@ function dedupeByTargetId(targets: RouteTarget[]): RouteTarget[] {
   return [...seen.values()]
 }
 
-function money(v: number | null): string {
-  return v == null ? '—' : `$${v.toFixed(2)}`
-}
-
 interface Row {
   key: string
   name: string
   kind: 'local' | 'cloud'
   requests: number | null
-  costPerMtok: number | null
+  /** Already formatted, because a cloud row's price is a range as often as it
+   *  is a scalar and there is no one number to hand a `toFixed`. */
+  priceLabel: string
   spend: number | null
+  /** True when unpriced traffic sits under `spend`, making it a lower bound. */
+  floor: boolean
+  basis: SpendBasis
 }
 
 export function SpendTab() {
@@ -86,13 +109,18 @@ export function SpendTab() {
   // Likewise, a fleet where every provider port does no spend accounting at
   // all must total to null, not the $0.00 that Array.reduce's seed would
   // otherwise produce -- that reads as "spent nothing" instead of "unknown".
-  const cloudSpendKnown = provs.some((p) => p.spend_today_usd != null)
-  const cloudSpend = cloudSpendKnown
-    ? provs.reduce((a, p) => a + (p.spend_today_usd ?? 0), 0)
-    : null
-  const totalSpend = localSpend == null && cloudSpend == null ? null : (localSpend ?? 0) + (cloudSpend ?? 0)
+  // `fleetSpend` additionally drops a provider whose every request went
+  // through an unpriced model, and reports that its traffic is missing.
+  const cloud = fleetSpend(provs)
+  const totalSpend =
+    localSpend == null && cloud.usd == null ? null : (localSpend ?? 0) + (cloud.usd ?? 0)
 
-  const totalTokens = allTargets.reduce((a, t) => a + (t.counters?.total_tokens ?? 0), 0)
+  // Remote targets carry no per-target counters -- the provider port accounts
+  // per provider, not per model -- so a cloud request's tokens reach this tile
+  // only through `tokens_today`. Without this the "tokens generated" figure
+  // was local-only while sitting next to a total that included cloud spend.
+  const localTokens = allTargets.reduce((a, t) => a + (t.counters?.total_tokens ?? 0), 0)
+  const totalTokens = localTokens + provs.reduce((a, p) => a + (cloudTokens(p) ?? 0), 0)
 
   const pc = (v: number) => (totalRequests > 0 ? (v / totalRequests) * 100 : 0)
   const localPct = pc(localRequests)
@@ -107,18 +135,31 @@ export function SpendTab() {
         name: targetLabel(t),
         kind: 'local' as const,
         requests: t.counters?.completed ?? null,
-        costPerMtok,
+        priceLabel: costPerMtok == null ? '—' : `$${costPerMtok.toFixed(3)}`,
         spend: tok != null && costPerMtok != null ? (tok / 1_000_000) * costPerMtok : null,
+        floor: false,
+        // Derived here from a rate the operator typed and a wattage we
+        // measured. Never a bill anyone sent us.
+        basis: 'estimated' as const,
       }
     }),
-    ...provs.map((p) => ({
-      key: p.provider_id,
-      name: p.provider_id,
-      kind: 'cloud' as const,
-      requests: p.requests_today,
-      costPerMtok: null,
-      spend: p.spend_today_usd,
-    })),
+    ...provs.map((p) => {
+      const s = cloudSpend(p)
+      return {
+        key: p.provider_id,
+        name: p.provider_id,
+        kind: 'cloud' as const,
+        requests: p.requests_today,
+        // The provider's own published rate for what it actually serves. One
+        // number when the served models agree, a range when they do not, and
+        // an em dash only when the provider publishes nothing -- which is a
+        // different row from one that publishes $0.
+        priceLabel: formatRange(publishedRange(p.models)),
+        spend: s.usd,
+        floor: s.floor,
+        basis: s.basis,
+      }
+    }),
   ]
 
   return (
@@ -152,14 +193,23 @@ export function SpendTab() {
             <div className="unit">requests</div>
           </div>
           <div>
-            <div className="big">{money(totalSpend)}</div>
-            {/* When no electricity rate is set, local generation is unpriced
-                and this figure is cloud spend alone — say so rather than
-                letting a partial total read as the whole (wave-2 N2). */}
-            <div className="unit">{rateSet ? 'spent today' : 'spent today · cloud only'}</div>
-            {!rateSet && totalSpend != null ? (
-              <div className="unit muted">set an electricity rate to price local generation</div>
-            ) : null}
+            {/* `≥` whenever real traffic sits under this number unpriced. A
+                total that omits some of its own inputs is a lower bound, and
+                rendering it as an equality is the fabricated-zero bug one
+                decimal place further along. */}
+            <div className="big">{money(totalSpend, cloud.floor)}</div>
+            {/* Every exclusion, not just the electricity one: an unset rate
+                leaves local generation out, and a provider serving models it
+                publishes no price for leaves its whole bill out (wave-2 N2,
+                and its cloud twin). */}
+            <div className="unit">{spendCaption(rateSet, cloud)}</div>
+            {totalSpend != null
+              ? spendNotes(rateSet, cloud).map((note) => (
+                  <div className="unit muted" key={note}>
+                    {note}
+                  </div>
+                ))
+              : null}
           </div>
           <div>
             <div className="big">{totalTokens.toLocaleString()}</div>
@@ -170,8 +220,13 @@ export function SpendTab() {
 
       <div className="card2">
         <h3>By target</h3>
+        {/* Says which of the two kinds of number the column holds, because
+            they are not the same claim: a metered figure is a charge, and an
+            estimate is arithmetic over a published rate that cannot see a
+            cached prompt or a long-context tier. */}
         <div className="unit" style={{ marginBottom: 10 }}>
-          Local cost derives from measured power draw at your electricity rate.
+          {basisNote(cloud, rateSet) ??
+            'Local cost derives from measured power draw at your electricity rate.'}
         </div>
         <div style={{ overflowX: 'auto' }}>
           <table>
@@ -180,7 +235,7 @@ export function SpendTab() {
                 <th>Target</th>
                 <th>Kind</th>
                 <th style={{ textAlign: 'right' }}>Requests</th>
-                <th style={{ textAlign: 'right' }}>$/Mtok</th>
+                <th style={{ textAlign: 'right' }}>$/Mtok out</th>
                 <th style={{ textAlign: 'right' }}>Spent</th>
               </tr>
             </thead>
@@ -190,8 +245,23 @@ export function SpendTab() {
                   <td className="mono">{r.name}</td>
                   <td className="unit">{r.kind}</td>
                   <td className="num">{r.requests == null ? '—' : r.requests.toLocaleString()}</td>
-                  <td className="num">{r.costPerMtok == null ? '—' : `$${r.costPerMtok.toFixed(3)}`}</td>
-                  <td className="num">{money(r.spend)}</td>
+                  <td className="num">{r.priceLabel}</td>
+                  <td
+                    className="num"
+                    title={
+                      r.basis === 'metered'
+                        ? 'as the provider reported it charged'
+                        : r.basis === 'mixed'
+                          ? 'part as the provider reported it, part estimated'
+                          : r.basis === 'unpriced'
+                            ? 'this provider publishes no price for the models it served'
+                            : r.kind === 'local'
+                              ? 'measured power draw at your electricity rate'
+                              : 'estimated from published rates'
+                    }
+                  >
+                    {money(r.spend, r.floor)}
+                  </td>
                 </tr>
               ))}
               {rows.length === 0 ? (

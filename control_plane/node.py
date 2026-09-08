@@ -46,6 +46,8 @@ from typing import Callable
 
 import uvicorn
 
+from control_plane import logfiles
+from control_plane import logfiles
 from control_plane.registry import NodeRuntime, RegistryConfig, start_node
 from control_plane.registry.config import ROLE_COORDINATOR
 
@@ -73,6 +75,9 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     from control_plane.links.service import LinkService
     from control_plane.planner.planner import Planner
     from control_plane.providers.service import ProviderService
+    from control_plane.deploy.flags import RUNTIMES as RUNTIME_SPECS
+    from control_plane.deploy.recipes import container_image
+    from control_plane.resolver import imageprobe
     from control_plane.resolver.resolver import ModelResolver
 
     registry = runtime.registry
@@ -83,7 +88,19 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
         )
 
     links = LinkService(registry=registry, local_node_id=runtime.profile.node_id)
-    resolver = ModelResolver()
+    # The composition root is the only thing that knows both which images
+    # this build launches and which component needs to ask them what they
+    # can load. Handing them over here is what lets the support table stop
+    # being a hand-copied list of somebody else's architectures -- see
+    # resolver/imageprobe.py. An image that is not on this machine is not
+    # pulled and not waited for; the static table answers instead.
+    resolver = ModelResolver(
+        runtime_images={
+            name: container_image(spec)
+            for name, spec in RUNTIME_SPECS.items()
+            if name in imageprobe.SCRIPTS
+        }
+    )
     fit = FitCalculator()
     # Never Planner(fit=FitCalculator()): the planner's fit argument is its
     # own FitHelpers protocol (min_nodes_required/kv_bytes_per_token), which
@@ -92,6 +109,12 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     planner = Planner()
     deployments = DeploymentManager(registry=registry, state_dir=config.data_dir)
     providers = ProviderService(data_path=config.data_dir)
+    # The log files opened in main() started with a fresh Redactor, which knows
+    # the vendor key shapes but no actual value. This is the first moment a
+    # thing that RESOLVES keys exists, so the file handlers are pointed at its
+    # redactor -- the same instance telemetry/service.py shares, for the same
+    # reason: a Redactor only scrubs what it has been told to remember.
+    logfiles.adopt_redactor(providers.redactor)
 
     # runtime.identity.cluster_id is the real minted (or joined) cluster id.
     # GatewaySettings.cluster_id defaults to the day-0 fixture "c-local";
@@ -217,9 +240,12 @@ async def run(config: RegistryConfig | None = None) -> None:
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("DERATE_LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format=logfiles.LOG_FORMAT,
     )
     logging.getLogger().setLevel(os.environ.get("DERATE_LOG_LEVEL", "INFO"))
+    # Before asyncio.run, so a failure to start a node is in the file rather
+    # than only on a stderr that systemd or `docker run -d` swallowed.
+    logfiles.install()
     asyncio.run(run())
 
 

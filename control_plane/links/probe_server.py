@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import socketserver
 import threading
@@ -55,7 +56,14 @@ class _SinkHandler(socketserver.BaseRequestHandler):
 
 
 class _Server(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+    # SO_REUSEADDR means two different things. On POSIX it lets us rebind a
+    # port still in TIME_WAIT from the previous process, which is what we want
+    # after a restart. On Windows it lets a second process bind a port another
+    # process is actively listening on -- both "succeed", and which one answers
+    # a measurement is then undefined. A link measurement that silently reads
+    # the wrong socket is worse than one that does not happen, so on Windows we
+    # let the second bind fail and the caller report the port as taken.
+    allow_reuse_address = os.name != "nt"
     daemon_threads = True
 
 

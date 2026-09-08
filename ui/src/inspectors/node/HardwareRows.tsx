@@ -1,6 +1,6 @@
 import type { MemoryReport, NodeStateDTO } from '../../api/types'
 import { useMemoryReport } from '../../state/resources'
-import { fmtUnit, gbytes, relativeTime, shortGpu } from '../../format'
+import { deviceClassLabel, fmtUnit, gbytes, relativeTime, shortGpu } from '../../format'
 
 /** What the machine is, and what of it is actually available.
  *
@@ -29,26 +29,38 @@ export function HardwareRows({ node }: { node: NodeStateDTO }) {
 
   return (
     <>
+      {/* The four GPU rows. On a machine with no GPU each one had a value
+          of nothing -- three blank cells, which read as a rendering fault, and
+          an "addressable" of "0.0 GiB · 0.0 GiB usable at the 0.90 guardrail",
+          which reads as a card with an empty pool rather than as a board with
+          no card. The device class answers the first row and the rest say so
+          plainly; what this machine DOES have is the host memory below. */}
       <div className="row">
         <span>GPU</span>
         <span className="mono">
-          {shortGpu(p.gpu_name)}
+          {noGpu ? deviceClassLabel(p.device_class) : shortGpu(p.gpu_name)}
           {p.gpu_count > 1 ? ` × ${p.gpu_count}` : ''}
         </span>
       </div>
       <div className="row">
         <span>compute capability</span>
-        <span className="mono">{p.compute_capability}</span>
+        <span className="mono">{p.compute_capability || '—'}</span>
       </div>
       <div className="row">
         <span>driver</span>
-        <span className="mono">{p.driver_version}</span>
+        <span className="mono">{p.driver_version || '—'}</span>
       </div>
       <div className="row">
         <span>addressable</span>
         <span className="mono">
-          {gbytes(p.addressable_memory, 1)} GiB · {gbytes(usable, 1)} GiB usable at the{' '}
-          {guardrail.toFixed(2)} guardrail
+          {noGpu ? (
+            <>—</>
+          ) : (
+            <>
+              {gbytes(p.addressable_memory, 1)} GiB · {gbytes(usable, 1)} GiB usable at
+              the {guardrail.toFixed(2)} guardrail
+            </>
+          )}
         </span>
       </div>
       <div className="row">

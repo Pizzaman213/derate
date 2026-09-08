@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { ProviderKindSpec } from '../../api/types'
-import { useCluster, useProviderKinds, useProviders } from '../../state/resources'
+import { useCluster, useProviders } from '../../state/resources'
+import { pullableProviders } from './pullTargets'
 import { useBackend } from '../../state/backend'
 import { ApiError } from '../../api/client'
 import { Verbatim } from '../../components/Verbatim'
@@ -13,16 +14,30 @@ import { gbytes } from '../../format'
  *  provider instead -- somebody else's hardware, reached over the network --
  *  and the way to get a model onto it is to tell it to fetch one.
  *
- *  The model is named the way that server names it, not as a HuggingFace
- *  repository, because that is the only name it will answer to. It is
- *  deliberately a second namespace and not folded into the quantization
- *  ladder: the ladder's sizes, variants and fit verdicts describe weights this
- *  cluster would hold, and none of them survive the trip to a machine whose
- *  memory derate does not manage.
+ *  This card names the model the way that server names it -- `qwen2.5:0.5b`,
+ *  `gemma3:270m` -- and that is now what it is for. The quantization ladder is
+ *  the primary route: picking the ollama runtime there sends the row you
+ *  chose, as `hf.co/<repo>:<tag>`, so the thing on screen and the thing served
+ *  are one object.
+ *
+ *  That reverses half of what this comment used to say. It argued the pull was
+ *  deliberately a second namespace because "the ladder's sizes, variants and
+ *  fit verdicts describe weights this cluster would hold, and none of them
+ *  survive the trip". The fit verdicts genuinely do not -- which is why the
+ *  ladder suppresses every one of them under that runtime rather than reusing
+ *  them. The sizes and variants do: `file_bytes` is a measured download, and
+ *  it is the number the pull gate weighs. What is left here is the escape
+ *  hatch for Ollama's own names, which no ladder row can express.
  */
-export function PullCard() {
+export function PullCard({
+  providerKinds,
+}: {
+  /** Polled once by the tab. `useResource` does not deduplicate, so mounting
+   *  `useProviderKinds` here as well would be a second interval for one
+   *  static table -- and two answers to "which providers can be pulled onto". */
+  providerKinds?: ProviderKindSpec[] | null
+}) {
   const providers = useProviders()
-  const kinds = useProviderKinds()
   const cluster = useCluster()
   const { backend, invalidate } = useBackend()
   const [providerId, setProviderId] = useState('')
@@ -33,12 +48,7 @@ export function PullCard() {
   const [override, setOverride] = useState(false)
   const [done, setDone] = useState<string | null>(null)
 
-  const pullable = new Set(
-    (kinds.data ?? [])
-      .filter((k: ProviderKindSpec) => k.supports_pull)
-      .map((k: ProviderKindSpec) => k.kind),
-  )
-  const targets = (providers.data ?? []).filter((p) => pullable.has(p.kind))
+  const targets = pullableProviders(providers.data, providerKinds)
 
   // With no provider configured this used to render nothing at all, on the
   // reasoning that a control which cannot act is worse than an absent one.
@@ -84,11 +94,15 @@ export function PullCard() {
       })
       setDone(
         reply.download_bytes
-          ? // The transfer runs as a background task in the coordinator, so
-            // restarting it drops the download and leaves the far end holding
-            // a partial file. Cheap to say, and the alternative is somebody
-            // watching a 70B pull vanish with no explanation.
-            `Pulling ${reply.model} — ${gbytes(reply.download_bytes, 2)} GiB. It appears here when the download finishes. Restarting the coordinator cancels it.`
+          ? // Points at the rail, where the bar is. This used to say only "it
+            // appears here when the download finishes", which was the whole
+            // problem: a 70B pull was minutes of silence after one sentence.
+            //
+            // The restart clause stays. The transfer runs as a background task
+            // in the coordinator, so restarting it drops the download and
+            // leaves the far end holding a partial file. Cheap to say, and the
+            // alternative is somebody watching a long pull vanish unexplained.
+            `Pulling ${reply.model} — ${gbytes(reply.download_bytes, 2)} GiB. Progress is in the sidebar under Activity, and it appears here when the download finishes. Restarting the coordinator cancels it.`
           : `${reply.model} is already on that machine.`,
       )
       setRefusal(null)
@@ -115,7 +129,9 @@ export function PullCard() {
       <h3>Run on a provider</h3>
       <div className="unit" style={{ marginBottom: 10 }}>
         A machine with no GPU cannot run vLLM or SGLang, so it is reached as a provider
-        rather than launched onto. Name the model the way that server names it.
+        rather than launched onto. Name the model the way that server names it — to send
+        a quantization from a HuggingFace repository instead, open the model and pick the
+        ollama runtime.
       </div>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>

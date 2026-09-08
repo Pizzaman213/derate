@@ -134,6 +134,36 @@ def _state(pid: int) -> str | None:
     return parts[0] if parts else None
 
 
+def _require_posix_signals() -> None:
+    """Refuse the kill verb where the signals it is built on do not exist.
+
+    Everything below this line is POSIX signal semantics, and on Windows each
+    piece is wrong in a way that is worse than missing:
+
+    ``os.kill(pid, sig)`` is ``TerminateProcess`` for every signal, so the
+    graceful tier is not graceful -- this module's own opening promises that "a
+    vLLM given ten seconds unmaps its weights and tears the CUDA context down
+    cleanly", and there it would be an immediate hard kill reported as
+    ``SIGTERM``. ``os.kill(pid, 0)`` is not a probe either; it terminates what
+    it is asked about, which makes ``_alive`` a killer. And ``signal.SIGKILL``
+    does not exist at all, so the escalation tier raises AttributeError inside
+    the request.
+
+    A Windows port of this needs a real graceful-shutdown mechanism, not a
+    translation table. Until there is one, refusing by name beats a button that
+    reports a clean drain it did not perform.
+    """
+    if os.name != "posix":
+        raise KillRefused(
+            "kill_unsupported_platform",
+            "This node cannot end a GPU process: it is not running on a "
+            "POSIX system, and the graceful SIGTERM-then-SIGKILL sequence "
+            "this uses has no equivalent here. Stop the workload where it "
+            "was started, or end the process with the operating system's own "
+            "task manager.",
+        )
+
+
 def _alive(pid: int) -> bool:
     """Is *pid* still running?
 
@@ -206,6 +236,7 @@ async def kill_gpu_process(
             "node can be killed from here." % pid,
         )
     guard(pid)
+    _require_posix_signals()
 
     before = target.gpu_memory
     try:

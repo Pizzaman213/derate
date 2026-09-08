@@ -171,13 +171,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             # while one that says it could not write names the actual problem.
             log.warning("could not record setup completion: %s", exc)
             return errors.error_response(
+                500,
                 "Setup finished, but this coordinator could not record that it "
                 "did: %s. Everything you configured is saved; only the "
                 "reminder to set up is. Check that the data directory is "
                 "writable." % errors.detail(exc),
                 "setup_error",
                 "setup_not_recorded",
-                status=500,
             )
         return JSONResponse({"completed": True})
 

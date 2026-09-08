@@ -51,6 +51,22 @@ export function apiUrl(path: string): string {
   return current ? current + path : path
 }
 
+/** `apiUrl` for a WebSocket: the same base, with the scheme a socket needs.
+ *
+ *  Same origin has to be resolved to an absolute URL here rather than left
+ *  relative -- `new WebSocket('/api/...')` is not a thing -- so this is the one
+ *  place that reads `window.location`, and it takes the page's own scheme with
+ *  it. That matters more than it looks: the coordinator is served over plain
+ *  HTTP on a LAN address, so this returns `ws://` in the deployed shape and
+ *  the session is **not encrypted**. Anything carried over it, the shell key
+ *  included, is on the wire in clear. The UI says so where an operator will
+ *  read it; this is the comment for whoever wonders why it is not `wss`. */
+export function wsUrl(path: string): string {
+  if (current) return current.replace(/^http/, 'ws') + path
+  const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${scheme}//${window.location.host}${path}`
+}
+
 /** What the UI is talking to right now, in words, for display. */
 export function describeBase(base: string): string {
   return base || `${window.location.origin} — this page's own origin`

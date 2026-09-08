@@ -9,64 +9,6 @@ I started this while bringing up an agent swarm for Jarvis, my self-hosted codin
 
 Planning and orchestration for DGX Spark clusters, for any model you want to run. It measures how fast your machines actually talk to each other, works out from that how to split a model across them, refuses launches that would run out of memory, and puts every model behind a single endpoint.
 
-## Why this is defensible
-
-**Nothing in the ecosystem measures the link and derives a plan from it.**
-
-- `sparkrun` takes `--tp N` from the user and never chooses it.
-- Dynamo's AIConfigurator has no GB10 profile at all.
-- vLLM checks whether peer-to-peer *works*, not how fast the link is.
-
-NVIDIA's own playbook says TP=2 for two Sparks. Measured all-reduce on that
-link is roughly 10 GB/s, not the 25 GB/s nameplate, because GPUDirect RDMA is
-off — every tensor is copied into system memory before the NIC sees it, which
-is why raw `ib_write_bw` reports 24.6 GB/s on a link where NCCL delivers ten.
-At that bandwidth pipeline parallel beats tensor parallel substantially on
-batched serving. derate probes the link, contradicts the playbook, and shows
-the arithmetic it disagreed on:
-
-```
-PP=2 across spark-01 and spark-02: measured all-reduce is 10.2 GB/s, below the
-40 GB/s threshold where tensor parallel becomes competitive, and at concurrency
-16 pipeline moves 92.2 KB per step over 1 exchange against tensor parallel's
-6.6 MB over 72 exchanges.
-
-  rejected — TP=2: measured all-reduce 10.2 GB/s is below the 40 GB/s
-  threshold; 2 all-reduces per layer across 36 layers is 72 cross-node
-  exchanges and 6.6 MB per step, which would dominate at concurrency 16.
-```
-
-That is not a sentence with a number pasted into it. Move the measurement above
-the threshold — as a driver update enabling GPUDirect RDMA would — and the same
-planner, same model, same nodes, same concurrency, inverts its own answer:
-
-```
-TP=2 across spark-01 and spark-02: measured all-reduce is 45.0 GB/s, at or
-above the 40 GB/s threshold, so tensor parallel's 72 all-reduces per token are
-affordable and it is the stronger choice for batched serving at concurrency 16.
-
-  rejected — PP=2: cheaper on the wire, but the measured link at 45.0 GB/s is
-  fast enough that tensor parallel's all-reduces are affordable and pipeline
-  still pays a 6 percent bubble at concurrency 16.
-```
-
-Both blocks are the planner's own output on `openai/gpt-oss-120b` at its native
-131,072-token context, copied verbatim. Nothing downstream may hold a bandwidth
-constant instead of reading the measurement, and two tests enforce it:
-`test_no_bandwidth_is_hardcoded_in_the_planner` greps the package for anything
-shaped like a bandwidth literal, and `test_answer_flips_when_only_the_measurement_changes`
-asserts exactly the inversion above.
-
-The number itself is never guessed either. Three rungs, tried in order and each
-labelled for what it is: `nccl-tests` `all_reduce_perf` and `sendrecv_perf` —
-the real answer, because it is the code path the runtime takes — then
-`ib_write_bw` scaled by a stated 0.42 ratio and flagged as an estimate, then
-TCP throughput, flagged as coarse. If all three fail the answer is *no
-measurement*, and the planner says so rather than inventing one: `TP=2: no
-measurement to justify 72 cross-node all-reduces per token; pipeline is the
-safe default until the link is probed.` Reporting raw RDMA as if it were NCCL
-bandwidth is precisely the error that makes the ecosystem's defaults wrong.
-
 ## The demo
 
 Two machines, two `curl` lines — **Install** below is both of them. The second joins the first and appears as a member. Launch a model that will not fit on one. The plan panel says pipeline parallel, names the measured 10.2 GB/s link as the reason, and lists tensor parallel as rejected.
@@ -109,43 +51,12 @@ it passes are Linux-host features: `--network host` does not reach the LAN
 under Docker Desktop, `--gpus` needs the NVIDIA container toolkit, and
 `--pid=host` has no host to name. macOS and Windows are on the roadmap.
 
-```bash
-# the first machine. It becomes the coordinator and serves the UI on :8080.
-curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/integration/install.sh | sh
+1. **Run this on machine one.** It becomes the coordinator and serves the UI
+   on `:8080`. That alone is a working single-node cluster.
 
-# every machine after. The UI composes this line for you, address and token
-# already filled in: Settings -> Add a node.
-curl -fsSL http://<coordinator>:8080/install.sh | sh -s -- \
-    --join http://<coordinator>:8080 --token ej_...
-```
-
-One image, one container, role decided at runtime. The script checks Docker,
-pulls `ghcr.io/pizzaman213/derate/node`, and runs it with host networking and a data volume;
-`--dry-run` prints the `docker run` it would use and stops, `--uninstall`
-reverses it. The `docker run` form below is still the whole of what it does and
-remains supported.
-
-The token in the second command is an **enrollment token**: minted on demand,
-expiring in an hour, spent by the machine that uses it. A node holding one is
-admitted on arrival, so there is nothing to click. The permanent cluster token
-still only makes a candidate — it is not the thing you carry around any more.
-
-```bash
-docker run --network host --gpus all --pid=host \
-    -v derate:/data ghcr.io/pizzaman213/derate/node    # equivalent, by hand
-```
-
-`--gpus all` because the hardware probe is `nvidia-smi`, and a container
-without one probes as unidentified hardware the planner will not place work
-on — a node that joins, reports healthy, and shows zeros. `--pid=host`
-because on GB10 per-process accounting is the only memory number nvidia-smi
-will still give you, and it only counts processes in its own namespace.
-`install.sh` passes both for you.
-
-## First run
-
-1. **Run the first line on machine one.** It becomes the coordinator and serves
-   the UI on `:8080`. That alone is a working single-node cluster.
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/integration/install.sh | sh
+   ```
 
 2. **Open `http://<machine one>:8080`.** A setup walkthrough runs on the first
    visit and takes five steps — read the machine, add a cloud provider if you
@@ -155,18 +66,41 @@ will still give you, and it only counts processes in its own namespace.
 
 3. **Settings → Add a node is where a node's token comes from.** There is
    nowhere else to look. Press it and the coordinator mints an **enrollment
-   token** and composes the whole second command for you — its own address and
-   the token already filled in — ready to copy. The same card lists the nodes
-   that turn up after it runs.
+   token** and composes this whole next line for you — its own address and the
+   token already filled in — ready to copy. The same card lists the nodes that
+   turn up after it runs.
 
-4. **Run that command on machine two.** The token lasts an hour and is spent by
-   the machine that uses it, so the node is admitted on arrival: no approval
-   step, nothing to click.
+   ```bash
+   curl -fsSL http://<coordinator>:8080/install.sh | sh -s -- \
+       --join http://<coordinator>:8080 --token ej_...
+   ```
+
+4. **Run that on machine two.** The token lasts an hour and is spent by the
+   machine that uses it, so the node is admitted on arrival: no approval step,
+   nothing to click.
 
 The permanent cluster token is a different thing, and it is not what you carry
 around — it only makes a *candidate*. A node that reaches the coordinator
 without a live enrollment token, over mDNS or with that permanent token, waits
 instead; Settings → Add a node is also where you admit it.
+
+One image, one container, role decided at runtime. The script checks Docker,
+pulls `ghcr.io/pizzaman213/derate/node`, and runs it with host networking and a
+data volume; `--dry-run` prints the `docker run` it would use and stops,
+`--uninstall` reverses it. That `docker run` is the whole of what it does, and
+is still supported by hand:
+
+```bash
+docker run --network host --gpus all --pid=host \
+    -v derate:/data ghcr.io/pizzaman213/derate/node
+```
+
+`--gpus all` because the hardware probe is `nvidia-smi`, and a container
+without one probes as unidentified hardware the planner will not place work
+on — a node that joins, reports healthy, and shows zeros. `--pid=host`
+because on GB10 per-process accounting is the only memory number nvidia-smi
+will still give you, and it only counts processes in its own namespace.
+`install.sh` passes both for you.
 
 ## One endpoint
 
@@ -301,13 +235,6 @@ Four ways to serve audio, cheapest first:
 An audio deployment reports `—` rather than a token rate, in the strip and in
 the inspector. There is no audio-side rate measured today, and a zero would
 read as a stalled deployment.
-
-## Looking something up
-
-- **`CONTRACTS.md`** — every type, enum, constant, derived fact, route and environment variable, generated from the code. A test fails when it goes stale, so it cannot be wrong in a way the code is not. This is where you look something up.
-- **`00-architecture.md`** — why any of it is shaped this way. It is a journal: the early sections are never edited and the dated appendices amend them, so start from the index at the top rather than reading down.
-- **`ui/README.md`** — the screen, the URL scheme, and the verifiers.
-- **`CLAUDE.md`** — the part that is only useful while you are editing.
 
 ## License
 

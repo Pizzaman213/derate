@@ -57,6 +57,12 @@ header {
   padding: 12px 20px;
   border-bottom: 1px solid var(--rule);
 }
+/* Metrics stream dropped (shell/Header.tsx: `stale` from useMetrics) --
+   the lamp already turns into a hollow --fault ring, but that is easy to
+   miss; the whole top bar's rule line does too. */
+header.stream-fault {
+  border-bottom-color: var(--fault);
+}
 .dest {
   display: flex;
   gap: 2px;
@@ -370,6 +376,32 @@ h3 {
   font-weight: 500;
   margin-bottom: 7px;
 }
+/* The Verdict card's mode tabs, drawn onto its own top edge rather than as a
+ * control floating above it -- a filing-cabinet tab, not a settings toggle.
+ * Negative margins cancel .verdict's own padding and lift the row 1px past
+ * its border, so the tab sits ON that line; the active tab's bottom border
+ * then matches the card's background rather than the rule, erasing the seam
+ * so it reads as fused with the card rather than resting on top of it. */
+.verdict-modetabs {
+  display: flex;
+  gap: 4px;
+  margin: calc(-1 * var(--s-3) - 1px) calc(-1 * var(--s-3)) 0;
+  padding: 0 var(--s-3);
+}
+.verdict-modetabs button {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 5px 12px;
+  background: var(--panel-recessed);
+  color: var(--ink-muted);
+  font-size: var(--size-label);
+}
+.verdict-modetabs button[aria-pressed='true'] {
+  background: var(--panel);
+  color: var(--ink);
+  font-weight: 500;
+  border-bottom-color: var(--panel);
+}
 .budget {
   display: flex;
   height: 20px;
@@ -392,6 +424,24 @@ h3 {
   display: flex;
   flex-direction: column;
   min-height: calc(100vh - 95px);
+}
+/* The graph's block is the flex item that grows, so the drawing still takes
+   whatever is left between the toolbar and the two reference blocks below it.
+   Without this the card sizes to its own content and the floor's `flex: 1`
+   has no free space to resolve against, which collapses the drawing.
+
+   `flex: 1` with `min-height: 0` at EVERY level between .clusterstage and the
+   graph's own element, this one included, is what keeps ClusterGraph's
+   ResizeObserver from feeding back into its own size: a flex-basis of 0 means
+   the height comes from the container's free space and never from the
+   content, so measuring the box cannot change the box. Wrapping the floor in
+   a block added a level to that chain, and a level that sizes to its content
+   would reintroduce the loop. */
+.clusterstage .floorcard {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .clusterstage .floor {
   flex: 1;
@@ -516,6 +566,18 @@ svg text.m {
 .edge {
   cursor: pointer;
 }
+/* The floor moves rather than teleports. `useFloorMotion` renders a plate
+   where it has arrived and pushes it back to where it was with an inline
+   transform; dropping the push is what this transition then carries. Both the
+   token and the easing are the panel's, so a wire tweened in JavaScript to the
+   same two arrives with the plates instead of racing them.
+
+   Reduced motion needs no rule here: base.css clamps every transition in the
+   document, so the push is simply gone on the next frame. */
+.machine,
+.band {
+  transition: transform var(--dur) var(--ease);
+}
 /* The card's own border carries the node's signal colour, so hover cannot
    restyle it without overwriting state with decoration. It gets its own ring
    OUTSIDE the card instead -- the same trick --select-on-panel uses. */
@@ -543,8 +605,104 @@ svg text.m {
 .edge:focus-visible > path:last-of-type {
   stroke: var(--ink);
 }
-.machine[data-dragging='true'] {
+/* A plate under the pointer is not going anywhere it has to be shown getting
+   to: the drag writes a transform on the ghost every frame, and a transition
+   on top of that is a plate that lags the cursor. Bands are hand-placed the
+   same way now, so they get the same rule. */
+.machine[data-dragging='true'],
+.band[data-dragging='true'] {
   cursor: grabbing;
+  transition: none;
+}
+
+/* A band that is still arriving.
+ *
+ * The bar sweeps and never fills, which is the same claim -- and the same
+ * refusal -- as the setup screen's `.setup-bar .is-open`: nothing downstream
+ * reports how big a launch's download will be, so there is no position to
+ * draw and this does not draw one. `transform-box: fill-box` puts the
+ * percentages on the rect's own box; without it an SVG element measures them
+ * against the whole viewport and the highlight leaves the floor entirely. */
+.bandsweep-move {
+  transform-box: fill-box;
+  animation: band-sweep 1.6s ease-in-out infinite;
+}
+.bandsweep-still {
+  display: none;
+}
+@keyframes band-sweep {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(360%);
+  }
+}
+/* The waiting dots on the step in progress. Three real glyphs rather than the
+   animated `content` the setup screen uses, because SVG text has no
+   pseudo-elements -- but the same sequence: nothing, then one, two, three. A
+   keyframe each rather than one keyframe under three delays, which rolls the
+   dots instead of counting them up. */
+.banddot1,
+.banddot2,
+.banddot3 {
+  animation-duration: 1.4s;
+  animation-timing-function: steps(1, end);
+  animation-iteration-count: infinite;
+}
+.banddot1 {
+  animation-name: band-dot1;
+}
+.banddot2 {
+  animation-name: band-dot2;
+}
+.banddot3 {
+  animation-name: band-dot3;
+}
+@keyframes band-dot1 {
+  0%,
+  24% {
+    opacity: 0;
+  }
+  25%,
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes band-dot2 {
+  0%,
+  49% {
+    opacity: 0;
+  }
+  50%,
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes band-dot3 {
+  0%,
+  74% {
+    opacity: 0;
+  }
+  75%,
+  100% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Still visibly in progress, without the movement. */
+  .bandsweep-move {
+    display: none;
+  }
+  .bandsweep-still {
+    display: inline;
+  }
+  .banddot1,
+  .banddot2,
+  .banddot3 {
+    animation: none;
+    opacity: 1;
+  }
 }
 
 .sheet {
@@ -598,6 +756,120 @@ svg text.m {
     grid-template-columns: 1fr;
   }
 }
+/* ── The deployment sheet's two columns ──────────────────────────────────────
+   Left is the deployment -- what it is doing, what it is serving, where it was
+   placed. Right is the backend log, which used to be a disclosure at the
+   bottom of one column: below the fold during a launch, which is the one time
+   anybody is reading this sheet at all. Even split, because a log line is a
+   sparkrun path or a vLLM config dict and wraps three times in a narrow pane.
+
+   The log column is sticky against the top of the card so it stays in view
+   while the left column scrolls past it -- the log is the thing being watched,
+   not a footnote you scroll to. `align-items: start` is what makes that work:
+   without it the column stretches to the row's height and has nowhere to
+   stick. Same breakpoint as .nodegrid, and for the same reason. */
+.depgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s-5);
+  align-items: start;
+}
+.depgrid > .deplogcol {
+  position: sticky;
+  top: 0;
+}
+@media (max-width: 900px) {
+  .depgrid {
+    grid-template-columns: 1fr;
+  }
+  .depgrid > .deplogcol {
+    position: static;
+  }
+}
+/* The log itself, in `.logbox`'s frame. A `<pre>` rather than the usual
+   `.body` div: the lines arrive as one blob and are wrapped, never clipped,
+   because the end of a traceback line is where the reason is. Taller than
+   `.logbox .body`'s 320px -- it has a whole column to itself now, and the
+   figure is viewport-relative so a tall screen shows more of the launch
+   rather than the same forty lines with more empty card under them. */
+.logbox pre.body {
+  margin: 0;
+  max-height: min(62vh, 720px);
+  background: var(--panel-recessed);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+/* ── Events and log, on the node page ────────────────────────────────────────
+   A bordered panel with its own scrollbar, which is a shape this file did not
+   have: `.chart` supplies the frame (and is already inside this sheet, via
+   NodeCharts), `.msplit`'s panes supply the scroll treatment. Both halves are
+   borrowed rather than invented.
+
+   The nesting is deliberate but not free -- `.card.full` is itself
+   `overflow-y: auto`, so this is a scrollbar inside a scrollbar, which
+   `.msplit`'s own comment warns about. `overscroll-behavior: contain` is what
+   makes it bearable: reaching the bottom of the log does not then start
+   scrolling the sheet behind it. */
+.logbox {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--panel);
+  margin-bottom: var(--s-3);
+}
+/* Same grammar as `.chart h4`: a title on the left, the control on the right,
+   both on one baseline. */
+.logbox > h4 {
+  font-size: var(--size-unit);
+  font-weight: 500;
+  color: var(--ink-muted);
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--rule);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--s-3);
+}
+/* `.chips` carries a 10px bottom margin for its usual home above a grid. In a
+   baseline-aligned header that margin hangs the buttons high. */
+.logbox > h4 .chips {
+  margin: 0;
+}
+.logbox .body {
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  padding: 4px 12px 8px;
+}
+.logbox .foot {
+  border-top: 1px solid var(--rule);
+  padding: 6px 12px;
+}
+.logline {
+  padding: 5px 0;
+}
+.logline + .logline {
+  border-top: 1px solid var(--rule);
+}
+
+/* The terminal's own pane inside a .logbox. A fixed height rather than a
+   max-height: xterm measures its container to decide how many rows to ask the
+   pty for, and a container that sizes to its content has no height to measure
+   until there is content -- which is a chicken and egg that renders as one row.
+   Same 320px as the log beside it, so the column keeps its rhythm. */
+.termbody {
+  height: 320px;
+  padding: 6px 8px;
+}
+.termbody .xterm-viewport {
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
 /* The sheet header stays put while the page scrolls under it -- the window
    chips are the control that changes what every chart below is showing, and a
    control you have to scroll back up to reach reads as a one-time choice. */
@@ -786,6 +1058,33 @@ svg text.m {
   margin-top: 2px;
 }
 
+/* uPlot's own stylesheet is imported by Chart.tsx and is entirely scoped to
+   its `.u-*` classes, so it collides with nothing here. What it does carry is
+   a handful of literal colours for the cursor, and this product has no literal
+   colours -- the four rules below hand those back to the tokens.
+
+   The crosshair is a SOLID hairline, not uPlot's dashed default: dashing reads
+   as "projection" or "threshold" everywhere else on this screen, and the
+   cursor is neither. It is muted rather than --ink so that it never competes
+   with the trace it is there to read. */
+.chart .plot {
+  width: 100%;
+}
+.chart .uplot,
+.chart .u-wrap {
+  width: 100% !important;
+}
+.chart .u-cursor-x,
+.chart .u-cursor-y {
+  border-color: var(--ink-muted) !important;
+  border-style: solid !important;
+}
+.chart .u-cursor-pt {
+  border-color: var(--panel) !important;
+  background: var(--ink) !important;
+  box-shadow: none !important;
+}
+
 /* ── Chat ───────────────────────────────────────────────────────────────────
    The model list beside the transcript. Both scroll inside main's own height
    rather than growing the page: a long transcript must never push the composer
@@ -800,6 +1099,10 @@ svg text.m {
 .chat {
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
+  /* Without this the row is the implicit `auto` track, which sizes to the
+     transcript's true content height instead of `.chat`'s own height below --
+     the same `min-height: 0`/fr rule .clusterstage documents applies here. */
+  grid-template-rows: minmax(0, 1fr);
   gap: var(--s-4);
   /* the 55px header, plus main's own 20px padding top and bottom */
   height: calc(100vh - 95px);
@@ -823,10 +1126,28 @@ svg text.m {
   background: var(--panel-sunk);
 }
 
+/* One heading per endpoint family in the model picker. Sticky, because the
+   list scrolls and the question the heading answers -- which endpoint does
+   the row I am looking at go to -- is exactly the one that stops being
+   visible when it scrolls off. */
+.chatgrouphead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  padding: var(--s-2) var(--s-1) var(--s-half);
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink-muted);
+}
+.chatgroup + .chatgroup .chatgrouphead {
+  margin-top: var(--s-3);
+}
+
 .chatpane {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
+  min-height: 0;
 }
 .chatbody {
   display: grid;
@@ -845,8 +1166,15 @@ svg text.m {
   overflow-y: auto;
   padding: var(--s-3) var(--s-3) 0 0;
 }
+/* The rule down the left is WHICH MODEL this turn went to. Transparent by
+   default so a plain block and a coloured one sit on the same left edge, and
+   painted from `tabs/chat/tags.ts` -- which owns the assignment, the eight
+   identities and the reason a ninth model is left plain rather than repeating
+   a colour. Style and tint arrive together with it, so nothing here needs a
+   per-slot class. */
 .turn {
-  padding: var(--s-3) 0;
+  padding: var(--s-3) var(--s-3) var(--s-3) var(--s-2);
+  border-left: 3px solid transparent;
 }
 .turn + .turn {
   border-top: 1px solid var(--rule);
@@ -872,7 +1200,56 @@ svg text.m {
   min-height: 62px;
 }
 
+/* Chat's composer, for a speech or transcription model: two fields above the
+   textarea (voice+format, or file+language), and the clip readout below a
+   speech reply. Reuses `.chat`'s grid, `.chatpane`, `.chatbody`, `.chathead`,
+   `.chatlog` and `.composer` outright rather than a second set of names. */
+.speechrow {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+}
+/* The native file control, only brought as far as the surrounding fields.
+   A custom button over a hidden input is the usual dodge and it costs the
+   file name, the drop target and the keyboard behaviour the browser gives
+   away free. */
+.speechrow input[type='file'] {
+  font: inherit;
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+  max-width: 260px;
+}
+.speechrow input[type='file']::file-selector-button {
+  font: inherit;
+  font-size: var(--size-unit);
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  margin-right: var(--s-2);
+  cursor: pointer;
+}
+.speechrow input[type='text'] {
+  padding: 5px 8px;
+  width: 5ch;
+}
+.clip {
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3) 0;
+}
+.cliprow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+}
 @media (max-width: 760px) {
+  .speechrow {
+    flex-wrap: wrap;
+  }
   .chat {
     grid-template-columns: 1fr;
     grid-template-rows: 160px minmax(0, 1fr);
@@ -962,29 +1339,8 @@ svg text.m {
   isolation: isolate;
 }
 
-/* The aura. One soft ellipse of the accent, positioned per card from a hash of
- * the model id, so a grid does not look stamped from one template and also
- * never moves between renders. Behind the content, never over it. */
-.mcard::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background:
-    radial-gradient(
-      42% 58% at var(--glow-x) var(--glow-y),
-      color-mix(in srgb, var(--accent) 26%, transparent),
-      transparent 70%
-    );
-  opacity: 0.85;
-  transition: opacity var(--dur) var(--ease);
-}
-
 .mcard:hover {
   border-color: var(--rule-strong);
-}
-.mcard:hover::before {
-  opacity: 1;
 }
 .mcard:focus-visible {
   outline: var(--focus);
@@ -993,9 +1349,59 @@ svg text.m {
 
 .mcard-top {
   display: flex;
-  align-items: flex-start;
+  /* The mark reads as the card's anchor, so it sits on the middle of the name
+     block rather than on the first line of it: at one line of title the avatar
+     is the taller of the two and used to overhang the owner, and at two it sat
+     high against a block half again its height. Centred, the same card reads
+     the same at either length. The dots are the exception -- they belong on
+     the title's own line, so they opt out below. */
+  align-items: center;
   gap: 10px;
   min-width: 0;
+}
+
+/* The publisher's mark, and the aura behind it.
+ *
+ * The aura used to be an ellipse dropped at a position hashed from the model
+ * id -- deterministic, but unrelated to anything on the card, which is why it
+ * read as a smudge rather than as light. It is anchored to the mark instead:
+ * one core immediately behind the image, spilling a rim of the publisher's own
+ * colour around an otherwise flat tile, falling off into the wash that is the
+ * card's background. A grid still does not look stamped, because `--accent` is
+ * the avatar's own dominant colour and so differs card to card; it just varies
+ * in hue now instead of in position.
+ *
+ * The wrapper exists because `.mcard-avatar` clips (`overflow: hidden`) and
+ * the aura has to bleed well past it. `.mcard` clips it again at the card
+ * edge, which is what keeps it inside the tile. */
+.mcard-mark {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+}
+.mcard-mark::before {
+  content: '';
+  position: absolute;
+  /* The mark is 44x44, so this is a 236x176 field centred on it. */
+  inset: -66px -96px;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      40px 40px at 50% 50%,
+      color-mix(in srgb, var(--accent) 52%, transparent),
+      transparent 100%
+    ),
+    radial-gradient(
+      50% 50% at 50% 50%,
+      color-mix(in srgb, var(--accent) 22%, transparent),
+      transparent 72%
+    );
+  opacity: 0.85;
+  transition: opacity var(--dur) var(--ease);
+}
+.mcard:hover .mcard-mark::before {
+  opacity: 1;
 }
 
 .mcard-avatar {
@@ -1071,6 +1477,9 @@ svg text.m {
   align-items: center;
   gap: 4px;
   flex: 0 0 auto;
+  /* Not centred with the rest of the row: a signal lamp belongs beside the
+     name it is about, which is the row's first line. */
+  align-self: flex-start;
   margin-top: 3px;
 }
 .mcard-glyph {
@@ -1153,6 +1562,25 @@ svg text.m {
   border-radius: var(--radius);
   padding: 0 var(--s-2);
   background: var(--panel-recessed);
+}
+
+/* The provider allowlist: a flat list of what one provider publishes, with a
+ * toggle each. Deliberately reuses `.mbar-search` above, whose comment scopes
+ * it to the models toolbar -- this is the second place in the app where you
+ * search a long list of model names, and giving it a second look-alike field
+ * would be a difference that means nothing. The scroll lives here rather than
+ * on the row so the search box stays put while the list moves under it. */
+.pmodels {
+  padding: var(--s-2) 0;
+}
+.pmodels-list {
+  max-height: 320px;
+  overflow-y: auto;
+  margin-top: var(--s-2);
+  padding-right: var(--s-2);
+}
+.pmodels-list .sw {
+  padding: 4px 0;
 }
 
 /* Cards-or-rows, the same two-position toggle Studio uses for models-or-datasets. */
@@ -1260,4 +1688,75 @@ svg text.m {
   .msplit-detail-body {
     max-height: none;
   }
+}
+
+/* ── Models: the machine board ──────────────────────────────────────────────
+ *
+ * Six facts per machine, one row each, in cluster order. A grid rather than a
+ * `<table>` because two of the cells are two lines tall (a figure over its
+ * proportion bar; a name over its id) and a row can carry a full-width note
+ * underneath -- the registry's sentence for a machine it will not vouch for.
+ *
+ * It scrolls sideways rather than reflowing. The detail pane is already the
+ * narrow half of a split, and a board that collapsed its columns at this width
+ * would drop exactly the figures somebody opened it to compare.
+ */
+.nboard-scroll {
+  overflow-x: auto;
+}
+.nboard-head,
+.nboard-row {
+  display: grid;
+  grid-template-columns:
+    18px minmax(148px, 1.6fr) minmax(150px, 168px) minmax(96px, 116px)
+    minmax(78px, 92px) minmax(92px, 1fr);
+  gap: var(--s-3);
+  align-items: start;
+  min-width: 640px;
+}
+.nboard-head {
+  font-size: var(--size-micro);
+  font-weight: 500;
+  color: var(--ink-muted);
+  letter-spacing: 0.04em;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--rule);
+}
+.nboard-row {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.nboard-row:last-child {
+  border-bottom: none;
+}
+/* The ticked machines carry the same wash selection uses everywhere else, so
+ * "this one is in the deployment" reads as the same idea as "this one is
+ * selected" rather than a second vocabulary. */
+.nboard-row.on {
+  background: var(--panel-sunk);
+}
+.nboard-row > input[type='checkbox'] {
+  margin-top: 3px;
+}
+.nboard-row > label {
+  cursor: pointer;
+}
+.nboard-row > input[type='checkbox']:disabled + label {
+  cursor: default;
+}
+/* Indented under the machine it is about, clear of the tick column. */
+.nboard-note {
+  grid-column: 2 / -1;
+  margin: 5px 0 0;
+}
+
+/* ── The node terminal ───────────────────────────────────────────────────────
+ * inspectors/node/Terminal.tsx mounts xterm into this div, and a definite
+ * height is the whole requirement. FitAddon works out rows and columns by
+ * measuring the parent, so an auto-height parent measures zero, the pty is
+ * opened 0x0, and the pane draws nothing at all -- which reads as "the shell
+ * did not connect" rather than as a missing CSS rule. */
+.termbody {
+  height: 340px;
+  padding: 6px 8px;
 }

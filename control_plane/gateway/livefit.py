@@ -66,16 +66,26 @@ def allocatable_map(
 ) -> tuple[dict[str, int], list[dict[str, str]], str | None]:
     """node_id -> live allocatable bytes, plus what we had to exclude.
 
-    Duck-typed on ``Registry.available_memory``, exactly as this gateway
-    already duck-types resolve_full, supported_by, candidates, handle_join and
-    admit. A registry without it (either stub) yields an empty map, so every
-    existing caller keeps today's static answer unchanged.
+    Duck-typed on the registry, exactly as this gateway already duck-types
+    resolve_full, supported_by, candidates, handle_join and admit. A registry
+    without either method (both stubs) yields an empty map, so every existing
+    caller keeps today's static answer unchanged.
+
+    ``allocatable_or_none`` is preferred over ``available_memory`` because it
+    can say "nobody has measured this". ``available_memory`` cannot: it is
+    typed ``-> int`` and answers an unsampled node with its static ceiling, so
+    the ``value is None`` arm below was unreachable against the real registry
+    and a nameplate figure was reaching the gate wearing ``budget_basis:
+    "live"``. Falling back keeps a registry that only has the older method
+    working exactly as before.
 
     Returns ``(budgets, excluded, unavailable_reason)``. ``excluded`` carries
     one entry per node dropped from the budget and why, so a refusal can name
     the exclusion instead of silently refusing everything.
     """
-    available = getattr(registry, "available_memory", None)
+    available = getattr(registry, "allocatable_or_none", None)
+    if not callable(available):
+        available = getattr(registry, "available_memory", None)
     if not callable(available):
         return {}, [], "this registry does not report live allocatable memory"
 
@@ -92,7 +102,10 @@ def allocatable_map(
             continue
         if value is None:
             excluded.append(
-                {"node_id": node_id, "reason": "no telemetry sample yet"}
+                {
+                    "node_id": node_id,
+                    "reason": "nothing has measured this node's memory recently",
+                }
             )
             continue
         budgets[node_id] = int(value)

@@ -64,23 +64,82 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
-def _connect(path: Path, *, writer: bool = True) -> sqlite3.Connection:
+def _connect(path: Path) -> sqlite3.Connection:
     """A connection to the journal.
 
-    *writer* is the long-lived one the background thread owns; it is the only
-    one that needs the auto-vacuum setting. Short-lived connections still
-    write -- reading acknowledges collection, which moves the high-water
-    mark -- so this is not a read-only mode, just a lighter setup.
+    Every connection here can write -- reading acknowledges collection, which
+    moves the high-water mark -- so there is no read-only variant, and every
+    one of them applies the same pragmas. This used to gate auto-vacuum behind
+    a *writer* flag, on the reasoning that only the long-lived writer needed
+    it. That left whichever connection happened to touch the file first
+    deciding whether it would ever be reclaimable, which is not a decision a
+    call site should be able to make by accident.
     """
     conn = sqlite3.connect(str(path), timeout=10.0, isolation_level=None)
+    # BEFORE journal_mode. SQLite only accepts an auto_vacuum change while the
+    # page size is still unfixed, and `PRAGMA journal_mode=WAL` fixes it -- so
+    # setting auto_vacuum afterwards is a no-op that reports no error, on a
+    # brand-new file as much as an old one. That is not a theoretical ordering
+    # nicety: with auto_vacuum NONE every `PRAGMA incremental_vacuum` below is
+    # also a silent no-op, freed pages stay in the file, and `_file_bytes` --
+    # page_count * page_size -- can never fall back under `_max_bytes` once it
+    # has crossed. `_enforce_size` then evicts the whole journal on every trim,
+    # forever. Measured before this line moved: a 540 MB journal, 540 MB of it
+    # freelist, holding one row.
+    #
+    # Harmless on a file that already exists: SQLite refuses the change there
+    # too, so this only ever decides the shape of a database being created.
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.execute("PRAGMA journal_mode=WAL")
     # Telemetry is not worth an fsync per commit. WAL plus NORMAL loses at
     # most the last commits to a machine losing power, and never corrupts.
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=10000")
-    if writer:
-        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     return conn
+
+
+def ensure_incremental_vacuum(conn: sqlite3.Connection, path: Path | str) -> bool:
+    """Convert a file written before the pragma order above was right.
+
+    The reorder only helps a database being created now. One that already
+    exists is auto_vacuum=NONE, and the only way out of that is a full VACUUM.
+    Cheap where it matters most: a file poisoned by the old bug is almost
+    entirely freelist, and VACUUM's cost scales with live content rather than
+    file size, so 515 MiB of freelist rewrites in milliseconds.
+
+    **Never call this at open time.** Every caller of this module opens its
+    database on the pre-bind startup path -- ``registry/startup.py`` builds
+    the journal before ``node_agent.start()``, so a stall here is a node that
+    never begins listening, with no log line to say why. It belongs on a
+    timer thread that already exists for slow work.
+
+    Never raises, and never lets a failure reach the caller's own error
+    handling: an exception out of ``Journal.__init__`` is caught in
+    service.py as "the journal would not open" and turns telemetry off for
+    the life of the process. A disk too full to vacuum must not cost the node
+    its telemetry. Returns whether the file is now incremental.
+    """
+    try:
+        if conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+            return True
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        conn.execute("VACUUM")  # atomic, and cannot run inside a transaction
+        log.info("%s converted to incremental auto-vacuum", path)
+        return True
+    except Exception as exc:
+        # A read-only volume, or no room for the rewrite. VACUUM is atomic, so
+        # the file is untouched and this is safe to retry. The size cap still
+        # terminates without it -- _enforce_size stops on progress, not on the
+        # file measure -- it just cannot give the space back.
+        log.warning("could not convert %s to incremental auto-vacuum: %s", path, exc)
+        return False
+
+
+def _is_gap_row(kind: str, body: str) -> bool:
+    """A previously-written gap marker. Excluded from the range a new gap
+    covers: a hole in the record of holes is not information, and counting one
+    is how a marker's own timestamp became the whole reported gap."""
+    return kind == KIND_EVENT and GAP_EVENT in (body or "")
 
 
 class Journal:
@@ -97,7 +156,12 @@ class Journal:
         batch_rows: int = config.JOURNAL_BATCH_ROWS,
         batch_interval_s: float = config.JOURNAL_BATCH_INTERVAL_S,
         retention_s: float = config.JOURNAL_RETENTION_S,
-        max_bytes: int = config.JOURNAL_MAX_BYTES,
+        # config.journal_max_bytes(), not the bare constant. The constant was
+        # the default here and nothing ever called the reader, so
+        # DERATE_TELEMETRY_MAX_BYTES did nothing at all despite being
+        # documented in CONTRACTS.md -- and it is the first knob an operator
+        # reaches for when a journal is misbehaving.
+        max_bytes: int | None = None,
         trim_interval_s: float = config.JOURNAL_TRIM_INTERVAL_S,
         clock=time.time,
     ) -> None:
@@ -107,7 +171,9 @@ class Journal:
         self._batch_rows = batch_rows
         self._batch_interval_s = batch_interval_s
         self._retention_s = retention_s
-        self._max_bytes = max_bytes
+        self._max_bytes = (
+            config.journal_max_bytes() if max_bytes is None else max_bytes
+        )
         self._trim_interval_s = trim_interval_s
         self._clock = clock
 
@@ -121,6 +187,7 @@ class Journal:
         self._appended = 0
         self._settled = threading.Condition(self._lock)
         self._last_trim = 0.0
+        self._migrated = False
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = _connect(self.path)
@@ -321,6 +388,19 @@ class Journal:
 
     # -- retention -------------------------------------------------------
 
+    def _migrate_once(self, conn: sqlite3.Connection) -> None:
+        """Convert a pre-fix file, once, on the writer thread.
+
+        Called from trim() rather than __init__ so the cost lands on the
+        thread built for slow work instead of on the startup path that has to
+        finish before the node agent binds its port. Worst case is a healthy
+        journal at the 512 MiB cap; the poisoned case is milliseconds.
+        """
+        if self._migrated:
+            return
+        self._migrated = True
+        ensure_incremental_vacuum(conn, self.path)
+
     def _maybe_trim(self, conn: sqlite3.Connection) -> None:
         now = self._clock()
         if now - self._last_trim < self._trim_interval_s:
@@ -341,6 +421,7 @@ class Journal:
         owned = conn is None
         conn = conn or _connect(self.path)
         try:
+            self._migrate_once(conn)
             shipped = self._meta_int(conn, "shipped_hwm", 0)
             cutoff = self._clock() - self._retention_s
             row = conn.execute(
@@ -355,29 +436,71 @@ class Journal:
                 ).rowcount
             deleted += self._enforce_size(conn)
             if deleted:
-                conn.execute("PRAGMA incremental_vacuum")
+                conn.execute("PRAGMA incremental_vacuum").fetchall()
             return deleted
         finally:
             if owned:
                 conn.close()
 
+    #: Batches one call to :meth:`_enforce_size` will evict before giving up
+    #: and waiting for the next trim. A backstop, not a policy: at 512 rows a
+    #: batch this is far more than a full journal holds, so a healthy eviction
+    #: never reaches it. What it buys is that a future bug in the size
+    #: measurement degrades to a slow trim instead of a spin.
+    MAX_EVICT_BATCHES = 4096
+
     def _enforce_size(self, conn: sqlite3.Connection) -> int:
+        """Drop the oldest rows until the file fits. One gap for the whole run.
+
+        The gap marker is written *after* the loop, never inside it. It is
+        itself a journal row, so noting each batch as it went meant the loop
+        kept refilling the table it was waiting to empty -- ``if not rows``
+        could never fire, and each lap logged a warning. That combination
+        produced 371,530 identical lines in one minute on a real coordinator.
+        One discard is also the truer record: a trim pass is a single hole,
+        not one hole per five hundred rows.
+        """
         deleted = 0
-        while self._file_bytes(conn) > self._max_bytes:
+        gap_from = gap_to = None
+        for _ in range(self.MAX_EVICT_BATCHES):
+            if self._file_bytes(conn) <= self._max_bytes:
+                break
             rows = conn.execute(
-                "SELECT seq, ts FROM journal ORDER BY seq LIMIT ?",
+                "SELECT seq, ts, kind, body FROM journal ORDER BY seq LIMIT ?",
                 (self._batch_rows,),
             ).fetchall()
             if not rows:
-                return deleted
-            first_ts, last_seq, last_ts = rows[0][1], rows[-1][0], rows[-1][1]
+                break
+            last_seq = rows[-1][0]
             shipped = self._meta_int(conn, "shipped_hwm", 0)
-            deleted += conn.execute(
+            gone = conn.execute(
                 "DELETE FROM journal WHERE seq <= ?", (last_seq,)
             ).rowcount
-            conn.execute("PRAGMA incremental_vacuum")
-            if last_seq > shipped:
-                self._note_gap(conn, first_ts, last_ts)
+            if not gone:
+                # Nothing moved, so another lap will not move anything either.
+                # Termination hangs on progress rather than on the file
+                # measure, which is what keeps this bounded where the vacuum
+                # cannot run at all -- a read-only volume, an older SQLite.
+                break
+            deleted += gone
+            conn.execute("PRAGMA incremental_vacuum").fetchall()
+            # Only rows past the high-water mark are a hole. Taking the
+            # batch's first timestamp regardless -- which is what this did --
+            # overstates the gap whenever `shipped` falls inside the batch,
+            # reporting collected rows as lost. And min/max rather than
+            # first/last because `ts` is caller-supplied and buffered in call
+            # order, so it is not strictly monotonic in `seq`.
+            lost = [ts for seq, ts, kind, body in rows if seq > shipped
+                    and not _is_gap_row(kind, body)]
+            if lost:
+                lo, hi = min(lost), max(lost)
+                gap_from = lo if gap_from is None else min(gap_from, lo)
+                gap_to = hi if gap_to is None else max(gap_to, hi)
+        # `gap_to > gap_from` and nothing else: a zero-width gap is not a
+        # fact, and 772 of them are sitting in the live archive because the
+        # old loop kept re-discarding the single marker it had just written.
+        if gap_from is not None and gap_to is not None and gap_to > gap_from:
+            self._note_gap(conn, gap_from, gap_to)
         return deleted
 
     def _note_gap(self, conn: sqlite3.Connection, from_ts: float, to_ts: float) -> None:
@@ -436,7 +559,7 @@ class Journal:
         mark. That keeps the protocol to one endpoint and makes a replayed
         request harmless.
         """
-        conn = _connect(self.path, writer=False)
+        conn = _connect(self.path)
         try:
             if since > 0:
                 conn.execute(
@@ -472,7 +595,7 @@ class Journal:
             conn.close()
 
     def stats(self) -> dict[str, Any]:
-        conn = _connect(self.path, writer=False)
+        conn = _connect(self.path)
         try:
             head = conn.execute("SELECT MAX(seq) FROM journal").fetchone()[0] or 0
             count = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]

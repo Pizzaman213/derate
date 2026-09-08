@@ -531,3 +531,276 @@ def test_the_operators_choice_is_recorded_on_the_persisted_fit():
         "placed and shaped at the operator's instruction" in w
         for w in recorded["fit"].warnings
     )
+
+
+class TestDerivedContext:
+    """`largest_runnable(context=None)` -- the gate choosing the question.
+
+    The models screen used to ask for a context length before a model had been
+    chosen, and the Serve panel asked again. Both are gone, so the number has
+    to come from the arithmetic instead. What it must not do is make the
+    quantization ladder meaningless, which is the failure mode the derivation
+    is shaped around.
+    """
+
+    NATIVE_WINDOW = 40960
+
+    def _walk(self, allocatable, *, native=NATIVE_WINDOW):
+        return largest_runnable(
+            [(QWEN3_30B_A3B, QWEN3_30B_A3B.model_id, None)],
+            [SPARK_01],
+            context=None,
+            max_seqs=1,
+            kv_dtype="fp16",
+            allocatable=allocatable,
+            native_context={QWEN3_30B_A3B.model_id: native},
+        )[0][0]
+
+    def test_a_roomy_machine_gets_the_models_own_window_at_its_own_dtype(self):
+        row = self._walk(None)
+        assert row.dtype == QWEN3_30B_A3B.dtype, "nothing forced a requantize"
+        assert row.context == self.NATIVE_WINDOW
+
+    def test_a_tight_budget_still_quantizes_rather_than_shrinking_context(self):
+        """The regression the two-pass derivation exists to prevent.
+
+        Deriving the context per LADDER RUNG would fit every rung by
+        construction -- `max_context` returns the largest context that fits, so
+        bf16 at 512 tokens "fits" -- the native dtype would always win, and a
+        ladder that always recommends the native dtype has stopped answering
+        the question it exists for.
+        """
+        row = self._walk({SPARK_01.node_id: 26 * GIB})
+        assert row.fits, row.reason
+        assert row.requantized, (
+            f"chose {row.dtype} at {row.context} tokens instead of quantizing"
+        )
+        assert row.context >= 4096, (
+            f"traded quality for {row.context} tokens, which is not a context "
+            f"worth having"
+        )
+
+    def test_the_derived_context_is_one_the_gate_verified(self):
+        """Never report a context that has not been checked. Feed it back in."""
+        calc = FitCalculator()
+        for allocatable in (None, {SPARK_01.node_id: 26 * GIB}):
+            row = self._walk(allocatable)
+            if not row.fits:
+                continue
+            shape = dataclasses.replace(QWEN3_30B_A3B, dtype=row.dtype)
+            again = calc.check(
+                FitRequest(
+                    shape=shape,
+                    context_length=row.context,
+                    max_concurrent_seqs=row.max_seqs,
+                    kv_dtype="fp16",
+                    plan=_plan(),
+                ),
+                [SPARK_01],
+                allocatable=allocatable,
+            )
+            assert again.verdict is not Verdict.WONT_FIT, again.reason
+
+    def test_an_unknown_window_falls_back_to_what_the_screen_used_to_ask_at(self):
+        """A model whose `max_position_embeddings` we could not read is judged
+        the way it was judged before the context became derivable -- lower if
+        that does not fit, never higher. The alternative is the ceiling of the
+        search, which is 2,097,152 tokens and is not a window anybody asked
+        for."""
+        from control_plane.fit.capacity import FALLBACK_CONTEXT
+
+        row = self._walk(None, native=None)
+        assert row.context == FALLBACK_CONTEXT
+
+    def test_a_ladderless_walk_is_not_handed_a_refused_rungs_window(self):
+        """The variant-table regression, end to end.
+
+        `/api/models/variants` walks with `ladder=()` -- each published file is
+        judged as it ships, never re-quantized into something nobody published.
+        That removes the recovery every other test on this path leans on, so a
+        context derived from a rung which does not fit is fatal rather than
+        merely wasteful: the whole list refuses on KV cache.
+
+        The shipped symptom was a 26B MoE whose 4-bit variants are ~13 GiB
+        being judged at 262,144 tokens -- the native window of its 48 GiB bf16
+        sibling, which had been refused outright -- and every row reporting
+        "will not fit" at 12 tok/s on hardware that holds it.
+        """
+        tight = {SPARK_01.node_id: 20 * GIB}
+        rows, _ = largest_runnable(
+            [
+                (dataclasses.replace(QWEN3_30B_A3B, dtype="bf16"), "bf16", None),
+                (dataclasses.replace(QWEN3_30B_A3B, dtype="q4_k_m"), "q4", None),
+            ],
+            [SPARK_01],
+            context=None,
+            max_seqs=1,
+            kv_dtype="fp16",
+            allocatable=tight,
+            ladder=(),
+            native_context={"bf16": self.NATIVE_WINDOW, "q4": self.NATIVE_WINDOW},
+        )
+        by_label = {r.label: r for r in rows}
+        assert by_label["q4"].fits, (
+            f"the 4-bit variant was refused at {by_label['q4'].context} tokens: "
+            f"{by_label['q4'].reason}"
+        )
+        assert by_label["q4"].context < self.NATIVE_WINDOW
+
+    def test_a_row_that_cannot_load_still_reports_no_throughput_worth_reading(self):
+        """A decode figure is about a model that is resident. The screen used
+        to print one beside every refusal, computed against a cache read for a
+        window nothing had verified."""
+        tight = {SPARK_01.node_id: 4 * GIB}
+        rows, _ = largest_runnable(
+            [(dataclasses.replace(QWEN3_30B_A3B, dtype="bf16"), "bf16", None)],
+            [SPARK_01],
+            context=None,
+            max_seqs=1,
+            kv_dtype="fp16",
+            allocatable=tight,
+            ladder=(),
+            native_context={"bf16": self.NATIVE_WINDOW},
+        )
+        assert rows[0].verdict == Verdict.WONT_FIT.value
+        assert rows[0].reason, "a refusal has to say what blew the budget"
+        assert "weights" in rows[0].reason.lower(), (
+            f"the refusal does not name the term that blew the budget: "
+            f"{rows[0].reason}"
+        )
+
+    def test_a_named_context_is_untouched(self):
+        rows, _ = largest_runnable(
+            [(QWEN3_30B_A3B, QWEN3_30B_A3B.model_id, None)],
+            [SPARK_01],
+            context=32768,
+            max_seqs=4,
+            kv_dtype="fp16",
+        )
+        assert rows[0].context == 32768
+        assert rows[0].max_seqs == 4
+
+
+class TestAnUnmeasuredNodeIsNotALiveReading:
+    """A ceiling reported as a measurement is the bug this file exists for.
+
+    The regression above was budgeting against the static ceiling instead of
+    the live figure. This is the same defect one layer down and it survived
+    that fix: ``Registry.available_memory`` is typed ``-> int``, so a node
+    nothing had sampled was answered with its nameplate, and the gate could
+    not tell that apart from a reading. The verdict then went out as
+    ``basis: "live"`` with prose saying "allocatable right now" about a number
+    no machine had ever been asked for.
+
+    That matters most on exactly the hardware this project targets, where the
+    pool is shared with the OS and with whatever else the operator is running:
+    the ceiling is not an optimistic estimate there, it is the one figure
+    guaranteed to be wrong.
+    """
+
+    def _registry(self, tmp_path, sampled: bool):
+        import time
+
+        from control_plane.registry.telemetry import TelemetrySample
+        from tests.test_registry import (
+            REAL_SPARK_AVAILABLE,
+            REAL_SPARK_GPU_MIB,
+            REAL_SPARK_POOL_TOTAL,
+            make_registry,
+        )
+
+        registry = make_registry(tmp_path, local=SPARK_01)
+        if sampled:
+            registry.apply_sample(
+                SPARK_01.node_id,
+                TelemetrySample(
+                    ts=time.time(),
+                    memory_used=REAL_SPARK_POOL_TOTAL - REAL_SPARK_AVAILABLE,
+                    memory_total=REAL_SPARK_POOL_TOTAL,
+                    power_watts=84.0,
+                    temperature_c=81.0,
+                    utilization_pct=96.0,
+                    gpu_memory_used=REAL_SPARK_GPU_MIB * 1024**2,
+                    gpu_process_count=1,
+                    host_memory_total=REAL_SPARK_POOL_TOTAL,
+                    host_memory_available=REAL_SPARK_AVAILABLE,
+                ),
+            )
+        return registry
+
+    def test_an_unsampled_node_is_excluded_rather_than_guessed(self, tmp_path):
+        registry = self._registry(tmp_path, sampled=False)
+
+        assert registry.available_memory(SPARK_01.node_id) == SPARK_01.usable_memory(), (
+            "available_memory still answers with the ceiling, which is what the "
+            "memory report wants; allocatable_or_none is the honest one"
+        )
+        assert registry.allocatable_or_none(SPARK_01.node_id) is None
+
+        budgets, excluded, why = livefit.allocatable_map(registry, [SPARK_01.node_id])
+        assert budgets == {}, "a nameplate must not enter the live budget"
+        assert [e["node_id"] for e in excluded] == [SPARK_01.node_id]
+        assert excluded[0]["reason"], "an exclusion has to say why"
+        assert why
+
+    def test_the_verdict_says_static_not_live(self, tmp_path):
+        registry = self._registry(tmp_path, sampled=False)
+        budgets, _, _ = livefit.allocatable_map(registry, [SPARK_01.node_id])
+        static, live, missing = livefit.dual_check(
+            FitCalculator(), _req(QWEN3_30B_A3B, context=32768, seqs=4), [SPARK_01], budgets
+        )
+
+        assert live is None, "nothing measured this node, so there is no live verdict"
+        assert missing
+        decision = livefit.serve_decision(static, live, unavailable_reason=missing)
+        assert decision["basis"] == livefit.BASIS_STATIC
+        assert "allocatable right now" not in static.reason, (
+            "the static verdict must not describe a ceiling as a live reading: "
+            f"{static.reason}"
+        )
+
+    def test_a_sampled_node_still_gates_on_the_live_figure(self, tmp_path):
+        """The fix must not cost the measurement when there is one."""
+        registry = self._registry(tmp_path, sampled=True)
+        live_bytes = registry.allocatable_or_none(SPARK_01.node_id)
+        assert live_bytes is not None
+        assert live_bytes < SPARK_01.usable_memory() / 5, (
+            "the sample says most of the pool is spoken for"
+        )
+
+        budgets, excluded, why = livefit.allocatable_map(registry, [SPARK_01.node_id])
+        assert budgets == {SPARK_01.node_id: live_bytes}
+        assert excluded == [] and why is None
+
+        _, live, _ = livefit.dual_check(
+            FitCalculator(), _req(QWEN3_30B_A3B, context=32768, seqs=4), [SPARK_01], budgets
+        )
+        assert live is not None and live.verdict is Verdict.WONT_FIT, (
+            "a 30B cannot fit in what this node can actually hand out"
+        )
+
+    def test_an_unknown_node_is_absent_not_zero(self, tmp_path):
+        """The mirror of the same mistake: absence rendered as a number.
+
+        ``available_memory`` answers an id it does not hold with ``0``, which
+        reads as "this node can allocate nothing" and would refuse every
+        launch onto it rather than admitting it was never found.
+        """
+        registry = self._registry(tmp_path, sampled=True)
+        assert registry.available_memory("nope") == 0
+        assert registry.allocatable_or_none("nope") is None
+
+    def test_a_node_whose_telemetry_stopped_is_not_a_current_reading(self, tmp_path):
+        """A node can answer /agent/health with its samples frozen.
+
+        ``_sample_node`` keeps the last reading on purpose -- the health loop
+        owns that verdict -- so staleness has to be read off the node state
+        rather than inferred from the sample being present.
+        """
+        registry = self._registry(tmp_path, sampled=True)
+        assert registry.allocatable_or_none(SPARK_01.node_id) is not None
+
+        registry._members[SPARK_01.node_id].healthy = False
+        assert registry.allocatable_or_none(SPARK_01.node_id) is None, (
+            "an old reading of a shared pool is not a fact about now"
+        )

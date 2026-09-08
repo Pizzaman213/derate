@@ -8,7 +8,9 @@ read from real metadata or accompanied by a warning saying it was not.
 
 from __future__ import annotations
 
+import logging
 import re
+import threading
 
 import os
 import time
@@ -26,7 +28,7 @@ from control_plane.contracts.quant import (
 )
 
 from . import gguf as gguf_mod
-from . import gguf_names, quant_detect, support
+from . import gguf_names, imageprobe, quant_detect, support
 from .cache import ShapeCache
 from .config_map import Mapped, map_config, vision_config
 from .hf import HubClient, ModelInfo, count_safetensors_params, safetensors_header
@@ -43,6 +45,8 @@ from .types import (
     UnsupportedArchitecture,
 )
 
+log = logging.getLogger("resolver.probe")
+
 #: Above this, the hub's parameter tally is not believed. It has been seen to
 #: count storage elements rather than logical weights on exotic 4-bit packings,
 #: and being 40 percent wrong about a 70B model is not a rounding error.
@@ -58,10 +62,59 @@ class ModelResolver:
         cache: ShapeCache | None = None,
         *,
         offline: bool = False,
+        runtime_images: dict[str, str] | None = None,
     ) -> None:
         self.client = client or HubClient()
         self.cache = cache if cache is not None else ShapeCache()
         self.offline = offline or os.environ.get("DERATE_OFFLINE") == "1"
+        # {runtime: container image}, from the composition root, which is the
+        # only thing that knows both. Empty means the support table answers
+        # from its static lists, which is the state on any machine without
+        # docker -- see `start` and `imageprobe`.
+        self.runtime_images = dict(runtime_images or {})
+
+    # ---- startup -------------------------------------------------------
+
+    def start(self) -> None:
+        """Ask each runtime image what it can load. Returns immediately.
+
+        Called by the gateway lifespan's resolver step, which is bounded by
+        `startup_step_timeout_s` -- five seconds, against a container start
+        that takes fifteen to thirty. So the probe runs on its own thread and
+        this returns at once: a startup step that timed out would be recorded
+        as degraded and, worse, would have thrown away the answer.
+
+        Until it lands, the static tables answer. That is the same result as
+        a machine with no docker, which is why nothing here waits on it.
+        """
+        if not self.runtime_images:
+            return
+        threading.Thread(
+            target=self._probe_runtime_images, name="derate-imageprobe", daemon=True
+        ).start()
+
+    def _probe_runtime_images(self) -> None:
+        cache_dir = self.cache.directory.parent / "runtimes"
+        for runtime, image in self.runtime_images.items():
+            try:
+                found = imageprobe.probe(runtime, image, cache_dir=cache_dir)
+            except Exception:  # pragma: no cover - probe is best effort
+                found = None
+            if found is None:
+                log.info(
+                    "runtime probe: %s (%s) not readable here, keeping the "
+                    "static architecture table",
+                    runtime,
+                    image,
+                )
+                continue
+            support.record_probe(found)
+            log.info(
+                "runtime probe: %s loads %d architectures, per %s",
+                runtime,
+                len(found.architectures),
+                found.provenance,
+            )
 
     # ---- ResolverPort --------------------------------------------------
 
@@ -538,6 +591,21 @@ class ModelResolver:
     #: turning one click into thirty requests.
     _MAX_GGUF_REPOS = 6
 
+    #: How many GGUF headers one ``quant_variants`` call may read.
+    #:
+    #: Scoped to the whole enumeration, not to each repository: six repos at
+    #: three probes each would be eighteen multi-second ranged reads, which is
+    #: the 20s timeout again with extra steps. A probe costs one or more 4 MiB
+    #: ranged reads because ``read_header`` walks every KV pair to reach
+    #: ``general.file_type``, and a tokenizer with 151k entries sits in front
+    #: of it -- measured at 2.4-3.3s per file against the live hub.
+    #:
+    #: Three is enough for a repo that ships one or two oddly-named builds and
+    #: not enough to blow the budget on a repo where nothing parses. When it is
+    #: spent the remaining files are priced at the default and SAY SO -- the
+    #: note must never claim a header could not be read when it was never read.
+    _MAX_HEADER_PROBES = 3
+
     @staticmethod
     def _looks_like_gguf_repo(hit_id: str, tags: tuple[str, ...] | list[str]) -> bool:
         """Does this search hit ship GGUF files?
@@ -667,9 +735,15 @@ class ModelResolver:
         # common case in a quantization catalogue and it changes what the repo
         # id itself means, so the "self" entry below has to be built knowing the
         # answer.
+        # One header-read budget for this whole call, spent across this
+        # repository and every GGUF repo the search below opens. A list so the
+        # callee can decrement it. Per-repo budgets would be _MAX_GGUF_REPOS
+        # times larger, which is the timeout this exists to prevent.
+        budget = [self._MAX_HEADER_PROBES]
+
         own_files: list[QuantVariant] = []
         if not self.offline:
-            own_files = self._gguf_file_variants(model_id, add_to=None)
+            own_files = self._gguf_file_variants(model_id, add_to=None, budget=budget)
 
         try:
             res = self.resolve_full(model_id)
@@ -776,7 +850,7 @@ class ModelResolver:
 
         gguf_repos.sort(key=lambda pair: pair[0], reverse=True)
         for _, repo in gguf_repos[: self._MAX_GGUF_REPOS]:
-            self._gguf_file_variants(repo, add_to=add)
+            self._gguf_file_variants(repo, add_to=add, budget=budget)
         return variants
 
     def _dtype_from_header(self, repo_id: str, filename: str) -> str | None:
@@ -797,7 +871,9 @@ class ModelResolver:
         except Exception:
             return None
 
-    def _gguf_file_variants(self, repo_id: str, add_to=None) -> list[QuantVariant]:
+    def _gguf_file_variants(
+        self, repo_id: str, add_to=None, budget: list[int] | None = None
+    ) -> list[QuantVariant]:
         """One variant per quantization in a GGUF repo, sized from the hub.
 
         Shards are summed, not listed. ``unsloth/Qwen3-30B-A3B-GGUF`` ships its
@@ -812,6 +888,10 @@ class ModelResolver:
         unfashionable: a ``.gguf`` says what it is in its own header, so a name
         that parses to nothing is a reason to read the file, not to pretend it
         is absent.
+
+        ``budget`` is a one-element list of remaining header reads, shared
+        across every repository in one ``quant_variants`` call. ``None`` means
+        unlimited, which is what a direct caller gets.
         """
         try:
             info = self.client.model_info(repo_id)
@@ -861,9 +941,25 @@ class ModelResolver:
             notes = ["one file inside a GGUF repository; size is measured, not estimated"]
             dtype = entry["dtype"]
             if not dtype:
-                dtype = self._dtype_from_header(repo_id, first)
+                # Two different failures, and they must not share a sentence.
+                # A spent budget means the header was never opened; saying it
+                # "could not be read" would report a measurement that was never
+                # attempted.
+                spent = budget is not None and budget[0] <= 0
+                if not spent:
+                    if budget is not None:
+                        budget[0] -= 1
+                    dtype = self._dtype_from_header(repo_id, first)
                 if dtype:
                     notes.append("scheme read from the file's own header, not its name")
+                elif spent:
+                    dtype = DEFAULT_DTYPE
+                    notes.append(
+                        "the name says nothing and this enumeration had already "
+                        "spent its header-read budget, so the file was not "
+                        f"opened; priced at {DEFAULT_DTYPE}, which over-charges "
+                        "rather than under-charges"
+                    )
                 else:
                     # Charged at the default rather than at a guess. The
                     # measured size is still the honest number beside it.

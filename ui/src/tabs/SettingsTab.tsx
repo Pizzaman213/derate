@@ -5,9 +5,22 @@ import { NodesCard } from './settings/NodesCard'
 import { ProvidersCard } from './settings/ProvidersCard'
 import { ClusterCard } from './settings/ClusterCard'
 import { ContainmentCard } from './settings/ContainmentCard'
+import { ReliabilityCard } from './settings/ReliabilityCard'
+import { AppearanceCard } from './settings/AppearanceCard'
 import { ScopeCards } from './settings/ScopeCards'
+import { FilesystemsCard } from './storage/FilesystemsCard'
+import { ModelCacheCard } from './storage/ModelCacheCard'
+import { EstateCard } from './storage/EstateCard'
+import { CollectionCard } from './storage/CollectionCard'
 
-type Sub = 'connection' | 'nodes' | 'providers' | 'policy' | 'about'
+type Sub =
+  | 'connection'
+  | 'nodes'
+  | 'storage'
+  | 'providers'
+  | 'policy'
+  | 'appearance'
+  | 'about'
 
 const SUBS: { id: Sub; label: string }[] = [
   // Connection first for the same reason Coordinator used to be the first
@@ -15,25 +28,39 @@ const SUBS: { id: Sub; label: string }[] = [
   // not, and every other section is empty until the address in it is right.
   { id: 'connection', label: 'Connection' },
   { id: 'nodes', label: 'Nodes' },
+  { id: 'storage', label: 'Storage' },
   { id: 'providers', label: 'Providers' },
   { id: 'policy', label: 'Policy' },
+  { id: 'appearance', label: 'Appearance' },
   { id: 'about', label: 'About' },
 ]
 
 /** The Settings destination: which coordinator this browser talks to, the
- *  machines and providers behind it, what they are allowed to cost, and what
- *  this project has said it will not build.
+ *  machines and providers behind it, what they are allowed to cost, what they
+ *  are spending their disk on, and what this project has said it will not
+ *  build.
  *
- *  Five sub-tabs (`.subs`, the same bar the Dashboard uses) rather than the
+ *  Seven sub-tabs (`.subs`, the same bar the Dashboard uses) rather than the
  *  one nine-card column this used to be. The column was not merely long: it
  *  ran four unrelated jobs together, and roughly half its height was the
  *  About cards, which are documentation and never change. Splitting on the
  *  job puts every screen inside one viewport.
  *
+ *  Storage joined this tab rather than staying its own destination: it is the
+ *  same job as Nodes -- reading facts off the machines behind this
+ *  coordinator -- and the four cards (`tabs/storage/*`) moved in unchanged,
+ *  including the docstring on why disk is read on demand and never sampled.
+ *
  *  Every section stays mounted and is hidden with `hidden`, not unmounted.
  *  Add a node holds a minted enrollment token, its countdown, and the list of
  *  machines that have turned up since -- state a tab switch must not throw
  *  away -- and the same is true of a half-typed coordinator address.
+ *
+ *  Appearance joined the same way: the dark-mode select used to sit in the
+ *  header, next to the destination tabs, which put a local-only preference
+ *  in the one bar every screen shares. It reads and writes `theme.ts`, the
+ *  same module the header now calls once on load to apply whatever was
+ *  stored.
  *
  *  Ported from mockups-next/js/settings.js + derate.html's `#d-settings`
  *  section, plus AddNodeCard, which the mockup gestured at with an address
@@ -79,6 +106,13 @@ export function SettingsTab() {
         <NodesCard />
       </div>
 
+      <div id="st-storage" role="tabpanel" aria-labelledby="st-tab-storage" hidden={sub !== 'storage'}>
+        <FilesystemsCard />
+        <ModelCacheCard />
+        <EstateCard />
+        <CollectionCard />
+      </div>
+
       <div
         id="st-providers"
         role="tabpanel"
@@ -90,6 +124,16 @@ export function SettingsTab() {
 
       <div id="st-policy" role="tabpanel" aria-labelledby="st-tab-policy" hidden={sub !== 'policy'}>
         <ContainmentCard />
+        <ReliabilityCard />
+      </div>
+
+      <div
+        id="st-appearance"
+        role="tabpanel"
+        aria-labelledby="st-tab-appearance"
+        hidden={sub !== 'appearance'}
+      >
+        <AppearanceCard />
       </div>
 
       {/* Not settings. Nothing here writes anything; they are the project's

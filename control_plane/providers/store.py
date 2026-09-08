@@ -18,10 +18,13 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
+from ..contracts.modality import Modality
 from ..contracts.providers import Provider, ProviderKind, ProviderModel
 from .config import PROVIDERS_FILE, data_dir
 from .runtime import DaySpend, ProviderRuntime
 from .secrets import Redactor
+
+from control_plane import fsutil
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +44,42 @@ def _model_from_dict(raw: dict) -> ProviderModel:
         supports_tools=bool(raw.get("supports_tools", False)),
         input_cost_per_mtok=_opt_float(raw.get("input_cost_per_mtok")),
         output_cost_per_mtok=_opt_float(raw.get("output_cost_per_mtok")),
+        modality=_modality(raw.get("modality")),
     )
+
+
+def _modality(value: object) -> Modality:
+    """The persisted modality, or TEXT when the record predates it.
+
+    ``_model_to_dict`` has always written this field and this function has
+    always dropped it, so every provider model came back from disk as TEXT and
+    a restart put ``whisper-1`` in the chat picker as an ordinary chat model --
+    the exact defect the modality field was added to close. An unrecognized
+    value falls back rather than raising: a catalogue is cached state, and one
+    unknown word in it is not a reason to lose the whole file.
+    """
+    if isinstance(value, Modality):
+        return value
+    try:
+        return Modality(value)
+    except ValueError:
+        return Modality.TEXT
+
+
+def _enabled_models(value: object) -> frozenset[str] | None:
+    """The persisted allowlist, or ``None`` for a record written before it.
+
+    A missing key and an explicit ``null`` both mean "this provider was
+    configured before the allowlist existed"; it keeps serving its whole
+    catalogue rather than going dark on upgrade. Only a list -- including the
+    empty one -- means somebody has chosen.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return frozenset(str(item) for item in value)
+    log.error("ignoring malformed enabled_models (%s); serving whole catalogue", type(value).__name__)
+    return None
 
 
 def _opt_float(value: object) -> float | None:
@@ -70,6 +108,14 @@ def provider_to_dict(provider: Provider, runtime: ProviderRuntime | None = None)
     if runtime is not None:
         record["daily_budget_usd"] = runtime.daily_budget_usd
         record["aliases"] = dict(runtime.aliases)
+        record["backend_pins"] = dict(runtime.backend_pins)
+        # Sorted, so a file two people read side by side does not differ by set
+        # iteration order. `null` is not the same as `[]` here and is written as
+        # itself: see ProviderRuntime.enabled_models for why the two must stay
+        # distinguishable across a restart.
+        record["enabled_models"] = (
+            None if runtime.enabled_models is None else sorted(runtime.enabled_models)
+        )
         record["spend"] = {day: asdict(s) for day, s in runtime.spend.items()}
     return record
 
@@ -107,6 +153,8 @@ def provider_from_dict(raw: dict) -> tuple[Provider, ProviderRuntime]:
         last_refreshed=provider.last_refreshed,
         daily_budget_usd=_opt_float(raw.get("daily_budget_usd")),
         aliases={str(k): str(v) for k, v in (raw.get("aliases") or {}).items()},
+        enabled_models=_enabled_models(raw.get("enabled_models")),
+        backend_pins={str(k): str(v) for k, v in (raw.get("backend_pins") or {}).items()},
     )
     for day, spend in (raw.get("spend") or {}).items():
         if isinstance(spend, dict):
@@ -116,6 +164,10 @@ def provider_from_dict(raw: dict) -> tuple[Provider, ProviderRuntime]:
                 output_tokens=int(spend.get("output_tokens") or 0),
                 requests=int(spend.get("requests") or 0),
                 unpriced_requests=int(spend.get("unpriced_requests") or 0),
+                # Absent in every record written before metering existed. Zero
+                # is the right read there: those days were priced from the rate
+                # card, which is exactly what a zero here means.
+                metered_requests=int(spend.get("metered_requests") or 0),
             )
     return provider, runtime
 
@@ -160,7 +212,7 @@ class ProviderStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".providers-")
         try:
-            os.fchmod(fd, 0o600)
+            fsutil.harden_fd(fd, self.path)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
             os.replace(tmp, self.path)

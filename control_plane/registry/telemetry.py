@@ -37,6 +37,7 @@ from control_plane.contracts import (
     NodeProfile,
 )
 
+from . import hostfacts
 from .config import HOST_MEMORY_RESERVE, TELEMETRY_RING_SAMPLES
 from .probe import _num
 
@@ -194,7 +195,14 @@ def read_host_memory() -> HostMemory | None:
     try:
         text = MEMINFO.read_text()
     except OSError:
-        return None
+        # No /proc. Not necessarily "no reading" -- see registry/hostfacts.py.
+        # The trigger is the missing file, not the operating system's name, so
+        # a Linux container on a Mac still reads the line above and wins.
+        facts = hostfacts.host_memory()
+        if facts is None:
+            return None
+        total, available, swap_used = facts
+        return HostMemory(total=total, available=available, swap_used=swap_used)
     fields: dict[str, int] = {}
     wanted = {"MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:"}
     for line in text.splitlines():
@@ -230,7 +238,7 @@ def read_host_temperature() -> float | None:
     try:
         zones = sorted(THERMAL_ZONES.glob("thermal_zone*/temp"))
     except OSError:
-        return None
+        return hostfacts.temperature()
     readings: list[float] = []
     for zone in zones:
         try:
@@ -287,7 +295,10 @@ async def read_cpu_utilization() -> float | None:
     global _last_cpu_times
     current = read_cpu_times()
     if current is None:
-        return None
+        # No /proc/stat. psutil keeps its own previous reading, so it has the
+        # same difference-against-last-call contract as the block below --
+        # including that the first call has nothing to difference against.
+        return hostfacts.cpu_utilization()
     previous = _last_cpu_times
     _last_cpu_times = current
     if previous is None or current.total <= previous.total:
@@ -554,6 +565,33 @@ def allocatable_bytes(
     # double counting: it is the same headroom seen from the pool's side.
     host_headroom = max(0, sample.host_memory_available - host_reserve)
     return min(gpu_headroom, host_headroom)
+
+
+def allocatable_bytes_or_none(
+    profile: NodeProfile,
+    sample: TelemetrySample | None,
+    guardrail: float = DEFAULT_GUARDRAIL,
+    host_reserve: int = HOST_MEMORY_RESERVE,
+) -> int | None:
+    """:func:`allocatable_bytes`, with "nobody has measured this" left sayable.
+
+    ``allocatable_bytes`` answers an unsampled node with its static ceiling.
+    That is the right default for a display and the wrong one for a gate: the
+    caller cannot tell a measurement from a nameplate, and the fit gate goes on
+    to narrate it as "allocatable right now". On a part whose pool is shared
+    with an operating system -- and, on the box this was written for, with a
+    llama-server holding 68 GiB of it -- the ceiling is not merely optimistic.
+    It is the one figure guaranteed to be wrong, and it is the spec-sheet
+    number this project exists to refuse to plan against.
+
+    ``None`` instead lets the live path drop the node, so the fit gate falls
+    back to the ceiling *and says that is what it did* -- the branch
+    ``FitCalculator._budget`` has always carried and nothing could reach,
+    because the ceiling arrived as a number rather than as an absence.
+    """
+    if sample is None:
+        return None
+    return allocatable_bytes(profile, sample, guardrail, host_reserve)
 
 
 @dataclass

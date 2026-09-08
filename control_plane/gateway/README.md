@@ -62,6 +62,76 @@ was ever reached does the gateway answer with its own 502
 `upstream_unreachable`. Rule 2 holds at the end of the chain, not just the
 first hop.
 
+`httpx.PoolTimeout` is the exception, and it is not a transport failure. It
+means *this gateway* had no free upstream connection within
+`upstream_connect_timeout_s` -- a fact about us, not about the backend, which
+may be answering in microseconds. It is still retryable across targets, since
+another origin has its own pool, but it never reaches the circuit breaker and it
+answers 503 `upstream_pool_exhausted` rather than 502 `upstream_unreachable`.
+Counting it as a transport failure is what took the whole gateway down on
+2026-09-08: leaked connections filled the pool, three PoolTimeouts benched two
+healthy backends, and the half-open probe died on the same empty pool and
+re-benched them for as long as anyone kept asking.
+
+### 1a. An upstream response is always closed
+
+One `AsyncClient` per origin, each bounded by `upstream_per_origin_limit`, so a
+backend that exhausts its slots cannot take the others with it. That only holds
+if connections come back, and there are two ways they did not:
+
+- **The cleanup ran inside a cancelled scope.** Starlette cancels the anyio
+  scope a `StreamingResponse` body runs in the instant the client hangs up, and
+  an anyio cancel scope is *level*-triggered -- every later `await` in it raises
+  at once. The bare `await response.aclose()` in the generator's `finally`
+  therefore never ran. `close_quietly` shields it. `asyncio.shield` does not
+  work here; the cancellation is anyio's, not `Task.cancel`'s.
+- **The generator never started.** Starlette sends the response line before it
+  first iterates, so a client that vanishes in between leaves the body generator
+  constructed and unstarted -- and an unstarted async generator runs no cleanup
+  when it is collected. There is no `finally` to shield, so `UpstreamProxy`
+  tracks every open response and a janitor closes the ones whose body was never
+  read. It reaps *only* those: a running stream is never touched however long it
+  takes, because reaping on age would be a read timeout by the back door and
+  `upstream_read_timeout_s` is `None` on purpose.
+
+### 1b. Recovery is decided by bytes, not by a clock
+
+An attempt used to stop being retryable the moment `upstream_header_hold_s`
+expired. That was the wrong line to draw. At that moment the client has a status
+line and **zero body bytes**, so nothing it has seen would be contradicted by
+streaming a different target's body underneath the same headers.
+
+The measure is now what the *client* has seen. `forward` takes a `reopen`
+callback and, when an upstream dies with nothing yielded yet, asks the dispatcher
+for another target and finishes from there; the client sees one uninterrupted
+response. Past the first byte the old rule stands unchanged -- rule 2 above --
+because splicing two completions together is worse than a truncated one.
+
+Why it matters more than it sounds: the hold is 10s, and on this cluster it
+fired 130,815 times, **every one of them the 30B** (76-130s prefill) and none of
+them the 0.5B (5s). Protection keyed on a fixed timer meant the fast model was
+always covered and the slow one never was -- backwards, since the slow request
+is the expensive one to lose.
+
+`failover_deadline_s` deliberately does not apply after commit. It exists to stop
+stacking retries on a request nobody is waiting for; a client that has held for a
+two-minute prefill is the opposite case. The bound there is attempts.
+
+### 1c. Hedging, off by default
+
+With `hedge_after_s` set, a leader that has produced nothing by then is raced
+against a second target and the first usable response wins. `policies.hedge_candidate`
+refuses far more often than it accepts: never under `LOCAL_FIRST`, where sending
+to the remote is a saturation decision and not a speed one, and never onto a
+target below `weak_target_floor`, which would lose every race and burn the
+capacity to learn nothing.
+
+The loser must be handed back explicitly. Its body generator is never started, so
+no `finally` runs -- `Attempt.discard` settles the accounting, releases the KV
+commitment and returns the connection. `forward` also unwinds if it is cancelled
+while waiting on the first chunk, which is where a losing hedge is usually
+killed. Without both, every hedged request would leak exactly what §1a describes.
+
 ### 2. Headers are held until the first chunk
 
 `proxy.forward` waits for the first body byte before constructing the

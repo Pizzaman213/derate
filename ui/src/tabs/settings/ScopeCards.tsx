@@ -36,6 +36,10 @@ const SCOPE_CHANGED: [string, string][] = [
     'Log browser',
     'narrowed, not dropped: a node’s recent lines on its own page, with no search and no logger filter. Amended 2026-09-07',
   ],
+  [
+    'A shell on the node',
+    'procs.py bounded the kill verb so it would not be a remote-exec hole; this is that hole, opened on purpose. Off unless DERATE_SHELL=1, and its key is read off the machine — no route mints one. Amended 2026-09-07',
+  ],
 ]
 
 const OUT_OF_SCOPE: [string, string][] = [

@@ -6,8 +6,10 @@ they are alive, and what they are doing right now.
 
 from .agent import NodeAgent, create_agent_app
 from .bootstrap import (
+    Announcement,
     RoleDecision,
     post_join,
+    reannounce,
     rejoin_until_admitted,
     resolve_role,
     resolve_role_sync,
@@ -23,7 +25,8 @@ from .errors import (
     ProbeFailed,
     RegistryError,
 )
-from .identity import ClusterIdentity, banner, load_or_create_identity
+from .identity import ClusterIdentity, banner, load_or_create_identity, read_identity
+from .nodeident import load_or_create_node_id, seed_node_id
 from .net import detect_bridge_networking, primary_address, require_host_networking
 from .probe import bandwidth_for, probe_local, unknown_profile
 from .registry import Registry
@@ -35,6 +38,7 @@ from .telemetry import (
     TelemetrySample,
     TelemetryStore,
     allocatable_bytes,
+    allocatable_bytes_or_none,
     read_compute_apps,
     read_host_memory,
     read_telemetry,
@@ -42,6 +46,7 @@ from .telemetry import (
 
 __all__ = [
     "Advertiser",
+    "Announcement",
     "AgentClient",
     "BridgeNetworkError",
     "ClusterIdentity",
@@ -64,6 +69,7 @@ __all__ = [
     "TelemetrySample",
     "TelemetryStore",
     "allocatable_bytes",
+    "allocatable_bytes_or_none",
     "bandwidth_for",
     "banner",
     "browse",
@@ -71,16 +77,20 @@ __all__ = [
     "create_agent_app",
     "detect_bridge_networking",
     "load_or_create_identity",
+    "load_or_create_node_id",
     "post_join",
     "primary_address",
     "probe_local",
     "read_compute_apps",
+    "read_identity",
     "read_host_memory",
     "read_telemetry",
+    "reannounce",
     "rejoin_until_admitted",
     "require_host_networking",
     "resolve_role",
     "resolve_role_sync",
+    "seed_node_id",
     "start_node",
     "unknown_profile",
 ]

@@ -11,8 +11,10 @@ import asyncio
 import json
 import logging
 import random
+import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -113,6 +115,160 @@ def test_trim_keeps_rows_that_were_never_collected(tmp_path):
     j.read(since=5, limit=10)  # acknowledge the first five
     assert j.trim() == 5
     assert [json.loads(r["body"])["i"] for r in j.read(0, 20)["rows"]] == list(range(5, 10))
+
+
+# -- the size cap ------------------------------------------------------------
+#
+# This block exists because `_enforce_size` had no coverage at all -- no test
+# ever passed `max_bytes` -- and two bugs shipped through the hole and met.
+# `PRAGMA auto_vacuum=INCREMENTAL` was issued after `PRAGMA journal_mode=WAL`,
+# which silently refuses it, so every `PRAGMA incremental_vacuum` was a no-op
+# and `_file_bytes` could never fall back under the cap; and the gap marker was
+# written inside the eviction loop, into the table the loop was draining, so
+# `if not rows` could never fire either. On a real coordinator that produced a
+# 540 MB journal holding one row, 371,530 identical warnings in one minute,
+# and total loss of the node's telemetry.
+
+
+def _fill_journal(path, rows=4000, size=200, start=1000.0):
+    """Rows straight into the file, bypassing the writer thread, so a test
+    controls exactly how many trim passes run."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    # One transaction, not four thousand. Autocommit here means an fsync per
+    # row and turns a 20 ms fixture into a 6 s one.
+    conn.execute("BEGIN")
+    conn.executemany(
+        "INSERT INTO journal(ts, kind, body) VALUES(?, ?, ?)",
+        [(start + i * 0.01, "log", json.dumps({"m": "z" * size})) for i in range(rows)],
+    )
+    conn.execute("COMMIT")
+    conn.close()
+
+
+def _journal_pages(path):
+    conn = sqlite3.connect(path)
+    try:
+        page = conn.execute("PRAGMA page_size").fetchone()[0]
+        return (
+            conn.execute("PRAGMA page_count").fetchone()[0] * page,
+            conn.execute("PRAGMA freelist_count").fetchone()[0] * page,
+        )
+    finally:
+        conn.close()
+
+
+def test_a_new_journal_really_is_incremental_auto_vacuum(tmp_path):
+    """The regression that would have caught all of it, in one line.
+
+    `PRAGMA auto_vacuum` has to be set before `journal_mode` fixes the page
+    size. Afterwards SQLite refuses the change and reports no error, so this
+    is invisible everywhere except here.
+    """
+    j = Journal(tmp_path / "j.db", node_id="n")
+    conn = sqlite3.connect(tmp_path / "j.db")
+    assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    conn.close()
+    j.close()
+
+
+def test_trimming_at_the_cap_reclaims_the_file_and_terminates(tmp_path):
+    """The cap must be satisfiable. Before the fix it was not: freed pages
+    stayed in the file, so the loop evicted everything and still did not fit."""
+    path = tmp_path / "j.db"
+    j = Journal(path, node_id="n", max_bytes=200_000, batch_rows=64)
+    _fill_journal(path)
+    assert _journal_pages(path)[0] > 200_000
+
+    deleted = j.trim()  # hung forever before the fix
+
+    size, free = _journal_pages(path)
+    assert size <= 200_000, "the cap is not satisfiable if the file cannot shrink"
+    assert free == 0, "PRAGMA incremental_vacuum must be stepped to completion"
+    assert deleted, "something had to go"
+    kept = j.read(0, 5000)["rows"]
+    assert len(kept) > 100, "evicting the whole journal to satisfy a cap is not a trim"
+
+
+def test_one_trim_pass_writes_one_gap_not_one_per_batch(tmp_path):
+    """The gap goes in after the loop, never inside it.
+
+    Writing it per batch put a row into the table being drained, which is what
+    made the loop unable to see an empty table -- and it logged a warning each
+    lap. A pass is one hole, and it is announced once.
+    """
+    path = tmp_path / "j.db"
+    j = Journal(path, node_id="n", max_bytes=200_000, batch_rows=64)
+    _fill_journal(path)
+
+    seen = []
+    handler = logging.Handler()
+    handler.emit = lambda record: seen.append(record.getMessage())
+    log = logging.getLogger("control_plane.telemetry.journal")
+    log.addHandler(handler)
+    try:
+        j.trim()
+    finally:
+        log.removeHandler(handler)
+
+    gaps = [
+        json.loads(r["body"])
+        for r in j.read(0, 5000)["rows"]
+        if r["kind"] == "event"
+    ]
+    assert len(gaps) == 1, f"one pass, one gap; got {len(gaps)}"
+    assert len(seen) == 1, f"one pass, one warning; got {len(seen)}"
+    assert gaps[0]["reason"] == "journal_size_cap"
+    assert gaps[0]["to_ts"] > gaps[0]["from_ts"], (
+        "a zero-width gap is not a fact -- 772 of them reached a live archive"
+    )
+
+
+def test_the_cap_terminates_even_when_the_file_cannot_shrink(tmp_path):
+    """A journal on a file that predates the pragma fix, with the migration
+    refused. Reclamation is impossible, so the cap can never be met -- and the
+    loop must still stop rather than evict forever."""
+    path = tmp_path / "j.db"
+    Journal(path, node_id="n").close()
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=DELETE")  # undo it the way the bug did
+    conn.execute("PRAGMA auto_vacuum=NONE")
+    conn.execute("VACUUM")
+    conn.close()
+    assert sqlite3.connect(path).execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+
+    j = Journal(path, node_id="n", max_bytes=200_000, batch_rows=64)
+    j._migrated = True  # the read-only-volume case: conversion did not happen
+    _fill_journal(path)
+    j.trim()  # must return; before the fix this never did
+
+
+def test_a_journal_written_before_the_fix_is_converted(tmp_path):
+    """...and when the conversion *can* run, it does, on the trim thread
+    rather than at open -- opening happens before the node agent binds."""
+    path = tmp_path / "j.db"
+    Journal(path, node_id="n").close()
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA auto_vacuum=NONE")
+    conn.execute("VACUUM")
+    conn.close()
+
+    j = Journal(path, node_id="n")
+    assert sqlite3.connect(path).execute("PRAGMA auto_vacuum").fetchone()[0] == 0, (
+        "opening must not pay for the migration; startup blocks on it"
+    )
+    j.trim()
+    assert sqlite3.connect(path).execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+
+
+def test_the_journal_size_cap_is_settable_from_the_environment(monkeypatch):
+    """DERATE_TELEMETRY_MAX_BYTES is documented in CONTRACTS.md and did
+    nothing: the reader had no callers, because the constant was the default.
+    It is the first knob anyone reaches for when a journal misbehaves."""
+    from control_plane.telemetry import config as tconfig
+
+    monkeypatch.setenv("DERATE_TELEMETRY_MAX_BYTES", "12345")
+    assert tconfig.journal_max_bytes() == 12345
 
 
 def test_paging_is_stable_and_covers_every_row(journal):
@@ -364,6 +520,50 @@ def test_retention_deletes_past_the_horizon(archive, monkeypatch):
     ).fetchone()["n"] > 0
 
 
+def test_an_archive_written_before_the_fix_is_converted_by_compaction(tmp_path):
+    """Not at open, like the journal's: `Archive` is built inside start_node
+    before the gateway binds, and a VACUUM at the 16 GiB ceiling is ~48s of
+    silence. Compaction already runs on a worker thread every 60s."""
+    path = tmp_path / "a.db"
+    Archive(path).close()
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA auto_vacuum=NONE")
+    conn.execute("VACUUM")
+    conn.close()
+    assert sqlite3.connect(path).execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+
+    a = Archive(path)
+    try:
+        assert sqlite3.connect(path).execute("PRAGMA auto_vacuum").fetchone()[0] == 0, (
+            "opening must not pay for it; startup blocks on the open"
+        )
+        compact(a, now=time.time())
+        assert sqlite3.connect(path).execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    finally:
+        a.close()
+
+
+def test_gaps_are_aged_out_and_the_meaningless_ones_dropped(archive):
+    """`gaps` was the one table with no horizon, and _envelope() returns every
+    gap overlapping a window on every history query -- so an accumulation of
+    them is payload on every poll of every screen. A live archive reached 773
+    rows, 772 of them zero-width, and a three-row log response was 74 KB."""
+    from control_plane.telemetry import config as tconfig
+
+    now = _fill(archive, hours=2)
+    archive.note_gap("spark-01", now - 300, now - 240, "journal_size_cap")
+    archive.note_gap("spark-01", now - 100, now - 100, "journal_size_cap")  # zero width
+    old = now - tconfig.EVENTS_RETENTION_S - 86400.0
+    archive.note_gap("spark-01", old, old + 60, "journal_size_cap")
+
+    compact(archive, now=now)
+
+    kept = archive.conn.execute("SELECT from_ts, to_ts FROM gaps").fetchall()
+    assert len(kept) == 1, "the stale one ages out, the zero-width one is not a fact"
+    assert kept[0]["to_ts"] > kept[0]["from_ts"]
+
+
 # ---------------------------------------------------------------------------
 # query
 # ---------------------------------------------------------------------------
@@ -485,6 +685,100 @@ def test_debug_stays_local_and_the_journal_never_logs_itself(journal):
         assert [r["message"] for r in kept] == ["worth keeping"]
     finally:
         uninstall()
+
+
+@contextmanager
+def _emitting_at_info(*names: str):
+    """Make the named loggers actually deliver INFO to the root handler.
+
+    Three things gate a record before any handler sees it, and the full suite
+    trips all three: the root logger's own level (WARNING by default), each
+    logger's level, and `propagate`. That last one is the interesting failure --
+    uvicorn's stock LOGGING_CONFIG sets `propagate: False` on its loggers, so
+    once anything in the suite has stood up a real uvicorn, records emitted
+    there never reach root again.
+
+    **Call `install()` inside this, not before it.** `install` reads
+    `propagate` to decide whether to ALSO attach the handler directly to the
+    uvicorn loggers -- so installing first and pinning after gets both the
+    direct handler and the root one, and every record is journalled twice.
+    That is not a bug in the handler; it is the two halves of the plumbing
+    being set in the wrong order.
+    """
+    root = logging.getLogger()
+    saved: list[tuple[logging.Logger, int, bool]] = [(root, root.level, root.propagate)]
+    root.setLevel(logging.INFO)
+    for name in names:
+        logger = logging.getLogger(name)
+        saved.append((logger, logger.level, logger.propagate))
+        logger.setLevel(logging.NOTSET)
+        logger.propagate = True
+    try:
+        yield
+    finally:
+        for logger, level, propagate in saved:
+            logger.setLevel(level)
+            logger.propagate = propagate
+
+
+def test_the_access_log_is_not_journalled_but_uvicorn_errors_are(journal):
+    """The one that pays for itself.
+
+    Measured on a three-node cluster before this filter existed: uvicorn.access
+    and httpx were 99.6% of every log row and 81% of the whole archive, and the
+    journal was hitting its byte cap in ~30 hours against a 72-hour retention --
+    which trims by writing a gap marker, so the noise was eating the
+    coordinator-outage window the journal exists to provide.
+
+    uvicorn.error is the control: startup and crash lines live there, and
+    dropping the pair by their shared "uvicorn" prefix would take them too.
+    """
+    with _emitting_at_info("uvicorn.access", "httpx", "uvicorn.error", "gateway"):
+        uninstall()
+        install(journal, level="INFO")
+        try:
+            logging.getLogger("uvicorn.access").info('GET /agent/telemetry 1.1" 200')
+            logging.getLogger("httpx").info("HTTP Request: GET http://x/agent/telemetry")
+            logging.getLogger("uvicorn.error").info("Application startup complete.")
+            logging.getLogger("gateway").info("gateway ready")
+            drain(journal)
+            kept = [json.loads(r["body"]) for r in journal.read(0, 100)["rows"]]
+            assert [r["message"] for r in kept] == [
+                "Application startup complete.",
+                "gateway ready",
+            ]
+        finally:
+            uninstall()
+
+
+def test_an_empty_quiet_list_records_everything_again(journal):
+    """The escape hatch is a real one: DERATE_TELEMETRY_QUIET_LOGGERS="" means
+    record the lot, which is what the handler did before this existed."""
+    with _emitting_at_info("uvicorn.access"):
+        # `install` is also idempotent by returning any handler already on the
+        # root logger, arguments and all ignored -- right for the one-per-process
+        # caller it was written for, a trap for a test that passes `quiet`.
+        uninstall()
+        install(journal, level="INFO", quiet=())
+        try:
+            logging.getLogger("uvicorn.access").info("noisy")
+            drain(journal)
+            kept = [json.loads(r["body"]) for r in journal.read(0, 100)["rows"]]
+            assert [r["message"] for r in kept] == ["noisy"]
+        finally:
+            uninstall()
+
+
+def test_quiet_loggers_reads_the_environment(monkeypatch):
+    from control_plane.telemetry import config as tconfig
+
+    monkeypatch.delenv("DERATE_TELEMETRY_QUIET_LOGGERS", raising=False)
+    assert tconfig.quiet_loggers() == tconfig.NOISY_LOGGERS
+    monkeypatch.setenv("DERATE_TELEMETRY_QUIET_LOGGERS", "a.b , c ")
+    assert tconfig.quiet_loggers() == ("a.b", "c")
+    # Present and empty is "record everything", not "fall back to the default".
+    monkeypatch.setenv("DERATE_TELEMETRY_QUIET_LOGGERS", "")
+    assert tconfig.quiet_loggers() == ()
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ name: publish image
 
 on:
   push:
-    branches: [integration, main]
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 

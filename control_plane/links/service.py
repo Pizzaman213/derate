@@ -22,9 +22,15 @@ from .measure import Endpoint, LadderMeasurer, default_measurer
 from .record import AnnotatedLink, LinkAnnotation, annotate, pair_key
 from .store import LinkStore
 
+from control_plane.paths import CONTAINER_DATA_DIR, data_dir
+
 log = logging.getLogger(__name__)
 
-DEFAULT_DATA_DIR = "/data"
+#: Kept for callers that import it by name. The *resolved* root comes from
+#: control_plane.paths, which falls back off this when /data is not writable --
+#: and the value comes from there too, so the alias cannot outlive the thing it
+#: aliases.
+DEFAULT_DATA_DIR = str(CONTAINER_DATA_DIR)
 DEFAULT_STORE_NAME = "links.json"
 
 
@@ -243,7 +249,7 @@ def _local_names() -> frozenset[str]:
 
 
 def _default_store_path() -> str:
-    return os.path.join(os.environ.get("DERATE_DATA_DIR", DEFAULT_DATA_DIR), DEFAULT_STORE_NAME)
+    return str(data_dir() / DEFAULT_STORE_NAME)
 
 
 def _env_key(node_id: str) -> str:

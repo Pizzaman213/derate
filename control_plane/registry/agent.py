@@ -22,13 +22,22 @@ import os
 import secrets
 import time
 from pathlib import Path
+
+from control_plane.paths import data_dir
 from typing import Callable
 
 from control_plane.contracts import NodeProfile
 from control_plane.telemetry import NULL_SINK, TelemetrySink
+from control_plane.version import build_id
 
-from . import modelcache, reach, storage
-from .config import ROLE_WORKER, TELEMETRY_INTERVAL_S
+from . import modelcache, reach, shell_config, storage
+from .config import (
+    PROFILE_REPROBE_INTERVAL_S,
+    ROLE_WORKER,
+    TELEMETRY_INTERVAL_S,
+)
+from .probe import probe_local
+from .profiles import profile_supersedes
 from .discovery import Advertiser
 from .procs import KillRefused, kill_gpu_process
 from .serde import (
@@ -70,6 +79,17 @@ class NodeAgent:
         self._started_at = clock()
         self._ring = RingBuffer()
         self._task: asyncio.Task | None = None
+        # Monotonic time of the last hardware re-probe, anchored in start().
+        self._last_reprobe = 0.0
+        # Wall-clock time of the last inbound /agent/health request, or None
+        # when nobody has ever asked. This is how a node notices it has been
+        # forgotten: the coordinator polls every member every 5s, so a member
+        # that has not been asked in several intervals is a member whose
+        # coordinator has lost it -- restarted with an empty roster, replaced,
+        # or dialling an address this node no longer answers on. Recorded from
+        # the route rather than from health_payload(), because the fact that
+        # matters is that somebody asked over the network.
+        self._last_polled: float | None = None
         self._running = False
         self._advertiser = advertiser
         # Defaults to the no-op sink, so a NodeAgent still constructs and
@@ -84,11 +104,9 @@ class NodeAgent:
         # same env var every other component reads, with the same /data
         # fallback, so an agent constructed without one still reports the real
         # root rather than nothing.
-        self._data_root = Path(
-            data_root
-            if data_root is not None
-            else os.environ.get("DERATE_DATA_DIR", "/data")
-        )
+        self._data_root = Path(data_root) if data_root is not None else data_dir()
+        # One live shell session per node. See claim_shell below.
+        self._shell_open = False
 
     # ------------------------------------------------------------------
     # Payloads
@@ -103,7 +121,20 @@ class NodeAgent:
         return self._clock() - self._started_at
 
     def profile_payload(self) -> dict:
-        return profile_to_dict(self.profile)
+        """This machine's hardware, plus which build is describing it.
+
+        ``build`` is not part of NodeProfile and deliberately never will be:
+        the profile is hardware, and the software reading it is a different
+        fact. It rides along here because this is the payload a coordinator
+        probes back, and "what does this node think it is" is not answerable
+        without also knowing what was doing the thinking. A node whose image
+        predates a probe improvement reports hardware its coordinator would
+        have identified, and until this field existed the two were
+        indistinguishable from the outside.
+        """
+        payload = profile_to_dict(self.profile)
+        payload["build"] = build_id()
+        return payload
 
     def telemetry_payload(self) -> dict:
         return telemetry_to_dict(self.node_id, self._ring.latest)
@@ -167,6 +198,46 @@ class NodeAgent:
         """
         return await asyncio.to_thread(modelcache.delete, folder)
 
+    def claim_shell(self) -> bool:
+        """Take the single shell slot, or refuse.
+
+        One live session per node, deliberately. Not a resource limit -- a pty
+        is cheap -- but an accountability one: two prompts on the same machine
+        with no way to tell them apart is how somebody watches a command they
+        did not run and cannot find who did. It also bounds what a stolen key
+        reaches while a legitimate session is open.
+        """
+        if self._shell_open:
+            return False
+        self._shell_open = True
+        return True
+
+    def release_shell(self) -> None:
+        self._shell_open = False
+
+    def note_shell_opened(self, *, host: bool) -> None:
+        """Record that a root prompt was opened on this machine.
+
+        An event, never the output. Terminal output is unbounded and would
+        recreate the access-log problem with a payload that can contain
+        anything the operator typed, credentials included. What is worth
+        keeping is that a session happened, when, and whether it reached the
+        host or stopped at this container -- and ``events`` is the one raw
+        table the archive's size cap never evicts.
+        """
+        try:
+            self._sink.event(
+                "shell",
+                {
+                    "type": "shell_opened",
+                    "ts": self._clock(),
+                    "node_id": self.profile.node_id,
+                    "host": host,
+                },
+            )
+        except Exception:
+            log.debug("could not record shell event", exc_info=True)
+
     def set_token(self, token: str | None) -> None:
         """Adopt the cluster token, including on a late admission.
 
@@ -189,6 +260,10 @@ class NodeAgent:
             "role": self.role,
             "cluster_id": self.cluster_id,
             "uptime_s": round(self.uptime_s, 1),
+            # Rides the heartbeat rather than needing a call of its own: the
+            # coordinator already dials this endpoint every 5s and used to
+            # throw the body away. See Registry.check_health.
+            "build": build_id(),
         }
 
     async def reach_payload(self, url: object, client=None) -> dict:
@@ -254,6 +329,64 @@ class NodeAgent:
             self._sink.sample(self.node_id, sample)
         return sample
 
+    def note_polled(self) -> None:
+        """Somebody just asked this agent for its health over HTTP."""
+        self._last_polled = self._clock()
+
+    def seconds_since_poll(self) -> float | None:
+        """How long since anyone asked. None when nobody ever has.
+
+        None is not "a long time": on a freshly started node it means the
+        coordinator has not had a chance yet, and treating that as abandonment
+        would make every boot announce itself twice.
+        """
+        if self._last_polled is None:
+            return None
+        return max(0.0, self._clock() - self._last_polled)
+
+    async def reprobe_once(self) -> bool:
+        """Re-read this machine's hardware. True when the profile changed.
+
+        A node used to probe exactly once, at construction, so a driver
+        installed on a running machine was invisible until somebody restarted
+        the container -- and on a Spark that meant a GB10 sitting in the roster
+        as unidentified hardware with nothing saying why.
+
+        The probe shells out, so it runs on a thread: this loop also drives
+        telemetry and must not stall behind nvidia-smi.
+
+        **A failed probe never overwrites a good profile.** ``probe_local`` is
+        total -- it always returns something, and its answer for "I could not
+        look" is a fully-formed profile that says UNKNOWN. On a one-shot path
+        that is fine, because a join implies the machine just answered. On a
+        timer it is not: one wedged nvidia-smi cycle would flip an identified
+        GB10 to unidentified, and the roster would flap between the two. So
+        UNKNOWN is only ever accepted when we had nothing better already.
+        Every other class is a positive identification and lands -- including a
+        downgrade like GB10 to CPU, which is what pulling a card actually looks
+        like and should be believed.
+        """
+        try:
+            fresh = await asyncio.to_thread(probe_local, self.profile.node_id)
+        except Exception as exc:  # probe_local does not raise, but a thread can
+            log.debug("re-probe failed: %s", exc)
+            return False
+        if not profile_supersedes(fresh, self.profile):
+            return False
+        if fresh == self.profile:
+            return False
+        log.info(
+            "hardware changed on %s: %s -> %s",
+            self.profile.node_id,
+            self.profile.device_class.value,
+            fresh.device_class.value,
+        )
+        # Publishing is the point, not bookkeeping: /agent/profile reads this
+        # attribute, so replacing it IS how the coordinator finds out. A
+        # re-probe the node kept to itself would fix nothing.
+        self.profile = fresh
+        return True
+
     async def _sample_loop(self, interval: float) -> None:
         while self._running:
             started = asyncio.get_running_loop().time()
@@ -263,6 +396,18 @@ class NodeAgent:
                 raise
             except Exception as exc:
                 log.exception("local telemetry sample failed: %s", exc)
+            now = asyncio.get_running_loop().time()
+            # Hardware on the same loop as telemetry, but two orders of
+            # magnitude slower. A second task would be a second thing to
+            # cancel; this inherits the one that already exists.
+            if now - self._last_reprobe >= PROFILE_REPROBE_INTERVAL_S:
+                self._last_reprobe = now
+                try:
+                    await self.reprobe_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.exception("re-probe failed: %s", exc)
             elapsed = asyncio.get_running_loop().time() - started
             await asyncio.sleep(max(0.0, interval - elapsed))
 
@@ -276,6 +421,12 @@ class NodeAgent:
             await self.sample_once()
         except Exception as exc:
             log.debug("initial telemetry prime failed: %s", exc)
+        # Anchor the re-probe clock here rather than at construction. The
+        # profile we were handed was probed moments ago by start_node, so the
+        # first re-probe belongs one full interval away, not on the first tick.
+        # It also keeps nvidia-smi out of the short-interval agent tests, which
+        # spin this loop for milliseconds and have no business shelling out.
+        self._last_reprobe = asyncio.get_running_loop().time()
         self._task = asyncio.create_task(self._sample_loop(interval), name="agent-telemetry")
         if self._advertiser is not None:
             self._advertiser.start()
@@ -311,6 +462,7 @@ def create_agent_app(node_agent: NodeAgent):
 
     @app.get("/agent/health")
     async def get_health() -> dict:
+        node_agent.note_polled()
         return node_agent.health_payload()
 
     @app.get("/agent/journal")
@@ -392,6 +544,21 @@ def create_agent_app(node_agent: NodeAgent):
                 status_code=status, detail={"code": exc.code, "message": exc.message}
             ) from exc
         return result.as_dict()
+
+    # The shell, and only if it was asked for. Registered conditionally rather
+    # than registered-and-refusing: an absent route cannot be probed for, and
+    # cannot be switched on by anything arriving over the network.
+    if shell_config.enabled():
+        # The key is NOT bootstrapped here. This is a factory, and twenty-odd
+        # tests call it; generating a secret and creating a data directory is a
+        # process-startup side effect, so it lives in startup.py where the node
+        # actually boots.
+        #
+        # Imported here, not at the top: this module must stay importable
+        # without FastAPI, and shell_route imports it eagerly.
+        from . import shell_route
+
+        shell_route.install(app, node_agent)
 
     app.state.node_agent = node_agent
     return app

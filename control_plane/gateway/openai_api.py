@@ -8,6 +8,7 @@ answered.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -19,7 +20,8 @@ from starlette.responses import JSONResponse, Response
 from control_plane.contracts import Modality, TargetKind
 from control_plane.telemetry import RequestTrace
 
-from . import errors, realtime
+from . import errors, policies, proxy as proxy_mod, realtime
+from .proxy import Attempt
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.openai")
@@ -204,8 +206,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         request: Request, path: str, streaming_allowed: bool
     ) -> Response:
         """The JSON entry point: chat, completions, embeddings, audio/speech."""
+        limit = ctx.settings.max_json_body_bytes
+        raw = await _read_bounded_body(request, limit)
+        if raw is None:
+            return errors.error_response(
+                413,
+                f"The request body is larger than the {limit // (1024 * 1024)} MiB limit.",
+                "invalid_request_error",
+                "payload_too_large",
+            )
         try:
-            raw = await request.body()
             body = json.loads(raw) if raw else {}
         except json.JSONDecodeError as exc:
             return errors.error_response(
@@ -232,6 +242,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             body=body,
             raw_len=len(raw),
             streaming=bool(body.get("stream")) and streaming_allowed,
+            raw_body=raw,
         )
 
     async def _proxy_multipart(request: Request, path: str) -> Response:
@@ -295,12 +306,19 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         streaming: bool,
         content: bytes | None = None,
         content_type: str | None = None,
+        raw_body: bytes | None = None,
     ) -> Response:
         """Everything both entry points share: model lookup, the modality
         guard, failover, the breaker, parking and the trace id.
 
         `body` is None exactly when `content` is set, which is what tells the
         rest of this function it is looking at bytes it cannot inspect.
+
+        `raw_body` is the JSON path's original bytes, carried alongside `body`
+        so an attempt that needs no rewrite can forward them verbatim instead
+        of paying to re-serialize `body` back to JSON. `content` already means
+        "opaque upload" elsewhere in this function, so this is a second,
+        separate channel rather than overloading that one.
         """
         settings = ctx.settings
         # An audio body has no tokens to count and nothing to read a `usage`
@@ -387,6 +405,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     status_code=last.status,
                     headers=last.headers or {},
                 )
+            if last.reason == proxy_mod.RETRY_POOL:
+                # We never reached a backend, but that is our pool's doing and
+                # not the backend's. Saying "unreachable" here would blame a
+                # machine that is answering perfectly well.
+                return errors.upstream_pool_exhausted(model, len(tried))
             return errors.upstream_unreachable(
                 model, last.error or "unreachable", len(tried)
             )
@@ -401,8 +424,20 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             tried: set[str] = set()
             last = None
             deadline = time.monotonic() + settings.failover_deadline_s
+            _SKIP = object()
 
-            for attempt_no in range(settings.failover_max_attempts):
+            def _claim(attempt_no):
+                """Pick the next untried target and take the right to send.
+
+                Three outcomes, and the difference between the last two is
+                load-bearing: a selection; `_SKIP`, meaning this target refused
+                but another may not; or None, meaning stop offering the request
+                at all.
+
+                There is deliberately no await between the select and the
+                breaker claim, which is what lets a single half-open probe be
+                safe without a lock. Keep it that way.
+                """
                 selection = ctx.router.select(
                     model,
                     # Only the first attempt uses the cache-affinity hash. A
@@ -413,7 +448,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     exclude=tried,
                 )
                 if selection is None:
-                    break
+                    return None
                 target = selection.target
                 tried.add(target.target_id)
                 # Which evidence set this target's strength -- measured decode
@@ -422,20 +457,78 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # what makes a recorded strength interpretable later.
                 score = ctx.router.index().raw_strength.get(target.target_id)
                 trace.strength_source = getattr(score, "source", "") or ""
-                # No await between the selection above and this claim, which is
-                # what lets a single-token half-open probe be safe without a
-                # lock. Keep it that way.
                 if not ctx.breaker.begin(target.target_id):
-                    continue  # its one probe is already out; try another
+                    return _SKIP  # its one probe is already out; another may do
                 if attempt_no > 0 and not ctx.retry_budget.take():
                     ctx.breaker.abandon(target.target_id)
-                    break
+                    return None  # out of budget: stop, do not try another
+                return selection
 
+            def _make_reopen(committed_at):
+                """Finish a committed response from another target.
+
+                Handed to `forward`, which calls it only when an upstream dies
+                with the client still on zero body bytes. Returns the
+                replacement's own body iterator -- so its accounting, breaker
+                verdict, KV commitment and cleanup all stay inside its own
+                generator -- or None to let the original failure stand.
+
+                Deliberately NOT bounded by `deadline`. That budget exists to
+                stop stacking retries on a request nobody is waiting for, and a
+                committed response is the opposite case: the client has been
+                holding for the whole prefill, which on a 30B is two minutes,
+                and would far rather wait again than be handed an error. The
+                bound here is attempts, and only ever one more.
+                """
+
+                async def reopen(sent_content_type):
+                    n = committed_at + 1
+                    if n >= settings.failover_max_attempts:
+                        return None
+                    selection = _claim(n)
+                    if selection is None or selection is _SKIP:
+                        return None
+                    outcome = await _attempt_on(selection, n, None)
+                    if not isinstance(outcome, Attempt) or outcome.response is None:
+                        # A refusal or a skip. Neither can be shown to a client
+                        # that already has a 200 on the wire, so the original
+                        # failure stands.
+                        if isinstance(outcome, Attempt):
+                            last_error = outcome.error or outcome.reason
+                            log.info("reopen found no usable target: %s", last_error)
+                        return None
+                    replacement = outcome.response
+                    got = replacement.headers.get("content-type")
+                    if sent_content_type and got and got != sent_content_type:
+                        # We have already sent the first target's headers. A
+                        # body of a different type underneath them would be
+                        # corruption, not recovery.
+                        log.warning(
+                            "not finishing a %s response from a %s one",
+                            sent_content_type, got,
+                        )
+                        return None
+                    body_iterator = getattr(replacement, "body_iterator", None)
+                    return body_iterator
+
+                return reopen
+
+            async def _attempt_on(selection, attempt_no, reopen):
+                """One target's turn, from body rewrite to bytes on the wire.
+
+                Extracted so that `reopen` below can run a second target
+                through exactly the same path -- key resolution, body rewrite,
+                admission, provider routing -- rather than a simplified copy of
+                it that would drift. Returns an `Attempt`, or a `Response` when
+                the request itself is refused, or None to try another target.
+                """
+                target = selection.target
                 # Everything below is rebuilt per attempt. Hoisting any of it
                 # out of the loop would carry one target's body rewrite -- or
                 # worse, one provider's key -- onto the next target.
                 upstream_body = body
                 upstream_content = content
+                upstream_raw = raw_body
                 api_key = None
                 on_finish = None
                 use_provider_service = False
@@ -493,6 +586,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         if body is not None:
                             upstream_body = dict(body)
                             upstream_body["model"] = selection.model.upstream_id
+                            upstream_raw = None
                         elif content is not None and content_type is not None:
                             # The name is inside the body here rather than in a
                             # dict we can copy, so it is spliced in place. Only
@@ -510,7 +604,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                                 # us. Sending it unrewritten would name a model
                                 # this provider does not have.
                                 ctx.breaker.abandon(target.target_id)
-                                continue
+                                return None  # nothing was sent; try another target
                             upstream_content = rewritten
                     provider_id = (
                         selection.provider.provider_id
@@ -548,7 +642,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     )
                     if not use_provider_service and selection.provider is not None:
                         try:
-                            api_key = ctx.deps.providers.resolve_key(provider_id)
+                            api_key = await asyncio.to_thread(
+                                ctx.deps.providers.resolve_key, provider_id
+                            )
                         except Exception:
                             # Never echo anything about key material.
                             log.warning(
@@ -582,13 +678,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         selection=selection,
                         trace=trace,
                         attempt_no=attempt_no,
+                        reopen=reopen,
                     )
                     if result is None:
                         # The provider refused before anything was sent --
                         # rate limited, over budget, disabled. Not this
                         # target's fault to answer for; try another one.
                         ctx.breaker.abandon(target.target_id)
-                        continue
+                        return None  # nothing was sent; try another target
                 else:
                     result = await ctx.proxy.forward(
                         selection=selection,
@@ -601,10 +698,128 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         on_finish=on_finish,
                         trace=trace,
                         attempt_no=attempt_no,
-                        content=upstream_content,
+                        content=upstream_content
+                        if upstream_content is not None
+                        else upstream_raw,
                         content_type=content_type,
                         count_tokens=count_tokens,
+                        reopen=reopen,
                     )
+                return result
+
+            async def _discard(outcome) -> None:
+                """Throw away an attempt nobody will read.
+
+                The loser of a hedge holds a live upstream whose body generator
+                will never be started, so nothing would ever settle its
+                accounting, release its KV commitment or return its connection.
+                `Attempt.discard` does all three; without this a hedge leaks
+                exactly what the 2026-09-08 outage leaked, one request at a
+                time.
+                """
+                if not isinstance(outcome, Attempt):
+                    return
+                discard = outcome.discard
+                if discard is None:
+                    return
+                try:
+                    await discard()
+                except Exception:
+                    log.warning("could not discard a hedged attempt", exc_info=True)
+
+            async def _hedged(selection, attempt_no):
+                """Run one attempt, racing a second target if it stalls.
+
+                The leader keeps its head start: the hedge is only sent if the
+                leader has produced nothing by `hedge_after_s`, and whichever
+                returns a usable response first is the one the client gets.
+                """
+                primary = asyncio.ensure_future(
+                    _attempt_on(selection, attempt_no, _make_reopen(attempt_no))
+                )
+                done, _ = await asyncio.wait(
+                    {primary}, timeout=settings.hedge_after_s
+                )
+                if primary in done:
+                    return primary.result()
+
+                config = ctx.router.config_for(model)
+                mate = (
+                    policies.hedge_candidate(
+                        config, selection.target, settings, exclude=tried
+                    )
+                    if config is not None
+                    else None
+                )
+                if mate is None:
+                    return await primary
+
+                hedge_selection = _claim(attempt_no + 1)
+                if hedge_selection is None or hedge_selection is _SKIP:
+                    return await primary
+                # `_claim` runs the policy and the breaker, so what it hands
+                # back need not be the target `hedge_candidate` picked. Check
+                # the one actually claimed against the same rule, or a target
+                # below the floor slips past the gate that exists to stop it.
+                if not policies.may_hedge(
+                    config, selection.target, hedge_selection.target, settings
+                ):
+                    ctx.breaker.abandon(hedge_selection.target.target_id)
+                    return await primary
+                secondary = asyncio.ensure_future(
+                    _attempt_on(hedge_selection, attempt_no + 1, None)
+                )
+                log.info(
+                    "%s has produced nothing in %.1fs; racing %s",
+                    selection.target.target_id,
+                    settings.hedge_after_s,
+                    hedge_selection.target.target_id,
+                )
+                try:
+                    done, _ = await asyncio.wait(
+                        {primary, secondary},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    winner = next(iter(done))
+                    loser = secondary if winner is primary else primary
+                    result = winner.result()
+                    # A winner that is not actually usable is no winner: fall
+                    # back to whatever the other one has to say rather than
+                    # discarding a live response to report a refusal.
+                    if not isinstance(result, Attempt) or result.response is None:
+                        return await loser
+                    loser.cancel()
+                    try:
+                        await _discard(await loser)
+                    except asyncio.CancelledError:
+                        # Expected: the loser was cancelled mid-flight, and
+                        # `forward` gives its upstream back on the way out.
+                        pass
+                    except Exception:
+                        log.warning("hedged loser did not unwind", exc_info=True)
+                    return result
+                finally:
+                    for task in (primary, secondary):
+                        if not task.done():
+                            task.cancel()
+
+            for attempt_no in range(settings.failover_max_attempts):
+                selection = _claim(attempt_no)
+                if selection is None:
+                    break
+                if selection is _SKIP:
+                    continue
+                if settings.hedge_after_s is not None:
+                    outcome = await _hedged(selection, attempt_no)
+                else:
+                    outcome = await _attempt_on(
+                        selection, attempt_no, _make_reopen(attempt_no)
+                    )
+                if outcome is None:
+                    continue
+                if not isinstance(outcome, Attempt):
+                    return outcome  # a refusal, already recorded
+                result = outcome
                 if not result.retryable:
                     return _tagged(result.response)
                 last = result
@@ -692,6 +907,101 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         id -- is the same code path as every other route.
         """
         return await _proxy_multipart(request, "/audio/transcriptions")
+
+    @router.get("/v1/audio/voices")
+    async def audio_voices(request: Request) -> Response:
+        """Which reference voices this deployment has installed.
+
+        Not an OpenAI route. It exists because `runtimes/tts.py` serves one and
+        nothing outside the container could ask it: a voice is a `<name>.wav`
+        beside a `<name>.txt` transcript, an unknown name is refused by design,
+        and a caller that cannot enumerate them has to guess at the one thing
+        the server will not let them guess at.
+
+        Three ways it differs from every route above, each for a reason:
+
+        *   The model is a **query parameter**. This is a GET with no body, and
+            the name still has to be here -- voices are a property of one
+            deployment's filesystem, not of the cluster.
+        *   It does not go through `_serve`. Streaming, admission, the parking
+            lot, cache affinity, spend and the retry budget are all about a
+            generation request; this is a directory listing. What it does keep
+            is the model lookup and the modality guard, so a wrong name fails
+            here exactly as it would on /v1/audio/speech.
+        *   It answers from a **local** target only. No provider implements
+            this route, and a speech model that exists only behind one is
+            refused with the reason rather than handed a 404 from somebody
+            else's API.
+        """
+        model = request.query_params.get("model")
+        if not model:
+            return errors.error_response(
+                400,
+                "You must provide a 'model' query parameter, naming the "
+                "deployment whose voices you want: "
+                "GET /v1/audio/voices?model=<served name>.",
+                "invalid_request_error",
+                "missing_model",
+            )
+
+        index = ctx.router.index()
+        if model not in index.targets:
+            pending = index.pending.get(model)
+            if pending:
+                return errors.model_not_ready(
+                    model, sorted({d.state.value for d in pending})
+                )
+            return errors.unknown_model(model, index.served_names())
+
+        has = index.modality.get(model)
+        if has is not None and _modality_conflict(has, Modality.SPEECH):
+            return errors.wrong_modality(
+                model, has, Modality.SPEECH, "/v1/audio/voices"
+            )
+
+        local = next(
+            (
+                t
+                for t in index.targets[model]
+                if t.kind is TargetKind.LOCAL and t.backend_url
+            ),
+            None,
+        )
+        if local is None:
+            return errors.error_response(
+                400,
+                f"'{model}' is served by a provider, and a voice library is a "
+                f"property of a deployment this cluster runs: the reference "
+                f"clips live on the node, in the directory the tts runtime was "
+                f"pointed at. Deploy it here to choose a voice, or send "
+                f"/v1/audio/speech without one and the model speaks in its own.",
+                "invalid_request_error",
+                "no_local_target",
+            )
+
+        url = local.backend_url.rstrip("/") + "/audio/voices"
+        try:
+            upstream = await ctx.proxy.client_for(url).get(url)
+        except Exception as exc:  # httpx raises a family, not one class
+            return errors.error_response(
+                502,
+                f"Could not reach '{model}' to list its voices: "
+                # The shared provider redactor, reached the way internal_api's
+                # _redactor does: a fresh one knows no secrets to scrub, and a
+                # local backend_url is not a secret but the exception chain
+                # under it may have come from anywhere.
+                f"{errors.detail(exc, getattr(ctx.deps.providers, 'redactor', None))}.",
+                "server_error",
+                "upstream_unreachable",
+            )
+        # The runtime's own envelope, unaltered -- including `skipped`, which
+        # is it explaining which clips it declined and why. Re-shaping that
+        # would throw away the only sentence a person can act on.
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
 
     @router.websocket("/v1/realtime")
     async def realtime_session(websocket: WebSocket) -> None:

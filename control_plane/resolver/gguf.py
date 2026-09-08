@@ -88,6 +88,15 @@ GGUF_FILE_TYPES: dict[int, str] = {
     22: "iq3_xs", 23: "iq3_xxs", 24: "iq1_s", 25: "iq4_nl",
     26: "iq3_s", 27: "iq3_m", 28: "iq2_s", 29: "iq2_m",
     30: "iq4_xs", 31: "iq1_m",
+    # 33, 34 and 35 are MOSTLY_Q4_0_4_4, _4_8 and _8_8: llama.cpp's ARM
+    # repackings of Q4_0, interleaved for i8mm/SVE. Same blocks, same 4.5 bpw,
+    # same bytes -- only the memory order differs, and nothing here reads it.
+    # Their absence meant a header read returned None for exactly the files
+    # whose names quant_detect could not parse either, so the multi-second
+    # ranged read bought nothing and the file was charged at bf16 regardless.
+    # 36 and 37 (TQ1_0, TQ2_0) stay out: BYTES_PER_PARAM has no ternary key,
+    # and adding one is a change to the frozen contract.
+    33: "q4_0", 34: "q4_0", 35: "q4_0",
     32: "bf16", 38: "mxfp4", 39: "nvfp4",
 }
 

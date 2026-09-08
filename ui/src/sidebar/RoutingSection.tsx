@@ -32,6 +32,15 @@ const POLICIES: { value: RoutingPolicy; help: string }[] = [
 
 function targetLabel(t: RouteTarget): string {
   if (t.kind === 'local' && t.node_ids && t.node_ids.length > 0) return t.node_ids.join(' + ')
+  // A remote target's id is `<provider>:<upstream model>` (gateway/targets.py
+  // builds it, ProviderService.split_target_id takes it apart). Printed raw it
+  // reads as one opaque string, so the row said a remote was serving this name
+  // without saying WHICH provider -- the question somebody selects a model to
+  // answer. Split on the FIRST colon only: an upstream id may contain more.
+  if (t.kind === 'remote') {
+    const cut = t.target_id.indexOf(':')
+    if (cut > 0) return `${t.target_id.slice(0, cut)} · ${t.target_id.slice(cut + 1)}`
+  }
   return t.target_id
 }
 
@@ -122,7 +131,12 @@ export function RoutingSection() {
 
       <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
         {cfg.targets.map((t) => (
-          <TargetWeight key={t.target_id} target={t} proportional={proportional} />
+          <TargetWeight
+            key={t.target_id}
+            target={t}
+            proportional={proportional}
+            policy={policy}
+          />
         ))}
       </div>
 
@@ -145,7 +159,15 @@ export function RoutingSection() {
   )
 }
 
-function TargetWeight({ target: t, proportional }: { target: RouteTarget; proportional: boolean }) {
+function TargetWeight({
+  target: t,
+  proportional,
+  policy,
+}: {
+  target: RouteTarget
+  proportional: boolean
+  policy: RoutingPolicy
+}) {
   const pctv = Math.round(t.weight * 100)
   const label = targetLabel(t)
   const circuitFlagged = t.circuit === 'open' || t.circuit === 'half_open'
@@ -203,7 +225,11 @@ function TargetWeight({ target: t, proportional }: { target: RouteTarget; propor
         ) : null}
         <span>
           {label}
-          {t.kind === 'remote' ? ' · remote' : ''}
+          {/* Under local_first a remote is not merely remote, it is the thing
+              that takes over when the cluster runs out -- and a zero-weight
+              row with nothing but "remote" beside it reads as a target that is
+              not being used rather than one held in reserve. */}
+          {t.kind === 'remote' ? (policy === 'local_first' ? ' · backup' : ' · remote') : ''}
         </span>
         {zeroReason ? <span>· {zeroReason}</span> : null}
       </div>

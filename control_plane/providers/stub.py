@@ -205,7 +205,7 @@ def build_stub_service(
         **kwargs,
     )
     if STUB_PROVIDER_ID not in {p.provider_id for p in service.list()}:
-        service.add(
+        provider = service.add(
             {
                 "provider_id": STUB_PROVIDER_ID,
                 "kind": ProviderKind.OPENROUTER,
@@ -213,5 +213,14 @@ def build_stub_service(
                 "api_key_ref": STUB_KEY_REF,
                 "priority": 10,
             }
+        )
+        # Switch the whole stub catalogue on. A real provider starts with
+        # nothing enabled and waits for somebody to choose, but there is nobody
+        # to choose here: this exists so LOCAL_FIRST can be wired against three
+        # priced models before any key does, and a provider serving nothing
+        # would rehearse the empty case instead of the one being built.
+        service.update(
+            STUB_PROVIDER_ID,
+            {"enabled_models": [m.upstream_id for m in provider.models]},
         )
     return service

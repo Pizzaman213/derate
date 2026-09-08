@@ -16,24 +16,29 @@
 // directly, for the same reason layout.check.mjs does it: node's ESM resolver
 // will not resolve an extensionless specifier.
 
-import { execFileSync } from 'node:child_process'
+import { build as bundleWithEsbuild } from 'esbuild'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const uiRoot = join(here, '..', '..')
 const out = mkdtempSync(join(tmpdir(), 'router-check-'))
 const bundle = join(out, 'routes.mjs')
 
-execFileSync(
-  join(uiRoot, 'node_modules', '.bin', 'esbuild'),
-  [join(here, 'routes.ts'), '--bundle', '--format=esm', `--outfile=${bundle}`, '--log-level=warning'],
-  { stdio: 'inherit' },
-)
+// esbuild's JS API rather than the launcher under node_modules/.bin:
+// that shim is a POSIX script with no .cmd twin, so spawning it by path
+// fails on Windows. rows.check.mjs already bundles this way.
+await bundleWithEsbuild({
+  entryPoints: [join(here, 'routes.ts')],
+  bundle: true,
+  format: 'esm',
+  outfile: bundle,
+  logLevel: 'warning',
+})
 
-const { parse, href, DEFAULT_CONTEXT, DEFAULT_CONCURRENCY } = await import(bundle)
+const { parse, href, DESTINATIONS, DEFAULT_CONTEXT, DEFAULT_CONCURRENCY } = await import(pathToFileURL(bundle).href)
 
 let failures = 0
 function check(what, got, want) {
@@ -56,7 +61,6 @@ for (const [path, dest] of [
   ['/dashboard', 'dash'],
   ['/models', 'models'],
   ['/cluster', 'cluster'],
-  ['/storage', 'storage'],
   ['/chat', 'chat'],
   ['/spend', 'spend'],
   ['/settings', 'settings'],
@@ -67,6 +71,17 @@ for (const [path, dest] of [
 ]) {
   check(`${path} -> ${dest}`, parse(path).dest, dest)
   check(`${path} round trips`, href(parse(path)), path)
+}
+
+// Every destination the type admits is reachable, walked from routes.ts's own
+// `DESTINATIONS` rather than from the pairs above -- so a `Dest` added with no
+// `SEGMENT` entry is caught here even though the loop above, being a list,
+// would never have heard of it. Such a Dest parses as the dashboard and
+// href()s to `/undefined`, silently, in both directions.
+for (const dest of DESTINATIONS) {
+  const url = href({ ...parse('/'), dest })
+  check(`${dest} has a segment`, url.includes('undefined'), false)
+  check(`${dest} survives its own URL`, parse(url).dest, dest)
 }
 
 // ── Model ids, which are the only ids with a slash in them ───────────────────
@@ -124,14 +139,30 @@ check(
 check('context', parse('/models?ctx=32768').context, 32768)
 check('sequences', parse('/models?seq=4').concurrency, 4)
 check('numbers round trip', href(parse('/models?ctx=32768&seq=4')), '/models?ctx=32768&seq=4')
-// A URL spelling out the default says nothing a bare /models does not, and two
-// spellings of one screen is exactly what a shared link must not have.
-check('default context is omitted', href(parse(`/models?ctx=${DEFAULT_CONTEXT}`)), '/models')
-check('default sequences omitted', href(parse(`/models?seq=${DEFAULT_CONCURRENCY}`)), '/models')
-check('default context parses as null', parse(`/models?ctx=${DEFAULT_CONTEXT}`).context, null)
-check('garbage context is the default', parse('/models?ctx=abc').context, null)
-check('zero context is the default', parse('/models?ctx=0').context, null)
-check('negative sequences is the default', parse('/models?seq=-3').concurrency, null)
+// A REVERSAL, and the reason it is not a regression.
+//
+// These three used to assert the opposite: `?ctx=8192` was normalised away,
+// because absence and 8192 were the same request and one screen must not have
+// two URLs. They are not the same request any more. Absence means the
+// coordinator picks the context per model from what actually fits -- which is
+// what lets the models screen band every row on a fresh install with nothing
+// typed anywhere -- and `?ctx=8192` means somebody overrode that and every
+// verdict is taken at 8192 instead. Two questions, so two URLs, and the rule
+// is intact: one spelling per meaning.
+//
+// Dropping an explicit 8192 on the way out would silently rewrite the first
+// into the second on a link somebody shared, which is the failure the old
+// assertion was written to prevent, pointed the other way.
+check('an explicit default is kept', href(parse(`/models?ctx=${DEFAULT_CONTEXT}`)), `/models?ctx=${DEFAULT_CONTEXT}`)
+check('an explicit default parses as itself', parse(`/models?ctx=${DEFAULT_CONTEXT}`).context, DEFAULT_CONTEXT)
+check('an explicit one sequence is kept', href(parse(`/models?seq=${DEFAULT_CONCURRENCY}`)), `/models?seq=${DEFAULT_CONCURRENCY}`)
+check('no context is the coordinator choosing', parse('/models').context, null)
+check('no sequences is the coordinator choosing', parse('/models').concurrency, null)
+// Unparseable is still absent, not 8192: a URL nobody can read is not an
+// override somebody made.
+check('garbage context defers to the coordinator', parse('/models?ctx=abc').context, null)
+check('zero context defers to the coordinator', parse('/models?ctx=0').context, null)
+check('negative sequences defer to the coordinator', parse('/models?seq=-3').concurrency, null)
 check('fractional context rounds', parse('/models?ctx=4096.4').context, 4096)
 // The numbers belong to the fit question, so they ride along wherever that
 // question is being asked -- the models tab, or a model sheet over any screen.
@@ -141,6 +172,47 @@ check(
   href({ ...parse(`/spend?open=model:${HF}`), context: 32768 }),
   `/spend?open=model:${HF}&ctx=32768`,
 )
+
+// ── The deployment shape: which machines, at which degrees ───────────────────
+//
+// These ride with ctx/seq because they are the other half of the same
+// question. A verdict is only worth sending to somebody if what it was taken
+// at travels with it, and "on which machines" is as much a part of that as
+// "at what context".
+
+check('machines parse', parse('/models?on=spark-01,spark-02').on, ['spark-01', 'spark-02'])
+check('machines round trip', href(parse('/models?on=spark-01,spark-02')), '/models?on=spark-01,spark-02')
+// Sorted on the way in, so two people who ticked the same machines in a
+// different order are looking at the same URL -- and send the same request
+// body, and hit the same server-side memo key.
+check('machines sort', parse('/models?on=spark-02,spark-01').on, ['spark-01', 'spark-02'])
+check('machine order is one spelling', href(parse('/models?on=spark-02,spark-01')), '/models?on=spark-01,spark-02')
+check('a repeated machine is one machine', parse('/models?on=spark-01,spark-01').on, ['spark-01'])
+check('blank entries are dropped', parse('/models?on=spark-01,,%20').on, ['spark-01'])
+// `null` and `[]` are different requests: absent means "the planner picks",
+// which is what every URL written before this field existed meant, and the
+// empty list is a 400 with no honest answer.
+check('no machines is the planner', parse('/models').on, null)
+check('an empty list is the planner', parse('/models?on=').on, null)
+check('an empty list is not written', href(parse('/models?on=')), '/models')
+check('machines are dropped off the models tab', href({ ...parse('/spend'), on: ['spark-01'] }), '/spend')
+
+check('degrees parse', [parse('/models?tp=2&pp=1').tp, parse('/models?tp=2&pp=1').pp], [2, 1])
+check('degrees round trip', href(parse('/models?tp=2&pp=1')), '/models?tp=2&pp=1')
+// The one that `positive()` would get wrong. TP=1 against a planner that wants
+// TP=2 is an override, and collapsing it to "unset" would hand the axis back
+// to the planner it was overruling -- silently, and only in the URL.
+check('tp=1 is not the absence of tp', parse('/models?tp=1&pp=1').tp, 1)
+check('tp=1 survives being written down', href(parse('/models?tp=1&pp=1')), '/models?tp=1&pp=1')
+check('no degrees is the planner', [parse('/models').tp, parse('/models').pp], [null, null])
+// Adopted as a pair, because `parallelism` is one object on the wire: with an
+// omitted key meaning 1, "TP mine, PP the planner's" cannot be expressed at
+// all, so half a pair is completed rather than half-honoured.
+check('one axis adopts the pair', [parse('/models?tp=4').tp, parse('/models?tp=4').pp], [4, 1])
+check('one axis writes the pair', href(parse('/models?tp=4')), '/models?tp=4&pp=1')
+check('garbage degrees are the planner', parse('/models?tp=abc&pp=x').tp, null)
+check('zero degrees are the planner', parse('/models?tp=0&pp=0').tp, null)
+check('degrees are dropped off the models tab', href({ ...parse('/spend'), tp: 2, pp: 1 }), '/spend')
 
 // ── The properties themselves, over every URL above ──────────────────────────
 
@@ -157,6 +229,13 @@ const URLS = [
   `/spend?open=model:${HF}&ctx=131072`,
   '/settings?node=spark-01&dep=qwen3-30b-a3b&open=dep:qwen3-30b-a3b',
   '/nonsense?ctx=99',
+  `/models/${HF}?ctx=32768&seq=8&on=spark-4d38`,
+  '/models?on=spark-01,spark-02&tp=2&pp=1',
+  // An override that happens to equal the number the disclosure shows. It has
+  // to survive the round trip like any other, or a shared link quietly becomes
+  // "let the coordinator choose".
+  `/models/${HF}?ctx=8192&seq=1`,
+  `/spend?open=model:${HF}&on=spark-01&tp=1&pp=2`,
 ]
 
 for (const url of URLS) {

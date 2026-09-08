@@ -25,12 +25,20 @@ from control_plane.contracts import (
     RoutingConfig,
 )
 
+# Never rendered, whatever a port puts in the object. Imported rather than
+# re-typed: the secret store decides what a key renders as, and two modules
+# each holding their own "***" is two things to change on the day it stops
+# being one. Imported here rather than referenced through `config.` because
+# this module's own callers reach for `serialize.REDACTED`.
+from control_plane.providers.config import REDACTED
+# Re-exported: these read a NodeState, which the registry owns, and the
+# registry's own payloads have to apply the same rule. Callers here reach
+# for `serialize.power_reading`, so the names stay available from this
+# module too.
+from control_plane.registry.serde import power_reading, temp_reading
 from control_plane.version import same_build
 
 from . import ui_detail
-
-# Never rendered, whatever a port puts in the object.
-REDACTED = "***"
 
 
 def plain(value: Any) -> Any:
@@ -77,6 +85,15 @@ def _eligibility(
     device class today, so the reason says "cannot confirm eligible" rather
     than asserting an exclusion the system does not enforce -- conservative
     about admitting an unidentified node without overclaiming.
+
+    What it no longer covers is a machine with no GPU. That used to land here
+    too, and it is the one case where the hedge was simply wrong: a Raspberry
+    Pi is not hardware we failed to identify, it is hardware we identified as
+    having no GPU. ``probe.probe_local`` now says DeviceClass.CPU for it, and
+    a CPU node is eligible by the rule this function already had -- eligible
+    unless there is a concrete reason not to be. It still cannot carry a rank,
+    but that refusal is `addressable_memory == 0`'s to make, said where the
+    placement is actually attempted, and it names the real reason.
     """
     if not healthy:
         return False, _INELIGIBLE_UNHEALTHY
@@ -94,34 +111,28 @@ def _eligibility(
     return True, None
 
 
-def power_reading(state: NodeState) -> float | None:
-    """GPU power draw, or unknown on a machine that has no GPU to draw it.
+def memory_used_pct(state: NodeState) -> float | None:
+    """How full this node's memory is, or unknown when nothing can say.
 
-    A machine the probe found no GPU on reports host facts (memory from
-    /proc/meminfo, temperature from /sys/class/thermal, utilisation from
-    /proc/stat) and has no GPU power draw to read at all. Emitting 0 W there
-    would read as a measurement of an idle GPU rather than as the absence of
-    one, so it goes out as unknown.
+    Physical GPU memory first, matching the architecture doc's topology
+    payload. A machine with no GPU has none and falls back to the live host
+    total its own sample carries -- without a denominator its memory readout is
+    a permanent em dash, which reads as broken rather than as absent.
 
-    Shared rather than inlined because it was inlined here and nowhere else:
-    the 1 Hz metrics frame and the topology payload each sent `power_watts`
-    straight through, so one node answered `null` on /api/nodes and `0 W` on
-    /api/metrics/stream -- and the UI prefers the frame while it is fresh, so
-    the roster showed the reading this rule exists to suppress.
+    Shared for the same reason ``power_reading`` is: the topology payload
+    computed its own version that dropped the host-total fallback, so a GPU-less
+    node answered a real percentage on /api/nodes and `null` on /api/topology at
+    the same instant, for the same node, from the same sample.
+
+    ``registry.serde.memory_used_pct`` divides by *addressable* memory instead,
+    and that difference is intended: it is the planning view, and on a GB10 the
+    addressable pool is a slice of the physical one. Two questions, two
+    answers -- not a duplicate to collapse.
     """
-    return None if state.profile.gpu_count == 0 else state.power_watts
-
-
-def temp_reading(state: NodeState) -> float | None:
-    """Board temperature, unknown only when nothing exposed a thermal zone.
-
-    Deliberately weaker than the power rule: a GPU-less board usually does have
-    /sys/class/thermal, and a running machine does not sit at exactly 0.0 C, so
-    a real host reading survives as itself.
-    """
-    if state.profile.gpu_count == 0 and not state.temperature_c:
+    total = state.profile.total_memory or state.memory_total or 0
+    if not total:
         return None
-    return state.temperature_c
+    return round(state.memory_used / total * 100.0, 1)
 
 
 def node_payload(
@@ -140,11 +151,6 @@ def node_payload(
     # and the topology payload in the architecture doc both use. Admission
     # control deliberately uses addressable memory instead: that is the slice
     # the GPU can actually reach and the one Agent D budgets a fit against.
-    # Physical GPU memory first, matching the architecture doc's topology
-    # payload. A machine with no GPU has none, and falls back to the live host
-    # total its own sample carries -- without a denominator its memory readout
-    # is a permanent em dash, which reads as broken rather than as absent.
-    total = profile.total_memory or state.memory_total or 0
     # Only a difference between two builds we can both name. Two unknowns are
     # not agreement, and one unknown is not a difference -- see version.py.
     skewed = not same_build(coordinator_build, state.build)
@@ -179,9 +185,7 @@ def node_payload(
         # whenever a node's telemetry source dies while its agent stays up.
         "sample_ts": state.sample_ts or None,
         "memory_used": state.memory_used,
-        "memory_used_pct": round(state.memory_used / total * 100.0, 1)
-        if total
-        else None,
+        "memory_used_pct": memory_used_pct(state),
         # See power_reading/temp_reading: a machine with no GPU has no GPU
         # power draw to read, and 0 W would read as an idle one. Utilisation is
         # left alone -- an idle Pi really is at 0%.
@@ -190,6 +194,12 @@ def node_payload(
         "util_pct": state.utilization_pct,
         "eligible": eligible,
         "ineligible_reason": ineligible_reason,
+        # The machine the coordinator is itself running on. Not the same
+        # question as `node_id == settings.coordinator_node_id`, which is what
+        # the cluster and topology payloads answer from a setting that can be
+        # stale or unset; this comes from the registry's own enrollment of its
+        # own host, so it is true from the first instant and needs nothing
+        # configured to be right.
         "is_coordinator_host": state.is_local,
         # Which build this node is running, and whether it differs from the
         # coordinator's. `build_skew` is never true on an absent id: a node
@@ -426,6 +436,12 @@ def resolution_payload(res: Any) -> dict:
         "revision": getattr(res, "revision", None),
         "model_type": getattr(res, "model_type", ""),
         "architectures": list(getattr(res, "architectures", ()) or ()),
+        # Which endpoint family this model answers on, so the screen offering
+        # to serve it can name the route it would be served on. Duck-typed
+        # like everything else here: a resolver port that predates it reports
+        # None, and the UI treats that as text, which is what every model was
+        # before audio existed.
+        "modality": getattr(res, "modality", None),
         "max_position_embeddings": getattr(res, "max_position_embeddings", None),
         "shape": shape_payload(shape),
         # Derived, so the client never divides anything.
@@ -464,6 +480,7 @@ def resolution_payload(res: Any) -> dict:
                     "runtime": entry.runtime,
                     "level": getattr(entry.level, "value", entry.level),
                     "reason": entry.reason,
+                    "version": entry.version,
                 }
                 for entry in support.runtimes
             ],
@@ -537,6 +554,8 @@ def deployment_payload(deployment: Deployment) -> dict:
         "node_ids": list(deployment.plan.node_ids) if deployment.plan else [],
         "plan": plan_payload(deployment.plan) if deployment.plan else None,
         "fit": fit_payload(deployment.fit) if deployment.fit else None,
+        "extra_args": list(deployment.extra_args),
+        "custom_command": list(deployment.custom_command),
     }
 
 
@@ -553,7 +572,11 @@ def provider_model_payload(model: ProviderModel) -> dict:
     }
 
 
-def provider_payload(provider: Provider, spend: dict[str, Any] | None = None) -> dict:
+def provider_payload(
+    provider: Provider,
+    spend: dict[str, Any] | None = None,
+    key: dict[str, Any] | None = None,
+) -> dict:
     """Allowlist. ``api_key_ref`` is a reference -- an env var name or secret
     key -- and is safe to show; it is what the UI needs to tell the user which
     variable to set. Any resolved key material is rendered as ``***`` and
@@ -564,6 +587,12 @@ def provider_payload(provider: Provider, spend: dict[str, Any] | None = None) ->
     provider's slice in here, never the port itself. Absent (the default)
     behaves exactly like a port that does not account: the nine spend keys
     are all ``None``, never ``0``.
+
+    *key* is this provider's ``key_status()`` -- whether its reference
+    resolves and which of the environment and secrets.json answered. State and
+    provenance only; it carries no key material and could not, since neither
+    field is ever a value. Absent leaves both ``None``, which reads as "this
+    port cannot say", not as "there is no key".
     """
     payload = {
         "provider_id": provider.provider_id,
@@ -580,6 +609,11 @@ def provider_payload(provider: Provider, spend: dict[str, Any] | None = None) ->
         "models": [provider_model_payload(m) for m in provider.models],
     }
     payload.update(ui_detail.spend_fields(spend))
+    # Always both keys, so the shape does not change under a port that has no
+    # key_status(): a missing field and a null field read the same to a UI, and
+    # only one of them survives a round trip through JSON.
+    payload["key_state"] = (key or {}).get("key_state")
+    payload["key_source"] = (key or {}).get("key_source")
     return payload
 
 

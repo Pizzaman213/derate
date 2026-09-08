@@ -6,54 +6,67 @@
 import { apiUrl } from './origin'
 import { scrub } from './redact'
 import type {
+  Activity,
+  AdoptedRuntime,
+  CacheClearResult,
   Candidate,
+  CapacityReport,
   ChatMessage,
   ChatTurnMeta,
   Cluster,
-  Modality,
-  NodeHealth,
-  NodeProfile,
-  NodeStateDTO,
-  ProviderKindSpec,
-  PullAccepted,
+  CuratedModel,
   DeploymentDTO,
+  DeploymentLogs,
   Enrollment,
   EnrollmentRow,
   EnrollmentSpec,
+  EventHistory,
+  KillResult,
   LaunchRequest,
   LinkMeasurement,
+  LogHistory,
+  MemoryReportList,
   MetricsFrame,
+  Modality,
+  ModelDeleteResult,
+  ModelDetail,
+  ModelRegistryResponse,
+  ModelSearchResponse,
+  NodeHealth,
+  NodeHistory,
+  NodeProcessList,
+  NodeProfile,
+  NodeRuntime,
+  NodeStateDTO,
   PlanRequest,
   PlanResponse,
   Provider,
+  ProviderBackendOption,
+  ProviderCatalogueModel,
+  ProviderKindSpec,
   ProviderPatch,
   ProviderSpec,
+  PullAccepted,
+  QuantTable,
+  ReachReport,
+  RequestHistory,
   RoutingConfig,
   RoutingPolicy,
   ServedModel,
   Settings,
   SettingsPatch,
-  TargetKind,
-  Topology,
-  CuratedModel,
-  MemoryReportList,
-  ModelDetail,
-  ModelSearchResponse,
-  QuantTable,
-  ReachReport,
-  VariantLadder,
-  CapacityReport,
-  NodeProcessList,
-  KillResult,
-  StorageReport,
   SetupStatus,
-  CacheClearResult,
-  ModelDeleteResult,
+  ShellStatus,
+  SpeechRequest,
+  SpeechResult,
+  StorageReport,
+  TargetKind,
   TelemetryEstate,
-  NodeHistory,
-  RequestHistory,
-  EventHistory,
-  LogHistory,
+  Topology,
+  TranscriptionRequest,
+  TranscriptionResult,
+  VariantLadder,
+  VoiceLibrary,
 } from './types'
 
 /** One turn's worth of arguments for `chatStream`.
@@ -89,11 +102,32 @@ export interface Backend {
    *  ends -- including when it ended because the caller aborted, which is an
    *  outcome rather than an error and leaves the partial text standing. */
   chatStream(req: ChatStreamRequest): Promise<ChatTurnMeta>
+  /** `POST /v1/audio/speech`. One request, one audio file, no stream. */
+  speech(req: SpeechRequest, signal?: AbortSignal): Promise<SpeechResult>
+  /** `GET /v1/audio/voices?model=`. The reference clips installed beside this
+   *  deployment, and the ones it declined to offer. */
+  voices(model: string): Promise<VoiceLibrary>
+  /** `POST /v1/audio/transcriptions`. An audio file in, its text out. */
+  transcribe(req: TranscriptionRequest, signal?: AbortSignal): Promise<TranscriptionResult>
   plan(req: PlanRequest): Promise<PlanResponse>
   /** Refused by the fit gate when the verdict is WONT_FIT. Nothing starts. */
   launch(req: LaunchRequest): Promise<DeploymentDTO>
   setPolicy(servedName: string, policy: RoutingPolicy): Promise<RoutingConfig>
   admit(nodeId: string): Promise<void>
+  /** What model runtime is listening on this node, if any. Cheap enough to
+   *  call when a node sheet opens; the probe is bounded and a miss is normal. */
+  nodeRuntime(nodeId: string): Promise<NodeRuntime>
+  /** Adopt that runtime as a provider. Takes no body: the coordinator already
+   *  knows the address it probed, and accepting one from the browser would let
+   *  a click register a target pointing somewhere else. Idempotent. */
+  adoptNodeRuntime(nodeId: string): Promise<AdoptedRuntime>
+  /** Load a model into memory on that node's runtime, or evict it. Not a
+   *  cluster launch: nothing is placed and no rank is assigned. */
+  setRuntimeModel(
+    nodeId: string,
+    model: string,
+    resident: boolean,
+  ): Promise<{ done_reason: string | null }>
   /** Mint a short-lived token for one install. The response is the only
    *  time the secret is returned; it lives in `command` and nowhere else. */
   mintEnrollment(spec?: EnrollmentSpec): Promise<Enrollment>
@@ -114,6 +148,11 @@ export interface Backend {
   /** `DELETE /api/deployments/{id}`. Drains first: the deployment stops
    *  admitting immediately and in-flight requests finish. */
   stopDeployment(deploymentId: string): Promise<void>
+  /** What the launcher and the backend have said, for the sheet that shows
+   *  it. Cheap while a launch is in flight — those lines are already in the
+   *  coordinator's memory — and one bounded `sparkrun logs` afterwards, which
+   *  is why the reply says which of the two answered. Poll only the first. */
+  deploymentLogs(deploymentId: string, tail?: number): Promise<DeploymentLogs>
   /** What is holding GPU memory on a node right now. Read on demand — this
    *  costs an nvidia-smi call on the node, so it is only polled while a node
    *  sheet is open. */
@@ -142,19 +181,32 @@ export interface Backend {
   memory(): Promise<MemoryReportList>
   /** The largest model that runs right now, and the same question against
    *  the idle-hardware ceiling. The fit gate answers; nothing is computed
-   *  in the browser. */
-  /** What runs on this cluster, and how fast.
+   *  in the browser.
    *
-   *  Both arguments are nullable, and null is NOT "use the default" -- it is a
-   *  different question. A null context asks the coordinator to choose one per
-   *  model out of what actually fits, clamped to each model's own window, and
-   *  the answer comes back on `CapacityRow.context`. That is the default path,
-   *  and it is what lets a fresh install with nothing configured show real
-   *  verdicts. Sending a number instead answers a narrower question and prints
+   *  Every argument is nullable and null is not "use the default" -- it is a
+   *  question. A null context asks the coordinator to choose one per model
+   *  from what actually fits, clamped to each model's own window; that is the
+   *  default path, and it is why this screen bands every row on a fresh
+   *  install with nothing configured. Null machines means the coordinator's
+   *  own host. Sending 8192 instead would answer a narrower question and print
    *  it as though somebody had asked it. */
   capacity(
     context: number | null,
     concurrency: number | null,
+    nodeIds?: string[] | null,
+  ): Promise<CapacityReport>
+  /** The same walk, for a named set instead of the curated shortlist.
+   *
+   *  One request rather than one per model: ten single-model calls are ten hub
+   *  resolves the server can neither batch nor memoise together, and the whole
+   *  point is to answer "can I run the things I just found" without a round
+   *  trip per row. The report comes back in exactly `capacity()`'s shape, so
+   *  the two fold into one `capacityIndex`. */
+  capacityFor(
+    modelIds: string[],
+    context: number | null,
+    concurrency: number | null,
+    nodeIds?: string[] | null,
   ): Promise<CapacityReport>
   /** The contract's own quantization table. Fetched, never re-typed here: a
    *  second copy of these byte figures is a second answer, and the one that
@@ -163,14 +215,35 @@ export interface Backend {
   /** The curated shortlist, server side, so the picker and the capacity answer
    *  cannot drift apart. */
   catalog(): Promise<CuratedModel[]>
+
+  /** Every model this cluster knows about, from one place: running, on disk,
+   *  curated, served by a provider, published by one.
+   *
+   *  Deliberately carries NO fit answer -- that is a function of (model,
+   *  context, concurrency, nodes) and stays on `/api/capacity` -- and no hub
+   *  search hits, which stay on `/api/models/search` because that endpoint
+   *  resolves nothing and its answers are a query's, not a fact about this
+   *  cluster. `models()` is `/v1/models`, which is a different question
+   *  again: what the gateway will accept as a `model` right now. */
+  modelRegistry(): Promise<ModelRegistryResponse>
   /** Three sources at once, none resolved. Degrades to the local two when
    *  the hub is unreachable rather than answering empty. */
   searchModels(q: string, limit?: number): Promise<ModelSearchResponse>
   modelDetail(modelId: string): Promise<ModelDetail>
-  /** Every obtainable quantization, with this cluster's verdict on each. */
+  /** Every obtainable quantization, with this cluster's verdict on each.
+   *
+   *  `nodeIds` is the machines the board above the ladder has ticked, and it
+   *  is load-bearing rather than decorative: without it the server sized every
+   *  row on one machine while the Serve button launched onto several, and the
+   *  pane apologised for the gap in prose. The response's `sized_on` says what
+   *  the rows were actually sized against, which is what the caption states. */
   modelVariants(
     modelId: string,
-    opts?: { context?: number; concurrency?: number },
+    opts?: {
+      context?: number | null
+      concurrency?: number | null
+      nodeIds?: string[] | null
+    },
   ): Promise<VariantLadder>
   /** Node samples over a window: 1 Hz raw rows, or 1-minute/1-hour rollups
    *  when the window is too wide for raw. Answers from the registry's
@@ -207,18 +280,40 @@ export interface Backend {
   /** Whether anything is being kept at all, and how much. Same shape as
    *  `StorageReport.telemetry`. */
   historyStatus(): Promise<TelemetryEstate>
+  /** Whether a terminal can be opened, and if not, the sentence saying why.
+   *  Always answers, including when the shell is off -- that is the whole
+   *  point, so the page can explain rather than offer a button that fails.
+   *  It never reports whether a key is configured: that is information about
+   *  a secret, offered to an unauthenticated caller, for no benefit to a
+   *  legitimate one. */
+  shellStatus(): Promise<ShellStatus>
   getSettings(): Promise<Settings>
   /** 501, with a message naming why, when the patch includes a daily spend
    *  cap and no provider port can be measured against. */
   patchSettings(patch: SettingsPatch): Promise<Settings>
   providerKinds(): Promise<ProviderKindSpec[]>
+  /** Reference *names* already in secrets.json. Names only -- the values stay
+   *  on the coordinator -- so the reference field can offer what exists. */
+  providerSecretRefs(): Promise<string[]>
   pullToProvider(
     providerId: string,
     body: { model: string; allow_over_memory?: boolean },
   ): Promise<PullAccepted>
+  /** Transfers in flight and models still starting. Polled fast, because it
+   *  reads a process-local dict and the in-memory deployment list -- no
+   *  fan-out to the node agents, unlike `storage()`. */
+  activity(): Promise<Activity>
   addProvider(spec: ProviderSpec): Promise<Provider>
   removeProvider(providerId: string): Promise<void>
   patchProvider(providerId: string, patch: ProviderPatch): Promise<Provider>
+  /** The provider's whole catalogue, each row saying whether it is switched
+   *  on. Every other provider read in this client is already filtered to the
+   *  enabled models; this is the one that is not. */
+  providerModels(providerId: string): Promise<ProviderCatalogueModel[]>
+  /** One model's backend hosts, live from OpenRouter's own endpoints call --
+   *  not cached, unlike everything else this client reads. 400 for a kind
+   *  without `supports_backend_routing`. */
+  providerBackends(providerId: string, upstreamId: string): Promise<ProviderBackendOption[]>
   refreshProvider(providerId: string): Promise<Provider>
   /** Returns an unsubscribe. `onState` reports stream health so the UI can grey
    *  live values during a gap instead of freezing or zeroing them. */
@@ -281,6 +376,18 @@ export type StreamState =
 
 // ── HTTP backend ─────────────────────────────────────────────────────────────
 
+/** A numeric response header, or null.
+ *
+ *  Null rather than 0 for an absent or unparseable one: a provider sends
+ *  neither of the two this reads, and `0 Hz` on screen would be a claim about
+ *  the audio rather than a gap in what came back. */
+function numberHeader(res: Response, name: string): number | null {
+  const raw = res.headers.get(name)
+  if (raw === null) return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // Every path in this file is written as the contract spells it -- relative,
   // rooted at /api or /v1 -- and `apiUrl` is the one place a configured
@@ -306,6 +413,37 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
  *  actually wrote -- e.g. the 501 explaining why a daily spend cap cannot be
  *  enforced -- rather than the raw JSON blob. `.body` keeps the untouched text
  *  for a caller that wants more than the message. */
+/** A path plus however many query parts survived. Zero is a real answer here:
+ *  `/api/capacity` with nothing named is the default request, and appending a
+ *  bare "?" would be a second spelling of it. */
+function query(path: string, parts: string[]): string {
+  return parts.length ? `${path}?${parts.join('&')}` : path
+}
+
+/** The fit question as query parts: what context, how many sequences, which
+ *  machines. Every one of them is OMITTED when it is null.
+ *
+ *  Omission is the load-bearing behaviour, not a saving. A missing `context=`
+ *  asks the coordinator to choose one per model out of what actually fits,
+ *  clamped to the model's own window; a missing `on=` means its own host. That
+ *  is the default path for the whole models screen, and it is the reason there
+ *  is no field anywhere asking for either number before a model is chosen.
+ *  Sending `context=8192` when nobody asked for 8192 would answer a narrower
+ *  question and then print the answer as if somebody had asked it. */
+function fitQuestion(
+  context?: number | null,
+  concurrency?: number | null,
+  nodeIds?: string[] | null,
+): string[] {
+  const parts: string[] = []
+  if (context != null) parts.push(`context=${encodeURIComponent(context)}`)
+  if (concurrency != null) parts.push(`concurrency=${encodeURIComponent(concurrency)}`)
+  if (nodeIds && nodeIds.length) {
+    parts.push(`on=${nodeIds.map(encodeURIComponent).join(',')}`)
+  }
+  return parts
+}
+
 function errorMessage(status: number, path: string, body: string): string {
   try {
     const parsed = JSON.parse(body) as { error?: { message?: unknown } }
@@ -649,6 +787,107 @@ export const httpBackend: Backend = {
 
     return meta(false)
   },
+
+  async speech(
+    { model, input, voice, response_format }: SpeechRequest,
+    signal?: AbortSignal,
+  ): Promise<SpeechResult> {
+    // The second method in this file that cannot go through `req<T>`, and for
+    // the mirror-image reason `chatStream` cannot: that one awaits
+    // `res.json()` and the value is in not waiting, this one awaits it and the
+    // body is not JSON. It must also stay clear of `scrub()` -- redact.ts
+    // walks a decoded object graph, and there is nothing here to walk.
+    const path = apiUrl('/v1/audio/speech')
+    const res = await fetch(path, {
+      method: 'POST',
+      signal,
+      headers: { 'content-type': 'application/json' },
+      // `voice` omitted rather than sent as null when nobody picked one:
+      // naming no voice is a real request that means "your own", and an
+      // explicit null is a value the server would have to have an opinion
+      // about. No `speed` and no `stream` -- see SpeechRequest.
+      body: JSON.stringify({
+        model,
+        input,
+        response_format,
+        ...(voice ? { voice } : {}),
+      }),
+    })
+
+    const requestId = res.headers.get('X-Request-Id')
+
+    if (!res.ok) {
+      // A refusal is still JSON, and ApiError unwraps `{error:{message}}` into
+      // `.message` -- which the speech screen renders through Verbatim. The
+      // unknown-voice refusal lists what IS installed and the format refusals
+      // name what would have worked; rewording either destroys the only part
+      // a reader can act on.
+      throw new ApiError(res.status, await res.text().catch(() => ''), path)
+    }
+
+    const blob = await res.blob()
+    return {
+      blob,
+      contentType: res.headers.get('content-type') ?? blob.type ?? '',
+      bytes: blob.size,
+      // The runtime's own two headers. A provider sends neither, so both are
+      // null rather than 0 -- the dash rule, applied to a figure nobody
+      // reported rather than to one that came back zero.
+      durationS: numberHeader(res, 'X-Audio-Duration-Seconds'),
+      sampleRate: numberHeader(res, 'X-Audio-Sample-Rate'),
+      requestId,
+    }
+  },
+
+  async transcribe(
+    { model, file, language }: TranscriptionRequest,
+    signal?: AbortSignal,
+  ): Promise<TranscriptionResult> {
+    // The third method that cannot go through `req<T>`, and the one where
+    // using it would fail most confusingly: `req` sets
+    // `content-type: application/json`, and a multipart body carries its
+    // boundary IN that header. Setting it by hand -- to anything, including
+    // the right media type -- destroys the boundary and the server sees a
+    // body with no parts. So no `headers` at all here: `fetch` derives the
+    // full `multipart/form-data; boundary=...` from the FormData itself, and
+    // the gateway forwards those bytes verbatim under the client's own
+    // content-type (gateway/proxy.py's raw-content path).
+    const path = apiUrl('/v1/audio/transcriptions')
+    const form = new FormData()
+    form.append('model', model)
+    form.append('file', file, file.name)
+    if (language) form.append('language', language)
+
+    const res = await fetch(path, { method: 'POST', signal, body: form })
+    const requestId = res.headers.get('X-Request-Id')
+    if (!res.ok) {
+      throw new ApiError(res.status, await res.text().catch(() => ''), path)
+    }
+    // OpenAI's default `response_format` is json: `{"text": "..."}`. Not sent
+    // as a field, because the default is the one we want and a strict
+    // upstream is entitled to reject anything else. Scrubbed like any other
+    // JSON body -- it is a decoded object graph, unlike a Blob.
+    const wire = scrub((await res.json()) as { text?: unknown })
+    return {
+      text: typeof wire.text === 'string' ? wire.text : '',
+      requestId,
+    }
+  },
+
+  async voices(model: string): Promise<VoiceLibrary> {
+    const wire = await req<{
+      data?: { id?: unknown }[]
+      skipped?: unknown[]
+    }>(`/v1/audio/voices?model=${encodeURIComponent(model)}`)
+    return {
+      voices: (wire.data ?? [])
+        .map((v) => v.id)
+        .filter((id): id is string => typeof id === 'string'),
+      skipped: (wire.skipped ?? []).filter(
+        (note): note is string => typeof note === 'string',
+      ),
+    }
+  },
   plan: (body) =>
     req<PlanResponse>('/api/plan', { method: 'POST', body: JSON.stringify(body) }),
   launch: (body) =>
@@ -663,6 +902,17 @@ export const httpBackend: Backend = {
     }),
   admit: (nodeId) =>
     req<void>(`/api/nodes/${encodeURIComponent(nodeId)}/admit`, { method: 'POST' }),
+  nodeRuntime: (nodeId) =>
+    req<NodeRuntime>(`/api/nodes/${encodeURIComponent(nodeId)}/runtime`),
+  adoptNodeRuntime: (nodeId) =>
+    req<AdoptedRuntime>(`/api/nodes/${encodeURIComponent(nodeId)}/runtime`, {
+      method: 'POST',
+    }),
+  setRuntimeModel: (nodeId, model, resident) =>
+    req<{ done_reason: string | null }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/runtime/model`,
+      { method: 'POST', body: JSON.stringify({ model, resident }) },
+    ),
   mintEnrollment: (spec = {}) =>
     req<Enrollment>('/api/enroll', { method: 'POST', body: JSON.stringify(spec) }),
   enrollments: () => req<EnrollmentRow[]>('/api/enroll'),
@@ -688,6 +938,7 @@ export const httpBackend: Backend = {
   memory: () => req<MemoryReportList>('/api/memory'),
   quantTable: () => req<QuantTable>('/api/models/quant-table'),
   catalog: () => req<CuratedModel[]>('/api/catalog'),
+  modelRegistry: () => req<ModelRegistryResponse>('/api/models'),
   // A model id contains "/", and proxies and ASGI servers disagree about
   // whether %2F is decoded before routing -- there is a Vite dev proxy in the
   // chain too. So the id travels as a query parameter, encoded once.
@@ -699,26 +950,34 @@ export const httpBackend: Backend = {
     req<ModelDetail>(`/api/models/detail?model_id=${encodeURIComponent(modelId)}`),
   modelVariants: (modelId, opts) =>
     req<VariantLadder>(
-      `/api/models/variants?model_id=${encodeURIComponent(modelId)}` +
-        `&context=${opts?.context ?? 8192}` +
-        `&concurrency=${opts?.concurrency ?? 1}`,
+      query(`/api/models/variants`, [
+        `model_id=${encodeURIComponent(modelId)}`,
+        ...fitQuestion(opts?.context, opts?.concurrency, opts?.nodeIds),
+      ]),
     ),
-  capacity: (context, concurrency) => {
-    // Omitted rather than defaulted. An absent parameter is what asks the
-    // coordinator to choose; sending a number it did not choose would put a
-    // figure next to a row it was not computed for.
-    const params = [
-      context === null ? null : `context=${encodeURIComponent(context)}`,
-      concurrency === null ? null : `concurrency=${encodeURIComponent(concurrency)}`,
-    ].filter((p): p is string => p !== null)
-    return req<CapacityReport>(
-      `/api/capacity${params.length ? `?${params.join('&')}` : ''}`,
-    )
-  },
+  capacity: (context, concurrency, nodeIds) =>
+    req<CapacityReport>(
+      query('/api/capacity', fitQuestion(context, concurrency, nodeIds)),
+    ),
+  capacityFor: (modelIds, context, concurrency, nodeIds) =>
+    req<CapacityReport>(
+      query('/api/capacity', [
+        ...fitQuestion(context, concurrency, nodeIds),
+        // Each id encoded, joined on a literal comma. The %2F trap this file
+        // documents above is about PATH segments and proxy routing; a query
+        // value is safe, and `searchModels` already sends a "/" inside `q`.
+        `models=${modelIds.map(encodeURIComponent).join(',')}`,
+      ]),
+    ),
   stopDeployment: (deploymentId) =>
     req<void>(`/api/deployments/${encodeURIComponent(deploymentId)}`, {
       method: 'DELETE',
     }),
+  deploymentLogs: (deploymentId, tail) =>
+    req<DeploymentLogs>(
+      `/api/deployments/${encodeURIComponent(deploymentId)}/logs` +
+        (tail ? `?tail=${tail}` : ''),
+    ),
   nodeProcesses: (nodeId) =>
     req<NodeProcessList>(`/api/nodes/${encodeURIComponent(nodeId)}/processes`),
   killProcess: (nodeId, pid) =>
@@ -759,6 +1018,7 @@ export const httpBackend: Backend = {
       }, ['exclude']),
     ),
   historyStatus: () => req<TelemetryEstate>('/api/history/status'),
+  shellStatus: () => req<ShellStatus>('/api/shell/status'),
   clearResolverCache: () =>
     req<CacheClearResult>('/api/storage/cache/resolver', { method: 'DELETE' }),
   deleteCachedModel: (nodeId, folder) =>
@@ -770,15 +1030,27 @@ export const httpBackend: Backend = {
   patchSettings: (patch) =>
     req<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
   providerKinds: () => req<ProviderKindSpec[]>('/api/providers/kinds'),
+  providerSecretRefs: async () =>
+    (await req<{ refs?: string[] }>('/api/providers/secret-refs')).refs ?? [],
   pullToProvider: (providerId, body) =>
     req<PullAccepted>(`/api/providers/${encodeURIComponent(providerId)}/pull`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+  activity: () => req<Activity>('/api/activity'),
   addProvider: (spec) =>
     req<Provider>('/api/providers', { method: 'POST', body: JSON.stringify(spec) }),
   removeProvider: (providerId) =>
     req<void>(`/api/providers/${encodeURIComponent(providerId)}`, { method: 'DELETE' }),
+  providerModels: (providerId) =>
+    req<ProviderCatalogueModel[]>(
+      `/api/providers/${encodeURIComponent(providerId)}/models`,
+    ),
+  providerBackends: (providerId, upstreamId) =>
+    req<ProviderBackendOption[]>(
+      `/api/providers/${encodeURIComponent(providerId)}/backends` +
+        `?upstream_id=${encodeURIComponent(upstreamId)}`,
+    ),
   patchProvider: (providerId, patch) =>
     req<Provider>(`/api/providers/${encodeURIComponent(providerId)}`, {
       method: 'PATCH',

@@ -8,6 +8,7 @@ import type { SafeMetricsFrame } from '../state/useMetrics'
 import { NodeInspector } from '../inspectors/node/NodeInspector'
 import { DeploymentInspector } from '../inspectors/DeploymentInspector'
 import { ModelInspector } from '../tabs/models/ModelInspector'
+import { runners } from '../tabs/cluster/layout'
 
 // The one modal host (mockups-next: a single `#sheet`/`#cardBody` pair reused
 // by both the node inspector and the deployment inspector). Each inspector
@@ -106,17 +107,19 @@ export function Sheet() {
   if (!sheet) return null
 
   // Three sizes. A model carries a quantization ladder, which needs the wide
-  // card for the same reason the deployment inspector does; a node carries its
-  // own telemetry over a window, what it is serving, the requests that ran on
-  // it and its logs, which is a page rather than a card.
+  // card. A node carries its own telemetry over a window, what it is serving,
+  // the requests that ran on it and its logs, which is a page rather than a
+  // card -- and a deployment is now the same shape: two columns, the backend
+  // log filling the right one, which a 700px card would have squeezed to two
+  // narrow strips.
   //
   // Note that bare `.card` sets no max-height at all -- only `.wide` and
   // `.full` do. That is fine now every long inspector is one of the two, and
   // the only thing left on `.card` is `Gone`, which is two lines.
   const size =
-    sheet.kind === 'node'
+    sheet.kind === 'node' || sheet.kind === 'dep'
       ? 'card full'
-      : sheet.kind === 'dep' || sheet.kind === 'model'
+      : sheet.kind === 'model'
         ? 'card wide'
         : 'card'
 
@@ -208,7 +211,14 @@ function SheetBody({
     )
   }
 
-  const dep = cluster?.deployments.find((d) => d.served_name === sheet.id)
+  // A sheet is addressed by served name, and the ledger can hold several rows
+  // under one: three failed attempts at a model that is now up are four rows
+  // named the same thing, in store order. Taking the first match opened the
+  // oldest corpse of a model that is serving right now. A live row wins; the
+  // ledger row is the fallback, so a model whose every attempt failed still
+  // opens and still says why.
+  const named = cluster?.deployments.filter((d) => d.served_name === sheet.id) ?? []
+  const dep = runners(named)[0] ?? named[0]
   if (!dep) return <Gone id={sheet.id} onClose={onClose} />
   const cfg = routing?.find((c) => c.served_name === sheet.id) ?? null
   return (

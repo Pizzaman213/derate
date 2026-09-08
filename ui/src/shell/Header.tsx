@@ -1,14 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { plainClick, useRouter, type Dest } from '../state/router'
 import { useCluster, useSettings } from '../state/resources'
 import { useMetrics } from '../state/metrics'
-import { Lamp } from '../components/Lamp'
+import { applyTheme, loadTheme } from '../theme'
 
 const DESTS: { id: Dest; label: string }[] = [
   { id: 'dash', label: 'Dashboard' },
   { id: 'models', label: 'Models' },
   { id: 'cluster', label: 'Cluster' },
-  { id: 'storage', label: 'Storage' },
   { id: 'chat', label: 'Chat' },
   { id: 'spend', label: 'Spend' },
   { id: 'settings', label: 'Settings' },
@@ -18,9 +17,12 @@ interface Props {
   dest: Dest
 }
 
-/** The wordmark, the roster pill, the destination tabs, the theme control, and
- *  the one lamp that says whether the metrics stream is actually connected --
- *  everything mockups-next/derate.html puts in `<header>`. */
+/** The wordmark, the roster pill, and the destination tabs -- everything
+ *  mockups-next/derate.html puts in `<header>`. A dropped metrics stream
+ *  turns the bar's own rule line red (see .stream-fault in derate.css)
+ *  instead of a separate lamp. The theme control that used to live here
+ *  moved to Settings -> Appearance; this still applies the stored theme on
+ *  load so it takes effect on every destination, not only that one. */
 export function Header({ dest }: Props) {
   useTheme()
   const { linkTo, navigate } = useRouter()
@@ -36,8 +38,19 @@ export function Header({ dest }: Props) {
   ).length
 
   return (
-    <header>
-      <svg width="32" height="24" viewBox="0 0 64 50" aria-label="derate">
+    <header className={stale ? 'stream-fault' : undefined}>
+      {/* The monogram's solid stroke sits above the icon's own bounding-box
+          centre -- the faint echo stroke below it doesn't carry the same
+          visual weight -- so flex centring against the wordmark leaves the
+          mark looking high. Nudged down to match; SetupTab's copy of this
+          mark gets the same offset in setup.css. */}
+      <svg
+        width="32"
+        height="24"
+        viewBox="0 0 64 50"
+        aria-label="derate"
+        style={{ transform: 'translateY(2px)' }}
+      >
         <path
           d="M26 25 V39 H56"
           fill="none"
@@ -89,73 +102,15 @@ export function Header({ dest }: Props) {
           </a>
         ))}
       </nav>
-
-      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <Lamp
-          signal={stale ? 'fault' : stream.status === 'open' ? 'live' : 'idle'}
-          hollow={stale}
-          label={
-            stale
-              ? 'metrics stream disconnected, retrying'
-              : stream.status === 'open'
-                ? 'metrics stream connected'
-                : 'connecting'
-          }
-        />
-        <span className="unit">
-          {stale
-            ? `stream lost, retrying in ${Math.round(stream.retryInMs / 1000)} s`
-            : stream.status === 'open'
-              ? 'live'
-              : 'connecting'}
-        </span>
-      </span>
-
-      <ThemeToggle />
     </header>
   )
 }
 
-// ── Theme ────────────────────────────────────────────────────────────────────
-// Transplanted from the old App.tsx verbatim: dark mode is a token swap.
-
-type Theme = 'system' | 'light' | 'dark'
-
-/** Dark mode is a token swap. Nothing here touches a component. */
+/** Applies the stored theme once on mount, so it takes effect app-wide
+ *  regardless of which destination renders first. The control that changes
+ *  it lives in Settings -> Appearance (tabs/settings/AppearanceCard.tsx). */
 function useTheme(): void {
   useEffect(() => {
-    const stored = (localStorage.getItem('derate.theme') as Theme) ?? 'system'
-    apply(stored)
+    applyTheme(loadTheme())
   }, [])
-}
-
-function apply(theme: Theme) {
-  const root = document.documentElement
-  if (theme === 'system') root.removeAttribute('data-theme')
-  else root.setAttribute('data-theme', theme)
-  localStorage.setItem('derate.theme', theme)
-}
-
-function ThemeToggle() {
-  const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem('derate.theme') as Theme) ?? 'system',
-  )
-  return (
-    <label>
-      <span className="sr-only">Colour scheme</span>
-      <select
-        value={theme}
-        onChange={(e) => {
-          const t = e.target.value as Theme
-          setTheme(t)
-          apply(t)
-        }}
-        style={{ fontSize: 12, padding: '2px 6px' }}
-      >
-        <option value="system">System</option>
-        <option value="light">Light</option>
-        <option value="dark">Dark</option>
-      </select>
-    </label>
-  )
 }

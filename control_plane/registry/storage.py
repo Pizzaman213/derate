@@ -68,6 +68,7 @@ ESTATE: tuple[tuple[str, str, str, str], ...] = (
     ("enrollments", "Enrollment tokens", "enrollments.json", "file"),
     ("links", "Link measurements", "links.json", "file"),
     ("settings", "Settings", "settings.json", "file"),
+    ("models", "Model registry", "models.db", "file"),
     ("providers", "Provider config", "providers.json", "file"),
     ("secrets", "Provider keys", "secrets.json", "file"),
 )
