@@ -19,12 +19,19 @@
 # public once, or an anonymous `docker pull` returns a 401 that reads exactly
 # like the "repository does not exist" failure this replaces.
 #
-# `dev` builds too, and only ever as :dev. The default branch owns :latest --
-# install.sh defaults to it and enroll_api.INSTALL_BRANCH points at main -- so
-# a dev push must never move the tag a stranger's `curl ... | sh` resolves.
-# Run a dev build with:
+# `dev` builds too, into a package of its own: derate/node-dev. Deliberately
+# not a :dev tag on derate/node -- the two would share one package page and one
+# `docker pull`-shaped mistake, and install.sh defaults to
+# `ghcr.io/pizzaman213/derate/node:latest`, so the cost of confusing them is a
+# stranger's cluster running unreviewed code. Two names cannot be confused by a
+# typo. Within node-dev, :latest means the newest dev build, which is what
+# somebody testing one wants to type:
 #
-#     DERATE_IMAGE=ghcr.io/pizzaman213/derate/node:dev ./install.sh
+#     DERATE_IMAGE=ghcr.io/pizzaman213/derate/node-dev:latest ./install.sh
+#
+# A package GHCR has not seen before is created PRIVATE. node-dev needs the
+# same one-time flip to public that node needed, or that pull answers 401 --
+# which reads exactly like the "no such repository" failure it is not.
 #
 # `verify` is the better half of why dev is on the list: the check now runs on
 # the branch the work is on, instead of first reporting on main, where a red
@@ -42,7 +49,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/pizzaman213/derate/node
+  # One package per branch, resolved once here. dev builds derate/node-dev;
+  # main, a version tag and a manual dispatch build derate/node, which is what
+  # install.sh pulls and what every enrolled node is already running.
+  IMAGE: ghcr.io/pizzaman213/derate/node${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
 
 jobs:
   # Everything that can fail without hardware. Cheap relative to a two-arch
@@ -143,12 +153,18 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          # :latest tracks the default branch, same as install.sh and
-          # enroll_api.INSTALL_BRANCH. `event=branch` is what gives dev its own
-          # :dev tag, moved by every push to the branch; nothing but main ever
-          # touches :latest.
+          # :latest is the newest build of whichever package this is -- main's
+          # for node, dev's for node-dev. It cannot cross between them: the
+          # image name did the separating before this rule is read, which is
+          # the whole reason dev has a package rather than a tag. install.sh
+          # and enroll_api.INSTALL_BRANCH resolve node:latest, and only a push
+          # to main can move it.
+          #
+          # The branch tag stays alongside it, so the same digest is also
+          # addressable as node-dev:dev by where it came from rather than by
+          # how recent it is.
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' }}
             type=ref,event=branch
             type=ref,event=tag
             type=sha,format=long

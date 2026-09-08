@@ -385,8 +385,12 @@ build"* rather than as a fabricated id.
 
 `.github/workflows/publish-image.yml` resolves it the same way for the images
 that are actually published — a `git rev-parse --short=12 HEAD` step after the
-checkout, into the same build arg — so `:latest` and `:dev` name the commit
-they were built from. They did not until 2026-09-08: CI passed no build arg at
+checkout, into the same build arg — so both published packages name the commit
+they were built from. There are two: `derate/node`, built from `main` and from
+a `v*` tag, which is what install.sh pulls; and `derate/node-dev`, built from
+every push to `dev`. Separate packages rather than a `:dev` tag on the first
+one, so that no pull of `derate/node` can reach an unreviewed build; the build
+id is how you tell two images from the same branch apart once you have one. They did not until 2026-09-08: CI passed no build arg at
 all, and every image in the registry reported an unidentified build. The `ARG`
 now sits at the very end of the final stage rather than the top, because the
 value changes on every commit and BuildKit chains cache keys through the image
