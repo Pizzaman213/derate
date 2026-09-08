@@ -49,10 +49,9 @@ _IMAGE_PATH = Path("/opt/derate/install.sh")
 _REPO_PATH = Path(__file__).resolve().parents[2] / "install.sh"
 
 # Where the first node's copy comes from, since there is no coordinator to ask
-# yet. One constant, named in the UI and the README too; it moves to `main`
-# when this lands there.
+# yet. One constant, named in the UI and the README too.
 INSTALL_REPO = "Pizzaman213/derate"
-INSTALL_BRANCH = "integration"
+INSTALL_BRANCH = "main"
 PUBLIC_INSTALL_URL = (
     f"https://raw.githubusercontent.com/{INSTALL_REPO}/{INSTALL_BRANCH}/install.sh"
 )

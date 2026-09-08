@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-I started this while bringing up an agent swarm for Jarvis, my self-hosted coding agent. The containers kept crashing and I had no way to watch them — which one died, why, or whether it ever had the memory to run at all. So I built derate.
+I started this while bringing up an agent swarm for Jarvis, my self-hosted coding agent. The containers kept crashing and I had no way to watch them — which one died, why, or whether it ever had the memory to run at all. So I built derate. Built it in 48 hours, 32 of them spent actually building.
 
 Planning and orchestration for DGX Spark clusters, for any model you want to run. It measures how fast your machines actually talk to each other, works out from that how to split a model across them, refuses launches that would run out of memory, and puts every model behind a single endpoint.
 
@@ -55,7 +55,7 @@ under Docker Desktop, `--gpus` needs the NVIDIA container toolkit, and
    on `:8080`. That alone is a working single-node cluster.
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/integration/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh | sh
    ```
 
 2. **Open `http://<machine one>:8080`.** A setup walkthrough runs on the first
@@ -244,5 +244,3 @@ If you are running derate in production, please open an issue first and say
 what you are building on. The gateway has no inbound authentication yet, and
 there are things worth knowing about sizing and placement that are cheaper to
 hear before the deploy than after it.
-
-Target: NVIDIA GTC Berlin Golden Ticket, submission window closes September 10, 2026.

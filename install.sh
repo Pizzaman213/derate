@@ -2,7 +2,7 @@
 # derate installer. One command per machine, no configuration.
 #
 #   # the first node -- it becomes the coordinator and serves the UI on :8080
-#   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/integration/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh | sh
 #
 #   # every node after -- the UI's "Add a node" card composes this line for you,
 #   # token and address already filled in

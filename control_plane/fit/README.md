@@ -38,7 +38,7 @@ on `FitResult.ok`, never on `verdict is FITS`: `FITS_DEGRADED` means the model
 loads and decodes below `DEGRADED_TPS_THRESHOLD` (10.0 tok/s), which is
 sometimes exactly what somebody wants.
 
-Four refusals exist and they are ordered. A plan wanting more ranks than the
+Three refusals exist and they are ordered. A plan wanting more ranks than the
 supplied GPUs is refused first. Then negative headroom, diagnosed by
 `_diagnose` into `weights`, `kv_cache` or `combined`. Then a context past the
 model's own `native_window` — not a memory question at all, and the reason says
@@ -47,8 +47,9 @@ free, and a launch here died on `max_model_len (780800) is greater than ...
 max_position_embeddings (40960.0)` thirty minutes into a readiness wait,
 because nothing upstream of the runtime knew to say no first. That check runs
 *after* headroom, because a model whose weights alone do not fit is refused for
-that reason first — a smaller context would not fix it. Then the degraded
-bandwidth verdict, then `FITS`.
+that reason first — a smaller context would not fix it. `FITS_DEGRADED` follows,
+then `FITS`; neither is a refusal, and `limiting_term` is `"bandwidth"` and
+`"none"` on them.
 
 The exported helpers are used outside the class: `memory_breakdown`,
 `weight_bytes_per_rank`, `replicated_bytes_per_rank`, `activation_bytes`,
@@ -74,8 +75,8 @@ bytes_per_param()` and subtracted out, floored at zero.
 
 ### The refusal strings are the product
 
-`_weights_reason`, `_kv_reason` and `_combined_reason` are a third of this file
-and the reason the file is worth its length. Three details in them are
+`_weights_reason`, `_kv_reason` and `_combined_reason` are the last 150 lines of
+the file and the reason it is worth its length. Three details in them are
 load-bearing:
 
 - **`_gib_vs` widens precision until two side-by-side figures differ.** "15.6
@@ -119,10 +120,11 @@ could spend — it is what was left at the moment we looked.
 ## `capacity.py`
 
 `largest_runnable(shapes, nodes, ...)` returns one `CapacityRow` per shape and
-the largest that fits, tied on active parameters, "since that is what decides
-whether it is usable once loaded". Each row records the context and `max_seqs`
-it was actually judged at, so a derived-per-model context does not leave one
-number at the top of a report describing rows it does not describe.
+the largest that fits — `max` over `total_params`, the honest reading of
+"largest model", since a row carries no active-parameter figure to break a tie
+on. Each row records the context and `max_seqs` it was actually judged at, so a
+derived-per-model context does not leave one number at the top of a report
+describing rows it does not describe.
 
 `_walk` climbs down the ladder: the native dtype first, then every scheme below
 it in `QUANT_SUGGESTION_ORDER`, stopping at the first that is not `WONT_FIT`. It
@@ -137,9 +139,9 @@ row carries a warning saying the weights were priced from the formula. Pricing
 q4_k_m weights from measured bf16 bytes would fabricate exactly the sort of
 number `weight_bytes` was introduced to remove.
 
-`probe_plan(node_ids, tp)` and `_single_node_plan` are placements *stated*, not
-searched for, with `measured_link_gbps` pinned at 0.0 so a capacity answer can
-never be mistaken for a planner result. Capacity means "what runs on these
+`probe_plan(node_ids, tensor_parallel)` and `_single_node_plan(node_ids)` are
+placements *stated*, not searched for, with `measured_link_gbps` pinned at 0.0
+so a capacity answer can never be mistaken for a planner result. Capacity means "what runs on these
 machines as they stand"; "what could run if we replanned the cluster around it"
 needs a target and a link measurement and belongs to `POST /api/plan`.
 
@@ -186,10 +188,13 @@ implementations of that question are two answers to it on the same screen.
 `contracts/ports.py` — which declares five positional parameters and neither
 keyword. So the arguments are passed by `inspect.signature` probe, not by
 `try/except TypeError`, which would also swallow a genuine TypeError raised
-inside the port. A port with no `max_context` at all degrades to
-`FALLBACK_CONTEXT` (8192) rather than taking the request down; the launch path
-refuses separately and loudly when there is no fit gate, and that refusal is not
-this function's to pre-empt.
+inside the port. A port with no `max_context` at all returns
+`_clamp_context(0, native_window)` — the model's own window where the resolver
+found one, `FALLBACK_CONTEXT` (8192) where it did not — rather than taking the
+request down; `FALLBACK_CONTEXT` is the bare fallback only on the other path,
+where the port raised and the exception was logged. The launch path refuses
+separately and loudly when there is no fit gate, and that refusal is not this
+function's to pre-empt.
 
 ## `kv.py`
 
@@ -215,6 +220,11 @@ KV heads replicates the heads instead of splitting them — and MLA has nothing 
 split by head at all, so every TP rank holds the whole cache. `stage_fraction`
 charges the *busiest* pipeline stage: 80 layers over 3 stages is 27/27/26, and
 the node that OOMs is the one holding 27.
+
+`kv_bytes_per_token` is the full-attention *rate* and `kv_cache_bytes` the real
+total: multiplying the rate by the context is right for a dense model and
+over-charges a windowed one by multiples, which is why every term in
+`calculator.py` goes through the total.
 
 `kv_elem_bytes` reads `"auto"` as the model's own dtype only when that dtype is
 something a cache can be stored in; a model whose weights are mxfp4 still caches
@@ -248,18 +258,20 @@ taken.
 It lived in `ui/src/api/catalog.ts`, which was fine while the picker was its
 only consumer. The capacity answer needs the same list, and that answer has to
 come from the fit gate rather than the browser, so the list moved here and the
-UI fetches it. `gateway/capacity_api.py` and `inventory/api.py` both import it.
+UI fetches it from `GET /api/catalog`, which is `catalog_payload()` and nothing
+else. `gateway/capacity_api.py` and `inventory/api.py` both import it.
 
 ## `constants.py`
 
-Six of the tuning knobs, three of which do not exist in `contracts/constants.py`
-today and so run on the local default: `ACTIVATION_CHUNK_TOKENS` (2048),
+Eight names, three of them read through `getattr(_k, NAME, default)` against
+`contracts/constants.py`, which defines none of the three today — so all three
+run on the local default: `ACTIVATION_CHUNK_TOKENS` (2048),
 `DECODE_EFFICIENCY` (0.55 — real runtimes land near half the pure
 memory-bandwidth ceiling) and `CONTEXT_ROUNDING` (512, because page sizes are
-powers of two and a suggestion of 18944 is easier to act on than 18991). Each is
-read through `getattr(_k, NAME, default)`, so contracts always win the moment
-they define one. `MAX_CONTEXT_SEARCH` (2^21) and `MAX_SEARCH_NODES` (64) are
-local outright.
+powers of two and a suggestion of 18944 is easier to act on than 18991).
+Contracts win the moment they define one, without an edit here.
+`MAX_CONTEXT_SEARCH` (2^21), `MAX_SEARCH_NODES` (64), `KV_ELEM_BYTES`,
+`KV_FALLBACK_DTYPE` and `QUANT_SUGGESTION_ORDER` are local outright.
 
 `KV_ELEM_BYTES` is deliberately not `BYTES_PER_PARAM`: sub-byte weight
 quantization schemes do not apply to the cache, and runtimes cache in fp8 at the
@@ -309,7 +321,7 @@ never pulls the package in.
 from control_plane.fit import FitCalculator
 
 result = FitCalculator().check(req, nodes, allocatable=budgets)
-if not result.ok:                 # covers FITS and FITS_DEGRADED
+if not result.ok:                 # .ok is FITS and FITS_DEGRADED; this is WONT_FIT
     refuse(result.reason)         # rendered verbatim, never summarised
 ```
 
@@ -382,10 +394,12 @@ sentence that says what to change.
 - **`max_context` throws inside `ladder_context` or `context_for`.** Logged, and
   the rung is skipped or the context degrades to `FALLBACK_CONTEXT`. Never 0,
   which would be a refusal dressed as a choice.
-- **No rung on the ladder holds the model.** `ladder_context` returns
-  `(CONTEXT_ROUNDING, None)` and lets the following walk produce the gate's own
-  refusal, naming the term and the overflow, rather than a sentence invented in
-  that function.
+- **No rung clears `MIN_USEFUL_CONTEXT`.** The best-quality rung that held any
+  context at all is returned anyway — a cramped answer beats refusing to
+  answer. Only when no rung holds even one page does `ladder_context` return
+  `(CONTEXT_ROUNDING, None)`, which lets the following walk produce the gate's
+  own refusal, naming the term and the overflow, rather than a sentence
+  invented in that function.
 
 `tests/test_fit.py` (57 tests) and `tests/test_live_memory.py` (34 tests) gate
 all of it.

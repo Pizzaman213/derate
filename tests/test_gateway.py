@@ -4663,28 +4663,51 @@ def test_plan_forwards_context_length_and_kv_dtype_to_the_planner():
     assert seen_calls == [(32768, "fp8")]
 
 
+def _off_the_loop():
+    """Where a port call landed: (thread name, is this the event loop?).
+
+    ``asyncio.get_running_loop()`` succeeds only on a thread that is *running*
+    a loop, so its RuntimeError is the direct evidence that M-14 wrapped the
+    call in ``to_thread`` -- and it is evidence no event loop implementation
+    can spell differently.
+
+    This used to assert the worker's *name* began with "asyncio_", which is
+    ``BaseEventLoop.run_in_executor``'s ``thread_name_prefix``. uvloop's
+    ``run_in_executor`` builds its default executor as a bare
+    ``ThreadPoolExecutor()`` with no prefix, so those same threads are named
+    "ThreadPoolExecutor-N_0" and the assertion failed on a correct build. It
+    only ever reached uvloop in CI: uvicorn <= 0.35 sets the event loop policy
+    process-globally when it starts (`uvloop_setup`), so the first
+    ``RunningServer`` in the file leaves every later ``TestClient`` portal on a
+    uvloop loop, and requirements.txt pins `uvicorn[standard]==0.34.0`, which
+    brings uvloop with it. The name is a detail of one loop; running off it is
+    the contract.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        on_loop = False
+    else:
+        on_loop = True
+    return threading.current_thread().name, on_loop
+
+
 def test_plan_and_fit_port_calls_run_off_the_event_loop():
-    # asyncio.to_thread's default executor names its workers "asyncio_N"
-    # (thread_name_prefix='asyncio' in BaseEventLoop.run_in_executor) --
-    # distinct from both pytest's MainThread and the event-loop thread
-    # TestClient/anyio runs the ASGI app on. Recording the thread name from
-    # inside each port call is a direct check that M-14 wrapped it in
-    # to_thread, not just a check that it avoided one specific thread.
     seen_threads = {}
 
     class RecordingResolver(StubResolver):
         def resolve(self, model_id, dtype=None):
-            seen_threads["resolver"] = threading.current_thread().name
+            seen_threads["resolver"] = _off_the_loop()
             return super().resolve(model_id, dtype)
 
     class RecordingPlanner(StubPlanner):
         def plan(self, shape, nodes, link, target, concurrency, **kw):
-            seen_threads["planner"] = threading.current_thread().name
+            seen_threads["planner"] = _off_the_loop()
             return super().plan(shape, nodes, link, target, concurrency, **kw)
 
     class RecordingFit(StubFit):
         def check(self, req, nodes):
-            seen_threads["fit"] = threading.current_thread().name
+            seen_threads["fit"] = _off_the_loop()
             return super().check(req, nodes)
 
     deps = build_deps()
@@ -4697,8 +4720,11 @@ def test_plan_and_fit_port_calls_run_off_the_event_loop():
         )
     assert reply.status_code == 200
     assert seen_threads.keys() == {"resolver", "planner", "fit"}
-    for name in seen_threads.values():
-        assert name.startswith("asyncio_"), seen_threads
+    for name, on_loop in seen_threads.values():
+        assert not on_loop, seen_threads
+        # ...and not run inline on the caller either, which would block the
+        # test's own thread rather than the gateway's loop.
+        assert name != "MainThread", seen_threads
 
 
 # ---------------------------------------------------------------------------

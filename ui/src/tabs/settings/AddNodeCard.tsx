@@ -321,11 +321,11 @@ function clock(seconds: number): string {
 /** The repository URL, which only the coordinator knows for certain.
  *
  *  Hardcoded here as the fallback and taken from the mint response when there
- *  is one: the branch moves when this lands on main, and `enroll_api.py` is
- *  where that constant lives. A UI that guessed it would go stale silently.
+ *  is one: `enroll_api.py` is where that constant lives. A UI that guessed it
+ *  would go stale silently.
  */
 const FALLBACK_INSTALL_URL =
-  'https://raw.githubusercontent.com/Pizzaman213/derate/integration/install.sh'
+  'https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh'
 
 function firstNodeCommand(minted: Enrollment | null): string {
   return `curl -fsSL ${minted?.public_install_url ?? FALLBACK_INSTALL_URL} | sh`
