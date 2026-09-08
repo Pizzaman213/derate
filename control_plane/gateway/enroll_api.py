@@ -107,8 +107,32 @@ def _coordinator_origin(ctx: GatewayContext, request: Request) -> str:
 
 
 def build_command(origin: str, token: str) -> str:
-    """The one line to paste on the new machine. Composed in exactly one place."""
+    """The one line to paste on the new machine. Composed in exactly one place.
+
+    The Docker form, and still the default: it is what a Linux GPU node runs.
+    Kept as its own function and its own response field so nothing that already
+    reads ``command`` has to change.
+    """
     return f"curl -fsSL {origin}/install.sh | sh -s -- --join {origin} --token {token}"
+
+
+def build_commands(origin: str, token: str) -> dict[str, str]:
+    """The join line. Still composed in exactly one place.
+
+    One entry, and that is the claim being made: ``install.sh`` installs a
+    *container* and refuses to run anywhere Docker cannot give it host
+    networking, the GPU and the host PID namespace. Linux is what derate
+    supports today.
+
+    There were two more, ``native`` and ``windows``, and both were
+    ``pipx install derate``. **That name on PyPI is somebody else's** -- "a
+    machine wide rate limiter", coincidentally also at version 0.1.0 -- so the
+    line installed an unrelated project onto the laptop of whoever was adding
+    their first node, and looked like it had worked. Nothing rendered them,
+    which is how it survived. Do not put a platform back in this dict without
+    an installer that has been run on that platform.
+    """
+    return {"docker": build_command(origin, token)}
 
 
 def create_router(ctx: GatewayContext) -> APIRouter:
@@ -213,6 +237,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # not a credential the UI stores or a field it can reach into. No
         # endpoint anywhere returns the permanent cluster token.
         body["command"] = build_command(origin, token.token)
+        # Additive: the Docker line above is unchanged for every existing
+        # reader, and "commands" carries the same token for the two
+        # platforms that cannot run it.
+        body["commands"] = build_commands(origin, token.token)
         body["join_url"] = origin
         body["install_url"] = f"{origin}/install.sh"
         body["public_install_url"] = PUBLIC_INSTALL_URL
