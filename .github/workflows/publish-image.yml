@@ -77,58 +77,23 @@ jobs:
         working-directory: ui
         run: npm run build
 
-      # There is no UI test runner. These verifiers ARE the UI's test suite,
-      # and each exists because a class of bug is invisible to types: the URL
-      # scheme, the graph layout, the quantization ladder, the QR encoder.
+      # There is no UI test runner. The *.check.mjs verifiers ARE the UI's
+      # test suite, and each exists because a class of bug is invisible to
+      # types: the URL scheme, the graph layout, the quantization ladder, the
+      # QR encoder.
       #
-      # Only the ones that need nothing but this checkout.
+      # This step used to discover them here and carry its own `case` statement
+      # deciding which to skip -- a second copy of a fact each verifier already
+      # states in its header, and one that was already wrong: registry needs a
+      # live coordinator and was not on the list.
       #
-      # Left out, each for a reason that is not "it is flaky":
-      #   tabs/{chat,models,spend}/rows.check.mjs, tabs/settings/allowlist -- they
-      #     drive themselves from a live coordinator on :8088, deliberately,
-      #     because checking a type against the real wire is the whole point of
-      #     them. There is no cluster on a runner to answer.
-      #   state/history.check.mjs -- its fixtures are real payloads captured
-      #     from a coordinator's archive and are not in the repo; it prints the
-      #     curl lines to recapture them.
-      # keyfield.check.mjs shells out to the Python, not to a server, so it runs.
+      # Both now live in ui/check.mjs, which reads each file's `// requires:`
+      # line, probes once, and reports a skip as a skip. A runner has no
+      # coordinator, no captured fixtures and no browser, so those verifiers
+      # skip here and are named in the output rather than counted as passes.
       - name: Verifiers
         working-directory: ui
-        run: |
-          set -eu
-          # Discovered, not listed. The verifiers ARE this UI's test suite --
-          # there is no runner -- and each exists because a class of bug is
-          # invisible to types. A hard-coded list silently stops covering a
-          # verifier the moment somebody renames or adds one, which is the same
-          # failure as not having it at all.
-          #
-          # Skipped, each for a reason that is not flakiness:
-          #   */rows.check.mjs (chat, models, spend) and settings/allowlist --
-          #     they drive themselves from a live coordinator on :8088,
-          #     deliberately, because checking a type against the real wire is
-          #     the whole point of them. No runner has a cluster to answer.
-          #   state/history -- its fixtures are real payloads captured from a
-          #     coordinator's archive and are not in the repo; running it prints
-          #     the curl lines to recapture them.
-          # settings/keyfield shells out to the Python, not to a server, so it
-          # runs here.
-          ran=0
-          for f in $(find src -name '*.check.mjs' | sort); do
-            case "$f" in
-              */chat/rows.check.mjs|*/models/rows.check.mjs|*/spend/rows.check.mjs) skip=live ;;
-              */settings/allowlist.check.mjs)                                      skip=live ;;
-              */state/history.check.mjs)                                           skip=fixtures ;;
-              *)                                                                   skip= ;;
-            esac
-            if [ -n "$skip" ]; then echo "-- skip ($skip) $f"; continue; fi
-            echo "== $f"
-            node "$f"
-            ran=$((ran + 1))
-          done
-          # A glob that matched nothing would otherwise pass silently, which is
-          # the one way this step could lie about having run.
-          [ "$ran" -gt 0 ] || { echo "no verifiers ran"; exit 1; }
-          echo "$ran verifier(s) passed"
+        run: npm run check
 
   publish:
     needs: verify
