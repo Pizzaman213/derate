@@ -501,7 +501,7 @@ _DELETE_TIMEOUT_S = 120.0
 #: a judgement ``deploy.fsm`` owns -- importing the original would run the
 #: deploy package __init__ and pull the manager, the sparkrun adapter and the
 #: event bus into this request module to obtain one frozenset.
-#: ``tests/test_single_source.py`` holds the two equal.
+#: ``tests/unit/test_single_source.py`` holds the two equal.
 _TERMINAL_STATES = states.TERMINAL
 
 #: The states that mean "on its way but not yet serving" -- what /api/activity

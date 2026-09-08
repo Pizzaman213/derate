@@ -24,7 +24,7 @@ from control_plane.gateway.restart import RestartCoordinator
 from control_plane.telemetry.events import GatewayEvents, RESTART_ATTEMPTED, RESTART_EXHAUSTED
 
 from tests.fixtures import MODEL_SHAPES, wont_fit
-from tests.test_gateway import FakeDeployments, StubFit, build_deps, make_deployment
+from tests.unit.test_gateway import FakeDeployments, StubFit, build_deps, make_deployment
 
 FAST_BACKOFF = (0.01, 0.01, 0.01)
 

@@ -4,7 +4,7 @@ Two corpora, because they answer two different questions.
 
 ``--corpus`` (the default) reads every ``tests/resolver_data/*.config.json``
 and compares the result against ``EXPECTED.json`` beside them. Hermetic, about
-a second, and it is what ``tests/test_model_corpus.py`` gates the suite on.
+a second, and it is what ``tests/unit/test_model_corpus.py`` gates the suite on.
 This is the regression net: a config that resolves today has to keep resolving,
 with the same numbers.
 

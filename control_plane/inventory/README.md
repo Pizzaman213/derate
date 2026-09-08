@@ -278,7 +278,7 @@ there would call a finished download partial.
 **No fit verdict and no credential field ever reaches a row.** A verdict is an
 answer to a question -- (model, context, concurrency, node set) -- and a row
 here carrying one would be asserting a verdict nobody asked for; it stays on
-`/api/capacity` and the UI joins it on. `tests/test_inventory_api.py` asks for
+`/api/capacity` and the UI joins it on. `tests/unit/test_inventory_api.py` asks for
 both structurally, over field *names*: a substring search for a key would miss
 `api_key: '***'` and would also fire on a payload behaving correctly, since a
 provider whose key does not resolve reports a `last_error` naming the reference,
@@ -311,10 +311,10 @@ and that sentence is the product telling an operator what to fix.
   path here is `BEGIN IMMEDIATE` / `COMMIT` with that rollback, so a half-written
   merge is not a reachable state.
 
-`tests/test_inventory.py` (24 tests) gates the merge and the ways it could
+`tests/unit/test_inventory.py` (24 tests) gates the merge and the ways it could
 quietly lie -- a source dropping out, an unreachable node reading as an empty
 disk, a verdict appearing for a question nobody asked -- and
-`tests/test_inventory_api.py` (9 tests) gates the wire, including that the route
+`tests/unit/test_inventory_api.py` (9 tests) gates the wire, including that the route
 is reachable with the UI mounted and that it does not shadow `capacity_api`'s
 four literal paths.
 

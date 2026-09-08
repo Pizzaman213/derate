@@ -8,12 +8,12 @@ modality the gateway reports -- text to /v1/chat/completions, embeddings to
 /v1/audio/transcriptions -- because "all the models" on a mixed cluster is not
 one endpoint.
 
-    python3 loadtest.py                                  # TUI on localhost:8088
-    python3 loadtest.py --list
-    python3 loadtest.py --model qwen2.5:0.5b -c 16
-    python3 loadtest.py --all --no-tui --duration 30      # free targets only
-    python3 loadtest.py --base http://spark-01:8088 -c 64 --no-stream
-    python3 loadtest.py --all --hammer                    # as hard as it goes
+    python3 tests/load/loadtest.py                                  # TUI on localhost:8088
+    python3 tests/load/loadtest.py --list
+    python3 tests/load/loadtest.py --model qwen2.5:0.5b -c 16
+    python3 tests/load/loadtest.py --all --no-tui --duration 30      # free targets only
+    python3 tests/load/loadtest.py --base http://spark-01:8088 -c 64 --no-stream
+    python3 tests/load/loadtest.py --all --hammer                    # as hard as it goes
 
 There are two ways to push, and they measure different things.
 
@@ -106,7 +106,7 @@ ENDPOINT_FOR_MODALITY = {
 #: a synthesised clip and a recorded one of the same length are the same load,
 #: exactly. What silence cannot tell you is whether the words come back, and
 #: that is a different question, asked by the round trip in
-#: tests/test_gateway.py rather than by a throughput harness.
+#: tests/unit/test_gateway.py rather than by a throughput harness.
 #:
 #: --audio still exists for when the audio should be real.
 DRIVABLE = ("text", "embedding", "speech", "transcription")
@@ -426,7 +426,7 @@ def synth_wav(seconds: float, rate: int, nonce: str) -> bytes:
     this file is: it imports nothing from control_plane and nothing from PyPI
     but httpx, and a load harness that needs libsndfile installed before it
     can measure a transcription server is one nobody runs. The header layout
-    is the same one tests/test_tts_runtime.py::wav writes; restated, not
+    is the same one tests/unit/test_tts_runtime.py::wav writes; restated, not
     imported, on the same rule as ENDPOINT_FOR_MODALITY.
 
     The samples are not silence -- the nonce is expanded into them -- but it
@@ -2056,7 +2056,7 @@ def raise_fd_limit() -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="loadtest.py",
+        prog="tests/load/loadtest.py",
         description="Load-test the derate gateway: one model or all of them.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

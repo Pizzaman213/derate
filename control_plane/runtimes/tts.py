@@ -92,7 +92,7 @@ DEFAULT_MAX_NEW_TOKENS = 512
 #: launch from that; this is the same sentence for the runtime we write.
 #:
 #: Changing the wording means changing the copy in ``_RUNTIME_FATAL`` in the
-#: same commit. ``tests/test_tts_runtime.py`` asserts the two match.
+#: same commit. ``tests/unit/test_tts_runtime.py`` asserts the two match.
 FATAL_MARKER = "fatal: the speech server failed to start."
 
 

@@ -9,7 +9,7 @@ N hosts without ever picking N.
 
 **Nothing here hardcodes a bandwidth.** If a driver update turns GPUDirect RDMA
 on and the measured all-reduce doubles, the answer flips on its own —
-`tests/test_planner.py::test_no_bandwidth_is_hardcoded_in_the_planner` greps
+`tests/unit/test_planner.py::test_no_bandwidth_is_hardcoded_in_the_planner` greps
 every `.py` in this folder for a literal shaped like one, because a planner that
 hardcodes the number it exists to measure has quietly stopped being the product.
 
@@ -279,7 +279,7 @@ while `human_bytes`, `link_seconds`, `compute_seconds_per_step` and
 `check_degrees`, `DegreeRefusal`, `IllegalDegrees` and the three degree
 validators from `legality`; `NodeGroup`, `POOLING_HAZARD` and the four topology
 helpers; and five of `constants.py`'s eight values, which is why
-`tests/test_planner.py` imports `MIN_NODES_FOR_CROSS_NODE_EP` from the package
+`tests/unit/test_planner.py` imports `MIN_NODES_FOR_CROSS_NODE_EP` from the package
 rather than from the module. All of it is in `__all__`, and
 `gateway/internal_api.py` imports seven of those names at module scope, so
 removing one is not a refactor.
@@ -287,7 +287,7 @@ removing one is not a refactor.
 ## `constants.py`
 
 Anything the whole system shares lives in `contracts/constants.py` and is
-imported, never re-declared — `tests/test_planner.py::test_thresholds_come_from_contracts`
+imported, never re-declared — `tests/unit/test_planner.py::test_thresholds_come_from_contracts`
 asserts that neither `TP_VIABLE_THRESHOLD` nor `EP_VIABLE_THRESHOLD` appears in
 this file's source. What is here is how the planner weighs one strategy against
 another, and every value carries the measurement it came from:
@@ -322,7 +322,7 @@ measurement and must not be shown to a user as if it were".
 
 Its docstring says it is deleted at integration and that any import of it
 afterwards is the bug. Today its only importers are this package's `__init__.py`
-and `tests/test_planner.py`: the gateway, `contracts/routes.py` and the load
+and `tests/unit/test_planner.py`: the gateway, `contracts/routes.py` and the load
 harness all compose `gateway/stubs.py::StubPlanner`, which is a different class.
 
 ## The seam with the gateway and the node

@@ -312,7 +312,7 @@ def test_importing_logfiles_does_not_pull_the_provider_stack():
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "False []", out.stdout

@@ -102,7 +102,7 @@ most misleading answer this resolver can give about a quantization catalogue.
 `evaluate_runtime(runtime, architectures, dtype)` answers per runtime and
 `build_verdict` answers for all three at once. `RUNTIMES` holds `vllm`,
 `sglang` and `tts`; `contracts/derived.py` records it as a copy of
-`deploy/flags.py::SUPPORTED_RUNTIMES`, so `tests/test_single_source.py` fails if
+`deploy/flags.py::SUPPORTED_RUNTIMES`, so `tests/unit/test_single_source.py` fails if
 the two stop naming the same set.
 
 `VLLM_ARCHITECTURES` is generated from the image this project launches —
@@ -497,7 +497,7 @@ compatible.
 ## The model tester
 
 `tests/model_sweep.py` (723 lines) is how a change to this package is proved not
-to have moved a number, and `tests/test_model_corpus.py` gates the suite on it.
+to have moved a number, and `tests/unit/test_model_corpus.py` gates the suite on it.
 
 ```bash
 python3 -m tests.model_sweep              # the checked-in corpus, hermetic, ~1s
@@ -622,8 +622,8 @@ take a repository path, and no runtime here claims to load llama.cpp's format.
   local directory and a local `.gguf` still resolve, because neither needs the
   network.
 
-`tests/test_resolver.py` (162 tests), `tests/test_model_corpus.py` (23),
-`tests/test_imageprobe.py` (18) and `tests/test_avatars.py` (8) gate all of it.
+`tests/unit/test_resolver.py` (162 tests), `tests/unit/test_model_corpus.py` (23),
+`tests/unit/test_imageprobe.py` (18) and `tests/unit/test_avatars.py` (8) gate all of it.
 
 ## Deliberately not built
 

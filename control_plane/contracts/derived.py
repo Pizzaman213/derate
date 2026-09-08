@@ -17,7 +17,7 @@ comparing.
 Two lists per fact, because they fail differently:
 
 ``copies``
-    Resolvable ``module:attr`` names. ``tests/test_single_source.py`` imports
+    Resolvable ``module:attr`` names. ``tests/unit/test_single_source.py`` imports
     each and asserts it equals the canonical value. These cannot drift silently.
 
 ``restated_at``

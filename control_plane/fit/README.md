@@ -327,7 +327,7 @@ if not result.ok:                 # .ok is FITS and FITS_DEGRADED; this is WONT_
 
 `contracts/derived.py` records one crossing in the other direction:
 `control_plane.fit.calculator:_gib` is a declared copy of
-`control_plane.humanize:binary_bytes`, and `tests/test_single_source.py` fails
+`control_plane.humanize:binary_bytes`, and `tests/unit/test_single_source.py` fails
 if the two stop matching. The formatter left this package because the gateway's
 download strings need the same ladder; it stayed out of `planner/comm.py` on
 purpose, because that one formats transfer volumes beside decimal GB/s
@@ -401,7 +401,7 @@ sentence that says what to change.
   own refusal, naming the term and the overflow, rather than a sentence
   invented in that function.
 
-`tests/test_fit.py` (57 tests) and `tests/test_live_memory.py` (34 tests) gate
+`tests/unit/test_fit.py` (57 tests) and `tests/unit/test_live_memory.py` (34 tests) gate
 all of it.
 
 ## Deliberately not built

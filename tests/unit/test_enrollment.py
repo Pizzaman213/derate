@@ -40,9 +40,9 @@ from control_plane.registry.identity import CLUSTER_FILE
 from control_plane.registry.roster import ROSTER_FILE
 
 from tests.fixtures import SPARK_01, SPARK_02
-from tests.test_registry import FakeClient, make_registry, run
+from tests.unit.test_registry import FakeClient, make_registry, run
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = REPO_ROOT / "install.sh"
 
 

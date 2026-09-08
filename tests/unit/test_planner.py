@@ -662,7 +662,7 @@ def test_no_bandwidth_is_hardcoded_in_the_planner():
     never fall in that range. Contract imports (``TP_VIABLE_THRESHOLD``, a
     name, not a number) and docstrings/comments are unaffected either way.
     """
-    package = pathlib.Path(__file__).resolve().parent.parent / "control_plane" / "planner"
+    package = pathlib.Path(__file__).resolve().parents[2] / "control_plane" / "planner"
     banned = re.compile(r"(?<![\w.])([1-9]\d\.\d{1,2}|9\.0)(?![\w])")
 
     for path in sorted(package.glob("*.py")):
@@ -676,7 +676,7 @@ def test_no_bandwidth_is_hardcoded_in_the_planner():
 def test_thresholds_come_from_contracts():
     """The planner must not keep its own copy of a shared constant."""
     source = (
-        pathlib.Path(__file__).resolve().parent.parent
+        pathlib.Path(__file__).resolve().parents[2]
         / "control_plane" / "planner" / "constants.py"
     ).read_text()
 

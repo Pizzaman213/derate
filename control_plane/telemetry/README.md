@@ -462,8 +462,8 @@ misbehaving.
   bundle's own `reason`, except `/api/history/nodes`, which falls back to the
   registry's 300-sample in-RAM ring and labels it `durable: false`.
 
-`tests/test_telemetry.py` (53 tests) gates this package, with
-`tests/test_history_api.py` covering the routes above it.
+`tests/unit/test_telemetry.py` (53 tests) gates this package, with
+`tests/unit/test_history_api.py` covering the routes above it.
 
 ## Deliberately not built
 

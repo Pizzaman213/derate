@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-I started this while bringing up an agent swarm for Jarvis, my self-hosted coding agent. The containers kept crashing and I had no way to watch them — which one died, why, or whether it ever had the memory to run at all. So I built derate. Built it in 48 hours, 32 of them spent actually building.
+I started this while bringing up an agent swarm for Jarvis, my self-hosted coding agent. The containers kept crashing and I had no way to watch them — which one died, why, or whether it ever had the memory to run at all. So I built derate.
 
 Planning and orchestration for DGX Spark clusters, for any model you want to run. It measures how fast your machines actually talk to each other, works out from that how to split a model across them, refuses launches that would run out of memory, and puts every model behind a single endpoint.
 

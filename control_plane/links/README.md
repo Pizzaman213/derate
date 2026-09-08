@@ -49,7 +49,7 @@ needs nothing installed.
 `_run_test` exports `NCCL_DEBUG=INFO` and `NCCL_DEBUG_SUBSYS=INIT,NET` and
 stops there — `NCCL_NET_GDR_LEVEL`, `NCCL_IB_DISABLE` and their relatives stay
 untouched. The point is to measure what this cluster does, not what it could be
-coaxed into doing, and `tests/test_links.py::test_the_probe_does_not_tamper_with_the_transport_it_is_measuring`
+coaxed into doing, and `tests/unit/test_links.py::test_the_probe_does_not_tamper_with_the_transport_it_is_measuring`
 asserts both names are absent from every argv the probe built.
 
 **`_ClientSideMixin` runs the client half from endpoint a, not from here.**
@@ -409,7 +409,7 @@ saying so.
 - **The same node twice.** `measure` raises `ValueError("a link needs two
   distinct nodes")`; `get` on a self-pair is `None`.
 
-`tests/test_links.py` (930 lines, 66 tests) gates all of it, and is written
+`tests/unit/test_links.py` (930 lines, 66 tests) gates all of it, and is written
 around the two failure modes rather than around coverage: a figure that is subtly
 wrong, and a figure that is honest about being a guess. Its headline assertion is
 `test_real_spark_pair_lands_in_the_acceptance_band_with_gdr_off` — 8 to 12 GB/s

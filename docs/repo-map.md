@@ -1,6 +1,6 @@
 # The repository root
 
-Thirteen files sit above the packages, and they answer four questions: what
+Twelve files sit above the packages, and they answer four questions: what
 this is, how it gets onto a machine, what it is pinned against, and how hard
 you can push it. Nothing at this level is imported by the running system except
 `install.sh`, which the coordinator serves to the next node.
@@ -18,7 +18,6 @@ you can push it. Nothing at this level is imported by the running system except
 | `compose.yaml` | 127 | the optional single-node equivalent of the `docker run` |
 | `pyproject.toml` | 55 | the package, the console script, pytest and ruff config |
 | `requirements.txt` | 23 | the runtime pins the image installs directly |
-| `loadtest.py` | 2306 | a standalone load tester against the public API |
 | `.dockerignore` | 12 | what never reaches the build context |
 | `.gitignore` | 41 | what never reaches a commit |
 | `URL-BUNDLE.models-node.txt` | — | a generated planning snapshot of one URL's code path. Deleted from the working tree; recoverable with `git show HEAD:URL-BUNDLE.models-node.txt` |
@@ -62,11 +61,13 @@ rather than just a title -- inbound gateway authentication is "currently none;
 biggest gap", manual placement is "the planner has no placement field",
 coordinator-down "needs an architecture decision before any implementation".
 The first item is the only one under **Evidence**, and it is the honest one:
-the README's claim that pipeline parallel beats tensor parallel at ~10 GB/s is
-still an assertion, `tests/load/` is the harness that would settle it, and it is
-blocked because all three links currently read `measured: false`. Its header
-credits two planning documents that are no longer in the checkout. Touch it
-when something ships, or when a new gap is found with a reason attached.
+pipeline parallel beating tensor parallel head-to-head has never been
+measured on real hardware, only asserted -- the README no longer makes that
+claim either, since the section that once did was cut rather than backed with
+data -- `tests/load/` is the harness that would settle it, and it is blocked
+because all three links currently read `measured: false`. Its header credits
+two planning documents that are no longer in the checkout. Touch it when
+something ships, or when a new gap is found with a reason attached.
 
 ## `LICENSE`
 
@@ -164,35 +165,6 @@ cancelled by then, and `asyncio.shield` does not cover an anyio cancellation.
 Linux readers do not go through it. `sparkrun` is not here -- the Dockerfile
 installs it separately, pinned by build arg.
 
-## `loadtest.py`
-
-**A client, not a test.** It points at the public gateway API, asks
-`/v1/models` what is being served, and hammers one model or all of them; it
-imports nothing from `control_plane`, which is why it also works pointed at a
-coordinator on another box. It routes by the modality the gateway reports --
-text to `/v1/chat/completions`, embeddings to `/v1/embeddings`, speech to
-`/v1/audio/speech`, transcription to `/v1/audio/transcriptions` -- because "all
-the models" on a mixed cluster is not one endpoint. Two push modes measure
-different things: closed-loop `--concurrency` slots can never overload anything
-and answer "how does it behave at N users", while `--hammer` or an explicit
-`--rps` issues on a schedule computed from the start of the run and answers
-"where does it break", ramping until a bar trips and reporting the last rung
-that held. Every request is measured against three clocks -- latency from when
-it was *due*, service from when it was sent, and the send delay between them --
-because a run that reports flat latency while the queue explodes is one that
-started its clock at send time. Paid models are excluded unless
-`--include-paid` is passed, read from `/api/providers` rather than from whether
-a target is remote. `--list` prints what is served and exits; `--no-tui` runs
-headless. `tests/test_loadtest.py` is its gate, pinning the handful of things
-that go wrong silently.
-
-**`tests/load/` is a different thing entirely.** That is an in-process harness:
-the real `create_app()` with real `GatewaySettings` on a pinned core, driven by
-up to eight driver processes against four fake vLLM runtimes on cores of their
-own, producing the gateway's derating curve. `loadtest.py` measures a cluster
-you are running; `tests/load/` measures the gateway itself under laboratory
-conditions.
-
 ## `.dockerignore` and `.gitignore`
 
 `.dockerignore` (12 lines) keeps the build context small and honest: VCS
@@ -233,7 +205,7 @@ generates it on a schedule, which is why losing it costs nothing.
 |---|---|---|
 | `control_plane/` | One package, one process, one entry point (`python3 -m control_plane.node`). Twelve subpackages composed at runtime; the ten modules beside them are the only things all twelve may import. | [`../control_plane/README.md`](../control_plane/README.md) |
 | `ui/` | The screen the gateway serves itself, at the same origin as the API -- no CORS, no second service. Typecheck plus `*.check.mjs` verifiers are the whole gate. | [`../ui/README.md`](../ui/README.md) |
-| `tests/` | pytest, roughly 1300 tests at `-m "not slow"`. Also holds the model sweep and `load/`, which is a harness rather than a suite. | [`../tests/load/README.md`](../tests/load/README.md) |
+| `tests/` | The suite is `tests/unit/`, roughly 2000 tests at `-m "not slow"`. Beside it sit the things that are not collected: the model sweep, the doc sweep, the frozen fixtures, and `load/`, which is a harness rather than a suite. | [`../tests/README.md`](../tests/README.md) |
 | `docker/` | One image on every machine, role resolved at runtime: the entrypoint, the preflight, the build script, and the two model-container Dockerfiles. | [`../docker/README.md`](../docker/README.md) |
 | `docs/` | Everything the README points at: `screenshots/`, holding the eight captures and `brand/` (generated by `build.py`, never hand-edited). This map lives here too. | [`./index.md`](./index.md) |
 | `.github/` | `workflows/publish-image.yml`, which builds and pushes the image every node pulls. A `verify` job gates the push, because a broken commit on the default branch used to become `:latest` on machines nobody is watching. | Covered in [`../docker/README.md`](../docker/README.md) |

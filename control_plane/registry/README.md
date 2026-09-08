@@ -372,7 +372,7 @@ drift from the frozen fixtures, and fall back to an inline copy inside the image
 
 It is not the gateway's stub — `gateway/stubs.py` has its own `StubRegistry`, and
 that is what `contracts/routes.py` composes. This one is reached from
-`tests/test_node_naming.py` and `tests/test_gateway_runtime.py`, and its docstring
+`tests/unit/test_node_naming.py` and `tests/unit/test_gateway_runtime.py`, and its docstring
 still says "deleted at integration", which it was not.
 
 ## `serde.py`
@@ -692,7 +692,7 @@ placed under one of them would be counted as weights and deleted with them.
   bootstraps one before the route exists, so `DERATE_SHELL=1` alone cannot produce
   a terminal that is advertised and turns everything away.
 
-`tests/test_registry.py` (206 tests) is the bulk of the gate, with
+`tests/unit/test_registry.py` (206 tests) is the bulk of the gate, with
 `test_enrollment.py` (60), `test_gpu_processes.py` (29), `test_node_naming.py` (26),
 `test_modelcache.py` (21), `test_storage.py` (20) and `test_shell.py` (17) alongside.
 

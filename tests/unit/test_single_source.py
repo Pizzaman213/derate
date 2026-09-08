@@ -1,6 +1,6 @@
 """One fact, one home, and a red test when a copy stops agreeing.
 
-``tests/test_contracts.py`` pins the shapes. This pins everything derived from
+``tests/unit/test_contracts.py`` pins the shapes. This pins everything derived from
 them -- which is where the drift actually happened, because a shape has one
 obvious home and a fact about a shape has none.
 
@@ -32,7 +32,7 @@ from control_plane import envspec
 from control_plane.contracts import derived
 from control_plane.contracts.manifest import resolve
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
+REPO = pathlib.Path(__file__).resolve().parents[2]
 
 #: Directories that are not source: build output, caches, dependencies, and the
 #: scratch trees the UI verifiers leave behind.

@@ -52,7 +52,7 @@ const check = (name, actual, expected) => {
   )
 }
 
-// Every literal from tests/test_providers.py's looks_like_secret table, plus
+// Every literal from tests/unit/test_providers.py's looks_like_secret table, plus
 // the shapes the two modes have to tell apart, plus the references derate
 // mints for itself -- which must read as names, or the UI hides its own.
 const CASES = [

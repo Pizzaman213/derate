@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from control_plane.contracts import (  # noqa: E402
     Deployment,
@@ -56,7 +56,7 @@ from control_plane.deploy.recipes import materialize, synthesize  # noqa: E402
 from control_plane.deploy.sparkrun import default_served_name, is_oom  # noqa: E402
 from tests import fixtures as fx  # noqa: E402
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 HAVE_SPARKRUN = shutil.which("sparkrun") is not None
 HAVE_DOCKER = shutil.which("docker") is not None
 

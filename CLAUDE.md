@@ -31,7 +31,7 @@ python3 -m tests.model_sweep --live    # ...or every local model the coordinator
 python3 -m tests.model_sweep --arch    # VLLM_ARCHITECTURES against the image's registry
 ```
 
-`tests/model_sweep.py` is the model tester and `tests/test_model_corpus.py`
+`tests/model_sweep.py` is the model tester and `tests/unit/test_model_corpus.py`
 gates the suite on it.
 
 The corpus mode is hermetic and compares against
@@ -68,8 +68,8 @@ python3 -m control_plane.contracts.routes --write     # every route both apps an
 python3 -m control_plane.contracts.document --write   # docs/CONTRACTS.md, from the two above
 ```
 
-`tests/test_contracts_manifest.py` fails when any of the three is stale, and
-`tests/test_single_source.py` fails when a copy of a fact stops matching the one
+`tests/unit/test_contracts_manifest.py` fails when any of the three is stale, and
+`tests/unit/test_single_source.py` fails when a copy of a fact stops matching the one
 `control_plane/contracts/derived.py` names as canonical. Add a row there rather
 than adding an assertion by hand.
 
@@ -143,7 +143,9 @@ control_plane/redaction.py the key scrubber, standard library only. It lives
 control_plane/logfiles.py  node.log and proxy.log, in one folder
 control_plane/node.py      the real entry point: one process, role at runtime
 ui/                        the screen. See ui/README.md, which is thorough.
-tests/                     pytest. tests/load/ is a harness, not a suite.
+tests/                     the suite is tests/unit/; everything beside it is not
+                           collected -- the sweeps, fixtures/, resolver_data/, and
+                           load/, which is a harness rather than a suite.
 docs/screenshots/          every image the README shows, and one README over
                            both halves of it. The eight PNGs are promoted by hand
                            out of ui/screens/ after `npm run screens`.

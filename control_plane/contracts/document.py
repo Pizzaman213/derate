@@ -34,7 +34,7 @@ _HEADER = """# Contracts, as the code has them
     python3 -m control_plane.contracts.routes --write
     python3 -m control_plane.contracts.document --write
 
-`tests/test_contracts_manifest.py` fails when any of the three is stale, so
+`tests/unit/test_contracts_manifest.py` fails when any of the three is stale, so
 what follows is what the code said at the last commit that ran the suite.
 
 This is the lookup surface. `00-architecture.md` is the design record and the
@@ -92,7 +92,7 @@ def render() -> str:
     out.append("\n## Derived facts\n")
     out.append(
         "\nFacts about the shapes above that live outside `contracts/`, and every\n"
-        "site that restates one. `tests/test_single_source.py` holds the copies to\n"
+        "site that restates one. `tests/unit/test_single_source.py` holds the copies to\n"
         "the canonical value.\n"
     )
     for name, fact in m["derived"].items():
@@ -118,7 +118,7 @@ def render() -> str:
 
     out.append("\n## Environment\n")
     out.append(
-        "\nEvery variable the tree reads. `tests/test_single_source.py` fails on one\n"
+        "\nEvery variable the tree reads. `tests/unit/test_single_source.py` fails on one\n"
         "that is read and not declared here, and on two readers disagreeing about a\n"
         "default. A blank default means absence is itself the answer.\n"
     )

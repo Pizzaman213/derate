@@ -335,7 +335,7 @@ sees those; every non-loopback interface being a veth (`ifindex != iflink`) is
 exactly what a bridged container gets, and that is the only branch that refuses.
 `BRIDGE_MESSAGE` prints the interfaces it saw, the `--network host` run line,
 `network_mode: host` for compose, and names `DERATE_ALLOW_BRIDGE`. Five tests in
-`tests/test_deploy.py` import this file by path.
+`tests/unit/test_deploy.py` import this file by path.
 
 ## `placeholder_app.py`
 
@@ -352,7 +352,7 @@ One line in it is still load-bearing as a record. `AGENT_PORT` defaults to
 — and not to `PORT`, which is what it used to do. Defaulting it to `PORT` made
 the two equal whenever only `DERATE_PORT` was named, which silently collapsed
 the "serve on both ports" branch below into serving on one, with no error either
-way. `tests/test_single_source.py::test_no_two_readers_of_a_variable_disagree_about_its_default`
+way. `tests/unit/test_single_source.py::test_no_two_readers_of_a_variable_disagree_about_its_default`
 is that fault turned into a gate. `serve()` carries the other one: `EADDRINUSE`
 becomes a sentence naming which variable moves the port, because under host
 networking a collision is with something the operator already runs.
@@ -434,7 +434,7 @@ under `PYTHONDONTWRITEBYTECODE=1`, because importing vLLM to run the check
 writes 60 MB of `.pyc` across its tree and would bake it into the image; a
 build-time assertion must not change what ships. No `ENTRYPOINT` and, unlike
 `tts.Dockerfile`, no `CMD` either.
-`tests/test_deploy.py::test_the_audio_dockerfile_builds_on_the_image_it_is_a_layer_over`
+`tests/unit/test_deploy.py::test_the_audio_dockerfile_builds_on_the_image_it_is_a_layer_over`
 asserts the `BASE` line, both package args, and `load_audio` with `44100`.
 
 ## `entrypoint.sh`
@@ -496,7 +496,7 @@ the `vllm-audio` default relies on. `DERATE_TTS_IMAGE` also works and is one
 restart away from being lost; it was lost that way once, and the next launch
 went straight back to `manifest unknown`. Prefer the local tag.
 
-`tests/test_gateway.py::_IMAGE_MISSING` is the same fact written down as a skip:
+`tests/unit/test_gateway.py::_IMAGE_MISSING` is the same fact written down as a skip:
 `manifest unknown`, `image distribution failed`, `failed to ensure local image`
 and `pull access denied` turn a live launch test into a skip rather than a
 failure, on the reasoning that this is the one launch failure that is a fact
@@ -602,6 +602,6 @@ deployment cannot tell the two apart.
 
 **No coordinator image and no worker image.** The Dockerfile has one
 `ENTRYPOINT` and no `--target`, and
-`tests/test_deploy.py::test_dockerfile_ships_one_image_with_the_required_shape`
+`tests/unit/test_deploy.py::test_dockerfile_ships_one_image_with_the_required_shape`
 asserts both, along with the `/agent/health` health check and the absence of
 `/api/cluster` from it.

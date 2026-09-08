@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
-from tests.test_gateway import build_deps
+from tests.unit.test_gateway import build_deps
 
 
 @pytest.fixture(autouse=True)

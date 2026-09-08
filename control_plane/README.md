@@ -35,7 +35,7 @@ Nothing from `gateway`, `deploy`, `providers`, `fit`, `planner`, `links` or
 `resolver` is imported at module scope; every one of those imports lives inside
 `build_gateway_deps` or `_serve_coordinator`, so a worker process never pulls
 httpx, uvicorn's gateway stack or a fit calculator into memory.
-`tests/test_node.py::test_worker_never_builds_gateway_deps` is the gate on that.
+`tests/unit/test_node.py::test_worker_never_builds_gateway_deps` is the gate on that.
 
 `_install_shutdown` is split out of `_run_with_signals` so the shutdown
 behaviour can be exercised with plain fake objects, without a real OS signal or
@@ -125,7 +125,7 @@ estate. The entrypoint bridges them by hand
 (`DERATE_DATA_DIR="${DERATE_DATA_DIR:-$DERATE_DATA}"`), which works, and is
 exactly the kind of bridge nobody remembers on the fifth variable.
 
-`is_declared(name)` is the predicate `tests/test_single_source.py` greps the
+`is_declared(name)` is the predicate `tests/unit/test_single_source.py` greps the
 whole tree with. `None` as a default means absence is itself the answer -- an
 absent `DERATE_TOKEN` makes the coordinator generate one, which is not the same
 as an empty string.
@@ -249,7 +249,7 @@ trust. So anything non-zero steps down through MiB and KiB, while a genuine zero
 still prints `0.0 GiB`, because an empty comm buffer is a real zero and should
 look like one. `contracts/derived.py` names this the canonical
 `binary_byte_formatter` and declares `fit.calculator:_gib` a copy;
-`tests/test_single_source.py` fails when they stop matching.
+`tests/unit/test_single_source.py` fails when they stop matching.
 
 ## `procmatch.py`
 
@@ -314,7 +314,7 @@ module. Every other module here is a leaf: the traffic is one-way, upward.
 - **`humanize.py`** goes to `fit/calculator.py` and `gateway/internal_api.py`.
 - **`procmatch.py`** goes to `deploy/manager.py` and `gateway/gpu_procs.py`.
 - **`envspec.py`** is read by `contracts/manifest.py::reflect_env` and by
-  `tests/test_single_source.py`, and by nothing at runtime.
+  `tests/unit/test_single_source.py`, and by nothing at runtime.
 - **`logfiles.py`** is installed by exactly two entrypoints: `node.py::main` and
   `gateway/main.py`, both immediately after `basicConfig`, both using
   `logfiles.LOG_FORMAT` so a line copied out of a file reads the same as one
@@ -362,7 +362,7 @@ caller asking where the estate is should not have the side effect of making one.
 about to write.
 
 **`envspec.default` is the literal as written at the reading site, not a
-normalized value.** `tests/test_single_source.py` compares them by string:
+normalized value.** `tests/unit/test_single_source.py` compares them by string:
 `test_declared_defaults_match_what_the_code_actually_falls_back_to` fails when a
 declaration drifts from the `os.environ.get` beside it, and
 `test_no_two_readers_of_a_variable_disagree_about_its_default` fails when two

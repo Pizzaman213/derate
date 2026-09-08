@@ -39,7 +39,7 @@ from control_plane.registry.registry import Registry
 from control_plane.registry.serde import profile_to_dict
 from control_plane.telemetry.service import Telemetry
 
-RESOLVER_DATA = Path(__file__).parent / "resolver_data"
+RESOLVER_DATA = Path(__file__).resolve().parents[1] / "resolver_data"
 
 _STUB_CLASSES = tuple(
     obj

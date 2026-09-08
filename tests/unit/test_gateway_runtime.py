@@ -2,7 +2,7 @@
 strict-deps and static-UI enablers for C-1.
 
 This file owns tests for control_plane/gateway/{app,deps,proxy,openai_api,
-metrics,stats,settings}.py. tests/test_gateway.py is a sibling package's file
+metrics,stats,settings}.py. tests/unit/test_gateway.py is a sibling package's file
 this wave; nothing here duplicates it, and nothing here imports from it, so
 this file has no dependency on how that one evolves.
 """

@@ -14,7 +14,7 @@ entrypoint bridges them by hand (``DERATE_DATA_DIR="${DERATE_DATA_DIR:-$DERATE_D
 which works and is exactly the kind of bridge nobody remembers on the fifth
 variable.
 
-``tests/test_single_source.py`` greps the tree for ``DERATE_*`` and fails on
+``tests/unit/test_single_source.py`` greps the tree for ``DERATE_*`` and fails on
 anything not declared here or matched by a :data:`DYNAMIC` pattern, so a new
 variable cannot arrive undocumented.
 
@@ -157,13 +157,13 @@ _DECLARED = (
        "dev server only: which coordinator `npm run dev` proxies to"),
 
     # -- tests, harnesses and verifiers -------------------------------------
-    _v("DERATE_TEST_NETWORK", None, "tests/test_resolver.py",
+    _v("DERATE_TEST_NETWORK", None, "tests/unit/test_resolver.py",
        "opt in to tests that reach HuggingFace"),
     _v("DERATE_LOAD_LOGS", None, "tests/load/harness.py", ""),
     _v("DERATE_STUB_PROVIDER_KEY", None, "control_plane/providers/stub.py",
        "the key reference the day-0 provider stub hands out"),
-    _v("DERATE_API_KEY", "", "loadtest.py", ""),
-    _v("DERATE_BASE_URL", "http://localhost:8088", "loadtest.py", ""),
+    _v("DERATE_API_KEY", "", "tests/load/loadtest.py", ""),
+    _v("DERATE_BASE_URL", "http://localhost:8088", "tests/load/loadtest.py", ""),
     _v("DERATE_CHECK_ORIGIN", "http://localhost:8088", "ui/src/**/*.check.mjs",
        "which coordinator the live-API verifiers talk to"),
     _v("DERATE_CHECK_STRICT", None, "ui/check.mjs",
@@ -175,9 +175,9 @@ _DECLARED = (
     _v("DERATE_TTS_DEFAULT_VOICES", "1", "control_plane/runtimes/tts.py",
        "0 leaves an empty voice directory empty instead of fetching a "
        "starter library"),
-    _v("DERATE_E2E_ORIGIN", "http://localhost:8088", "tests/test_gateway.py",
+    _v("DERATE_E2E_ORIGIN", "http://localhost:8088", "tests/unit/test_gateway.py",
        "which coordinator the audio round trip launches real models on"),
-    _v("DERATE_TEST_AUDIO", None, "tests/test_gateway.py",
+    _v("DERATE_TEST_AUDIO", None, "tests/unit/test_gateway.py",
        "cache the tts runtime's reference clip here, so rerunning the "
        "transcription half does not launch the speech model again"),
 )

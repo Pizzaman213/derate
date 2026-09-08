@@ -880,7 +880,7 @@ frozenset, `targets` as both a tuple and an inline pair, `gpu_procs` as a
 complement -- and only the first had anything checking it. `LIVE` is spelled as
 the complement of `TERMINAL` rather than listed, so a new state joins it by
 default: a state nobody has classified yet is far likelier to be live than
-finished. `tests/test_single_source.py` holds all of it equal to `deploy.fsm`
+finished. `tests/unit/test_single_source.py` holds all of it equal to `deploy.fsm`
 through `contracts/derived.py`.
 
 ## `__init__.py`
@@ -988,7 +988,7 @@ Each new module costs one `include_router` line.
 `capacity_api` owns four literal paths under `/api/models/`, and registering a
 sibling above them is how one of those would one day start answering the wrong
 handler. `inventory_api` adds only the bare `/api/models`, which collides with
-nothing; the ordering is belt and braces and `tests/test_inventory_api.py` pins
+nothing; the ordering is belt and braces and `tests/unit/test_inventory_api.py` pins
 it.
 
 ## Failure behaviour

@@ -1086,7 +1086,7 @@ def test_the_ring_answers_node_history_when_there_is_no_archive(no_telemetry):
 
     from control_plane.gateway import create_app
     from control_plane.registry.telemetry import TelemetrySample
-    import tests.test_gateway as gw
+    import tests.unit.test_gateway as gw
 
     now = time.time()
     rows = [
@@ -1158,7 +1158,7 @@ def test_a_registry_without_a_ring_still_refuses_honestly(no_telemetry):
     from fastapi.testclient import TestClient
 
     from control_plane.gateway import create_app
-    import tests.test_gateway as gw
+    import tests.unit.test_gateway as gw
 
     with TestClient(create_app(gw.build_deps())) as client:
         reply = client.get("/api/history/nodes", params={"from": "-5m"})

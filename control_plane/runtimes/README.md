@@ -76,8 +76,8 @@ on screen naming the cause. `deploy/progress.py::_RUNTIME_FATAL` carries a
 verbatim copy of the string — a copy and not an import, because `progress.py`
 runs on a node that must never import this package — and the assertion holding
 the two together is `assert tts.FATAL_MARKER in progress._RUNTIME_FATAL` in
-`tests/test_deploy.py`. Follow `tts.py`'s own docstring instead and you will
-look for it in `tests/test_tts_runtime.py`, which does not import `progress`
+`tests/unit/test_deploy.py`. Follow `tts.py`'s own docstring instead and you will
+look for it in `tests/unit/test_tts_runtime.py`, which does not import `progress`
 and does not check this.
 
 `main` splits `SystemExit` by code: 0 and `None` are `--help` printing and
@@ -256,7 +256,7 @@ has no `import` statement and no `__all__`.
 The emptiness is the point, and it is not the point people assume. Importing
 this package on a node does **not** fail: only `fastapi`, `starlette` and the
 standard library are imported at `tts.py`'s module scope, and `fastapi` is
-pinned in `requirements.txt` with `starlette` arriving under it — which is why `tests/test_tts_runtime.py` does a bare
+pinned in `requirements.txt` with `starlette` arriving under it — which is why `tests/unit/test_tts_runtime.py` does a bare
 `from control_plane.runtimes import tts` at the top and runs 33 tests in the
 ordinary suite with no torch and no GPU. What an `__init__` re-exporting
 `SpeechEngine` would cost is that property: the class is defined in the same
@@ -312,7 +312,7 @@ route, and each one has a test holding the two ends together.
   offers, `aac` deliberately absent; the second to match the returned
   `Content-Type` as a prefix.
 
-`tests/test_tts_runtime.py` (33 tests, 471 lines) gates everything about this
+`tests/unit/test_tts_runtime.py` (33 tests, 471 lines) gates everything about this
 runtime that needs no GPU. What it cannot cover, in its own words, is that the
 checkpoint loads and speaks; that was verified by running the server against
 `Audio8/Audio8-TTS-Preview-0.6b` on a GB10 and playing the result.

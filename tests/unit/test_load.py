@@ -2,7 +2,7 @@
 
 Deliberately small: the full ladder in ``tests/load`` is an exploration tool
 that takes minutes, while these are the three properties that must not silently
-regress. Run with ``pytest tests/test_load.py -m slow``.
+regress. Run with ``pytest tests/unit/test_load.py -m slow``.
 """
 
 from __future__ import annotations

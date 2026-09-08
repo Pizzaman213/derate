@@ -562,7 +562,7 @@ def create_app(
     # /api/models/, and registering a sibling above them is how one of them
     # would one day start answering the wrong handler. This one adds only the
     # bare /api/models, which collides with nothing -- the ordering is belt
-    # and braces, and tests/test_inventory_api.py pins it.
+    # and braces, and tests/unit/test_inventory_api.py pins it.
     app.include_router(inventory_api.create_router(ctx))
     # Same rule again. A GPU-less node cannot carry a rank but can host a
     # runtime, and this is the pair of routes that finds one and adopts it.

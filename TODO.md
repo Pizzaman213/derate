@@ -7,17 +7,18 @@ onboarding/model-surface/cluster item; this file is the flat checklist.
 
 ## Evidence
 
-- [ ] **Measure PP=2 against TP=2 on two Sparks and put the numbers in the
-      README.** The README's "Why this is defensible" section says pipeline
-      parallel "beats tensor parallel substantially on batched serving" at
-      ~10 GB/s. Every other claim in that section is now verbatim planner
-      output; this one is still an assertion and it is the load-bearing one.
-      `tests/load/` is the harness. Run `openai/gpt-oss-120b` at 131072
-      context and concurrency 16 both ways on `spark-4d38` and `spark-26af`,
-      and replace "substantially" with two tokens/sec figures and a ratio.
+- [ ] **Measure PP=2 against TP=2 on two Sparks and put real numbers
+      somewhere public.** No document in this repo currently claims a ratio
+      between them — the README's old "Why this is defensible" section made
+      that claim and was cut rather than backed with data, so there is
+      nothing left asserting more than the code can show, but the head-to-head
+      throughput comparison itself still doesn't exist. `tests/load/` is the
+      harness. Run `openai/gpt-oss-120b` at 131072 context and concurrency 16
+      both ways on `spark-4d38` and `spark-26af`, and write the resulting
+      tokens/sec figures and ratio into the README once they exist.
       Blocked on the link actually being probed first — all three links on
       :8088 currently read `measured: false`, so the planner is running on
-      the no-measurement rung, not on 10.2 GB/s.
+      the no-measurement rung, not on a real bandwidth figure.
 
 ## Onboarding and reach
 

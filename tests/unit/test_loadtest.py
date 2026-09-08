@@ -17,8 +17,8 @@ import wave
 import httpx
 import pytest
 
-import loadtest
-from loadtest import (
+from tests.load import loadtest
+from tests.load.loadtest import (
     HAMMER_PROMPT_FALLBACK,
     MAX_AUDIO_UPLOAD_BYTES,
     Model,
@@ -546,7 +546,7 @@ def gateway_transport():
     """A real gateway app, reachable over ASGI rather than a socket."""
     from control_plane.gateway.app import create_app
 
-    from tests.test_gateway import build_deps, two_unequal_replicas
+    from tests.unit.test_gateway import build_deps, two_unequal_replicas
 
     return httpx.ASGITransport(app=create_app(build_deps(deployments=two_unequal_replicas())))
 

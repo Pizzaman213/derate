@@ -8,7 +8,7 @@ module. Each copy was correct when written and none of them are checked.
 So this reflects rather than restates. ``dataclasses.fields()`` and
 ``Enum.__members__`` already know the answer, and a generator that asks them
 cannot itself drift; the only thing that can go stale is the checked-in
-``manifest.json``, which is exactly what ``tests/test_contracts_manifest.py``
+``manifest.json``, which is exactly what ``tests/unit/test_contracts_manifest.py``
 fails on. Nothing here is hand-written twice, because a manifest somebody has
 to remember to update is the failure mode this exists to end -- ``00-architecture.md``
 is the demonstration.

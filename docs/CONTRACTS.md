@@ -6,7 +6,7 @@
     python3 -m control_plane.contracts.routes --write
     python3 -m control_plane.contracts.document --write
 
-`tests/test_contracts_manifest.py` fails when any of the three is stale, so
+`tests/unit/test_contracts_manifest.py` fails when any of the three is stale, so
 what follows is what the code said at the last commit that ran the suite.
 
 This is the lookup surface. `00-architecture.md` is the design record and the
@@ -308,7 +308,7 @@ The interfaces components hold each other to.
 ## Derived facts
 
 Facts about the shapes above that live outside `contracts/`, and every
-site that restates one. `tests/test_single_source.py` holds the copies to
+site that restates one. `tests/unit/test_single_source.py` holds the copies to
 the canonical value.
 
 ### `binary_byte_formatter`
@@ -460,7 +460,7 @@ the canonical value.
 
 ## Environment
 
-Every variable the tree reads. `tests/test_single_source.py` fails on one
+Every variable the tree reads. `tests/unit/test_single_source.py` fails on one
 that is read and not declared here, and on two readers disagreeing about a
 default. A blank default means absence is itself the answer.
 
@@ -469,8 +469,8 @@ default. A blank default means absence is itself the answer.
 | `DERATE_AGENT_PORT` | `8081` | `control_plane/registry/agent.py` — the node agent's port; docker/placeholder_app.py defaults it to DERATE_PORT instead, which is a fork only reachable by running that file directly |
 | `DERATE_ALLOWED_ORIGINS` | `` | `control_plane/gateway/settings.py` |
 | `DERATE_ALLOW_BRIDGE` |  | `control_plane/registry/config.py` — the container refuses bridge networking unless this is set |
-| `DERATE_API_KEY` | `` | `loadtest.py` |
-| `DERATE_BASE_URL` | `http://localhost:8088` | `loadtest.py` |
+| `DERATE_API_KEY` | `` | `tests/load/loadtest.py` |
+| `DERATE_BASE_URL` | `http://localhost:8088` | `tests/load/loadtest.py` |
 | `DERATE_BUILD` |  | `control_plane/version.py` — stamped into the image; absent means a source checkout |
 | `DERATE_CACHE_DIR` |  | `control_plane/resolver/cache.py` — also read by registry/storage.py |
 | `DERATE_CHECK_BROWSER` |  | `ui/src/check/browser.mjs` — an explicit Chromium path, for a machine whose Playwright cache is somewhere the finder does not look |
@@ -479,7 +479,7 @@ default. A blank default means absence is itself the answer.
 | `DERATE_CLUSTER_ID` |  | `control_plane/registry/config.py` |
 | `DERATE_DATA` | `/data` | `docker/entrypoint.sh` — SHELL ONLY. The entrypoint bridges it onto DERATE_DATA_DIR; no Python reads it. Overriding this alone moves nothing (audit defect M-17) |
 | `DERATE_DATA_DIR` |  | `control_plane/paths.py` — unset: /data when writable, else the platform application-state dir |
-| `DERATE_E2E_ORIGIN` | `http://localhost:8088` | `tests/test_gateway.py` — which coordinator the audio round trip launches real models on |
+| `DERATE_E2E_ORIGIN` | `http://localhost:8088` | `tests/unit/test_gateway.py` — which coordinator the audio round trip launches real models on |
 | `DERATE_ELECTRICITY_RATE` | `0` | `control_plane/gateway/main.py` — currency per kWh; 0 means the spend screen shows no power cost |
 | `DERATE_ENTRYPOINT` |  | `docker/entrypoint.sh` |
 | `DERATE_GATEWAY` |  | `ui/vite.config.ts` — dev server only: which coordinator `npm run dev` proxies to |
@@ -521,8 +521,8 @@ default. A blank default means absence is itself the answer.
 | `DERATE_TELEMETRY_QUIET_LOGGERS` |  | `control_plane/telemetry/config.py` |
 | `DERATE_TELEMETRY_RETENTION_DAYS` | `30` | `control_plane/telemetry/config.py` |
 | `DERATE_TELEMETRY_SHIP_INTERVAL_S` | `5` | `control_plane/telemetry/config.py` |
-| `DERATE_TEST_AUDIO` |  | `tests/test_gateway.py` — cache the tts runtime's reference clip here, so rerunning the transcription half does not launch the speech model again |
-| `DERATE_TEST_NETWORK` |  | `tests/test_resolver.py` — opt in to tests that reach HuggingFace |
+| `DERATE_TEST_AUDIO` |  | `tests/unit/test_gateway.py` — cache the tts runtime's reference clip here, so rerunning the transcription half does not launch the speech model again |
+| `DERATE_TEST_NETWORK` |  | `tests/unit/test_resolver.py` — opt in to tests that reach HuggingFace |
 | `DERATE_TOKEN` |  | `control_plane/registry/config.py` — unset: the coordinator generates one and persists it |
 | `DERATE_TTS_DEFAULT_VOICES` | `1` | `control_plane/runtimes/tts.py` — 0 leaves an empty voice directory empty instead of fetching a starter library |
 | `DERATE_TTS_IMAGE` |  | `control_plane/deploy/flags.py` |

@@ -421,7 +421,7 @@ class FakeAgent:
 
 def _gateway(agent_url, deployments, handles=None):
     """A gateway whose registry points at a real HTTP agent."""
-    from tests.test_gateway import FakeDeployments, FakeRegistry, build_deps
+    from tests.unit.test_gateway import FakeDeployments, FakeRegistry, build_deps
     from control_plane.gateway.app import create_app
 
     class Reg(FakeRegistry):
@@ -451,7 +451,7 @@ def test_route_annotates_a_stray_and_leaves_it_killable():
 
 
 def test_route_refuses_to_kill_a_backend_the_router_is_still_using():
-    from tests.test_gateway import make_deployment
+    from tests.unit.test_gateway import make_deployment
 
     dep = make_deployment(
         "d-1",

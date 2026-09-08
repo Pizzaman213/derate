@@ -2,13 +2,17 @@
 
 Finds where the gateway breaks, and produces its derating curve.
 
+This directory holds two different things. Everything below is the in-process
+harness (`python -m tests.load`); `loadtest.py` beside it is a separate tool --
+see [`loadtest.py`](#loadtestpy) at the bottom.
+
 ```bash
 python -m tests.load calibrate   # the harness's own ceiling, always run first
 python -m tests.load rps         # offered request rate, 1 -> 200,000
 python -m tests.load stream      # concurrent SSE streams, 1 -> 8192
 python -m tests.load probes      # the cascades
 python -m tests.load all --json result.json
-pytest tests/test_load.py -m slow   # the SLO guards
+pytest tests/unit/test_load.py -m slow   # the SLO guards
 ```
 
 ## Layout
@@ -113,3 +117,37 @@ verification tool can lie.
    on a fresh cluster. It was the harness. Subprocess logs now go to files
    under `$DERATE_LOAD_LOGS`, and `error_storm` went from 873 answered plus 264
    unanswered to all 3,000 answered.
+
+## `loadtest.py`
+
+**A client, not a test, and a different thing entirely from the harness above.**
+It points at the public gateway API, asks `/v1/models` what is being served,
+and hammers one model or all of them; it imports nothing from `control_plane`,
+which is why it also works pointed at a coordinator on another box. It routes
+by the modality the gateway reports -- text to `/v1/chat/completions`,
+embeddings to `/v1/embeddings`, speech to `/v1/audio/speech`, transcription to
+`/v1/audio/transcriptions` -- because "all the models" on a mixed cluster is
+not one endpoint. Two push modes measure different things: closed-loop
+`--concurrency` slots can never overload anything and answer "how does it
+behave at N users", while `--hammer` or an explicit `--rps` issues on a
+schedule computed from the start of the run and answers "where does it break",
+ramping until a bar trips and reporting the last rung that held. Every request
+is measured against three clocks -- latency from when it was *due*, service
+from when it was sent, and the send delay between them -- because a run that
+reports flat latency while the queue explodes is one that started its clock at
+send time. Paid models are excluded unless `--include-paid` is passed, read
+from `/api/providers` rather than from whether a target is remote. `--list`
+prints what is served and exits; `--no-tui` runs headless.
+`tests/unit/test_loadtest.py` is its gate, pinning the handful of things that
+go wrong silently.
+
+```bash
+python3 tests/load/loadtest.py                     # TUI on localhost:8088
+python3 tests/load/loadtest.py --all --hammer       # as hard as it goes
+```
+
+The harness above is in-process: the real `create_app()` with real
+`GatewaySettings` on a pinned core, driven by up to eight driver processes
+against four fake vLLM runtimes on cores of their own, producing the gateway's
+derating curve under laboratory conditions. `loadtest.py` measures a cluster
+you are actually running.

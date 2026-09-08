@@ -1430,12 +1430,12 @@
     },
     "DERATE_API_KEY": {
       "default": "",
-      "owner": "loadtest.py",
+      "owner": "tests/load/loadtest.py",
       "note": ""
     },
     "DERATE_BASE_URL": {
       "default": "http://localhost:8088",
-      "owner": "loadtest.py",
+      "owner": "tests/load/loadtest.py",
       "note": ""
     },
     "DERATE_BUILD": {
@@ -1480,7 +1480,7 @@
     },
     "DERATE_E2E_ORIGIN": {
       "default": "http://localhost:8088",
-      "owner": "tests/test_gateway.py",
+      "owner": "tests/unit/test_gateway.py",
       "note": "which coordinator the audio round trip launches real models on"
     },
     "DERATE_ELECTRICITY_RATE": {
@@ -1690,12 +1690,12 @@
     },
     "DERATE_TEST_AUDIO": {
       "default": null,
-      "owner": "tests/test_gateway.py",
+      "owner": "tests/unit/test_gateway.py",
       "note": "cache the tts runtime's reference clip here, so rerunning the transcription half does not launch the speech model again"
     },
     "DERATE_TEST_NETWORK": {
       "default": null,
-      "owner": "tests/test_resolver.py",
+      "owner": "tests/unit/test_resolver.py",
       "note": "opt in to tests that reach HuggingFace"
     },
     "DERATE_TOKEN": {

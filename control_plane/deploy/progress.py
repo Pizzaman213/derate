@@ -256,7 +256,7 @@ _RUNTIME_MARKERS: tuple[tuple[str | re.Pattern[str], str], ...] = (
 #: this repository writes and therefore the one that had no marker. It is a
 #: verbatim copy of `runtimes.tts.FATAL_MARKER`; a copy rather than an import
 #: because nothing outside a model container may import that module (torch and
-#: transformers are its dependencies), and `tests/test_tts_runtime.py` asserts
+#: transformers are its dependencies), and `tests/unit/test_tts_runtime.py` asserts
 #: the two strings match so the copy cannot drift.
 #:
 #: Nothing else belongs in this tuple. A marker here ends a launch, so "looks

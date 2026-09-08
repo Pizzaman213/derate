@@ -120,6 +120,10 @@ one file per screen the URL can name.
 
 ## Everything else
 
+- [`../tests/README.md`](../tests/README.md) — the front door over the sweeps,
+  the frozen fixtures and the captured resolver corpus, with
+  [`../tests/unit/README.md`](../tests/unit/README.md) over the forty modules
+  the suite is made of.
 - [`../tests/load/README.md`](../tests/load/README.md) — finds where the gateway
   breaks, and produces its derating curve. A harness, not a suite.
 - [`../docker/README.md`](../docker/README.md) — one image on every machine, role

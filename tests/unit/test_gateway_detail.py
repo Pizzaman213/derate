@@ -25,7 +25,7 @@ from control_plane.gateway.ui_detail import (
 )
 from control_plane.links.record import LinkAnnotation, annotate
 from tests.fixtures import LINKS
-from tests.test_gateway import (
+from tests.unit.test_gateway import (
     FakeDeployments,
     FakeProviders,
     build_deps,

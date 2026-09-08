@@ -130,7 +130,7 @@ Three layers keep them out of everything else:
 3. `assert_no_key_material` runs over every serialized response and every disk
    write, and raises rather than emitting.
 
-`tests/test_providers.py::test_no_key_material_in_any_output` asserts this
+`tests/unit/test_providers.py::test_no_key_material_in_any_output` asserts this
 across every response shape the package emits. If that test is missing, the
 feature is not done.
 

@@ -18,8 +18,8 @@ once, and it was never the definitions that drifted — it was the TypeScript
 union mirroring an enum, the second byte formatter in another module, the route
 table someone maintained in prose. `derived.py` names each such fact and every
 site that restates it; `manifest.py` and `routes.py` reflect the live objects
-into JSON rather than describing them; `tests/test_single_source.py` and
-`tests/test_contracts_manifest.py` go red when a copy stops agreeing.
+into JSON rather than describing them; `tests/unit/test_single_source.py` and
+`tests/unit/test_contracts_manifest.py` go red when a copy stops agreeing.
 
 ## Layout
 
@@ -196,7 +196,7 @@ which of them mean "it is over" is deliberately not answered here — see
 
 `runtime` is a plain `str`, and its annotation named two runtimes long after the
 third shipped. `deploy/flags.py::SUPPORTED_RUNTIMES` is the list that decides
-(`vllm`, `sglang`, `tts`), and `tests/test_single_source.py` holds
+(`vllm`, `sglang`, `tts`), and `tests/unit/test_single_source.py` holds
 `resolver/support.py`'s table to the same names.
 
 Three fields are trailing and defaulted so every record written before they
@@ -259,8 +259,8 @@ a client that names a model on the wrong route is told which one they wanted:
 Seven `Protocol`s — `RegistryPort`, `LinkPort`, `ResolverPort`, `FitPort`,
 `PlannerPort`, `ProviderPort`, `DeploymentPort` — every one `@runtime_checkable`,
 so `assert isinstance(Planner(), PlannerPort)` is a real test.
-`tests/test_planner.py` makes it against both `Planner` and `StubPlanner`, and
-`tests/test_deploy.py` makes the same assertion against `DeploymentPort`.
+`tests/unit/test_planner.py` makes it against both `Planner` and `StubPlanner`, and
+`tests/unit/test_deploy.py` makes the same assertion against `DeploymentPort`.
 Everyone codes against the protocol, not the implementation: `gateway/deps.py`
 types its seven port fields by protocol and carries nothing else but `strict`
 and `settings`.
@@ -291,7 +291,7 @@ than part of it, so four modules each formed their own answer. `FACTS` is eight
 `DerivedFact` rows, each naming a `canonical` `module:attr`, a `why` explaining
 what keeps the fact out of `contracts/`, and two lists that fail differently:
 
-- **`copies`** are resolvable `module:attr` names. `tests/test_single_source.py`
+- **`copies`** are resolvable `module:attr` names. `tests/unit/test_single_source.py`
   imports each and asserts equality with the canonical value. These cannot drift
   silently.
 - **`restated_at`** are sites that inline the fact as an expression —
@@ -327,7 +327,7 @@ Adding a row is cheap and is the point.
 restates.** `dataclasses.fields()` and `Enum.__members__` already know the
 answer, so a generator that asks them cannot itself drift; the only thing that
 can go stale is the checked-in `manifest.json`, which is exactly what
-`tests/test_contracts_manifest.py` fails on.
+`tests/unit/test_contracts_manifest.py` fails on.
 
 `reflect_contracts()` walks every module in this package except
 `_NOT_CONTRACTS = {"manifest", "derived", "routes", "document"}` — the modules
@@ -389,7 +389,7 @@ joined to a markdown filename. **Nothing is at that path in this checkout and
 git has never tracked it**, so `--write` creates the file rather than updating
 it, and `test_the_generated_contract_document_matches_the_manifests`, which
 reads the path directly before diffing, fails on the read rather than on a
-difference. `telemetry/journal.py:162` and `tests/test_telemetry.py:265` both
+difference. `telemetry/journal.py:162` and `tests/unit/test_telemetry.py:265` both
 still send an operator there to look up `DERATE_TELEMETRY_MAX_BYTES`, and there
 is nothing there to read.
 
@@ -491,10 +491,10 @@ grounds.
   `DEFAULT_DTYPE` (bf16). Never smaller. Deciding what an *undeclared*
   quantization costs is the resolver's job, not the table's.
 - **A contract changed and the manifests not regenerated.**
-  `tests/test_contracts_manifest.py` fails with the exact command in the
+  `tests/unit/test_contracts_manifest.py` fails with the exact command in the
   assertion message, and tells you to read the diff before committing — it is
   the list of contracts your change moved.
-- **A copy of a derived fact stops matching.** `tests/test_single_source.py`
+- **A copy of a derived fact stops matching.** `tests/unit/test_single_source.py`
   fails, naming both sites. Fix by making them agree, and extend coverage by
   adding a row to `derived.py`, never by adding an assertion to the test.
 - **A shape moved and nothing under `control_plane/` broke.** The TypeScript

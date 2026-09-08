@@ -192,7 +192,7 @@ prints on its way out (that is the marker that catches a `max_model_len` past th
 model's `max_position_embeddings`, rejected inside `create_engine_config` before
 `EngineCore` ever forked). The fifth is a verbatim copy of
 `runtimes.tts.FATAL_MARKER`, a copy rather than an import because nothing outside
-a model container may import that module, and `tests/test_tts_runtime.py` asserts
+a model container may import that module, and `tests/unit/test_tts_runtime.py` asserts
 the two strings match. "Looks like an error" is not the bar; "this line means the
 process is on its way out" is.
 
@@ -474,7 +474,7 @@ the event bus into a request-handling module to obtain one frozenset.
 `control_plane/contracts/derived.py` names
 `control_plane.deploy.fsm:TERMINAL`, `control_plane.deploy.fsm:SERVING` and
 `control_plane.deploy.flags:SUPPORTED_RUNTIMES` as canonical, and
-`tests/test_single_source.py` fails when the copy stops matching.
+`tests/unit/test_single_source.py` fails when the copy stops matching.
 
 - **`control_plane/node.py`** is the composition root and imports lazily inside
   `build_gateway_deps`, so a worker process never pulls the package in. It builds

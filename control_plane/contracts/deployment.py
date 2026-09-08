@@ -32,7 +32,7 @@ class Deployment:
     fit: FitResult
     # "vllm" | "sglang" | "tts". The third is derate's own, and the annotation
     # here named two long after it shipped -- deploy/flags.py::SUPPORTED_RUNTIMES
-    # is the list that decides, and tests/test_single_source.py holds
+    # is the list that decides, and tests/unit/test_single_source.py holds
     # resolver/support.py's table to the same names.
     runtime: str
     state: DeploymentState

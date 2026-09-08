@@ -25,7 +25,7 @@ from control_plane.fit.capacity import largest_runnable
 from control_plane.gateway import livefit
 from control_plane.gateway.app import create_app
 from tests.fixtures import GPT_OSS_120B, QWEN3_30B_A3B, SPARK_01
-from tests.test_gateway import FakeRegistry, build_deps, node_state
+from tests.unit.test_gateway import FakeRegistry, build_deps, node_state
 
 GIB = 1024**3
 
@@ -702,7 +702,7 @@ class TestAnUnmeasuredNodeIsNotALiveReading:
         import time
 
         from control_plane.registry.telemetry import TelemetrySample
-        from tests.test_registry import (
+        from tests.unit.test_registry import (
             REAL_SPARK_AVAILABLE,
             REAL_SPARK_GPU_MIB,
             REAL_SPARK_POOL_TOTAL,

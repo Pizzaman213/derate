@@ -50,7 +50,7 @@ from control_plane.resolver.support import build_verdict, modality_for, sharding
 from control_plane.resolver.types import ParamSource, QuantSource, SupportLevel
 from tests.fixtures import DEEPSEEK_V3, GB10_PROFILES, GPT_OSS_120B, LLAMA_3_3_70B, WS_3090
 
-DATA = Path(__file__).parent / "resolver_data"
+DATA = Path(__file__).resolve().parents[1] / "resolver_data"
 
 
 def load_config(name: str) -> dict:

@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from control_plane.contracts.providers import Provider, ProviderKind, ProviderModel
 from control_plane.gateway import create_app
 from tests.fixtures import node_state
-from tests.test_gateway import (
+from tests.unit.test_gateway import (
     FakeProviders,
     FakeRegistry,
     build_deps,

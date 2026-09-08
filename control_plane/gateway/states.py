@@ -12,7 +12,7 @@ separately: ``internal_api`` as a named frozenset, ``targets`` as both a tuple
 and an inline pair, ``gpu_procs`` as a complement. Four spellings of one fact,
 and only the first had anything checking it.
 
-One spelling now, and ``tests/test_single_source.py`` compares it to
+One spelling now, and ``tests/unit/test_single_source.py`` compares it to
 ``deploy.fsm`` through ``control_plane/contracts/derived.py``, so the copy that
 has to exist cannot quietly stop matching the original.
 """

@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from control_plane.contracts.quant import BYTES_PER_PARAM, QUANT_INFO
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
 from control_plane.resolver import StubResolver as DetailResolver
-from tests.test_gateway import (
+from tests.unit.test_gateway import (
     FakeRegistry,
     _no_gpu_profile,
     build_deps,
@@ -1065,7 +1065,7 @@ class TestCapacityWithNoConfiguration:
         """Not the largest. Somebody looking at a fresh install is standing in
         front of the coordinator, and answering about a different machine with
         nothing on screen saying which is how a verdict stops being trusted."""
-        from tests.test_gateway import NODE_PROFILES, node_state
+        from tests.unit.test_gateway import NODE_PROFILES, node_state
 
         class _WithLocal(FakeRegistry):
             local_node_id = "spark-02"
@@ -1082,7 +1082,7 @@ class TestCapacityWithNoConfiguration:
     def test_a_coordinator_with_no_gpu_falls_through_to_a_machine_with_one(self):
         """The literal rule would band every row "won't fit" on a cluster whose
         coordinator is a Pi and whose worker is a Spark."""
-        from tests.test_gateway import NODE_PROFILES, node_state
+        from tests.unit.test_gateway import NODE_PROFILES, node_state
 
         class _WithLocal(FakeRegistry):
             local_node_id = "cpu-box"
