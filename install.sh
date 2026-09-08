@@ -9,6 +9,10 @@
 #   curl -fsSL http://<coordinator>:8080/install.sh | sh -s -- \
 #       --join http://<coordinator>:8080 --token ej_...
 #
+#   # the dev build rather than the released one. A package of its own,
+#   # ghcr.io/pizzaman213/derate/node-dev, built from every push to dev
+#   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/dev/install-dev.sh | sh
+#
 # There is one image and one container. Role is decided at runtime by the node
 # itself (00-architecture.md section 2), so this script's whole job is to put
 # the container on the machine with the right two environment variables and
@@ -85,6 +89,24 @@ Options
                       it comes back looking for a cluster to join.
   --keep-images       do not reclaim derate images the upgrade superseded
   -h, --help          this
+
+The dev build
+  Every push to the dev branch publishes ghcr.io/pizzaman213/derate/node-dev.
+  It is a separate GHCR package rather than a tag on the released one, so that
+  no pull of ghcr.io/pizzaman213/derate/node can land on unreviewed code by a
+  typo. Install it with the wrapper, which is this script with that default:
+
+      curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/dev/install-dev.sh | sh
+
+  ...or say it here, which is the same thing and works from any branch:
+
+      --image ghcr.io/pizzaman213/derate/node-dev:latest
+
+  Either way, pass it on every node you add as well. The image this machine
+  runs is not carried across the join, so a dev coordinator whose nodes were
+  installed without it is a cluster running two different builds -- which the
+  roster will tell you, since each node reports the build id its image was
+  stamped with.
 USAGE
 }
 
