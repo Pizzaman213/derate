@@ -2728,6 +2728,24 @@ def test_dockerfile_ships_one_image_with_the_required_shape():
     assert "DERATE_JOIN" in dockerfile
 
 
+def test_the_image_installs_the_binaries_sparkrun_shells_out_to():
+    """A missing binary is a traceback about subprocess, not about a package.
+
+    sparkrun's recipe registry is a git clone and RegistryManager runs the
+    binary itself -- ensure_initialized() -> update() -> _clone_or_pull() ->
+    subprocess.run(["git", ...]) -- so an image without git dies with
+    FileNotFoundError: 'git' on every launch, before it has read a recipe.
+    That failure is invisible from a checkout, where the developer's machine
+    has git and the registry is already cloned, which is why it is asserted
+    against the image rather than left to the first launch to find. Whole
+    lines, not substrings: "git" is inside the image.source label.
+    """
+    directives = _uncommented((REPO / "Dockerfile").read_text())
+    installed = {line.strip().rstrip("\\").strip() for line in directives.splitlines()}
+    for package in ("git", "openssh-client", "iproute2", "curl", "ca-certificates"):
+        assert package in installed, package
+
+
 def test_compose_uses_host_networking_and_restarts():
     compose = (REPO / "compose.yaml").read_text()
     settings = _uncommented(compose)
