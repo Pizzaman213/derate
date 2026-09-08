@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -2756,6 +2757,251 @@ def test_the_image_installs_the_binaries_sparkrun_shells_out_to():
     # Both architectures resolve, or the arm64 half of the manifest is an
     # image that cannot launch anything.
     assert "x86_64" in directives and "aarch64" in directives
+
+
+def test_a_failed_launch_keeps_its_log_where_the_next_attempt_cannot_reach_it(tmp_path):
+    """The reason a launch failed used to live exactly as long as this process.
+
+    The lines are in a per-deployment buffer in memory, and a retry is a new
+    deployment with its own -- so the retry does not overwrite them, a restart
+    does. The runtime's own copy is worse off: a solo launch writes
+    /tmp/sparkrun_serve.log inside a container the relaunch reuses by name, so
+    attempt N's traceback is truncated away by attempt N+1.
+
+    Both happened here on the same afternoon. The cause of a real failure --
+    `No available memory for the cache blocks` -- was read once out of the
+    buffer and was unrecoverable eight minutes later, because the coordinator
+    had restarted and the container had been relaunched.
+    """
+    from control_plane.deploy.manager import FAILED_LOG_DIR
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    manager.adapter.log_tail = "ValueError: No available memory for the cache blocks."
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+
+    kept = tmp_path / FAILED_LOG_DIR / ("%s.log" % dep.deployment_id)
+    assert wait_for(kept.exists), "the failed launch kept no log"
+    text = kept.read_text()
+    # Self-contained: the reader has a deployment id and a question, not this
+    # process's memory.
+    assert dep.deployment_id in text
+    assert fx.QWEN3_30B_A3B.model_id in text
+    # The cause, which is the whole point -- the post-mortem's tail, not just
+    # the state machine's one-line reason.
+    assert "No available memory for the cache blocks" in text
+
+
+def test_the_kept_log_is_what_log_tail_answers_once_the_buffer_is_gone(tmp_path):
+    """A restarted coordinator has the record and none of the lines."""
+    from control_plane.deploy.manager import FAILED_LOG_DIR
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    manager.adapter.log_tail = "ValueError: No available memory for the cache blocks."
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    assert wait_for((tmp_path / FAILED_LOG_DIR / ("%s.log" % dep.deployment_id)).exists)
+
+    # What a restart leaves behind: the record, and an empty buffer.
+    manager._records[dep.deployment_id].log_lines.clear()
+
+    answer = manager.log_tail(dep.deployment_id)
+    # Named as itself rather than passed off as the live read it is not.
+    assert answer["source"] == "archive", answer
+    assert any("No available memory" in line for line in answer["lines"]), answer
+
+
+def test_only_the_newest_failed_logs_are_kept(tmp_path):
+    """A box that fails a lot is the one you want the last few from."""
+    from control_plane.deploy.manager import FAILED_LOG_DIR, FAILED_LOGS_KEPT
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    kept_dir = tmp_path / FAILED_LOG_DIR
+    kept_dir.mkdir(parents=True)
+    for i in range(FAILED_LOGS_KEPT + 12):
+        (kept_dir / ("d-old%03d.log" % i)).write_text("old\n")
+
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+
+    assert wait_for(lambda: len(list(kept_dir.glob("*.log"))) == FAILED_LOGS_KEPT)
+    # The one just written is not the one pruned.
+    assert (kept_dir / ("%s.log" % dep.deployment_id)).exists()
+
+
+def test_a_state_dir_that_cannot_be_written_does_not_fail_the_launch(tmp_path):
+    """Losing the evidence is bad; reporting that as the launch's own failure,
+    on a launch that already failed, is worse."""
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    # A file where the directory would go: mkdir fails whoever is running this,
+    # root included, which a chmod would not.
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
+    manager.failed_log_dir = blocker / "failed-launches"
+
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    assert "stopped answering" in manager.get(dep.deployment_id).last_error
+    assert manager.log_tail(dep.deployment_id)["source"] in ("buffer", "read", "none")
+
+
+def _record_launch_window(manager):
+    """Wrap the adapter's launch so a test can see when each one was inside it.
+
+    The window that matters is the whole of `adapter.launch` -- container
+    start, weights, and the engine's memory profiling inside it -- so entry and
+    exit are both recorded and the assertion is about overlap, not order.
+    """
+    events: list[tuple[str, str]] = []
+    inner = manager.adapter.launch
+    lock = threading.Lock()
+
+    def launch(plan, *args, **kwargs):
+        who = kwargs.get("served_name") or plan.node_ids[0]
+        with lock:
+            events.append(("enter", who))
+        try:
+            return inner(plan, *args, **kwargs)
+        finally:
+            with lock:
+                events.append(("exit", who))
+
+    manager.adapter.launch = launch
+    return events
+
+
+def test_two_launches_on_one_node_never_profile_at_the_same_time(tmp_path):
+    """The whole point: one engine's startup must not run inside another's.
+
+    vLLM sizes its KV cache as `device total x utilization` minus the DEVICE's
+    free-memory drop across its own profiling -- not its own allocation. A
+    neighbour allocating in that window is billed to whoever is profiling, and
+    the loser dies with `No available memory for the cache blocks` after
+    minutes of load and graph capture, then retries into the same race. It
+    happened three times in a row on spark-26af with an 8B loading inside a
+    0.5B's profile.
+    """
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    manager.adapter.launch_delay = 0.3
+    events = _record_launch_window(manager)
+
+    threads = [
+        threading.Thread(
+            target=manager.launch,
+            args=(shape, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64),
+            kwargs={"served_name": name},
+        )
+        for shape, name in ((fx.QWEN3_30B_A3B, "first"), (fx.LLAMA_3_3_70B, "second"))
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert wait_for(lambda: len([e for e in events if e[0] == "exit"]) == 2), events
+    # enter/exit/enter/exit. Any interleaving is two engines profiling at once.
+    assert [e[0] for e in events] == ["enter", "exit", "enter", "exit"], events
+
+
+def test_a_second_node_is_not_made_to_wait_for_the_first(tmp_path):
+    """The gate is per node, not a global queue.
+
+    A cluster whose launches serialise across every machine would be slower
+    than the problem being solved: two engines on two devices cannot bill each
+    other anything.
+    """
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    manager.adapter.launch_delay = 0.4
+    events = _record_launch_window(manager)
+
+    threads = [
+        threading.Thread(
+            target=manager.launch,
+            args=(shape, fx.single_node_plan(node), fx.fits(), "vllm", 8192, 64),
+            kwargs={"served_name": name},
+        )
+        for shape, node, name in (
+            (fx.QWEN3_30B_A3B, "spark-01", "first"),
+            (fx.LLAMA_3_3_70B, "spark-02", "second"),
+        )
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert wait_for(lambda: len([e for e in events if e[0] == "exit"]) == 2), events
+    # Both inside the launcher before either left it.
+    assert [e[0] for e in events][:2] == ["enter", "enter"], events
+
+
+def test_waiting_out_a_busy_node_is_refused_by_name(tmp_path):
+    """Refusing names the node and says what it protected, per the house rule
+    that a refusal has to tell you what to change."""
+    manager = make_manager(tmp_path, probe=FakeProbe(), ready_timeout_s=0.3)
+    # Somebody else is starting on this node, and has not finished.
+    assert manager._hold_starting(("spark-01",), deadline=time.time() + 60)
+    try:
+        deployment = manager.launch(
+            fx.LLAMA_3_3_70B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64
+        )
+        assert wait_for(
+            lambda: manager.get(deployment.deployment_id).state is S.FAILED, timeout=10
+        )
+        error = manager.get(deployment.deployment_id).last_error
+        assert "still starting on spark-01" in error, error
+        assert "memory profiling" in error, error
+    finally:
+        manager._release_starting(("spark-01",))
+
+
+def test_a_failed_launch_hands_the_node_back(tmp_path):
+    """Otherwise one bad launch closes the node until the coordinator restarts."""
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    manager.adapter.fail_with = LaunchError("sparkrun said no", raw="")
+    first = manager.launch(
+        fx.LLAMA_3_3_70B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(first.deployment_id).state is S.FAILED)
+
+    manager.adapter.fail_with = None
+    second = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64,
+        served_name="second",
+    )
+
+    assert wait_for(lambda: manager.get(second.deployment_id).state is S.READY), (
+        manager.get(second.deployment_id).last_error
+    )
 
 
 def test_compose_uses_host_networking_and_restarts():

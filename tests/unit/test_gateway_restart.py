@@ -315,10 +315,21 @@ def test_two_overlapping_crash_events_do_not_double_schedule(monkeypatch):
         # attempt has even started sleeping out its backoff.
         deployments.bus.emit(**crash_event(deployment))
         deployments.bus.emit(**crash_event(deployment))
+        # Wait for the EVENT, not for the launch. The coordinator awaits
+        # _attempt_relaunch and emits attempted only after it returns, so
+        # `deployments.launched` fills strictly first -- and a runner that does
+        # not schedule the coordinator again before the next line then reads
+        # zero events off a perfectly correct implementation. This waited on
+        # `launched` and failed that way on a two-core CI runner while passing
+        # on every developer box.
         for _ in range(200):
-            if deployments.launched:
+            if attempted_events(ctx):
                 break
             await asyncio.sleep(0.01)
+        # Then give a second attempt time to arrive. Asserting the instant the
+        # first one lands cannot see the double schedule this test exists to
+        # catch: the backoff above is 0.1s, so a second one would be along.
+        await asyncio.sleep(0.3)
         assert len(deployments.launched) == 1, "two crash events launched two retries"
         assert len(attempted_events(ctx)) == 1
 
