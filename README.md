@@ -16,15 +16,15 @@ sets up the fabric and launches the processes. derate measures the interconnect,
 resolves the model to a shape, plans the parallelism from the two, refuses
 launches that will not fit — naming the term that blew the budget and the change
 that would work — and fronts the result behind one endpoint. Every one of those
-is decided from a measurement rather than a default. `00-architecture.md` has
-the reasoning; `docs/CONTRACTS.md` has the numbers.
+is decided from a measurement rather than a default; `docs/CONTRACTS.md` has
+the numbers.
 
 ## Screenshots
 
 <table>
 <tr>
 <td width="50%"><img src="docs/screenshots/dashboard.png" alt="Dashboard: nodes, deployments, tokens/sec, watts, and GiB free, with a plan and routing panel on the right."><br><sub>Dashboard — every deployment, every node, live</sub></td>
-<td width="50%"><img src="docs/screenshots/cluster.png" alt="Cluster floor: machines, deployments and providers as a graph, with the measured link speed between nodes."><br><sub>Cluster — the measured interconnect, drawn as a graph</sub></td>
+<td width="50%"><img src="docs/screenshots/cluster.png" alt="Cluster floor: machines, deployments and providers as a graph, with each link labeled measured or never measured."><br><sub>Cluster — the interconnect, drawn as a graph, each link labeled measured or not</sub></td>
 </tr>
 <tr>
 <td width="50%"><img src="docs/screenshots/model-detail.png" alt="A model open on the Models screen, with a refusal on one node and a fit verdict with real numbers on another."><br><sub>A refusal, and the arithmetic it's based on — same gate, same numbers, either way it comes out</sub></td>
@@ -130,7 +130,7 @@ a tensor- or pipeline-parallel rank — a Raspberry Pi, anything without an
 NVIDIA GPU, anything not launching through `sparkrun` — says so in the roster
 rather than implying otherwise.
 
-<p align="center"><img src="docs/screenshots/cluster.png" width="820" alt="Cluster floor: machines, deployments and providers as a graph, with the measured link speed between nodes."></p>
+<p align="center"><img src="docs/screenshots/cluster.png" width="820" alt="Cluster floor: machines, deployments and providers as a graph, with each link labeled measured or never measured."></p>
 
 ## The screen
 
@@ -165,70 +165,26 @@ it from source.
 
 ## Voice and TTS
 
-The OpenAI surface covers audio as well as text:
+The OpenAI surface covers audio too: `POST /v1/audio/speech`, `POST
+/v1/audio/transcriptions`, and `GET /v1/realtime` relayed to a provider.
+`GET /v1/models` reports a `modality` per model, and naming one on the wrong
+endpoint is refused with the endpoint that would have worked — which matters
+even if you never serve audio, because an OpenAI or OpenRouter catalog is
+ingested wholesale and `tts-1` would otherwise sit in the chat picker.
 
-```
-POST /v1/audio/speech            text in, audio bytes out
-POST /v1/audio/transcriptions    audio file in, text out
-GET  /v1/realtime                websocket, relayed to a provider
-```
+Four ways to serve it, cheapest first: a **remote provider**, routed like any
+other model; an **OpenAI-compatible server on the LAN** (Kokoro-FastAPI,
+openedai-speech) added as a `custom` provider; a **Whisper deployment** on vLLM,
+fit-checked like anything else and kept off the chat routes; or a **TTS
+deployment** on the `tts` runtime, derate's own server
+(`control_plane/runtimes/tts.py`), because neither vLLM nor SGLang serves
+`/v1/audio/speech` at all.
 
-`GET /v1/models` reports a `modality` per model (`text`, `embedding`, `speech`,
-`transcription`), and naming a model on the wrong endpoint is refused with the
-one that would have worked. That matters even if you never serve audio
-yourself: an OpenAI or OpenRouter catalog is ingested wholesale, so `tts-1` and
-`whisper-1` arrive as ordinary models, and without the modality they show up in
-the chat picker as if they were chat models.
-
-Four ways to serve audio, cheapest first:
-
-1. **A remote provider.** Add OpenAI or Groq and their audio models are routed
-   like any other.
-2. **An OpenAI-compatible server on the LAN** — Kokoro-FastAPI,
-   openedai-speech, faster-whisper-server. Add it as a `custom` provider with
-   its base URL; nothing needs to be launched by the control plane.
-3. **A Whisper deployment the control plane launches**, on vLLM. Planned,
-   fit-checked and launched like any other model; it is recorded as a
-   transcription deployment, so it is offered on `/v1/audio/transcriptions` and
-   kept off the chat routes.
-4. **A TTS deployment the control plane launches**, on the `tts` runtime —
-   derate's own server (`control_plane/runtimes/tts.py`), because neither vLLM
-   nor SGLang serves `/v1/audio/speech` at all and neither will load a
-   text-to-speech checkpoint's architecture. Pick the model, pick `tts`, press
-   Serve: it is planned, fit-checked and launched like any other deployment,
-   and it answers `POST /v1/audio/speech` behind the same gateway as
-   everything else.
-
-   ```bash
-   curl localhost:8080/v1/audio/speech \
-     -H 'content-type: application/json' \
-     -d '{"model": "audio8-tts", "input": "The link is measured, not assumed.",
-          "response_format": "mp3"}' --output line.mp3
-   ```
-
-   It writes `wav`, `mp3`, `flac`, `opus` and `pcm`; `aac` is refused by name
-   rather than served as something else. `speed` is refused too — resampling
-   moves the pitch, and a 1.5× that quietly returned a chipmunk would be worse
-   than a sentence saying so. It generates one request at a time, so
-   `--max-num-seqs` bounds how many callers may be waiting and the rest get a
-   503 the router already knows how to hold.
-
-   These checkpoints clone a voice zero-shot from a reference clip plus that
-   clip's exact transcript, so a "voice" is a file pair. Point the runtime at a
-   directory of them (`DERATE_TTS_VOICE_DIR`, or `--voice-dir`), one
-   `<name>.wav` beside one `<name>.txt`; `GET /v1/audio/voices` lists what
-   loaded and what was skipped. Omit `voice` entirely and the model speaks in
-   its own. An unknown voice is refused, naming the ones installed — returning
-   a different speaker under a 200 is the failure you cannot hear until
-   somebody else does.
-
-   Verified on a GB10 against `Audio8/Audio8-TTS-Preview-0.6b`, a 0.6B DualAR
-   model with a 44.1 kHz codec: 4.4 seconds of speech in 4.3 seconds of wall
-   clock, and 2451 MiB resident against the fit gate's predicted 2.3 GiB.
-
-An audio deployment reports `—` rather than a token rate, in the strip and in
-the inspector. There is no audio-side rate measured today, and a zero would
-read as a stalled deployment.
+It writes `wav`, `mp3`, `flac`, `opus` and `pcm`; `aac` and `speed` are refused
+by name, because a 1.5× that quietly returned a chipmunk is worse than a
+sentence saying so. Voices are zero-shot clones — `<name>.wav` beside
+`<name>.txt` under `DERATE_TTS_VOICE_DIR`. An audio deployment reports `—`
+rather than a token rate: none is measured, and a zero would read as stalled.
 
 ## License
 
