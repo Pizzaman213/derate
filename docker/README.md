@@ -383,6 +383,16 @@ nothing anywhere able to say which build was running. No git available prints
 `version.py::describe_build` renders the empty result as *"an unidentified
 build"* rather than as a fabricated id.
 
+`.github/workflows/publish-image.yml` resolves it the same way for the images
+that are actually published — a `git rev-parse --short=12 HEAD` step after the
+checkout, into the same build arg — so `:latest` and `:dev` name the commit
+they were built from. They did not until 2026-09-08: CI passed no build arg at
+all, and every image in the registry reported an unidentified build. The `ARG`
+now sits at the very end of the final stage rather than the top, because the
+value changes on every commit and BuildKit chains cache keys through the image
+config: above the apt layer it re-fetched the 40 MB docker CLI through QEMU on
+every build to record twelve characters.
+
 On a failed build whose platform list is not the native one, it prints the
 `docker run --privileged --rm tonistiigi/binfmt --install all` line: a missing
 QEMU binfmt handler surfaces somewhere deep in apt and reads like a broken

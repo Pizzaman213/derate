@@ -18,11 +18,22 @@
 # thing it cannot set: after the first successful run, flip the package to
 # public once, or an anonymous `docker pull` returns a 401 that reads exactly
 # like the "repository does not exist" failure this replaces.
+#
+# `dev` builds too, and only ever as :dev. The default branch owns :latest --
+# install.sh defaults to it and enroll_api.INSTALL_BRANCH points at main -- so
+# a dev push must never move the tag a stranger's `curl ... | sh` resolves.
+# Run a dev build with:
+#
+#     DERATE_IMAGE=ghcr.io/pizzaman213/derate/node:dev ./install.sh
+#
+# `verify` is the better half of why dev is on the list: the check now runs on
+# the branch the work is on, instead of first reporting on main, where a red
+# suite is already merged.
 name: publish image
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -105,6 +116,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The image has no .git -- .dockerignore drops it -- so version.py's
+      # second source cannot run inside a published container and build_id()
+      # answers "", which renders as "an unidentified build" on every node
+      # running an image from this workflow. docker/build.sh has always
+      # stamped it and CI never did. `--short=12` is build.sh's length and
+      # version.py's SHA_LENGTH, so both paths name the same commit the same
+      # way. It matters more now that :dev and :latest both float: the tag a
+      # node pulled is not recoverable from the node, only the build is.
+      - id: build
+        run: echo "id=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
       # amd64 is native on this runner; arm64 is emulated. The UI stage is
       # pinned to $BUILDPLATFORM in the Dockerfile, so npm runs once, natively,
       # and only apt and pip go through QEMU.
@@ -122,7 +144,9 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           # :latest tracks the default branch, same as install.sh and
-          # enroll_api.INSTALL_BRANCH.
+          # enroll_api.INSTALL_BRANCH. `event=branch` is what gives dev its own
+          # :dev tag, moved by every push to the branch; nothing but main ever
+          # touches :latest.
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=branch
@@ -134,6 +158,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            DERATE_BUILD=${{ steps.build.outputs.id }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
