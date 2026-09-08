@@ -29,9 +29,12 @@
 #
 #     DERATE_IMAGE=ghcr.io/pizzaman213/derate/node-dev:latest ./install.sh
 #
-# A package GHCR has not seen before is created PRIVATE. node-dev needs the
-# same one-time flip to public that node needed, or that pull answers 401 --
-# which reads exactly like the "no such repository" failure it is not.
+# node-dev needed no flip. A package GHCR sees for the first time from a
+# workflow inherits the repository's visibility, and this repository is public,
+# so the pull above worked the moment the first run finished -- checked with an
+# anonymous token against the registry, not assumed. The paragraph above still
+# holds for a package that arrives any other way, and it is worth keeping: the
+# 401 it describes reads exactly like a name that does not exist.
 #
 # `verify` is the better half of why dev is on the list: the check now runs on
 # the branch the work is on, instead of first reporting on main, where a red
