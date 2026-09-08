@@ -144,10 +144,12 @@ control_plane/logfiles.py  node.log and proxy.log, in one folder
 control_plane/node.py      the real entry point: one process, role at runtime
 ui/                        the screen. See ui/README.md, which is thorough.
 tests/                     pytest. tests/load/ is a harness, not a suite.
-docs/brand/                the README's logo. The mark is a COPY of the one
-                           Header.tsx draws, so change that and rerun
+docs/brand/                the README's banner and bare lockup. The mark is a
+                           COPY of the one Header.tsx draws and the colours are
+                           copies of tokens.css, so change either and rerun
                            `python3 docs/brand/build.py`, which derives the
-                           lockup's proportions from the header's own CSS.
+                           lockup's proportions from the header's own CSS and
+                           outlines the wordmark so no font has to be installed.
 ```
 
 ## Rules that are not style
