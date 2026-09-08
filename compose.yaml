@@ -55,13 +55,29 @@ services:
       - ${HOME}/.config/sparkrun:/root/.config/sparkrun:ro
       # sparkrun drives the cluster over SSH.
       - ${HOME}/.ssh:/root/.ssh:ro
+      # The host's docker socket, so this node can start a model. sparkrun runs
+      # `docker` itself -- inspect, then run -- and inside a container that
+      # client has no daemon unless the host's is handed in. The container it
+      # starts is then a sibling on the host, not a child in here.
+      #
+      # Said plainly, because it is real: the docker API is root-equivalent on
+      # the host. Without this line the node still joins and still reports its
+      # hardware; it simply cannot launch, and says so.
+      - /var/run/docker.sock:/var/run/docker.sock
       # The model cache the runtime downloads into. Read-WRITE, unlike the two
       # above, and deliberately: the Storage tab's whole purpose for this mount
       # is deleting weights, and 894 GiB of them is the largest thing on a
       # serving box by orders of magnitude. Without it the node reports "no
       # model cache" honestly and nothing breaks -- it simply cannot see or
       # reclaim what the runtime downloaded.
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      #
+      # At the SAME path it has on the host, with HF_HOME below pointing at it.
+      # sparkrun resolves the cache as ${HF_HOME:-$HOME/.cache/huggingface} and
+      # gives the answer to the host's daemon as a bind mount, so a container
+      # that saw the cache at /root/.cache/... would send the host a path that
+      # is root's home, and every weight would be downloaded again into a
+      # directory the Storage tab cannot see.
+      - ${HOME}/.cache/huggingface:${HOME}/.cache/huggingface
 
     environment:
       # Every one has a working default; they are listed so they are
@@ -74,6 +90,9 @@ services:
       # Unset -> discover the coordinator over mDNS. Set to an address to skip
       # discovery when the other node is on a different subnet.
       DERATE_JOIN: ${DERATE_JOIN:-}
+      # The other half of the cache mount above: one path, agreed on both sides,
+      # so the runtime, the node agent and the operator see the same bytes.
+      HF_HOME: ${HOME}/.cache/huggingface
       DERATE_LOG_LEVEL: ${DERATE_LOG_LEVEL:-INFO}
       # Unset -> <project root>/logs, which is /opt/derate/logs in this image:
       # a layer, so `docker rm` takes node.log and proxy.log with it. Set it to

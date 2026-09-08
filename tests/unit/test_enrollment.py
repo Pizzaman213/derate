@@ -18,8 +18,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pathlib
 import shutil
 import stat
+import pty
+import select
 import subprocess
 import time
 from pathlib import Path
@@ -588,8 +591,8 @@ def test_index_is_never_cached_but_hashed_assets_are(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def sh(*args, path=None):
-    env = {**os.environ, "HOME": "/nonexistent"}
+def sh(*args, path=None, home="/nonexistent"):
+    env = {**os.environ, "HOME": home}
     if path is not None:
         env["PATH"] = path
     return subprocess.run(
@@ -944,14 +947,155 @@ def test_missing_docker_names_the_command_to_fix_it(tmp_path):
             os.symlink(found, fake_path / tool)
     assert shutil.which("docker", path=str(fake_path)) is None
 
+    # start_new_session, so the child has no controlling terminal. Without it
+    # this test inherits pytest's, install.sh finds a /dev/tty to ask on, and
+    # the whole suite blocks on a question nobody is there to answer -- for
+    # every developer who runs it from a terminal, and for nobody who runs it
+    # from CI. It is also the property being asserted: nobody to ask is a no.
     result = subprocess.run(
         ["/bin/sh", str(INSTALL_SH)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, start_new_session=True,
         env={"PATH": str(fake_path), "HOME": "/nonexistent"},
     )
     assert result.returncode != 0
     assert "get.docker.com" in result.stderr
     assert "--install-docker" in result.stderr
+    assert "[y/N]" not in result.stderr, "asked a question with no terminal to ask on"
+
+
+def docker_less_path(tmp_path):
+    """A PATH that reaches the docker check with no docker on it, and a curl
+    that records rather than installs.
+
+    Symlinks rather than an empty PATH: the script runs `uname` before it looks
+    for docker, so emptying PATH fails earlier and proves nothing about this
+    branch.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for tool in ("sh", "uname", "id", "sed", "grep", "cat", "sort", "rm"):
+        found = shutil.which(tool)
+        if found and not (bin_dir / tool).exists():
+            os.symlink(found, bin_dir / tool)
+    log = tmp_path / "curl.log"
+    (bin_dir / "curl").write_text(
+        "#!/bin/sh\n"
+        f"echo \"$*\" >> {log}\n"
+        # What get.docker.com would hand to `sh`. Saying so out loud is how the
+        # yes-path proves it ran the installer and not something else.
+        "echo 'echo FAKE-DOCKER-INSTALLER-RAN'\n"
+    )
+    (bin_dir / "curl").chmod(0o755)
+    assert shutil.which("docker", path=str(bin_dir)) is None
+    return bin_dir, log
+
+
+def sh_on_a_tty(*args, path, answer, timeout=20.0):
+    """Run install.sh with a controlling terminal, and answer its question.
+
+    `curl ... | sh` leaves stdin as the pipe carrying the script, so the
+    question goes to /dev/tty -- which a process only has when it has a
+    controlling terminal. subprocess.run never gives it one, so this branch is
+    invisible to a plain runner; pty.fork does, and it is stdlib, so this does
+    not depend on util-linux's `script` being installed on whatever runs it.
+    """
+    pid, fd = pty.fork()
+    if pid == 0:  # pragma: no cover -- the child is replaced immediately
+        try:
+            os.execve("/bin/sh", ["/bin/sh", str(INSTALL_SH), *args],
+                      {"PATH": str(path), "HOME": "/nonexistent"})
+        except BaseException:
+            os._exit(127)
+    os.write(fd, answer.encode())  # the line discipline holds it until read
+    out, deadline = b"", time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not select.select([fd], [], [], 0.5)[0]:
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:  # the child exited and closed the slave
+            break
+        if not chunk:
+            break
+        out += chunk
+    os.close(fd)
+    _, status = os.waitpid(pid, 0)
+    return out.decode(errors="replace"), status
+
+
+@pytest.mark.filterwarnings("ignore:This process .*is multi-threaded")
+def test_declining_the_docker_question_installs_nothing(tmp_path):
+    """Asked, and no is an answer. The refusal is the one it prints unasked."""
+    bin_dir, curl_log = docker_less_path(tmp_path)
+
+    out, status = sh_on_a_tty(path=bin_dir, answer="n\n")
+
+    assert status != 0
+    assert "[y/N]" in out, out
+    assert not curl_log.exists(), curl_log.read_text()
+    assert "--install-docker" in out, out
+
+
+@pytest.mark.filterwarnings("ignore:This process .*is multi-threaded")
+def test_answering_yes_runs_the_docker_installer(tmp_path):
+    """The question is the whole point: this is a daemon, on their machine."""
+    bin_dir, curl_log = docker_less_path(tmp_path)
+
+    out, status = sh_on_a_tty(path=bin_dir, answer="y\n")
+
+    assert "[y/N]" in out, out
+    assert "get.docker.com" in curl_log.read_text()
+    assert "FAKE-DOCKER-INSTALLER-RAN" in out, out
+    # The fake install leaves no daemon behind, so the script still stops --
+    # having said which of the two things went wrong.
+    assert status != 0
+    assert "not responding yet" in out, out
+
+
+def test_the_model_cache_is_mounted_at_the_path_the_host_calls_it(tmp_path):
+    """One path, agreed on both sides of the socket.
+
+    sparkrun resolves the cache as ${HF_HOME:-$HOME/.cache/huggingface} and
+    hands the answer to the HOST's daemon as a bind mount for the runtime
+    container. Mounting the operator's cache at /root/.cache/huggingface in
+    here -- which is what this did -- means sparkrun answers
+    /root/.cache/huggingface, the host creates that empty directory, and every
+    weight is downloaded again into a place the Storage tab cannot see.
+    """
+    cache = tmp_path / ".cache" / "huggingface"
+    cache.mkdir(parents=True)
+
+    out = sh("--dry-run", home=str(tmp_path)).stdout
+
+    assert f"-v {cache}:{cache}" in out, out
+    assert f"-e HF_HOME={cache}" in out, out
+    assert ":/root/.cache/huggingface" not in out, out
+
+
+def test_no_model_cache_on_the_host_mounts_nothing(tmp_path):
+    """A bind mount of a missing path creates a root-owned directory."""
+    out = sh("--dry-run", home=str(tmp_path)).stdout
+
+    assert "huggingface" not in out, out
+    assert "HF_HOME" not in out, out
+
+
+def test_the_docker_socket_is_mounted_or_the_refusal_is_explained():
+    """Without the socket a node plans, writes a recipe and dies in sparkrun.
+
+    The client in the image has no daemon of its own -- it is the CLI only --
+    so this mount is what separates a node that can serve a model from one that
+    joins, reports its hardware and fails at [3/6] Distributing resources.
+
+    Both branches are asserted rather than skipping on a machine without a
+    socket: the message is the whole value of the branch that has none.
+    """
+    result = sh("--dry-run")
+
+    if pathlib.Path("/var/run/docker.sock").is_socket():
+        assert "-v /var/run/docker.sock:/var/run/docker.sock" in result.stdout
+    else:
+        assert "not be able" in result.stderr and "launch a model" in result.stderr
 
 
 def test_help_documents_both_shapes():

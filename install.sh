@@ -58,7 +58,11 @@ Options
   --image IMAGE       container image (default: ghcr.io/pizzaman213/derate/node:latest)
   --port PORT         coordinator/UI port (default: 8080)
   --agent-port PORT   node agent port (default: 8081)
-  --install-docker    install Docker with get.docker.com if it is missing
+  --install-docker    install Docker with get.docker.com if it is missing.
+                      Without this flag the script asks, on the terminal --
+                      and a machine with no terminal to ask on (CI, cron, a
+                      provisioning script) is a no, not an assumed yes. This
+                      flag is how such a machine says yes in advance.
   --install-ollama    also install Ollama on this machine and bind it to the
                       LAN, so a node with no GPU can serve a small model over
                       the network. Opt-in for the same reason --install-docker
@@ -130,6 +134,31 @@ done
 DOCKER=docker
 docker_ok() { $DOCKER info >/dev/null 2>&1; }
 
+# A yes/no question, asked on the terminal rather than on stdin. This script is
+# usually running as `curl ... | sh`, where stdin is the pipe carrying the
+# script itself -- a `read` there consumes the rest of the program, so the
+# question has to go to /dev/tty or not be asked at all.
+#
+# No terminal is a no, never an assumed yes: a machine in a provisioning script
+# or a CI job has nobody to answer, and it takes the refusal below rather than
+# having a daemon installed on it because nothing objected. --install-docker is
+# how that machine says yes in advance.
+ask_yes_no() {
+    # /dev/tty is present on a machine with no controlling terminal too -- a
+    # cron job, a CI runner, a docker build. It is the *open* that fails there,
+    # with ENXIO, so the test has to be an open, in a subshell so the failure
+    # is this function's and not the shell's. `-r /dev/tty` was true in exactly
+    # the case this is meant to catch, and printed two device errors on its way
+    # to the refusal.
+    ( : >/dev/tty ) 2>/dev/null || return 1
+    printf '[derate] %s [y/N] ' "$1" >/dev/tty
+    read -r _answer </dev/tty || return 1
+    case "$_answer" in
+        [Yy]|[Yy][Ee][Ss]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ensure_docker() {
     if command -v docker >/dev/null 2>&1; then
         if docker_ok; then return 0; fi
@@ -146,6 +175,14 @@ ensure_docker() {
         die "docker is installed but not responding. Is the daemon running? Try: systemctl start docker"
     fi
 
+    # Asked, then done -- never done quietly. This installs a daemon, which is
+    # more than the machine was asked for, so it is the operator's call and not
+    # this script's.
+    if [ "$INSTALL_DOCKER" -eq 0 ] \
+       && ask_yes_no "docker is not installed. Install it with get.docker.com?"; then
+        INSTALL_DOCKER=1
+    fi
+
     if [ "$INSTALL_DOCKER" -eq 1 ]; then
         info "installing Docker via get.docker.com"
         command -v curl >/dev/null 2>&1 || die "curl is needed to install Docker."
@@ -155,8 +192,8 @@ ensure_docker() {
         return 0
     fi
 
-    # Deliberately not silent-installing a daemon from a piped script. Say
-    # exactly what to run instead.
+    # No, or nobody to ask. Deliberately not silent-installing a daemon from a
+    # piped script. Say exactly what to run instead.
     die "docker is not installed.
     Install it, then re-run this script:
         curl -fsSL https://get.docker.com | sh
@@ -252,13 +289,52 @@ set -- "$@" -v "$VOLUME:/data"
 [ -d "${HOME:-/root}/.ssh" ] && \
     set -- "$@" -v "${HOME:-/root}/.ssh:/root/.ssh:ro"
 
+# The host's docker socket, so this node can start a model.
+#
+# sparkrun runs `docker` itself -- `docker image inspect` to decide whether to
+# pull, then `docker run` for the runtime -- and inside a container that client
+# has no daemon to talk to unless the host's socket is handed in. Without it a
+# node joins, reports its hardware, plans, writes a recipe and then dies at
+# [3/6] Distributing resources, which reads as a sparkrun bug and is not one.
+#
+# What this grants is real and worth saying plainly: the docker API is
+# root-equivalent on the host, so a process in this container can start any
+# container it likes, privileged, with any host path mounted. That is the same
+# authority `sparkrun` already has when it is run from a shell on this machine
+# -- this installer moves it, it does not create it -- but it is now held by a
+# long-running service rather than by a command somebody typed.
+#
+# The container it starts is a SIBLING on the host, not a child in here. That
+# is why the cache below is mounted at the host's own path: every -v the client
+# sends is resolved by the host's daemon, in the host's filesystem.
+DOCKER_SOCK=/var/run/docker.sock
+[ -S "$DOCKER_SOCK" ] || DOCKER_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+if [ -S "$DOCKER_SOCK" ]; then
+    set -- "$@" -v "$DOCKER_SOCK:/var/run/docker.sock"
+else
+    info "no docker socket at /var/run/docker.sock or in \$XDG_RUNTIME_DIR."
+    info "The node will join and report its hardware, and it will not be able"
+    info "to launch a model: sparkrun needs a daemon to talk to. Rootless"
+    info "Docker keeps its socket elsewhere -- set XDG_RUNTIME_DIR and re-run."
+fi
+
 # The model cache the runtime downloads into, read-write. This is the mount
 # that lets the Storage tab show and reclaim downloaded weights, which are the
 # largest thing on a serving box by a wide margin. Mounted only when it already
 # exists, for the same reason as the two above: a bind mount of a missing path
 # creates a root-owned directory in the operator's home.
-[ -d "${HOME:-/root}/.cache/huggingface" ] && \
-    set -- "$@" -v "${HOME:-/root}/.cache/huggingface:/root/.cache/huggingface"
+#
+# Mounted at the SAME absolute path it has on the host, with HF_HOME pointing
+# at it, and both halves are load-bearing. sparkrun resolves the cache as
+# ${HF_HOME:-$HOME/.cache/huggingface} and hands the answer to the host's
+# daemon as a bind mount -- so a container that mounted /home/you/.cache/...
+# at /root/.cache/... would resolve /root/.cache/huggingface and the host would
+# create that empty directory and download every weight again, into a place the
+# Storage tab cannot see. One path, agreed on both sides, and the runtime, the
+# node agent and the operator are all looking at the same bytes.
+HF_CACHE="${HOME:-/root}/.cache/huggingface"
+[ -d "$HF_CACHE" ] && \
+    set -- "$@" -v "$HF_CACHE:$HF_CACHE" -e "HF_HOME=$HF_CACHE"
 
 set -- "$@" -e "DERATE_PORT=$PORT" -e "DERATE_AGENT_PORT=$AGENT_PORT"
 [ -n "$JOIN" ]  && set -- "$@" -e "DERATE_JOIN=$JOIN"

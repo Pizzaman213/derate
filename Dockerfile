@@ -94,6 +94,40 @@ RUN apt-get update \
       ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+# The docker CLI -- the client only, never the daemon. sparkrun starts the
+# runtime container by running `docker` itself: containers/registry.py asks
+# `docker image inspect` whether the image is here before it pulls, and
+# orchestration/executor_docker.py builds the `docker run` for the model. A
+# node without this binary clears every gate, plans, writes a recipe, and dies
+# in subprocess with FileNotFoundError: 'docker' at [3/6] Distributing
+# resources -- which is what happened on every launch from a containerized node
+# until this layer existed.
+#
+# The client talks to the HOST's daemon over the socket install.sh mounts, so
+# the container it starts is a sibling on the host, not a child here. Nothing
+# in this image runs containers itself.
+#
+# Debian's docker.io is the wrong package for that: 32 MB down, 128 MB
+# installed, and most of it is the daemon and containerd, which this image must
+# never start. The upstream static bundle is one binary, extracted alone --
+# 40 MB on disk, ~18 MB in the layer.
+#
+# Pinned, and pinned to what this fleet's daemons run (29.2.1). The CLI
+# negotiates the API version down to whatever daemon answers, so a newer client
+# would work; a pin that matches is one less thing to be surprised by, and an
+# unpinned URL would make the image un-rebuildable.
+ARG DOCKER_CLI_VERSION=29.2.1
+ARG TARGETARCH
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) arch=x86_64 ;; \
+      arm64) arch=aarch64 ;; \
+      *) echo "no static docker CLI is published for $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/$arch/docker-${DOCKER_CLI_VERSION}.tgz" \
+      | tar -xzf - -C /usr/local/bin --strip-components=1 docker/docker; \
+    docker --version
+
 COPY --from=deps /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

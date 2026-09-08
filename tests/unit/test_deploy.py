@@ -14,6 +14,7 @@ import dataclasses
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2745,6 +2746,17 @@ def test_the_image_installs_the_binaries_sparkrun_shells_out_to():
     for package in ("git", "openssh-client", "iproute2", "curl", "ca-certificates"):
         assert package in installed, package
 
+    # The docker CLI is the other one sparkrun execs, and it is NOT apt's
+    # docker.io: that is 128 MB installed and most of it is the daemon and
+    # containerd, which this image must never start. One static client binary,
+    # from a pinned URL -- unpinned, the image could not be rebuilt.
+    assert "download.docker.com" in directives
+    assert re.search(r"DOCKER_CLI_VERSION=\d+\.\d+\.\d+", directives)
+    assert "docker.io" not in installed
+    # Both architectures resolve, or the arm64 half of the manifest is an
+    # image that cannot launch anything.
+    assert "x86_64" in directives and "aarch64" in directives
+
 
 def test_compose_uses_host_networking_and_restarts():
     compose = (REPO / "compose.yaml").read_text()
@@ -2753,6 +2765,21 @@ def test_compose_uses_host_networking_and_restarts():
     assert "restart: unless-stopped" in settings
     assert "/agent/health" in settings
     assert "/api/cluster" not in settings
+
+
+def test_compose_hands_in_the_socket_and_agrees_with_the_host_on_the_cache():
+    """The same two lines install.sh composes, for the people who use compose.
+
+    A node whose compose file omits the socket joins, reports its hardware and
+    then dies inside sparkrun; one that mounts the cache anywhere but the
+    host's own path sends the host's daemon a path that is root's home, and
+    downloads every weight again where nothing can see it.
+    """
+    settings = _uncommented((REPO / "compose.yaml").read_text())
+    assert "/var/run/docker.sock:/var/run/docker.sock" in settings
+    assert "${HOME}/.cache/huggingface:${HOME}/.cache/huggingface" in settings
+    assert "HF_HOME: ${HOME}/.cache/huggingface" in settings
+    assert ":/root/.cache/huggingface" not in settings
 
 
 def test_build_script_builds_both_architectures():
