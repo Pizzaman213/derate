@@ -360,7 +360,7 @@ the canonical value.
 
 ## HTTP surface
 
-### Coordinator gateway (77 routes)
+### Coordinator gateway (78 routes)
 
 | Method | Path |
 |---|---|
@@ -371,6 +371,7 @@ the canonical value.
 | GET | `/api/deployments` |
 | POST | `/api/deployments` |
 | DELETE | `/api/deployments/{deployment_id}` |
+| GET | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}/logs` |
 | GET | `/api/docs` |
 | GET | `/api/enroll` |

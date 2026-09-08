@@ -2759,6 +2759,96 @@ def test_the_image_installs_the_binaries_sparkrun_shells_out_to():
     assert "x86_64" in directives and "aarch64" in directives
 
 
+def _terminal_dep(i: int) -> Deployment:
+    """A persistable record, built from the contract rather than a dict, so a
+    field added to Deployment fails here rather than silently going unwritten."""
+    return Deployment(
+        deployment_id="d-%03d" % i,
+        served_name="model-%d" % i,
+        shape=fx.QWEN3_30B_A3B,
+        plan=fx.single_node_plan(),
+        fit=fx.fits(),
+        runtime="vllm",
+        state=S.FAILED,
+        backend_url=None,
+        context_length=8192,
+        max_concurrent_seqs=64,
+        started_at=None,
+        last_error="EngineCore failed to start.",
+    )
+
+
+def test_the_store_keeps_only_the_newest_terminal_records(tmp_path):
+    """The age window cannot help: a retry storm's records are all minutes old.
+
+    One failed launch is retried by the restart coordinator, each retry is a
+    new deployment id, and a node whose engines are being killed produces one
+    every twenty seconds. A week's retention swept once per restart left 1,628
+    records and 13 MB on disk, every byte of it returned by the list route.
+    """
+    import os
+
+    from control_plane.deploy.store import DeploymentStore
+
+    store = DeploymentStore(tmp_path / "deployments")
+    for i in range(20):
+        path = store.save(_terminal_dep(i))
+        # Explicit mtimes: twenty writes inside one filesystem tick would make
+        # "newest" a coin toss, and this test is about which ones survive.
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+    live = dataclasses.replace(_terminal_dep(99), deployment_id="d-live", state=S.READY)
+    store.save(live)
+
+    removed = store.purge_surplus(keep=5)
+
+    kept = sorted(p.stem for p in (tmp_path / "deployments").glob("*.json"))
+    assert removed == 15, removed
+    # The newest five failures, and the live one whatever its age.
+    assert kept == ["d-015", "d-016", "d-017", "d-018", "d-019", "d-live"], kept
+
+
+def test_the_store_does_not_read_a_thing_while_it_is_under_the_cap(tmp_path):
+    """Called on every terminal transition, so the common case is a listing."""
+    from control_plane.deploy.store import DeploymentStore
+
+    store = DeploymentStore(tmp_path / "deployments")
+    for i in range(3):
+        store.save(dataclasses.replace(_terminal_dep(i), deployment_id="d-%d" % i))
+
+    assert store.purge_surplus(keep=200) == 0
+    assert len(list((tmp_path / "deployments").glob("*.json"))) == 3
+
+
+def test_a_terminal_transition_sweeps_the_surplus(tmp_path):
+    """Not only reconcile(): a restart-time sweep cannot hold against a loop
+    that writes a record every twenty seconds."""
+    from control_plane.deploy import store as store_module
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    for i in range(12):
+        manager.store.save(
+            dataclasses.replace(_terminal_dep(i), deployment_id="d-old%02d" % i)
+        )
+    kept = 4
+    original = store_module.TERMINAL_RECORDS_KEPT
+    store_module.TERMINAL_RECORDS_KEPT = kept
+    try:
+        dep = manager.launch(
+            fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+        )
+        assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+        probe.kill(dep.backend_url)
+        manager.tick()
+        manager.tick()
+        assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    finally:
+        store_module.TERMINAL_RECORDS_KEPT = original
+
+    on_disk = list((tmp_path / "deployments").glob("*.json"))
+    assert len(on_disk) <= kept + 1, sorted(p.stem for p in on_disk)
+
+
 def test_a_failed_launch_keeps_its_log_where_the_next_attempt_cannot_reach_it(tmp_path):
     """The reason a launch failed used to live exactly as long as this process.
 

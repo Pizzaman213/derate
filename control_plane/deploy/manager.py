@@ -1797,6 +1797,16 @@ class DeploymentManager:
             return
         deployment.state = target
         self.store.save(deployment, record.handle)
+        if target in TERMINAL:
+            # Here, not only in reconcile(): a week's retention swept once per
+            # restart cannot hold against a retry loop that writes a record
+            # every twenty seconds, and the pile it leaves is what a browser
+            # then has to download. Costs a directory listing while the count
+            # is under the cap.
+            try:
+                self.store.purge_surplus()
+            except Exception:
+                logger.warning("could not sweep terminal records", exc_info=True)
         self.bus.emit(
             ev.STATE_CHANGED,
             deployment_id=deployment.deployment_id,

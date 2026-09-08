@@ -147,10 +147,11 @@ def node_payload(
     valid row -- with no name, which is what "nobody renamed it" looks like.
     """
     profile = state.profile
-    # Reported against physical memory, which is the basis Agent A's telemetry
-    # and the topology payload in the architecture doc both use. Admission
-    # control deliberately uses addressable memory instead: that is the slice
-    # the GPU can actually reach and the one Agent D budgets a fit against.
+    # Reported against physical memory, which is the basis the registry's
+    # telemetry and the topology payload in the architecture doc both use.
+    # Admission control deliberately uses addressable memory instead: that is
+    # the slice the GPU can actually reach and the one the fit calculator
+    # budgets a fit against.
     # Only a difference between two builds we can both name. Two unknowns are
     # not agreement, and one unknown is not a difference -- see version.py.
     skewed = not same_build(coordinator_build, state.build)
@@ -538,7 +539,42 @@ def fit_payload(fit: FitResult) -> dict:
     return data
 
 
-def deployment_payload(deployment: Deployment) -> dict:
+#: How much of `last_error` the LIST carries. The detail route carries all of
+#: it, and the launch log under it carries the rest of the story.
+#:
+#: A vLLM startup traceback is 3-5 KB, and 1,624 of them made 5.3 MB of a
+#: 7.7 MB list payload -- which the browser downloaded, parsed and held on
+#: every refresh of the models screen, and which is what actually took the tab
+#: down. Generous on purpose: the strings this project refuses to truncate are
+#: the planner's and the fit gate's, and those are hundreds of characters, so
+#: they are never reached by this. What gets cut is a Python traceback.
+LIST_ERROR_CHARS = 1500
+
+
+def deployment_payload(deployment: Deployment, *, error_chars: int | None = None) -> dict:
+    """The wire shape. *error_chars* bounds `last_error` for list responses.
+
+    None -- the default, and what the detail route passes -- is the whole
+    error, verbatim, which is the contract everything that renders it through
+    `Verbatim` depends on.
+
+    The marker points at the log rather than at the detail route on purpose:
+    the sheet that shows a truncated error already opens the launch log under
+    it, and DeploymentManager._archive_log writes `last_error` whole into that
+    file. So the sentence is true for a reader today, without the UI having to
+    learn a second endpoint first.
+    """
+    error = deployment.last_error
+    truncated = False
+    if error is not None and error_chars is not None and len(error) > error_chars:
+        # Cut from the FRONT of the tail rather than the end: the line that
+        # says what to do is the last one, and a traceback's first 1500
+        # characters are import frames.
+        error = "... (%d characters cut -- the whole of it is in the log below)\n%s" % (
+            len(error) - error_chars,
+            error[-error_chars:],
+        )
+        truncated = True
     return {
         "deployment_id": deployment.deployment_id,
         "served_name": deployment.served_name,
@@ -550,7 +586,8 @@ def deployment_payload(deployment: Deployment) -> dict:
         "max_concurrent_seqs": deployment.max_concurrent_seqs,
         "modality": deployment.modality.value,
         "started_at": deployment.started_at,
-        "last_error": deployment.last_error,
+        "last_error": error,
+        "last_error_truncated": truncated,
         "node_ids": list(deployment.plan.node_ids) if deployment.plan else [],
         "plan": plan_payload(deployment.plan) if deployment.plan else None,
         "fit": fit_payload(deployment.fit) if deployment.fit else None,
