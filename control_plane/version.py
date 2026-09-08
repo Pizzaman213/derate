@@ -27,9 +27,10 @@ Resolution order, most trustworthy first:
 3. Nothing. A build we cannot identify says so.
 
 The package version from ``pyproject.toml`` is deliberately *not* a fallback.
-It has been ``0.1.0`` for the life of the project and would answer the question
-"which build" with a string that is true of every build ever made -- which is
-the failure this module exists to end, in a more confident voice.
+It moves when a release is cut and not when a build is made, so it would answer
+the question "which build" with a string true of every build carrying that
+version -- which is the failure this module exists to end, in a more confident
+voice.
 """
 
 from __future__ import annotations
