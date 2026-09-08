@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import type { RouteTarget } from '../api/types'
+import type { Provider, RouteTarget, RoutingConfig } from '../api/types'
 import { useProviders, useRouting, useSettings } from '../state/resources'
 import type { SpendBasis } from './spend/rows'
 import {
@@ -57,9 +57,42 @@ function dedupeByTargetId(targets: RouteTarget[]): RouteTarget[] {
   return [...seen.values()]
 }
 
+// node_ids identifies the box, not the deployment -- two models colocated on
+// the same node both label as that node's name (see targetLabel above), which
+// reads as a duplicate row until the model column tells them apart. A target
+// itself carries no served_name (RouteTarget has none), only the RoutingConfig
+// wrapping it does, so that association has to be made here, before the
+// flatMap in dedupeByTargetId above would lose it.
+interface LocalTarget {
+  target: RouteTarget
+  servedName: string
+}
+
+function localTargetsWithModel(configs: RoutingConfig[]): LocalTarget[] {
+  const seen = new Map<string, LocalTarget>()
+  for (const c of configs) {
+    for (const t of c.targets) {
+      if (t.kind !== 'local') continue
+      if (!seen.has(t.target_id)) seen.set(t.target_id, { target: t, servedName: c.served_name })
+    }
+  }
+  return [...seen.values()]
+}
+
+// A provider port can serve several models, so unlike a local target there is
+// no single served_name to show -- same reasoning `priceLabel` already uses
+// to render a range instead of one rate when the served models disagree.
+function providerModelLabel(p: Provider): string {
+  const names = p.models.map((m) => m.served_name)
+  if (names.length === 0) return '—'
+  if (names.length === 1) return names[0] ?? '—'
+  return `${names.length} models`
+}
+
 interface Row {
   key: string
   name: string
+  model: string
   kind: 'local' | 'cloud'
   requests: number | null
   /** Already formatted, because a cloud row's price is a range as often as it
@@ -80,10 +113,7 @@ export function SpendTab() {
   const provs = providers.data ?? []
   const rateSet = (settings.data?.electricity_rate_usd_per_kwh ?? 0) > 0
 
-  const localTargets = useMemo(
-    () => dedupeByTargetId(configs.flatMap((c) => c.targets.filter((t) => t.kind === 'local'))),
-    [configs],
-  )
+  const localTargets = useMemo(() => localTargetsWithModel(configs), [configs])
   const allTargets = useMemo(() => dedupeByTargetId(configs.flatMap((c) => c.targets)), [configs])
 
   // Two different accounting windows, on purpose: providers report a figure
@@ -92,7 +122,7 @@ export function SpendTab() {
   // them is still the right total request count -- it just is not "today"
   // for both halves, which is exactly what the copy below says (and why the
   // tile itself is labelled "requests", not "requests today").
-  const localRequests = localTargets.reduce((a, t) => a + (t.counters?.completed ?? 0), 0)
+  const localRequests = localTargets.reduce((a, { target }) => a + (target.counters?.completed ?? 0), 0)
   const cloudRequests = provs.reduce((a, p) => a + (p.requests_today ?? 0), 0)
   const totalRequests = localRequests + cloudRequests
 
@@ -100,7 +130,7 @@ export function SpendTab() {
   // "never priced" and "priced at zero" must stay distinguishable here the
   // same way they do for a non-accounting provider port below.
   const localSpend = rateSet
-    ? localTargets.reduce((a, t) => {
+    ? localTargets.reduce((a, { target: t }) => {
         const tok = t.counters?.total_tokens
         if (tok == null || t.cost_per_mtok == null) return a
         return a + (tok / 1_000_000) * t.cost_per_mtok
@@ -127,12 +157,13 @@ export function SpendTab() {
   const cloudPct = pc(cloudRequests)
 
   const rows: Row[] = [
-    ...localTargets.map((t) => {
+    ...localTargets.map(({ target: t, servedName }) => {
       const tok = t.counters?.total_tokens
       const costPerMtok = rateSet ? t.cost_per_mtok : null
       return {
         key: t.target_id,
         name: targetLabel(t),
+        model: servedName,
         kind: 'local' as const,
         requests: t.counters?.completed ?? null,
         priceLabel: costPerMtok == null ? '—' : `$${costPerMtok.toFixed(3)}`,
@@ -148,6 +179,7 @@ export function SpendTab() {
       return {
         key: p.provider_id,
         name: p.provider_id,
+        model: providerModelLabel(p),
         kind: 'cloud' as const,
         requests: p.requests_today,
         // The provider's own published rate for what it actually serves. One
@@ -233,6 +265,7 @@ export function SpendTab() {
             <thead>
               <tr>
                 <th>Target</th>
+                <th>Model</th>
                 <th>Kind</th>
                 <th style={{ textAlign: 'right' }}>Requests</th>
                 <th style={{ textAlign: 'right' }}>$/Mtok out</th>
@@ -243,6 +276,7 @@ export function SpendTab() {
               {rows.map((r) => (
                 <tr key={r.key}>
                   <td className="mono">{r.name}</td>
+                  <td className="mono">{r.model}</td>
                   <td className="unit">{r.kind}</td>
                   <td className="num">{r.requests == null ? '—' : r.requests.toLocaleString()}</td>
                   <td className="num">{r.priceLabel}</td>
@@ -266,7 +300,7 @@ export function SpendTab() {
               ))}
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="unit">
+                  <td colSpan={6} className="unit">
                     Nothing served yet.
                   </td>
                 </tr>
