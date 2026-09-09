@@ -459,6 +459,12 @@
           "type": "int",
           "optional": true,
           "default": 0
+        },
+        {
+          "name": "is_encoder_decoder",
+          "type": "bool",
+          "optional": true,
+          "default": false
         }
       ]
     },
@@ -1432,6 +1438,11 @@
       "default": "",
       "owner": "tests/load/loadtest.py",
       "note": ""
+    },
+    "DERATE_API_TOKEN": {
+      "default": null,
+      "owner": "control_plane/gateway/settings.py",
+      "note": "opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op"
     },
     "DERATE_BASE_URL": {
       "default": "http://localhost:8088",

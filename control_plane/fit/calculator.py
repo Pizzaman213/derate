@@ -137,7 +137,7 @@ def _dedup(items: list[str]) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# exported helpers, called by Agent E
+# exported helpers, called by the planner
 # --------------------------------------------------------------------------
 
 
@@ -226,7 +226,7 @@ def min_nodes_required(
     concurrency, under the most memory-efficient shard available at each size.
 
     A memory question only. Whether that shard is a *good* plan at the measured
-    link bandwidth is Agent E's call, not this function's.
+    link bandwidth is the planner's call, not this function's.
 
     ``weight_bytes``, when given, is the resolver's measured on-disk total
     (``FitRequest.weight_bytes``) -- forwarded to :func:`memory_breakdown` so
@@ -243,7 +243,7 @@ def min_nodes_required(
     node count comes back computed against memory that is not available, and
     "spread it over 5 nodes" names a number that would still OOM.
 
-    Exported for Agent E.
+    Exported for the planner.
     """
     if usable is None:
         usable = node_profile.usable_memory(guardrail)
@@ -386,6 +386,13 @@ def memory_breakdown(
             f"{_gib(EP_EXTRA_BUFFER_BYTES)} of expert-staging buffers on top of "
             f"the {_gib(COMM_BUFFER_BYTES)} collective buffers"
         )
+    if shape.is_encoder_decoder:
+        warnings.append(
+            "encoder-decoder shape: kv_cache below prices the decoder's "
+            "self-attention only and is a floor, not the real figure -- "
+            "cross-attention cache over the encoder's own output is not "
+            "modeled"
+        )
 
     kv_total = kv_cache_bytes(shape, context, max_seqs, kv_dtype)
     breakdown = MemoryBreakdown(
@@ -407,8 +414,8 @@ def memory_breakdown(
 class FitCalculator:
     """Implements ``FitPort``.
 
-    ``check`` is the blocking gate: Agent F refuses to launch on its verdict,
-    Agent G refuses to admit on its numbers. ``FITS_DEGRADED`` is not a
+    ``check`` is the blocking gate: the deployment manager refuses to launch
+    on its verdict, the gateway refuses to admit on its numbers. ``FITS_DEGRADED`` is not a
     failure — the model loads, and sometimes that is exactly what someone
     wants. Callers must branch on ``FitResult.ok``, not on ``verdict is FITS``.
 

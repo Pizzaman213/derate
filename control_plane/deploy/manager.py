@@ -990,6 +990,31 @@ class DeploymentManager:
                 buffer.append(line)
         self._note_progress(record, read(line))
 
+    #: Headroom added on top of `fit.breakdown.kv_cache` before it becomes
+    #: `--kv-cache-memory-bytes`. Two measured shortfalls, both real, neither
+    #: fixed by the fit gate's own arithmetic being "more correct":
+    #:
+    #: - vLLM allocates the cache in fixed-size blocks plus alignment, so a
+    #:   figure computed as kv_bytes_per_token * context lands short of what
+    #:   `_check_enough_kv_cache_memory` actually requires. Qwen3-4B-AWQ at
+    #:   40960 tokens asked for exactly 16 tokens (one block) less than vLLM
+    #:   needed; reproduced identically on a GPTQ and an fp16 checkpoint, so
+    #:   it is the block rounding, not a per-model estimate being wrong.
+    #: - Encoder-decoder shapes (Whisper family) undercount for a different
+    #:   reason: the figure only prices decoder self-attention
+    #:   (`ModelShape.is_encoder_decoder`, `fit/kv.py`), never the
+    #:   cross-attention cache over the encoder's own output. openai/
+    #:   whisper-base.en at 448 tokens asked for 5.5 MB against a measured
+    #:   vLLM minimum of 0.03 GiB -- six times over, not one block.
+    #:
+    #: 1 GiB clears both on every model this box has launched. It is not free
+    #: on a tight fit -- a plan the gate approved with less than 1 GiB of
+    #: headroom can now ask the runtime for more than is free, trading the
+    #: block-rounding crash for the one `deploy/utilization.py` describes at
+    #: its own module docstring. Cheaper than that trade on this box, where
+    #: launches have been failing outright rather than starting thin.
+    KV_CACHE_LAUNCH_MARGIN_BYTES = 1024**3
+
     def _launch_kv_cache_bytes(self, record: _Record) -> int | None:
         """The KV cache to reserve outright, instead of one derived by profiling.
 
@@ -1003,10 +1028,17 @@ class DeploymentManager:
         seen on spark-26af in one afternoon, on identical commands minutes
         apart. Given the figure, the runtime skips that derivation entirely.
 
+        `KV_CACHE_LAUNCH_MARGIN_BYTES` is added on top before it is handed
+        over, because the bare figure has twice been measured short of what
+        vLLM actually requires -- see that constant's own comment.
+
         Zero or missing returns None, and the runtime sizes its own cache as
         before: an embedding model has no KV cache, and a fit record without a
         breakdown is not a licence to ask for nothing -- which is what a
-        literal zero would mean to the flag.
+        literal zero would mean to the flag. No margin is added in this case
+        either: there is nothing to round up, and 1 GiB of KV cache handed to
+        a runtime that never asked for any is not a safety margin, it is a
+        different request.
         """
         breakdown = getattr(record.deployment.fit, "breakdown", None)
         kv = getattr(breakdown, "kv_cache", 0) if breakdown is not None else 0
@@ -1014,7 +1046,7 @@ class DeploymentManager:
             kv = int(kv)
         except (TypeError, ValueError):
             return None
-        return kv if kv > 0 else None
+        return kv + self.KV_CACHE_LAUNCH_MARGIN_BYTES if kv > 0 else None
 
     def _launch_utilization(self, record: _Record) -> float | None:
         """What share of the device this launch should ask the runtime for.

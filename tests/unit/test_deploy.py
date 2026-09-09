@@ -2824,7 +2824,8 @@ def test_a_runtime_that_cannot_be_told_its_kv_size_is_not_told(tmp_path):
 
 
 def test_the_manager_hands_the_runtime_the_fit_gates_own_number(tmp_path):
-    """End to end: what the gate budgeted is what the recipe asks for."""
+    """End to end: what the gate budgeted, plus the launch margin, is what the
+    recipe asks for -- see DeploymentManager.KV_CACHE_LAUNCH_MARGIN_BYTES."""
     fit = fx.fits()
     fit.breakdown.kv_cache = 9 * fx.GIB
     manager = make_manager(tmp_path, probe=FakeProbe())
@@ -2833,7 +2834,8 @@ def test_the_manager_hands_the_runtime_the_fit_gates_own_number(tmp_path):
     assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
 
     assert manager.adapter.recipes, "no recipe was rendered"
-    assert "kv_cache_memory_bytes: %d" % (9 * fx.GIB) in manager.adapter.recipes[-1]
+    expected = 9 * fx.GIB + DeploymentManager.KV_CACHE_LAUNCH_MARGIN_BYTES
+    assert "kv_cache_memory_bytes: %d" % expected in manager.adapter.recipes[-1]
 
 
 def test_a_model_with_no_kv_cache_asks_for_nothing(tmp_path):
