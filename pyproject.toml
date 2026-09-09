@@ -19,7 +19,7 @@ dependencies = [
     "websockets==15.0.1",
     "httpx==0.28.1",
     "pydantic==2.10.4",
-    "zeroconf==0.136.2",
+    "zeroconf==0.149.16",
     "PyYAML==6.0.3",
     "requests==2.34.2",
     # Host facts -- memory, CPU, process liveness and process kill -- on the
