@@ -472,7 +472,6 @@ default. A blank default means absence is itself the answer.
 | `DERATE_ALLOWED_ORIGINS` | `` | `control_plane/gateway/settings.py` |
 | `DERATE_ALLOW_BRIDGE` |  | `control_plane/registry/config.py` — the container refuses bridge networking unless this is set |
 | `DERATE_API_KEY` | `` | `tests/load/loadtest.py` |
-| `DERATE_API_TOKEN` |  | `control_plane/gateway/settings.py` — opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op |
 | `DERATE_BASE_URL` | `http://localhost:8088` | `tests/load/loadtest.py` |
 | `DERATE_BUILD` |  | `control_plane/version.py` — stamped into the image; absent means a source checkout |
 | `DERATE_CACHE_DIR` |  | `control_plane/resolver/cache.py` — also read by registry/storage.py |
