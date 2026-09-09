@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -127,6 +128,10 @@ class FakeAdapter(SparkrunAdapter):
         #: of the launch budget inside the launcher the way a real image pull
         #: and weight download do.
         self.launch_delay = 0.0
+        #: The recipe body rendered for each launch. The real adapter writes
+        #: it to disk; this keeps it where a test can read what the runtime
+        #: was actually asked for.
+        self.recipes: list[str] = []
         self._counter = 0
         # M-16: cluster ids whose check-job a wedged host cannot answer.
         # is_running() must read this as unknown (None), not as False.
@@ -137,7 +142,8 @@ class FakeAdapter(SparkrunAdapter):
 
     def launch(
         self, plan, shape, runtime, ctx, max_seqs, *, served_name=None, port=None,
-        gpu_memory_utilization=None, on_output=None, extra_args=(), custom_command=(),
+        gpu_memory_utilization=None, kv_cache_memory_bytes=None, on_output=None,
+        extra_args=(), custom_command=(),
     ):
         if self.fail_with is not None:
             raise self.fail_with
@@ -157,9 +163,14 @@ class FakeAdapter(SparkrunAdapter):
         # a utilization nothing ever checks.
         recipe = self.recipe_for(
             plan, shape, runtime, ctx, max_seqs, served_name=served_name, port=port,
-            gpu_memory_utilization=gpu_memory_utilization, extra_args=extra_args,
+            gpu_memory_utilization=gpu_memory_utilization,
+            # Rendered exactly as the real adapter renders it, for the same
+            # reason the share above is: a fake that dropped the KV budget
+            # would let the manager pass a number nothing ever checks.
+            kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
             custom_command=custom_command,
         )
+        self.recipes.append(recipe.content)
         materialize(recipe)
         argv = self.render_command(
             plan, shape, runtime, ctx, max_seqs, served_name=served_name, port=port,
@@ -2756,6 +2767,421 @@ def test_the_image_installs_the_binaries_sparkrun_shells_out_to():
     # Both architectures resolve, or the arm64 half of the manifest is an
     # image that cannot launch anything.
     assert "x86_64" in directives and "aarch64" in directives
+
+
+def test_the_vllm_recipe_asks_for_the_kv_cache_the_plan_costed(tmp_path):
+    """The number the fit gate approved, handed to the runtime by name.
+
+    vLLM's own sizing is `device total x utilization` minus the DEVICE's
+    free-memory drop across its profiling -- a number about whatever else is
+    on the box. A neighbour allocating in that window is billed here until the
+    budget goes negative ("No available memory for the cache blocks"); one
+    releasing trips an assert ("Error in memory profiling"). Given this flag,
+    determine_available_memory returns the figure and reaches neither.
+    """
+    from control_plane.deploy.recipes import synthesize
+
+    spec = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "vllm", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.42,
+        kv_cache_memory_bytes=17 * fx.GIB, recipe_dir=tmp_path,
+    )
+
+    assert "kv_cache_memory_bytes: %d" % (17 * fx.GIB) in spec.content
+    assert "--kv-cache-memory-bytes {kv_cache_memory_bytes}" in spec.content
+    # The share still goes too: it is what the runtime's startup free-memory
+    # check reads, and that check is the one that fails fast on a full box.
+    assert "--gpu-memory-utilization {gpu_memory_utilization}" in spec.content
+
+
+def test_no_budget_renders_exactly_what_it_always_did(tmp_path):
+    """Absent, the runtime sizes its own cache as before. An embedding model
+    has no KV cache at all, and a zero here would be a request for none."""
+    from control_plane.deploy.recipes import synthesize
+
+    spec = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "vllm", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.42, recipe_dir=tmp_path,
+    )
+
+    assert "kv-cache-memory" not in spec.content
+    assert "kv_cache_memory_bytes" not in spec.content
+
+
+def test_a_runtime_that_cannot_be_told_its_kv_size_is_not_told(tmp_path):
+    """sglang has no such flag, and the tts server is derate's own. A knob
+    invented for one runtime must not appear in another's command line."""
+    from control_plane.deploy.recipes import synthesize
+
+    for runtime in ("sglang", "tts"):
+        spec = synthesize(
+            fx.QWEN3_30B_A3B, fx.single_node_plan(), runtime, 8192, 64, "m",
+            port=8100, gpu_memory_utilization=0.42,
+            kv_cache_memory_bytes=17 * fx.GIB, recipe_dir=tmp_path,
+        )
+        assert "kv-cache-memory" not in spec.content, runtime
+        assert "kv_cache_memory_bytes" not in spec.content, runtime
+
+
+def test_the_manager_hands_the_runtime_the_fit_gates_own_number(tmp_path):
+    """End to end: what the gate budgeted, plus the launch margin, is what the
+    recipe asks for -- see DeploymentManager.KV_CACHE_LAUNCH_MARGIN_BYTES."""
+    fit = fx.fits()
+    fit.breakdown.kv_cache = 9 * fx.GIB
+    manager = make_manager(tmp_path, probe=FakeProbe())
+
+    dep = manager.launch(fx.QWEN3_30B_A3B, fx.single_node_plan(), fit, "vllm", 8192, 64)
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+
+    assert manager.adapter.recipes, "no recipe was rendered"
+    expected = 9 * fx.GIB + DeploymentManager.KV_CACHE_LAUNCH_MARGIN_BYTES
+    assert "kv_cache_memory_bytes: %d" % expected in manager.adapter.recipes[-1]
+
+
+def test_a_model_with_no_kv_cache_asks_for_nothing(tmp_path):
+    """Zero is not a budget of zero -- it is the absence of one. Sending it
+    would tell the runtime to allocate no cache at all."""
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    fit = fx.fits()
+    fit.breakdown.kv_cache = 0
+    record = type("R", (), {"deployment": type("D", (), {"fit": fit})()})()
+
+    assert manager._launch_kv_cache_bytes(record) is None
+
+
+def _terminal_dep(i: int) -> Deployment:
+    """A persistable record, built from the contract rather than a dict, so a
+    field added to Deployment fails here rather than silently going unwritten."""
+    return Deployment(
+        deployment_id="d-%03d" % i,
+        served_name="model-%d" % i,
+        shape=fx.QWEN3_30B_A3B,
+        plan=fx.single_node_plan(),
+        fit=fx.fits(),
+        runtime="vllm",
+        state=S.FAILED,
+        backend_url=None,
+        context_length=8192,
+        max_concurrent_seqs=64,
+        started_at=None,
+        last_error="EngineCore failed to start.",
+    )
+
+
+def test_the_store_keeps_only_the_newest_terminal_records(tmp_path):
+    """The age window cannot help: a retry storm's records are all minutes old.
+
+    One failed launch is retried by the restart coordinator, each retry is a
+    new deployment id, and a node whose engines are being killed produces one
+    every twenty seconds. A week's retention swept once per restart left 1,628
+    records and 13 MB on disk, every byte of it returned by the list route.
+    """
+    import os
+
+    from control_plane.deploy.store import DeploymentStore
+
+    store = DeploymentStore(tmp_path / "deployments")
+    for i in range(20):
+        path = store.save(_terminal_dep(i))
+        # Explicit mtimes: twenty writes inside one filesystem tick would make
+        # "newest" a coin toss, and this test is about which ones survive.
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+    live = dataclasses.replace(_terminal_dep(99), deployment_id="d-live", state=S.READY)
+    store.save(live)
+
+    removed = store.purge_surplus(keep=5)
+
+    kept = sorted(p.stem for p in (tmp_path / "deployments").glob("*.json"))
+    assert removed == 15, removed
+    # The newest five failures, and the live one whatever its age.
+    assert kept == ["d-015", "d-016", "d-017", "d-018", "d-019", "d-live"], kept
+
+
+def test_the_store_does_not_read_a_thing_while_it_is_under_the_cap(tmp_path):
+    """Called on every terminal transition, so the common case is a listing."""
+    from control_plane.deploy.store import DeploymentStore
+
+    store = DeploymentStore(tmp_path / "deployments")
+    for i in range(3):
+        store.save(dataclasses.replace(_terminal_dep(i), deployment_id="d-%d" % i))
+
+    assert store.purge_surplus(keep=200) == 0
+    assert len(list((tmp_path / "deployments").glob("*.json"))) == 3
+
+
+def test_a_terminal_transition_sweeps_the_surplus(tmp_path):
+    """Not only reconcile(): a restart-time sweep cannot hold against a loop
+    that writes a record every twenty seconds."""
+    from control_plane.deploy import store as store_module
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    for i in range(12):
+        manager.store.save(
+            dataclasses.replace(_terminal_dep(i), deployment_id="d-old%02d" % i)
+        )
+    kept = 4
+    original = store_module.TERMINAL_RECORDS_KEPT
+    store_module.TERMINAL_RECORDS_KEPT = kept
+    try:
+        dep = manager.launch(
+            fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+        )
+        assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+        probe.kill(dep.backend_url)
+        manager.tick()
+        manager.tick()
+        assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    finally:
+        store_module.TERMINAL_RECORDS_KEPT = original
+
+    on_disk = list((tmp_path / "deployments").glob("*.json"))
+    assert len(on_disk) <= kept + 1, sorted(p.stem for p in on_disk)
+
+
+def test_a_failed_launch_keeps_its_log_where_the_next_attempt_cannot_reach_it(tmp_path):
+    """The reason a launch failed used to live exactly as long as this process.
+
+    The lines are in a per-deployment buffer in memory, and a retry is a new
+    deployment with its own -- so the retry does not overwrite them, a restart
+    does. The runtime's own copy is worse off: a solo launch writes
+    /tmp/sparkrun_serve.log inside a container the relaunch reuses by name, so
+    attempt N's traceback is truncated away by attempt N+1.
+
+    Both happened here on the same afternoon. The cause of a real failure --
+    `No available memory for the cache blocks` -- was read once out of the
+    buffer and was unrecoverable eight minutes later, because the coordinator
+    had restarted and the container had been relaunched.
+    """
+    from control_plane.deploy.manager import FAILED_LOG_DIR
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    manager.adapter.log_tail = "ValueError: No available memory for the cache blocks."
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+
+    kept = tmp_path / FAILED_LOG_DIR / ("%s.log" % dep.deployment_id)
+    assert wait_for(kept.exists), "the failed launch kept no log"
+    text = kept.read_text()
+    # Self-contained: the reader has a deployment id and a question, not this
+    # process's memory.
+    assert dep.deployment_id in text
+    assert fx.QWEN3_30B_A3B.model_id in text
+    # The cause, which is the whole point -- the post-mortem's tail, not just
+    # the state machine's one-line reason.
+    assert "No available memory for the cache blocks" in text
+
+
+def test_the_kept_log_is_what_log_tail_answers_once_the_buffer_is_gone(tmp_path):
+    """A restarted coordinator has the record and none of the lines."""
+    from control_plane.deploy.manager import FAILED_LOG_DIR
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    manager.adapter.log_tail = "ValueError: No available memory for the cache blocks."
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    assert wait_for((tmp_path / FAILED_LOG_DIR / ("%s.log" % dep.deployment_id)).exists)
+
+    # What a restart leaves behind: the record, and an empty buffer.
+    manager._records[dep.deployment_id].log_lines.clear()
+
+    answer = manager.log_tail(dep.deployment_id)
+    # Named as itself rather than passed off as the live read it is not.
+    assert answer["source"] == "archive", answer
+    assert any("No available memory" in line for line in answer["lines"]), answer
+
+
+def test_only_the_newest_failed_logs_are_kept(tmp_path):
+    """A box that fails a lot is the one you want the last few from."""
+    from control_plane.deploy.manager import FAILED_LOG_DIR, FAILED_LOGS_KEPT
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    kept_dir = tmp_path / FAILED_LOG_DIR
+    kept_dir.mkdir(parents=True)
+    for i in range(FAILED_LOGS_KEPT + 12):
+        (kept_dir / ("d-old%03d.log" % i)).write_text("old\n")
+
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+
+    assert wait_for(lambda: len(list(kept_dir.glob("*.log"))) == FAILED_LOGS_KEPT)
+    # The one just written is not the one pruned.
+    assert (kept_dir / ("%s.log" % dep.deployment_id)).exists()
+
+
+def test_a_state_dir_that_cannot_be_written_does_not_fail_the_launch(tmp_path):
+    """Losing the evidence is bad; reporting that as the launch's own failure,
+    on a launch that already failed, is worse."""
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    # A file where the directory would go: mkdir fails whoever is running this,
+    # root included, which a chmod would not.
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
+    manager.failed_log_dir = blocker / "failed-launches"
+
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    assert "stopped answering" in manager.get(dep.deployment_id).last_error
+    assert manager.log_tail(dep.deployment_id)["source"] in ("buffer", "read", "none")
+
+
+def _record_launch_window(manager):
+    """Wrap the adapter's launch so a test can see when each one was inside it.
+
+    The window that matters is the whole of `adapter.launch` -- container
+    start, weights, and the engine's memory profiling inside it -- so entry and
+    exit are both recorded and the assertion is about overlap, not order.
+    """
+    events: list[tuple[str, str]] = []
+    inner = manager.adapter.launch
+    lock = threading.Lock()
+
+    def launch(plan, *args, **kwargs):
+        who = kwargs.get("served_name") or plan.node_ids[0]
+        with lock:
+            events.append(("enter", who))
+        try:
+            return inner(plan, *args, **kwargs)
+        finally:
+            with lock:
+                events.append(("exit", who))
+
+    manager.adapter.launch = launch
+    return events
+
+
+def test_two_launches_on_one_node_never_profile_at_the_same_time(tmp_path):
+    """The whole point: one engine's startup must not run inside another's.
+
+    vLLM sizes its KV cache as `device total x utilization` minus the DEVICE's
+    free-memory drop across its own profiling -- not its own allocation. A
+    neighbour allocating in that window is billed to whoever is profiling, and
+    the loser dies with `No available memory for the cache blocks` after
+    minutes of load and graph capture, then retries into the same race. It
+    happened three times in a row on spark-26af with an 8B loading inside a
+    0.5B's profile.
+    """
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    manager.adapter.launch_delay = 0.3
+    events = _record_launch_window(manager)
+
+    threads = [
+        threading.Thread(
+            target=manager.launch,
+            args=(shape, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64),
+            kwargs={"served_name": name},
+        )
+        for shape, name in ((fx.QWEN3_30B_A3B, "first"), (fx.LLAMA_3_3_70B, "second"))
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert wait_for(lambda: len([e for e in events if e[0] == "exit"]) == 2), events
+    # enter/exit/enter/exit. Any interleaving is two engines profiling at once.
+    assert [e[0] for e in events] == ["enter", "exit", "enter", "exit"], events
+
+
+def test_a_second_node_is_not_made_to_wait_for_the_first(tmp_path):
+    """The gate is per node, not a global queue.
+
+    A cluster whose launches serialise across every machine would be slower
+    than the problem being solved: two engines on two devices cannot bill each
+    other anything.
+    """
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    manager.adapter.launch_delay = 0.4
+    events = _record_launch_window(manager)
+
+    threads = [
+        threading.Thread(
+            target=manager.launch,
+            args=(shape, fx.single_node_plan(node), fx.fits(), "vllm", 8192, 64),
+            kwargs={"served_name": name},
+        )
+        for shape, node, name in (
+            (fx.QWEN3_30B_A3B, "spark-01", "first"),
+            (fx.LLAMA_3_3_70B, "spark-02", "second"),
+        )
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert wait_for(lambda: len([e for e in events if e[0] == "exit"]) == 2), events
+    # Both inside the launcher before either left it.
+    assert [e[0] for e in events][:2] == ["enter", "enter"], events
+
+
+def test_waiting_out_a_busy_node_is_refused_by_name(tmp_path):
+    """Refusing names the node and says what it protected, per the house rule
+    that a refusal has to tell you what to change."""
+    manager = make_manager(tmp_path, probe=FakeProbe(), ready_timeout_s=0.3)
+    # Somebody else is starting on this node, and has not finished.
+    assert manager._hold_starting(("spark-01",), deadline=time.time() + 60)
+    try:
+        deployment = manager.launch(
+            fx.LLAMA_3_3_70B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64
+        )
+        assert wait_for(
+            lambda: manager.get(deployment.deployment_id).state is S.FAILED, timeout=10
+        )
+        error = manager.get(deployment.deployment_id).last_error
+        assert "still starting on spark-01" in error, error
+        assert "memory profiling" in error, error
+    finally:
+        manager._release_starting(("spark-01",))
+
+
+def test_a_failed_launch_hands_the_node_back(tmp_path):
+    """Otherwise one bad launch closes the node until the coordinator restarts."""
+    manager = make_manager(tmp_path, probe=FakeProbe())
+    manager.adapter.fail_with = LaunchError("sparkrun said no", raw="")
+    first = manager.launch(
+        fx.LLAMA_3_3_70B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(first.deployment_id).state is S.FAILED)
+
+    manager.adapter.fail_with = None
+    second = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan("spark-01"), fx.fits(), "vllm", 8192, 64,
+        served_name="second",
+    )
+
+    assert wait_for(lambda: manager.get(second.deployment_id).state is S.READY), (
+        manager.get(second.deployment_id).last_error
+    )
 
 
 def test_compose_uses_host_networking_and_restarts():

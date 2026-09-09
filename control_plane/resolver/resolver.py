@@ -1,9 +1,10 @@
 """The resolver: a HuggingFace model id in, a complete ModelShape out.
 
-Everything downstream reads these numbers. Agent D's memory arithmetic and
-Agent E's parallelism choice are both wrong if the KV head count, the active
-parameter count or the quantization is wrong here, so every field is either
-read from real metadata or accompanied by a warning saying it was not.
+Everything downstream reads these numbers. The fit calculator's memory
+arithmetic and the planner's parallelism choice are both wrong if the KV head
+count, the active parameter count or the quantization is wrong here, so every
+field is either read from real metadata or accompanied by a warning saying it
+was not.
 """
 
 from __future__ import annotations
@@ -1074,6 +1075,7 @@ def _shape_from(model_id: str, mapped: Mapped, accounting, dtype: str) -> ModelS
         mla_latent_dim=mapped.mla_latent_dim,
         mla_rope_dim=mapped.qk_rope_head_dim,
         vision_params=accounting.vision_params,
+        is_encoder_decoder=mapped.is_encoder_decoder,
     )
 
 

@@ -43,6 +43,12 @@ class ModelShape:
     # Replicated per node when sharding, never split
     vision_params: int = 0
 
+    # Encoder-decoder (Whisper family). KV cache math (fit/kv.py) only prices
+    # the decoder's self-attention, so on a shape where this is True that
+    # figure is a floor: cross-attention cache over the encoder's own output
+    # is real memory it does not count.
+    is_encoder_decoder: bool = False
+
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0

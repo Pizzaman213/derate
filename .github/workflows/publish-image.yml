@@ -18,11 +18,32 @@
 # thing it cannot set: after the first successful run, flip the package to
 # public once, or an anonymous `docker pull` returns a 401 that reads exactly
 # like the "repository does not exist" failure this replaces.
+#
+# `dev` builds too, into a package of its own: derate/node-dev. Deliberately
+# not a :dev tag on derate/node -- the two would share one package page and one
+# `docker pull`-shaped mistake, and install.sh defaults to
+# `ghcr.io/pizzaman213/derate/node:latest`, so the cost of confusing them is a
+# stranger's cluster running unreviewed code. Two names cannot be confused by a
+# typo. Within node-dev, :latest means the newest dev build, which is what
+# somebody testing one wants to type:
+#
+#     DERATE_IMAGE=ghcr.io/pizzaman213/derate/node-dev:latest ./install.sh
+#
+# node-dev needed no flip. A package GHCR sees for the first time from a
+# workflow inherits the repository's visibility, and this repository is public,
+# so the pull above worked the moment the first run finished -- checked with an
+# anonymous token against the registry, not assumed. The paragraph above still
+# holds for a package that arrives any other way, and it is worth keeping: the
+# 401 it describes reads exactly like a name that does not exist.
+#
+# `verify` is the better half of why dev is on the list: the check now runs on
+# the branch the work is on, instead of first reporting on main, where a red
+# suite is already merged.
 name: publish image
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -31,7 +52,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/pizzaman213/derate/node
+  # One package per branch, resolved once here. dev builds derate/node-dev;
+  # main, a version tag and a manual dispatch build derate/node, which is what
+  # install.sh pulls and what every enrolled node is already running.
+  IMAGE: ghcr.io/pizzaman213/derate/node${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
 
 jobs:
   # Everything that can fail without hardware. Cheap relative to a two-arch
@@ -105,6 +129,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The image has no .git -- .dockerignore drops it -- so version.py's
+      # second source cannot run inside a published container and build_id()
+      # answers "", which renders as "an unidentified build" on every node
+      # running an image from this workflow. docker/build.sh has always
+      # stamped it and CI never did. `--short=12` is build.sh's length and
+      # version.py's SHA_LENGTH, so both paths name the same commit the same
+      # way. It matters more now that :dev and :latest both float: the tag a
+      # node pulled is not recoverable from the node, only the build is.
+      - id: build
+        run: echo "id=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
       # amd64 is native on this runner; arm64 is emulated. The UI stage is
       # pinned to $BUILDPLATFORM in the Dockerfile, so npm runs once, natively,
       # and only apt and pip go through QEMU.
@@ -121,10 +156,18 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          # :latest tracks the default branch, same as install.sh and
-          # enroll_api.INSTALL_BRANCH.
+          # :latest is the newest build of whichever package this is -- main's
+          # for node, dev's for node-dev. It cannot cross between them: the
+          # image name did the separating before this rule is read, which is
+          # the whole reason dev has a package rather than a tag. install.sh
+          # and enroll_api.INSTALL_BRANCH resolve node:latest, and only a push
+          # to main can move it.
+          #
+          # The branch tag stays alongside it, so the same digest is also
+          # addressable as node-dev:dev by where it came from rather than by
+          # how recent it is.
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' }}
             type=ref,event=branch
             type=ref,event=tag
             type=sha,format=long
@@ -134,6 +177,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            DERATE_BUILD=${{ steps.build.outputs.id }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

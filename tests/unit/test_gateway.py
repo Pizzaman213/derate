@@ -344,6 +344,103 @@ def make_provider(
     )
 
 
+def _failed(deployment_id, error=None):
+    dep = make_deployment(
+        deployment_id, deployment_id, backend_url=None, state=DeploymentState.FAILED
+    )
+    dep.last_error = error
+    return dep
+
+
+def test_the_deployment_list_is_bounded_and_never_drops_a_live_one():
+    """Unbounded, this route is what took the browser down.
+
+    1,628 records and 7.7 MB on this cluster, downloaded and parsed on every
+    refresh of the models screen. A failed launch is retried and every retry
+    is a new deployment id, so the list grew by one every twenty seconds.
+
+    The cut only ever falls on FAILED and STOPPED: a cap that could hide a
+    running model would be worse than the bug it fixes.
+    """
+    from control_plane.gateway.internal_api import DEPLOYMENT_LIST_TERMINAL
+
+    dead = [_failed("d-dead%04d" % i) for i in range(DEPLOYMENT_LIST_TERMINAL + 50)]
+    live = [
+        make_deployment("d-live-%d" % i, "live-%d" % i, backend_url="http://127.0.0.1:810%d/v1" % i)
+        for i in range(3)
+    ]
+    deps = build_deps(deployments=FakeDeployments(dead + live))
+
+    with TestClient(create_app(deps)) as client:
+        body = client.get("/api/deployments").json()
+
+    ids = [d["deployment_id"] for d in body]
+    assert len(body) == DEPLOYMENT_LIST_TERMINAL + 3, len(body)
+    for dep in live:
+        assert dep.deployment_id in ids
+    # Newest kept, oldest dropped.
+    assert "d-dead%04d" % (DEPLOYMENT_LIST_TERMINAL + 49) in ids
+    assert "d-dead0000" not in ids
+
+
+def test_the_deployment_list_limit_is_a_query_parameter():
+    from control_plane.gateway.internal_api import DEPLOYMENT_LIST_TERMINAL
+
+    dead = [_failed("d-dead%04d" % i) for i in range(DEPLOYMENT_LIST_TERMINAL + 20)]
+    deps = build_deps(deployments=FakeDeployments(dead))
+
+    with TestClient(create_app(deps)) as client:
+        assert len(client.get("/api/deployments?limit=5").json()) == 5
+        assert len(client.get("/api/deployments?limit=0").json()) == 0
+
+
+def test_a_traceback_is_bounded_in_the_list_and_whole_on_the_deployment():
+    """5.3 MB of the 7.7 was `last_error`, and only the sheet ever shows it."""
+    from control_plane.gateway.serialize import LIST_ERROR_CHARS
+
+    cause = "ValueError: No available memory for the cache blocks."
+    dep = _failed("d-1", error=("import frame\n" * 900) + cause)
+    deps = build_deps(deployments=FakeDeployments([dep]))
+
+    with TestClient(create_app(deps)) as client:
+        listed = client.get("/api/deployments").json()[0]
+        detail = client.get("/api/deployments/d-1").json()
+
+    assert listed["last_error_truncated"] is True
+    assert len(listed["last_error"]) < LIST_ERROR_CHARS + 200
+    # Cut from the front: the line that says what to do is the last one.
+    assert cause in listed["last_error"]
+    assert "characters cut" in listed["last_error"]
+    # Whole, here, for the sheet that renders it through Verbatim.
+    assert detail["last_error"] == dep.last_error
+    assert detail["last_error_truncated"] is False
+
+
+def test_a_refusal_short_enough_to_read_is_never_touched():
+    """Planner and fit strings are the product: they render exactly as
+    received. The bound is set above anything they produce, so the branch that
+    matters for them is the one that does nothing."""
+    reason = (
+        "gpt-oss-120b needs 62.4 GiB per node at 4096 context and this cluster "
+        "has 24.0 GiB. Drop the context to 2048, or add a second node."
+    )
+    deps = build_deps(deployments=FakeDeployments([_failed("d-1", error=reason)]))
+
+    with TestClient(create_app(deps)) as client:
+        listed = client.get("/api/deployments").json()[0]
+
+    assert listed["last_error"] == reason
+    assert listed["last_error_truncated"] is False
+
+
+def test_asking_for_a_deployment_that_is_not_there_is_a_404():
+    deps = build_deps(deployments=FakeDeployments([]))
+    with TestClient(create_app(deps)) as client:
+        r = client.get("/api/deployments/d-nope")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "deployment_not_found"
+
+
 def build_deps(*, registry=None, deployments=None, providers=None, settings=None):
     settings = settings or GatewaySettings()
     return GatewayDeps(

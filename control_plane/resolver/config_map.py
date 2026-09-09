@@ -277,6 +277,12 @@ class Mapped:
     architectures: tuple[str, ...] = ()
     warnings: list[str] = field(default_factory=list)
 
+    # Encoder-decoder (Whisper family). KV-cache math downstream only charges
+    # the decoder's self-attention -- see kv.py -- so this flags shapes where
+    # that figure is a floor, not the real number: cross-attention over the
+    # encoder's own output is real cache memory this shape does not count.
+    is_encoder_decoder: bool = False
+
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0
@@ -297,7 +303,8 @@ def map_config(config: dict[str, Any]) -> Mapped:
     # figures, and say so: an encoder-decoder shape charged as if it were
     # decoder-only understates the weights by the size of the encoder, which
     # the parameter count from the weight index later corrects.
-    if cfg.get("is_encoder_decoder") is True:
+    is_encoder_decoder = cfg.get("is_encoder_decoder") is True
+    if is_encoder_decoder:
         if num_layers is None:
             num_layers = _int(_first(cfg, _DECODER_LAYER_KEYS))
         if num_heads is None:
@@ -465,6 +472,7 @@ def map_config(config: dict[str, Any]) -> Mapped:
         architectures=arch_names,
         num_nextn_predict_layers=_int(cfg.get("num_nextn_predict_layers")) or 0,
         warnings=warnings,
+        is_encoder_decoder=is_encoder_decoder,
     )
 
     _map_moe(cfg, mapped)

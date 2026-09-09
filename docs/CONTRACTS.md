@@ -146,6 +146,7 @@ Every value that crosses the wire as a string.
 | `mla_latent_dim` | `int | None` | yes |
 | `mla_rope_dim` | `int | None` | yes |
 | `vision_params` | `int` | yes |
+| `is_encoder_decoder` | `bool` | yes |
 
 ### `NodeProfile`
 
@@ -360,7 +361,7 @@ the canonical value.
 
 ## HTTP surface
 
-### Coordinator gateway (77 routes)
+### Coordinator gateway (78 routes)
 
 | Method | Path |
 |---|---|
@@ -371,6 +372,7 @@ the canonical value.
 | GET | `/api/deployments` |
 | POST | `/api/deployments` |
 | DELETE | `/api/deployments/{deployment_id}` |
+| GET | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}/logs` |
 | GET | `/api/docs` |
 | GET | `/api/enroll` |

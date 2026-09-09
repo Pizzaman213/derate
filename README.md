@@ -52,6 +52,20 @@ under Docker Desktop, `--gpus` needs the NVIDIA container toolkit, and
    curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh | sh
    ```
 
+   Or, if you want the dev branch instead of the release, the same install
+   with a different image — `ghcr.io/pizzaman213/derate/node-dev`, published
+   by every push to `dev`. It is a package of its own rather than a tag on the
+   released one, so nothing that pulls the line above can reach it:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/dev/install-dev.sh | sh
+   ```
+
+   Pass `--image ghcr.io/pizzaman213/derate/node-dev:latest` on each machine
+   you add in step 4 as well: the image is not carried across the join, so a
+   dev coordinator whose nodes were installed without it runs two builds at
+   once.
+
 2. **Open `http://<machine one>:8080`.** A setup walkthrough runs on the first
    visit and takes five steps — read the machine, add a cloud provider if you
    want one, pick a first model and check it against the fit gate, add more

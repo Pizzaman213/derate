@@ -5,7 +5,7 @@ past PLANNED is written to /data/deployments/<id>.json, atomically, so a
 half-written file can never be read back as a deployment.
 
 Records carry the full ModelShape, ParallelismPlan and FitResult because
-reconcile has to hand Agent G a complete Deployment without re-running the
+reconcile has to hand the gateway a complete Deployment without re-running the
 resolver, the planner, or the fit gate against a cluster that may have
 changed shape while we were down.
 """
@@ -43,12 +43,25 @@ SCHEMA_VERSION = 2
 
 #: Low-severity finding: delete() had no caller, so FAILED/STOPPED records
 #: accumulated on disk forever and were reloaded into memory on every
-#: restart. A week is long enough to still have the record around while
-#: debugging a launch failure after the fact, short enough that a control
-#: plane that has been up for months is not carrying years of dead
-#: deployments. reconcile() sweeps for this once per restart -- see
-#: DeploymentManager.reconcile.
-TERMINAL_RETENTION_S = 7 * 24 * 3600.0
+#: restart. Long enough to still have the record around while debugging a
+#: launch failure after the fact, short enough that a control plane that has
+#: been up for months is not carrying years of dead deployments.
+#:
+#: It was a week, which assumed a failed launch is a rare event a person is
+#: about to look at. A launch that fails is retried by the restart
+#: coordinator, and every retry is a NEW deployment id -- so one click on one
+#: model produced three records in four minutes, and a node whose engines were
+#: being killed produced one every twenty seconds. An afternoon of that is
+#: 1,628 records and 13 MB on disk, all of it returned by GET /api/deployments
+#: and parsed by a browser.
+TERMINAL_RETENTION_S = 6 * 3600.0
+
+#: ...and the age window alone does not save you, because the storm happens
+#: inside it. Whatever the clock says, only this many terminal records are
+#: kept -- the newest, because a failure you are debugging is a recent one.
+#: The launch logs are kept separately (DeploymentManager._archive_log), so
+#: what a swept record costs is a row in a list, not the evidence.
+TERMINAL_RECORDS_KEPT = 200
 
 
 class DeploymentStore:
@@ -106,7 +119,46 @@ class DeploymentStore:
                 continue
             self.delete(deployment_id)
             removed += 1
-        return removed
+        return removed + self.purge_surplus()
+
+    def purge_surplus(self, keep: int | None = None) -> int:
+        """Delete all but the newest *keep* terminal records, whatever their age.
+
+        The age sweep above cannot help with a retry storm: those records are
+        minutes old and every one of them is inside any sane window. This is
+        the bound that holds when the failures are arriving faster than they
+        expire. Newest by mtime, which `save` rewrites on every state change,
+        so it is when the record settled rather than when it was created.
+        """
+        # Read at call time rather than bound as a default: a default is
+        # evaluated once at import, so the constant could not be changed by
+        # anything -- a test, or a deployment that wants a different bound --
+        # after this module was first imported.
+        keep = TERMINAL_RECORDS_KEPT if keep is None else keep
+        if not self.root.is_dir():
+            return 0
+        paths = list(self.root.glob("*.json"))
+        # A directory listing, and no reads at all, in the case this runs in
+        # most often: called on every terminal transition, it must cost a
+        # syscall rather than a parse of every record on the box.
+        if len(paths) <= keep:
+            return 0
+        terminal: list[tuple[float, str]] = []
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text())
+                if DeploymentState(payload["deployment"]["state"]) not in TERMINAL:
+                    continue
+                terminal.append((path.stat().st_mtime, payload["deployment"]["deployment_id"]))
+            except Exception:
+                logger.warning("could not evaluate %s for GC, leaving it", path, exc_info=True)
+                continue
+        if len(terminal) <= keep:
+            return 0
+        terminal.sort(reverse=True)
+        for _, deployment_id in terminal[keep:]:
+            self.delete(deployment_id)
+        return len(terminal) - keep
 
     # -- read -------------------------------------------------------------
 

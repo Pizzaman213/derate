@@ -58,22 +58,6 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim
 
-# The build this image was made from. Empty on a plain `docker build`, which
-# is honest: control_plane/version.py renders that as "an unidentified build"
-# rather than inventing one. docker/build.sh always passes it.
-ARG DERATE_BUILD=""
-
-LABEL org.opencontainers.image.title="derate/node" \
-      org.opencontainers.image.description="Derate node: agent, coordinator, gateway, UI" \
-      org.opencontainers.image.source="https://github.com/Pizzaman213/derate" \
-      org.opencontainers.image.revision="${DERATE_BUILD}"
-
-# Read by control_plane.version.build_id() and reported on /agent/profile and
-# /agent/health, so a node running an old image can be told apart from a node
-# whose hardware genuinely cannot be identified. Those two used to render
-# identically, which is how a working Raspberry Pi came to read as a fault.
-ENV DERATE_BUILD="${DERATE_BUILD}"
-
 # openssh-client: sparkrun drives the cluster over SSH.
 # git: sparkrun's recipe registry is a git clone and its RegistryManager shells
 #      out to the binary -- ensure_initialized() -> update() -> _clone_or_pull()
@@ -178,5 +162,31 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${DERATE_AGENT_PORT:-8081}/agent/health" \
    || curl -fsS "http://127.0.0.1:${DERATE_PORT:-8080}/agent/health" \
    || exit 1
+
+# The build this image was made from, and the LAST thing this stage does.
+#
+# Position is load-bearing rather than tidy. The value changes on every commit,
+# and BuildKit chains cache keys through the image config, so an ENV set before
+# the apt layer and the docker CLI download would miss both on every build --
+# 40 MB re-fetched through QEMU for arm64 to record a twelve-character string.
+# At the end it invalidates nothing but itself.
+#
+# Empty on a plain `docker build`, which is honest: control_plane/version.py
+# renders that as "an unidentified build" rather than inventing one.
+# docker/build.sh passes it, and so does .github/workflows/publish-image.yml --
+# .dockerignore drops .git, so an unstamped image has no second source to fall
+# back to and every published node reads as unidentified.
+ARG DERATE_BUILD=""
+
+LABEL org.opencontainers.image.title="derate/node" \
+      org.opencontainers.image.description="Derate node: agent, coordinator, gateway, UI" \
+      org.opencontainers.image.source="https://github.com/Pizzaman213/derate" \
+      org.opencontainers.image.revision="${DERATE_BUILD}"
+
+# Read by control_plane.version.build_id() and reported on /agent/profile and
+# /agent/health, so a node running an old image can be told apart from a node
+# whose hardware genuinely cannot be identified. Those two used to render
+# identically, which is how a working Raspberry Pi came to read as a fault.
+ENV DERATE_BUILD="${DERATE_BUILD}"
 
 ENTRYPOINT ["/opt/derate/docker/entrypoint.sh"]

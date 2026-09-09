@@ -31,6 +31,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
+from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
+from starlette.routing import Mount
 
 from . import (
     capacity_api,
@@ -594,7 +597,25 @@ def create_app(
     if settings.ui_dir:
         ui_path = Path(settings.ui_dir)
         if ui_path.is_dir():
-            app.mount("/", _UIStatics(directory=str(ui_path), html=True), name="ui")
+            # GZipMiddleware, not the global `app.add_middleware`: Starlette's
+            # gzip responder holds back the ASGI `http.response.start` event
+            # until the wrapped app produces its first body chunk, gzip or
+            # not -- it has to see that chunk to decide whether compression
+            # applies. Scoped to /v1 or /api, that would silently reintroduce
+            # the header-holding bug `upstream_header_hold_s` exists to avoid
+            # on a slow-starting chat stream. Bare static files never stream
+            # a slow first byte, so the mount is the one place this is free:
+            # the built UI ships a ~570 KB JS bundle, a 42 KB stylesheet and,
+            # with `vite.config.ts`'s `sourcemap: true`, source maps DevTools
+            # fetches whenever it's open -- none of it compressed before this.
+            app.router.routes.append(
+                Mount(
+                    "/",
+                    app=_UIStatics(directory=str(ui_path), html=True),
+                    name="ui",
+                    middleware=[Middleware(GZipMiddleware, minimum_size=500)],
+                )
+            )
         else:
             log.warning(
                 "DERATE_UI_DIR=%s does not exist; not serving the UI",

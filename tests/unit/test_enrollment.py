@@ -649,7 +649,7 @@ def fake_ports(tmp_path, *listening):
     return bin_dir
 
 
-def fake_docker(tmp_path, responses=None, listening=()):
+def fake_docker(tmp_path, responses=None, listening=(), fail_runs=0):
     """A `docker` on PATH that records its argv and answers canned queries.
 
     Prepended to the real PATH rather than replacing it: install.sh shells out
@@ -670,8 +670,17 @@ def fake_docker(tmp_path, responses=None, listening=()):
         "import json, sys\n"
         f"log = {str(log)!r}\n"
         f"table = json.loads({table!r})\n"
+        f"fail_runs = {fail_runs}\n"
         "argv = ' '.join(sys.argv[1:])\n"
         "open(log, 'a').write(argv + chr(10))\n"
+        # `docker run` refusing the first N times, with something on stderr to
+        # be quoted back. The count is read off the log rather than kept in the
+        # stub, because each call is its own process.
+        "if fail_runs and argv.startswith('run '):\n"
+        "    prior = sum(1 for line in open(log) if line.startswith('run '))\n"
+        "    if prior <= fail_runs:\n"
+        "        sys.stderr.write('docker: Error response from daemon: boom' + chr(10))\n"
+        "        sys.exit(125)\n"
         "for key, out in table:\n"
         "    if key in argv:\n"
         "        sys.stdout.write(out)\n"
@@ -1096,6 +1105,46 @@ def test_the_docker_socket_is_mounted_or_the_refusal_is_explained():
         assert "-v /var/run/docker.sock:/var/run/docker.sock" in result.stdout
     else:
         assert "not be able" in result.stderr and "launch a model" in result.stderr
+
+
+def test_a_failed_start_is_retried_with_the_gpu_flags_still_on(tmp_path):
+    """A first `docker run` fails for reasons that are not the GPU.
+
+    This ladder used to drop --gpus in the very step that removed the leftover
+    container, so the removal fixed the run and the GPU took the blame -- and
+    the machine was recorded as unidentified hardware, which the planner will
+    not place work on, under a message about the container toolkit. spark-26af
+    came up exactly that way on an install whose host ran `docker run --gpus
+    all` correctly a minute later.
+    """
+    path, log = fake_docker(tmp_path, fail_runs=1)
+
+    result = sh(path=path)
+
+    runs = [c for c in docker_calls(log) if c.startswith("run ")]
+    assert result.returncode == 0, result.stderr
+    assert len(runs) == 2, runs
+    assert all("--gpus all" in r for r in runs), runs
+    assert "could not pass the GPU" not in result.stderr, result.stderr
+
+
+def test_the_gpu_is_only_dropped_after_two_tries_and_docker_is_quoted(tmp_path):
+    """When it really is the GPU, say so -- and say what Docker said.
+
+    The error was written to a temp file and deleted unread on the fallback
+    path, so a node downgraded itself and nothing on the machine recorded why.
+    """
+    path, log = fake_docker(tmp_path, fail_runs=2)
+
+    result = sh(path=path)
+
+    runs = [c for c in docker_calls(log) if c.startswith("run ")]
+    assert result.returncode == 0, result.stderr
+    assert len(runs) == 3, runs
+    assert "--gpus all" in runs[0] and "--gpus all" in runs[1], runs
+    assert "--gpus all" not in runs[2], runs[2]
+    assert "Docker said" in result.stderr, result.stderr
+    assert "Error response from daemon: boom" in result.stderr, result.stderr
 
 
 def test_help_documents_both_shapes():

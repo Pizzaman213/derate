@@ -1,7 +1,7 @@
 """The internal API. Exactly the surface in architecture section 4.8.
 
-No additions without updating that file: Agent H is coding against it in
-parallel. Where a port does not yet expose an operation the HTTP surface
+No additions without updating that file: the UI codes against it exactly.
+Where a port does not yet expose an operation the HTTP surface
 promises, the endpoint degrades with a clear 501 rather than disappearing,
 so the UI can be built against the full shape from day 0.
 """
@@ -503,6 +503,12 @@ _DELETE_TIMEOUT_S = 120.0
 #: event bus into this request module to obtain one frozenset.
 #: ``tests/unit/test_single_source.py`` holds the two equal.
 _TERMINAL_STATES = states.TERMINAL
+
+#: How many FAILED/STOPPED deployments GET /api/deployments carries. The live
+#: ones are always all of them; see the route. Two hundred is more history
+#: than a screen shows and small enough that the payload stays in the tens of
+#: kilobytes where it belongs.
+DEPLOYMENT_LIST_TERMINAL = 200
 
 #: The states that mean "on its way but not yet serving" -- what /api/activity
 #: reports. Deliberately an allowlist: every other state is a deployment that
@@ -1301,7 +1307,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.get("/api/nodes/candidates")
     async def node_candidates() -> JSONResponse:
-        # Discovery proposes, a human accepts. Agent A owns the candidate set.
+        # Discovery proposes, a human accepts. The registry owns the candidate set.
         candidates = getattr(ctx.deps.registry, "candidates", None)
         if not callable(candidates):
             return JSONResponse([])
@@ -2544,13 +2550,58 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
 
     @router.get("/api/deployments")
-    async def list_deployments() -> JSONResponse:
+    async def list_deployments(limit: int = DEPLOYMENT_LIST_TERMINAL) -> JSONResponse:
+        """Everything still alive, plus the newest *limit* that are not.
+
+        Unbounded, this returned every record the manager held. On this
+        cluster that reached 1,628 records and 7.7 MB -- 5.3 MB of it
+        tracebacks in `last_error` -- which the browser downloaded and parsed
+        on every refresh of the models screen, and which is what took the tab
+        down after a launch. A launch that fails is retried, every retry is a
+        new deployment id, and the list grew by one every twenty seconds.
+
+        Live deployments are never dropped, however many there are: they are
+        the ones the screen is actually about, and a cap that could hide a
+        running model would be a worse bug than the one this fixes. The cut is
+        only ever applied to FAILED and STOPPED, newest kept.
+
+        Original order is preserved rather than re-sorted -- the callers do
+        their own sorting and this route has never promised one.
+        """
         try:
             deployments = ctx.deps.deployments.list()
         except Exception:
             log.exception("deployment listing failed")
             deployments = []
-        return JSONResponse([serialize.deployment_payload(d) for d in deployments])
+        keep = max(0, min(int(limit), 2000))
+        terminal = [d for d in deployments if d.state in _TERMINAL_STATES]
+        kept = {d.deployment_id for d in terminal[len(terminal) - keep:]} if keep else set()
+        return JSONResponse([
+            serialize.deployment_payload(d, error_chars=serialize.LIST_ERROR_CHARS)
+            for d in deployments
+            if d.state not in _TERMINAL_STATES or d.deployment_id in kept
+        ])
+
+    @router.get("/api/deployments/{deployment_id}")
+    async def get_deployment(deployment_id: str) -> Response:
+        """One deployment, with `last_error` whole.
+
+        The list bounds that field; this is where the rest of it lives, and
+        the sheet that renders a refusal through `Verbatim` -- planner and fit
+        strings, which are the product and are never truncated -- reads it
+        from here.
+        """
+        try:
+            deployment = ctx.deps.deployments.get(deployment_id)
+        except Exception:
+            log.exception("deployment lookup failed")
+            deployment = None
+        if deployment is None:
+            return errors.error_response(
+                404, f"No deployment '{deployment_id}'.",
+                "invalid_request_error", "deployment_not_found",
+            )
+        return JSONResponse(serialize.deployment_payload(deployment))
 
     @router.post("/api/deployments")
     async def create_deployment(request: Request) -> Response:
@@ -3108,7 +3159,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     # -- history -----------------------------------------------------------
     #
     # New endpoints, never a widened frame. Section 4.8 fixes the SSE payload
-    # and Agent H codes against it; a history surface belongs beside it, not
+    # and the UI codes against it; a history surface belongs beside it, not
     # inside it. Every answer says which resolution it used and which parts of
     # the window were trimmed rather than quiet.
 

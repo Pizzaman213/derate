@@ -73,7 +73,7 @@ def _pct(value: float) -> str:
 
 
 # The table. Order here is the order in the rendered command, which is the
-# order Agent H shows the user, so keep the interesting knobs first.
+# order the UI shows the user, so keep the interesting knobs first.
 KNOBS: tuple[Knob, ...] = (
     Knob("hosts", "cli", "hosts", "--hosts", lambda v: ",".join(v)),
     Knob("tensor_parallel", "cli", "tensor_parallel", "--tp"),
@@ -146,6 +146,33 @@ class RuntimeSpec:
     #: refusal is in `sharding_refusal` below so the launch path and the
     #: runtime itself cannot disagree about which degrees are legal.
     shards: bool = True
+    #: Appended, with the byte count the fit gate budgeted, when this runtime
+    #: can be told the KV cache size outright instead of deriving one.
+    #:
+    #: vLLM's default sizing is `device total x gpu_memory_utilization` minus
+    #: the DEVICE's free-memory drop across its own profiling -- not this
+    #: process's allocation. Its own note above that subtraction: "we assume
+    #: that the other processes using the same GPU did not change their memory
+    #: usage during the profiling." On a box with neighbours that assumption is
+    #: false in both directions, and both are fatal: one allocating during the
+    #: window is billed to whoever is profiling until the budget goes negative
+    #: (`No available memory for the cache blocks`), and one *releasing* trips
+    #: an assert outright (`Error in memory profiling ... other processes ...
+    #: release GPU memory while vLLM is profiling`).
+    #:
+    #: Given this flag, `determine_available_memory` returns the figure and
+    #: never reaches either -- no derived budget, so nothing a neighbour does
+    #: can corrupt it. The number is `fit.breakdown.kv_cache`, which is what
+    #: the gate approved the launch against, so this is also the first time the
+    #: runtime is asked for the cache the plan actually costed rather than
+    #: whatever a fraction of the machine happened to leave over.
+    #:
+    #: The trade, said out loud: vLLM will now allocate this exactly, and OOM
+    #: if the plan was wrong, where before it would quietly settle for less.
+    #: The fit gate sizes against live memory precisely so the plan is not
+    #: wrong, and a launch that silently gets a smaller KV cache than the plan
+    #: promised is a worse failure -- it is the one nobody notices.
+    kv_cache_bytes_arg: str | None = None
 
 
 _VLLM_COMMAND = """\
@@ -231,6 +258,7 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         command_template=_VLLM_COMMAND,
         custom_command_prefix=_VLLM_CUSTOM_PREFIX,
         expert_parallel_arg="--enable-expert-parallel",
+        kv_cache_bytes_arg="--kv-cache-memory-bytes {kv_cache_memory_bytes}",
         health_path="/health",
         # vLLM resolves VLLM_CACHE_ROOT to `~/.cache/vllm` (envs.py, read out
         # of the shipped image), and sparkrun runs the container with

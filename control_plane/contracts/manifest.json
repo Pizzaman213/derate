@@ -459,6 +459,12 @@
           "type": "int",
           "optional": true,
           "default": 0
+        },
+        {
+          "name": "is_encoder_decoder",
+          "type": "bool",
+          "optional": true,
+          "default": false
         }
       ]
     },

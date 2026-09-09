@@ -6,9 +6,9 @@ across a control-plane restart.
 
 Four rules this file exists to enforce:
 
-* Agent D's fit verdict gates every launch. WONT_FIT never produces a launch
-  attempt, and the refusal carries D's reason unedited -- it is more specific
-  than anything written here.
+* The fit calculator's verdict gates every launch. WONT_FIT never produces a
+  launch attempt, and the refusal carries its reason unedited -- it is more
+  specific than anything written here.
 * One node runs one copy of a model. A node here is one GPU, so a second copy
   of the same model on it is not a second machine's worth of throughput: it is
   the same weights loaded twice out of one pool of unified memory that the fit
@@ -106,6 +106,30 @@ POST_MORTEM_READ_S = 10.0
 #: is the one from the launch that is going wrong -- and small enough that a
 #: fleet of them is not a memory decision anybody has to think about.
 LOG_BUFFER_LINES = 500
+#: Where a failed launch's log is written, under ``state_dir`` beside the
+#: deployment records, because it is evidence about a deployment rather than
+#: something this process said about itself.
+#:
+#: The buffer above is per deployment and a retry is a NEW deployment with its
+#: own, so a relaunch does not overwrite it -- what loses it is this process
+#: restarting. The runtime's own copy is worse off: a solo launch writes to
+#: /tmp/sparkrun_serve.log inside a container the relaunch reuses by name, so
+#: attempt N's traceback is truncated away by attempt N+1. Between the two,
+#: the reason a launch failed survived only as long as the coordinator did.
+#:
+#: Which mattered on the first real launch from a containerized node: three
+#: attempts, the first two `RuntimeError: Engine core initialization failed.
+#: See root cause above.` -- and the root cause above, `ValueError: No
+#: available memory for the cache blocks`, was in a buffer nobody had a reason
+#: to open and a file the next attempt had already overwritten.
+#: How often a launch waiting for a node to finish starting something else
+#: re-checks. Short: the thing it is waiting for takes minutes, and the cost of
+#: asking is a set lookup.
+STARTING_GATE_POLL_S = 0.5
+FAILED_LOG_DIR = "failed-launches"
+#: How many of them to keep. A box that fails a lot is exactly the box you
+#: want the last few from, and 500 lines each is not a disk decision.
+FAILED_LOGS_KEPT = 50
 STOP_CONFIRM_TIMEOUT_S = 30.0
 #: Per-request budget when talking to a node agent during a forced stop.
 #: Long enough to cover the agent's own SIGTERM grace plus SIGKILL wait.
@@ -178,8 +202,8 @@ def _bar_desc(line: str) -> str | None:
 class LaunchRefused(RuntimeError):
     """The fit gate said no.
 
-    ``str(exc)`` and ``exc.reason`` are Agent D's reason, character for
-    character. Do not paraphrase it on the way to the user.
+    ``str(exc)`` and ``exc.reason`` are the fit calculator's reason, character
+    for character. Do not paraphrase it on the way to the user.
     """
 
     def __init__(self, fit: FitResult) -> None:
@@ -299,7 +323,7 @@ class _Record:
         return reasons
 
     def admitting(self) -> bool:
-        """False once any node crosses critical. Agent G reads this."""
+        """False once any node crosses critical. The gateway reads this."""
         return "critical" not in self.node_severity.values()
 
 
@@ -328,6 +352,12 @@ class DeploymentManager:
         self.adapter = adapter or SparkrunAdapter(registry, recipe_dir=state_dir / "recipes")
         self.registry = registry
         self.store = DeploymentStore(state_dir / "deployments")
+        self.failed_log_dir = state_dir / FAILED_LOG_DIR
+        #: Nodes with an engine between `docker run` and ready. See
+        #: _hold_starting: two vLLM startups on one node bill each other's
+        #: allocations to their own memory budget, so they are serialised.
+        self._starting: set[str] = set()
+        self._starting_cv = threading.Condition()
         self.bus = bus or EventBus()
         self.poll_interval_s = poll_interval_s
         self.health_fail_threshold = health_fail_threshold
@@ -380,7 +410,7 @@ class DeploymentManager:
                 served_name=served_name or default_served_name(shape),
                 model_id=shape.model_id,
                 verdict=fit.verdict.value,
-                reason=fit.reason,  # Agent D's words, verbatim
+                reason=fit.reason,  # the fit calculator's words, verbatim
                 limiting_term=fit.limiting_term,
                 max_context_that_fits=fit.max_context_that_fits,
                 node_ids=list(plan.node_ids),
@@ -697,14 +727,78 @@ class DeploymentManager:
                 and record.deployment.state is S.LAUNCHING
             }
 
+    def _archive_log(self, record: _Record) -> None:
+        """Write this failed launch's log somewhere the next attempt cannot reach.
+
+        Called on the way into FAILED, so the lines are still in the buffer.
+        The file is self-contained -- what was being launched, what killed it,
+        then every line -- because the person opening it has a deployment id
+        and a question, not this process's memory.
+
+        Never raises. An unwritable state directory costs the evidence, which
+        is bad; failing the launch that is already failing, to report it, is
+        worse, and it would be reported as the launch's own error.
+        """
+        deployment = record.deployment
+        with self._lock:
+            lines = list(record.log_lines)
+            last_error = deployment.last_error or ""
+        if not lines and not last_error:
+            return
+        header = [
+            "deployment: %s" % deployment.deployment_id,
+            "model:      %s" % deployment.shape.model_id,
+            "served as:  %s" % deployment.served_name,
+            "runtime:    %s" % deployment.runtime,
+            "nodes:      %s" % ", ".join(deployment.plan.node_ids),
+            "",
+            "--- why it failed ---",
+            last_error.strip(),
+            "",
+            "--- the launch, as it was printed ---",
+        ]
+        try:
+            self.failed_log_dir.mkdir(parents=True, exist_ok=True)
+            path = self.failed_log_dir / ("%s.log" % deployment.deployment_id)
+            path.write_text("\n".join(header + lines) + "\n")
+            self._prune_failed_logs()
+        except Exception:
+            logger.warning(
+                "could not keep the log for %s", deployment.deployment_id, exc_info=True
+            )
+
+    def _prune_failed_logs(self) -> None:
+        """Newest FAILED_LOGS_KEPT, by the time each was written."""
+        kept = sorted(
+            self.failed_log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        for stale in kept[FAILED_LOGS_KEPT:]:
+            stale.unlink(missing_ok=True)
+
+    def _archived_log(self, deployment_id: str, *, limit: int) -> list[str]:
+        """The kept lines for *deployment_id*, or none. Never raises."""
+        path = self.failed_log_dir / ("%s.log" % deployment_id)
+        try:
+            return path.read_text().splitlines()[-limit:]
+        except FileNotFoundError:
+            return []
+        except Exception:
+            logger.warning("could not read the kept log %s", path, exc_info=True)
+            return []
+
     def log_tail(self, deployment_id: str, *, limit: int = LOG_BUFFER_LINES) -> dict[str, Any]:
         """What this deployment's launcher and backend have said.
 
-        Two sources, and the caller is told which one it got:
+        Three sources, and the caller is told which one it got:
 
         ``"buffer"`` -- the lines the manager already streamed while the
         launch was in flight, served straight out of memory. Free, live, and
         safe to poll.
+
+        ``"archive"`` -- the file written on the way into FAILED, for a
+        launch that failed before this process last restarted. The buffer is
+        memory and the runtime's own log is truncated by the next attempt, so
+        for a failure older than the coordinator this is the only copy.
 
         ``"read"`` -- a bounded `sparkrun logs` for a deployment we are no
         longer following. That command tails and follows, so it does not
@@ -719,6 +813,12 @@ class DeploymentManager:
         with self._lock:
             record = self._records.get(deployment_id)
             if record is None:
+                # No record and possibly still a kept log: the records are
+                # swept after a week and the file outlives nothing, but the
+                # order of the two is not this method's business.
+                kept = self._archived_log(deployment_id, limit=limit)
+                if kept:
+                    return {"lines": kept, "source": "archive", "cluster_id": None}
                 return {"lines": [], "source": "none", "cluster_id": None}
             lines = list(record.log_lines)[-limit:]
             cluster_id = record.cluster_id
@@ -735,6 +835,15 @@ class DeploymentManager:
             terminal = record.deployment.state in TERMINAL
         if lines and (following or terminal):
             return {"lines": lines, "source": "buffer", "cluster_id": cluster_id}
+        # The buffer is memory, so a coordinator that has restarted since the
+        # failure has the record and none of the lines. `sparkrun logs` below
+        # cannot help there either -- the container is gone, or the relaunch
+        # truncated its log -- so the file written on the way into FAILED is
+        # the only copy left, and it is named as its own source rather than
+        # passed off as the live read it is not.
+        kept = self._archived_log(deployment_id, limit=limit)
+        if kept:
+            return {"lines": kept, "source": "archive", "cluster_id": cluster_id}
         if not cluster_id:
             return {"lines": [], "source": "none", "cluster_id": None}
         try:
@@ -750,7 +859,7 @@ class DeploymentManager:
             "cluster_id": cluster_id,
         }
 
-    # -- the rest of Agent F's surface ------------------------------------
+    # -- the rest of the deployment manager's surface ---------------------
 
     def render_command(
         self,
@@ -881,6 +990,65 @@ class DeploymentManager:
                 buffer.append(line)
         self._note_progress(record, read(line))
 
+    #: Headroom added on top of `fit.breakdown.kv_cache` before it becomes
+    #: `--kv-cache-memory-bytes`. Two measured shortfalls, both real, neither
+    #: fixed by the fit gate's own arithmetic being "more correct":
+    #:
+    #: - vLLM allocates the cache in fixed-size blocks plus alignment, so a
+    #:   figure computed as kv_bytes_per_token * context lands short of what
+    #:   `_check_enough_kv_cache_memory` actually requires. Qwen3-4B-AWQ at
+    #:   40960 tokens asked for exactly 16 tokens (one block) less than vLLM
+    #:   needed; reproduced identically on a GPTQ and an fp16 checkpoint, so
+    #:   it is the block rounding, not a per-model estimate being wrong.
+    #: - Encoder-decoder shapes (Whisper family) undercount for a different
+    #:   reason: the figure only prices decoder self-attention
+    #:   (`ModelShape.is_encoder_decoder`, `fit/kv.py`), never the
+    #:   cross-attention cache over the encoder's own output. openai/
+    #:   whisper-base.en at 448 tokens asked for 5.5 MB against a measured
+    #:   vLLM minimum of 0.03 GiB -- six times over, not one block.
+    #:
+    #: 50 MiB clears both: the block-rounding gap is a handful of MB at most,
+    #: and whisper-base.en's cross-attention shortfall measured about 27 MB
+    #: (5.5 MB supplied against a 32 MB vLLM minimum). Kept small rather than
+    #: the 1 GiB first tried, because this is not free on a tight fit -- a
+    #: plan the gate approved with less headroom than the margin can now ask
+    #: the runtime for more than is free, trading the block-rounding crash for
+    #: the one `deploy/utilization.py` describes at its own module docstring.
+    KV_CACHE_LAUNCH_MARGIN_BYTES = 50 * 1024**2
+
+    def _launch_kv_cache_bytes(self, record: _Record) -> int | None:
+        """The KV cache to reserve outright, instead of one derived by profiling.
+
+        `fit.breakdown.kv_cache` is what the gate approved this launch against
+        -- this model, this context, this concurrency, per node -- and until
+        now no runtime was ever told it. vLLM worked its own out as `device
+        total x utilization` minus the DEVICE's free-memory drop across its own
+        profiling, which is a number about whatever else the box was doing:
+        a neighbour allocating in that window is billed here until the budget
+        goes negative, and a neighbour *releasing* trips an assert. Both were
+        seen on spark-26af in one afternoon, on identical commands minutes
+        apart. Given the figure, the runtime skips that derivation entirely.
+
+        `KV_CACHE_LAUNCH_MARGIN_BYTES` is added on top before it is handed
+        over, because the bare figure has twice been measured short of what
+        vLLM actually requires -- see that constant's own comment.
+
+        Zero or missing returns None, and the runtime sizes its own cache as
+        before: an embedding model has no KV cache, and a fit record without a
+        breakdown is not a licence to ask for nothing -- which is what a
+        literal zero would mean to the flag. No margin is added in this case
+        either: there is nothing to round up, and handing a KV cache to a
+        runtime that never asked for any is not a safety margin, it is a
+        different request.
+        """
+        breakdown = getattr(record.deployment.fit, "breakdown", None)
+        kv = getattr(breakdown, "kv_cache", 0) if breakdown is not None else 0
+        try:
+            kv = int(kv)
+        except (TypeError, ValueError):
+            return None
+        return kv + self.KV_CACHE_LAUNCH_MARGIN_BYTES if kv > 0 else None
+
     def _launch_utilization(self, record: _Record) -> float | None:
         """What share of the device this launch should ask the runtime for.
 
@@ -922,6 +1090,61 @@ class DeploymentManager:
             smallest = share if smallest is None else min(smallest, share)
         return smallest
 
+    def _hold_starting(self, node_ids: tuple[str, ...], deadline: float) -> bool:
+        """Wait until no other engine is starting on any of *node_ids*.
+
+        **Two vLLM startups on one device corrupt each other's arithmetic.**
+        The engine sizes its KV cache as
+
+            requested   = device total x gpu_memory_utilization
+            consumed    = free memory before the model - free memory after profiling
+            available   = requested - consumed - transient peak
+
+        and `consumed` is the *device's* free-memory drop, not this process's
+        allocation. vLLM says so itself, above that subtraction: "we assume
+        that the other processes using the same GPU did not change their
+        memory usage during the profiling." A neighbour that allocates inside
+        that window is charged to whoever is profiling, and when the total goes
+        negative the engine dies with `No available memory for the cache
+        blocks` -- advice to raise gpu_memory_utilization for a model that
+        wanted 1.8 GiB and was billed for somebody else's 16.
+
+        That is what happened on the first launch from a containerized node
+        here: three attempts of the same 0.5B with the same command, the first
+        two failing at two minutes each because an 8B was loading its weights
+        inside their profiling window, the third succeeding once the device was
+        quiet. Nothing about the model, the plan or the flags differed.
+
+        So a node starts one engine at a time. It costs the wall-clock of
+        launching two models at once, which was never real: the second one died
+        and retried into the same race.
+
+        Returns False if *deadline* passes first, which the caller turns into a
+        refusal rather than a launch into a busy profiler.
+
+        Still here after `--kv-cache-memory-bytes` landed, and for a narrower
+        reason: vLLM no longer derives a budget at all, but sglang and the tts
+        server still profile, and vLLM's startup check -- free >= total x
+        utilization -- can still be lost to a neighbour that allocates first.
+        That failure is fast and legible where the old one cost two minutes,
+        so taking this gate off is now a small change rather than a risky one.
+        It wants proving on hardware first.
+        """
+        with self._starting_cv:
+            while any(node in self._starting for node in node_ids):
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return False
+                self._starting_cv.wait(min(remaining, STARTING_GATE_POLL_S))
+            self._starting.update(node_ids)
+            return True
+
+    def _release_starting(self, node_ids: tuple[str, ...]) -> None:
+        """Let the next launch on these nodes begin. Idempotent."""
+        with self._starting_cv:
+            self._starting.difference_update(node_ids)
+            self._starting_cv.notify_all()
+
     def _launch_worker(self, record: _Record, port: int) -> None:
         deployment = record.deployment
         # One clock for the whole of LAUNCHING. `adapter.launch` carries its
@@ -933,7 +1156,45 @@ class DeploymentManager:
         # stays the bound on that one call; this deadline is the bound on the
         # state, which is the number a person is actually waiting out.
         deadline = self._clock() + self.ready_timeout_s
+
+        # One engine at a time per node, for the whole of its startup -- see
+        # _hold_starting for the arithmetic that makes two of them fatal to
+        # each other.
+        #
+        # That lift has since landed: `_launch_kv_cache_bytes` below passes
+        # `--kv-cache-memory-bytes`, so vLLM returns the fit gate's own figure
+        # ("skipped memory profiling ... does not respect the
+        # gpu_memory_utilization config") instead of deriving one from the
+        # device's free-memory delta. What remains for this gate is sglang and
+        # the tts server, which still profile, and vLLM's own startup check.
+        nodes = tuple(sorted(set(deployment.plan.node_ids)))
+        if not self._hold_starting(nodes, deadline):
+            self._fail_launch(
+                record,
+                LaunchError(
+                    "another model is still starting on %s. This one waited "
+                    "%.0fs for the node and stopped rather than starting a "
+                    "second engine inside the first one's memory profiling, "
+                    "which is a launch that dies after minutes of work and "
+                    "blames its own gpu_memory_utilization."
+                    % (", ".join(nodes), self.ready_timeout_s),
+                    raw="",
+                ),
+            )
+            return
+        try:
+            self._launch_and_wait(record, port, deadline)
+        finally:
+            self._release_starting(nodes)
+
+    def _launch_and_wait(self, record: _Record, port: int, deadline: float) -> None:
+        """The launch itself, with the node held. Split out so the release in
+        `_launch_worker` covers every way this returns."""
+        deployment = record.deployment
+        # After the gate, not before: this reads what the device has free, and
+        # the answer is worthless while another engine is mid-profile.
         share = self._launch_utilization(record)
+        kv_bytes = self._launch_kv_cache_bytes(record)
         if share is not None:
             logger.info(
                 "launching %s at %.2f of the device (%.1f GiB is what the plan "
@@ -952,6 +1213,10 @@ class DeploymentManager:
                 served_name=deployment.served_name,
                 port=port,
                 gpu_memory_utilization=share,
+                # The cache the plan costed, asked for by name. See
+                # _launch_kv_cache_bytes: this is what takes the launch's
+                # budget out of the hands of whatever else is on the device.
+                kv_cache_memory_bytes=kv_bytes,
                 # Everything before the container exists is inside this call:
                 # the image pull and the weights. Read it as it is printed or
                 # it is not readable at all -- the output is in a pipe until
@@ -1195,6 +1460,8 @@ class DeploymentManager:
             self._emit_fit_miss(record, detail)
         elif post_mortem:
             self._post_mortem(record)
+        # Last, so the file carries whatever the post-mortem added.
+        self._archive_log(record)
 
     def _post_mortem(self, record: _Record) -> None:
         """Pull the container log tail and look for an OOM signature.
@@ -1225,12 +1492,24 @@ class DeploymentManager:
         if is_oom(tail):
             self._emit_fit_miss(record, tail)
 
+    def _post_mortem_and_keep(self, record: _Record) -> None:
+        """The post-mortem, then the log. One thread, in that order.
+
+        `finally`, because a post-mortem that raises -- an SSH to a host that
+        has gone away -- is exactly when the lines already in the buffer are
+        the only account of what happened.
+        """
+        try:
+            self._post_mortem(record)
+        finally:
+            self._archive_log(record)
+
     def _emit_fit_miss(self, record: _Record, detail: str) -> None:
         """The most valuable telemetry this system produces.
 
-        A launch that OOMs despite passing the fit gate means Agent D's
-        estimate was low. Emitting the full breakdown next to the actual
-        failure is what makes the next estimate better.
+        A launch that OOMs despite passing the fit gate means the fit
+        calculator's estimate was low. Emitting the full breakdown next to the
+        actual failure is what makes the next estimate better.
         """
         deployment = record.deployment
         breakdown = deployment.fit.breakdown
@@ -1454,7 +1733,7 @@ class DeploymentManager:
             else:
                 record.unhealthy_nodes.discard(node_id)
 
-            # M-13: this must share Agent G's admission-controller denominator
+            # M-13: this must share the gateway's admission-controller denominator
             # (gateway/admission.py), not the nameplate total. addressable_memory
             # is the GPU-reachable ceiling the fit calculator's usable_memory()
             # budget was computed against; total_memory is bytes the GPU can
@@ -1488,8 +1767,8 @@ class DeploymentManager:
                 "memory_used_pct": round(fraction * 100.0, 1),
             }
             if severity == "critical":
-                # Agent G stops admitting. We do not kill: shedding load is
-                # recoverable, killing a loaded model is not.
+                # The gateway stops admitting. We do not kill: shedding load
+                # is recoverable, killing a loaded model is not.
                 self.bus.emit(
                     ev.MEMORY_CRITICAL,
                     severity="critical",
@@ -1549,9 +1828,13 @@ class DeploymentManager:
             deployment.last_error = detail
             self._transition(record, S.FAILED, reason=detail)
         # Post-mortem after the transition, on its own thread: an SSH to a
-        # wedged host must not hold up the next deployment's health check.
+        # wedged host must not hold up the next deployment's health check. The
+        # log is kept once that has run, on the same thread and in that order,
+        # so the file carries whatever the post-mortem found. A backend that
+        # dies while serving is relaunched by the restart coordinator, so this
+        # log has exactly the same short life as a failed launch's.
         threading.Thread(
-            target=self._post_mortem,
+            target=self._post_mortem_and_keep,
             args=(record,),
             name="derate-postmortem-%s" % deployment.deployment_id,
             daemon=True,
@@ -1580,6 +1863,16 @@ class DeploymentManager:
             return
         deployment.state = target
         self.store.save(deployment, record.handle)
+        if target in TERMINAL:
+            # Here, not only in reconcile(): a week's retention swept once per
+            # restart cannot hold against a retry loop that writes a record
+            # every twenty seconds, and the pile it leaves is what a browser
+            # then has to download. Costs a directory listing while the count
+            # is under the cap.
+            try:
+                self.store.purge_surplus()
+            except Exception:
+                logger.warning("could not sweep terminal records", exc_info=True)
         self.bus.emit(
             ev.STATE_CHANGED,
             deployment_id=deployment.deployment_id,

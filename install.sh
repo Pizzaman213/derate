@@ -9,6 +9,10 @@
 #   curl -fsSL http://<coordinator>:8080/install.sh | sh -s -- \
 #       --join http://<coordinator>:8080 --token ej_...
 #
+#   # the dev build rather than the released one. A package of its own,
+#   # ghcr.io/pizzaman213/derate/node-dev, built from every push to dev
+#   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/dev/install-dev.sh | sh
+#
 # There is one image and one container. Role is decided at runtime by the node
 # itself (00-architecture.md section 2), so this script's whole job is to put
 # the container on the machine with the right two environment variables and
@@ -85,6 +89,24 @@ Options
                       it comes back looking for a cluster to join.
   --keep-images       do not reclaim derate images the upgrade superseded
   -h, --help          this
+
+The dev build
+  Every push to the dev branch publishes ghcr.io/pizzaman213/derate/node-dev.
+  It is a separate GHCR package rather than a tag on the released one, so that
+  no pull of ghcr.io/pizzaman213/derate/node can land on unreviewed code by a
+  typo. Install it with the wrapper, which is this script with that default:
+
+      curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/dev/install-dev.sh | sh
+
+  ...or say it here, which is the same thing and works from any branch:
+
+      --image ghcr.io/pizzaman213/derate/node-dev:latest
+
+  Either way, pass it on every node you add as well. The image this machine
+  runs is not carried across the join, so a dev coordinator whose nodes were
+  installed without it is a cluster running two different builds -- which the
+  roster will tell you, since each node reports the build id its image was
+  stamped with.
 USAGE
 }
 
@@ -552,34 +574,53 @@ give_up() {
 
 info "starting the node"
 if ! run_node "$@" >/dev/null 2>"$RUN_ERR"; then
-    # Almost always the NVIDIA container toolkit: the driver is on the machine,
-    # so nvidia-smi answered above, but Docker has no way to hand the device to
-    # a container. Installing it is not this script's business, and refusing to
-    # install at all would be worse than a node that runs -- so fall back, and
-    # say plainly what was lost, because an unidentified node is invisible in
-    # exactly the way that reads as a bug somewhere else.
-    [ "$GPU_ARGS_PRESENT" -eq 1 ] || give_up
-    GPU_ARGS_PRESENT=0
+    # The same run again, GPU flags still on, after clearing whatever is
+    # holding the container's name.
+    #
+    # A first `docker run` fails for reasons that have nothing to do with the
+    # GPU, and this ladder used to drop --gpus in the very step that removed
+    # the leftover container -- so the retry succeeded, the removal got the
+    # credit, and a working GB10 was recorded as unidentified hardware under a
+    # message blaming Docker. Not hypothetical: spark-26af came up that way,
+    # while `docker run --gpus all` on that same host a minute later printed
+    # the card. Ask twice before believing the device is the problem.
     $DOCKER rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    run_node "$@" >/dev/null 2>"$RUN_ERR" || give_up
-    if [ "$HAS_DRIVER" -eq 1 ]; then
-        info "this machine has an NVIDIA driver but Docker could not pass the GPU"
-        info "into the container, so the node started without it. It joins and"
-        info "reports healthy, and it reports host memory, temperature and CPU --"
-        info "but the probe can see the driver and not the GPU, so it records"
-        info "unidentified hardware and the planner will not place work on it."
-        info "Install the NVIDIA container toolkit and re-run:"
-        info "  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
-    else
-        info "Docker could not pass a GPU into the container, and this machine has"
-        info "no NVIDIA driver on PATH. The node started without it, and what it"
-        info "then reports depends on what is actually here. If there is no NVIDIA"
-        info "hardware at all -- a Pi, a NAS, a spare box -- it probes as a CPU"
-        info "node: a cluster member with real host telemetry, which can front a"
-        info "provider but will not be given a rank. If there IS a card, the probe"
-        info "finds it on the PCI bus and records unidentified hardware instead;"
-        info "install the driver and the container toolkit and re-run. Pass"
-        info "--no-gpu to skip this attempt and this message."
+    if ! run_node "$@" >/dev/null 2>"$RUN_ERR"; then
+        # Almost always the NVIDIA container toolkit: the driver is on the
+        # machine, so nvidia-smi answered above, but Docker has no way to hand
+        # the device to a container. Installing it is not this script's
+        # business, and refusing to install at all would be worse than a node
+        # that runs -- so fall back, and say plainly what was lost, because an
+        # unidentified node is invisible in exactly the way that reads as a bug
+        # somewhere else.
+        [ "$GPU_ARGS_PRESENT" -eq 1 ] || give_up
+        # What Docker actually said, before the flags come off. Discarding it
+        # is what made the downgrade impossible to explain afterwards: the node
+        # was unidentified from then on and nothing on the machine said why.
+        info "the node would not start with the GPU flags. Docker said:"
+        sed 's/^/    /' "$RUN_ERR" >&2
+        GPU_ARGS_PRESENT=0
+        $DOCKER rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        run_node "$@" >/dev/null 2>"$RUN_ERR" || give_up
+        if [ "$HAS_DRIVER" -eq 1 ]; then
+            info "this machine has an NVIDIA driver but Docker could not pass the GPU"
+            info "into the container, so the node started without it. It joins and"
+            info "reports healthy, and it reports host memory, temperature and CPU --"
+            info "but the probe can see the driver and not the GPU, so it records"
+            info "unidentified hardware and the planner will not place work on it."
+            info "Install the NVIDIA container toolkit and re-run:"
+            info "  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
+        else
+            info "Docker could not pass a GPU into the container, and this machine has"
+            info "no NVIDIA driver on PATH. The node started without it, and what it"
+            info "then reports depends on what is actually here. If there is no NVIDIA"
+            info "hardware at all -- a Pi, a NAS, a spare box -- it probes as a CPU"
+            info "node: a cluster member with real host telemetry, which can front a"
+            info "provider but will not be given a rank. If there IS a card, the probe"
+            info "finds it on the PCI bus and records unidentified hardware instead;"
+            info "install the driver and the container toolkit and re-run. Pass"
+            info "--no-gpu to skip this attempt and this message."
+        fi
     fi
 fi
 rm -f "$RUN_ERR"
