@@ -1007,13 +1007,14 @@ class DeploymentManager:
     #:   whisper-base.en at 448 tokens asked for 5.5 MB against a measured
     #:   vLLM minimum of 0.03 GiB -- six times over, not one block.
     #:
-    #: 1 GiB clears both on every model this box has launched. It is not free
-    #: on a tight fit -- a plan the gate approved with less than 1 GiB of
-    #: headroom can now ask the runtime for more than is free, trading the
-    #: block-rounding crash for the one `deploy/utilization.py` describes at
-    #: its own module docstring. Cheaper than that trade on this box, where
-    #: launches have been failing outright rather than starting thin.
-    KV_CACHE_LAUNCH_MARGIN_BYTES = 1024**3
+    #: 50 MiB clears both: the block-rounding gap is a handful of MB at most,
+    #: and whisper-base.en's cross-attention shortfall measured about 27 MB
+    #: (5.5 MB supplied against a 32 MB vLLM minimum). Kept small rather than
+    #: the 1 GiB first tried, because this is not free on a tight fit -- a
+    #: plan the gate approved with less headroom than the margin can now ask
+    #: the runtime for more than is free, trading the block-rounding crash for
+    #: the one `deploy/utilization.py` describes at its own module docstring.
+    KV_CACHE_LAUNCH_MARGIN_BYTES = 50 * 1024**2
 
     def _launch_kv_cache_bytes(self, record: _Record) -> int | None:
         """The KV cache to reserve outright, instead of one derived by profiling.
@@ -1036,8 +1037,8 @@ class DeploymentManager:
         before: an embedding model has no KV cache, and a fit record without a
         breakdown is not a licence to ask for nothing -- which is what a
         literal zero would mean to the flag. No margin is added in this case
-        either: there is nothing to round up, and 1 GiB of KV cache handed to
-        a runtime that never asked for any is not a safety margin, it is a
+        either: there is nothing to round up, and handing a KV cache to a
+        runtime that never asked for any is not a safety margin, it is a
         different request.
         """
         breakdown = getattr(record.deployment.fit, "breakdown", None)
