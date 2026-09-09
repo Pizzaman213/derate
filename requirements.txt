@@ -14,7 +14,7 @@ httpx==0.28.1
 # cancelled by then. asyncio.shield does not cover an anyio cancellation.
 anyio==4.14.2
 pydantic==2.10.4
-zeroconf==0.136.2
+zeroconf==0.149.16
 PyYAML==6.0.3
 requests==2.34.2
 # Host facts on the two platforms with no /proc: memory, CPU utilisation,
