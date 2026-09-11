@@ -3,7 +3,7 @@ import type { QuantTable } from '../../api/types'
 import { BandHeading, useBandCollapse } from './BandSection'
 import { subscribeDominant } from './dominant'
 import { ModelCard } from './ModelCard'
-import { subscribeAvatars } from './owner'
+import { useAvatars } from './OwnerMark'
 import type { Group, ModelRow } from './rows'
 
 /** The card grid.
@@ -45,11 +45,12 @@ export function CardGrid({
   expandAll?: boolean
 }) {
   const collapse = useBandCollapse(expandAll)
+  // Two stores, one re-render each. The avatar half is shared with every other
+  // list that draws a publisher's mark; the dominant-colour half is this
+  // grid's alone -- nothing else reads an avatar's pixels back.
   const [, bump] = useReducer((n: number) => n + 1, 0)
-  useEffect(() => {
-    const off = [subscribeAvatars(bump), subscribeDominant(bump)]
-    return () => off.forEach((fn) => fn())
-  }, [])
+  useAvatars()
+  useEffect(() => subscribeDominant(bump), [])
 
   if (error) {
     return (

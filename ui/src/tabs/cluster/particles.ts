@@ -47,6 +47,12 @@ import { useEffect, useRef, type RefObject } from 'react'
 import type { MetricsDeploymentFrame, RoutingConfig } from '../../api/types'
 import { localFlightKey, providerFlightKey, type Point } from './layout'
 
+/** The block's width across the wire. Deliberately inside the wire's own
+ *  range (`edgeWidth` in layout.ts tops out at 5.7 for a saturated link) so
+ *  the block reads as a lit-up piece of the wire, the way the header logo's
+ *  pulse does, rather than a shape sitting on top of a thinner line. */
+export const PARTICLE_STROKE_WIDTH = 3
+
 /** Used only when a target has requests in flight but has never completed one,
  *  so there is no measured duration to fly at yet. */
 export const FLIGHT_MS = 1600
@@ -258,66 +264,65 @@ export function streamBlockWidth(streaming: boolean | null): number {
   return streaming === true ? 6 : 11
 }
 
-/** One flight: a small rect walked along `pts` over `durationMs`, then removed.
+/** One flight: a block that slides along `d` over `durationMs`, then removed.
  *  `layer` is never touched by React -- this is the only thing that mutates
  *  it, and it does so with plain DOM calls so the flight keeps running
  *  through any number of parent re-renders. `onDone` fires exactly once, when
- *  the block leaves, so the caller's in-flight tally can drop. */
+ *  the block leaves, so the caller's in-flight tally can drop.
+ *
+ *  The block is drawn the way the header logo's pulse is: a dashed segment of
+ *  the SAME rendered path the wire itself strokes (see `pathsRender` in
+ *  layout.ts), animated by sliding `stroke-dashoffset`, rather than a
+ *  separate shape whose position is interpolated by hand. That makes it
+ *  geometrically impossible for the block to sit off the wire, corners
+ *  included, and reads as a lit-up piece of the line rather than a box
+ *  riding over it. */
 export function spawnParticle(
   layer: SVGGElement,
-  pts: Point[],
+  d: string,
   color: string,
   durationMs: number = FLIGHT_MS,
   onDone?: () => void,
-  /** Block size. The defaults are the inbound block and the offsets below
-   *  reproduce its original -5/-4 exactly, so nothing about a request flight
-   *  changes; a narrower block is how a streamed token reads as a sliver. */
-  w: number = 11,
-  h: number = 9,
+  /** Dash length, i.e. the block's size ALONG the path. The default is the
+   *  inbound request block; a shorter one is how a streamed token reads as a
+   *  sliver (`streamBlockWidth`). */
+  blockLen: number = 11,
+  strokeWidth: number = PARTICLE_STROKE_WIDTH,
 ): void {
-  if (pts.length < 2) {
+  const NS = 'http://www.w3.org/2000/svg'
+  const path = document.createElementNS(NS, 'path')
+  path.setAttribute('d', d)
+  path.setAttribute('fill', 'none')
+  path.setAttribute('stroke', color)
+  path.setAttribute('stroke-width', String(strokeWidth))
+  // Butt, not round: a round cap adds half the stroke width past each end of
+  // the dash, which would elongate the block past `blockLen` -- the same
+  // reason the logo's own pulse (docs/screenshots/brand/build.py) uses it.
+  path.setAttribute('stroke-linecap', 'butt')
+  layer.appendChild(path)
+
+  const total = path.getTotalLength()
+  if (!d || total <= 0) {
+    path.remove()
     onDone?.()
     return
   }
-  const NS = 'http://www.w3.org/2000/svg'
-  const box = document.createElementNS(NS, 'rect')
-  box.setAttribute('width', String(w))
-  box.setAttribute('height', String(h))
-  box.setAttribute('rx', '1.5')
-  box.setAttribute('fill', color)
-  layer.appendChild(box)
-
-  const segs: number[] = []
-  let total = 0
-  for (let i = 1; i < pts.length; i++) {
-    const L = Math.hypot(pts[i]!.x - pts[i - 1]!.x, pts[i]!.y - pts[i - 1]!.y)
-    segs.push(L)
-    total += L
-  }
+  path.setAttribute('stroke-dasharray', `${blockLen} ${total}`)
 
   const t0 = performance.now()
   const span = Math.max(1, durationMs)
 
   const step = (now: number) => {
     const p = Math.min((now - t0) / span, 1)
-    let d = p * total
-    let i = 0
-    while (i < segs.length && d > segs[i]!) {
-      d -= segs[i]!
-      i++
-    }
-    if (i >= segs.length) i = segs.length - 1
-    const a = pts[i]!
-    const b = pts[i + 1] ?? pts[i]!
-    const f = segs[i] ? d / segs[i]! : 0
-    box.setAttribute('x', String(a.x + (b.x - a.x) * f - Math.floor(w / 2)))
-    box.setAttribute('y', String(a.y + (b.y - a.y) * f - Math.floor(h / 2)))
+    // Slides the dash's leading edge from the path's start (p=0) to past its
+    // end (p=1), the same offset technique `pulse_path()` uses.
+    path.setAttribute('stroke-dashoffset', String(blockLen - p * (blockLen + total)))
     // A parent unmount can detach `layer` before this flight finishes; the
-    // rect just keeps walking off-tree for the rest of its span and is
+    // path just keeps walking off-tree for the rest of its span and is
     // garbage the moment the callback stops, so there is nothing to guard.
     if (p < 1) requestAnimationFrame(step)
     else {
-      box.remove()
+      path.remove()
       onDone?.()
     }
   }
@@ -334,6 +339,9 @@ export interface ParticleFieldOptions {
    *  which draw the same thing: nothing. */
   streams: StreamFlow[]
   paths: Record<string, Point[]>
+  /** The same flights, rendered -- what `spawnParticle` actually walks. See
+   *  `ClusterLayout.pathsRender` in layout.ts. */
+  pathsRender: Record<string, string>
 }
 
 /** Mount-scoped top-up loop, cancelled on unmount and fully suppressed under
@@ -370,10 +378,10 @@ export function useParticleField(opts: ParticleFieldOptions): void {
       for (const [key, flow] of byPath) {
         const running = active.get(key) ?? 0
         if (running >= flow.inflight) continue
-        const pts = latest.current.paths[key]
-        if (!pts) continue
+        const d = latest.current.pathsRender[key]
+        if (!d) continue
         active.set(key, running + 1)
-        spawnParticle(layer, pts, 'var(--flow)', flightMs(flow.meanDurationS), () => {
+        spawnParticle(layer, d, 'var(--flow)', flightMs(flow.meanDurationS), () => {
           active.set(key, Math.max(0, (active.get(key) ?? 1) - 1))
         })
       }
@@ -381,8 +389,8 @@ export function useParticleField(opts: ParticleFieldOptions): void {
       // The return legs. One loop, one reduced-motion guard, so the output
       // stream is suppressed with the rest of it rather than needing its own.
       for (const s of collapseStreams(latest.current.streams, latest.current.paths)) {
-        const pts = latest.current.paths[s.pathKey]
-        if (!pts) continue
+        const d = latest.current.pathsRender[s.pathKey]
+        if (!d) continue
         const { credit, emit } = streamCredit(credits.get(s.pathKey) ?? 0, s.tokensPerSec, TOPUP_MS)
         credits.set(s.pathKey, credit)
         // No onDone and no tally: the population is not the measurement here,
@@ -390,7 +398,7 @@ export function useParticleField(opts: ParticleFieldOptions): void {
         if (emit) {
           spawnParticle(
             layer,
-            pts,
+            d,
             streamTone(s.streaming),
             STREAM_FLIGHT_MS,
             undefined,

@@ -1,6 +1,13 @@
 import { useState } from 'react'
 import { isAudio } from '../api/types'
-import type { DeploymentDTO, NodeStateDTO, RouteTarget, RoutingConfig, Settings } from '../api/types'
+import type {
+  DeploymentDTO,
+  NodeStateDTO,
+  RouteTarget,
+  RoutingConfig,
+  Settings,
+  SpeculativeCounters,
+} from '../api/types'
 import { useBackend } from '../state/backend'
 import type { SafeMetricsFrame } from '../state/useMetrics'
 import { Lamp } from '../components/Lamp'
@@ -11,7 +18,7 @@ import { fromState, nameIndex } from '../state/names'
 import { useActivity } from '../state/resources'
 import { LAUNCH_PHASES, phaseLabel, phaseRank } from '../state/launchPhase'
 import { DeploymentLog } from './DeploymentLog'
-import { fmt, fmtUnit, pct, planShortFromDegrees, relativeTime, remainingLabel } from '../format'
+import { fmt, fmtUnit, gbytes, pct, planShortFromDegrees, relativeTime, remainingLabel } from '../format'
 
 interface Props {
   dep: DeploymentDTO
@@ -190,6 +197,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
   const decodeTps = counters?.decode_tps ?? null
   const meanDuration = counters?.mean_duration_s ?? null
   const ttft = depFrame?.ttft_ms ?? null
+  const spec = depFrame?.speculative ?? null
 
   // A speech or transcription deployment decodes no tokens, so every
   // token-denominated readout below is absent rather than zero.
@@ -208,6 +216,24 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
   // Read the disabled state off the wire, not off local `stopping`, so a
   // reload part-way through a stop still shows the truth.
   const alreadyStopping = dep.state === 'stopping' || dep.state === 'stopped'
+
+  // Absent from a gateway that predates the field; read it as on, which is
+  // what every deployment then was.
+  const offered = dep.serving !== false
+  const [switching, setSwitching] = useState(false)
+
+  const setOffered = async (next: boolean) => {
+    setSwitching(true)
+    setStopError(null)
+    try {
+      await backend.setDeploymentServing(dep.deployment_id, next)
+      invalidate()
+    } catch (e) {
+      setStopError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSwitching(false)
+    }
+  }
 
   const stop = async () => {
     // The consequence, not just the question: this is what the backend
@@ -247,8 +273,26 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
           <span className="label mono" style={{ fontSize: 17 }}>
             {dep.served_name}
           </span>
+          {dep.origin === 'adopted' ? (
+            <span
+              className="pill"
+              title="This container was already running and unrecorded -- derate never launched it. The plan and fit shown below are reconstructed from its running flags, not decided in advance."
+            >
+              Adopted
+            </span>
+          ) : null}
         </span>
         <span style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+          {/* Offered on the API, or not. Deliberately NOT a stop: the
+              container stays up and keeps its GPU memory, which is the whole
+              difference between the two and is said out loud below. Only
+              while the thing is actually up -- there is nothing to take off
+              /v1/models once it has stopped. */}
+          {!alreadyStopping && serving ? (
+            <button onClick={() => void setOffered(!offered)} disabled={switching}>
+              {switching ? 'Saving…' : offered ? 'Take off the API' : 'Put back on the API'}
+            </button>
+          ) : null}
           {alreadyStopping ? (
             <button disabled>{dep.state === 'stopped' ? 'Stopped' : 'Stopping…'}</button>
           ) : (
@@ -262,6 +306,24 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
       {stopError ? (
         <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: '8px 0 0' }}>
           {stopError}
+        </p>
+      ) : null}
+      {/* The cost of the switch, in the one unit that matters on this
+          hardware. A deployment taken off the API is still resident: it holds
+          every byte the fit gate charged it, and nothing can reach it. Saying
+          only "off the API" would make an idle 30 GiB invisible, which is the
+          opposite of what this whole product is for. */}
+      {!offered && serving ? (
+        <p
+          className="unit"
+          style={{ color: 'var(--warn)', margin: '8px 0 0', fontWeight: 400 }}
+        >
+          Off the API — not in /v1/models, not routed, not in the chat picker.
+          The container is still running and still holding
+          {dep.fit?.breakdown
+            ? ` ${gbytes(dep.fit.breakdown.weights + dep.fit.breakdown.kv_cache)} GiB per rank`
+            : ' its GPU memory'}
+          . Stop it to get that back.
         </p>
       ) : null}
       <div className="unit" style={{ margin: '5px 0 0' }}>
@@ -324,6 +386,13 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
         ) : (
           <div className="unit">Not yet observed.</div>
         )}
+
+        {/* Only for a deployment that is actually speculating. Absent is the
+            ordinary case and is deliberately silent rather than an empty
+            section reading zero: a model with no draft head has no acceptance
+            rate, and the fit gate's own sentence about the rate being
+            unmeasured is still the truth for it. */}
+        {spec ? <SpeculativeBlock spec={spec} /> : null}
         </>
         )}
         </>
@@ -542,5 +611,64 @@ function TargetRow({
       </td>
       <td className="num">{fmt(t.counters?.completed ?? null, 0)}</td>
     </tr>
+  )
+}
+
+
+/** What the engine itself counted about its speculation, over one scrape
+ *  window of the coordinator's own slower clock.
+ *
+ *  This is the number the Verdict card says it does not have. That card
+ *  states a floor and a ceiling and a sentence saying the acceptance rate
+ *  between them is not measured -- true at PLAN time, when there is no engine
+ *  to ask. Once one is running there is, and this is it. The two are not in
+ *  conflict and neither replaces the other: the range is what is true for a
+ *  workload nobody has run, this is what happened on the workload that ran.
+ *
+ *  Deliberately not fed back into routing. `strength.py` scores targets from
+ *  real proxied traffic, and an acceptance figure -- however measured -- must
+ *  not outrank that. */
+function SpeculativeBlock({ spec }: { spec: SpeculativeCounters }) {
+  return (
+    <>
+      <div className="sub">speculative decoding · measured</div>
+      <div className="quad">
+        <Quad value={spec.acceptance * 100} decimals={1} unit="% of drafted tokens kept" />
+        <Quad value={spec.accepted_per_step} decimals={2} unit="drafted tokens per step" />
+        <Quad value={spec.drafts} unit="draft rounds" />
+        <Quad value={spec.draft_tokens} unit="tokens proposed" />
+      </div>
+      {/* The shape, not just the mean. A head that lands position 0 almost
+          always and position 3 almost never is a head to run at a lower n --
+          and averaging the positions together hides exactly that, which is
+          the decision this table exists to inform. */}
+      {spec.acceptance_per_pos.length > 0 ? (
+        <div style={{ display: 'grid', gap: 4, marginTop: 6 }}>
+          {spec.acceptance_per_pos.map((v, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="unit" style={{ minWidth: 72 }}>
+                position {i}
+              </span>
+              {/* `v` straight through, never `v ?? 0`: the bar draws a null as
+                  a dashed empty track and a real zero as a solid one, and
+                  collapsing the two would make "never accepted here" and "no
+                  reading for this position" pixel-identical. */}
+              <ProportionBar value={v} width={140} label={`position ${i} acceptance`} />
+              <span className="unit" style={{ minWidth: 48, textAlign: 'right' }}>
+                {/* pct() wants a 0..100 scale and these are fractions. */}
+                {v == null ? '—' : `${pct(v * 100)}%`}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <div className="unit">
+        Read from the engine&apos;s own <span className="mono">vllm:spec_decode_*</span> counters and
+        differenced over the last scrape window, so it is what just happened rather than the
+        engine&apos;s whole life. Position acceptance is cumulative, not conditional: a draft is only
+        checked at position 2 when position 1 was accepted first, which is why the figures fall away
+        rather than varying freely. Nothing here feeds routing.
+      </div>
+    </>
   )
 }

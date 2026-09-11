@@ -3,7 +3,8 @@ import type { QuantTable } from '../../api/types'
 import { Lamp } from '../../components/Lamp'
 import { sizeLabel } from '../../format'
 import { dominantColor } from './dominant'
-import { avatarUrl, isFirstParty, ownerAccent, ownerInitials } from './owner'
+import { avatarUrl, isFirstParty, ownerAccent, ownerOf, repoOf } from './owner'
+import { OwnerMark } from './OwnerMark'
 import type { ModelRow } from './rows'
 import { classifySupport } from './support'
 
@@ -40,10 +41,10 @@ export function ModelCard({
 }) {
   // A bare repo id (`gpt2`) has no publisher at all. That is different from a
   // publisher we could not identify, so the owner line is omitted rather than
-  // drawn as an em dash.
-  const slash = row.model_id.indexOf('/')
-  const owner = slash > 0 ? row.model_id.slice(0, slash) : ''
-  const repo = slash > 0 ? row.model_id.slice(slash + 1) : row.model_id
+  // drawn as an em dash. `ownerOf` is that distinction, shared with the
+  // speculative field, which needs exactly the same one.
+  const owner = ownerOf(row.model_id)
+  const repo = repoOf(row.model_id)
 
   const support = useMemo(
     () => classifySupport(row, table, canPull),
@@ -103,13 +104,7 @@ export function ModelCard({
         {/* The wrapper is what the aura hangs off: the avatar itself clips, and
             the glow has to bleed past it. See `.mcard-mark` in derate.css. */}
         <span className="mcard-mark">
-          <span className="mcard-avatar" style={{ background: accent }}>
-            {url ? (
-              <img src={url} alt="" loading="lazy" decoding="async" />
-            ) : (
-              <span className="mcard-initials">{ownerInitials(owner || repo)}</span>
-            )}
-          </span>
+          <OwnerMark owner={owner || repo} variant="card" accent={accent} />
         </span>
 
         <span className="mcard-id">

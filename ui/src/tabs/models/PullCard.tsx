@@ -4,6 +4,7 @@ import { useCluster, useProviders } from '../../state/resources'
 import { pullableProviders } from './pullTargets'
 import { useBackend } from '../../state/backend'
 import { ApiError } from '../../api/client'
+import { Select, type SelectOption } from '../../components/Select'
 import { Verbatim } from '../../components/Verbatim'
 import { gbytes } from '../../format'
 
@@ -128,26 +129,23 @@ export function PullCard({
     <div className="card2">
       <h3>Run on a provider</h3>
       <div className="unit" style={{ marginBottom: 10 }}>
-        A machine with no GPU cannot run vLLM or SGLang, so it is reached as a provider
-        rather than launched onto. Name the model the way that server names it — to send
-        a quantization from a HuggingFace repository instead, open the model and pick the
-        ollama runtime.
+        A box already running its own server — Ollama, or anything else with an
+        OpenAI-compatible URL — is reached as a provider rather than launched onto. Name
+        the model the way that server names it. To send a quantization from a
+        HuggingFace repository instead, open the model and pick the ollama runtime; to
+        have derate launch and manage the server itself on a machine with no GPU, enrol
+        it as a node and pick the llamacpp runtime.
       </div>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div className="fld">
           <label htmlFor="pullprov">Provider</label>
-          <select
+          <Select
             id="pullprov"
             value={chosen}
-            onChange={(e) => setProviderId(e.target.value)}
-          >
-            {targets.map((p) => (
-              <option key={p.provider_id} value={p.provider_id}>
-                {p.display_name}
-              </option>
-            ))}
-          </select>
+            options={targets.map((p): SelectOption<string> => ({ value: p.provider_id, label: p.display_name }))}
+            onChange={setProviderId}
+          />
         </div>
         <div className="fld" style={{ flex: 1, minWidth: 200 }}>
           <label htmlFor="pullmodel">Model</label>

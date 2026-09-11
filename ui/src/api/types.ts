@@ -1,5 +1,5 @@
 // TypeScript mirrors of the frozen contracts in 00-architecture.md section 4.
-// These describe Agent G's HTTP surface only. Nothing here is invented: every
+// These describe the gateway's HTTP surface only. Nothing here is invented: every
 // field appears in the architecture doc or in one of its example payloads.
 
 export type DeviceClass = 'gb10' | 'discrete' | 'apple' | 'cpu' | 'unknown'
@@ -101,6 +101,14 @@ export interface TopologyEdge {
   ports_inspected_on?: string | null
   gdr_detected_by?: string | null
   duration_s?: number | null
+  /** Whether a probe or a calibration is in flight for this pair, from the
+   *  SERVER rather than a local spinner. It has to come from the server: a
+   *  calibration takes minutes, and `calibrate` and `measure` share one lock,
+   *  so a second press blocks rather than refusing. A local flag is also wrong
+   *  after a reload and wrong for a second person watching. */
+  measuring?: boolean
+  /** Absent from a gateway that predates calibration. */
+  tuning?: LinkTuning
 }
 
 // ── POST /api/links/reach ────────────────────────────────────────────────────
@@ -319,12 +327,48 @@ export interface KillResult {
   detail: string
 }
 
+/** One row of a link's calibration: one candidate setting at one size band. */
+export interface TuningRow {
+  /** Rounded DOWN to a power of two. The two that matter are the decode
+   *  all-reduce a TP step issues dozens of times per token (kilobytes) and the
+   *  prefill one (megabytes) -- four decades apart, and a setting good at one
+   *  can be bad at the other. */
+  size_band: number
+  microseconds: number
+  busbw_gbps: number
+  /** The setting this row was taken under. `{}` is the default, which every
+   *  candidate is measured against. */
+  env: Record<string, string>
+  /** Set when the collective did not complete. A recorded failure is a fact
+   *  about the fabric: "never tried" and "tried and it would not run" are
+   *  different answers, and an absent row cannot tell them apart. */
+  error: string | null
+}
+
+/** A pair's NCCL calibration, as `serialize.link_tuning` reports it.
+ *
+ *  `calibrated` is deliberately separate from `env`: the server answers
+ *  `env: {}` both for a pair nobody has measured AND for one where the default
+ *  won. Read them apart -- see `tabs/cluster/tuning.ts::tuningState`. */
+export interface LinkTuning {
+  calibrated: boolean
+  env: Record<string, string>
+  rows: TuningRow[]
+  /** The LOADED libnccl's version, not what torch was compiled against. */
+  nccl_version?: string
+  measured_at?: number
+}
+
 export interface LinkMeasurement {
   src: string
   dst: string
   all_reduce_gbps: number
   sendrecv_gbps: number
-  latency_us: number
+  /** Cost of one cross-node COLLECTIVE. Null when no rung measured one --
+   *  the ib_write_bw rung declines rather than offering an ib_write_lat,
+   *  which times a different operation. Render the absence; never
+   *  substitute 0, which would read as an instant fabric. */
+  latency_us: number | null
   gpudirect_rdma: boolean
   measured_at: number
   method: string
@@ -345,6 +389,14 @@ export interface LinkMeasurement {
   ports_inspected_on?: string | null
   gdr_detected_by?: string | null
   duration_s?: number | null
+  /** Whether a probe or a calibration is in flight for this pair, from the
+   *  SERVER rather than a local spinner. It has to come from the server: a
+   *  calibration takes minutes, and `calibrate` and `measure` share one lock,
+   *  so a second press blocks rather than refusing. A local flag is also wrong
+   *  after a reload and wrong for a second person watching. */
+  measuring?: boolean
+  /** Absent from a gateway that predates calibration. */
+  tuning?: LinkTuning
 }
 
 export interface ClusterSummary {
@@ -440,6 +492,22 @@ export interface MemoryBreakdown {
   total: number
 }
 
+/** One accumulated decode measurement, keyed by the hardware it is about. */
+export interface MeasuredDecode {
+  decode_tps: number
+  /** Rounded DOWN to a power of two. Decode reads the cache for the tokens
+   *  actually present, so a rate measured at 300 tokens is not the rate at
+   *  8192 and the two are filed apart. */
+  context_band: number
+  concurrency_band: number
+  requests: number
+  measured_at: number
+  /** What the fit gate said when this was taken. Carried with the measurement
+   *  so the disagreement can be read off directly rather than recomputed
+   *  against a prediction that may since have moved. */
+  predicted_tps: number | null
+}
+
 export interface FitResult {
   verdict: Verdict
   breakdown: MemoryBreakdown
@@ -455,6 +523,168 @@ export interface FitResult {
    *  hardware could spend with nothing else running. "live" = what the node
    *  could actually hand out when the check ran. */
   budget_basis?: 'static' | 'live'
+  /** The two ends of what speculative decoding would decode at, and never a
+   *  single number: the ceiling is every drafted token accepted, the floor is
+   *  none accepted with the draft head read for nothing — which is genuinely
+   *  BELOW `predicted_decode_tps` and is shown that way. Null unless the plan
+   *  was taken with `speculative` set; absent on a gateway that predates it. */
+  speculative_decode_tps_floor?: number | null
+  speculative_decode_tps_ceiling?: number | null
+  /** The fit gate's own sentence for that range, including the part where it
+   *  says derate does not measure acceptance rate. Rendered verbatim, on the
+   *  same terms as `reason`. Empty when nothing was asked for. */
+  speculative_reason?: string
+  /** The other end of the ordinary decode range: the rate with an EMPTY cache.
+   *
+   *  `predicted_decode_tps` is computed against the cache for a sequence at the
+   *  full requested context, so it is the rate once the context is full — the
+   *  slowest this will ever decode. Decoding reads the tokens actually present,
+   *  so a short request is faster, and measured on real hardware the gap is
+   *  roughly 2x. One number cannot be both, so the card shows both.
+   *
+   *  Optional: absent on a gateway that predates it, in which case the card
+   *  falls back to the single figure it has always shown. */
+  predicted_decode_tps_empty?: number | null
+}
+
+/** One speculative-decoding method a checkpoint declares, from
+ *  `resolver/speculators.py`. `launchable: false` is a real entry, not a
+ *  filtered-out one: derate found the mechanism and cannot price it, and
+ *  saying so beats saying nothing. */
+export interface SpeculativeOption {
+  method: 'mtp' | 'dspark' | 'ngram' | string
+  default_tokens: number
+  max_tokens: number
+  /** Null together, and null means the cost was not derived — which is what
+   *  makes `launchable` false. Never read a null here as zero. */
+  draft_params: number | null
+  draft_bytes: number | null
+  /** `checkpoint` — the target's own config declares it. `method` — it needs
+   *  no model support at all (ngram). `head` — a separately-published repo. */
+  source: 'checkpoint' | 'method' | 'head' | string
+  /** The config key that declared it, for a reader who wants to go and look.
+   *  Empty for a method no config declares. */
+  declared_by: string
+  /** The resolver's own sentence. Rendered verbatim. */
+  note: string
+  launchable: boolean
+  /** Sweep results for this model and method ON THIS HARDWARE, newest first,
+   *  from `python3 -m tests.spec_sweep`. Absent on a gateway that predates
+   *  measurement; empty when nobody has run one, which is the ordinary case.
+   *
+   *  One entry per workload, and deliberately not reduced to a single figure:
+   *  acceptance on code that mostly copies its input is a different number
+   *  from acceptance on prose, and choosing between them here would be
+   *  choosing the flattering one. */
+  measured?: SpeculativeMeasurement[]
+}
+
+/** One sweep result. Every field was read off the engine's own counters or
+ *  timed from requests the sweep sent — nothing here is an estimate. */
+export interface SpeculativeMeasurement {
+  /** Which prompt set, from `tests/spec_data/`. The measurement means nothing
+   *  without it. */
+  workload: string
+  best_k: number
+  best_tps: number
+  /** The same model on the same box with speculation off. */
+  baseline_tps: number
+  mean_acceptance: number | null
+  /** Draft rounds behind the figure. A short run is a noisy one. */
+  drafts: number
+  measured_at: number
+  gpu_name: string
+  runtime_version: string
+  /** `per_pos` when the engine reported acceptance per draft position — which
+   *  is what lets one launch answer for every k — else `aggregate`. */
+  basis: string
+}
+
+/** `GET /api/models/speculative-heads`. Every published draft head for one
+ *  model, priced and ranked — computed without launching anything, so it
+ *  answers on a cluster with no free memory.
+ *
+ *  Deliberately not part of `PlanResponse`: that fires on every keystroke in
+ *  the Serve panel, and this costs a handful of hub searches plus a resolve
+ *  per candidate. */
+export interface SpeculativeHeads {
+  model_id: string
+  /** The model's own decode rate with no speculation, for the ranking to be
+   *  read against. */
+  baseline_tps?: number
+  heads: SpeculativeHead[]
+  /** The one to offer, already priced — or null when nothing here can be
+   *  recommended. NOT the top row of `heads` and it cannot be: the ranking is
+   *  a ceiling, a weightless draft wins it by arithmetic, and within a method
+   *  family it ties. A whole row rather than an id because the screen renders
+   *  it beside an unticked checkbox, before anything is selected. */
+  recommended_head?: SpeculativeHead | null
+  /** When the scan behind this answer was run, epoch seconds. */
+  scanned_at?: number
+  /** Whether this came from the stored scan rather than the hub. A scan is a
+   *  dozen searches plus a resolve per candidate, so it is written down and
+   *  the second view is free — which is what lets the control recommend
+   *  something without being asked to look. */
+  from_cache?: boolean
+  /** Why the highest ceiling on the list is not the recommendation. Present
+   *  only when there IS a weightless option on the list to explain away. */
+  ngram_note?: string
+  /** One head per METHOD FAMILY, best-established first. Separate from the
+   *  ranking because the top row and the thing to try are not the same: the
+   *  ceiling ties within a family, so the pick is by downloads. */
+  recommended?: string[]
+  rejected?: { model_id: string; reason: string }[]
+  rejected_total?: number
+  /** The server's own sentence about what the ranking does and does not say.
+   *  Rendered verbatim — it is the part that stops a ceiling being read as a
+   *  prediction. */
+  caveat?: string
+  /** Present instead of results when the hub could not be reached or this
+   *  resolver cannot search it. */
+  note?: string
+}
+
+export interface SpeculativeHead {
+  /** The repository the draft ships in. For an option the CHECKPOINT declares
+   *  — `mtp` — the draft is inside the model itself, so this is the target's
+   *  own id and `declared_by` is what says where it came from. */
+  model_id: string
+  method: string
+  max_tokens: number
+  /** What the source of this option says to draft. The `n` control starts
+   *  here and is bounded above by `max_tokens`. */
+  default_tokens?: number
+  draft_bytes: number | null
+  /** Zero means derived and genuinely nothing — ngram reads no weights. Null
+   *  means the cost was NOT derived, which is a different thing and is what
+   *  makes an option unlaunchable. Never read one as the other. */
+  draft_params?: number | null
+  /** `checkpoint` — the target's own config declares it. `method` — it needs
+   *  no model support at all. `head` — a separately-published repository. */
+  source?: string
+  /** The config key that declared it, for a reader who wants to go and look. */
+  declared_by?: string
+  /** Sweep results for this method on this hardware, newest first. Empty is
+   *  the ordinary case; when it is not, a real number displaces the ceiling. */
+  measured?: SpeculativeMeasurement[]
+  /** Every drafted token accepted. A bound, never a prediction — see
+   *  `caveat`. */
+  ceiling_tps: number
+  downloads?: number | null
+  recommended: boolean
+  /** The resolver's own sentence about this head. Rendered verbatim. */
+  note: string
+}
+
+/** What a plan was actually taken with. Null means one token per step. */
+export interface SpeculativeSpec {
+  method: string
+  num_speculative_tokens: number
+  draft_bytes: number
+  draft_params: number
+  /** The head's repository, for a method whose draft ships separately from the
+   *  target. Null for the methods the checkpoint itself carries. */
+  model?: string | null
 }
 
 /** `serialize.shape_payload`. The backend emits this; it never echoed back a
@@ -612,6 +842,16 @@ export interface PlanResponse {
   /** The same verdict taken against what the nodes can hand out right now.
    *  null when nothing could read them; never a stand-in for `fit`. */
   fit_live?: FitResult | null
+  /** What one of these machines actually decoded at, when anything has.
+   *
+   *  Cited BESIDE the predicted range and never in place of it: the range is
+   *  what is true for a context nobody has run, this is what one machine did.
+   *  On the hardware this was built against the two disagreed by 2x, which is
+   *  why the prediction grew a second end rather than being quietly replaced.
+   *
+   *  null is the ordinary answer and means nobody has run this model on this
+   *  hardware yet. Absent on a gateway that predates it. */
+  measured_decode?: MeasuredDecode | null
   /** Absent on a gateway that predates the live-memory work. */
   capacity?: CapacityBlock
   serve?: ServeDecision
@@ -633,6 +873,14 @@ export interface PlanResponse {
   recommended_plan?: ParallelismPlan | null
   /** Every legal shape on this node set, for the degree hints. */
   alternatives?: PlanAlternative[]
+  /** Every speculative method this checkpoint declares. Absent on a gateway
+   *  that predates the feature; empty only from a resolver that could not say
+   *  what the model declares — never a claim that a model supports none, since
+   *  ngram needs no model support at all. */
+  speculative_options?: SpeculativeOption[]
+  /** What this verdict was taken with, echoed for the same reason `context`
+   *  and `concurrency` are. Null means one token per step. */
+  speculative?: SpeculativeSpec | null
 }
 
 export interface LaunchRequest {
@@ -664,6 +912,45 @@ export interface LaunchRequest {
    *  after it. Same tokenizing and allowlist as extra_args. Mutually
    *  exclusive with it — sending both is a 400. */
   custom_command?: string
+  /** Speculative decoding, on the same terms as `parallelism`: the caller
+   *  chooses the method and how many tokens to draft, and the coordinator
+   *  prices it. Sending a cost here is not possible and not the point — a
+   *  caller-supplied draft weight would be a memory budget the operator wrote
+   *  for themselves. Mutually exclusive with `custom_command`, which replaces
+   *  the very flag this would add. */
+  speculative?: SpeculativeRequest
+  /** Skip CUDA graph capture and torch.compile entirely, trading decode
+   *  throughput for a startup that skips the single slowest launch phase.
+   *  Launch-only, like this whole request: it changes nothing the fit gate
+   *  priced. Mutually exclusive with `cudagraph_capture_sizes` (nothing left
+   *  to trim once graphs are off) and with `custom_command`. */
+  enforce_eager?: boolean
+  /** A trimmed set of batch sizes to capture CUDA graphs for, instead of the
+   *  runtime's own default list — fewer sizes, less capture time, at the
+   *  cost of eager execution for any batch size not listed. Mutually
+   *  exclusive with `enforce_eager` and with `custom_command`. */
+  cudagraph_capture_sizes?: number[]
+  /** The KV cache element width to size AND serve at — `'fp8'`, `'fp16'`,
+   *  `'auto'`. Unlike everything above it this is a fit-gate input, not a
+   *  launch-only choice: the gate halves bytes-per-token for fp8 and
+   *  approves a context on that basis, so the same value has to reach the
+   *  engine or the halved byte budget is filled with full-width entries and
+   *  the deployment serves half the approved context with nothing on screen
+   *  to say so. Omit for the coordinator's configured default. Mutually
+   *  exclusive with `custom_command`. */
+  kv_dtype?: string
+}
+
+export interface SpeculativeRequest {
+  method: string
+  num_speculative_tokens: number
+  /** A separately-published draft head. The coordinator resolves it, checks it
+   *  against the target's hidden size and vocabulary, prices it from its own
+   *  measured weights and refuses it by name if any of that fails — so this is
+   *  the repository id and nothing else. There is no field for its cost: a
+   *  caller-supplied draft weight would be a memory budget the operator wrote
+   *  for themselves. */
+  model?: string
 }
 
 /** Degrees the operator set by hand.
@@ -693,12 +980,20 @@ export interface PlanRequest {
    *
    *  Overrides bytes-per-parameter in the fit arithmetic so "what would this
    *  cost at q4_k_m" can be asked. It can never change what launches: neither
-   *  serve command template carries `--quantization`, and the only model
-   *  identifier they interpolate is the repository id. `POST /api/deployments`
-   *  refuses this field with 400 `dtype_not_launchable` for that reason.
+   *  serve command template carried `--quantization`, so `POST
+   *  /api/deployments` refused this field outright.
    *
-   *  To launch a quantized model, send that variant repository's own id as
-   *  `model_id` — a quantization is a different repository, not a flag. */
+   *  Both templates carry it now, and this is a fit-gate input on BOTH
+   *  routes: send the same value to each, exactly as with `kv_dtype` below.
+   *  Bytes-per-parameter differs by 3.5x between bf16 and nvfp4, so a plan
+   *  approved at one scheme and launched at another is budgeted for a
+   *  checkpoint the engine is not going to load.
+   *
+   *  Only the schemes the runtime has a loader for: `fp32`, `fp16`, `bf16`,
+   *  `fp8`, `awq_int4`, `gptq_int4`, `nvfp4`, `mxfp4`. Anything else — the
+   *  whole GGUF ladder, `nf4`, `int8` — is refused by name on the launch
+   *  route. For those, send that quantization's own repository id as
+   *  `model_id`: it is a different repository, not a flag. */
   dtype?: string
 
   /** Exactly the machines to plan across, in order -- the first is the
@@ -709,6 +1004,21 @@ export interface PlanRequest {
   node_ids?: string[]
   /** Absent means the planner picks the degrees. */
   parallelism?: ParallelismRequest
+  /** Absent means one token per step, which is what every request sent before
+   *  this field existed meant. Sent, the fit gate charges the draft's weights
+   *  and its extra cache, so the verdict beside it is the verdict for the
+   *  speculating launch and not for a different one. */
+  speculative?: SpeculativeRequest
+  /** The KV cache element width to size the cache at — `'fp8'`, `'fp16'`,
+   *  `'auto'`. Absent means the coordinator's configured default.
+   *
+   *  UNLIKE `dtype` above, this one is NOT sizing-only: `LaunchRequest`
+   *  carries it too, and both requests have to carry the same value. fp8
+   *  halves bytes-per-token, so the gate approves a longer context on it and
+   *  then passes the halved byte budget; an engine not told the same width
+   *  fills that budget at full width and serves half the approved context
+   *  with nothing on screen to say so. Send it to both or to neither. */
+  kv_dtype?: string
 }
 
 /** Which endpoint family a served model answers on. Mirrors
@@ -763,6 +1073,37 @@ export interface DeploymentDTO {
    *  mutually exclusive with extra_args. Absent from a gateway that
    *  predates the field; read it as none. */
   custom_command?: string[]
+  /** 'adopted' means this container was already running and unrecorded --
+   *  derate never launched it, so `plan`/`fit` are reconstructed from the
+   *  running process's own flags rather than decided in advance. Absent
+   *  from a gateway that predates the field, or 'launched': read either as
+   *  what every deployment was before adoption existed. */
+  origin?: 'launched' | 'adopted'
+  /** Whether this deployment disabled CUDA graph capture and torch.compile
+   *  entirely. Absent from a gateway that predates the field; read it as
+   *  `false`, which is what every deployment launched before it did. */
+  enforce_eager?: boolean
+  /** The trimmed CUDA graph capture sizes this deployment launched with, if
+   *  any. Absent from a gateway that predates the field, or `null`: read
+   *  either as the runtime's own default sizing. */
+  cudagraph_capture_sizes?: number[] | null
+  /** The KV cache element width this deployment was gated at and launched
+   *  with — the one value, which is the point of the field. Absent from a
+   *  gateway that predates it, or `null`: read either as the model's own
+   *  dtype, which is what every deployment launched before it got. */
+  kv_dtype?: string | null
+  /** Whether this deployment is offered on the API.
+   *
+   *  `false` takes it off `/v1/models`, out of routing, off the chat picker
+   *  and off the topology graph together — one seam,
+   *  `targets.py::build_index`, exactly as a provider's `enabled_models`
+   *  allowlist works.
+   *
+   *  **The container keeps running and keeps holding its GPU memory.** That
+   *  is the whole difference between this and stopping, so any surface that
+   *  draws it has to say so. Absent from a gateway that predates the field;
+   *  read it as `true`, which is what every deployment then was. */
+  serving?: boolean
 }
 
 // ── Routing: GET /api/routing, PUT /api/routing/{served_name} ────────────────
@@ -1051,12 +1392,80 @@ export interface MetricsNodeFrame {
   sample_ts?: number | null
 }
 
+/** What the ENGINE counted about its own speculative decoding over one scrape
+ *  window -- the coordinator's own slower clock, not the 1 Hz frame's tick.
+ *
+ *  `null` on the frame is the ordinary case and means "not measured", never
+ *  "zero": most deployments run no draft head at all, and a model that
+ *  drafted nothing has no acceptance rate. The fit gate states a floor and a
+ *  ceiling and says the rate between them is unmeasured; this sits BESIDE that
+ *  range and never replaces it. */
+export interface SpeculativeCounters {
+  /** Draft rounds in the window. One per verify step that speculated. */
+  drafts: number
+  /** Tokens proposed across those rounds. */
+  draft_tokens: number
+  /** Tokens the target model then kept. */
+  accepted_tokens: number
+  /** `accepted_tokens / draft_tokens` over the window. */
+  acceptance: number
+  /** Per draft POSITION, and cumulative rather than conditional -- vLLM's own
+   *  definition, its dashboard divides the per-position series by the draft
+   *  count. A head that lands position 0 almost always and position 3 almost
+   *  never is a head to run at a lower n, and a mean hides exactly that. */
+  acceptance_per_pos: (number | null)[]
+  /** Drafted tokens settled per step. The figure that maps onto a speedup. */
+  accepted_per_step: number
+}
+
+/** One standing condition: something that is wrong right now, not something
+ *  that happened. See `control_plane/alerts.py` for the fold and for why this
+ *  is a separate surface from `/api/history/events`. */
+export interface Alert {
+  key: string
+  kind: 'node_down' | 'cap_reached' | 'oom'
+  /** The `Lamp` vocabulary, deliberately: a severity that did not map onto
+   *  something drawable would be a third spelling of the same idea. */
+  severity: 'warn' | 'fault'
+  subject: string
+  subject_kind: 'node' | 'provider' | 'deployment'
+  /** The operator's label for a node, when there is one. */
+  subject_label?: string
+  /** The sentence. The fit gate's or `admission_block`'s own words where one
+   *  existed; composed in `alerts.py` where none did. Renders through
+   *  `Verbatim` and is never re-worded. */
+  detail: string
+  /** When the condition began, reconstructed from the event rather than from
+   *  when the coordinator started watching. `null` means the start genuinely
+   *  is not recorded -- a budget already over when the process first looked --
+   *  and is SAID on screen, never rendered as a date. */
+  since: number | null
+  /** A program's own words about the failure: the probe's error, the engine's
+   *  last output. `null`, not `''`, when nothing was said. */
+  evidence: string | null
+  /** How many times the condition has been re-observed. A crash loop is one
+   *  alert with a large count, not hundreds of alerts. */
+  count: number
+  last_seen: number
+  /** Budget alerts only: the UTC day the cap belongs to. */
+  day: string | null
+}
+
+export interface AlertsReport {
+  alerts: Alert[]
+  /** When the coordinator started watching. The rail says so rather than
+   *  implying the set reaches back before the process did. */
+  observing_since: number
+  measured_at: number
+}
+
 export interface MetricsDeploymentFrame {
   deployment_id: string
   state: DeploymentState
   tokens_per_sec: number | null
   ttft_ms: number | null
   queue_depth: number | null
+  speculative: SpeculativeCounters | null
 }
 
 /** The same counters for a model a PROVIDER serves, off the same registry and
@@ -1073,6 +1482,10 @@ export interface MetricsRemoteFrame {
   tokens_per_sec: number | null
   ttft_ms: number | null
   queue_depth: number | null
+  /** Always null. Carried so one reader can draw a remote band and a local one
+   *  from the same names -- we have no engine to scrape on somebody else's
+   *  API, and that is a missing reading, not a missing key. */
+  speculative: SpeculativeCounters | null
 }
 
 export interface MetricsFrame {
@@ -1196,11 +1609,21 @@ export interface TranscriptionResult {
   requestId: string | null
 }
 
-export type ChatRole = 'user' | 'assistant'
+export type ChatRole = 'user' | 'assistant' | 'system'
+
+/** One part of a multi-part message body -- the OpenAI vision shape. Sent
+ *  only when the composer has an image attached; every other message still
+ *  sends `content` as a plain string, which is the cheaper and far more
+ *  common path. `admission.py` on the gateway already reads the `text`
+ *  sub-key out of exactly this shape, which is the evidence it is tolerated
+ *  end-to-end rather than an assumption. */
+export type ChatContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
 
 export interface ChatMessage {
   role: ChatRole
-  content: string
+  content: string | ChatContentPart[]
 }
 
 /** What one completed turn observed about itself.
@@ -1227,6 +1650,11 @@ export interface ChatTurnMeta {
    *  own request records (`tokens_estimated`); presenting a counted frame as a
    *  measured token would be the same fabrication with a nicer font. */
   tokensEstimated: boolean
+  /** Milliseconds from send to the last reasoning fragment, i.e. how long the
+   *  model thought before its first answer token. `null` when this turn
+   *  carried no reasoning content at all -- not the same as `0`, which would
+   *  claim a model thought for no time rather than not thinking out loud. */
+  reasoningMs: number | null
   /** The reader was cancelled from the Stop button. The text is a real partial
    *  answer, not a failure. */
   stopped: boolean
@@ -2248,8 +2676,29 @@ export interface LaunchActivity {
  *  of them is a backend that printed nothing. */
 export interface DeploymentLogs {
   lines: string[]
-  source: 'buffer' | 'read' | 'none' | 'unavailable'
+  /** `archive` and `snapshot` are both a one-time read of a file on disk
+   *  rather than a live source, same as `read` -- see
+   *  `control_plane/deploy/manager.py::log_tail` for what puts a deployment
+   *  in each one. */
+  source: 'buffer' | 'archive' | 'snapshot' | 'read' | 'none' | 'unavailable'
   cluster_id?: string | null
+}
+
+/** `GET /api/nodes/{id}/logs`. A tail of `node.log` or `proxy.log` -- the
+ *  control plane's own process log on that machine, written by
+ *  `control_plane/logfiles.py` -- not a deployment's serving log
+ *  (`DeploymentLogs` above) and not the structured, queryable archive
+ *  (`HistoryEnvelope`). `available: false` means the file does not exist yet
+ *  or could not be read, with `reason` saying which, verbatim. `truncated`
+ *  means the read's byte cap was hit before `lines` reached what was asked
+ *  for -- there is more history in the file than this answer could reach. */
+export interface NodeLogTail {
+  node_id: string
+  which: 'node' | 'proxy'
+  lines: string[]
+  truncated: boolean
+  available: boolean
+  reason: string | null
 }
 
 export interface Activity {

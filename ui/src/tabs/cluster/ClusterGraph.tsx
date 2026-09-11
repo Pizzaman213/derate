@@ -37,6 +37,7 @@ import {
   PROVIDER_ROW_TEXT_X,
   PROVIDER_TEXT_X,
   CORNER_R,
+  edgeKey,
   layoutCluster,
   moveToSlot,
   roundedPath,
@@ -78,9 +79,15 @@ const ZOOM_MIN = 0.4
 const ZOOM_MAX = 4
 /** Authored units of breathing room between the ink and the viewBox edge. */
 const FIT_PAD = 12
-/** Authored units a pointer must travel before a press on a plate becomes a
- *  drag rather than a click. Without it, selecting a machine nudges it. */
-const DRAG_SLOP = 4
+/** CLIENT pixels a pointer must travel before a press on a plate becomes a
+ *  drag rather than a click. Without it, selecting a machine nudges it.
+ *
+ *  Measured on the pointer itself, deliberately not in scene units: scene
+ *  distance is client distance divided by the zoom, so an authored-unit slop
+ *  shrank to a couple of real pixels at a zoomed-out fit -- and ordinary
+ *  click jitter, a touchpad's especially, turned "highlight this plate" into
+ *  a drag nobody meant to start. */
+const DRAG_SLOP = 5
 /** How long after a press on a plate a second press still reads as a
  *  double-click. The browser's own `dblclick` never reaches a plate: the drag
  *  handler takes pointer capture on the SVG the moment a plate is pressed, and
@@ -95,6 +102,12 @@ export interface ClusterGraphHandle {
 
 interface Props {
   deployments: DeploymentDTO[]
+  /** Whether `deployments` is an answer yet, or just the [] a resource holds
+   *  before its first poll lands. The two are indistinguishable from the
+   *  array alone, and the difference decides one thing: the resting frame
+   *  re-frames once when the answer arrives, so a page opened mid-launch
+   *  frames the launch band instead of a floor that predates knowing it. */
+  deploymentsKnown: boolean
   topology: Topology
   /** Cluster's own node rows: the live telemetry source, and the only place
    *  `healthy` / `state` for the state border comes from. */
@@ -136,6 +149,7 @@ interface Props {
 export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function ClusterGraph(
   {
     deployments,
+    deploymentsKnown,
     topology,
     nodes,
     routing,
@@ -232,6 +246,29 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
     return { k, tx: W / 2 - cx * k, ty: H / 2 - cy * k }
   }, [layout])
 
+  /** When the resting view is allowed to RE-frame: only when this changes.
+   *
+   *  The fit itself tracks every box on the floor, and applying it on every
+   *  layout made the machines move with the bands below them: a launch
+   *  stepper is a 103-unit band that appears at PLANNED, vanishes on a crash,
+   *  reappears on the relaunch and shrinks to 36 at READY -- and each of
+   *  those re-fit the whole drawing, so the plate somebody was watching slid
+   *  and rescaled in step with the download under it. A machine that moves
+   *  between refreshes is a machine you cannot learn the position of, and the
+   *  fit was doing exactly what the layout is engineered never to do.
+   *
+   *  So the frame chases the MACHINES and the element, nothing else: it
+   *  re-frames when a machine joins, leaves, is re-dealt, is dropped
+   *  somewhere, grows on selection, or the panel resizes -- every case where
+   *  the plates themselves are somewhere new -- and holds still while the
+   *  band stack breathes. A launch band taller than the held frame can hang
+   *  below its bottom edge until the launch settles; it is directly under
+   *  machines that stayed put, the pan still reaches it, and `Reset view`
+   *  re-frames everything on demand. */
+  const frameKey = `${deploymentsKnown ? 1 : 0}|${layout.width}x${layout.height}|${layout.cards
+    .map((c) => `${c.nodeId}:${c.x},${c.y},${c.w},${c.h}`)
+    .join('|')}`
+
   // ── Pan and zoom: a ref-written transform, never React state ──────────────
   const view = useRef({ ...fit })
   const drag = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null)
@@ -242,6 +279,13 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
   /** Has anyone panned or zoomed? Until they have, a resize or a change in the
    *  cluster re-frames; after, their framing is theirs and survives both. */
   const userMoved = useRef(false)
+  /** The frame the view last rested on, and the offsetX the scene was last
+   *  drawn at. Refs, because both are consulted from `resetView` and the
+   *  framing effect below without wanting either re-bound. */
+  const framedAt = useRef<string | null>(null)
+  const frameKeyRef = useRef(frameKey)
+  frameKeyRef.current = frameKey
+  const drawnOffsetX = useRef<number | null>(null)
 
   const applyView = () => {
     sceneRef.current?.setAttribute(
@@ -259,16 +303,30 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
   const resetView = () => {
     view.current = { ...fitRef.current }
     userMoved.current = false
+    framedAt.current = frameKeyRef.current
     applyView()
   }
 
   useImperativeHandle(ref, () => ({ reset: resetView }))
 
   useEffect(() => {
-    if (!userMoved.current) view.current = { ...fit }
+    // The scene translates by layout.offsetX BEFORE the view transform, and
+    // band churn can move that centring while the frame holds still -- a
+    // band grown for its served name widens the ink and offsetX re-centres
+    // it. Undo the difference here, or every plate slides sideways by it;
+    // the same drift used to move the floor under a user's own pan, so the
+    // compensation applies whether or not anyone has panned.
+    const drift = drawnOffsetX.current == null ? 0 : layout.offsetX - drawnOffsetX.current
+    drawnOffsetX.current = layout.offsetX
+    if (!userMoved.current && framedAt.current !== frameKey) {
+      framedAt.current = frameKey
+      view.current = { ...fit }
+    } else if (drift !== 0) {
+      view.current.tx -= drift * view.current.k
+    }
     applyView()
     // eslint-disable-next-line react-hooks/exhaustive-deps -- applyView only touches refs
-  }, [fit])
+  }, [fit, frameKey, layout.offsetX])
 
   // ── Plate drag ────────────────────────────────────────────────────────────
   //
@@ -289,6 +347,10 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
   const cardDrag = useRef<{
     nodeId: string
     from: Point
+    /** Where the press landed in CLIENT pixels, for the slop test only --
+     *  scene distance shrinks with the zoom, and the slop is about how far
+     *  the HAND moved. */
+    fromClient: Point
     /** Where this plate already was, relative to its slot, when the press
      *  landed. A drag adds to it -- the alternative resets the plate to its
      *  slot the moment a second drag starts. */
@@ -404,6 +466,7 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
           cardDrag.current = {
             nodeId,
             from: toScene(e),
+            fromClient: { x: e.clientX, y: e.clientY },
             base,
             dx: 0,
             dy: 0,
@@ -422,6 +485,26 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
     const onPointerMove = (e: PointerEvent) => {
       const cd = cardDrag.current
       if (cd) {
+        // A gesture whose button is no longer down is a gesture whose
+        // pointerup this svg never received. Capture is supposed to make
+        // that impossible, but Chrome drops it when the pressed element was
+        // unmounted mid-gesture -- and this floor unmounts the pressed
+        // element ROUTINELY: the ghost re-parent when slop is exceeded,
+        // every 5s poll re-render, and a crash-looping launch whose band
+        // dies under the pointer. Without this, the band followed the bare
+        // cursor forever, which read as the floor moving on its own.
+        if (e.buttons === 0) {
+          if (cd.moved) {
+            onPointerEnd()
+          } else {
+            // The press's release was lost before it meant anything --
+            // synthesising a click seconds later on a stray mousemove would
+            // select something nobody asked for, so it just dissolves.
+            cardDrag.current = null
+            lastPress.current = null
+          }
+          return
+        }
         const p = toScene(e)
         // The bus spans the full floor width by construction
         // (ClusterProvider.offset), so a horizontal drag has nowhere honest
@@ -429,7 +512,11 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
         // becoming part of the gesture, exactly as if it were pinned there.
         const dx = cd.nodeId === PROVIDER_NODE_ID ? 0 : p.x - cd.from.x
         const dy = p.y - cd.from.y
-        if (!cd.moved && Math.hypot(dx, dy) < DRAG_SLOP) return
+        if (
+          !cd.moved &&
+          Math.hypot(e.clientX - cd.fromClient.x, e.clientY - cd.fromClient.y) < DRAG_SLOP
+        )
+          return
         if (!cd.moved) {
           cd.moved = true
           setDragging(cd.nodeId)
@@ -445,6 +532,12 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
         return
       }
       if (!drag.current) return
+      // Same lost-pointerup insurance as the plate drag above.
+      if (e.buttons === 0) {
+        drag.current = null
+        svg.style.cursor = 'grab'
+        return
+      }
       const p = toVB(e)
       userMoved.current = true
       view.current.tx = drag.current.tx + (e.clientX - drag.current.x) * p.sx
@@ -560,8 +653,7 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
         e.preventDefault()
         const edges = topology.edges
         if (edges.length === 0) return
-        const keyOf = (a: string, b: string) => [a, b].sort().join('~')
-        const cur = selLink == null ? -1 : edges.findIndex((edge) => keyOf(edge.src, edge.dst) === selLink)
+        const cur = selLink == null ? -1 : edges.findIndex((edge) => edgeKey(edge.src, edge.dst) === selLink)
         const nn = edges.length
         const next = edges[(((e.key === ']' ? cur + 1 : cur - 1) % nn) + nn) % nn]!
         selectLink(next.src, next.dst)
@@ -575,6 +667,11 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
     svg.addEventListener('pointermove', onPointerMove)
     svg.addEventListener('pointerup', onPointerEnd)
     svg.addEventListener('pointercancel', onPointerEnd)
+    // The third way a gesture ends: the browser took the capture away
+    // (element churn, focus loss). Ending the drag here is what pointercancel
+    // SHOULD have done; on a normal release it fires after pointerup has
+    // already cleaned up, where onPointerEnd is a no-op.
+    svg.addEventListener('lostpointercapture', onPointerEnd)
     svg.addEventListener('keydown', onKeyDown)
     return () => {
       svg.removeEventListener('wheel', onWheel)
@@ -582,9 +679,29 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
       svg.removeEventListener('pointermove', onPointerMove)
       svg.removeEventListener('pointerup', onPointerEnd)
       svg.removeEventListener('pointercancel', onPointerEnd)
+      svg.removeEventListener('lostpointercapture', onPointerEnd)
       svg.removeEventListener('keydown', onKeyDown)
     }
-  }, [layout, topology.edges, selLink, selectLink, selectNode, openSheet, onReorder, onMove, announce])
+  }, [layout, topology.edges, selLink, selectLink, selectNode, selectDep, openSheet, onReorder, onMove, announce])
+
+  // A dragged plate or band can cease to exist mid-gesture: the crash-loop
+  // ends a launch and `runners()` drops its band while the pointer is still
+  // carrying it. The ghost unmounts with it, so the gesture is over whether
+  // or not a pointerup ever arrives -- holding the state open would leave
+  // `data-dragging` on a corpse and paint-order sorting against a name
+  // nothing answers to.
+  useEffect(() => {
+    if (!dragging) return
+    const exists =
+      dragging === PROVIDER_NODE_ID
+        ? layout.provider != null
+        : layout.cards.some((c) => c.nodeId === dragging) ||
+          layout.bands.some((b) => b.id === dragging)
+    if (!exists) {
+      cardDrag.current = null
+      setDragging(null)
+    }
+  }, [dragging, layout])
 
   if (box.w <= 0) {
     return (
@@ -720,7 +837,7 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
               ),
             )}
 
-            <BandLaunchLayer bands={layout.bands} deployments={live} />
+            <BandLaunchLayer bands={layout.bands} deployments={live} dragging={dragging} />
 
             <PlateLayer
               layout={layout}
@@ -753,6 +870,7 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(function Clust
           layerRef={particleLayerRef}
           routing={routing}
           paths={layout.paths}
+          pathsRender={layout.pathsRender}
           bands={layout.bands}
         />
       </svg>
@@ -1295,6 +1413,13 @@ function useFloorMotion(
       w: layout.width,
       h: layout.height,
     }
+    // The provider bus rides the same FLIP the plates do -- it is `.machine`
+    // with a data-node of its own, so the index below already finds it. All
+    // it was missing was a previous position to be pushed back from, so it
+    // teleported where every plate and band glided.
+    if (layout.provider) {
+      now.cards.set(PROVIDER_NODE_ID, { x: layout.provider.x, y: layout.provider.y })
+    }
     const was = prev.current
     prev.current = now
     const dropped = justPlaced.current
@@ -1437,7 +1562,6 @@ function PlateLayer({
             frame={frame}
             stale={stale}
             dragging={dragging === card.nodeId}
-            subline={layout.subline}
             share={share(routing, card.nodeId)}
             servedNames={servedOn(deployments, card.nodeId)}
             onSelect={onSelect}
@@ -1481,7 +1605,6 @@ function MachinePlate({
   frame,
   stale,
   dragging,
-  subline,
   share: shareOf,
   servedNames,
   onSelect,
@@ -1493,10 +1616,6 @@ function MachinePlate({
   frame: ReturnType<typeof useMetrics>['frame']
   stale: boolean
   dragging: boolean
-  /** Authored units reserved on every full-tier plate for the identity line.
-   *  Reserved floor-wide (see layout.SUBLINE_H), so a plate with nothing to
-   *  put there still shifts its rows down and stays aligned with its row. */
-  subline: number
   share: { served_name: string; weight: number } | null
   servedNames: string[]
   onSelect: (id: string) => void
@@ -1520,11 +1639,10 @@ function MachinePlate({
   // hostname, so naming plates that way draws two machines with one name (see
   // state/names.ts). The id everything else keys by goes underneath.
   const name = nodeName(topo ?? { node_id: card.nodeId }, card.nodeId)
+  // No plate has room to draw the identity line any more (the floor rests at
+  // chip and promotes to compact at most -- see layoutCluster); the tooltip
+  // and the node sheet carry it instead, via `label` below.
   const identity = nodeSubtitle(topo ?? { node_id: card.nodeId }, topo?.hostname)
-  // Only the tier the floor reserved room on can draw it; on the others the
-  // tooltip and the node sheet carry it.
-  const showsIdentity = card.bodyTier === 'full' && subline > 0 && identity !== ''
-  const dy = card.bodyTier === 'full' ? subline : 0
   // Both from layout.ts, which measured the plate's width from these exact
   // strings. A second spelling here is how a box stops fitting what it draws.
   const occupant = plateOccupant(servedNames)
@@ -1593,17 +1711,12 @@ function MachinePlate({
         strokeWidth={1.5}
       />
 
-      <text x={card.x + 11} y={card.y + 15} className="m" fontSize={9} fill="var(--on-fill)">
+      <text x={card.x + 11} y={card.y + 12} className="m" fontSize={9} fill="var(--on-fill)">
         {name}
       </text>
-      {showsIdentity ? (
-        <text x={card.x + 11} y={card.y + 26} className="m" fontSize={8} fill="var(--on-fill-dim)">
-          {identity}
-        </text>
-      ) : null}
       <text
         x={card.x + card.w - 11}
-        y={card.y + 15}
+        y={card.y + 12}
         textAnchor="end"
         className="m"
         fontSize={9}
@@ -1619,9 +1732,9 @@ function MachinePlate({
       {mem == null ? (
         <rect
           x={card.x + 11}
-          y={card.y + 21 + dy}
+          y={card.y + 16}
           width={trackW}
-          height={14}
+          height={8}
           rx={2}
           fill="none"
           stroke="var(--on-fill)"
@@ -1631,12 +1744,12 @@ function MachinePlate({
         />
       ) : (
         <>
-          <rect x={card.x + 11} y={card.y + 21 + dy} width={trackW} height={14} rx={2} fill="var(--on-fill)" opacity={0.18} />
+          <rect x={card.x + 11} y={card.y + 16} width={trackW} height={8} rx={2} fill="var(--on-fill)" opacity={0.18} />
           <rect
             x={card.x + 11}
-            y={card.y + 21 + dy}
+            y={card.y + 16}
             width={(trackW * mem) / 100}
-            height={14}
+            height={8}
             rx={2}
             fill="var(--on-fill)"
             opacity={0.85}
@@ -1644,28 +1757,30 @@ function MachinePlate({
         </>
       )}
 
-      {/* The two live rows. The plate reserved room for these from a template
-          of their widest form (layout.ts POWER_ROW and UTIL_ROW) rather than
-          from the figures themselves, which change every second -- keep the
-          templates in step with what is written here. */}
+      {/* The live rows the promoted plate gains. The plate reserved room for
+          these from a template of their widest form (layout.ts POWER_ROW and
+          UTIL_ROW) rather than from the figures themselves, which change
+          every second -- keep the templates in step with what is written
+          here. Selection is the floor's "tell me more" gesture now that it
+          rests at chip, so the routing share rides here too rather than
+          being lost with the retired full tier. */}
       {tier !== 'chip' ? (
-        <text x={card.x + 11} y={card.y + 47 + dy} className="m" fontSize={9} fill="var(--on-fill-dim)">
-          {`${fmt(live?.power_w ?? topo?.power_w, 0)} W · ${fmt(live?.temp_c ?? topo?.temp_c, 0)} °C`}
-        </text>
+        <>
+          {shareOf ? <ShareBar card={card} trackW={trackW} share={shareOf} /> : null}
+          <text x={card.x + 11} y={card.y + 47} className="m" fontSize={9} fill="var(--on-fill-dim)">
+            {`${fmt(live?.power_w ?? topo?.power_w, 0)} W · ${fmt(live?.temp_c ?? topo?.temp_c, 0)} °C`}
+          </text>
+        </>
       ) : null}
 
       {tier === 'full' ? (
         <>
-          <text x={card.x + 11} y={card.y + 61 + dy} className="m" fontSize={9} fill="var(--on-fill-dim)">
+          <text x={card.x + 11} y={card.y + 61} className="m" fontSize={9} fill="var(--on-fill-dim)">
             {`${utilKind(state?.profile ?? topo)} ${fmt(live?.util_pct ?? topo?.util_pct, 0)}% · ${pct(mem)}% memory`}
           </text>
-          {shareOf ? (
-            <ShareBar card={card} trackW={trackW} dy={dy} share={shareOf} />
-          ) : (
-            <text x={card.x + 11} y={card.y + 74 + dy} className="m" fontSize={9} fill="var(--on-fill-dim)">
-              {plateSpec(topo)}
-            </text>
-          )}
+          <text x={card.x + 11} y={card.y + 74} className="m" fontSize={9} fill="var(--on-fill-dim)">
+            {plateSpec(topo)}
+          </text>
         </>
       ) : null}
     </g>
@@ -1673,18 +1788,17 @@ function MachinePlate({
 }
 
 /** Under weighted routing an unequal split should be visible rather than
- *  mysterious. Same meter grammar as the memory bar above it, half the height,
- *  so the plate carries one visual vocabulary rather than two. */
+ *  mysterious. Same meter grammar as the memory bar above it, most of the
+ *  height, so the plate carries one visual vocabulary rather than two. Drawn
+ *  between the meter and the power row, in the space the promoted plate has
+ *  and the resting chip does not. */
 function ShareBar({
   card,
   trackW,
-  dy,
   share: shareOf,
 }: {
   card: PlacedCard
   trackW: number
-  /** The plate's identity-line shift, so this rides with the rows above it. */
-  dy: number
   share: { served_name: string; weight: number }
 }) {
   const w = trackW - 30
@@ -1692,11 +1806,11 @@ function ShareBar({
   return (
     <g>
       <title>{`${shareOf.served_name}: ${pct(shareOf.weight * 100)} percent of traffic`}</title>
-      <rect x={card.x + 11} y={card.y + 68 + dy} width={w} height={6} rx={2} fill="var(--on-fill)" opacity={0.18} />
-      <rect x={card.x + 11} y={card.y + 68 + dy} width={w * clamped} height={6} rx={2} fill="var(--on-fill)" opacity={0.85} />
+      <rect x={card.x + 11} y={card.y + 31} width={w} height={6} rx={2} fill="var(--on-fill)" opacity={0.18} />
+      <rect x={card.x + 11} y={card.y + 31} width={w * clamped} height={6} rx={2} fill="var(--on-fill)" opacity={0.85} />
       <text
         x={card.x + card.w - 11}
-        y={card.y + 74 + dy}
+        y={card.y + 37}
         textAnchor="end"
         className="m"
         fontSize={9}
@@ -1725,11 +1839,13 @@ function ParticleField({
   layerRef,
   routing,
   paths,
+  pathsRender,
   bands,
 }: {
   layerRef: RefObject<SVGGElement>
   routing: RoutingConfig[]
   paths: ClusterLayout['paths']
+  pathsRender: ClusterLayout['pathsRender']
   bands: ClusterBand[]
 }) {
   const { selDep } = useSelection()
@@ -1773,6 +1889,6 @@ function ParticleField({
     [bands, selDep, frame, stale, streaming],
   )
 
-  useParticleField({ layerRef, flows, streams, paths })
+  useParticleField({ layerRef, flows, streams, paths, pathsRender })
   return null
 }

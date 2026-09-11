@@ -1,3 +1,4 @@
+import { Combobox } from '../../components/Combobox'
 import { keyFieldWarning, type KeyMode } from './keyfield'
 
 export interface KeyFieldProps {
@@ -56,7 +57,6 @@ export function KeyField(props: KeyFieldProps) {
 
   const keyId = `${idPrefix}-key`
   const refId = `${idPrefix}-ref`
-  const listId = `${idPrefix}-refs`
   const warning = keyFieldWarning(mode, mode === 'key' ? apiKey : apiKeyRef)
 
   return (
@@ -95,25 +95,16 @@ export function KeyField(props: KeyFieldProps) {
           spellCheck={false}
         />
       ) : (
-        <>
-          {/* Not type="password": a reference is a name, and masking it is
-              what invited a key into the field in the first place. */}
-          <input
-            id={refId}
-            type="text"
-            autoComplete="off"
-            list={listId}
-            value={apiKeyRef}
-            onChange={(e) => onApiKeyRef(e.target.value)}
-            placeholder="OPENROUTER_API_KEY"
-            spellCheck={false}
-          />
-          <datalist id={listId}>
-            {knownRefs.map((r) => (
-              <option key={r} value={r} />
-            ))}
-          </datalist>
-        </>
+        // Not type="password": a reference is a name, and masking it is what
+        // invited a key into the field in the first place.
+        <Combobox
+          id={refId}
+          value={apiKeyRef}
+          onChange={onApiKeyRef}
+          suggestions={knownRefs}
+          placeholder="OPENROUTER_API_KEY"
+          autoComplete="off"
+        />
       )}
       {warning ? (
         <div className="unit" style={{ marginTop: 4, color: 'var(--warn)' }}>

@@ -13,6 +13,7 @@ import {
 } from './keyfield'
 import { KeyField } from './KeyField'
 import { ProviderBackupPanel } from './ProviderBackupPanel'
+import { Select, type SelectOption } from '../../components/Select'
 
 // Ported from mockups-next/js/settings.js `settings()`'s `provTable` block.
 // One row per provider, same as the mockup -- a provider's own accounting
@@ -389,17 +390,12 @@ export function ProvidersCard() {
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginTop: 12, flexWrap: 'wrap' }}>
         <div className="fld">
           <label htmlFor="pkind">Provider</label>
-          <select
+          <Select
             id="pkind"
             value={kind}
-            onChange={(e) => chooseKind(e.target.value as ProviderKind)}
-          >
-            {offered.map((k) => (
-              <option key={k.kind} value={k.kind}>
-                {k.display_name}
-              </option>
-            ))}
-          </select>
+            options={offered.map((k): SelectOption<ProviderKind> => ({ value: k.kind, label: k.display_name }))}
+            onChange={chooseKind}
+          />
         </div>
         <div className="fld" style={{ flex: 1, minWidth: 180 }}>
           <label htmlFor="pbase">Base URL</label>

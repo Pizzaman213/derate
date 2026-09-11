@@ -110,7 +110,11 @@ export function relativeTime(unixSeconds: number, now = Date.now() / 1000): stri
   const d = Math.max(0, Math.round(now - unixSeconds))
   if (d < 60) return `${d}s ago`
   if (d < 3600) return `${Math.round(d / 60)}m ago`
-  return `${Math.round(d / 3600)}h ago`
+  // Days, because the callers include things that are legitimately old: a
+  // stored head scan and a cached repository's mtime are both routinely a
+  // week out, and `168h ago` is a number nobody converts in their head.
+  if (d < 86400) return `${Math.round(d / 3600)}h ago`
+  return `${Math.round(d / 86400)}d ago`
 }
 
 /** A remaining time that something else measured, worded for a caption.

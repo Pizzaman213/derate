@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type {
   Cluster,
   LadderBasis,
@@ -11,7 +11,7 @@ import type { Runtime } from '../../state/runtime'
 import { DEFAULT_CONCURRENCY, DEFAULT_CONTEXT } from '../../state/routes'
 import { servesOnCluster } from '../../state/runtime'
 import { alreadyOn } from './pullTargets'
-import { ollamaRef, partitionForRuntime, variantKey } from './ollamaTarget'
+import { launchId, ollamaRef, partitionForRuntime, variantKey } from './ollamaTarget'
 import { ApiError } from '../../api/client'
 import { useBackend } from '../../state/backend'
 import { usePlacement } from '../../state/placement'
@@ -19,31 +19,42 @@ import { Disclosure } from '../../components/Panel'
 import { Lamp } from '../../components/Lamp'
 import { OverrideGate } from '../../components/OverrideGate'
 import { Verbatim } from '../../components/Verbatim'
-import { decodeLabel, fitLamp } from './ladder'
+import { fitLamp } from './ladder'
 import { gbytes } from '../../format'
 import type { CacheIndex } from './rows'
 
-/** One quantization, already chosen, with the rest a click away.
+/** The available quantizations, shown so they can be chosen from -- not one
+ *  featured guess with the rest a click away.
  *
- *  A repository can publish forty of these, and a table of forty rows asks a
- *  question most people cannot answer and should not have to. So this opens on
- *  a single pick -- the largest variant that both fits and can be served here
- *  -- with the button already beside it.
+ *  That used to be the shape: a single "pick" card decided in JS
+ *  (`recommended ?? servable[0] ?? ordered[0]`), and `servable[0]` is a
+ *  runtime-FORMAT fact, not a fit one -- so the featured card could, and on
+ *  this box did, open on a variant marked "not servable" with no Serve button
+ *  at all, while the rows that actually launch right now sat behind a
+ *  "+ Show all N" click inside a nine-column table. Nothing to select, a dead
+ *  end up front, and the real choices hidden.
  *
- *  The rest are split in two, and the split is the point. Most of what a hub
- *  search turns up for a popular model is GGUF, and there is no llama.cpp
- *  runtime here, so those rows cannot be launched at all: for Qwen3-30B-A3B,
- *  thirty-seven of forty-one. The gateway ranks on fit before servability, so
- *  its ordering puts the four launchable rows at 29, 30, 31 and 39 -- a list
- *  that opens on twenty-nine dead ends. Partitioning fixes what someone sees
- *  without touching the ordering: rank order is preserved exactly inside each
- *  group, so this is still reading the gateway's answer rather than composing
- *  a second one. Re-sorting in the browser would be that second answer, and the
- *  one that disagreed would be the one that misled.
+ *  Now every launchable row is a radio in a list that is visible the moment
+ *  this section renders -- bounded and scrollable rather than open-ended,
+ *  because under Ollama a popular repository can publish fifteen or twenty
+ *  single-file GGUF quantizations and an unbounded list would just be the
+ *  same wall of rows in a different shape. Rank order is preserved exactly:
+ *  re-sorting in the browser would be a second answer to the gateway's
+ *  question, and the one that disagreed would be the one that misled.
  *
- *  Serve is absent on a row that cannot be served, rather than present and
- *  dead: a disabled button reads as "not right now" when the truth is "not by
- *  this route at all". */
+ *  Selecting a row does not launch anything -- it only decides which one the
+ *  single card below describes. That card is the only Serve button on this
+ *  whole section, driven by whichever row is selected: the gateway's own
+ *  recommendation when there is one, else the first row that actually fits
+ *  right now, else the first launchable row regardless, so the panel only
+ *  ever opens on a dead end when literally nothing here can be served.
+ *
+ *  A repository can also publish formats nothing on this cluster loads at
+ *  all -- most of what a hub search turns up for a popular model is GGUF, and
+ *  there is no llama.cpp runtime here, so for Qwen3-30B-A3B that is
+ *  thirty-seven of forty-one rows. Those stay in their own collapsed group
+ *  below, with no radio and no Serve: a disabled button reads as "not right
+ *  now" when the truth is "not by this route at all". */
 export function QuantLadder({
   ladder,
   loading,
@@ -55,6 +66,7 @@ export function QuantLadder({
   provider,
   cache,
   cluster,
+  embedded,
 }: {
   ladder: VariantLadder | null
   loading: boolean
@@ -81,15 +93,25 @@ export function QuantLadder({
    *  sglang, and null when nothing is configured -- which is why Serve checks
    *  it rather than assuming the panel above supplied one. */
   provider: Provider | null
+  /** Folded into the base model's own Verdict card as a subsection, rather
+   *  than standing alone. Only changes the selected-variant summary below --
+   *  it drops its own `.verdict` border/background so it flows as part of
+   *  the outer card instead of a second one, since it is now nested inside
+   *  one. Nothing about the fit logic or the Serve flow changes: the fault
+   *  signal still shows on the lamp and the refusal text, just not as a
+   *  whole-card border. False (the default) when there is no outer card to
+   *  join -- a provider runtime, or while the base plan is still resolving. */
+  embedded?: boolean
 }) {
   const { backend, invalidate } = useBackend()
   const { nodeIds, degrees } = usePlacement()
 
   // Whether Serve on this list goes through the launcher or onto a provider.
   const onCluster = servesOnCluster(runtime)
-  // Keyed on `variantKey`, never on repo_id. One GGUF repository publishes
-  // many quantizations, so a repo-keyed state lights "Serving…" on every
-  // sibling row of the one that was clicked.
+  // Which row is selected, or null for "nobody has clicked one, use the
+  // default". Keyed on `variantKey`, never on repo_id -- one GGUF repository
+  // publishes many quantizations.
+  const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [launching, setLaunching] = useState<string | null>(null)
   const [launchError, setLaunchError] = useState<string | null>(null)
   const [launched, setLaunched] = useState<string | null>(null)
@@ -97,18 +119,44 @@ export function QuantLadder({
   // never becomes a Deployment, so the post-Serve chip has no cluster record
   // to resolve and reads this instead of waiting forever on one.
   const [pulled, setPulled] = useState<PullAccepted | null>(null)
-  // A memory refusal, held with the variant it refused, and with the field
-  // that would override it -- the cluster gate and the pull gate publish
-  // different names. Cleared on every new attempt: an override must never
-  // outlive the measurement that justified it.
-  const [refusal, setRefusal] = useState<
-    { key: string; message: string; param: string } | null
-  >(null)
+  // A memory refusal from the last Serve attempt, and the field that would
+  // override it -- the cluster gate and the pull gate publish different
+  // names. There is exactly one Serve button on this section now, so a
+  // refusal is always about `selected` at the moment it happened; the effect
+  // below is what keeps that true after the moment passes.
+  const [refusal, setRefusal] = useState<{ message: string; param: string } | null>(null)
   const [override, setOverride] = useState(false)
   const [fittingOnly, setFittingOnly] = useState(false)
-  const [openShards, setOpenShards] = useState<string | null>(null)
-  const [showAll, setShowAll] = useState(false)
+  const [shardsOpen, setShardsOpen] = useState(false)
   const [showReference, setShowReference] = useState(false)
+
+  // A new ladder means a genuinely new question -- a different model,
+  // context, concurrency or placement was just re-judged -- never a poll or
+  // an echo of this component's own launch: `ModelInspector`'s fetch effect
+  // does not run on a timer, and `invalidate()` (called below on a
+  // successful launch) is not among its dependencies. So a selection, a
+  // refusal or an override that predate the new numbers cannot still be
+  // describing them.
+  useEffect(() => {
+    setSelectedKey(null)
+    setRefusal(null)
+    setOverride(false)
+    setLaunchError(null)
+    setShardsOpen(false)
+  }, [ladder])
+
+  // Clicking a different row does not launch anything, so a refusal from the
+  // row selected a moment ago must not survive onto this one -- ticking the
+  // override box would otherwise grant an exemption measured against a
+  // variant nobody is looking at any more, which is exactly the failure
+  // "an override must never outlive the measurement that justified it"
+  // exists to prevent.
+  useEffect(() => {
+    setRefusal(null)
+    setOverride(false)
+    setShardsOpen(false)
+  }, [selectedKey])
+
   const serve = async (variant: QuantVariant, allowOverMemory = false) => {
     const key = variantKey(variant)
     setLaunching(key)
@@ -116,11 +164,14 @@ export function QuantLadder({
     if (!allowOverMemory) setRefusal(null)
     try {
       if (onCluster) {
-        // The variant's own repository id, never the base model with a dtype
-        // override: a quantization is a different repository, and the serve
-        // command carries no --quantization to make an override mean anything.
+        // The variant's own id, never the base model with a dtype override: a
+        // quantization is a different repository, and the serve command
+        // carries no --quantization to make an override mean anything.
+        //
+        // `launchId` and not `repo_id`, because a GGUF repository holds many
+        // quantizations and its id names none of them -- see that function.
         await backend.launch({
-          model_id: variant.repo_id,
+          model_id: launchId(variant),
           // What THIS row was judged at, not what the panel above was asked
           // for. On the default path nobody named a context and the gate chose
           // one per variant, so launching at the prop would start a deployment
@@ -184,7 +235,7 @@ export function QuantLadder({
       // line -- and a static refusal, which is a 400, correctly does not.
       const code = e instanceof ApiError && e.status === 409 ? refusalCode(e) : null
       if (code) {
-        setRefusal({ key, message: e instanceof Error ? e.message : String(e), param: code })
+        setRefusal({ message: e instanceof Error ? e.message : String(e), param: code })
         setOverride(false)
       } else {
         setLaunchError(e instanceof Error ? e.message : String(e))
@@ -237,25 +288,13 @@ export function QuantLadder({
   // requires `fits and launchable`, so it can only ever name a row this
   // runtime cannot fetch.
   const recommended = onCluster ? ladder.recommended : null
-
-  // The pick. `recommended` is the gateway's -- the largest variant that both
-  // fits and can be served -- and when there is one it is the row to put the
-  // button on. When there is not, the best servable row is shown rather than
-  // the top of a ranking whose first rows cannot be launched at all; failing
-  // that, the top of the ranking, because "here is the closest thing, and here
-  // is why you cannot run it" is an answer and an empty card is not.
   const recommendedVariant =
     recommended != null
       ? (ordered.find(
           (v) => v.repo_id === recommended.repo_id && v.label === recommended.label,
         ) ?? null)
       : null
-  const pick = recommendedVariant ?? servable[0] ?? ordered[0]!
-  const pickLamp = fitLamp(pick, onCluster)
-  const pickKey = variantKey(pick)
-  const refused = refusal
-    ? (ordered.find((v) => variantKey(v) === refusal.key) ?? null)
-    : null
+
   // Servability under this runtime, which is what the button is really asking.
   // Under the cluster runtimes that is the gateway's `launchable` and its fit
   // verdict together; under a provider runtime it is whether the row is a GGUF
@@ -271,6 +310,28 @@ export function QuantLadder({
         sizedOn.local_serving !== false && v.launchable && v.fits === true
       : Boolean(provider) && Boolean(ollamaRef(v))
 
+  // The row selected before anyone has clicked one. `fits` only means
+  // something on this cluster -- under a provider runtime it describes a
+  // machine the pull never touches, so that preference is gated on
+  // `onCluster` the same way `recommended` already is above.
+  const defaultPick =
+    recommendedVariant ??
+    (onCluster ? (servable.find((v) => v.fits === true) ?? null) : null) ??
+    servable[0] ??
+    ordered[0]!
+  const selectedFromList = selectedKey
+    ? (ordered.find((v) => variantKey(v) === selectedKey) ?? null)
+    : null
+  const selected = selectedFromList ?? defaultPick
+  const selectedKeyResolved = variantKey(selected)
+  const selectedLamp = fitLamp(selected, onCluster)
+  const servableNow = canServe(selected)
+  // Fault whenever there is nothing to press right now, whether that is a
+  // fresh refusal or a row that was never servable to begin with -- the same
+  // rule the base model's own Verdict card already uses.
+  const cardBad = refusal != null || !servableNow
+  const headerLamp = refusal ? { signal: 'fault' as const, label: 'refused on live memory' } : selectedLamp
+
   return (
     <>
       <p className="unit" style={{ margin: '0 0 8px' }}>
@@ -285,82 +346,173 @@ export function QuantLadder({
           <>
             Verdicts are from the fit gate on {sizedOnPhrase(sizedOn)},{' '}
             {ladderContext(ladder)}
+            {/* `local_serving` and not the basis: sizing against host memory
+                and being unable to serve were one fact until the llamacpp
+                runtime arrived, and the server now answers them separately.
+                A machine with no GPU that CAN serve must not be told it
+                cannot -- that sentence sent people to a provider they did not
+                need. */}
             {sizedOn.budget_basis === 'host_memory'
-              ? ', against host memory — no GPU was found there, so nothing below can be served from it'
+              ? sizedOn.local_serving === false
+                ? ', against host memory — no GPU was found there, so nothing below can be served from it'
+                : ', against host memory — no GPU was found there, so these are sized for the CPU runtime'
               : sizedOn.budget_is_live === false
                 ? ', against the memory that hardware could spend with nothing else running — no node reported a live figure'
                 : ', against what those machines can hand out right now'}
             .
           </>
         )}
-        {/* What used to be here was an apology.
-
-            `GET /api/models/variants` sized every row on ONE machine while the
-            board above allowed several to be ticked, so the sentence said so:
-            "Each row is sized on a single machine, so it does not account for
-            the N you ticked above." That was honest and useless -- the numbers
-            were still the wrong ones, the launch was still gated on different
-            figures, and it only appeared when the operator had ticked the
-            machines rather than when the planner chose them.
-
-            The request now carries the machines, so the answer is about them,
-            and the caption above states which ones and at what degree instead
-            of hedging about what it does not know. Nothing to apologise for. */}
       </p>
 
-      {/* The pick, already made. Everything needed to act is on this one card:
-          what it is, what it costs, whether it runs, and the button. */}
-      <div className={recommendedVariant ? 'verdict on' : 'verdict'} style={{ marginBottom: 10 }}>
-        <div className="vhead" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <Lamp {...pickLamp} hollow={pickLamp.signal === 'idle'} />
-          <span className="mono">{pick.label}</span>
-          <span className="unit">{pick.dtype}</span>
-          <span className="num">
-            {pick.file_bytes != null ? `${gbytes(pick.file_bytes)} GiB` : '—'}
-          </span>
-          {pick.bits_per_weight != null ? (
-            <span className="unit">{pick.bits_per_weight.toFixed(2)} bpw</span>
+      {/* Every launchable row, at once. Filter first, so it stays reachable
+          even when it has hidden everything below. */}
+      {servable.length > 1 ? (
+        <>
+          {onCluster ? (
+            <label
+              className="unit"
+              style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '0 0 8px' }}
+            >
+              <input
+                type="checkbox"
+                checked={fittingOnly}
+                onChange={(e) => setFittingOnly(e.target.checked)}
+              />
+              Only show variants that fit
+              {fittingOnly && hidden > 0 ? (
+                // Never silently. A filtered list that does not say what it
+                // removed reads as a complete one.
+                <span className="unit">({hidden} hidden)</span>
+              ) : null}
+            </label>
           ) : null}
-          {pick.shard_count > 1 ? (
-            <span className="unit">{pick.shard_count} shards</span>
+
+          {rows.length === 0 ? (
+            <p className="unit" style={{ marginBottom: 10 }}>
+              {onCluster
+                ? 'Nothing here fits at this context and concurrency.'
+                : 'No GGUF was found in this repository, and Ollama loads nothing else.'}
+            </p>
+          ) : (
+            <div
+              role="radiogroup"
+              aria-label="Quantization"
+              style={{
+                display: 'grid',
+                maxHeight: 260,
+                overflowY: 'auto',
+                border: '1px solid var(--rule)',
+                borderRadius: 'var(--radius)',
+                marginBottom: 10,
+              }}
+            >
+              {rows.map((v) => {
+                const key = variantKey(v)
+                const lamp = fitLamp(v, onCluster)
+                const isRecommended =
+                  recommended != null &&
+                  v.repo_id === recommended.repo_id &&
+                  v.label === recommended.label
+                const id = `qv-${key}`
+                return (
+                  <div
+                    key={key}
+                    className={`nboard-row${key === selectedKeyResolved ? ' on' : ''}`}
+                    style={{ gridTemplateColumns: '18px 1fr', minWidth: 0 }}
+                  >
+                    <input
+                      id={id}
+                      type="radio"
+                      name="quant-pick"
+                      checked={key === selectedKeyResolved}
+                      onChange={() => setSelectedKey(key)}
+                      style={{ marginTop: 3 }}
+                    />
+                    <label
+                      htmlFor={id}
+                      style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}
+                    >
+                      <Lamp signal={lamp.signal} hollow={lamp.signal === 'idle'} label={lamp.label} />
+                      <span className="mono" style={{ wordBreak: 'break-all' }}>
+                        {v.label}
+                      </span>
+                      <span className="unit">
+                        {v.dtype}
+                        {v.bits_per_weight != null ? ` · ${v.bits_per_weight.toFixed(2)} bpw` : ''}
+                      </span>
+                      <span className="num">
+                        {v.file_bytes != null ? `${gbytes(v.file_bytes)} GiB` : '—'}
+                      </span>
+                      {isRecommended ? <span className="pill">recommended</span> : null}
+                      {onCluster ? (
+                        <OnDisk repoId={v.repo_id} expectedBytes={v.file_bytes} cache={cache} />
+                      ) : (
+                        <AlreadyThere provider={provider} variant={v} />
+                      )}
+                    </label>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </>
+      ) : null}
+
+      {/* The one thing that can be served: whatever `selected` is, whether
+          that is the gateway's own pick, this list's default fallback, or a
+          row someone clicked. This is the only Serve button in the section. */}
+      <div
+        className={embedded ? undefined : `verdict on${cardBad ? ' bad' : ''}`}
+        style={{ marginBottom: 10 }}
+      >
+        <div className="vhead" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <Lamp {...headerLamp} hollow={headerLamp.signal === 'idle'} />
+          <span className="mono">{selected.label}</span>
+          <span className="unit">{selected.dtype}</span>
+          <span className="num">
+            {selected.file_bytes != null ? `${gbytes(selected.file_bytes)} GiB` : '—'}
+          </span>
+          {selected.bits_per_weight != null ? (
+            <span className="unit">{selected.bits_per_weight.toFixed(2)} bpw</span>
+          ) : null}
+          {selected.shard_count > 1 ? (
+            <span className="unit">{selected.shard_count} shards</span>
           ) : null}
           {onCluster ? (
-            <OnDisk repoId={pick.repo_id} expectedBytes={pick.file_bytes} cache={cache} />
+            <OnDisk repoId={selected.repo_id} expectedBytes={selected.file_bytes} cache={cache} />
           ) : (
             // A different disk. The cache index walks this cluster's nodes,
             // and the provider's storage is not among them -- so the question
             // becomes whether that box already lists this ref.
-            <AlreadyThere provider={provider} variant={pick} />
+            <AlreadyThere provider={provider} variant={selected} />
           )}
           <span style={{ marginLeft: 'auto' }}>
-            {canServe(pick) ? (
-              launched === pickKey ? (
-                <Served
-                  repoId={pick.repo_id}
-                  cluster={cluster}
-                  pulled={onCluster ? null : pulled}
-                />
-              ) : (
-                <button
-                  className="ghost"
-                  style={{ padding: '2px 10px', fontSize: 12 }}
-                  disabled={launching === pickKey}
-                  onClick={() => void serve(pick)}
-                >
-                  {launching === pickKey ? (onCluster ? 'Serving…' : 'Pulling…') : 'Serve'}
-                </button>
-              )
-            ) : (
-              // Absent, not disabled, on the pick card too.
-              <span className="unit" title={pick.note}>
+            {!servableNow ? (
+              // Absent, not disabled.
+              <span className="unit" title={selected.note}>
                 {onCluster || provider ? 'not servable' : 'no provider configured'}
               </span>
+            ) : refusal ? (
+              <span className="unit" style={{ color: 'var(--fault)' }}>
+                refused — see below
+              </span>
+            ) : launched === selectedKeyResolved ? (
+              <Served repoId={selected.repo_id} cluster={cluster} pulled={onCluster ? null : pulled} />
+            ) : (
+              <button
+                className="ghost"
+                style={{ padding: '2px 10px', fontSize: 12 }}
+                disabled={launching === selectedKeyResolved}
+                onClick={() => void serve(selected)}
+              >
+                {launching === selectedKeyResolved ? (onCluster ? 'Serving…' : 'Pulling…') : 'Serve'}
+              </button>
             )}
           </span>
         </div>
         <div className="unit" style={{ wordBreak: 'break-all', marginTop: 2 }}>
-          {pick.repo_id}
-          {pick.gguf_file ? ` · ${pick.gguf_file.split('/').pop()}` : ''}
+          {selected.repo_id}
+          {selected.gguf_file ? ` · ${selected.gguf_file.split('/').pop()}` : ''}
         </div>
         {/* The fit gate's own sentence. Never paraphrased: it is more precise
             than a rewrite and it names the numbers it used -- which is exactly
@@ -372,10 +524,10 @@ export function QuantLadder({
         {onCluster ? (
           <>
             <Verbatim
-              text={recommendedVariant ? recommended!.reason : pick.reason}
+              text={selected === recommendedVariant ? recommended!.reason : selected.reason}
               size="label"
             />
-            <Consequence variant={pick} />
+            <Consequence variant={selected} />
           </>
         ) : null}
         {/* Not on disk yet, so the first launch pulls it. Stated from the
@@ -383,13 +535,13 @@ export function QuantLadder({
             control plane does not download weights, the runtime container
             does. */}
         {onCluster &&
-        pick.launchable &&
-        pick.file_bytes != null &&
-        cache.complete(pick.repo_id, pick.file_bytes) !== true ? (
+        selected.launchable &&
+        selected.file_bytes != null &&
+        cache.complete(selected.repo_id, selected.file_bytes) !== true ? (
           <p className="unit" style={{ margin: '4px 0 0' }}>
-            {cache.nodes(pick.repo_id).length
-              ? `Only part of this is cached — the first launch pulls the rest of ${gbytes(pick.file_bytes)} GiB.`
-              : `Not cached on any node — the first launch pulls ${gbytes(pick.file_bytes)} GiB.`}
+            {cache.nodes(selected.repo_id).length
+              ? `Only part of this is cached — the first launch pulls the rest of ${gbytes(selected.file_bytes)} GiB.`
+              : `Not cached on any node — the first launch pulls ${gbytes(selected.file_bytes)} GiB.`}
           </p>
         ) : null}
         {recommendedVariant ? null : (
@@ -406,142 +558,44 @@ export function QuantLadder({
                 : 'Nothing here both fits and can be served by a runtime on this cluster; this is the closest.'}
           </p>
         )}
-      </div>
-
-      {/* The live-memory refusal, wherever it came from. Serve exists on the
-          pick card and on every fitting row of the table, so a gate that only
-          rendered inside the card would leave a row-triggered 409 with nowhere
-          to go -- the launch would refuse and the screen would say nothing. */}
-      {refused ? (
-        <div className="verdict on bad" style={{ marginBottom: 10 }}>
-          <div className="vhead" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Lamp signal="fault" label="refused on live memory" />
-            <span className="mono">{refused.label}</span>
-            <span className="unit" style={{ wordBreak: 'break-all' }}>
-              {refused.repo_id}
-            </span>
-          </div>
-          <OverrideGate
-            reason={refusal!.message}
-            sentence={
-              refusal!.param === 'allow_over_memory'
-                ? 'Pull anyway. I am overriding the memory gate, which measured what ' +
-                  'that machine has free and refused; the download will proceed and may ' +
-                  'fill its disk.'
-                : 'Serve anyway. I am overriding the live fit gate, which measured what ' +
-                  'the node can hand out right now and refused; it would fit on an idle machine.'
-            }
-            checked={override}
-            onChange={setOverride}
-            onLaunch={() => void serve(refused, true)}
-            launching={launching === variantKey(refused)}
-          />
-        </div>
-      ) : null}
-
-      {/* The list says its own size. A collapsed list that does not reads as a
-          short one, and forty rows is the fact that made the pick worth
-          making. */}
-      {servable.length > 1 ? (
-        <button
-          className="ghost"
-          aria-expanded={showAll}
-          style={{ padding: '2px 0', border: 0, fontSize: 12 }}
-          onClick={() => setShowAll(!showAll)}
-        >
-          {showAll
-            ? '– Hide the servable list'
-            : onCluster
-              ? `+ Show all ${servable.length} that can be served here`
-              : `+ Show all ${servable.length} a provider could fetch`}
-        </button>
-      ) : null}
-
-      {!showAll ? null : (
-        <>
-          {/* Filters rows the gateway already judged. It decides nothing itself
-              -- `fits` is read, never recomputed. Absent under a provider
-              runtime: there is no verdict on these rows to filter on, and a
-              checkbox that hid everything would look like an answer. */}
-          {onCluster ? (
-            <label
-              className="unit"
-              style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '8px 0' }}
+        {selected.shard_count > 1 ? (
+          <div style={{ marginTop: 4 }}>
+            <Disclosure
+              summary={`${selected.shard_count} shards, summed`}
+              open={shardsOpen}
+              onToggle={() => setShardsOpen((v) => !v)}
             >
-              <input
-                type="checkbox"
-                checked={fittingOnly}
-                onChange={(e) => setFittingOnly(e.target.checked)}
-              />
-              Only show variants that fit
-              {fittingOnly && hidden > 0 ? (
-                // Never silently. A filtered list that does not say what it
-                // removed reads as a complete one.
-                <span className="unit">({hidden} hidden)</span>
-              ) : null}
-            </label>
-          ) : null}
-
-          <div style={{ overflowX: 'auto' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Fit</th>
-                  <th>Variant</th>
-                  <th>Scheme</th>
-                  <th style={{ textAlign: 'right' }}>Download</th>
-                  {/* Both are the fit gate's arithmetic about a GPU node in
-                      this cluster. Under a provider runtime the columns are
-                      dropped rather than blanked: a dash reads as "not
-                      measured yet", and predicted decode from a node's memory
-                      bandwidth would be wrong by orders of magnitude on a CPU
-                      box, printed as a bare figure with nothing qualifying it. */}
-                  {onCluster ? <th style={{ textAlign: 'right' }}>Headroom</th> : null}
-                  {onCluster ? <th style={{ textAlign: 'right' }}>Decode</th> : null}
-                  <th>Repository</th>
-                  <th>File</th>
-                  <th>Serve</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((v) => {
-                  const key = variantKey(v)
-                  return (
-                    <Row
-                      key={key}
-                      variant={v}
-                      cache={cache}
-                      cluster={cluster}
-                      onCluster={onCluster}
-                      provider={provider}
-                      servable={canServe(v)}
-                      pulled={onCluster ? null : pulled}
-                      recommended={
-                        recommended != null &&
-                        v.repo_id === recommended.repo_id &&
-                        v.label === recommended.label
-                      }
-                      launching={launching === key}
-                      launched={launched === key}
-                      shardsOpen={openShards === key}
-                      onToggleShards={() => setOpenShards(openShards === key ? null : key)}
-                      onServe={() => void serve(v)}
-                    />
-                  )
-                })}
-              </tbody>
-            </table>
+              <div className="unit" style={{ wordBreak: 'break-all' }}>
+                {selected.shard_files.map((f) => (
+                  <div key={f}>{f.split('/').pop() ?? f}</div>
+                ))}
+              </div>
+            </Disclosure>
           </div>
-
-          {rows.length === 0 ? (
-            <p className="unit" style={{ marginTop: 8 }}>
-              {onCluster
-                ? 'Nothing here fits at this context and concurrency.'
-                : 'No GGUF was found in this repository, and Ollama loads nothing else.'}
-            </p>
-          ) : null}
-        </>
-      )}
+        ) : null}
+        {/* The override path for a 409 from Serve above, on this same card --
+            guaranteed by the effects above to be about `selected`, so there is
+            nothing left to key it against. */}
+        {refusal ? (
+          <div style={{ marginTop: 8 }}>
+            <OverrideGate
+              reason={refusal.message}
+              sentence={
+                refusal.param === 'allow_over_memory'
+                  ? 'Pull anyway. I am overriding the memory gate, which measured what ' +
+                    'that machine has free and refused; the download will proceed and may ' +
+                    'fill its disk.'
+                  : 'Serve anyway. I am overriding the live fit gate, which measured what ' +
+                    'the node can hand out right now and refused; it would fit on an idle machine.'
+              }
+              checked={override}
+              onChange={setOverride}
+              onLaunch={() => void serve(selected, true)}
+              launching={launching === selectedKeyResolved}
+            />
+          </div>
+        ) : null}
+      </div>
 
       {/* Everything no runtime here can load, in one collapsed group with the
           reason said once. Kept rather than filtered out: the variants exist,
@@ -850,137 +904,6 @@ function sizedOnPhrase(basis: LadderBasis): string {
   return basis.tensor_parallel > 1
     ? `${listed}, tensor-parallel ${basis.tensor_parallel}`
     : listed
-}
-
-
-function Row({
-  variant,
-  cache,
-  cluster,
-  onCluster,
-  provider,
-  servable,
-  pulled,
-  recommended,
-  launching,
-  launched,
-  shardsOpen,
-  onToggleShards,
-  onServe,
-}: {
-  variant: QuantVariant
-  cache: CacheIndex
-  cluster: Cluster | null
-  onCluster: boolean
-  provider: Provider | null
-  servable: boolean
-  pulled: PullAccepted | null
-  recommended: boolean
-  launching: boolean
-  launched: boolean
-  shardsOpen: boolean
-  onToggleShards: () => void
-  onServe: () => void
-}) {
-  const fits = variant.fits
-  const lamp = fitLamp(variant, onCluster)
-  const sharded = variant.shard_count > 1
-  const file = variant.gguf_file
-  const basename = file ? (file.split('/').pop() ?? file) : null
-
-  return (
-    <tr style={recommended ? { background: 'var(--panel-sunk)' } : undefined}>
-      <td>
-        <Lamp signal={lamp.signal} hollow={lamp.signal === 'idle'} label={lamp.label} />
-      </td>
-      <td className="mono" style={{ wordBreak: 'break-all' }}>
-        {variant.label}
-        {recommended ? <span className="pill" style={{ marginLeft: 6 }}>recommended</span> : null}
-        {onCluster ? (
-          <OnDisk repoId={variant.repo_id} expectedBytes={variant.file_bytes} cache={cache} />
-        ) : (
-          <AlreadyThere provider={provider} variant={variant} />
-        )}
-      </td>
-      <td className="unit">
-        {variant.dtype}
-        {variant.bits_per_weight != null ? (
-          <>
-            <br />
-            {variant.bits_per_weight.toFixed(2)} bpw
-          </>
-        ) : null}
-      </td>
-      <td className="num">
-        {/* Measured or absent. A size we did not measure is never drawn. */}
-        {variant.file_bytes != null ? `${gbytes(variant.file_bytes)} GiB` : '—'}
-      </td>
-      {onCluster ? (
-        <td className="num">
-          {/* Only where it means something: headroom under a refusal is the size
-              of the shortfall, which the reason already states in words. */}
-          {variant.headroom != null && fits === true ? `${gbytes(variant.headroom)} GiB` : '—'}
-        </td>
-      ) : null}
-      {onCluster ? (
-        <td className="num">
-          {/* Guarded like Headroom beside it, and for the same reason: a
-              throughput is about a model that is resident. `fits` is true for
-              `fits_degraded` too, so the row whose whole point IS its decode
-              figure keeps it, and only the refusals and the unjudged lose it.
-              This column used to print a number for every refusal -- computed,
-              in the reported case, against a cache read for a 262,144-token
-              window nothing had verified. */}
-          {decodeLabel(variant)}
-        </td>
-      ) : null}
-      <td className="unit" style={{ wordBreak: 'break-all' }}>
-        {variant.repo_id}
-        {variant.downloads != null ? (
-          <>
-            <br />
-            {variant.downloads.toLocaleString()} downloads
-          </>
-        ) : null}
-      </td>
-      <td className="unit" style={{ wordBreak: 'break-all', minWidth: 180 }}>
-        {basename ?? '—'}
-        {sharded ? (
-          // The size in the row beside this one is the sum of these files.
-          // Drawn as the list rather than a count so it is checkable.
-          <Disclosure
-            summary={`${variant.shard_count} shards, summed`}
-            open={shardsOpen}
-            onToggle={onToggleShards}
-          >
-            <div className="unit" style={{ wordBreak: 'break-all' }}>
-              {variant.shard_files.map((f) => (
-                <div key={f}>{f.split('/').pop() ?? f}</div>
-              ))}
-            </div>
-          </Disclosure>
-        ) : null}
-      </td>
-      <td>
-        {launched ? (
-          <Served repoId={variant.repo_id} cluster={cluster} pulled={pulled} />
-        ) : servable ? (
-          <button
-            className="ghost"
-            style={{ padding: '2px 8px', fontSize: 12 }}
-            disabled={launching}
-            onClick={onServe}
-          >
-            {launching ? (onCluster ? 'Serving…' : 'Pulling…') : 'Serve'}
-          </button>
-        ) : (
-          <span className="unit">
-            {!onCluster ? 'no provider' : fits === false ? 'will not fit' : '—'}
-          </span>
-        )}
-      </td>
-    </tr>
-  )
 }
 
 /** What the pull endpoint accepted, said in full.

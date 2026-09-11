@@ -27,6 +27,24 @@ const PALETTE = [
   'hsl(44 72% 50%)',
 ]
 
+/** The publisher half of a model id, or `''` for a bare repository.
+ *
+ *  `''` is load-bearing and is NOT the same as "a publisher we could not
+ *  identify": `gpt2` has no publisher at all, and `ngram` is a mechanism rather
+ *  than a repository. Both must draw no mark, because a tile there would invent
+ *  an owner for something that has none.
+ */
+export function ownerOf(modelId: string): string {
+  const slash = modelId.indexOf('/')
+  return slash > 0 ? modelId.slice(0, slash) : ''
+}
+
+/** The repository half — the whole id when there is no publisher. */
+export function repoOf(modelId: string): string {
+  const slash = modelId.indexOf('/')
+  return slash > 0 ? modelId.slice(slash + 1) : modelId
+}
+
 export function hashString(value: string): number {
   let h = 0
   for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0
@@ -219,3 +237,4 @@ export function subscribeAvatars(fn: () => void): () => void {
   listeners.add(fn)
   return () => listeners.delete(fn)
 }
+

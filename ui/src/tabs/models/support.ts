@@ -73,30 +73,24 @@ export function classifySupport(
   const entry = table.schemes.find((s) => s.key === scheme)
   if (!entry) return UNKNOWN
 
-  // Mirrors `gateway/serialize.py:_launchable`: a llama.cpp format is refused
-  // outright, because both serve templates take a repository path and there is
-  // no llama.cpp runtime on this cluster.
-  if (entry.family === 'gguf') {
-    // The status stays `unsupported` and the sentence keeps its first half:
-    // nothing on this cluster launches a llama.cpp format, which is still
-    // true and is still what the red dot means. With a pullable provider
-    // configured it is no longer the whole story, so the route out is
-    // appended rather than replacing what was there.
-    return {
-      status: 'unsupported',
-      reason:
-        `${entry.key} is a llama.cpp format. Neither vllm nor sglang is verified to load it, and there is no llama.cpp runtime here.` +
-        (canPull
-          ? ' Open the model and pick the ollama runtime to pull a GGUF onto a provider instead.'
-          : ''),
-    }
-  }
-
+  // GGUF used to be refused here before the table was consulted at all, on
+  // the grounds that both serve templates took a repository path and there
+  // was no llama.cpp runtime on this cluster. There is one now, so the
+  // special case is gone and the question goes to the table -- which is what
+  // this module's header says it does, and what made a scheme gaining support
+  // server-side light up here without an edit. The special case was the one
+  // exception to that, and it was the one that went stale.
   const levels = Object.values(entry.runtimes)
   if (levels.length && levels.every((l) => l === 'unsupported')) {
     return {
       status: 'unsupported',
-      reason: entry.note || `No runtime here loads ${entry.key}.`,
+      reason:
+        (entry.note || `No runtime here loads ${entry.key}.`) +
+        // Only for GGUF, and only when a provider could actually take it. A
+        // route out is worth appending; one that ends the same way is not.
+        (entry.family === 'gguf' && canPull
+          ? ' Open the model and pick the ollama runtime to pull a GGUF onto a provider instead.'
+          : ''),
     }
   }
   return OK

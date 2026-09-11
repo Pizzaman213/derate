@@ -17,6 +17,7 @@
 import { useMemo, useState } from 'react'
 
 import { useBackend, useKeyedResource } from '../../state/backend'
+import { Combobox } from '../../components/Combobox'
 import { useTopology } from '../../state/resources'
 
 /** Slow, like the models panel: the catalogue changes when the upstream
@@ -159,37 +160,25 @@ export function ProviderBackupPanel({ providerId }: { providerId: string }) {
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div className="fld" style={{ flex: 1, minWidth: 220 }}>
           <label htmlFor={`bk-up-${providerId}`}>Upstream model</label>
-          <input
+          {/* A typeahead field rather than a closed picker: several hundred
+              options is a list you type into, not one you scroll. */}
+          <Combobox
             id={`bk-up-${providerId}`}
-            list={`bk-up-list-${providerId}`}
             value={upstream}
-            onChange={(e) => setUpstream(e.target.value)}
+            onChange={setUpstream}
+            suggestions={(models ?? []).map((m) => m.upstream_id)}
             placeholder="meta-llama/llama-3.1-8b-instruct"
-            spellCheck={false}
           />
-          {/* A datalist rather than a select: several hundred options is a
-              list you type into, not one you scroll. */}
-          <datalist id={`bk-up-list-${providerId}`}>
-            {(models ?? []).map((m) => (
-              <option key={m.upstream_id} value={m.upstream_id} />
-            ))}
-          </datalist>
         </div>
         <div className="fld" style={{ flex: 1, minWidth: 200 }}>
           <label htmlFor={`bk-served-${providerId}`}>Answers to</label>
-          <input
+          <Combobox
             id={`bk-served-${providerId}`}
-            list={`bk-served-list-${providerId}`}
             value={served}
-            onChange={(e) => setServed(e.target.value)}
+            onChange={setServed}
+            suggestions={localNames}
             placeholder={localNames[0] ?? 'the name clients ask for'}
-            spellCheck={false}
           />
-          <datalist id={`bk-served-list-${providerId}`}>
-            {localNames.map((n) => (
-              <option key={n} value={n} />
-            ))}
-          </datalist>
           <div className="unit" style={{ marginTop: 4 }}>
             {served.trim() && localNames.includes(served.trim())
               ? `Backs up ${served.trim()}, which this cluster is serving.`

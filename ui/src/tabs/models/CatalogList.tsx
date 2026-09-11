@@ -2,7 +2,7 @@ import { Lamp } from '../../components/Lamp'
 import { Verbatim } from '../../components/Verbatim'
 import { gbytes } from '../../format'
 import { BandHeading, useBandCollapse } from './BandSection'
-import { band, deploymentSignal } from './rows'
+import { band, deploymentSignal, rowFacts } from './rows'
 import type { Band, Group, ModelRow } from './rows'
 
 /** The list: fit-banded sections, one row per model.
@@ -205,6 +205,32 @@ function Row({
       {(row.verdict === 'wont_fit' || row.verdict === null) && row.reason ? (
         <div style={{ padding: '0 var(--s1) 8px' }}>
           <Verbatim text={row.reason} size="unit" />
+          {/* The refusal is about ONE set of weights -- the checkpoint as it
+              ships. Most refused models are published at several schemes, and
+              the ladder on the model's own page is the only place those are
+              sized repositories rather than a scheme name: `rowFacts` says
+              "would fit at q2_k" because `capacity._walk` is arithmetic and
+              never asks whether anybody built that. Enumerating the ladder
+              costs a hub search per model, which is what `MAX_CATALOG_MODELS`
+              exists to prevent, so it stays one click away and is announced
+              instead of run. */}
+          {row.verdict === 'wont_fit' ? (
+            <button
+              type="button"
+              className="unit"
+              onClick={() => onOpen(row)}
+              style={{
+                marginTop: 4,
+                padding: 0,
+                border: 0,
+                background: 'transparent',
+                textDecoration: 'underline',
+                cursor: 'pointer',
+              }}
+            >
+              See the quantizations published for this model
+            </button>
+          ) : null}
         </div>
       ) : null}
     </>
@@ -214,25 +240,10 @@ function Row({
 /** The descriptive half of the row. Assembled here rather than upstream so the
  *  list can still sort and band on the parts. */
 function Facts({ row }: { row: ModelRow }) {
-  const parts: string[] = []
-  if (row.detail) parts.push(row.detail)
-  if (row.requantized && row.dtype) parts.push(`requantized to ${row.dtype}`)
-  if (row.quantHint) parts.push(row.quantHint)
-  if (row.pipelineTag) parts.push(row.pipelineTag)
-  for (const d of row.deployments) if (d.runtime) parts.push(d.runtime)
-  // Who publishes it without serving it, and on what terms. The price is the
-  // whole of what switching it on costs, so it belongs on the row rather than
-  // only behind a click. Null prices print as "not priced", never as $0 -- the
-  // wire keeps "never published a price" and "free" apart on purpose.
-  for (const o of row.offers) {
-    parts.push(
-      o.input_cost_per_mtok != null && o.output_cost_per_mtok != null
-        ? `${o.display_name} · $${o.input_cost_per_mtok.toFixed(2)} / $${o.output_cost_per_mtok.toFixed(2)} per Mtok`
-        : `${o.display_name} · not priced`,
-    )
-  }
-  if (row.downloads != null) parts.push(`${row.downloads.toLocaleString()} downloads`)
-  if (row.likes != null && row.likes > 0) parts.push(`${row.likes.toLocaleString()} likes`)
+  // The strings come from `rows.ts::rowFacts`, which is pure and therefore
+  // reachable by `rows.check.mjs`. What stays here is what cannot be a string:
+  // the gated warning and the cache pill are styled spans.
+  const parts = rowFacts(row)
 
   return (
     <>

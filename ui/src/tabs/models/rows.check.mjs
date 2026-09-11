@@ -86,7 +86,25 @@ const reference = ordered.filter(v => !v.launchable)
 console.log(`\nLadder: ${ordered.length} variants -> ${servable.length} servable, ${reference.length} reference`)
 console.log(`  gateway ranks of the servable rows: ${servable.map(v => v.rank).join(', ')}`)
 check(servable.length > 0, 'at least one variant can actually be served')
-check(Math.min(...servable.map(v => v.rank)) > 5, 'the gateway does rank dead rows above live ones (the defect this partitions around)')
+// What this used to assert: `Math.min(servable ranks) > 5`, i.e. that the
+// gateway still ranks at least six unservable rows above the first servable
+// one. That is not an invariant, it is a snapshot -- of one hub listing, on one
+// box, at one set of fit verdicts -- and it failed the moment a KV-margin
+// change moved the big GGUFs between fit tiers. Worse, it was inverted: fixing
+// `capacity_api.py::_rank_key` to consider `launchable` would improve the
+// product and break this line, as a hard FAIL rather than a skip.
+//
+// The gateway behaviour is real and unchanged: `_rank_key` sorts on fit tier
+// then size and never consults `launchable`, so rows vLLM cannot load outrank
+// rows it can. What the partition owes is not that the defect persists -- it
+// is that the partition never becomes a SECOND ordering. That is what the two
+// checks below hold it to, and they hold whether the gateway is fixed or not.
+// The ranks themselves are printed as evidence, never gated on.
+{
+  const dead = reference.filter(v => v.rank < Math.min(...servable.map(v => v.rank))).length
+  console.log(`  ${dead} unservable row(s) outrank the first servable one` +
+              `${dead ? ' -- the gateway still ranks on fit before servability' : ''}`)
+}
 const ranks = servable.map(v => v.rank)
 check(ranks.every((r, i) => i === 0 || r > ranks[i - 1]), 'partitioning preserves the gateway rank order inside the group')
 const rec = ladder.recommended
@@ -158,10 +176,32 @@ check(blocked.every(v => v.static_reason),
   "a row blocked only by resident memory carries the gate's own sentence for the other side")
 
 // --- completeness
-const stub = 'Qwen/Qwen3-30B-A3B'
-check(cache.complete(stub, 21740302912) === false, 'a 2 MB metadata stub is not reported as a finished download')
-check(cache.complete('openai/gpt-oss-120b', 195_000_000_000) === true, 'a fully cached repo is')
-check(cache.complete(stub, null) === null, 'with no expected size, completeness is unknown rather than guessed')
+// The SUBJECT is chosen from the live cache, never named here. This block
+// used to hardcode `Qwen/Qwen3-30B-A3B` as a 2 MB metadata stub and
+// `openai/gpt-oss-120b` as a finished 195 GB download -- true on the machine
+// it was written on, and false the moment somebody pulls or deletes either.
+// Qwen3-30B-A3B is 57 GB on this box now, so the stub assertion had been
+// failing for who knows how long, which is how a gate stops being read.
+//
+// The behaviour under test is unchanged and is the whole point: far less than
+// expected is NOT complete, at-or-above expected IS, and no expectation is
+// unknown rather than a guess. None of those three facts needs a particular
+// repository to be in a particular state.
+const anyCached = cache.all()[0]
+if (!anyCached) {
+  console.log('  no repo is cached on any node: completeness has nothing to judge')
+} else {
+  const { repo_id, bytes } = anyCached
+  console.log(`  judging completeness against ${repo_id} (${bytes} bytes on disk)`)
+  check(cache.complete(repo_id, bytes * 1000) === false,
+    'a repo holding far less than expected is not a finished download')
+  check(cache.complete(repo_id, Math.floor(bytes / 2)) === true,
+    'a repo holding at least what was expected is')
+  check(cache.complete(repo_id, null) === null,
+    'with no expected size, completeness is unknown rather than guessed')
+  check(cache.complete('nobody/never-pulled-this', bytes) === false,
+    'a repo that is not on any node is not complete either')
+}
 
 // --- filter
 check(catRows.filter(r => R.matches(r, 'mxfp4')).length === 1, 'the filter reaches quantization text')
@@ -177,15 +217,24 @@ const row = (over) => ({
   checking: false, remoteOnly: false, unservedOnly: false, ...over,
 })
 console.log('\n--- support classification (from /api/models/quant-table) ---')
+// GGUF used to be marked unsupported here for being GGUF at all, with a
+// sentence citing the missing llama.cpp runtime. That stopped being true when
+// the `llamacpp` runtime landed -- exactly as the text-to-speech case below
+// stopped being true when `tts` did, and it is worth noticing that this file
+// has now recorded the same shape of change twice.
+//
+// Read off the live `/api/models/quant-table`, which is the point: nothing in
+// `support.ts` knows what a GGUF is any more, so this passes or fails on what
+// the SERVER's runtime table says. A coordinator running a build without the
+// runtime will fail this, and correctly -- it is describing that build.
 const gguf = S.classifySupport(row({ tags: ['gguf'], model_id: 'unsloth/Qwen3-30B-A3B-GGUF' }), table)
-check(gguf.status === 'unsupported' && /llama\.cpp/.test(gguf.reason), 'a GGUF repo is marked unsupported, citing the missing llama.cpp runtime')
-// The same row with a pullable provider configured. The status and the
-// llama.cpp sentence are unchanged -- nothing on this cluster launches the
-// format, which is what the red dot means -- and the route out is appended.
+check(gguf.status === 'ok', 'a GGUF repo is servable now that a runtime here loads the format')
+check(gguf.reason === null, 'and carries no refusal sentence, because there is nothing to refuse')
+// A provider route is still appended when there IS something to refuse. The
+// pullable flag must not invent a refusal on a scheme that is supported.
 const ggufPullable = S.classifySupport(row({ tags: ['gguf'], model_id: 'unsloth/Qwen3-30B-A3B-GGUF' }), table, true)
-check(ggufPullable.status === 'unsupported' && /llama\.cpp/.test(ggufPullable.reason), 'a GGUF repo stays unsupported when a provider could fetch it')
-check(ggufPullable.reason.startsWith(gguf.reason), 'the provider route is appended to the existing sentence, never a rewrite of it')
-check(/ollama runtime/.test(ggufPullable.reason), 'and it names where to go')
+check(ggufPullable.status === 'ok' && ggufPullable.reason === null,
+  'and a configured provider does not turn a servable scheme back into a refusal')
 check(S.classifySupport(row({ quantHint: 'gptq_int4' }), table).status === 'ok', 'a GPTQ-Int4 repo is not marked unsupported')
 check(S.classifySupport(row({ quantHint: 'bf16' }), table).status === 'ok', 'plain bf16 is not marked unsupported')
 // text-to-speech used to be marked here for being TTS at all. That stopped
@@ -206,11 +255,23 @@ check(S.classifySupport(row({ pipelineTag: 'text-generation' }), table).status !
 check(S.classifySupport(row({}), null).status === 'unknown', 'with no quant table, support is unknown rather than assumed fine')
 
 console.log('\n--- an empty cache directory is not a cached model ---')
-const raw = storage.nodes.flatMap((n) => (n.models?.repos ?? []))
+// PER NODE, and that is the whole correction. This flattened `repos` across
+// nodes and then asserted that a repo empty on ANY node was on NO node --
+// which is wrong for exactly the repos that are an empty directory on one
+// machine and fully cached on another. Measured here when it was found:
+// 18 entries hold no files, and the only three that failed were the three
+// that also exist on the other Spark (openai/gpt-oss-20b: 0 blobs on 4d38,
+// 11 on 26af). The product was right and the check was wrong, which is the
+// expensive direction -- it invites someone to "fix" working code.
+//
+// Line ~430 below already does the per-node form; this is the same shape.
+const raw = storage.nodes.flatMap((n) =>
+  (n.models?.repos ?? []).map((r) => ({ ...r, nodeId: n.node_id })))
 const empty = raw.filter((r) => r.blob_count === 0)
-console.log(`  ${empty.length} of ${raw.length} cache entries hold no files: ${empty.map((r) => r.repo_id).join(', ') || 'none'}`)
+console.log(`  ${empty.length} of ${raw.length} cache entries hold no files`)
 for (const r of empty) {
-  check(cache.nodes(r.repo_id).length === 0, `${r.repo_id} is not reported as on device`)
+  check(!cache.nodes(r.repo_id).includes(r.nodeId),
+    `${r.repo_id} is not reported as on device at ${r.nodeId}`)
 }
 check(R.onDeviceRows(cache).length === new Set(raw.filter((r) => r.blob_count > 0).map((r) => r.repo_id)).size,
   'every repo that holds files becomes exactly one row')
@@ -261,8 +322,25 @@ const invented = merged.filter(r => r.verdict === null && (
 check(invented.length === 0, 'no row without a verdict carries an invented number')
 
 // A hub hit the walk never resolved has no answer, and says so.
-const unresolvedHub = merged.filter(r => r.where.includes('hub') && !answered.has(r.model_id))
-check(unresolvedHub.every(r => R.band(r) === 'unchecked' && r.verdict === null),
+// A hub hit that is ALSO being served is not unanswered -- `band()` returns
+// 'running' first, on the stated rule that "reality outranks a prediction",
+// and filing a model that is answering requests under anything else would be
+// false. Caught by this check flagging Qwen/Qwen3-0.6B as
+// `band=running where=running+ondisk+hub`: the product was right and the
+// assertion had simply never met a model that was both.
+const unresolvedHub = merged.filter(r =>
+  r.where.includes('hub') &&
+  !answered.has(r.model_id) &&
+  !r.deployments.some(d => !['stopped', 'failed'].includes(d.state)))
+const misbanded = unresolvedHub.filter(r => R.band(r) !== 'unchecked' || r.verdict !== null)
+if (misbanded.length) {
+  // A bare FAIL here is unactionable -- the whole question is WHICH row and
+  // what it carries instead.
+  for (const r of misbanded.slice(0, 5)) {
+    console.log(`    misbanded: ${r.model_id} band=${R.band(r)} verdict=${JSON.stringify(r.verdict)} where=${r.where.join('+')}`)
+  }
+}
+check(misbanded.length === 0,
   'a hub hit the capacity walk never resolved bands as unchecked')
 
 // Banding is total, and every heading is a real one now that `plain` is gone.
@@ -380,6 +458,45 @@ check(R.deploymentSignal('launching') === 'warn', 'launching is warn')
     { deployment_id: 'd1', model_id: 'x/y', served_name: 'y', state: 'stopped', runtime: 'vllm', node_ids: [] },
   ] })])
   check(R.band(stoppedOnly[0]) !== 'running', 'a finished deployment does not claim the running band')
+  check(!R.rowFacts(stoppedOnly[0]).includes('vllm'),
+        'and it contributes no runtime label, because nothing is running')
+}
+
+console.log('\n--- the row subtitle: distinct live runtimes, never one per record ---')
+{
+  // The defect, at the scale it actually reached on this box: a crash-looping
+  // model accumulated 200 FAILED records and the subtitle printed "vllm" two
+  // hundred times. The server keeps terminal deployments on purpose, so the
+  // row has to collapse them rather than the store dropping them.
+  const dep = (i, state) => ({
+    deployment_id: `d${i}`, model_id: 'x/y', served_name: 'y',
+    state, runtime: 'vllm', node_ids: [],
+  })
+  const crashLooped = R.mergeRows([R.runningRows({
+    deployments: Array.from({ length: 200 }, (_, i) => dep(i, 'failed')),
+  })])
+  const facts = R.rowFacts(crashLooped[0])
+  console.log(`  200 failed records -> ${facts.filter((f) => f === 'vllm').length} runtime labels`)
+  check(facts.filter((f) => f === 'vllm').length === 0,
+        '200 finished deployments contribute no runtime labels at all')
+
+  // One live one says it once, however many records sit behind it.
+  const busy = R.mergeRows([R.runningRows({
+    deployments: [...Array.from({ length: 200 }, (_, i) => dep(i, 'failed')), dep(200, 'ready')],
+  })])
+  const busyFacts = R.rowFacts(busy[0])
+  check(busyFacts.filter((f) => f === 'vllm').length === 1,
+        'a live deployment among two hundred dead ones names its runtime exactly once')
+
+  // Distinct, not counted: two runtimes really running are two labels.
+  const mixed = R.mergeRows([R.runningRows({ deployments: [
+    { deployment_id: 'a', model_id: 'x/y', served_name: 'y', state: 'ready', runtime: 'vllm', node_ids: [] },
+    { deployment_id: 'b', model_id: 'x/y', served_name: 'y2', state: 'ready', runtime: 'sglang', node_ids: [] },
+    { deployment_id: 'c', model_id: 'x/y', served_name: 'y3', state: 'ready', runtime: 'vllm', node_ids: [] },
+  ] })])
+  const names = R.rowFacts(mixed[0]).filter((f) => f === 'vllm' || f === 'sglang')
+  check(names.length === 2 && names.includes('vllm') && names.includes('sglang'),
+        'two distinct runtimes are two labels, deduped but not collapsed to a count')
 }
 
 console.log('\n--- the machine board: what you need in order to choose ---')
@@ -504,9 +621,27 @@ const EDGE = (src, dst, gbps) => gbps == null
   ? { src, dst, measured: false, stale: false }
   : { src, dst, measured: true, stale: false, all_reduce_gbps: gbps, sendrecv_gbps: gbps }
 const NOCACHE = { nodes: () => [], bytes: () => null, complete: () => null, all: () => [] }
+// `runtime` is explicit here and has no default in `buildBoard`, deliberately:
+// which machines can carry a rank now DEPENDS on it, and a helper that quietly
+// supplied one would test the GPU answer while claiming to test the board.
 const synth = (nodes, edges, chosen, extra = {}) => B.buildBoard({
   nodes, edges, memory: [], deployments: [], cache: NOCACHE, repoId: 'x/y',
-  plannerChose: null, placement: null, chosen, ...extra,
+  plannerChose: null, placement: null, chosen, runtime: 'vllm', ...extra,
+})
+
+// A machine with no GPU: what `registry/probe.py::_probe_cpu` actually writes
+// -- every memory field 0, no gpu_name, device_class 'cpu'. Not NODE(id, 0),
+// which is a GB10 whose probe came back empty and is a different machine with
+// a different remedy.
+const CPU_NODE = (id) => ({
+  profile: {
+    node_id: id, hostname: id, address: '10.0.0.9', device_class: 'cpu',
+    gpu_name: '', gpu_count: 0, total_memory: 0, addressable_memory: 0,
+    memory_bandwidth_gbps: 0, compute_capability: '', driver_version: '',
+  },
+  healthy: true, state: 'healthy', role: 'worker', last_seen: 0,
+  memory_used: 0, memory_total: 8 * 1024 ** 3,
+  power_watts: null, temperature_c: null, utilization_pct: null,
 })
 
 const three = [NODE('a'), NODE('b'), NODE('c')]
@@ -563,6 +698,33 @@ check(JSON.stringify(withDud.effective) === JSON.stringify(['a']),
   'a machine that cannot carry a rank is dropped from the effective set')
 check(withDud.selectableCount === 3, 'and is not counted among those that can')
 
+// The board answers per RUNTIME, because there are two kinds of serving node
+// now. This is the assertion that breaks first if `board.ts` and
+// `deploy/flags.py::placement_refusal` ever stop agreeing, and the two have to
+// agree exactly: the tick is withheld here precisely so nobody is offered a
+// selection the launch would refuse with 400 `node_has_no_memory`.
+const mixed = [NODE('spark'), CPU_NODE('pi')]
+const onGpu = synth(mixed, [], null)
+const onCpu = synth(mixed, [], null, { runtime: 'llamacpp' })
+const rowOf = (board, id) => board.rows.find((r) => r.nodeId === id)
+
+check(rowOf(onGpu, 'spark').selectable === true && rowOf(onGpu, 'pi').selectable === false,
+  'under vllm the Spark can carry a rank and the Pi cannot')
+check(rowOf(onCpu, 'pi').selectable === true && rowOf(onCpu, 'spark').selectable === false,
+  'under llamacpp it is exactly the other way round')
+check(onGpu.selectableCount === 1 && onCpu.selectableCount === 1,
+  'and the count follows the runtime rather than the hardware alone')
+
+// Each refusal names the remedy that exists, which is the half a shared
+// sentence could not do. "It cannot carry a rank" was true and useless: under
+// llamacpp the Pi is the ONLY machine that can.
+check(/pick llamacpp/i.test(rowOf(onGpu, 'pi').unselectableReason ?? ''),
+  'a GPU runtime on a GPU-less machine points at the runtime that runs there')
+check(/vllm|sglang/i.test(rowOf(onCpu, 'spark').unselectableReason ?? ''),
+  'and a CPU runtime on a machine with a GPU points back the other way')
+check(rowOf(onCpu, 'pi').unselectableReason === null,
+  'a machine that CAN carry the rank carries no refusal at all')
+
 // One node runs one copy of a model. `DeploymentManager._find_conflict`
 // refuses a second copy on a node already running the model and the gateway
 // answers 409 already_deployed, so the tick has to be withheld here rather
@@ -614,17 +776,41 @@ check(mirrored.owned === false, 'and still reads as the planner\'s choice, not y
 check(mirrored.rows.filter((r) => r.inPlan).length === 2, 'the planner\'s machines are badged')
 
 console.log('\n--- support reads the native dtype, never the fit gate\'s step-down ---')
-const qwen = catRows.find((r) => r.model_id === 'Qwen/Qwen3-30B-A3B')
-if (qwen) {
+// The subject is any row the gate ACTUALLY stepped down, found at run time.
+// This used to name Qwen/Qwen3-30B-A3B, which only demonstrates the bug while
+// the gate is stepping that particular model down -- and it is not any more
+// (native=bf16 suggested=bf16 requantized=false on this box), so the
+// demonstration had quietly lost its subject and the check just failed.
+// A regression test with no subject must say so, not fail.
+const qwen = catRows.find((r) => r.requantized && r.nativeDtype && r.dtype !== r.nativeDtype)
+if (!qwen) {
+  console.log('  no catalogue row is requantized right now: nothing steps down to classify from')
+} else {
   console.log(`  ${qwen.model_id}: native=${qwen.nativeDtype} suggested=${qwen.dtype} requantized=${qwen.requantized}`)
-  check(qwen.nativeDtype === 'bf16', 'the native dtype is carried through the join')
+  check(!!qwen.nativeDtype, 'the native dtype is carried through the join')
   const v = S.classifySupport(qwen, table)
   check(v.status !== 'unsupported',
-    'a bf16 repo the gate would step down to a GGUF quant is NOT marked unsupported')
+    'a repo the gate would step down to another quant is NOT marked unsupported')
   // The regression itself: classifying from the suggestion produced this.
+  //
+  // Only demonstrable while the dtype the gate steps DOWN to is one no runtime
+  // loads, and that is now a property of the runtime table rather than a
+  // constant. The subject found above steps down to q8_0, which every build
+  // marked unsupported until `llamacpp` arrived and made the whole GGUF ladder
+  // servable -- so on this build the step-down classifies as `ok` and the bug
+  // cannot be reproduced through it.
+  //
+  // Reported rather than failed, by the same rule the comment above states for
+  // a missing subject: the property being guarded (support reads the NATIVE
+  // dtype) is asserted by the check above it and still holds. What is absent
+  // is the counter-example, and a verifier that fails because a refusal got
+  // better is one nobody will trust the next time it goes red.
   const fromSuggestion = S.classifySupport({ ...qwen, nativeDtype: null, quantHint: qwen.dtype }, table)
-  check(fromSuggestion.status === 'unsupported',
-    'and classifying from the step-down would have marked it — which is the bug')
+  if (fromSuggestion.status === 'unsupported') {
+    check(true, 'and classifying from the step-down would have marked it — which is the bug')
+  } else {
+    console.log(`  ${qwen.dtype} is servable on this build, so the step-down no longer misclassifies: the counter-example has no subject`)
+  }
 }
 
 console.log('\n--- the un-served catalogue, the sixth source ---')

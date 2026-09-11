@@ -102,9 +102,16 @@ export function BandSweep({ band }: { band: ClusterBand }) {
 export function BandLaunchLayer({
   bands,
   deployments,
+  dragging = null,
 }: {
   bands: ClusterBand[]
   deployments: DeploymentDTO[]
+  /** The band mid-drag, if any. Its stepper is skipped rather than left
+   *  standing at the pick-up point: this layer draws from the band's laid-out
+   *  position and is outside the drag ghost's transform, so while the band
+   *  rect follows the pointer its phase rows would stay behind. The drop
+   *  re-lays everything out and the stepper comes back where the band went. */
+  dragging?: string | null
 }) {
   const activity = useActivity()
   const [now, setNow] = useState(() => Date.now() / 1000)
@@ -112,7 +119,7 @@ export function BandLaunchLayer({
   // A second, because the clock under the steps counts in seconds. Only while
   // something is actually arriving: a floor with nothing loading on it does
   // not get a timer at all.
-  const loading = bands.filter((b) => b.loading)
+  const loading = bands.filter((b) => b.loading && b.id !== dragging)
   const any = loading.length > 0
   useEffect(() => {
     if (!any) return

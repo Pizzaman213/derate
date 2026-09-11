@@ -1,10 +1,11 @@
 import { SPEECH_FORMATS, type SpeechFormat, type VoiceLibrary } from '../../api/types'
+import { Select, type SelectOption } from '../../components/Select'
 import { Verbatim, VerbatimList } from '../../components/Verbatim'
 
 /** The value of the "no voice" option.
  *
  *  Empty string rather than a sentinel word, because it is what an unset
- *  `<select>` carries anyway and because the field it maps to is *absent*
+ *  dropdown carries anyway and because the field it maps to is *absent*
  *  from the request body, not set to something. Naming no voice is a real
  *  request: the model speaks in its own. */
 export const OWN_VOICE = ''
@@ -29,7 +30,7 @@ interface Props {
   format: SpeechFormat
   onVoice: (v: string) => void
   onFormat: (f: SpeechFormat) => void
-  /** Namespaces the `<select id=…>` pair against the rest of the composer. */
+  /** Namespaces the voice/format dropdown pair against the rest of the composer. */
   idPrefix: string
 }
 
@@ -49,44 +50,40 @@ export function VoiceFields({
   idPrefix,
 }: Props) {
   const voices = library?.voices ?? []
+  // First and default. A cloned voice needs a reference clip AND that clip's
+  // exact transcript installed on the node; the model's own voice needs
+  // nothing, so it is the option that always works.
+  const voiceOptions: SelectOption<string>[] = [
+    { value: OWN_VOICE, label: 'the model’s own voice' },
+    ...voices.map((v) => ({ value: v, label: v })),
+  ]
+  const formatOptions: SelectOption<SpeechFormat>[] = SPEECH_FORMATS.map((f) => ({
+    value: f,
+    label: f,
+  }))
   return (
     <>
       <div className="speechrow">
         <div className="fld">
           <label htmlFor={`${idPrefix}-voice`}>Voice</label>
-          <select
+          <Select
             id={`${idPrefix}-voice`}
             value={resolveVoice(voice, library)}
             disabled={disabled}
-            onChange={(e) => onVoice(e.target.value)}
-          >
-            {/* First and default. A cloned voice needs a reference clip AND
-                that clip's exact transcript installed on the node; the model's
-                own voice needs nothing, so it is the option that always
-                works. */}
-            <option value={OWN_VOICE}>the model&rsquo;s own voice</option>
-            {voices.map((v) => (
-              <option key={v} value={v}>
-                {v}
-              </option>
-            ))}
-          </select>
+            options={voiceOptions}
+            onChange={onVoice}
+          />
         </div>
 
         <div className="fld">
           <label htmlFor={`${idPrefix}-format`}>Format</label>
-          <select
+          <Select
             id={`${idPrefix}-format`}
             value={format}
             disabled={disabled}
-            onChange={(e) => onFormat(e.target.value as SpeechFormat)}
-          >
-            {SPEECH_FORMATS.map((f) => (
-              <option key={f} value={f}>
-                {f}
-              </option>
-            ))}
-          </select>
+            options={formatOptions}
+            onChange={onFormat}
+          />
         </div>
 
         <span style={{ flex: 1 }} />

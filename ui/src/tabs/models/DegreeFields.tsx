@@ -1,6 +1,8 @@
 import type { ParallelismPlan, ParallelismRequest } from '../../api/types'
 import { planShortFromDegrees } from '../../format'
 
+type Axis = 'tensor_parallel' | 'pipeline_parallel' | 'expert_parallel'
+
 interface Props {
   /** null means "the planner picks", and sends no `parallelism`. */
   degrees: ParallelismRequest | null
@@ -8,7 +10,11 @@ interface Props {
   /** The degrees currently in force, whoever chose them. Shown as placeholder
    *  text while `degrees` is null, so an untouched field displays the planner's
    *  answer in muted type -- visibly present, visibly not yours. */
-  effective: { tensor_parallel: number; pipeline_parallel: number } | null
+  effective: {
+    tensor_parallel: number
+    pipeline_parallel: number
+    expert_parallel: number
+  } | null
   /** The planner's own pick. Rendered as a caption only when it differs from
    *  what will launch. */
   recommended: ParallelismPlan | null
@@ -21,13 +27,21 @@ interface Props {
   idPrefix?: string
 }
 
-/** TP and PP, owned as a set.
+/** TP, PP and EP, owned as a set.
  *
  *  Per-axis handback reads well and encodes badly: with `parallelism` sent as
  *  an object, an omitted key means 1, so "TP mine, PP the planner's" cannot be
  *  expressed on the wire at all. Rather than invent a second meaning for an
  *  empty field, the whole object is adopted on the first edit and handed back
  *  by one Reset -- the same first-touch-adopts gesture the machine picker uses.
+ *
+ *  There is no DP field and that is not an omission. vLLM builds no rank group
+ *  for expert parallel -- its size IS `dp * tp` -- so a DP box would have
+ *  exactly one legal value given EP and no meaning without it;
+ *  `state/placement.ts` pairs them on the way out. EP is here at all because
+ *  the planner cannot pick it on this class of hardware (`EP_VIABLE_THRESHOLD`
+ *  is 40 GB/s and a Spark tops out at 23.15) and without a field there was no
+ *  way to ask for it short of writing the request body by hand.
  *
  *  Nothing here checks legality. Head divisibility, layer counts and the
  *  bandwidth thresholds are the planner's arithmetic, and a second copy in the
@@ -43,10 +57,11 @@ export function DegreeFields({
   overruled,
   idPrefix = 'sp',
 }: Props) {
-  const adopt = (axis: 'tensor_parallel' | 'pipeline_parallel', raw: string) => {
+  const adopt = (axis: Axis, raw: string) => {
     const base: ParallelismRequest = degrees ?? {
       tensor_parallel: effective?.tensor_parallel ?? 1,
       pipeline_parallel: effective?.pipeline_parallel ?? 1,
+      expert_parallel: effective?.expert_parallel ?? 1,
     }
     if (raw.trim() === '') return
     const n = Number(raw)
@@ -56,11 +71,7 @@ export function DegreeFields({
     onChange({ ...base, [axis]: Math.round(n) })
   }
 
-  const field = (
-    axis: 'tensor_parallel' | 'pipeline_parallel',
-    id: string,
-    text: string,
-  ) => (
+  const field = (axis: Axis, id: string, text: string) => (
     <div className="fld" style={{ width: 58 }}>
       <label htmlFor={id}>{text}</label>
       <input
@@ -79,6 +90,7 @@ export function DegreeFields({
     <>
       {field('tensor_parallel', `${idPrefix}-tp`, 'TP')}
       {field('pipeline_parallel', `${idPrefix}-pp`, 'PP')}
+      {field('expert_parallel', `${idPrefix}-ep`, 'EP')}
       {degrees ? (
         <div className="fld">
           {/* Occupies the label row so the control lines up with the fields. */}

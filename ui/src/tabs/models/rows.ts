@@ -780,6 +780,61 @@ export function bandSubtitle(group: Group): string | null {
   return `from ${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
 }
 
+/** The descriptive half of a catalogue row, in order, as plain strings.
+ *
+ *  Out here rather than inside `CatalogList.tsx` for the reason `ladder.ts`
+ *  and `speculative.ts` are: `rows.check.mjs` bundles with esbuild's
+ *  `platform: 'neutral'` and cannot import a module that pulls in React, so a
+ *  decision left in the component is a decision nothing can check. This one
+ *  went unchecked and was wrong -- see the runtime clause below.
+ *
+ *  Strings only. `gated` and the cache pill stay in the component because they
+ *  are styled spans, not facts. */
+export function rowFacts(row: ModelRow): string[] {
+  const parts: string[] = []
+  if (row.detail) parts.push(row.detail)
+  // ARITHMETIC, not an offer. `capacity._walk` steps down
+  // `QUANT_SUGGESTION_ORDER` and answers which scheme WOULD hold -- it never
+  // asks whether anybody published the model at that scheme, so "requantized
+  // to q2_k" can name a build that does not exist. The real offer is the
+  // variant ladder on the model's own page, where every row is a repository
+  // that was sized; `CatalogList` links there. So this says what it is.
+  if (row.requantized && row.dtype) parts.push(`would fit at ${row.dtype}`)
+  if (row.quantHint) parts.push(row.quantHint)
+  if (row.pipelineTag) parts.push(row.pipelineTag)
+  // One label per RUNNING runtime, distinct -- never one per deployment
+  // record. The server keeps terminal deployments deliberately (a FAILED one
+  // is still the answer to "what happened to this model"), so a crash-looping
+  // model carries hundreds of them: `gpt-oss-20b` reached 200 and printed
+  // "vllm" two hundred times into one subtitle. Distinct, and live, because a
+  // row with nothing running should say nothing here -- it still bands by its
+  // verdict and still says what went wrong. Named rather than counted, the
+  // same rule `bandSubtitle` above states.
+  for (const runtime of [
+    ...new Set(
+      row.deployments
+        .filter((d) => !TERMINAL.has(d.state))
+        .map((d) => d.runtime)
+        .filter(Boolean),
+    ),
+  ].sort())
+    parts.push(runtime)
+  // Who publishes it without serving it, and on what terms. The price is the
+  // whole of what switching it on costs, so it belongs on the row rather than
+  // only behind a click. Null prices print as "not priced", never as $0 -- the
+  // wire keeps "never published a price" and "free" apart on purpose.
+  for (const o of row.offers) {
+    parts.push(
+      o.input_cost_per_mtok != null && o.output_cost_per_mtok != null
+        ? `${o.display_name} · $${o.input_cost_per_mtok.toFixed(2)} / $${o.output_cost_per_mtok.toFixed(2)} per Mtok`
+        : `${o.display_name} · not priced`,
+    )
+  }
+  if (row.downloads != null) parts.push(`${row.downloads.toLocaleString()} downloads`)
+  if (row.likes != null && row.likes > 0) parts.push(`${row.likes.toLocaleString()} likes`)
+  return parts
+}
+
 export type Sort = 'fit' | 'size' | 'downloads' | 'name'
 
 export const SORTS: { id: Sort; label: string }[] = [

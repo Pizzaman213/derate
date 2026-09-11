@@ -285,6 +285,17 @@ h3 {
   padding: 5px 8px;
 }
 
+/* Why the runtime picker above is on the value it is on, when this screen
+ * chose that value rather than the reader. A `.fld` is a column, so this sits
+ * directly under the control it explains; bounded so a sentence cannot stretch
+ * the toolbar it lives in, and `text-wrap: balance` because two ragged lines
+ * under a narrow control read worse than two even ones. */
+.sp-runtime-note {
+  margin: 4px 0 0;
+  max-width: 34ch;
+  text-wrap: balance;
+}
+
 .big {
   font-family: 'IBM Plex Mono', monospace;
   font-variant-numeric: tabular-nums;
@@ -1200,6 +1211,213 @@ svg text.m {
   min-height: 62px;
 }
 
+/* A turn's rendered markdown. Spacing between blocks, not inside one -- the
+   textarea used to be `white-space: pre-wrap` on a single `<p>`, and the
+   nearest thing to that feel with real block elements is each block owning
+   only the gap above it. */
+.mdbody > :first-child {
+  margin-top: 0;
+}
+.mdbody p,
+.mdbody ul,
+.mdbody ol,
+.mdbody blockquote {
+  margin: var(--s-2) 0 0;
+}
+.mdbody ul,
+.mdbody ol {
+  padding-left: var(--s-4);
+}
+.mdbody blockquote {
+  padding-left: var(--s-3);
+  border-left: 2px solid var(--rule-strong);
+  color: var(--ink-muted);
+}
+.mdbody code {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.92em;
+  background: var(--panel-sunk);
+  border-radius: 2px;
+  padding: 0 3px;
+}
+.mdbody a {
+  color: inherit;
+}
+
+.codeblock {
+  margin: var(--s-2) 0 0;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.codeblockhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-2);
+  background: var(--panel-sunk);
+  border-bottom: 1px solid var(--rule);
+}
+.codeblockhead button {
+  padding: 2px 8px;
+}
+.codeblock pre {
+  margin: 0;
+  padding: var(--s-2);
+  overflow-x: auto;
+}
+.codeblock code {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: var(--size-unit);
+  background: none;
+  padding: 0;
+}
+
+/* A model's reasoning, closed by default -- see chat/README.md. `summary`
+   uses `.unit`'s own muted colour rather than a new one: this is chrome
+   about the answer, not part of it. */
+.reasoning {
+  margin: 0 0 var(--s-2);
+}
+.reasoning summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+}
+.reasoning .mdbody {
+  margin-top: var(--s-1);
+  padding-left: var(--s-3);
+  border-left: 2px solid var(--rule);
+  color: var(--ink-muted);
+}
+
+.turnimages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-bottom: var(--s-2);
+}
+.turnimages img {
+  max-width: 160px;
+  max-height: 160px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  object-fit: cover;
+}
+
+.turnedit {
+  display: grid;
+  gap: var(--s-2);
+  margin-top: var(--s-1);
+}
+.turnedit textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: var(--s-half) var(--s1);
+  resize: vertical;
+}
+
+/* Always visible rather than hover-revealed: nothing else interactive in this
+   product hides behind a hover, and an invisible-until-hovered control is a
+   worse keyboard experience than a small, muted, always-there one. */
+.turnactions {
+  display: flex;
+  gap: var(--s-3);
+  margin-top: var(--s-2);
+}
+.turnaction {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--ink-muted);
+  font-size: var(--size-unit);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.turnaction:disabled {
+  color: var(--rule-strong);
+  text-decoration: none;
+}
+
+/* Request params: closed by default, same reasoning as `.reasoning` above --
+   this is the exception, not the thing every send needs set. */
+.reqparams {
+  margin-bottom: var(--s-1);
+}
+.reqparams summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+}
+.reqparamsgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--s-2) var(--s-3);
+  margin-top: var(--s-2);
+}
+.reqparamsgrid label {
+  display: grid;
+  gap: 3px;
+}
+.reqparamsgrid textarea,
+.reqparamsgrid input {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  resize: vertical;
+}
+
+.attachrow {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+}
+.filepick {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+}
+.filepick input[type='file'] {
+  font: inherit;
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+}
+.attachchips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+.attachchip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+  background: var(--panel-sunk);
+  border-radius: var(--radius);
+  padding: 2px var(--s-1) 2px 2px;
+}
+.attachchip img {
+  width: 22px;
+  height: 22px;
+  object-fit: cover;
+  border-radius: 2px;
+}
+.attachchip button {
+  border: none;
+  background: none;
+  padding: 0 2px;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+}
+
 /* Chat's composer, for a speech or transcription model: two fields above the
    textarea (voice+format, or file+language), and the clip readout below a
    speech reply. Reuses `.chat`'s grid, `.chatpane`, `.chatbody`, `.chathead`,
@@ -1300,6 +1518,79 @@ svg text.m {
   border-top: 1px solid var(--rule);
   margin-top: 6px;
   padding-top: 6px;
+}
+
+/* Select.tsx and Combobox.tsx: the one on-brand look every pick-a-value
+   control in the app renders through now, replacing the bare `select`/
+   `input list` chrome. Not `.pop`/`.popwrap` -- those assume a fixed 260px
+   toolbar context and checkbox rows; `.ddpanel` sizes to the trigger's own
+   width instead, because the sidebar's own column can be narrower than that
+   fixed minimum, and its rows are single-select options, not machine ticks. */
+.ddwrap {
+  position: relative;
+}
+.ddtrigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  height: var(--control-h);
+  width: 100%;
+  padding: 0 var(--s-2);
+  text-align: left;
+  background: var(--panel);
+}
+.ddchevron {
+  color: var(--ink-muted);
+  font-size: 10px;
+  flex: none;
+}
+.ddpanel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 5;
+  min-width: 100%;
+  width: max-content;
+  max-width: min(420px, 90vw);
+  /* `main` and `aside` are both overflow:hidden, so an unbounded panel would
+     clip at the bottom of the viewport rather than scrolling -- same reason
+     `.pop` is capped. */
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel-raised);
+  border: 1px solid var(--rule);
+  box-shadow: var(--shadow-raised);
+  padding: 4px;
+}
+.ddpanel .ddopt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ddpanel .ddopt:hover,
+.ddpanel .ddopt.active {
+  background: var(--hover);
+}
+.ddpanel .ddopt[aria-selected='true'] {
+  font-weight: 500;
+}
+.ddpanel .ddopt.off {
+  cursor: default;
+  color: var(--ink-muted);
+}
+.ddpanel .ddfoot {
+  border-top: 1px solid var(--rule);
+  margin-top: 4px;
+  padding: 6px 8px 2px;
+  color: var(--ink-muted);
+  font-size: var(--size-unit);
 }
 
 /* ── Model cards ────────────────────────────────────────────────────────────
@@ -1557,7 +1848,8 @@ svg text.m {
   padding: 2px 7px;
   color: var(--ink-muted);
 }
-.mbar select {
+.mbar select,
+.mbar .ddtrigger {
   height: 34px;
   border-radius: var(--radius);
   padding: 0 var(--s-2);
@@ -1759,4 +2051,46 @@ svg text.m {
 .termbody {
   height: 340px;
   padding: 6px 8px;
+}
+
+/* A publisher's mark at list size -- the head rows in the Serve panel's
+   speculative field. Same square tile and hairline as `.mcard-avatar`, scaled
+   to sit on a text baseline rather than to anchor a card. Drawn by
+   `OwnerMark variant="inline"`. */
+.omark {
+  position: relative;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: 0;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* Nudged down so an 18px block sits on the baseline of the mono text it
+     labels, rather than riding above it. */
+  vertical-align: -4px;
+  box-shadow: inset 0 0 0 1px var(--rule);
+}
+.omark img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.omark-initials {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  /* The tile is the accent at full strength, so the monogram is the light side
+     of the pair whichever hue landed here. Same rule as `.mcard-initials`. */
+  color: rgb(255 255 255 / 0.94);
+}
+/* The column, kept, for a row whose subject has no publisher -- ngram, which
+   is a mechanism rather than a repository. Not a tile: no accent and no
+   hairline, because there is nothing here to identify. */
+.omark-empty {
+  background: none !important;
+  box-shadow: none;
 }

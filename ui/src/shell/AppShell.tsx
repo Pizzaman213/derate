@@ -34,41 +34,41 @@ export type { Dest }
  *  narrower than the list feeding it. */
 const WIDE: ReadonlySet<Dest> = new Set<Dest>(['models'])
 
-/** Send a coordinator that nobody has set up to the setup screen, once.
+/** Send a coordinator that nobody has set up to the setup screen -- every time
+ *  the destination changes, not just once, and regardless of where the user
+ *  started. A typed URL, a bookmark or Back is not permission to skip setup;
+ *  only finishing the wizard (or already having a deployment or provider) is.
+ *  `replace` rather than a push, so Back does not land on the screen they
+ *  were bounced out of.
  *
- *  Only from the default landing destination, and only on the first answer. A
- *  person who has typed a URL, followed a link or clicked a tab has said where
- *  they want to be, and yanking them out of it because a fetch came back late
- *  is worse than never offering setup at all. `replace` rather than a push, so
- *  Back does not land on the dashboard they never saw.
+ *  Latches once /api/setup reports complete: setup cannot become incomplete
+ *  again mid-session, so there is no reason to keep asking.
  *
- *  A failed request does nothing. The dashboard on a fresh install is a thin
- *  screen, but it is a working one, and a coordinator that cannot answer
- *  /api/setup has a bigger problem than onboarding. */
+ *  A failed request does nothing, same as before -- a coordinator that
+ *  cannot answer /api/setup has a bigger problem than onboarding. */
 function useFirstRunRedirect(dest: Dest) {
   const { backend } = useBackend()
   const { navigate } = useRouter()
-  const asked = useRef(false)
-  // Read through a ref so the effect does not re-run when the destination
-  // changes -- it must fire once, against wherever the person started.
-  const startedAt = useRef(dest)
+  const completed = useRef(false)
 
   useEffect(() => {
-    if (asked.current) return
-    asked.current = true
+    if (completed.current || dest === 'setup') return
     let live = true
     backend
       .setup()
       .then((status) => {
-        if (!live || status.completed) return
-        if (startedAt.current !== 'dash') return
+        if (!live) return
+        if (status.completed) {
+          completed.current = true
+          return
+        }
         navigate({ dest: 'setup' }, { replace: true })
       })
       .catch(() => {})
     return () => {
       live = false
     }
-  }, [backend, navigate])
+  }, [backend, navigate, dest])
 }
 
 export function AppShell() {

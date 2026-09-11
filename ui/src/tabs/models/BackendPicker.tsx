@@ -15,6 +15,7 @@
 import { useEffect, useState } from 'react'
 
 import type { ProviderBackendOption } from '../../api/types'
+import { Select, type SelectOption } from '../../components/Select'
 import { useBackend } from '../../state/backend'
 
 export function BackendPicker({
@@ -79,6 +80,17 @@ export function BackendPicker({
 
   const current = pending ?? rows.find((r) => r.pinned)?.tag ?? ''
 
+  const options: SelectOption<string>[] = [
+    { value: '', label: 'Automatic' },
+    ...rows.map((r) => ({
+      value: r.tag,
+      label:
+        r.input_cost_per_mtok != null && r.output_cost_per_mtok != null
+          ? `${r.provider_name} — $${r.input_cost_per_mtok.toFixed(2)} / $${r.output_cost_per_mtok.toFixed(2)} per Mtok`
+          : r.provider_name,
+    })),
+  ]
+
   const setPin = async (tag: string) => {
     setPending(tag)
     setBusy(true)
@@ -105,22 +117,13 @@ export function BackendPicker({
         OpenRouter can answer {upstreamId} from any of these hosts and picks one itself unless
         pinned here.
       </div>
-      <select
+      <Select
         value={current}
         disabled={busy}
-        onChange={(e) => void setPin(e.target.value)}
+        options={options}
+        onChange={(tag) => void setPin(tag)}
         aria-label={`Backend host for ${upstreamId}`}
-      >
-        <option value="">Automatic</option>
-        {rows.map((r) => (
-          <option key={r.tag} value={r.tag}>
-            {r.provider_name}
-            {r.input_cost_per_mtok != null && r.output_cost_per_mtok != null
-              ? ` — $${r.input_cost_per_mtok.toFixed(2)} / $${r.output_cost_per_mtok.toFixed(2)} per Mtok`
-              : ''}
-          </option>
-        ))}
-      </select>
+      />
       {error ? (
         <div className="label" style={{ fontWeight: 400, color: 'var(--warn)', whiteSpace: 'pre-wrap' }}>
           {error}

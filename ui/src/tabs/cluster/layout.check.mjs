@@ -237,16 +237,35 @@ for (let n = 1; n <= 14; n++) {
   // Nothing may be authored below 9 units, which is 12 rendered -- the floor
   // the rest of the panel keeps. Geometry that carries type is checked here;
   // the sizes themselves live in the renderer.
-  ok(a.card.h >= 38 && a.card.w >= 78, `n=${n} plate is at least the chip size`)
+  ok(a.card.h >= L.CARD.chip.h && a.card.w >= L.CARD.chip.w, `n=${n} plate is at least the chip size`)
+  ok(a.tier === 'chip', `n=${n} floor always rests at the chip tier`)
 
   // At four machines and under, the whole mesh is on the canvas.
   if (n <= 4) ok(a.suppressedPairs === 0, `n=${n} whole mesh drawn`)
 }
 
-// Tiers flip where they should.
-ok(L.tierFor(4) === 'full' && L.tierFor(5) === 'compact', 'tier flips 4 -> 5')
-ok(L.tierFor(8) === 'compact' && L.tierFor(9) === 'chip', 'tier flips 8 -> 9')
 ok(build(12).kind === 'grid' && build(13).kind === 'ring', 'floor becomes a ring above 12')
+
+// Selection promotes on the ring too. Past RING_ABOVE the promotion is the
+// only way power and temperature reach the floor at all, and the grown plate
+// expands about its own ring point rather than hanging off it.
+{
+  const ringSel = build(13, { selection: { selDep: null, selNode: id(5), selLink: null } })
+  const grown = cardOf(ringSel, id(5))
+  ok(
+    ringSel.kind === 'ring' && grown.bodyTier === 'compact' && grown.h === L.CARD.compact.h,
+    'a selected plate grows in place on a ring floor',
+  )
+  ok(
+    ringSel.cards.filter((c) => c !== grown).every((c) => c.h === L.CARD.chip.h),
+    'and only the selected one',
+  )
+  const rest = cardOf(build(13), id(5))
+  ok(
+    Math.abs(grown.y + grown.h / 2 - (rest.y + rest.h / 2)) < 0.75,
+    'the grown plate keeps its centre on the ring',
+  )
+}
 
 // Coordinator first.
 ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
@@ -329,6 +348,33 @@ ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
   ok(junk.cards.length === base.cards.length, 'an offset for a departed machine places nothing')
 }
 
+// The same sanitiser covers every placement, not just the machines'. Bands
+// and the provider bus key into the same offsets map, and a NaN reaching any
+// box poisons the ink min/max -- the fit transform goes NaN and the whole
+// floor blanks -- while an absurd value obeyed on a band is exactly the
+// shrunk-to-nothing floor OFFSET_LIMIT exists to stop.
+{
+  const dep = deployment('llama', [id(0)])
+  const junk = build(2, {
+    deployments: [dep],
+    remotes: [remote('openrouter', 'gpt-oss-120b')],
+    offsets: {
+      [dep.deployment_id]: { x: NaN, y: NaN },
+      [L.PROVIDER_NODE_ID]: { x: 0, y: NaN },
+    },
+  })
+  const band = junk.bands.find((b) => b.deploymentId === dep.deployment_id)
+  ok(Number.isFinite(band.x) && Number.isFinite(band.y), 'a NaN band offset is no offset')
+  ok(Number.isFinite(junk.provider?.y), 'a NaN provider-bus offset is no offset')
+  ok(
+    [junk.ink.x, junk.ink.y, junk.ink.w, junk.ink.h].every(Number.isFinite),
+    'and the ink box stays drawable',
+  )
+  const flung = build(2, { deployments: [dep], offsets: { [dep.deployment_id]: { x: 1e9, y: 0 } } })
+  const far = flung.bands.find((b) => b.deploymentId === dep.deployment_id)
+  ok(far.offset.x <= L.OFFSET_LIMIT, 'an absurd band offset is bounded, not obeyed')
+}
+
 // Placement is keyed on node_id, which is why the node_id had to stop being
 // re-derived from the hostname on every boot (registry/nodeident.py). While it
 // was, renaming a machine discarded its place on the floor twice over: the
@@ -339,15 +385,21 @@ ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
 {
   const arranged = [id(0), id(1), id(2)]
   const offsets = { [id(1)]: { x: 40, y: -25 } }
-  const before = build(3, { order: arranged, offsets })
-  const joined = build(4, { order: arranged, offsets })
+  // 5 -> 6, not 3 -> 4: at the chip tier's width the panel fits five columns
+  // (`fits`, layout.ts), so a roster below that count packs one node per
+  // column and adding a node re-centres the whole row -- a real geometry
+  // change, not a regression. Above `fits` the column count itself is
+  // stable, which is the case this asserts: a joining machine must not move
+  // one that is already hand-placed.
+  const before = build(5, { order: arranged, offsets })
+  const joined = build(6, { order: arranged, offsets })
   const a = cardOf(before, id(1))
   const b = cardOf(joined, id(1))
   ok(
     b.x === a.x && b.y === a.y && b.offset.x === 40 && b.offset.y === -25,
     'a hand-placed machine keeps its place when another machine joins',
   )
-  ok(cardOf(joined, id(3)) !== undefined, 'the machine that joined is still drawn')
+  ok(cardOf(joined, id(5)) !== undefined, 'the machine that joined is still drawn')
   // The other half of the same fact, stated so it cannot regress quietly: a
   // machine whose id changes is a different machine to this floor.
   const renamed = build(3, { order: arranged, offsets: { 'spark-01-renamed': { x: 40, y: -25 } } })
@@ -390,6 +442,20 @@ ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
   ok(pair(apart).kind === 'path', 'dragging one off the row costs the pair its bracket')
   const back = build(4, { deployments, offsets: { [id(1)]: { x: 0, y: 0 } } })
   ok(pair(back).kind === 'bracket', 'a zero offset is the default floor')
+}
+
+// The bracket sits exactly on the meter band inside the plates it spans --
+// y+16, 8 tall, the meter MachinePlate draws -- so the bar between two
+// machines and the bars inside them read as one instrument row. The old
+// +19/7 matched the taller resting plate this floor retired, and left the
+// bar flush with the plate's bottom edge instead.
+{
+  const l = build(2)
+  const br = l.edges.find((e) => e.bracket)?.bracket
+  const top = Math.min(...l.cards.map((c) => c.y))
+  ok(br != null, 'two facing measured plates get a bracket')
+  ok(br.y === top + 16 && br.h === 8, 'the bracket sits on the meter band (y+16, 8 tall)')
+  ok(br.hitY + br.hitH / 2 === br.y + br.h / 2, 'its hit plate is centred on the bar')
 }
 
 // ── A link is a squared-off run, and it runs where no machine is ─────────────
@@ -943,6 +1009,17 @@ ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
   )
 }
 
+// And so does selecting the link ITSELF. The rail's chip list and the [ / ]
+// keyboard cycle can select any pair, and a selection the floor refuses to
+// draw is a detail rail about a wire that is nowhere on the canvas.
+{
+  const key = [id(2), id(6)].sort().join('~')
+  const plain = build(8)
+  const sel = build(8, { selection: { selDep: null, selNode: null, selLink: key } })
+  ok(!plain.edges.some((e) => e.linkKey === key), 'an unmeasured pair stays suppressed until someone asks')
+  ok(sel.edges.some((e) => e.linkKey === key), 'selecting a link puts it on the canvas')
+}
+
 // A deployment relying on an unmeasured link is always drawn, however big the
 // cluster gets. That is a warning, not noise.
 {
@@ -1018,6 +1095,37 @@ ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
     }
     ok(l.ink.w > 0 && l.ink.h > 0, `${n} machines: the ink box is non-degenerate`)
     ok(l.provider !== null, `${n} machines: the provider bus is in this fixture, so the check above covers it`)
+  }
+}
+
+// The ink box encloses the LINKS too, not only the boxes. A hop over the
+// first row rises into ARC_HEADROOM above the plates and its caption higher
+// still, and the fit crops to ink -- headroom reserved in layout coordinates
+// protects nothing if the frame the renderer scales to does not include it,
+// which is a hop clipped off the top whenever the height axis binds.
+{
+  // measuredPairs 2 measures (0,1) and (0,2): the second is the same-row
+  // non-adjacent pair, i.e. a hop with a caption, on a four-in-one-row floor.
+  const l = build(4, { measuredPairs: 2 })
+  const hop = l.edges.find((e) => e.kind === 'path' && e.measured)
+  ok(hop != null, 'the fixture actually has a hop, so the checks below cover one')
+  for (const e of l.edges.filter((x) => x.kind === 'path')) {
+    ok(
+      e.pts.every(
+        (p) => p.x >= l.ink.x && p.x <= l.ink.x + l.ink.w && p.y >= l.ink.y && p.y <= l.ink.y + l.ink.h,
+      ),
+      'the ink box encloses every link route',
+    )
+    if (e.showLabel) {
+      const w = L.plateWidth(e.label)
+      ok(
+        e.labelAt.x - w / 2 >= l.ink.x &&
+          e.labelAt.x + w / 2 <= l.ink.x + l.ink.w &&
+          e.labelAt.y - 9 >= l.ink.y &&
+          e.labelAt.y + 4 <= l.ink.y + l.ink.h,
+        'the ink box encloses every caption plate',
+      )
+    }
   }
 }
 
@@ -1145,7 +1253,11 @@ ok(build(4).arrangement[0] === id(0), 'coordinator takes the first slot')
 
   const solo = build(4, { deployments: [deployment('gpt-oss-120b', [id(0)])] })
   ok(solo.bands.length === 1, 'a single-node deployment gets a band too')
-  ok(solo.bands[0].w === solo.card.w, 'a solo band whose words fit spans exactly its one machine')
+  // A chip/compact-tier plate no longer reserves a full-tier plate's UTIL_ROW
+  // width, so a band's own floor (the throughput gutter, at a bigger font
+  // than the plate's text) now runs past even a short-named solo machine --
+  // never under it, which is the invariant that still matters.
+  ok(solo.bands[0].w >= solo.card.w, 'a solo band never spans less than its one machine')
   ok(solo.entries[0] != null, 'a solo deployment still gets an entry box')
   ok(solo.conns.some((c) => c.id.startsWith('entry-')), 'the entry box connects to the solo band')
 
@@ -1934,9 +2046,9 @@ function preview() {
     }
     for (const c of l.cards) {
       g.push(`<rect x="${c.x}" y="${c.y}" width="${c.w}" height="${c.h}" rx="4" fill="#33302B" stroke="#C9C2B4" stroke-width="1.5"/>`)
-      g.push(`<text x="${c.x + 11}" y="${c.y + 15}" font-size="9" fill="#EDE9E0" font-family="monospace">${T(c.nodeId)}</text>`)
-      g.push(`<rect x="${c.x + 11}" y="${c.y + 21}" width="${c.w - 22}" height="14" rx="2" fill="#EDE9E0" opacity="0.18"/>`)
-      g.push(`<rect x="${c.x + 11}" y="${c.y + 21}" width="${(c.w - 22) * 0.62}" height="14" rx="2" fill="#EDE9E0" opacity="0.85"/>`)
+      g.push(`<text x="${c.x + 11}" y="${c.y + 12}" font-size="9" fill="#EDE9E0" font-family="monospace">${T(c.nodeId)}</text>`)
+      g.push(`<rect x="${c.x + 11}" y="${c.y + 16}" width="${c.w - 22}" height="8" rx="2" fill="#EDE9E0" opacity="0.18"/>`)
+      g.push(`<rect x="${c.x + 11}" y="${c.y + 16}" width="${(c.w - 22) * 0.62}" height="8" rx="2" fill="#EDE9E0" opacity="0.85"/>`)
     }
     for (const j of l.junctions) g.push(`<circle cx="${j.x}" cy="${j.y}" r="${j.r}" fill="#1A1917" opacity="${j.opacity}"/>`)
     if (l.provider) {
@@ -1994,47 +2106,36 @@ function buildNodes(nodeList, opts = {}) {
   })
 }
 
-for (const n of [2, 3, 4]) {
+// The floor always rests at the chip tier now (see `layoutCluster`), and chip
+// plates have no room below the meter for an identity line -- that tier's
+// gate on `subline` (`tier === 'full'`) can never fire any more, so a shared
+// hostname or a rename no longer grows every plate. The identity still shows;
+// it moved to the tooltip and the node sheet instead of costing floor space.
+for (const n of [2, 3, 4, 6, 10]) {
   const plain = buildNodes(nodes(n))
   const shared = buildNodes(sharedHostname(n))
 
   ok(plain.subline === 0, `n=${n} a floor where every name says it all reserves nothing`)
-  ok(shared.subline === L.SUBLINE_H, `n=${n} a shared hostname reserves the identity line`)
+  ok(shared.subline === 0, `n=${n} a shared hostname reserves nothing at the resting tier`)
   ok(
-    shared.cards.every((c) => c.h === plain.cards[0].h + L.SUBLINE_H),
-    `n=${n} EVERY plate grows, so the meters in a row still line up`,
-  )
-
-  // The line has to fit inside the plate it is drawn on: the renderer puts the
-  // name at y+15, the identity at y+26 and shifts the rows below by SUBLINE_H,
-  // ending at y+74+SUBLINE_H for a full-tier plate.
-  ok(
-    shared.cards.every((c) => 74 + L.SUBLINE_H < c.h),
-    `n=${n} the shifted rows still fit inside the taller plate`,
+    shared.cards.every((c) => c.h === plain.cards[0].h),
+    `n=${n} plates do not grow for a shared hostname any more`,
   )
 
   let collide = false
   for (let i = 0; i < shared.cards.length; i++)
     for (let j = i + 1; j < shared.cards.length; j++)
       if (overlaps(shared.cards[i], shared.cards[j])) collide = true
-  ok(!collide, `n=${n} taller plates still do not overlap`)
+  ok(!collide, `n=${n} plates still do not overlap`)
 }
 
-// Compact and chip plates have no room below the meter, so they never reserve
-// it -- those tiers carry the identity in the tooltip and the node sheet.
-for (const n of [6, 10]) {
-  ok(
-    buildNodes(sharedHostname(n)).subline === 0,
-    `n=${n} tiers with no room reserve nothing`,
-  )
-}
-
-// A rename is the other reason a plate's name is not its id.
+// A rename is the other reason a plate's name is not its id, and it does not
+// reserve room either, for the same reason.
 {
   const renamed = nodes(3).map((node, i) =>
     i === 0 ? { ...node, label: 'Rack 2' } : node,
   )
-  ok(buildNodes(renamed).subline === L.SUBLINE_H, 'a renamed machine reserves the line too')
+  ok(buildNodes(renamed).subline === 0, 'a renamed machine reserves nothing at the resting tier')
   ok(
     buildNodes(nodes(3).map((node) => ({ ...node, label: node.node_id }))).subline === 0,
     'a label equal to the node_id is not a second identity and reserves nothing',

@@ -5,6 +5,7 @@ import { PROPORTIONAL } from '../state/policy'
 import { useRouting } from '../state/resources'
 import { useBackend } from '../state/backend'
 import { Lamp } from '../components/Lamp'
+import { Select, type SelectOption } from '../components/Select'
 import { Verbatim, VerbatimList } from '../components/Verbatim'
 
 // Ported from mockups-next/js/sidebar.js `sidebar()`'s weights block plus
@@ -90,17 +91,12 @@ export function RoutingSection() {
       <h2>Routing</h2>
       <label style={{ display: 'block' }}>
         <span className="sr-only">Routing policy for {cfg.served_name}</span>
-        <select
+        <Select
           value={policy}
-          onChange={(e) => void change(e.target.value as RoutingPolicy)}
+          onChange={(p) => void change(p)}
+          options={POLICIES.map((p): SelectOption<RoutingPolicy> => ({ value: p.value, label: p.value }))}
           style={{ width: '100%' }}
-        >
-          {POLICIES.map((p) => (
-            <option key={p.value} value={p.value}>
-              {p.value}
-            </option>
-          ))}
-        </select>
+        />
       </label>
 
       {error ? (

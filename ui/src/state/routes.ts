@@ -13,7 +13,7 @@
 //                                       /chat /spend /settings
 //   ...and the screen's own subject     /models/<model id>
 //   the QUERY names what is selected    ?node= ?link= ?dep= ?open= ?ctx= ?seq=
-//   ...and, on a model, the shape it is    ?on= ?tp= ?pp=
+//   ...and, on a model, the shape it is    ?on= ?tp= ?pp= ?ep=
 //   being planned at
 //
 // A model id carries slashes (`meta-llama/Llama-3.1-8B`) and they are kept as
@@ -87,12 +87,49 @@ export interface Route {
    *  planner picks and sends no `node_ids` -- the two are different requests,
    *  so absence is preserved rather than collapsed to "every machine". */
   on: string[] | null
-  /** The degrees the operator named. Held as a pair because `parallelism` is
+  /** The degrees the operator named. Held as a SET because `parallelism` is
    *  adopted as a whole object (tabs/models/DegreeFields.tsx): with an
    *  omitted key meaning 1 on the wire, "TP mine, PP the planner's" cannot be
-   *  expressed at all, so either both are here or neither is. */
+   *  expressed at all, so either all three are here or none are.
+   *
+   *  `ep` joined them when expert parallel became a field rather than an API
+   *  it was possible to reach only by hand. There is no `dp`: the data-parallel
+   *  degree is not independently selectable anywhere in this product -- vLLM
+   *  builds no rank group for expert parallel, so its size IS `dp * tp`, and
+   *  the cross-node shape the planner emits is `dp = ep` with `tp = 1`.
+   *  `state/placement.ts` writes that pairing into the request; the coordinator
+   *  is still the only thing that judges it. */
   tp: number | null
   pp: number | null
+  ep: number | null
+  /** Speculative decoding, as `method:k` — `spec=ngram:5`. `null` means one
+   *  token per step, which is what every URL written before this existed meant
+   *  and what the coordinator does when the field is absent.
+   *
+   *  A pair in one parameter rather than two, and not for brevity: the two
+   *  halves are never independently meaningful. A method with no token count
+   *  is not a request the fit gate can price, and a token count with no method
+   *  names nothing — so unlike `tp`/`pp`, which each stand alone at 1, there is
+   *  no sensible value to fill a missing half with. One parameter cannot be
+   *  half-written. */
+  spec: SpecRef | null
+}
+
+/** A speculative-decoding selection: which method, and how many tokens to
+ *  draft per step. The method is not narrowed to the union the API declares —
+ *  a URL is somebody else's text, and a method this build does not know must
+ *  round-trip to the server and come back as its refusal, not be silently
+ *  dropped here into a launch that speculates differently than the link said. */
+export interface SpecRef {
+  method: string
+  tokens: number
+  /** A separately-published draft head's repository, for a method whose draft
+   *  is not in the target's own checkpoint. Written as its own `?head=`
+   *  parameter rather than a third colon-separated field: a repository id is
+   *  somebody else's string and may contain a colon (a quant tag does), so
+   *  packing it into `spec=` would make the separator ambiguous the first time
+   *  one did. */
+  model?: string
 }
 
 const SEGMENT: Record<Dest, string> = {
@@ -176,12 +213,35 @@ function nodeList(raw: string | null): string[] | null {
   return ids.length ? ids.sort() : null
 }
 
-/** Both axes, or neither. */
-function degreePair(params: URLSearchParams): { tp: number | null; pp: number | null } {
+/** `method:k`. Null unless both halves are there and `k` is a positive integer.
+ *
+ *  Deliberately strict about the count and deliberately not strict about the
+ *  method: an unreadable count has no honest reading (drafting "NaN" tokens is
+ *  not a request), while an unknown method is a question only the coordinator
+ *  can answer, and it answers it with a sentence naming what this checkpoint
+ *  does offer. */
+function specRef(raw: string | null, head: string | null): SpecRef | null {
+  if (!raw) return null
+  const at = raw.indexOf(':')
+  if (at <= 0) return null
+  const method = raw.slice(0, at).trim()
+  const tokens = positive(raw.slice(at + 1))
+  if (!method || tokens === null) return null
+  const model = head?.trim()
+  return model ? { method, tokens, model } : { method, tokens }
+}
+
+type DegreeSet = { tp: number | null; pp: number | null; ep: number | null }
+
+const NO_DEGREES: DegreeSet = { tp: null, pp: null, ep: null }
+
+/** Every axis, or none. */
+function degreeSet(params: URLSearchParams): DegreeSet {
   const tp = degree(params.get('tp'))
   const pp = degree(params.get('pp'))
-  if (tp === null && pp === null) return { tp: null, pp: null }
-  return { tp: tp ?? 1, pp: pp ?? 1 }
+  const ep = degree(params.get('ep'))
+  if (tp === null && pp === null && ep === null) return NO_DEGREES
+  return { tp: tp ?? 1, pp: pp ?? 1, ep: ep ?? 1 }
 }
 
 /** `pathname + search`, split and validated. Anything unrecognised -- a typo, a
@@ -213,7 +273,7 @@ export function parse(url: string): Route {
   const wantsNumbers = dest === 'models' || sheet?.kind === 'model'
   // Either axis present adopts the pair, filling the other with 1 -- the same
   // first-touch-adopts gesture the field itself makes.
-  const degrees = wantsNumbers ? degreePair(params) : { tp: null, pp: null }
+  const degrees = wantsNumbers ? degreeSet(params) : NO_DEGREES
 
   return {
     dest,
@@ -227,6 +287,8 @@ export function parse(url: string): Route {
     on: wantsNumbers ? nodeList(params.get('on')) : null,
     tp: degrees.tp,
     pp: degrees.pp,
+    ep: degrees.ep,
+    spec: wantsNumbers ? specRef(params.get('spec'), params.get('head')) : null,
   }
 }
 
@@ -261,11 +323,19 @@ export function href(route: Route): string {
     if (route.on && route.on.length) {
       put('on', [...new Set(route.on)].sort().join(','))
     }
-    // Written as a pair, never singly: `tp` alone would parse back as the pair
-    // {tp, 1} and stop being the route that was written down.
-    if (route.tp !== null || route.pp !== null) {
+    // Written as a set, never singly: `tp` alone would parse back as the whole
+    // set {tp, 1, 1} and stop being the route that was written down.
+    if (route.tp !== null || route.pp !== null || route.ep !== null) {
       put('tp', String(route.tp ?? 1))
       put('pp', String(route.pp ?? 1))
+      put('ep', String(route.ep ?? 1))
+    }
+    if (route.spec) {
+      put('spec', `${route.spec.method}:${route.spec.tokens}`)
+      // Only ever beside a `spec`. A head with no method and no count is not a
+      // request the fit gate can price, so it is never written on its own --
+      // and `specRef` correspondingly ignores it without one.
+      if (route.spec.model) put('head', route.spec.model)
     }
   }
 

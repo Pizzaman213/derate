@@ -3,7 +3,7 @@ import type { ParallelismRequest } from '../api/types'
 import { useRouter } from './router'
 
 // The deployment shape a model is being planned at: which machines, and at
-// which degrees. Both live in the URL (`?on=`, `?tp=`/`?pp=`) for the same
+// which degrees. Both live in the URL (`?on=`, `?tp=`/`?pp=`/`?ep=`) for the same
 // reason `?ctx=`/`?seq=` do -- a verdict is only worth sending to somebody if
 // the question it answers travels with it. A placement held in component state
 // means two people opening one link read two different answers off the same
@@ -38,12 +38,25 @@ export function usePlacement(): PlacementApi {
   const key = route.on ? route.on.join(',') : null
   const nodeIds = useMemo(() => (key ? key.split(',') : null), [key])
 
+  // `data_parallel` mirrors `expert_parallel` and is never its own control.
+  // vLLM builds no rank group for expert parallel -- the expert-parallel size
+  // IS `dp * tp` -- so across machines the only shape that means EP=n is
+  // `dp=n, tp=1`, which is the one `enumerate_candidates` emits. A DP field
+  // would therefore have exactly one legal value given EP and no meaning
+  // without it. This is not a legality check in the browser, which this pane
+  // deliberately does not do: `legality.py::ep_rejection` still judges the
+  // pairing and still refuses a bad one in its own words.
   const degrees = useMemo<ParallelismRequest | null>(
     () =>
-      route.tp === null && route.pp === null
+      route.tp === null && route.pp === null && route.ep === null
         ? null
-        : { tensor_parallel: route.tp ?? 1, pipeline_parallel: route.pp ?? 1 },
-    [route.tp, route.pp],
+        : {
+            tensor_parallel: route.tp ?? 1,
+            pipeline_parallel: route.pp ?? 1,
+            expert_parallel: route.ep ?? 1,
+            data_parallel: route.ep ?? 1,
+          },
+    [route.tp, route.pp, route.ep],
   )
 
   // Both setters take only `navigate`, so they keep one identity for the life
@@ -66,8 +79,12 @@ export function usePlacement(): PlacementApi {
     (next: ParallelismRequest | null) => {
       navigate(
         next
-          ? { tp: next.tensor_parallel ?? 1, pp: next.pipeline_parallel ?? 1 }
-          : { tp: null, pp: null },
+          ? {
+              tp: next.tensor_parallel ?? 1,
+              pp: next.pipeline_parallel ?? 1,
+              ep: next.expert_parallel ?? 1,
+            }
+          : { tp: null, pp: null, ep: null },
         { replace: true },
       )
     },

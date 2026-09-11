@@ -1,7 +1,10 @@
 import { useState } from 'react'
+import { useRouter } from '../state/router'
 import { CoordinatorCard } from './settings/CoordinatorCard'
+import { ApiTokenCard } from './settings/ApiTokenCard'
 import { AddNodeCard } from './settings/AddNodeCard'
 import { NodesCard } from './settings/NodesCard'
+import { InstanceCard } from './settings/InstanceCard'
 import { ProvidersCard } from './settings/ProvidersCard'
 import { ClusterCard } from './settings/ClusterCard'
 import { ContainmentCard } from './settings/ContainmentCard'
@@ -16,6 +19,7 @@ import { CollectionCard } from './storage/CollectionCard'
 type Sub =
   | 'connection'
   | 'nodes'
+  | 'instance'
   | 'storage'
   | 'providers'
   | 'policy'
@@ -28,6 +32,7 @@ const SUBS: { id: Sub; label: string }[] = [
   // not, and every other section is empty until the address in it is right.
   { id: 'connection', label: 'Connection' },
   { id: 'nodes', label: 'Nodes' },
+  { id: 'instance', label: 'Instance' },
   { id: 'storage', label: 'Storage' },
   { id: 'providers', label: 'Providers' },
   { id: 'policy', label: 'Policy' },
@@ -40,11 +45,17 @@ const SUBS: { id: Sub; label: string }[] = [
  *  are spending their disk on, and what this project has said it will not
  *  build.
  *
- *  Seven sub-tabs (`.subs`, the same bar the Dashboard uses) rather than the
+ *  Eight sub-tabs (`.subs`, the same bar the Dashboard uses) rather than the
  *  one nine-card column this used to be. The column was not merely long: it
  *  ran four unrelated jobs together, and roughly half its height was the
  *  About cards, which are documentation and never change. Splitting on the
  *  job puts every screen inside one viewport.
+ *
+ *  Instance opens automatically when the address bar already names a node
+ *  (`/settings?node=&dep=`, the same global selection every other screen
+ *  shares) -- landing there used to be indistinguishable from a plain
+ *  `/settings`, which is the bug this exists to fix. That only decides the
+ *  FIRST render; switching sub-tabs by hand afterward is untouched.
  *
  *  Storage joined this tab rather than staying its own destination: it is the
  *  same job as Nodes -- reading facts off the machines behind this
@@ -66,7 +77,8 @@ const SUBS: { id: Sub; label: string }[] = [
  *  section, plus AddNodeCard, which the mockup gestured at with an address
  *  form it could not wire up. */
 export function SettingsTab() {
-  const [sub, setSub] = useState<Sub>('connection')
+  const { route } = useRouter()
+  const [sub, setSub] = useState<Sub>(() => (route.node ? 'instance' : 'connection'))
 
   return (
     <div>
@@ -97,6 +109,7 @@ export function SettingsTab() {
       >
         <div className="settingsgrid">
           <CoordinatorCard />
+          <ApiTokenCard />
           <ClusterCard />
         </div>
       </div>
@@ -104,6 +117,15 @@ export function SettingsTab() {
       <div id="st-nodes" role="tabpanel" aria-labelledby="st-tab-nodes" hidden={sub !== 'nodes'}>
         <AddNodeCard />
         <NodesCard />
+      </div>
+
+      <div
+        id="st-instance"
+        role="tabpanel"
+        aria-labelledby="st-tab-instance"
+        hidden={sub !== 'instance'}
+      >
+        <InstanceCard />
       </div>
 
       <div id="st-storage" role="tabpanel" aria-labelledby="st-tab-storage" hidden={sub !== 'storage'}>

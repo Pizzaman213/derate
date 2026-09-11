@@ -15,7 +15,6 @@ import { useCluster, useStorage } from '../../state/resources'
 import { Lamp } from '../../components/Lamp'
 import { Verbatim, VerbatimList } from '../../components/Verbatim'
 import { CapabilityChips } from './CapabilityChips'
-import { QuantLadder } from './QuantLadder'
 import { pullableProviders } from './pullTargets'
 import { ParamBreakdownTable } from './ParamBreakdownTable'
 import { BackendPicker } from './BackendPicker'
@@ -137,6 +136,10 @@ export function ModelInspector({
   // Serve button starts another.
   const [target, setTarget] = useState<'throughput' | 'latency'>('throughput')
   const [runtime, setRuntime] = useState<Runtime>('vllm')
+  // Why the runtime above is what it is, when the answer was not the default.
+  // Rendered next to the picker rather than inferred from it: a control that
+  // moved on its own has to say what moved it, or it reads as a bug.
+  const [runtimeBecause, setRuntimeBecause] = useState<string | null>(null)
   // The provider a pull would land on, for the same reason `runtime` is here:
   // the ladder sends it and the panel picks it, and two copies would let the
   // machine named on screen differ from the one that gets the download. Empty
@@ -299,7 +302,20 @@ export function ModelInspector({
           // than derived at render, so it stays a *default*: picking vllm to
           // read its refusal is a legitimate thing to do and this must not
           // undo it on the next poll.
-          setRuntime(runtimeFor(d.modality))
+          //
+          // The cluster is the second input, and it is a recommendation
+          // rather than a requirement: on a box with no GPU every CUDA
+          // runtime is refused on every machine, so the same argument applies
+          // with the same remedy. `runtimeFor` returns the reason with the
+          // choice, and the reason is what goes on screen -- a picker that
+          // moved on its own and says nothing reads as a bug.
+          //
+          // Deliberately inside the same `modelDetail` resolve rather than an
+          // effect of its own: the roster refreshes on a timer, and rerunning
+          // this when it does would overwrite a runtime somebody had picked.
+          const pick = runtimeFor(d.modality, cluster.data?.nodes)
+          setRuntime(pick.runtime)
+          setRuntimeBecause(pick.because)
         }
         return true
       })
@@ -465,32 +481,24 @@ export function ModelInspector({
           target={target}
           onTarget={setTarget}
           runtime={runtime}
-          onRuntime={setRuntime}
+          onRuntime={(next) => {
+            setRuntime(next)
+            // The note explains a default this screen chose. Once somebody has
+            // chosen for themselves it is describing a decision that is no
+            // longer in force, so it goes.
+            setRuntimeBecause(null)
+          }}
+          runtimeBecause={runtimeBecause}
           pullTargets={pullTargets}
           providerId={chosenProvider}
           onProviderId={setProviderId}
           cache={cache}
           cluster={cluster.data}
           initialCustomCommand={initialCustomCommand}
-        />
-        )}
-
-        {detailError && servedBy.length ? null : (
-        <>
-        <div className="sub">quantizations</div>
-        <QuantLadder
           ladder={ladder}
-          loading={loadingLadder}
-          error={ladderError}
-          context={context}
-          concurrency={concurrency}
-          target={target}
-          runtime={runtime}
-          provider={pullTargets.find((p) => p.provider_id === chosenProvider) ?? null}
-          cache={cache}
-          cluster={cluster.data}
+          loadingLadder={loadingLadder}
+          ladderError={ladderError}
         />
-        </>
         )}
         </>
         )}

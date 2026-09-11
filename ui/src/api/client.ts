@@ -1,11 +1,13 @@
-// The only place the UI talks to Agent G. Live only: the coordinator is
+// The only place the UI talks to the gateway. Live only: the coordinator is
 // always there in the deployed shape (a Compose service, a systemd unit) and
 // a UI that opens without one is not the shape this ships in. Day-0 fixture
 // data lived here through bring-up; it is gone as of the derate port.
 
+import { apiToken } from './apiToken'
 import { apiUrl } from './origin'
 import { scrub } from './redact'
 import type {
+  AlertsReport,
   Activity,
   AdoptedRuntime,
   CacheClearResult,
@@ -34,6 +36,7 @@ import type {
   ModelSearchResponse,
   NodeHealth,
   NodeHistory,
+  NodeLogTail,
   NodeProcessList,
   NodeProfile,
   NodeRuntime,
@@ -67,19 +70,32 @@ import type {
   TranscriptionResult,
   VariantLadder,
   VoiceLibrary,
+  SpeculativeHeads,
 } from './types'
 
 /** One turn's worth of arguments for `chatStream`.
  *
  *  `onDelta` is called per text fragment as it arrives; `onOpen` fires once the
  *  response headers are in, which is the earliest the request id exists and is
- *  therefore the only way a caller learns it for a turn that goes on to fail. */
+ *  therefore the only way a caller learns it for a turn that goes on to fail.
+ *  `onReasoning`, when given, is called per reasoning fragment -- a model's
+ *  "thinking" content, kept apart from `onDelta` so a caller can render it
+ *  separately (collapsed by default) rather than mixed into the answer.
+ *
+ *  `temperature`/`max_tokens`/`stop` are omitted from the request body
+ *  entirely when left `undefined`, the same convention `speech()` uses for an
+ *  unset voice: an omitted key is a real "use the server's default", not a
+ *  sent `null`. */
 export interface ChatStreamRequest {
   model: string
   messages: ChatMessage[]
   onDelta: (text: string) => void
+  onReasoning?: (text: string) => void
   onOpen?: (requestId: string | null) => void
   signal: AbortSignal
+  temperature?: number
+  max_tokens?: number
+  stop?: string[]
 }
 
 export interface Backend {
@@ -141,6 +157,13 @@ export interface Backend {
    *  serving — deliberately not a mode of `measureLink`, which saturates the
    *  interconnect. */
   checkReach(a: string, b: string): Promise<ReachReport>
+  /** Start a calibration for a pair and RETURN -- the work outlives the
+   *  request. It runs one two-rank collective per candidate setting, so it is
+   *  minutes; holding a fetch open that long would tie up a worker, trip any
+   *  proxy in front of this, and say nothing while it waited. Watch
+   *  `measuring` on the links poll instead, which also keeps the state right
+   *  across a reload and across two people looking at once. */
+  tuneLink(a: string, b: string): Promise<{ a: string; b: string; measuring: boolean }>
   /** Give a node a display name, or clear it with an empty string. Changes
    *  the caption and nothing else: `node_id` stays what it was, so every
    *  deployment, link and routing target keyed by it still resolves. */
@@ -148,6 +171,10 @@ export interface Backend {
   /** `DELETE /api/deployments/{id}`. Drains first: the deployment stops
    *  admitting immediately and in-flight requests finish. */
   stopDeployment(deploymentId: string): Promise<void>
+  /** `PATCH /api/deployments/{id}`. Offers the deployment on the API, or
+   *  stops offering it. The container keeps running and keeps holding its
+   *  GPU memory either way — `stopDeployment` is what frees it. */
+  setDeploymentServing(deploymentId: string, serving: boolean): Promise<DeploymentDTO>
   /** What the launcher and the backend have said, for the sheet that shows
    *  it. Cheap while a launch is in flight — those lines are already in the
    *  coordinator's memory — and one bounded `sparkrun logs` afterwards, which
@@ -157,6 +184,11 @@ export interface Backend {
    *  costs an nvidia-smi call on the node, so it is only polled while a node
    *  sheet is open. */
   nodeProcesses(nodeId: string): Promise<NodeProcessList>
+  /** `GET /api/nodes/{id}/logs`. A tail of that node's own `node.log` or
+   *  `proxy.log` -- the control plane's process log, not a deployment's
+   *  serving log. Read on demand; there is no "is this actively streaming"
+   *  signal to poll against, so a caller refreshes by hand. */
+  nodeLogTail(nodeId: string, which: 'node' | 'proxy', tail?: number): Promise<NodeLogTail>
   /** `DELETE /api/nodes/{id}/processes/{pid}`. SIGTERM, then SIGKILL after a
    *  grace period, and the result reports which one it took and how much
    *  memory actually came back. Refused with 409 for a process the control
@@ -229,6 +261,16 @@ export interface Backend {
   /** Three sources at once, none resolved. Degrades to the local two when
    *  the hub is unreachable rather than answering empty. */
   searchModels(q: string, limit?: number): Promise<ModelSearchResponse>
+  /** Draft heads published for one model, priced and ranked. Launches nothing.
+   *  Called on demand — never on the plan path, which fires per keystroke. */
+  /** Every way this model can speculate, ranked, plus the one to offer.
+   *
+   *  `refresh` goes past the stored scan and asks the hub again. Without it
+   *  a model is scanned once ever and the answer is instant afterwards. */
+  speculativeHeads(
+    modelId: string,
+    opts?: { limit?: number; refresh?: boolean },
+  ): Promise<SpeculativeHeads>
   modelDetail(modelId: string): Promise<ModelDetail>
   /** Every obtainable quantization, with this cluster's verdict on each.
    *
@@ -303,6 +345,7 @@ export interface Backend {
    *  reads a process-local dict and the in-memory deployment list -- no
    *  fan-out to the node agents, unlike `storage()`. */
   activity(): Promise<Activity>
+  alerts(): Promise<AlertsReport>
   addProvider(spec: ProviderSpec): Promise<Provider>
   removeProvider(providerId: string): Promise<void>
   patchProvider(providerId: string, patch: ProviderPatch): Promise<Provider>
@@ -394,9 +437,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // coordinator base is prepended. Same origin (the deployed shape, and the
   // default) leaves the path untouched.
   const url = apiUrl(path)
+  const token = apiToken()
   const res = await fetch(url, {
     ...init,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      'content-type': 'application/json',
+      // A no-op header on every deployment that never set DERATE_API_TOKEN,
+      // which is most of them -- see api/apiToken.ts.
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
@@ -466,12 +516,12 @@ export class ApiError extends Error {
 
 // ── Wire adaptation ──────────────────────────────────────────────────────────
 //
-// §4.8 is owned by Agent G and says the UI codes against exactly that surface,
+// §4.8 is owned by the gateway and says the UI codes against exactly that surface,
 // so where the wire and the view models differ the adaptation happens here.
 // This file is the only place that knows the wire format; everything above
 // `Backend` sees the shapes in `types.ts`.
 
-/** `GET /api/cluster` as Agent G emits it: identity at the top level, a
+/** `GET /api/cluster` as the gateway emits it: identity at the top level, a
  *  counters-only `summary`, flat node rows, and no deployments — those come
  *  from `/api/deployments`. */
 interface ClusterWire {
@@ -560,7 +610,7 @@ export function toNodeState(n: NodeWire, coordinator: string | null): NodeStateD
 }
 
 /** `GET /v1/models`. Standard OpenAI envelope; the three extras after `id` are
- *  Agent G's, and a stock client ignoring them is the point. */
+ *  the gateway's own, and a stock client ignoring them is the point. */
 interface ModelsWire {
   object: string
   data: {
@@ -578,9 +628,22 @@ interface ModelsWire {
 /** One `data:` frame of a streamed chat completion, as much of it as this UI
  *  reads. Everything is optional: the first frame usually carries only a role,
  *  and `usage` appears on the last frame from some upstreams and never from
- *  others. */
+ *  others.
+ *
+ *  `reasoning_content` (vLLM's reasoning parsers, DeepSeek's API) and
+ *  `reasoning` (OpenRouter) are the two names actually seen for a model's
+ *  "thinking" delta -- not a guaranteed set, just the ones with evidence. No
+ *  recipe in this repo turns on vLLM's `--reasoning-parser`, so a local
+ *  thinking model streams its reasoning as literal `<think>` tags inside
+ *  `content` instead; see the inline-tag scan in `chatStream`. */
 interface ChatChunkWire {
-  choices?: { delta?: { content?: string | null } }[]
+  choices?: {
+    delta?: {
+      content?: string | null
+      reasoning_content?: string | null
+      reasoning?: string | null
+    }
+  }[]
   usage?: { completion_tokens?: number | null } | null
 }
 
@@ -588,6 +651,23 @@ interface ChatChunkWire {
  *  DOMException`, which does not hold across every runtime this can run in. */
 function isAbort(e: unknown): boolean {
   return (e as { name?: string } | null)?.name === 'AbortError'
+}
+
+/** Splits `<think>...</think>` spans out of accumulated content text.
+ *
+ *  Takes the WHOLE buffer seen so far, not just the newest chunk -- a tag can
+ *  straddle a chunk boundary, and re-deriving both halves from scratch every
+ *  time is simpler to get right than carrying scan state across frames. The
+ *  `(<\/think>|$)` alternation is what makes an unterminated tag (the model
+ *  is still "thinking" when the stream ends) fall out as reasoning too,
+ *  rather than staying stuck in `content` forever. */
+function splitThink(raw: string): { content: string; reasoning: string } {
+  let reasoning = ''
+  const content = raw.replace(/<think>([\s\S]*?)(<\/think>|$)/g, (_m, inner: string) => {
+    reasoning += inner
+    return ''
+  })
+  return { content, reasoning }
 }
 
 export const httpBackend: Backend = {
@@ -668,8 +748,12 @@ export const httpBackend: Backend = {
     model,
     messages,
     onDelta,
+    onReasoning,
     onOpen,
     signal,
+    temperature,
+    max_tokens,
+    stop,
   }: ChatStreamRequest): Promise<ChatTurnMeta> {
     // The one thing in this file `req<T>` cannot carry: it awaits `res.json()`,
     // and the whole value here is in not waiting for the end of the body.
@@ -679,8 +763,25 @@ export const httpBackend: Backend = {
 
     let requestId: string | null = null
     let ttftMs: number | null = null
+    let reasoningMs: number | null = null
+    let sawReasoning = false
     let textFrames = 0
     let usageCompletion: number | null = null
+
+    // No recipe here passes vLLM `--reasoning-parser`, so a local thinking
+    // model's reasoning arrives as literal `<think>...</think>` inside
+    // `content`, not as its own field. `rawContent` accumulates every content
+    // delta seen so far and is re-split on every frame -- simpler and more
+    // obviously correct than a stateful scan for a tag that can straddle a
+    // chunk boundary, at the cost of a re-scan per frame that a chat-length
+    // transcript never makes expensive. Once a frame carries an explicit
+    // `reasoning_content`/`reasoning` field this is abandoned for the rest of
+    // the stream: trust the field the upstream chose to send, don't also go
+    // looking for tags it has no reason to emit.
+    let rawContent = ''
+    let splitContent = ''
+    let splitReasoning = ''
+    let explicitReasoning = false
 
     const meta = (stopped: boolean): ChatTurnMeta => ({
       model,
@@ -691,8 +792,21 @@ export const httpBackend: Backend = {
       // that reads as an em dash rather than as a model that emitted 0 tokens.
       completionTokens: usageCompletion ?? (textFrames || null),
       tokensEstimated: usageCompletion === null,
+      reasoningMs,
       stopped,
     })
+
+    const emitContent = (chunk: string) => {
+      const now = performance.now()
+      if (ttftMs === null) ttftMs = now - startedAt
+      if (sawReasoning && reasoningMs === null) reasoningMs = now - startedAt
+      textFrames += 1
+      onDelta(chunk)
+    }
+    const emitReasoning = (chunk: string) => {
+      sawReasoning = true
+      onReasoning?.(chunk)
+    }
 
     /** Returns true when the frame was the stream's terminator. */
     const consume = (event: string): boolean => {
@@ -710,11 +824,28 @@ export const httpBackend: Backend = {
           // the same rule `subscribe()` applies to the metrics stream.
           continue
         }
-        const text = frame.choices?.[0]?.delta?.content
+        const delta = frame.choices?.[0]?.delta
+        const reasoningField = delta?.reasoning_content ?? delta?.reasoning
+        if (typeof reasoningField === 'string' && reasoningField !== '') {
+          explicitReasoning = true
+          emitReasoning(reasoningField)
+        }
+        const text = delta?.content
         if (typeof text === 'string' && text !== '') {
-          if (ttftMs === null) ttftMs = performance.now() - startedAt
-          textFrames += 1
-          onDelta(text)
+          if (explicitReasoning) {
+            emitContent(text)
+          } else {
+            rawContent += text
+            const split = splitThink(rawContent)
+            if (split.reasoning.length > splitReasoning.length) {
+              emitReasoning(split.reasoning.slice(splitReasoning.length))
+              splitReasoning = split.reasoning
+            }
+            if (split.content.length > splitContent.length) {
+              emitContent(split.content.slice(splitContent.length))
+              splitContent = split.content
+            }
+          }
         }
         // Some upstreams close with a usage block. A real count beats a counted
         // frame whenever one turns up, which is why this is checked every time
@@ -726,6 +857,13 @@ export const httpBackend: Backend = {
     }
 
     try {
+      const body: Record<string, unknown> = { model, messages, stream: true }
+      // Omitted rather than sent as `null`/absent-by-default -- the same
+      // "unset means use the server's default" convention `speech()` uses for
+      // an unpicked voice.
+      if (temperature !== undefined) body.temperature = temperature
+      if (max_tokens !== undefined) body.max_tokens = max_tokens
+      if (stop !== undefined && stop.length > 0) body.stop = stop
       const res = await fetch(path, {
         method: 'POST',
         signal,
@@ -733,7 +871,7 @@ export const httpBackend: Backend = {
         // No `stream_options: {include_usage: true}`. Not every upstream in
         // ProviderKind accepts it, and a request refused for an unknown field
         // is worse than a token count labelled as an estimate.
-        body: JSON.stringify({ model, messages, stream: true }),
+        body: JSON.stringify(body),
       })
 
       // Read before anything can throw on the body: a refusal carries the id
@@ -930,6 +1068,11 @@ export const httpBackend: Backend = {
       method: 'POST',
       body: JSON.stringify({ a, b }),
     }),
+  tuneLink: (a, b) =>
+    req<{ a: string; b: string; measuring: boolean }>('/api/links/tune', {
+      method: 'POST',
+      body: JSON.stringify({ a, b }),
+    }),
   renameNode: (nodeId, label) =>
     req<{ node_id: string; label: string | null }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/label`,
@@ -942,6 +1085,12 @@ export const httpBackend: Backend = {
   // A model id contains "/", and proxies and ASGI servers disagree about
   // whether %2F is decoded before routing -- there is a Vite dev proxy in the
   // chain too. So the id travels as a query parameter, encoded once.
+  speculativeHeads: (modelId, opts) =>
+    req<SpeculativeHeads>(
+      `/api/models/speculative-heads?model_id=${encodeURIComponent(modelId)}` +
+        `&limit=${opts?.limit ?? 12}` +
+        (opts?.refresh ? '&refresh=1' : ''),
+    ),
   searchModels: (q, limit) =>
     req<ModelSearchResponse>(
       `/api/models/search?q=${encodeURIComponent(q)}&limit=${limit ?? 40}`,
@@ -973,6 +1122,11 @@ export const httpBackend: Backend = {
     req<void>(`/api/deployments/${encodeURIComponent(deploymentId)}`, {
       method: 'DELETE',
     }),
+  setDeploymentServing: (deploymentId, serving) =>
+    req<DeploymentDTO>(`/api/deployments/${encodeURIComponent(deploymentId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ serving }),
+    }),
   deploymentLogs: (deploymentId, tail) =>
     req<DeploymentLogs>(
       `/api/deployments/${encodeURIComponent(deploymentId)}/logs` +
@@ -980,6 +1134,11 @@ export const httpBackend: Backend = {
     ),
   nodeProcesses: (nodeId) =>
     req<NodeProcessList>(`/api/nodes/${encodeURIComponent(nodeId)}/processes`),
+  nodeLogTail: (nodeId, which, tail) =>
+    req<NodeLogTail>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/logs?which=${which}` +
+        (tail ? `&tail=${tail}` : ''),
+    ),
   killProcess: (nodeId, pid) =>
     req<KillResult>(
       `/api/nodes/${encodeURIComponent(nodeId)}/processes/${encodeURIComponent(pid)}`,
@@ -1038,6 +1197,7 @@ export const httpBackend: Backend = {
       body: JSON.stringify(body),
     }),
   activity: () => req<Activity>('/api/activity'),
+  alerts: () => req<AlertsReport>('/api/alerts'),
   addProvider: (spec) =>
     req<Provider>('/api/providers', { method: 'POST', body: JSON.stringify(spec) }),
   removeProvider: (providerId) =>

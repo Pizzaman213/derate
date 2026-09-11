@@ -80,6 +80,27 @@ export function runners(deployments: readonly DeploymentDTO[]): DeploymentDTO[] 
   return deployments.filter((d) => !TERMINAL.has(d.state))
 }
 
+/** What one node is running now, or -- if nothing is -- the last thing that
+ *  was, so its error and its log stay reachable instead of the machine just
+ *  reading "Nothing.".
+ *
+ *  `deployments` is unfiltered and its order is the ledger's own insertion
+ *  order (newest terminal rows are the ones kept, see `GET /api/deployments`),
+ *  so the last match is the most recent one. Shared by `NodeInspector` and the
+ *  Settings instance picker so the two surfaces cannot silently disagree about
+ *  what "here" means for the same node. */
+export function runningOrPrevious(
+  deployments: readonly DeploymentDTO[],
+  nodeId: string,
+): { here: DeploymentDTO[]; previous: DeploymentDTO | undefined } {
+  const here = runners(deployments).filter((d) => d.node_ids.includes(nodeId))
+  const previous =
+    here.length === 0
+      ? [...deployments].reverse().find((d) => TERMINAL.has(d.state) && d.node_ids.includes(nodeId))
+      : undefined
+  return { here, previous }
+}
+
 export interface Point {
   x: number
   y: number
@@ -94,15 +115,23 @@ export type FloorKind = 'grid' | 'ring'
  *  glyph, stroke, gap and radius together and not one constant has to move. */
 export const GSCALE = 12 / 9
 
-/** Plate size per tier, in authored units. These ARE the mockup's three box
- *  heights: 84 is its selected solo node, 54 its compact solo node, 38 its
- *  remote row. Constant per tier and NEVER divided by the node count -- the
- *  old flow diagram sized boxes as `(TW - (k-1)*GAP)/k`, which goes negative
- *  at five nodes in a row and silently erases them. */
+/** Plate size per tier, in authored units. `full` and `compact` ARE the
+ *  mockup's box heights: 84 is its selected solo node, 54 its compact solo
+ *  node. `chip` is the floor's resting size regardless of node count (see
+ *  `layoutCluster`) -- its height is cut well below the mockup's remote row,
+ *  closer to the connecting lines' own weight, but its width is NOT: `fits`
+ *  (below) sizes a row's column count off this constant rather than off
+ *  content, deliberately, so a long deployment name cannot reflow the grid --
+ *  and real content almost always needs more than a chip plate's width
+ *  anyway (`plateNeed`), so a narrower constant here would only tell `fits`
+ *  a row holds more machines than the plates it actually draws will fit.
+ *  Constant per tier and NEVER divided by the node count -- the old flow
+ *  diagram sized boxes as `(TW - (k-1)*GAP)/k`, which goes negative at five
+ *  nodes in a row and silently erases them. */
 export const CARD: Record<Tier, { w: number; h: number }> = {
   full: { w: 138, h: 84 },
   compact: { w: 102, h: 54 },
-  chip: { w: 78, h: 38 },
+  chip: { w: 78, h: 26 },
 }
 
 /** Extra plate height reserved for the identity line under a machine's name.
@@ -732,9 +761,11 @@ export interface ClusterLayout {
    *  it. */
   offsetX: number
   card: { w: number; h: number }
-  /** SUBLINE_H when some machine on this floor is named something other than
-   *  its node_id and the tier has room to say so, 0 otherwise. The renderer
-   *  shifts every full-tier plate's rows down by it. */
+  /** Always 0 since the floor stopped resting at the full tier: no plate has
+   *  room for the identity line any more, and it lives in the plate's tooltip
+   *  and the node sheet instead. Kept as a field -- and pinned at 0 by
+   *  layout.check.mjs -- so the seam is still here the day a tier with room
+   *  comes back. See SUBLINE_H for what it used to reserve. */
   subline: number
   cards: PlacedCard[]
   edges: ClusterEdge[]
@@ -758,6 +789,13 @@ export interface ClusterLayout {
    *  would silently misattribute the moment a target has no drawable
    *  deployment and the indices shift under it. */
   paths: Record<string, Point[]>
+  /** The same flights, rendered: each entry is `roundedPath(paths[key],
+   *  CORNER_R)` -- the identical fillet treatment an edge's own `dRender`
+   *  gets, so a particle drawn along this string is geometrically on the
+   *  wire through every corner instead of cutting across it on the
+   *  unfilleted vertex path. `paths` itself stays the straight vertex proof
+   *  `layout.check.mjs` reads; this is a rendering-only companion. */
+  pathsRender: Record<string, string>
   emptyMessage: string | null
   suppressedPairs: number
 }
@@ -810,12 +848,6 @@ export function edgeMeasured(edge: Pick<TopologyEdge, 'measured' | 'all_reduce_g
  *  threshold. Authored units, so 4.5 renders at 6. */
 export function edgeWidth(gbps: number): number {
   return 1.2 + 4.5 * Math.min(1, gbps / TP_THRESHOLD)
-}
-
-export function tierFor(n: number): Tier {
-  if (n <= 4) return 'full'
-  if (n <= 8) return 'compact'
-  return 'chip'
 }
 
 /** Plate width for a caption, from the real font metric. IBM Plex Mono's
@@ -1865,15 +1897,23 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
   // different place.
   const deployments = runners(input.deployments)
   const n = arrangement.length
-  const tier = tierFor(n)
-  // Only full-tier plates have room for the identity line, and only a floor
-  // that actually needs one pays for it -- a cluster where every machine goes
-  // by its node_id looks exactly as it did before this existed.
-  const subline =
-    tier === 'full' && input.nodes.some((node) => nodeSubtitle(node, node.hostname))
-      ? SUBLINE_H
-      : 0
-  const heightOf = (t: Tier) => CARD[t].h + (t === 'full' ? subline : 0)
+  // The floor always rests at the minimal presentation -- name, occupant,
+  // memory meter -- regardless of how many machines are on it. Selecting a
+  // plate still promotes it to `compact` in place (see `bodyTierOf`), which
+  // is what makes this a size change and not a loss of the peek. `full`
+  // stays a real `Tier` (layout.check.mjs and plateNeed still exercise it as
+  // a pure function) but nothing here asks for it any more: showing GPU%,
+  // memory%, hardware spec or a renamed node's subtitle inline would mean
+  // reserving floor-wide width for that content even at rest, which is
+  // exactly the oversized-box problem this replaces. That detail lives in
+  // the roster sidebar and the node sheet instead.
+  const tier: Tier = 'chip'
+  // Only a full-tier plate has room for the identity line, and the floor
+  // never rests there any more -- the identity still shows, in the tooltip
+  // and the node sheet, it just no longer costs every plate on the floor a
+  // taller row.
+  const subline = 0
+  const heightOf = (t: Tier) => CARD[t].h
   const present = new Set(arrangement)
   // What each machine is running, which shares the plate's top line with its
   // name and is the pair that used to collide.
@@ -1906,9 +1946,11 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
   // Hand-placement, sanitised once here rather than trusted at every read.
   // The store is localStorage, which anyone can hand-edit and any older build
   // can have written, so a NaN or a number four screens wide has to mean "not
-  // moved" rather than a floor that cannot be drawn.
-  const offsetOf = (nodeId: string): Point => {
-    const o = input.offsets?.[nodeId]
+  // moved" rather than a floor that cannot be drawn. EVERY placement lookup
+  // goes through this -- machines, bands, the provider bus -- because a NaN
+  // that reaches any box poisons the ink min/max and blanks the whole floor.
+  const offsetOf = (key: string): Point => {
+    const o = input.offsets?.[key]
     if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.y)) return { x: 0, y: 0 }
     const bound = (v: number) => Math.max(-OFFSET_LIMIT, Math.min(OFFSET_LIMIT, v))
     return { x: bound(o.x), y: bound(o.y) }
@@ -1925,12 +1967,13 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
   const conns: ClusterConn[] = []
   const junctions: { x: number; y: number; r: number; opacity: number }[] = []
   const paths: Record<string, Point[]> = {}
+  const pathsRender: Record<string, string> = {}
 
   if (n === 0) {
     return {
       // No ink to frame: this path renders the message as a <p>, not the SVG.
       tier, kind, width: GW, height: GH, ink: { x: 0, y: 0, w: GW, h: GH }, offsetX: 0, card, subline,
-      cards, edges, bands, conns, junctions, slots, paths,
+      cards, edges, bands, conns, junctions, slots, paths, pathsRender,
       entries: [], exits: [], provider: null,
       arrangement,
       emptyMessage: 'No machines yet. A Spark on this network appears here on its own.',
@@ -1951,11 +1994,23 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     spannedPairs.has(edgeKey(l.src, l.dst)) ||
     n <= 4 ||
     input.selection.selNode === l.src ||
-    input.selection.selNode === l.dst
+    input.selection.selNode === l.dst ||
+    // The selected link itself. The rail's chip list and the [ / ] keyboard
+    // cycle can select ANY pair, and a selection the floor refuses to draw is
+    // a detail rail about a wire that is nowhere on the canvas.
+    input.selection.selLink === edgeKey(l.src, l.dst)
 
   const floorAvail = Math.max(card.w, GW - FLOOR_X - EXIT_RESERVE - MARGIN)
   let floorRight = FLOOR_X + floorAvail
   let machineBottom: number
+
+  // Selection GROWS the plate in place rather than opening anything over the
+  // drawing. That is the mockup's own rule ("height is data-driven so the
+  // selected node grows in place"), and now that the floor always rests at
+  // chip it is also the ONLY way power and temperature reach the floor -- so
+  // it applies on both floor kinds, not just the grid.
+  const bodyTierOf = (nodeId: string): Tier =>
+    nodeId === input.selection.selNode ? 'compact' : tier
 
   if (kind === 'grid') {
     const gx = GAP_X[tier]
@@ -1981,17 +2036,8 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     })
     const topPad = willArc ? ARC_HEADROOM : MARGIN
 
-    // Selection GROWS the plate in place rather than opening anything over the
-    // drawing, so a row is only as tall as its tallest plate and the rows
-    // below shift down. That is the mockup's own rule ("height is data-driven
-    // so the selected node grows in place") and it is why row tops accumulate
-    // instead of being row * pitch.
-    const bodyTierOf = (nodeId: string): Tier =>
-      nodeId === input.selection.selNode && tier !== 'full'
-        ? tier === 'chip'
-          ? 'compact'
-          : 'full'
-        : tier
+    // A row is only as tall as its tallest plate and the rows below shift
+    // down, which is why row tops accumulate instead of being row * pitch.
     const rowHeights = Array.from({ length: rows }, (_, r) =>
       Math.max(
         ...arrangement
@@ -2030,18 +2076,24 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     const cy = MARGIN + h / 2
     arrangement.forEach((nodeId, i) => {
       const angle = -Math.PI / 2 + (i / n) * 2 * Math.PI
+      // The grown plate expands about its own ring point rather than hanging
+      // off it, so a selection does not read as the machine moving.
+      const bodyTier = bodyTierOf(nodeId)
+      const ch = heightOf(bodyTier)
       const x = cx + radius * Math.cos(angle) - card.w / 2
-      const y = cy + radius * Math.sin(angle) - card.h / 2
+      const y = cy + radius * Math.sin(angle) - ch / 2
       slots.push({ x, y })
       cards.push({
-        nodeId, x, y, w: card.w, h: card.h, slot: i, row: 0, col: i,
+        nodeId, x, y, w: card.w, h: ch, slot: i, row: 0, col: i,
         offset: { x: 0, y: 0 },
         selected: nodeId === input.selection.selNode,
-        bodyTier: tier,
+        bodyTier,
       })
     })
     floorRight = Math.max(FLOOR_X + w, FLOOR_X + card.w)
-    machineBottom = MARGIN + h
+    // The bands hang below the machines, and a plate grown at the ring's
+    // bottom can reach past the resting circle.
+    machineBottom = Math.max(MARGIN + h, ...cards.map((c) => c.y + c.h))
   }
 
   // ── Hand-placement, applied once ─────────────────────────────────────────
@@ -2117,19 +2169,22 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     const fraction = measured ? Math.min(1, link.all_reduce_gbps! / TP_THRESHOLD) : 0
     const label = measured ? `${link.all_reduce_gbps!.toFixed(1)} of ${TP_THRESHOLD} GB/s` : 'never measured'
 
-    // The mockup's bracket: a 7-tall bar filling the channel between two
-    // facing plates, top edge at a.y+19 so it lines up with the meters inside
-    // them. Only where there IS a channel -- a bracket cannot span an elbow.
+    // The mockup's bracket, kept on the mockup's own rule: it lines up with
+    // the meters inside the plates it spans. The meter sits at y+16, 8 tall
+    // (MachinePlate), so the bar takes exactly that band -- the old +19/7
+    // matched the taller plate this floor no longer rests at, and left the
+    // bar flush with the plate's bottom edge instead of level with its meter.
+    // Only where there IS a channel -- a bracket cannot span an elbow.
     const horizontal = kind === 'grid' && level(a, b)
     const bracket: ClusterBracket | null =
       geo.facing && horizontal
         ? {
             x: Math.min(a.x + a.w, b.x + b.w),
-            y: Math.min(a.y, b.y) + 19,
+            y: Math.min(a.y, b.y) + 16,
             w: Math.abs(a.x <= b.x ? b.x - (a.x + a.w) : a.x - (b.x + b.w)),
-            h: 7,
+            h: 8,
             fraction,
-            hitY: Math.min(a.y, b.y) + 14,
+            hitY: Math.min(a.y, b.y) + 11,
             hitH: 18,
           }
         : null
@@ -2380,8 +2435,10 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     // Hand-placement, both axes -- unlike a machine's, this offset is looked
     // up before the band's own final geometry exists, because the leads
     // below have to be routed against where it actually ends up, not where
-    // it was packed.
-    const bandOffset = input.offsets?.[dep.deployment_id] ?? { x: 0, y: 0 }
+    // it was packed. Through the same sanitizer the machines use: a NaN here
+    // used to poison the ink box and blank the whole floor, and an absurd
+    // value was obeyed rather than bounded.
+    const bandOffset = offsetOf(dep.deployment_id)
     const x = span.x + bandOffset.x
     const y = naturalY + bandOffset.y
     const backups = backupsFor.get(dep.served_name) ?? []
@@ -2448,7 +2505,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     const occupied = plates(g.hostIds)
     const naturalY = bandY
     const span = spanOf(occupied)
-    const bandOffset = input.offsets?.[`remote:${g.servedName}`] ?? { x: 0, y: 0 }
+    const bandOffset = offsetOf(`remote:${g.servedName}`)
     const x = span.x + bandOffset.x
     const y = naturalY + bandOffset.y
     const plan = `via ${providersLabel(g.providers)}`
@@ -2552,7 +2609,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     // Vertical only, same reasoning as the provider bus: this box spans the
     // full floor width by construction, so a horizontal offset has nowhere
     // honest to go.
-    const bandOffset = input.offsets?.[`remote:${g.servedName}`] ?? { x: 0, y: 0 }
+    const bandOffset = offsetOf(`remote:${g.servedName}`)
     const y = naturalY + bandOffset.y
     bands.push({
       id: `remote:${g.servedName}`,
@@ -2689,6 +2746,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
       ]
       conns.push(connFrom(`exit-${band.id}`, out, 5, 1))
       paths[outFlightKey(band.id)] = out
+      pathsRender[outFlightKey(band.id)] = roundedPath(out, CORNER_R)
     }
   })
 
@@ -2697,8 +2755,8 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     // Hand-placement, vertical only -- see ClusterProvider.offset. Folded in
     // here, at the one place `provY` is computed, so `busY`/`outY`/the box
     // itself all move together and nothing downstream has to know a drag
-    // happened at all.
-    const providerOffsetY = input.offsets?.[PROVIDER_NODE_ID]?.y ?? 0
+    // happened at all. Through `offsetOf`, like every other placement.
+    const providerOffsetY = offsetOf(PROVIDER_NODE_ID).y
     const provY = bandBottom + 20 + providerOffsetY
     let anyActive = false
     const activeProviders = new Set<string>()
@@ -2753,7 +2811,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
         opacity: active ? 1 : 0.55,
       })
       const py = entryY.get(band.id) ?? band.ny
-      paths[providerFlightKey(band.servedName)] = [
+      const providerPts: Point[] = [
         { x: ENTRY_R, y: py },
         { x: GUTTER_ENTRY, y: py },
         { x: GUTTER_ENTRY, y: band.ny },
@@ -2768,6 +2826,8 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
         { x: dropX, y: busY },
         { x: floorRight, y: busY },
       ]
+      paths[providerFlightKey(band.servedName)] = providerPts
+      pathsRender[providerFlightKey(band.servedName)] = roundedPath(providerPts, CORNER_R)
     }
 
     // One trunk, not one vertical per band: N runs down the same corridor
@@ -2899,12 +2959,19 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
         pts.push(...(forward ? seg : [...seg].reverse()), next)
       }
       paths[localFlightKey(servedName, dep.deployment_id)] = pts
+      pathsRender[localFlightKey(servedName, dep.deployment_id)] = roundedPath(pts, CORNER_R)
     }
   }
 
-  // Centre the ink. The extremes are the boxes, not the connectors: a
+  // Centre the ink. The boxes set the frame almost everywhere -- a flow
   // connector only ever runs between two of them, and the provider rail's own
-  // trunk sits inside the provider box's span.
+  // trunk sits inside the provider box's span -- but the LINKS do not stay
+  // inside them: a hop over the first row rises into ARC_HEADROOM above the
+  // plates, a side-channel route can leave the outermost column, and every
+  // caption is a plate of its own that the collision nudge above can push
+  // higher still. The fit crops to this box, so all of that is measured into
+  // it here -- headroom reserved in layout coordinates protects nothing if
+  // the frame the renderer scales to does not include it.
   const boxes: { x: number; y: number; w: number; h: number }[] = [
     ...cards,
     ...bands,
@@ -2915,6 +2982,15 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
     ...exits,
   ]
   if (provider) boxes.push(provider)
+  for (const e of edges) {
+    for (const p of e.pts) boxes.push({ x: p.x, y: p.y, w: 0, h: 0 })
+    // The exact rect Caption draws in ClusterGraph: plateWidth wide, centred
+    // on labelAt, rising 9 above its baseline.
+    if (e.showLabel) {
+      const cw = plateWidth(e.label)
+      boxes.push({ x: e.labelAt.x - cw / 2, y: e.labelAt.y - 9, w: cw, h: 13 })
+    }
+  }
   const inkL = Math.min(...boxes.map((b) => b.x))
   const inkR = Math.max(...boxes.map((b) => b.x + b.w))
   // Same reasoning down the other axis, which the fit transform needs. Padded
@@ -2934,7 +3010,7 @@ export function layoutCluster(input: ClusterLayoutInput): ClusterLayout {
 
   return {
     tier, kind, width: GW, height: GH, ink, offsetX, card, subline,
-    cards, edges, bands, conns, junctions, slots, paths,
+    cards, edges, bands, conns, junctions, slots, paths, pathsRender,
     entries, exits, provider,
     arrangement,
     emptyMessage: null,

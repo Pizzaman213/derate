@@ -19,12 +19,12 @@ interface Props {
 // browser, and saying otherwise on a screen next to one that shows them is
 // worse than saying nothing.
 const NOTE =
-  'Every series below comes from the 1 Hz metrics frame and is accumulated in this browser; this window is 60 seconds and starts empty on load. The coordinator also keeps a durable archive, which a node\u2019s own page charts over longer windows and which carries real TTFT and duration percentiles. Nothing on this screen does: the frame\u2019s TTFT and mean duration are moving averages.'
+  'Every series below comes from the 1 Hz metrics frame and is accumulated in this browser; this window is 60 seconds and starts empty on load. The coordinator also keeps a durable archive, which a node\u2019s own page charts over longer windows and which carries real TTFT and duration percentiles. Nothing on this screen does: the frame\u2019s TTFT and mean duration are moving averages. The prefix-cache trace is the one series here the coordinator samples on its own slower clock rather than reading off the frame\u2019s own tick, so it steps every ten seconds and is blank wherever nothing was asked of a cache.'
 
 /** Drill-down, not a wall: cluster charts are always on, per-Spark and
  *  per-deployment charts render only for the current selection. Selection is
  *  shared with the deployments strip and the cluster graph, so drilling in
- *  one place drills everywhere. Nine series total, because that is exactly
+ *  one place drills everywhere. Ten series total, because that is exactly
  *  what the 1 Hz frame carries -- see state/useTelemetry.ts. */
 export function TelemetrySub({ nodes, telemetry, selection }: Props) {
   const selectedNode = nodes.find((n) => n.profile.node_id === selection.selNode)
@@ -40,6 +40,12 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
         <ChartGrid>
           <Chart title="Throughput, all models" unit="tok/s" points={telemetry.clusterTps} />
           <Chart title="Power drawn" unit="W" points={telemetry.clusterPower} />
+          {/* Gaps here are the ordinary case, not a dropped frame: the
+              coordinator scrapes this every 10s against ready vLLMs only, and
+              answers null for a window in which nothing was asked of any
+              cache. `push` keeps a null as a real point so the trace breaks
+              rather than interpolating across it. */}
+          <Chart title="Prefix cache hits" unit="%" points={telemetry.clusterCacheHit} />
         </ChartGrid>
       </section>
 

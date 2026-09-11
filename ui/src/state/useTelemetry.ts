@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { SafeMetricsFrame } from './useMetrics'
 
-// Exactly nine series, because that is what the Telemetry sub-tab's three
-// chart rows draw: cluster (2), per Spark (4, keyed by node_id), per
+// Exactly ten series, because that is what the Telemetry sub-tab's three
+// chart rows draw: cluster (3), per Spark (4, keyed by node_id), per
 // deployment (3, keyed by served_name -- the metrics frame only knows
 // deployment_id, so the caller supplies the lookup).
 //
@@ -23,6 +23,11 @@ export interface TelemetryPoint {
 export interface TelemetrySeries {
   clusterTps: TelemetryPoint[]
   clusterPower: TelemetryPoint[]
+  /** Prefix-cache hits as a percentage of queries, over the coordinator's own
+   *  scrape window. `null` is the ordinary case, not an error: no ready vLLM,
+   *  a backend with metrics off, or a cluster that served nothing this tick.
+   *  See gateway/metrics.py::_prefix_cache_loop. */
+  clusterCacheHit: TelemetryPoint[]
   nodePower: Record<string, TelemetryPoint[]>
   nodeTemp: Record<string, TelemetryPoint[]>
   nodeMem: Record<string, TelemetryPoint[]>
@@ -40,6 +45,7 @@ const WINDOW_S = 60
 const EMPTY: TelemetrySeries = {
   clusterTps: [],
   clusterPower: [],
+  clusterCacheHit: [],
   nodePower: {},
   nodeTemp: {},
   nodeMem: {},
@@ -112,6 +118,7 @@ export function useTelemetry(
       return {
         clusterTps: push(prev.clusterTps, t, frame.cluster.tokens_per_sec),
         clusterPower: push(prev.clusterPower, t, frame.cluster.total_power_w),
+        clusterCacheHit: push(prev.clusterCacheHit, t, frame.cluster.cache_hit_pct),
         nodePower: pushKeyed(prev.nodePower, nodeIds, t, (id) => nodeById.get(id)?.power_w ?? null),
         nodeTemp: pushKeyed(prev.nodeTemp, nodeIds, t, (id) => nodeById.get(id)?.temp_c ?? null),
         nodeMem: pushKeyed(

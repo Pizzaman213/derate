@@ -23,6 +23,14 @@ const EMPTY_TOPOLOGY = { cluster_id: '', coordinator: '', nodes: [], edges: [], 
  *  This component fetches its own data (the same `state/resources` hooks every
  *  other destination uses) rather than taking props, so it can be dropped into
  *  AppShell's `cluster` tabpanel on its own. */
+/** The two size bands the server files NCCL records under
+ *  (`measurements.DECODE_COLLECTIVE_BYTES` / `BULK_COLLECTIVE_BYTES`, run
+ *  through `measurements.band`). Structural rather than fetched: the decode
+ *  all-reduce a TP step issues is `hidden_size x 2 x batch` and the prefill
+ *  one is megabytes. */
+const DECODE_BAND = 8192
+const BULK_BAND = 4194304
+
 export function ClusterTab() {
   const cluster = useCluster()
   const topology = useTopology()
@@ -35,6 +43,10 @@ export function ClusterTab() {
   // The reachability check is separate state from the measurement above, and
   // deliberately so: they are different questions at different prices, and one
   // running must not grey out the other's button.
+  // Only an error, deliberately. See `tune` below: the request returns in
+  // milliseconds and the work runs for minutes, so a local in-flight flag
+  // would be wrong almost immediately.
+  const [tuneError, setTuneError] = useState<{ key: string; message: string } | null>(null)
   const [checking, setChecking] = useState<string | null>(null)
   const [reachReport, setReachReport] = useState<{ key: string; value: ReachReport } | null>(null)
   const [reachError, setReachError] = useState<{ key: string; message: string } | null>(null)
@@ -72,8 +84,24 @@ export function ClusterTab() {
     [clusterId],
   )
 
+  /** A keyboard reorder hands back the RECONCILED arrangement -- present
+   *  machines only -- but the stored order keeps departed ids so a machine
+   *  that leaves and rejoins returns to the slot somebody put it in
+   *  (order.ts). Overwriting the store with the present-only list silently
+   *  dropped those slots, so each departed id is spliced back in at the
+   *  position it held. */
   const reorder = useCallback(
-    (order: string[]) => save({ ...arrangementRef.current, order }),
+    (order: string[]) => {
+      const stored = arrangementRef.current.order
+      const merged = [...order]
+      if (stored) {
+        const present = new Set(order)
+        for (const id of stored.filter((v) => !present.has(v))) {
+          merged.splice(Math.min(stored.indexOf(id), merged.length), 0, id)
+        }
+      }
+      save({ ...arrangementRef.current, order: merged })
+    },
     [save],
   )
 
@@ -107,6 +135,27 @@ export function ClusterTab() {
       setMeasureError({ key, message: err instanceof Error ? err.message : 'Measurement failed.' })
     } finally {
       setMeasuring(null)
+    }
+  }
+
+  // No local in-flight state, unlike `measure` above, and that is the point.
+  // The request returns in milliseconds while the calibration runs for
+  // minutes, so a local flag would clear at once and invite a second press --
+  // which the server would NOT refuse: `calibrate` and `measure` share one
+  // lock, so it would block silently for minutes. The button reads
+  // `edge.measuring` off the poll instead, which is also correct after a
+  // reload and correct for a second person watching the same cluster.
+  const tune = async (a: string, b: string) => {
+    const key = [a, b].sort().join('~')
+    setTuneError(null)
+    try {
+      await backend.tuneLink(a, b)
+      invalidate()
+    } catch (err) {
+      setTuneError({
+        key,
+        message: err instanceof Error ? err.message : 'Calibration failed to start.',
+      })
     }
   }
 
@@ -151,6 +200,7 @@ export function ClusterTab() {
           <ClusterGraph
             ref={graphRef}
             deployments={cluster.data?.deployments ?? []}
+            deploymentsKnown={cluster.data != null}
             topology={topology.data ?? EMPTY_TOPOLOGY}
             nodes={cluster.data?.nodes ?? []}
             routing={routing.data ?? []}
@@ -192,6 +242,14 @@ export function ClusterTab() {
             report: reachReport,
             error: reachError,
             onCheck: (a, b) => void checkReach(a, b),
+          }}
+          tune={{
+            error: tuneError,
+            onTune: (a, b) => void tune(a, b),
+            // The server's own size bands, so an evidence line is read at the
+            // size its record was filed under.
+            decodeBand: DECODE_BAND,
+            bulkBand: BULK_BAND,
           }}
           crowded={nodeCount > 4}
         />

@@ -39,8 +39,27 @@ export function fitLamp(variant: QuantVariant, onCluster = true): Lamp {
         ? { signal: 'fault', label: 'will not fit right now — fits on an idle machine' }
         : { signal: 'fault', label: 'will not fit' }
     default:
-      return { signal: 'idle', label: 'not checked' }
+      // A launchable row with no measured size was never handed to the gate,
+      // and "not checked" is the wrong word for that: it reads as a spinner
+      // that has not landed yet, when the truth is that nothing is coming.
+      // The gateway refuses to judge these rather than pricing them from the
+      // dtype formula -- on `Qwen/Qwen3.8-Flash-Next` that formula claimed
+      // 54.7 GiB to spare on a checkpoint that overflows by 4.1.
+      return unsized(variant)
+        ? { signal: 'idle', label: 'cannot be sized' }
+        : { signal: 'idle', label: 'not checked' }
   }
+}
+
+/** A row the fit gate deliberately did not judge.
+ *
+ *  Mirrors `capacity_api.py::_unsized`. A GGUF row is never launchable and is
+ *  priced from its own measured files, so this is only ever true of a
+ *  safetensors repository whose weight index could not be read -- gated,
+ *  rate-limited, or publishing no index at all.
+ */
+export function unsized(variant: QuantVariant): boolean {
+  return variant.launchable && variant.file_bytes == null
 }
 
 /** The Decode cell.

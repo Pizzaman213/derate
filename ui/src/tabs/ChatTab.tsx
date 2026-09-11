@@ -1,12 +1,13 @@
 import { useMemo, useRef, useState } from 'react'
 import { ENDPOINT_FOR_MODALITY } from '../api/types'
-import type { ChatMessage } from '../api/types'
+import type { ChatContentPart, ChatMessage } from '../api/types'
 import { useBackend } from '../state/backend'
 import { useCluster, useModels } from '../state/resources'
 import { useSelection } from '../state/selection'
 import { ModelList, buildRows, emptyNote } from './chat/ModelList'
 import { Transcript, type Turn } from './chat/Transcript'
-import { Composer, type SendExtra } from './chat/Composer'
+import { Composer, type ImageAttachment, type SendExtra } from './chat/Composer'
+import { DEFAULT_CHAT_PARAMS, parseMaxTokens, parseStop, parseTemperature } from './chat/RequestParams'
 import { useVoices } from './chat/useVoices'
 
 // Why this exists against a named non-goal.
@@ -16,7 +17,9 @@ import { useVoices } from './chat/useVoices'
 // The history half of that still holds here and is enforced by construction:
 // the transcript below is React state and nothing else. No localStorage, no
 // fetch on mount, no server-side surface, nothing added to the backend. Reload
-// the page and it is gone.
+// the page and it is gone. Every richer feature added since -- edit/resend,
+// regenerate, per-message reasoning, request params, image attachments --
+// lives in exactly this same in-memory state and disappears with it.
 //
 // The interface half was reversed deliberately. Until this tab there was no
 // way, from inside the product, to confirm that a deployment this cluster is
@@ -45,6 +48,21 @@ import { useVoices } from './chat/useVoices'
 // Settings' "Deliberately out of scope" card was narrowed to match, so the
 // product does not deny a feature it ships.
 
+/** A turn's `content`, widened into the OpenAI multi-part shape whenever it
+ *  carries an image -- the same shape the new outgoing user message uses, so
+ *  a picture attached three turns ago is still in the model's context on the
+ *  next send rather than silently dropped from history. */
+function turnToMessage(t: Turn): ChatMessage {
+  if (t.images && t.images.length > 0) {
+    const parts: ChatContentPart[] = [
+      { type: 'text', text: t.content },
+      ...t.images.map((img) => ({ type: 'image_url' as const, image_url: { url: img.url } })),
+    ]
+    return { role: t.role, content: parts }
+  }
+  return { role: t.role, content: t.content }
+}
+
 export function ChatTab() {
   const { backend } = useBackend()
   const models = useModels()
@@ -58,7 +76,12 @@ export function ChatTab() {
 
   const [turns, setTurns] = useState<Turn[]>([])
   const [streamingKey, setStreamingKey] = useState<number | null>(null)
+  const [params, setParams] = useState(DEFAULT_CHAT_PARAMS)
   const abortRef = useRef<AbortController | null>(null)
+  // Minted in (even, odd) pairs, one call to `send` at a time -- `userKey` is
+  // always even and `replyKey = userKey + 1` is always odd, and no other call
+  // site hands one out. `deleteTurn` below relies on exactly this to find a
+  // turn's other half from either one's key alone.
   const nextKey = useRef(0)
 
   const rows = useMemo(() => buildRows(models.data ?? []), [models.data])
@@ -114,30 +137,75 @@ export function ChatTab() {
 
   const busy = streamingKey !== null
 
-  const send = async (text: string, extra: SendExtra | null) => {
+  /** `history` defaults to the live transcript, and is only ever given
+   *  explicitly by `editAndResend`/`regenerate` below -- both truncate the
+   *  transcript first (dropping an edited turn's old reply, or a
+   *  regenerated one) and need `send` to build the outgoing `messages` from
+   *  that truncated list rather than from state that has not caught up yet. */
+  const send = async (text: string, extra: SendExtra, history: Turn[] = turns) => {
     if (!active || busy) return
 
-    // History is every turn that carries real text and did not fail. A refused
-    // turn has no assistant content to send back, and a stopped one does --
-    // a partial answer is still what the model said.
-    const messages: ChatMessage[] = turns
-      .filter((t) => t.error === null && t.content !== '')
-      .map((t) => ({ role: t.role, content: t.content }))
-    messages.push({ role: 'user', content: text })
+    // History is every turn that carries real text or an image and did not
+    // fail. A refused turn has no assistant content to send back, and a
+    // stopped one does -- a partial answer is still what the model said.
+    const messages: ChatMessage[] = history
+      .filter((t) => t.error === null && (t.content !== '' || (t.images?.length ?? 0) > 0))
+      .map(turnToMessage)
+    const system = params.system.trim()
+    if (system) messages.unshift({ role: 'system', content: system })
 
     const userKey = nextKey.current++
     const replyKey = nextKey.current++
+
+    const userImages = extra.kind === 'chat' ? extra.images : []
+    const userContent: ChatMessage['content'] =
+      userImages.length > 0
+        ? ([
+            { type: 'text', text },
+            ...userImages.map((img) => ({
+              type: 'image_url' as const,
+              image_url: { url: img.dataUrl },
+            })),
+          ] as ChatContentPart[])
+        : text
+    messages.push({ role: 'user', content: userContent })
+
     // `model: active` on BOTH halves, recorded here because this is the only
     // moment it is known. The picker can move to another model before the
     // answer lands and will move again over the life of the transcript, so a
     // turn that reads the current selection at render time would relabel and
     // recolour itself every time somebody switched -- which is the opposite of
     // what the colour is for. See chat/tags.ts.
-    setTurns((prev) => [
-      ...prev,
-      { key: userKey, role: 'user', content: text, meta: null, error: null, requestId: null, audio: null, model: active },
-      { key: replyKey, role: 'assistant', content: '', meta: null, error: null, requestId: null, audio: null, model: active },
-    ])
+    const userTurn: Turn = {
+      key: userKey,
+      role: 'user',
+      content: text,
+      reasoning: '',
+      meta: null,
+      error: null,
+      requestId: null,
+      audio: null,
+      images:
+        userImages.length > 0
+          ? userImages.map((img) => ({ url: img.dataUrl, name: img.name }))
+          : null,
+      model: active,
+      kind: extra.kind,
+    }
+    const replyTurn: Turn = {
+      key: replyKey,
+      role: 'assistant',
+      content: '',
+      reasoning: '',
+      meta: null,
+      error: null,
+      requestId: null,
+      audio: null,
+      images: null,
+      model: active,
+      kind: extra.kind,
+    }
+    setTurns(() => [...history, userTurn, replyTurn])
     setStreamingKey(replyKey)
 
     const ac = new AbortController()
@@ -146,7 +214,7 @@ export function ChatTab() {
       setTurns((prev) => prev.map((t) => (t.key === replyKey ? fn(t) : t)))
 
     try {
-      if (extra?.kind === 'transcription') {
+      if (extra.kind === 'transcription') {
         // Audio in, text out. The answer is text, so it lands in `content`
         // and every reader that already understood a chat turn renders it
         // unchanged -- the transcription case is the cheap one, and the
@@ -170,10 +238,11 @@ export function ChatTab() {
             elapsedMs: null,
             completionTokens: null,
             tokensEstimated: false,
+            reasoningMs: null,
             stopped: false,
           },
         }))
-      } else if (extra?.kind === 'speech') {
+      } else if (extra.kind === 'speech') {
         // The whole of the branch. No history is sent -- a speech request has
         // an `input`, not a conversation, and the server would refuse an
         // unknown field.
@@ -205,6 +274,7 @@ export function ChatTab() {
             elapsedMs: null,
             completionTokens: null,
             tokensEstimated: false,
+            reasoningMs: null,
             stopped: false,
           },
         }))
@@ -216,15 +286,20 @@ export function ChatTab() {
           // refused still names the row that recorded the refusal.
           onOpen: (id) => patch((t) => ({ ...t, requestId: id })),
           onDelta: (chunk) => patch((t) => ({ ...t, content: t.content + chunk })),
+          onReasoning: (chunk) => patch((t) => ({ ...t, reasoning: t.reasoning + chunk })),
           signal: ac.signal,
+          temperature: parseTemperature(params.temperature),
+          max_tokens: parseMaxTokens(params.maxTokens),
+          stop: parseStop(params.stop),
         })
         patch((t) => ({ ...t, meta }))
       }
     } catch (e) {
-      // Stop, on the speech path. chatStream swallows its own abort and
-      // returns a stopped meta; `speech()` cannot -- there is no partial
-      // audio to keep -- so the turn is marked stopped rather than failed.
-      if ((speaking || transcribing) && ac.signal.aborted) {
+      // Stop, on the speech/transcription path. chatStream swallows its own
+      // abort and returns a stopped meta; neither of these can -- there is no
+      // partial audio or partial transcript to keep -- so the turn is marked
+      // stopped rather than failed.
+      if (extra.kind !== 'chat' && ac.signal.aborted) {
         patch((t) => ({
           ...t,
           meta: {
@@ -234,6 +309,7 @@ export function ChatTab() {
             elapsedMs: null,
             completionTokens: null,
             tokensEstimated: false,
+            reasoningMs: null,
             stopped: true,
           },
         }))
@@ -247,6 +323,48 @@ export function ChatTab() {
       abortRef.current = null
       setStreamingKey(null)
     }
+  }
+
+  /** A sent user turn, edited and resubmitted. Drops that turn and its old
+   *  reply (and anything after -- there never is anything, a reply is always
+   *  the last turn) rather than appending a correction, the same "ask again"
+   *  model ChatGPT/Claude.ai's own edit uses. Only ever called on a turn
+   *  `Transcript` has already gated to `kind === 'chat'`. */
+  const editAndResend = (key: number, text: string) => {
+    if (busy) return
+    const idx = turns.findIndex((t) => t.key === key)
+    const turn = turns[idx]
+    if (idx === -1 || !turn) return
+    const images: ImageAttachment[] = (turn.images ?? []).map((img) => ({
+      name: img.name,
+      dataUrl: img.url,
+    }))
+    void send(text, { kind: 'chat', images }, turns.slice(0, idx))
+  }
+
+  /** Re-asks the question behind one assistant turn. `assistantKey` is always
+   *  the user turn's key + 1 (see `nextKey`), so its question is a lookup,
+   *  not a search. */
+  const regenerate = (assistantKey: number) => {
+    if (busy) return
+    const idx = turns.findIndex((t) => t.key === assistantKey)
+    if (idx <= 0) return
+    const userTurn = turns[idx - 1]
+    if (!userTurn || userTurn.role !== 'user') return
+    const images: ImageAttachment[] = (userTurn.images ?? []).map((img) => ({
+      name: img.name,
+      dataUrl: img.url,
+    }))
+    void send(userTurn.content, { kind: 'chat', images }, turns.slice(0, idx - 1))
+  }
+
+  /** Removes one exchange, both halves together -- deleting only a reply
+   *  would leave an orphaned question in the history the next send builds,
+   *  and deleting only a question would leave an answer to nothing. */
+  const deleteTurn = (key: number) => {
+    if (busy) return
+    const [a, b] = key % 2 === 0 ? [key, key + 1] : [key - 1, key]
+    setTurns((prev) => prev.filter((t) => t.key !== a && t.key !== b))
   }
 
   return (
@@ -284,6 +402,10 @@ export function ChatTab() {
             streamingKey={streamingKey}
             model={active}
             mode={activeRow?.modality ?? 'text'}
+            busy={busy}
+            onEdit={editAndResend}
+            onRegenerate={regenerate}
+            onDelete={deleteTurn}
           />
         </div>
 
@@ -298,6 +420,8 @@ export function ChatTab() {
           library={library}
           voicesError={voicesError}
           transcribing={transcribing}
+          params={params}
+          onParamsChange={setParams}
         />
       </div>
     </div>

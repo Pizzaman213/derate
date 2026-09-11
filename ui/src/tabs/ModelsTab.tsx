@@ -22,6 +22,7 @@ import { ModelInspector } from './models/ModelInspector'
 import { UnchosenBanner } from './models/UnchosenBanner'
 import { CustomServesCard } from './models/CustomServes'
 import type { CustomServe } from '../state/customServes'
+import { Select, type SelectOption } from '../components/Select'
 import {
   cacheIndex,
   registryRows,
@@ -450,29 +451,19 @@ export function ModelsTab() {
             ) : null}
           </div>
 
-          <select
+          <Select
             aria-label="Format filter"
             value={format}
-            onChange={(e) => setFormat(e.target.value as Format)}
-          >
-            {FORMATS.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.label}
-              </option>
-            ))}
-          </select>
+            options={FORMATS.map((f): SelectOption<Format> => ({ value: f.id, label: f.label }))}
+            onChange={setFormat}
+          />
 
-          <select
+          <Select
             aria-label="Sort models"
             value={sort}
-            onChange={(e) => setSort(e.target.value as Sort)}
-          >
-            {SORTS.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.label}
-              </option>
-            ))}
-          </select>
+            options={SORTS.map((s): SelectOption<Sort> => ({ value: s.id, label: s.label }))}
+            onChange={setSort}
+          />
 
           <div className="mview" role="radiogroup" aria-label="View">
             {(['cards', 'rows'] as View[]).map((v) => (
@@ -533,8 +524,11 @@ export function ModelsTab() {
                     `${capacity.data.concurrency === 1 ? 'sequence' : 'sequences'}, `
                   : 'each at the largest context it can hold up to its own window, ') +
                 (capacity.data.budget_basis === 'host_memory'
-                  ? 'against host memory — no GPU was found, so nothing here can be ' +
-                    'served from this machine. '
+                  ? capacity.data.local_serving === false
+                    ? 'against host memory — no GPU was found, so nothing here can be ' +
+                      'served from this machine. '
+                    : 'against host memory — no GPU was found, so these are sized ' +
+                      'for the CPU runtime. '
                   : cap.basis === 'live'
                     ? 'against what the nodes can hand out right now. '
                     : 'against the idle-hardware ceiling — there is no live memory reading. ') +

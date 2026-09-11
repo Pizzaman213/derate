@@ -22,7 +22,7 @@ await bundleWithEsbuild({
   outfile: bundle,
   logLevel: 'warning',
 })
-const { ollamaRef, runnableOnOllama, variantKey, partitionForRuntime } =
+const { ollamaRef, runnableOnOllama, variantKey, partitionForRuntime, launchId } =
   await import(pathToFileURL(bundle).href)
 
 let failures = 0
@@ -112,6 +112,27 @@ check('order is preserved, not recomputed',
 check('sglang partitions exactly as vllm does',
   partitionForRuntime(ladder, 'sglang').servable.map((v) => v.label).join(','),
   onCluster.servable.map((v) => v.label).join(','))
+
+// --- what a row is LAUNCHED as, which is not what it is keyed by ---------
+//
+// The repository id names a checkpoint for a safetensors row and a directory
+// for a GGUF one. Sending the directory is the bug this exists to stop: those
+// repos keep the base model's `config.json`, so derate would resolve it to a
+// confident bf16 describing weights that are not in the repository, and the
+// launch would carry a quantization nobody chose.
+check('a gguf row is launched as the file, not the repository',
+  launchId(gguf()), 'hf://bartowski/Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf')
+check('a safetensors row is launched as its repository, untouched',
+  launchId(gguf({ gguf_file: null, dtype: 'bf16' })), 'bartowski/Qwen2.5-0.5B-Instruct-GGUF')
+// Two quantizations in one repository must launch as two different ids. This
+// is the same failure `variantKey` exists for, one layer further out: keyed
+// apart on screen and collapsed on the wire would be worse than either.
+check('two quantizations in one repository do not collapse to one id',
+  launchId(gguf({ gguf_file: 'a.gguf' })) === launchId(gguf({ gguf_file: 'b.gguf' })), false)
+// A subdirectory layout, which is how the large quants are published.
+check('a quant in a subdirectory keeps its path',
+  launchId(gguf({ gguf_file: 'UD-Q4_K_XL/model-00001-of-00002.gguf' })),
+  'hf://bartowski/Qwen2.5-0.5B-Instruct-GGUF/UD-Q4_K_XL/model-00001-of-00002.gguf')
 
 rmSync(out, { recursive: true, force: true })
 console.log(failures ? `\n${failures} failed` : '\nall passed')

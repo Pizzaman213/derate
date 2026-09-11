@@ -6,6 +6,7 @@ import type {
   TopologyEdge,
 } from '../../api/types'
 import { TERMINAL, type CacheIndex } from './rows'
+import { canCarryRank, memoryPool, type Runtime } from '../../state/runtime'
 
 // The machine board's arithmetic, with no DOM and no React in it, for the same
 // reason `tabs/cluster/layout.ts` is split from `ClusterGraph.tsx`: it is the
@@ -111,6 +112,13 @@ export interface BoardInput {
   placement: PlacementBlock | null
   /** The operator's selection, or null for "the planner picks". */
   chosen: string[] | null
+  /** Which runtime the ticks are being offered for.
+   *
+   *  Required, not optional with a default: the whole reason it is here is
+   *  that the answer differs per runtime, and a default would let a caller
+   *  silently get the GPU answer for a CPU launch -- which is exactly the
+   *  disagreement between board and launcher this field exists to prevent. */
+  runtime: Runtime
 }
 
 /** The one definition of "measured" this board is allowed to use, matching
@@ -127,8 +135,42 @@ function edgeKey(a: string, b: string): string {
   return a < b ? `${a} ${b}` : `${b} ${a}`
 }
 
-const NO_MEMORY =
-  'This machine reports no addressable GPU memory. It can be a cluster member; it cannot carry a rank.'
+/** Why this machine cannot carry a rank of this runtime, or null.
+ *
+ *  The client's half of `deploy/flags.py::placement_refusal`, and it has to
+ *  stay the client's half of exactly that: the tick is withheld here so the
+ *  operator is not offered a selection the launch would refuse, which only
+ *  works while both sides answer the same question.
+ *
+ *  It was one sentence until there was a runtime that did not need a GPU.
+ *  `addressable_memory <= 0` was then both "has no GPU" and "cannot serve",
+ *  and a single string could say so. Now a machine with no GPU is the ONLY
+ *  kind `llamacpp` will run on, and a machine with one is the only kind the
+ *  other three will -- so there are two refusals pointing in opposite
+ *  directions, and each has to name the remedy that is actually available.
+ *
+ *  The second one is an ACCOUNTING refusal and has to read like one. Saying
+ *  llama.cpp "would not use" a GPU is a consequence dressed as a reason, and
+ *  a preference is not grounds for a refusal here: it would run on a Spark's
+ *  CPU perfectly well, just slowly. What derate cannot do is budget it there
+ *  -- `registry.allocatable_bytes` reports host memory only for a CPU device
+ *  class and a GPU figure for every other, so the gate would size a host-RAM
+ *  launch against memory the server never touches.
+ *
+ *  The server refuses a third case this cannot see: a CPU node whose free
+ *  memory nothing has measured. That needs a live telemetry read, and the
+ *  board would rather offer a tick the launch explains than withhold one on a
+ *  reading it does not have. */
+function rankRefusal(runtime: Runtime, addressable: number): string | null {
+  if (memoryPool(runtime) === 'host') {
+    return addressable > 0
+      ? 'llamacpp serves from host RAM, and derate only measures host RAM on a machine with no GPU — here the fit gate would size the launch against GPU memory the server never touches. Pick a machine with no GPU, or serve this on vllm or sglang.'
+      : null
+  }
+  return addressable > 0
+    ? null
+    : 'This machine reports no addressable GPU memory, so it cannot carry a rank of this runtime. Pick llamacpp to serve from its RAM instead.'
+}
 
 /** The client's half of the deployment manager's one-copy-per-node rule. Said
  *  here so the tick is withheld rather than offered and then refused; the
@@ -166,12 +208,16 @@ export function buildBoard(input: BoardInput): Board {
   const inPlan = new Set(input.plannerChose ?? [])
   const unused = new Set(input.placement?.unused_node_ids ?? [])
 
-  // A machine with no addressable GPU memory is not a placement the gateway
+  // A machine this runtime cannot be placed on is not a placement the gateway
   // will accept: `_select_nodes` refuses it with 400 `node_has_no_memory`.
   // Offering the tick would be offering a refusal, so it is withheld here and
   // the reason is said out loud on the row.
+  //
+  // Keyed on the runtime as well as the machine since there are two kinds of
+  // serving node. The same Pi is capable under `llamacpp` and incapable under
+  // `vllm`, and the same Spark is the reverse.
   const rankCapable = nodes
-    .filter((n) => n.profile.addressable_memory > 0)
+    .filter((n) => canCarryRank(input.runtime, n.profile))
     .map((n) => n.profile.node_id)
   // The second refusal, and the reason this is not the same list: a machine
   // already running this model CAN carry a rank -- it is carrying one now --
@@ -247,7 +293,7 @@ export function buildBoard(input: BoardInput): Board {
         ? null
         : busyWith !== undefined
           ? RUNNING_IT(busyWith)
-          : NO_MEMORY,
+          : rankRefusal(input.runtime, n.profile.addressable_memory),
       runningThisModel: busyWith !== undefined,
       ticked,
       inPlan: inPlan.has(id),

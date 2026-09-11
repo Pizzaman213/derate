@@ -46,12 +46,37 @@ function ok(cond, label) {
   }
 }
 
-// ── A DOM small enough to hold a moving rect ─────────────────────────────────
+// ── A DOM small enough to hold a moving dash ─────────────────────────────────
 //
-// spawnParticle only ever creates a rect, appends it, writes x/y and removes
-// it, so this is the whole surface it touches. Frames are driven by hand
-// rather than by a clock, which is what makes "the block is 40% along at 40%
-// of its span" checkable at all.
+// spawnParticle only ever creates a path, sets its d/stroke attributes, reads
+// getTotalLength(), writes stroke-dashoffset every frame and removes it, so
+// this is the whole surface it touches. Frames are driven by hand rather than
+// by a clock, which is what makes "the block is 40% along at 40% of its span"
+// checkable at all.
+//
+// getTotalLength() is faked by parsing the element's own `d` -- M/L/H/V only,
+// which is all these fixtures need (a d with a Q corner is `layout.check.mjs`'s
+// job, not this file's: that's `roundedPath`'s geometry, not spawnParticle's).
+function straightLength(d) {
+  const parts = d.match(/[MLHV][^MLHV]*/gi) ?? []
+  let cx = 0, cy = 0, total = 0
+  for (const part of parts) {
+    const nums = part.slice(1).trim().split(/[\s,]+/).filter(Boolean).map(Number)
+    if (part[0] === 'M') {
+      ;[cx, cy] = nums
+    } else if (part[0] === 'L') {
+      total += Math.hypot(nums[0] - cx, nums[1] - cy)
+      ;[cx, cy] = nums
+    } else if (part[0] === 'H') {
+      total += Math.abs(nums[0] - cx)
+      cx = nums[0]
+    } else if (part[0] === 'V') {
+      total += Math.abs(nums[0] - cy)
+      cy = nums[0]
+    }
+  }
+  return total
+}
 
 let clock = 0
 const pending = []
@@ -63,6 +88,9 @@ globalThis.document = {
     parent: null,
     setAttribute(k, v) {
       this.attrs[k] = v
+    },
+    getTotalLength() {
+      return straightLength(this.attrs.d ?? '')
     },
     remove() {
       if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this)
@@ -86,28 +114,32 @@ function tick(t) {
 
 // ── Flight ───────────────────────────────────────────────────────────────────
 {
-  // A straight 1000-unit path, so position maps to progress with no geometry
-  // in the way. The -5/-4 is the rect's own half-size, which centres it.
-  const pts = [
-    { x: 0, y: 0 },
-    { x: 1000, y: 0 },
-  ]
+  // A straight 1000-unit path, so arc length maps to progress with no
+  // corner geometry in the way. 11 is the request block's own along-path
+  // length (`blockLen`'s default).
+  const d = 'M0 0 H1000'
+  const blockLen = 11
   const layer = newLayer()
   let done = 0
   clock = 0
-  P.spawnParticle(layer, pts, 'red', 2000, () => done++)
+  P.spawnParticle(layer, d, 'red', 2000, () => done++)
   ok(layer.children.length === 1, 'a flight puts exactly one block on the layer')
-  const box = layer.children[0]
+  const block = layer.children[0]
+  const total = block.getTotalLength()
+  const offsetAt = (p) => blockLen - p * (blockLen + total)
 
   tick(0)
-  ok(Number(box.attrs.x) === -5, 'a block starts at the head of its path')
+  ok(Number(block.attrs['stroke-dashoffset']) === offsetAt(0), 'a block starts at the head of its path')
   tick(1000)
-  ok(Math.abs(Number(box.attrs.x) - 495) < 0.001, 'half the span puts the block half way along')
+  ok(
+    Math.abs(Number(block.attrs['stroke-dashoffset']) - offsetAt(0.5)) < 0.001,
+    'half the span puts the block half way along',
+  )
   ok(done === 0, 'a block in flight has not reported done')
   tick(1999)
-  ok(!box.removed, 'a block survives to the end of its span')
+  ok(!block.removed, 'a block survives to the end of its span')
   tick(2000)
-  ok(box.removed && layer.children.length === 0, 'a block leaves the layer when its flight ends')
+  ok(block.removed && layer.children.length === 0, 'a block leaves the layer when its flight ends')
   ok(done === 1, 'onDone fires exactly once, so the in-flight tally can drop')
   tick(3000)
   ok(done === 1, 'onDone does not fire again after the flight')
@@ -116,17 +148,20 @@ function tick(t) {
   // the block at a different speed over the same geometry.
   const slow = newLayer()
   clock = 0
-  P.spawnParticle(slow, pts, 'red', 8000)
+  P.spawnParticle(slow, d, 'red', 8000)
   tick(0)
   tick(1000)
-  ok(Math.abs(Number(slow.children[0].attrs.x) - 120) < 0.001, 'a longer span walks the same path slower')
+  ok(
+    Math.abs(Number(slow.children[0].attrs['stroke-dashoffset']) - offsetAt(1000 / 8000)) < 0.001,
+    'a longer span walks the same path slower',
+  )
 
   // A degenerate path draws nothing, and must still settle the tally --
   // otherwise the path would be counted as permanently occupied and never
   // draw again.
   const empty = newLayer()
   let settled = 0
-  P.spawnParticle(empty, [{ x: 0, y: 0 }], 'red', 1000, () => settled++)
+  P.spawnParticle(empty, 'M0 0', 'red', 1000, () => settled++)
   ok(empty.children.length === 0 && settled === 1, 'a path with no length draws nothing and settles')
 }
 

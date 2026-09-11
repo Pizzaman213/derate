@@ -70,6 +70,30 @@ export function variantKey(variant: QuantVariant): string {
   return `${variant.repo_id}::${variant.gguf_file ?? variant.label}`
 }
 
+/** The id to LAUNCH this row as, which is not always the row's repository.
+ *
+ *  For a safetensors row the repository is the model: `variant.repo_id` names
+ *  one set of weights and the resolver reads its `config.json`.
+ *
+ *  For a GGUF row it is not. One repository publishes many quantizations, so
+ *  the repository id names a directory rather than a checkpoint -- and derate
+ *  would resolve it through the original `config.json` those repos keep,
+ *  which reports `torch_dtype: bfloat16` and describes weights that are not
+ *  there. `hf://owner/repo/file.gguf` is the form that names the blob, and it
+ *  is the form `resolver/gguf.py` measures by summing the file's own tensor
+ *  directory rather than multiplying a parameter count by a nominal width.
+ *
+ *  `deploy/flags.py::llamacpp_model_spec` translates it once more at the
+ *  recipe boundary, into the `owner/repo:QUANT` spelling sparkrun's llama-cpp
+ *  plugin parses. Three spellings of one file, each owned by whoever needs it,
+ *  and this is the only one the browser has to know.
+ */
+export function launchId(variant: QuantVariant): string {
+  return variant.gguf_file
+    ? `hf://${variant.repo_id}/${variant.gguf_file}`
+    : variant.repo_id
+}
+
 /** Split a ladder into what this runtime can serve and what it cannot.
  *
  *  Under vllm and sglang this is the gateway's own `launchable`, unchanged.

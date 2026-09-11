@@ -113,6 +113,12 @@ export const useMemoryReport = () => useResource((b) => b.memory(), 2000)
 // node agents and no syscalls. `useResource` does not deduplicate, so this is
 // mounted in exactly one place -- the sidebar's Activity section.
 export const useActivity = () => useResource((b) => b.activity(), 2000)
+// Standing conditions. 5s rather than the Activity section's 2s: an alert is
+// not a bar that has to move, and a node that has been down for three hours
+// does not become more true at a higher poll rate. Mounted in exactly one
+// place -- the sidebar's Alerts section -- because `useResource` does not
+// deduplicate.
+export const useAlerts = () => useResource((b) => b.alerts(), 5000)
 // What is resident on one node's GPU. Only mounted while a node sheet is open,
 // and every poll costs an nvidia-smi call on that node, so it matches the
 // telemetry cadence rather than the 2s memory poll. `nodeId` empty means no

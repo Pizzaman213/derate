@@ -197,22 +197,102 @@ check('an empty list is the planner', parse('/models?on=').on, null)
 check('an empty list is not written', href(parse('/models?on=')), '/models')
 check('machines are dropped off the models tab', href({ ...parse('/spend'), on: ['spark-01'] }), '/spend')
 
-check('degrees parse', [parse('/models?tp=2&pp=1').tp, parse('/models?tp=2&pp=1').pp], [2, 1])
-check('degrees round trip', href(parse('/models?tp=2&pp=1')), '/models?tp=2&pp=1')
+check(
+  'degrees parse',
+  [parse('/models?tp=2&pp=1&ep=1').tp, parse('/models?tp=2&pp=1&ep=1').pp],
+  [2, 1],
+)
+check('degrees round trip', href(parse('/models?tp=2&pp=1&ep=1')), '/models?tp=2&pp=1&ep=1')
 // The one that `positive()` would get wrong. TP=1 against a planner that wants
 // TP=2 is an override, and collapsing it to "unset" would hand the axis back
 // to the planner it was overruling -- silently, and only in the URL.
 check('tp=1 is not the absence of tp', parse('/models?tp=1&pp=1').tp, 1)
-check('tp=1 survives being written down', href(parse('/models?tp=1&pp=1')), '/models?tp=1&pp=1')
-check('no degrees is the planner', [parse('/models').tp, parse('/models').pp], [null, null])
-// Adopted as a pair, because `parallelism` is one object on the wire: with an
+check(
+  'tp=1 survives being written down',
+  href(parse('/models?tp=1&pp=1')),
+  '/models?tp=1&pp=1&ep=1',
+)
+check(
+  'no degrees is the planner',
+  [parse('/models').tp, parse('/models').pp, parse('/models').ep],
+  [null, null, null],
+)
+// Adopted as a SET, because `parallelism` is one object on the wire: with an
 // omitted key meaning 1, "TP mine, PP the planner's" cannot be expressed at
-// all, so half a pair is completed rather than half-honoured.
-check('one axis adopts the pair', [parse('/models?tp=4').tp, parse('/models?tp=4').pp], [4, 1])
-check('one axis writes the pair', href(parse('/models?tp=4')), '/models?tp=4&pp=1')
-check('garbage degrees are the planner', parse('/models?tp=abc&pp=x').tp, null)
-check('zero degrees are the planner', parse('/models?tp=0&pp=0').tp, null)
-check('degrees are dropped off the models tab', href({ ...parse('/spend'), tp: 2, pp: 1 }), '/spend')
+// all, so a partial set is completed rather than half-honoured.
+check(
+  'one axis adopts the set',
+  [parse('/models?tp=4').tp, parse('/models?tp=4').pp, parse('/models?tp=4').ep],
+  [4, 1, 1],
+)
+check('one axis writes the set', href(parse('/models?tp=4')), '/models?tp=4&pp=1&ep=1')
+// Expert parallel is the axis the planner can never pick on this class of
+// hardware -- `EP_VIABLE_THRESHOLD` is 40 GB/s and a Spark tops out at 23.15 --
+// so the field is the only way anyone asks for it, and the URL is the only way
+// the ask survives being shared.
+check(
+  'ep adopts the set on its own',
+  [parse('/models?ep=2').tp, parse('/models?ep=2').pp, parse('/models?ep=2').ep],
+  [1, 1, 2],
+)
+check('ep writes the set', href(parse('/models?ep=2')), '/models?tp=1&pp=1&ep=2')
+check('ep=1 is not the absence of ep', parse('/models?ep=1').ep, 1)
+check('garbage degrees are the planner', parse('/models?tp=abc&pp=x&ep=!').tp, null)
+check('zero degrees are the planner', parse('/models?tp=0&pp=0&ep=0').tp, null)
+check(
+  'degrees are dropped off the models tab',
+  href({ ...parse('/spend'), tp: 2, pp: 1, ep: 1 }),
+  '/spend',
+)
+
+check('spec parses', parse('/models?spec=ngram:5').spec, { method: 'ngram', tokens: 5 })
+// A bare colon, not %3A -- the same reading `open=node:spark-01` gets above.
+// `enc` leaves it alone deliberately: a colon is legal in a query value and
+// escaping it would make the one part of this UI that people paste to each
+// other harder to read for nothing.
+check('spec round trips', href(parse('/models?spec=ngram:5')), '/models?spec=ngram:5')
+check('an escaped colon reads the same', parse('/models?spec=ngram%3A5').spec, {
+  method: 'ngram',
+  tokens: 5,
+})
+check('no spec is one token per step', parse('/models').spec, null)
+// An unknown method is NOT dropped here. Which methods a checkpoint offers is
+// the coordinator's answer, and it gives it as a sentence naming what this
+// model does support; swallowing the value in the parser would turn a shared
+// link into a silently different launch.
+check('an unknown method survives the parser', parse('/models?spec=eagle:3').spec, {
+  method: 'eagle',
+  tokens: 3,
+})
+// A count, unlike a method, has no honest reading when it is unreadable --
+// there is no server-side answer to "draft NaN tokens".
+check('a spec with no count is no spec', parse('/models?spec=ngram').spec, null)
+check('a spec with no method is no spec', parse('/models?spec=:5').spec, null)
+check('a garbage count is no spec', parse('/models?spec=ngram:abc').spec, null)
+check('a zero count is no spec', parse('/models?spec=ngram:0').spec, null)
+check('a head rides beside its method', parse('/models?spec=eagle3:3&head=Angel/Q_eagle3').spec, {
+  method: 'eagle3',
+  tokens: 3,
+  model: 'Angel/Q_eagle3',
+})
+// Bare slashes and a bare colon, like every other id in this scheme -- a
+// model id keeps its slashes in the path, and a head repository keeps them
+// here for the same reason: these URLs get pasted into messages.
+check(
+  'a head round trips',
+  href(parse('/models?spec=eagle3:3&head=Angel/Q_eagle3')),
+  '/models?spec=eagle3:3&head=Angel/Q_eagle3',
+)
+// A head with no method and no count is not a request the fit gate can price,
+// so it is ignored rather than half-honoured -- the same rule `spec=ngram`
+// with no count follows.
+check('a head alone is no spec', parse('/models?head=Angel/Q_eagle3').spec, null)
+check('a head alone is not written', href(parse('/models?head=Angel/Q_eagle3')), '/models')
+check(
+  'spec is dropped off the models tab',
+  href({ ...parse('/spend'), spec: { method: 'ngram', tokens: 5 } }),
+  '/spend',
+)
 
 // ── The properties themselves, over every URL above ──────────────────────────
 
@@ -230,12 +310,20 @@ const URLS = [
   '/settings?node=spark-01&dep=qwen3-30b-a3b&open=dep:qwen3-30b-a3b',
   '/nonsense?ctx=99',
   `/models/${HF}?ctx=32768&seq=8&on=spark-4d38`,
-  '/models?on=spark-01,spark-02&tp=2&pp=1',
+  '/models?on=spark-01,spark-02&tp=2&pp=1&ep=1',
+  // The shape the EP field exists to produce: DP attention with the experts
+  // sharded across it. `?dp=` is deliberately absent -- placement.ts pairs the
+  // data-parallel degree to this one, because vLLM's expert-parallel size IS
+  // `dp * tp` and no other pairing means EP=2 across machines.
+  '/models?on=spark-01,spark-02&tp=1&pp=1&ep=2',
   // An override that happens to equal the number the disclosure shows. It has
   // to survive the round trip like any other, or a shared link quietly becomes
   // "let the coordinator choose".
   `/models/${HF}?ctx=8192&seq=1`,
-  `/spend?open=model:${HF}&on=spark-01&tp=1&pp=2`,
+  `/spend?open=model:${HF}&on=spark-01&tp=1&pp=2&ep=1`,
+  `/models/${HF}?ctx=32768&spec=mtp:1`,
+  '/models?on=spark-4d38&tp=2&pp=1&ep=1&spec=ngram:5',
+  `/models/${HF}?spec=eagle3:3&head=AngelSlim/Qwen3-4B_eagle3`,
 ]
 
 for (const url of URLS) {

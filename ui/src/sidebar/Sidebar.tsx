@@ -1,3 +1,4 @@
+import { AlertsSection } from './AlertsSection'
 import { RosterSection } from './RosterSection'
 import { ActivitySection } from './ActivitySection'
 import { PlanSection } from './PlanSection'
@@ -16,6 +17,9 @@ import { CostSection } from './CostSection'
 export function Sidebar() {
   return (
     <>
+      {/* First on purpose: "something is wrong" outranks "here are the
+          machines". The rail's order is an argument, not a layout. */}
+      <AlertsSection />
       <RosterSection />
       <ActivitySection />
       <PlanSection />

@@ -1,9 +1,14 @@
-import type { LinkMeasurement, ReachReport, TopologyEdge } from '../../api/types'
+import type { LinkMeasurement, LinkTuning, ReachReport, TopologyEdge } from '../../api/types'
 import { useSelection } from '../../state/selection'
 import { fmt, fmtUnit, relativeTime } from '../../format'
-import { edgeMeasured } from './layout'
-
-const TP_THRESHOLD = 40
+// One spelling of the threshold and of a pair's key, both layout.ts's: a
+// second copy here is how the rail's verdict sentence and the wire's own
+// scale drift apart.
+import { edgeKey, edgeMeasured, TP_THRESHOLD } from './layout'
+// The tuning row's decisions live in a plain module so a verifier can reach
+// them: `check.mjs` bundles with esbuild `platform: 'neutral'` and cannot
+// import anything that pulls in React.
+import { canTune, tuningEvidence, tuningLabel, tuningState } from './tuning'
 
 /** Everything the two link rails need to run and show a reachability check.
  *  Passed as one object because both rails take all of it and none of it means
@@ -29,6 +34,18 @@ interface Props {
    *  chips here and the plates above cannot disagree about a machine's name. */
   name: (id: string) => string
   reach: ReachState
+  /** The calibration action, bundled like `reach` and for the same reason: a
+   *  different question at a different price, and one running must not grey
+   *  out the other's button. `error` is keyed by pair so it never renders
+   *  under a link it does not belong to. */
+  tune: {
+    error: { key: string; message: string } | null
+    onTune: (a: string, b: string) => void
+    /** Size bands the evidence lines are read at, from the server's own
+     *  constants rather than a second copy here. */
+    decodeBand: number
+    bulkBand: number
+  }
   /** Above four machines the graph stops drawing the whole unmeasured mesh --
    *  66 pairs at twelve machines buries the one link that carries a figure.
    *  The chips below are the complete list either way, so this only changes
@@ -36,9 +53,6 @@ interface Props {
   crowded: boolean
 }
 
-function edgeKey(a: string, b: string): string {
-  return [a, b].sort().join('~')
-}
 function findEdge(edges: TopologyEdge[], key: string): TopologyEdge | undefined {
   return edges.find((e) => edgeKey(e.src, e.dst) === key)
 }
@@ -63,6 +77,7 @@ export function SelectionRail({
   onMeasure,
   name,
   reach,
+  tune,
   crowded,
 }: Props) {
   const { selLink } = useSelection()
@@ -79,6 +94,7 @@ export function SelectionRail({
           onMeasure={onMeasure}
           name={name}
           reach={reach}
+          tune={tune}
         />
       )
     }
@@ -97,6 +113,7 @@ export function SelectionRail({
         onMeasure={onMeasure}
         name={name}
         reach={reach}
+        tune={tune}
       />
     )
   }
@@ -154,6 +171,7 @@ function UnmeasuredLinkRail({
   onMeasure,
   name,
   reach,
+  tune,
 }: {
   a: string
   b: string
@@ -162,6 +180,12 @@ function UnmeasuredLinkRail({
   onMeasure: (a: string, b: string) => void
   name: (id: string) => string
   reach: ReachState
+  tune: {
+    error: { key: string; message: string } | null
+    onTune: (a: string, b: string) => void
+    decodeBand: number
+    bulkBand: number
+  }
 }) {
   const key = edgeKey(a, b)
   const busy = measuring === key
@@ -178,8 +202,23 @@ function UnmeasuredLinkRail({
           question, so it is offered first and is not gated on a measurement
           ever having been taken. */}
       <ReachPanel a={a} b={b} name={name} reach={reach} />
+      <TunePanel
+        a={a}
+        b={b}
+        tuning={null}
+        measuring={false}
+        onTune={tune.onTune}
+        error={tune.error?.key === key ? tune.error.message : null}
+      />
+      {/* "About a minute" stopped being true when the coordinator started
+          calibrating a never-calibrated pair off the back of a measurement:
+          that adds one two-rank collective per candidate setting. Saying a
+          minute and taking five is worse than saying nothing, because the
+          reader concludes it hung. */}
       <div className="unit" style={{ marginTop: 10 }}>
-        Measuring saturates the link for about a minute.
+        Measuring saturates the link for about a minute — and a pair that has
+        never been tuned is calibrated straight afterwards, which takes several
+        more.
       </div>
       <button style={{ marginTop: 8 }} onClick={() => onMeasure(a, b)} disabled={busy}>
         {busy ? 'Measuring…' : 'Measure this link'}
@@ -201,6 +240,7 @@ function LinkRail({
   onMeasure,
   name,
   reach,
+  tune,
 }: {
   edge: TopologyEdge
   measurements: LinkMeasurement[]
@@ -209,6 +249,12 @@ function LinkRail({
   onMeasure: (a: string, b: string) => void
   name: (id: string) => string
   reach: ReachState
+  tune: {
+    error: { key: string; message: string } | null
+    onTune: (a: string, b: string) => void
+    decodeBand: number
+    bulkBand: number
+  }
 }) {
   // Same definition of "measured" as the graph and the chips (edgeMeasured):
   // a measured:true edge with no figure must open the never-measured rail,
@@ -223,6 +269,7 @@ function LinkRail({
         onMeasure={onMeasure}
         name={name}
         reach={reach}
+        tune={tune}
       />
     )
   }
@@ -258,8 +305,27 @@ function LinkRail({
         <div>
           <Row label="All-reduce" value={fmtUnit(ar, 1, 'GB/s')} />
           <Row label="Send/recv" value={fmtUnit(sendrecv, 1, 'GB/s')} />
-          <Row label="Latency" value={fmtUnit(edge.latency_us, 0, 'µs')} />
+          {/* Absent when no rung measured a COLLECTIVE -- today that is the
+              ordinary answer, because only nccl-tests times one and the
+              ib_write_bw rung declines rather than offering an ib_write_lat
+              for a different operation. Said as "not measured" rather than
+              omitted: a missing row reads as a screen that forgot, and a 0
+              would read as an instant fabric. */}
+          <Row
+            label="Latency"
+            value={
+              edge.latency_us == null
+                ? 'not measured'
+                : fmtUnit(edge.latency_us, 0, 'µs')
+            }
+          />
           <Row label="Method" value={method ?? '—'} />
+          <TuningRows
+            tuning={edge.tuning}
+            measuring={edge.measuring === true}
+            decodeBand={tune.decodeBand}
+            bulkBand={tune.bulkBand}
+          />
           {scaleFactor != null ? (
             <Row label="Derived" value={`${fmt(rawGbps, 1)} GB/s raw × ${scaleFactor} → ${fmt(ar, 1)} GB/s`} />
           ) : (
@@ -287,8 +353,8 @@ function LinkRail({
       <ReachPanel a={edge.src} b={edge.dst} name={name} reach={reach} />
       <div className="unit" style={{ marginTop: 8 }}>
         {ar != null && ar >= TP_THRESHOLD
-          ? 'At or above the 40 GB/s threshold, so tensor parallel is viable across this pair.'
-          : 'Below the 40 GB/s tensor-parallel threshold, which is why the planner chooses pipeline parallel over this pair.'}
+          ? `At or above the ${TP_THRESHOLD} GB/s threshold, so tensor parallel is viable across this pair.`
+          : `Below the ${TP_THRESHOLD} GB/s tensor-parallel threshold, which is why the planner chooses pipeline parallel over this pair.`}
       </div>
     </div>
   )
@@ -403,6 +469,82 @@ function ReachPanel({
             Checked {relativeTime(report.checked_at)}.
           </div>
         </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** The Tuning row and, when there is one, the evidence behind the verdict.
+ *
+ *  The evidence is not decoration. The choice is a trade between two regimes
+ *  four decades apart in message size, so the winner alone is an assertion --
+ *  seeing that the rejected candidate was FASTER in bulk and slower at decode
+ *  is what lets a reader check the rule rather than trust it. */
+function TuningRows({
+  tuning,
+  measuring,
+  decodeBand,
+  bulkBand,
+}: {
+  tuning: LinkTuning | null | undefined
+  measuring: boolean
+  decodeBand: number
+  bulkBand: number
+}) {
+  const state = tuningState(tuning)
+  const evidence = tuningEvidence(tuning, decodeBand, bulkBand)
+  return (
+    <>
+      <Row label="Tuning" value={measuring ? 'calibrating…' : tuningLabel(tuning)} />
+      {state !== 'uncalibrated' && evidence.length > 1 ? (
+        <div className="unit" style={{ marginTop: 4 }}>
+          {evidence.map((e) => (
+            <div key={e.label} className="mono" style={{ fontSize: '0.85em' }}>
+              {e.label}
+              {e.decodeUs != null ? ` · ${e.decodeUs.toFixed(1)}µs decode` : ''}
+              {e.bulkGbps != null ? ` · ${e.bulkGbps.toFixed(1)} GB/s bulk` : ''}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </>
+  )
+}
+
+/** The button, and the sentence that says what pressing it costs.
+ *
+ *  `disabled` comes from the SERVER's `measuring`, not from local state: the
+ *  request returns in milliseconds and the work runs for minutes, so a local
+ *  spinner would clear immediately and invite a second press -- which would
+ *  not be refused, because `calibrate` and `measure` share one lock. It would
+ *  block, silently, for minutes. */
+function TunePanel({
+  a,
+  b,
+  tuning,
+  measuring,
+  onTune,
+  error,
+}: {
+  a: string
+  b: string
+  tuning: LinkTuning | null | undefined
+  measuring: boolean
+  onTune: (a: string, b: string) => void
+  error: string | null
+}) {
+  if (!canTune(tuning, measuring)) return null
+  return (
+    <div style={{ marginTop: 10 }}>
+      <button onClick={() => onTune(a, b)} disabled={measuring}>
+        {measuring ? 'Calibrating…' : 'Tune this link'}
+      </button>
+      <span className="unit" style={{ marginLeft: 8 }}>
+        Times one collective per candidate setting. Minutes, and it saturates
+        the fabric — not while this cluster is serving.
+      </span>
+      {error ? (
+        <div className="unit" style={{ marginTop: 8, color: 'var(--fault)' }}>{error}</div>
       ) : null}
     </div>
   )

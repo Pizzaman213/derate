@@ -37,6 +37,10 @@ const SCOPE_CHANGED: [string, string][] = [
     'narrowed, not dropped: a node’s recent lines on its own page, with no search and no logger filter. Amended 2026-09-07',
   ],
   [
+    'Raw log files',
+    'node.log and proxy.log, tailed on Settings → Instance — reading them used to mean a shell on the machine. Still no search box: that constraint stands for this surface too. Added 2026-09-09',
+  ],
+  [
     'A shell on the node',
     'procs.py bounded the kill verb so it would not be a remote-exec hole; this is that hole, opened on purpose. Off unless DERATE_SHELL=1, and its key is read off the machine — no route mints one. Amended 2026-09-07',
   ],

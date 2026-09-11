@@ -6,14 +6,14 @@ import { Readout } from '../../components/Readout'
 import { Verbatim } from '../../components/Verbatim'
 import { nodeLive, nodeSignal, utilLabel } from '../../state/live'
 import { useMemoryReport } from '../../state/resources'
-import { deviceClassLabel, shortGpu } from '../../format'
+import { deviceClassLabel, relativeTime, shortGpu } from '../../format'
 import { fromState, nodeName } from '../../state/names'
 import type { HistoryWindow } from '../../state/history'
 import { WindowChips } from './WindowChips'
 import { NodeCharts } from './NodeCharts'
 import { HardwareRows } from './HardwareRows'
 import { Interconnect } from './Interconnect'
-import { runners } from '../../tabs/cluster/layout'
+import { runningOrPrevious } from '../../tabs/cluster/layout'
 import { ServingBlock } from './ServingBlock'
 import { RequestsTable } from './RequestsTable'
 import { EventsAndLogs } from './EventsAndLogs'
@@ -21,6 +21,7 @@ import { ResidentProcesses } from './ResidentProcesses'
 import { NodeRuntimeCard } from './NodeRuntimeCard'
 import { NodeTerminal } from './Terminal'
 import { RenameNode } from './RenameNode'
+import { DeploymentLog } from '../DeploymentLog'
 
 interface Props {
   node: NodeStateDTO
@@ -86,15 +87,17 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
     p.memory_bandwidth_gbps > 0 ? `${p.memory_bandwidth_gbps.toFixed(1)} GB/s` : null,
   ].filter(Boolean)
   // What this machine is running NOW, not everything it has ever been asked to
-  // run. `/api/deployments` is a ledger: it keeps every attempt for a week, so
-  // nine failed tries at four models are nine rows all naming this node, and
+  // run. `/api/deployments` is a ledger: it keeps every attempt for six hours,
+  // so nine failed tries at four models are nine rows all naming this node, and
   // each one drew a full serving block -- lamp, plan line, four readouts and
-  // three charts -- for a container that does not exist. `runners()` is the
-  // floor's and the dashboard strip's, deliberately not a fourth spelling of
-  // the same set: a machine cannot be serving something here and idle there.
-  // A finished attempt still says what went wrong, on the Models screen, which
-  // is the surface that bands a row by its verdict.
-  const here = runners(deployments).filter((d) => d.node_ids.includes(p.node_id))
+  // three charts -- for a container that does not exist. `runningOrPrevious()`
+  // is the floor's and the dashboard strip's `runners()`, deliberately not a
+  // fourth spelling of the same set: a machine cannot be serving something here
+  // and idle there. `previous` covers `restart.py` relaunching a crashed
+  // deployment as a brand new id, so the crashed one dropping out of `here`
+  // the moment it lands in FAILED does not just read as "Nothing.", with no
+  // error, no log and no sign anything had happened.
+  const { here, previous } = runningOrPrevious(deployments, p.node_id)
 
   return (
     <div>
@@ -167,7 +170,19 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
             serving
           </div>
           {here.length === 0 ? (
-            <div className="unit">Nothing.</div>
+            previous ? (
+              <div>
+                <div className="unit" style={{ marginBottom: 6 }}>
+                  Nothing now. {previous.served_name} was here, until it{' '}
+                  {previous.state === 'failed' ? 'failed' : 'stopped'}
+                  {previous.started_at != null ? ` (started ${relativeTime(previous.started_at)})` : ''}.
+                </div>
+                {previous.last_error ? <Verbatim text={previous.last_error} size="label" /> : null}
+                <DeploymentLog deploymentId={previous.deployment_id} autoOpen={false} />
+              </div>
+            ) : (
+              <div className="unit">Nothing.</div>
+            )
           ) : (
             here.map((d) => (
               <ServingBlock

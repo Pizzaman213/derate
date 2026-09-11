@@ -1,4 +1,9 @@
-// requires: fixtures HISTORY_FIXTURES -- real payloads, captured; it prints the curl lines
+// Hermetic: the fixtures are checked in beside this file, and
+// $HISTORY_FIXTURES overrides them with a fresh capture. There is deliberately
+// no `requires:` declaration -- check.mjs reads an ABSENT line as hermetic,
+// and an unknown one as a hard failure. This verifier used to declare
+// `fixtures HISTORY_FIXTURES` and skip on every machine, which is why
+// `npm run check -- --strict` could not pass on any box.
 // Verifier for the pure history adapters, in the same shape and for the same
 // reason as tabs/cluster/layout.check.mjs: there is no test runner in this
 // repo (AUDIT-2026-09-06.md:197, "No UI test suite exists (typecheck is the
@@ -52,18 +57,27 @@ await bundleWithEsbuild({
 
 const H = await import(pathToFileURL(bundle).href)
 
-const FIXTURES = process.env.HISTORY_FIXTURES
-if (!FIXTURES) {
-  console.error(
-    'Set HISTORY_FIXTURES to a directory holding nodes-raw.json, nodes-1m.json,\n' +
-      'requests-raw.json and requests-1m.json, captured from a live coordinator:\n' +
-      "  curl -s 'HOST/api/history/nodes?node_id=NODE&from=-5m'  > nodes-raw.json\n" +
-      "  curl -s 'HOST/api/history/nodes?node_id=NODE&from=-24h' > nodes-1m.json\n" +
-      "  curl -s 'HOST/api/history/requests?from=-6h&limit=500'  > requests-raw.json\n" +
-      "  curl -s 'HOST/api/history/requests?from=-7d&limit=500'  > requests-1m.json",
-  )
-  process.exit(2)
-}
+// Checked-in payloads by default; $HISTORY_FIXTURES overrides them with a
+// fresh capture.
+//
+// This used to REQUIRE the env var and exit 2 without it, which made it the
+// one verifier that skipped on every machine, forever -- and `npm run check
+// -- --strict` could therefore never pass anywhere. "A skip is never a pass"
+// is the rule, and a check nobody can run is the purest form of one.
+//
+// The defaults are real payloads from a live coordinator, trimmed to 120 rows
+// each: enough to exercise gaps, rollups and the bucket arithmetic, small
+// enough to check in. They carry model names and token COUNTS and no
+// credentials -- confirmed by grep for `sk-` and for bearer tokens before
+// they were committed, and `RequestHistoryRow` has no field that could hold
+// one.
+//
+// Recapture against a live coordinator with:
+//   curl -s 'HOST/api/history/nodes?node_id=NODE&from=-5m'  > nodes-raw.json
+//   curl -s 'HOST/api/history/nodes?node_id=NODE&from=-24h' > nodes-1m.json
+//   curl -s 'HOST/api/history/requests?from=-6h&limit=500'  > requests-raw.json
+//   curl -s 'HOST/api/history/requests?from=-7d&limit=500'  > requests-1m.json
+const FIXTURES = process.env.HISTORY_FIXTURES || join(here, 'history.fixtures')
 const load = (name) => JSON.parse(readFileSync(join(FIXTURES, name), 'utf8'))
 
 let passed = 0
@@ -179,9 +193,27 @@ ok(
   const bucket = req1m.requests.find((r) => r.tokens != null)
   if (bucket) {
     const got = tps.find((p) => p.t === bucket.ts)
+    // A bucket holds one row PER TARGET, and `depValue` sums them before
+    // dividing -- a cluster throughput series that reported only the first
+    // deployment in each minute would understate every multi-model minute.
+    // This used to compare the series against a single row's tokens, which
+    // agreed only while the box was serving one thing. It found three rows in
+    // that minute (7280, 195, 0) and called the correct sum a failure.
+    const rows = req1m.requests.filter((r) => r.ts === bucket.ts)
+    const tokens = rows.reduce((sum, r) => sum + (r.tokens ?? 0), 0)
+    // The resolution's own seconds, read off the payload, not the literal 60 --
+    // the same reason `depSeries` calls `bucketSeconds(history.resolution)`.
+    const per = { '1m': 60, '1h': 3600 }[req1m.resolution] ?? 60
+    const want = tokens / per
+    if (got == null || Math.abs(got.v - want) >= 1e-9) {
+      console.error(
+        `    bucket ts=${bucket.ts} rows=${rows.length} tokens=${tokens} ` +
+          `per=${per}s want=${want} got=${got == null ? 'NO POINT' : got.v}`,
+      )
+    }
     ok(
-      got != null && Math.abs(got.v - bucket.tokens / 60) < 1e-9,
-      'throughput is tokens divided by the bucket’s own seconds, not by 1',
+      got != null && Math.abs(got.v - want) < 1e-9,
+      'throughput is the bucket’s summed tokens over its own seconds, not by 1',
     )
   }
   const ttft = H.depSeries(req1m, 'ttft')
