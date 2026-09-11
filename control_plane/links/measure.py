@@ -237,6 +237,142 @@ class _ClientSideMixin:
         return self._runner.run_on(a.host, argv, timeout=timeout)
 
 
+class TorchNcclMeasurer:
+    """A real NCCL collective, timed inside the serving image.
+
+    The rung `NcclMeasurer` above has always wanted to be and never could:
+    its `available()` needs `mpirun`, `all_reduce_perf` and `sendrecv_perf`,
+    none of which is installed anywhere in this estate, so every link on every
+    cluster derate has run on fell through to `ib_write_bw` -- raw RDMA scaled
+    by a constant, with a latency for a different operation.
+
+    This one needs none of that. It runs a two-rank `torch.distributed`
+    all_reduce in the SAME container image the engine runs, so it exercises
+    the same NCCL build, the same transport and the same rails vLLM's own
+    collectives will. That is strictly better evidence than nccl-tests would
+    be: nccl-tests would measure a different NCCL than the one that serves.
+
+    It answers both numbers the planner needs and neither of which existed:
+
+    * the **8-byte time** is a real `latency_us` -- a collective, not the
+      one-sided 2-byte RDMA write `ib_write_lat` reports;
+    * **busbw at the largest size** is a real `all_reduce_gbps`, which retires
+      `IB_TO_NCCL_RATIO` for any link this rung covers.
+
+    Measured on this estate 2026-09-11: 13.36 us and 18.5 GB/s, against the
+    ib_write_bw rung's 5.728 GB/s and the 40 us the planner was charging.
+
+    Kept BELOW `NcclMeasurer` in the ladder so an operator who does install
+    nccl-tests still gets the reference implementation, and above
+    `IbWriteBwMeasurer` because an estimate should never win over a
+    measurement.
+    """
+
+    method = "nccl-torch"
+
+    #: 8 B is the latency floor. The largest is the bandwidth figure. The two
+    #: in between are the sizes derate's own collectives actually are, kept so
+    #: the notes can show the curve rather than two endpoints.
+    SIZES = (8, 8192, 1 << 20, 64 << 20)
+
+    def __init__(self, runner: CommandRunner | None = None, clock=None, *, image: str | None = None) -> None:
+        self._runner = runner or SubprocessRunner()
+        self._clock = clock or time.time
+        self._image = image
+
+    def available(self) -> bool:
+        """Whether the serving image is here to run the collective in.
+
+        Deliberately cheap: the expensive question -- does the fabric actually
+        complete a collective -- is what `measure` answers, and answering it
+        twice would double the cost of every ladder descent.
+        """
+        if self._runner.which("docker") is None:
+            return False
+        try:
+            proc = self._runner.run(
+                ["docker", "image", "inspect", self._resolved_image()], timeout=30.0
+            )
+            return proc.ok
+        except Exception:
+            return False
+
+    def _resolved_image(self) -> str:
+        if self._image:
+            return self._image
+        from control_plane.deploy.flags import runtime_spec
+
+        return os.environ.get("DERATE_VLLM_IMAGE") or runtime_spec("vllm").default_image
+
+    def measure(self, a: Endpoint, b: Endpoint) -> AnnotatedLink | None:
+        from control_plane.links import collective
+
+        local, peer = (a, b) if a.is_local else (b, a)
+        if not local.is_local:
+            # Neither end is this host, so this coordinator cannot be rank 0
+            # and has nothing honest to say about the pair.
+            return None
+
+        started = time.monotonic()
+        result = collective.run_collective(
+            image=self._resolved_image(),
+            sizes=list(self.SIZES),
+            master_addr=local.host,
+            peer_host=peer.host,
+            iface=collective.local_interface_for(local.host),
+        )
+        if not result.ok:
+            log.info("nccl-torch measure %s/%s: %s", a.node_id, b.node_id, result.error)
+            return None
+
+        floor = result.rows[0]["us"]
+        top = max(result.rows, key=lambda r: r["bytes"])
+        ports = _ports_for(self._runner, a, b)
+        evidence = detect_gdr(None, self._runner)
+
+        notes = [
+            f"two-rank all_reduce in {self._resolved_image()}, NCCL "
+            f"{result.nccl or 'unknown'} -- the same build the engine runs, so "
+            f"this is the transport vLLM's own collectives will use",
+            "latency_us is the 8-byte COLLECTIVE time, not an ib_write_lat: a "
+            "one-sided 2-byte RDMA write is a different operation and was the "
+            "number this ladder used to report",
+            " · ".join(
+                f"{r['bytes']}B {r['us']:.2f}us" for r in result.rows
+            ),
+        ]
+        if not evidence.enabled:
+            notes.append(
+                "GPUDirect RDMA is off, so every byte stages through host "
+                "memory -- on GB10 that is not a misconfiguration, it is what "
+                "unified memory means"
+            )
+        notes.extend(_port_notes(ports))
+
+        return AnnotatedLink(
+            src=a.node_id,
+            dst=b.node_id,
+            all_reduce_gbps=round(top["busbw_gbps"], 3),
+            # The same collective is the only thing measured, so reporting a
+            # different sendrecv figure would be inventing one. `ib_write_bw`
+            # says the same about itself.
+            sendrecv_gbps=round(top["busbw_gbps"], 3),
+            latency_us=round(floor, 2),
+            gpudirect_rdma=evidence.enabled,
+            measured_at=self._clock(),
+            method=self.method,
+            annotation=LinkAnnotation(
+                estimated=False,
+                active_ports=ports.active if ports.known else None,
+                total_ports=ports.total if ports.known else None,
+                ports_inspected_on=ports.inspected_on if ports.known else None,
+                gdr_detected_by=f"{evidence.source}: {evidence.detail}",
+                duration_s=round(time.monotonic() - started, 2),
+                notes=tuple(notes),
+            ),
+        )
+
+
 class IbWriteBwMeasurer(_ClientSideMixin):
     """Raw RDMA, scaled and flagged. Never reported as NCCL bandwidth."""
 
@@ -266,9 +402,23 @@ class IbWriteBwMeasurer(_ClientSideMixin):
             return None
 
         scaled = raw_gbps * IB_TO_NCCL_RATIO
-        latency, latency_note = self._latency(a, b, dev_args)
-        if latency is None:
-            return None
+        # `ib_write_lat` is still run, and its figure is still reported -- as a
+        # NOTE, never as `latency_us`. It measures a one-sided 2-byte RDMA
+        # write; the planner multiplies `latency_us` by the exchange count and
+        # calls the product the cost of that many two-rank NCCL all-reduces,
+        # which additionally carry a kernel launch, a reduction and a
+        # synchronisation. Reporting the write as the collective made the most
+        # decision-sensitive input in the planner ~28x optimistic (1.44 us
+        # recorded against this project's own nccl-tests fixtures at 40.0),
+        # and every plan built on it was wrong in the direction that favours
+        # tensor parallel.
+        #
+        # Absence rather than a substitute: this rung genuinely cannot measure
+        # a collective, and `UNMEASURED_COLLECTIVE_LATENCY_US` is what the
+        # planner charges instead, labelled. A missing ib_write_lat therefore
+        # no longer fails the whole rung -- the bandwidth estimate is still
+        # worth having.
+        write_latency, latency_note = self._latency(a, b, dev_args)
 
         evidence = detect_gdr(None, self._runner)
         # The 0.42 scale always applies (raw RDMA is never NCCL bandwidth),
@@ -287,11 +437,16 @@ class IbWriteBwMeasurer(_ClientSideMixin):
         notes = [
             f"derived from ib_write_bw: {raw_gbps:.2f} GB/s raw RDMA scaled by "
             f"{IB_TO_NCCL_RATIO} " + path_clause,
+            "no collective latency was measured: ib_write_lat times a one-sided "
+            "2-byte RDMA write, not a two-rank all-reduce, so it is reported "
+            "here as evidence and not as latency_us"
+            + (f" (ib_write_lat: {write_latency:.2f} us)" if write_latency is not None else ""),
             "ib_write_bw cannot tell all-reduce from sendrecv, so both figures are the "
             "same estimate; re-measure with nccl-tests before trusting the difference",
         ]
         if latency_note:
             notes.append(latency_note)
+        notes.extend(_single_rail_note(ports))
         notes.extend(_port_notes(ports))
 
         return AnnotatedLink(
@@ -299,7 +454,7 @@ class IbWriteBwMeasurer(_ClientSideMixin):
             dst=b.node_id,
             all_reduce_gbps=round(scaled, 3),
             sendrecv_gbps=round(scaled, 3),
-            latency_us=round(latency, 2),
+            latency_us=None,
             gpudirect_rdma=evidence.enabled,
             measured_at=self._clock(),
             method=self.method,
@@ -462,6 +617,9 @@ def default_measurer(runner: CommandRunner | None = None, clock=None) -> LadderM
     return LadderMeasurer(
         [
             NcclMeasurer(runner, clock),
+            # Below nccl-tests so a box that has it keeps the reference, above
+            # ib_write_bw because an estimate must never beat a measurement.
+            TorchNcclMeasurer(runner, clock),
             IbWriteBwMeasurer(runner, clock),
             TcpMeasurer(runner, clock),
         ]
@@ -495,12 +653,42 @@ def _port_notes(ports: PortStatus) -> list[str]:
     return [note] if note else []
 
 
-def _first_active_device(ports: PortStatus) -> str | None:
-    """The HCA name perftest wants, e.g. `mlx5_0`, from an active port."""
+def _active_devices(ports: PortStatus) -> list[str]:
+    """Every HCA with an active port, in order, deduplicated."""
+    out: list[str] = []
     for port in ports.ports:
         if port.active and ":" in port.name:
-            return port.name.split(":", 1)[0]
-    return None
+            name = port.name.split(":", 1)[0]
+            if name not in out:
+                out.append(name)
+    return out
+
+
+def _first_active_device(ports: PortStatus) -> str | None:
+    """The HCA name perftest wants, e.g. `mlx5_0`, from an active port."""
+    devices = _active_devices(ports)
+    return devices[0] if devices else None
+
+
+def _single_rail_note(ports: PortStatus) -> list[str]:
+    """Said when this rung drove one rail of several, which it always does.
+
+    `ib_write_bw` takes ONE `-d`, so a box with two active HCAs gets a figure
+    for one of them and the estimate is roughly half the fabric. Patching
+    around that by running perftest twice and adding the numbers would be
+    inventing an aggregate; the honest fix is the `nccl-torch` rung above,
+    which uses NCCL and binds every rail itself. This note is what stops the
+    fallback's number being read as the whole link.
+    """
+    devices = _active_devices(ports)
+    if len(devices) <= 1:
+        return []
+    return [
+        "measured on %s only: ib_write_bw drives one HCA per process, and this "
+        "host has %d active (%s). The figure is one rail's, not the fabric's -- "
+        "the nccl-torch rung measures every rail because NCCL binds them itself"
+        % (devices[0], len(devices), ", ".join(devices))
+    ]
 
 
 def _local_node(a: Endpoint, b: Endpoint) -> str | None:

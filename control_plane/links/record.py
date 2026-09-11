@@ -21,7 +21,7 @@ from control_plane.contracts.hardware import LinkMeasurement
 
 try:  # the day-0 constant if it exists, so we never drift from the rest of the tree
     from control_plane.contracts.constants import LINK_STALE_SECONDS as STALE_AFTER_S
-except ImportError:  # pragma: no cover - the window is specified in Agent B's brief
+except ImportError:  # pragma: no cover - this package's own staleness window
     STALE_AFTER_S = 7 * 24 * 60 * 60
 
 # Ratio of NCCL-effective bandwidth to raw RDMA bandwidth, derived from the
@@ -170,7 +170,12 @@ def from_json(d: dict) -> AnnotatedLink:
         dst=str(d["dst"]),
         all_reduce_gbps=float(d["all_reduce_gbps"]),
         sendrecv_gbps=float(d["sendrecv_gbps"]),
-        latency_us=float(d["latency_us"]),
+        # None for a record written by a rung that could not measure a
+        # collective, and for every record written before the field could be
+        # absent -- a stored 0.0 would read as an instant fabric.
+        latency_us=(
+            None if d.get("latency_us") is None else float(d["latency_us"])
+        ),
         gpudirect_rdma=bool(d["gpudirect_rdma"]),
         measured_at=float(d["measured_at"]),
         method=str(d["method"]),

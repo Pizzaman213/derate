@@ -1,12 +1,18 @@
-"""Day-0 stub so Agent E is never blocked on real hardware.
+"""Day-0 stub so the planner is never blocked on real hardware.
 
 Returns the fixture measurement for every pair: what two Sparks actually deliver
 with GPUDirect RDMA off. It satisfies the whole `LinkPort` surface and returns
 real contract types, because a stub that returns something else is worse than no
 stub at all.
 
-Deleted at integration. The values are duplicated from `tests/fixtures/links.py`
-rather than imported, because shipping code does not depend on the test tree.
+The real `LinkService` landed and `node.py` wires it in production behind
+`GatewayDeps(strict=True, ...)`, which refuses to start if any port -- this
+one included -- is still missing. This file stayed anyway: `__init__.py`
+exports `StubLinkService` as this package's public fake, and
+`tests/unit/test_links.py` reaches for it wherever a test needs a `LinkPort`
+without real hardware behind it. The values are duplicated from
+`tests/fixtures/links.py` rather than imported, because shipping code does
+not depend on the test tree.
 """
 
 from __future__ import annotations

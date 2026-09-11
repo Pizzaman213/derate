@@ -540,11 +540,51 @@ def test_ib_scaling_note_is_honest_when_gdr_is_enabled(monkeypatch):
     assert "GDR-disabled" not in scaling_note
 
 
-def test_ib_latency_comes_from_ib_write_lat_when_present():
+def test_ib_write_lat_is_reported_as_evidence_and_never_as_latency_us():
+    """The regression this closes, and it was the most expensive kind: a real
+    measurement of the WRONG OPERATION, in the field the planner trusts most.
+
+    `ib_write_lat` times a one-sided 2-byte RDMA write. `latency_us` is
+    multiplied by the exchange count and called the cost of that many two-rank
+    NCCL all-reduces, which additionally carry a kernel launch, a reduction and
+    a synchronisation. Recorded at 1.44 us against this project's own
+    nccl-tests fixtures at 40.0, it under-charged tensor parallel ~28x, and
+    every plan that turned on the wire was wrong in TP's favour.
+
+    So the rung declines. The number is still taken and still reported --
+    in the notes, where it is evidence about the fabric rather than an answer
+    to a question it did not ask.
+    """
     result = IbWriteBwMeasurer(ib_runner(), clock=lambda: T0).measure(
         Endpoint("a", "h1"), Endpoint("b", "h2")
     )
-    assert result.latency_us == pytest.approx(2.05, abs=0.01)
+    assert result.latency_us is None
+
+    notes = " ".join(result.annotation.notes)
+    assert "no collective latency was measured" in notes
+    assert "2.05" in notes, "the figure is kept, as evidence"
+    assert "not a two-rank all-reduce" in notes
+
+
+def test_the_bandwidth_estimate_survives_a_missing_ib_write_lat():
+    """Absence of a latency no longer fails the whole rung. It never should
+    have: the bandwidth half is independently useful, and dropping to a lower
+    rung over it discards a better bandwidth figure to gain nothing."""
+    runner = ib_runner()
+    original = runner.run
+
+    def without_lat(host, argv, **kwargs):
+        if argv and argv[0] == "ib_write_lat":
+            raise FileNotFoundError("ib_write_lat")
+        return original(host, argv, **kwargs)
+
+    runner.run = without_lat
+    result = IbWriteBwMeasurer(runner, clock=lambda: T0).measure(
+        Endpoint("a", "h1"), Endpoint("b", "h2")
+    )
+    assert result is not None
+    assert result.all_reduce_gbps > 0
+    assert result.latency_us is None
 
 
 def test_tcp_probe_labels_itself_as_an_upper_bound(monkeypatch):
@@ -928,3 +968,371 @@ def test_the_stub_worst_all_reduce_still_returns_the_minimum():
     stub.put(link("spark-01", "spark-03", all_reduce=4.1))
     worst = stub.worst_all_reduce(["spark-01", "spark-02", "spark-03"])
     assert worst.all_reduce_gbps == 4.1
+
+
+# ==========================================================================
+# NCCL calibration: the tuning that measures itself, per pair
+# ==========================================================================
+
+
+def test_calibrate_refuses_when_this_coordinator_is_not_an_endpoint(tmp_path):
+    """The guard that also keeps this whole suite from shelling out to docker,
+    which is why it is pinned rather than left implicit.
+
+    It is a real rule and not a test convenience: rank 0 has to run somewhere,
+    and a coordinator that is neither endpoint cannot be it. Measuring a pair
+    it is not part of would be timing someone else's fabric.
+    """
+    service = LinkService(path=tmp_path / "links.json")
+    assert service.calibrate("not-this-box", "nor-this-one") == 0
+
+
+def test_auto_calibration_is_on_by_default_and_can_be_turned_off(tmp_path, monkeypatch):
+    """On, because the point is that it is automatic. Off by one variable,
+    because the extra minutes at bring-up are not always wanted."""
+    monkeypatch.delenv("DERATE_NCCL_AUTOCALIBRATE", raising=False)
+    assert LinkService(path=tmp_path / "a.json").auto_calibrate is True
+    monkeypatch.setenv("DERATE_NCCL_AUTOCALIBRATE", "0")
+    assert LinkService(path=tmp_path / "b.json").auto_calibrate is False
+    assert LinkService(path=tmp_path / "c.json", auto_calibrate=False).auto_calibrate is False
+
+
+def test_a_measurement_calibrates_an_unknown_pair_exactly_once(tmp_path, monkeypatch):
+    """Calibration rides the measurement, which happens at bring-up and on
+    demand and never on a timer. It must fire for a pair nothing is stored for
+    and then stop: it costs one run per candidate, and re-spending that on
+    every measurement would make measuring the fabric something nobody does.
+    """
+    service = LinkService(
+        path=tmp_path / "links.json",
+        measurer=ScriptedMeasurer("nccl-tests", link()),
+        auto_calibrate=True,
+    )
+    calls = []
+    monkeypatch.setattr(service, "calibrate", lambda a, b, **kw: calls.append((a, b)) or 1)
+
+    monkeypatch.setattr(service, "_calibrated", lambda a, b, image: False)
+    service.measure("a", "b")
+    assert len(calls) == 1, "a pair with nothing stored gets calibrated"
+
+    monkeypatch.setattr(service, "_calibrated", lambda a, b, image: True)
+    service.measure("a", "b")
+    assert len(calls) == 1, "and is not calibrated again once it has rows"
+
+
+def test_a_failed_calibration_never_fails_the_measurement(tmp_path, monkeypatch):
+    """The measurement succeeded. Reporting it as failed because the tuning
+    that followed did not is the kind of coupling that makes people stop
+    measuring."""
+    service = LinkService(
+        path=tmp_path / "links.json",
+        measurer=ScriptedMeasurer("nccl-tests", link()),
+        auto_calibrate=True,
+    )
+    monkeypatch.setattr(service, "_calibrated", lambda a, b, image: False)
+    monkeypatch.setattr(
+        service, "calibrate",
+        lambda a, b, **kw: (_ for _ in ()).throw(RuntimeError("docker is not here")),
+    )
+    assert service.measure("a", "b") is not None
+
+
+def test_the_candidate_list_holds_no_knob_that_measured_nothing():
+    """Short on purpose, and the exclusions are the finding.
+
+    `NCCL_NET_OVERHEAD` was swept across 1/5/13/25/50 on this estate and moved
+    nothing outside the repeat noise. `NCCL_PROTO` is excluded for a stronger
+    reason: forcing the small-message protocol costs 6x at 4 MiB, because NCCL
+    already selects by size and a global override throws that away.
+    """
+    envs = LinkService.CALIBRATION_ENVS
+    assert {} in envs, "the default is a candidate: everything is measured against it"
+    keys = {k for e in envs for k in e}
+    assert keys == {"NCCL_MAX_NCHANNELS"}, keys
+
+
+class FakeCollective:
+    """A two-rank collective that answers from a script instead of a fabric.
+
+    Injected for the reason `measurer` and `clock` are injected everywhere
+    else here: the real one starts two containers and ssh's to a peer, so a
+    unit test using it would be a test about what else is on the machine.
+    """
+
+    def __init__(self, by_env=None, fail=()):
+        #: env-tuple -> {size: (microseconds, busbw_gbps)}
+        self.by_env = by_env or {}
+        self.fail = set(fail)
+        self.calls = []
+
+    def __call__(self, *, image, sizes, master_addr, peer_host, iface=None,
+                 env=None, **kw):
+        from control_plane.links.collective import CollectiveResult
+
+        env = env or {}
+        key = tuple(sorted(env.items()))
+        self.calls.append({"env": dict(env), "master": master_addr,
+                           "peer": peer_host, "iface": iface, "image": image})
+        if key in self.fail:
+            return CollectiveResult(error="the collective did not complete", env=dict(env))
+        table = self.by_env.get(key, {})
+        rows = [
+            {"bytes": n, "us": table.get(n, (10.0, 1.0))[0],
+             "busbw_gbps": table.get(n, (10.0, 1.0))[1]}
+            for n in sizes
+        ]
+        return CollectiveResult(rows=rows, nccl="2.31.2", env=dict(env))
+
+
+def _calibrating_service(tmp_path, monkeypatch, fake, *, records=None):
+    from control_plane import measurements as M
+
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: records or (tmp_path / "nccl"))
+    return LinkService(
+        path=tmp_path / "links.json",
+        measurer=ScriptedMeasurer("nccl-tests", link()),
+        local_node_id="here",
+        data_plane_addresses={"here": "10.0.0.1", "there": "10.0.0.2"},
+        collective_fn=fake,
+        auto_calibrate=True,
+    )
+
+
+def test_calibration_times_every_candidate_and_stores_a_row_per_size(tmp_path, monkeypatch):
+    """The body of `calibrate`, which until now no test reached at all -- the
+    only one that called it returned at the not-an-endpoint guard."""
+    from control_plane import measurements as M
+
+    D, B = M.DECODE_COLLECTIVE_BYTES, M.BULK_COLLECTIVE_BYTES
+    fake = FakeCollective({
+        (): {D: (17.7, 0.3), B: (1.0, 8.1)},
+        (("NCCL_MAX_NCHANNELS", "1"),): {D: (18.3, 0.3), B: (1.0, 10.9)},
+        (("NCCL_MAX_NCHANNELS", "2"),): {D: (17.4, 0.3), B: (1.0, 17.7)},
+        (("NCCL_MAX_NCHANNELS", "4"),): {D: (21.9, 0.3), B: (1.0, 18.6)},
+    })
+    service = _calibrating_service(tmp_path, monkeypatch, fake)
+
+    written = service.calibrate("here", "there", image="img")
+    assert written == len(LinkService.CALIBRATION_ENVS) * 2, written
+    assert [c["env"] for c in fake.calls] == list(LinkService.CALIBRATION_ENVS)
+
+    # Rank 0 runs on the LOCAL node, and the records are keyed by NODE ID --
+    # an address-keyed record is one the planner can never match.
+    assert all(c["master"] == "10.0.0.1" and c["peer"] == "10.0.0.2" for c in fake.calls)
+    assert M.matching_nccl("here", "there", image="img")
+
+    # And the winner is the one that is faster in bulk AND no worse at decode.
+    assert M.tuning_env("here", "there", image="img") == {"NCCL_MAX_NCHANNELS": "2"}
+
+
+def test_a_candidate_that_will_not_run_is_recorded_and_the_rest_continue(tmp_path, monkeypatch):
+    """"Nobody tried" and "tried and the fabric refused" are different answers,
+    and an absent record cannot tell them apart."""
+    from control_plane import measurements as M
+
+    D, B = M.DECODE_COLLECTIVE_BYTES, M.BULK_COLLECTIVE_BYTES
+    fake = FakeCollective(
+        {(): {D: (17.0, 0.3), B: (1.0, 8.0)},
+         (("NCCL_MAX_NCHANNELS", "2"),): {D: (16.0, 0.3), B: (1.0, 18.0)}},
+        fail={(("NCCL_MAX_NCHANNELS", "1"),)},
+    )
+    service = _calibrating_service(tmp_path, monkeypatch, fake)
+    service.calibrate("here", "there", image="img")
+
+    assert len(fake.calls) == len(LinkService.CALIBRATION_ENVS), "a failure stops nothing"
+    failures = [r for r in M.matching_nccl("here", "there", image="img") if r.error]
+    assert len(failures) == 1 and failures[0].env == {"NCCL_MAX_NCHANNELS": "1"}
+    # ...and a failed candidate is never crowned.
+    assert M.tuning_env("here", "there", image="img") == {"NCCL_MAX_NCHANNELS": "2"}
+
+
+def test_a_default_that_cannot_run_stops_the_calibration(tmp_path, monkeypatch):
+    """Every candidate is measured against the default. With no default there
+    is nothing to be better than, so spending the fabric on the rest would
+    produce rows nothing can read."""
+    from control_plane import measurements as M
+
+    fake = FakeCollective({}, fail={()})
+    service = _calibrating_service(tmp_path, monkeypatch, fake)
+    service.calibrate("here", "there", image="img")
+
+    assert len(fake.calls) == 1, "stopped after the default failed"
+    assert M.tuning_env("here", "there", image="img") == {}
+
+
+def test_calibration_names_the_bootstrap_interface_when_it_can_find_one(tmp_path, monkeypatch):
+    """NCCL picks its own out-of-band address otherwise, and on this estate it
+    picked a stray /30 the coordinator could not route to and hung until the
+    timeout -- which reads exactly like a fabric fault and is not one."""
+    from control_plane.links import collective
+
+    monkeypatch.setattr(collective, "local_interface_for", lambda addr: "enP7s7")
+    fake = FakeCollective()
+    service = _calibrating_service(tmp_path, monkeypatch, fake)
+    service.calibrate("here", "there", image="img")
+    assert fake.calls and all(c["iface"] == "enP7s7" for c in fake.calls)
+
+
+def test_a_measurement_of_an_unknown_pair_really_calibrates_it(tmp_path, monkeypatch):
+    """End to end through the trigger, with the real `calibrate` rather than a
+    stub for it -- the earlier trigger test monkeypatched the whole thing, so
+    it proved the call happened and nothing about what the call did."""
+    from control_plane import measurements as M
+
+    D, B = M.DECODE_COLLECTIVE_BYTES, M.BULK_COLLECTIVE_BYTES
+    fake = FakeCollective({
+        (): {D: (17.0, 0.3), B: (1.0, 8.0)},
+        (("NCCL_MAX_NCHANNELS", "2"),): {D: (16.0, 0.3), B: (1.0, 18.0)},
+    })
+    service = _calibrating_service(tmp_path, monkeypatch, fake)
+
+    assert M.tuning_env("here", "there", image="img") == {}
+    service.measure("here", "there")
+    assert fake.calls, "the measurement calibrated the pair"
+
+    before = len(fake.calls)
+    service.measure("here", "there")
+    assert len(fake.calls) == before, "and does not do it again"
+
+
+# ==========================================================================
+# nccl-torch: the rung that finally makes the measurement that counts run
+# ==========================================================================
+
+
+def test_the_ladder_prefers_a_real_collective_over_a_scaled_estimate():
+    """Order is the whole point of the rung.
+
+    `NcclMeasurer` stays first so a box with nccl-tests keeps the reference.
+    `nccl-torch` sits above `ib_write_bw` because an estimate must never beat
+    a measurement -- and until this rung existed the estimate always won by
+    default, since nccl-tests is installed nowhere in this estate.
+    """
+    from control_plane.links.measure import default_measurer
+
+    methods = [m.method for m in default_measurer()._measurers]
+    assert methods.index("nccl-torch") < methods.index("ib_write_bw")
+    assert methods.index("nccl-tests") < methods.index("nccl-torch")
+    assert methods.index("ib_write_bw") < methods.index("tcp")
+
+
+def test_the_collective_rung_reports_a_collective_latency_not_a_write(monkeypatch):
+    """The 8-byte time IS `latency_us`, and it is the first honest one this
+    ladder has produced: the rung below reports None rather than passing off an
+    `ib_write_lat` -- a one-sided 2-byte RDMA write -- as the cost of a
+    two-rank all-reduce."""
+    from control_plane.links import collective
+    from control_plane.links.measure import TorchNcclMeasurer
+
+    def fake_run(**kw):
+        return collective.CollectiveResult(
+            rows=[
+                {"bytes": 8, "us": 13.36, "busbw_gbps": 0.0},
+                {"bytes": 64 << 20, "us": 7000.0, "busbw_gbps": 18.49},
+            ],
+            nccl="2.31.2",
+        )
+
+    monkeypatch.setattr(collective, "run_collective", fake_run)
+    monkeypatch.setattr(collective, "local_interface_for", lambda addr: "eth0")
+    m = TorchNcclMeasurer(FakeRunner(), clock=lambda: T0, image="img")
+    link = m.measure(Endpoint("a", "h1", is_local=True), Endpoint("b", "h2"))
+
+    assert link is not None
+    assert link.method == "nccl-torch"
+    assert link.latency_us == pytest.approx(13.36, abs=0.01)
+    # busbw at the LARGEST size is the bandwidth, and it is measured rather
+    # than raw RDMA scaled by a constant -- so IB_TO_NCCL_RATIO does not apply.
+    assert link.all_reduce_gbps == pytest.approx(18.49, abs=0.01)
+    assert link.annotation.estimated is False
+    assert link.annotation.scale_factor is None
+    notes = " ".join(link.annotation.notes)
+    assert "same build the engine runs" in notes
+    assert "8-byte COLLECTIVE" in notes
+
+
+def test_a_fabric_that_will_not_complete_falls_through_rather_than_inventing(monkeypatch):
+    """None, so the ladder descends. The alternative -- a zero, or the
+    estimate's number wearing this rung's method name -- is the invented
+    figure this whole package exists to refuse."""
+    from control_plane.links import collective
+    from control_plane.links.measure import TorchNcclMeasurer
+
+    monkeypatch.setattr(
+        collective, "run_collective",
+        lambda **kw: collective.CollectiveResult(error="IB queue-pair fault"),
+    )
+    monkeypatch.setattr(collective, "local_interface_for", lambda addr: None)
+    m = TorchNcclMeasurer(FakeRunner(), clock=lambda: T0, image="img")
+    assert m.measure(Endpoint("a", "h1", is_local=True), Endpoint("b", "h2")) is None
+
+
+def test_the_rung_refuses_a_pair_this_host_is_not_part_of(monkeypatch):
+    """Rank 0 has to run somewhere. A coordinator that is neither endpoint
+    would be timing someone else's fabric."""
+    from control_plane.links.measure import TorchNcclMeasurer
+
+    m = TorchNcclMeasurer(FakeRunner(), clock=lambda: T0, image="img")
+    assert m.measure(Endpoint("a", "h1"), Endpoint("b", "h2")) is None
+
+
+def test_the_estimate_says_when_it_covered_one_rail_of_several():
+    """`ib_write_bw` takes one `-d`, so on a two-HCA box its figure is about
+    half the fabric. Running perftest twice and adding would be inventing an
+    aggregate; saying which rail it drove is the honest fix, and the
+    nccl-torch rung above is the real one -- NCCL binds every rail itself."""
+    from control_plane.links.measure import _active_devices, _single_rail_note
+    from control_plane.links.qsfp import PortInfo, PortStatus
+
+    two = PortStatus(ports=(
+        PortInfo(name="rocep1s0f0:1", active=True),
+        PortInfo(name="rocep1s0f1:1", active=False),
+        PortInfo(name="roceP2p1s0f0:1", active=True),
+    ))
+    assert _active_devices(two) == ["rocep1s0f0", "roceP2p1s0f0"]
+    note = _single_rail_note(two)
+    assert note and "one rail's, not the fabric's" in note[0]
+
+    one = PortStatus(ports=(PortInfo(name="rocep1s0f0:1", active=True),))
+    assert _single_rail_note(one) == [], "nothing to disclose on a single-rail box"
+
+
+def test_available_is_true_when_the_image_is_here(monkeypatch):
+    """A rung that measures correctly and reports itself unavailable never
+    runs, which is indistinguishable from not having written it.
+
+    This one did exactly that on first try: `available()` called
+    `runner.run(None, argv)` when the protocol is `run(argv)`, so it raised,
+    returned False, and the ladder would have descended to the estimate for
+    ever while the rung worked perfectly when called directly.
+    """
+    from control_plane.links.measure import TorchNcclMeasurer
+
+    class HasImage(FakeRunner):
+        def which(self, name):
+            return "/usr/bin/docker" if name == "docker" else None
+
+        def run(self, argv, timeout=60.0, env=None):
+            assert argv[0] == "docker", argv
+            return CommandResult(tuple(argv), 0, "[{}]", "", 0.01)
+
+    assert TorchNcclMeasurer(HasImage(), image="img").available() is True
+
+
+def test_available_is_false_without_docker_or_without_the_image():
+    """Both are real states on a node that can still measure other rungs."""
+    from control_plane.links.measure import TorchNcclMeasurer
+
+    class NoDocker(FakeRunner):
+        def which(self, name):
+            return None
+
+    class NoImage(FakeRunner):
+        def which(self, name):
+            return "/usr/bin/docker"
+
+        def run(self, argv, timeout=60.0, env=None):
+            return CommandResult(tuple(argv), 1, "", "No such image", 0.01)
+
+    assert TorchNcclMeasurer(NoDocker(), image="img").available() is False
+    assert TorchNcclMeasurer(NoImage(), image="img").available() is False
