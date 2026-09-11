@@ -144,7 +144,7 @@ rather than from the runtime's name, and `state/runtime.ts` states it once as
   everywhere else because it names the numbers the gate used; that promise is
   exactly what makes it wrong to show beside a button that starts something on
   a machine the gate never looked at.
-- **`?on=`, `?tp=` and `?pp=` are left alone**, not cleared. They are not in
+- **`?on=`, `?tp=`, `?pp=` and `?ep=` are left alone**, not cleared. They are not in
   this runtime's request, but discarding a machine selection because somebody
   glanced at another runtime would lose it on a reload with nothing launched.
 
@@ -179,6 +179,12 @@ the QUERY names what is selected  ?node=spark-01        a machine
                                                         verdicts are taken at; absent
                                                         means the coordinator picks
                                   ?on=spark-01,spark-02 the machines they are taken on
+                                  ?tp=1&pp=1&ep=2       the degrees, as a set: all three
+                                                        or none. No ?dp= -- placement.ts
+                                                        pairs it to ?ep=
+                                  ?spec=ngram:5         speculative decoding, method
+                                                        and drafted tokens; absent
+                                                        means one token per step
 ```
 
 Selections are query parameters rather than path segments because they are not
@@ -187,6 +193,34 @@ the dashboard's telemetry strip and in the sidebar roster, and the sheet is a
 modal that sits over whichever screen is showing. A model id is a path, because
 it is the subject of the screen and because `/models/meta-llama/Llama-3.1-8B`
 is the URL somebody would guess.
+
+**`?spec=` is one parameter carrying two values, unlike `?tp=`/`?pp=`/`?ep=`.**
+The two halves of `method:k` are never independently meaningful: a method with no
+count is not a request the fit gate can price, and a count with no method names
+nothing. Degrees each stand alone at 1, so a partial set can be completed; there
+is no value to complete half of this with, and one parameter cannot be
+half-written.
+
+**There is no `?dp=`, and that is the one place this scheme pairs two things.**
+vLLM builds no rank group for expert parallel -- `--enable-expert-parallel` is a
+boolean, so the expert-parallel size IS `dp * tp` -- and the shape the planner
+emits across machines is `dp = ep` with `tp = 1`. A data-parallel box would
+therefore have exactly one legal value given EP and no meaning without it, so
+`state/placement.ts` writes the pairing into the request and the field stays a
+single EP. It is not a legality check in the browser, which `DegreeFields` is
+careful not to do: `legality.py::ep_rejection` still judges the pairing and
+still refuses a bad one in its own words. EP has a field at all because the
+planner can never pick it on this hardware -- `EP_VIABLE_THRESHOLD` is 40 GB/s
+and a Spark tops out at 23.15 -- so the operator's is the only expert-parallel
+plan that will ever run here.
+
+The method is deliberately NOT validated against the union the API declares. A
+URL is somebody else's text, and which methods a checkpoint offers is the
+coordinator's answer -- it gives it as a sentence naming what this model does
+support. Dropping an unknown method in the parser would turn a shared link into
+a silently different launch. The drafted-token count IS validated, because an
+unreadable count has no honest reading at all: there is no server-side answer to
+"draft NaN tokens".
 
 **`?dep=` carries a served name, never a deployment id.** `state/selection.tsx`
 matches it against `served_name`, so a `deployment_id` there does not fail
@@ -491,6 +525,28 @@ a hue. The selected band paints its measured streamed/batched tone and every
 other passes null, which is the same "no reading" grey an empty meter track
 uses. Selecting a band is what answers that question for that band.
 
+**Measured speculation is on the frame, per deployment, or it is absent.**
+`MetricsDeploymentFrame.speculative` carries what the ENGINE counted about its
+own drafting -- acceptance over the window, acceptance per draft POSITION, and
+tokens settled per step -- read from `vllm:spec_decode_*` and differenced, so
+it is what just happened rather than the engine's whole life. `null` is the
+ordinary case and means "not measured", never zero: most deployments run no
+draft head, and a model that drafted nothing has no acceptance rate. It is
+drawn by `DeploymentInspector`'s speculative block and it sits BESIDE the fit
+gate's floor-to-ceiling range, never in place of it -- that range is what is
+true for a workload nobody ran, this is what happened on the one that did. A
+remote row carries the key as `null` for the same reason it carries the other
+counters: one reader draws both bands, and we cannot scrape somebody else's
+engine. Nothing here feeds `strength.py`.
+
+Per-position acceptance is CUMULATIVE, not conditional -- vLLM's own
+definition, its dashboard divides the per-position series by the draft count --
+so the figures fall away across positions rather than varying freely. The
+component passes each one to `ProportionBar` unchanged rather than `?? 0`,
+because that bar draws a null as a dashed empty track and a real zero as a
+solid one, and collapsing the two makes "never accepted here" and "no reading"
+pixel-identical.
+
 **Remote throughput comes off the same 1 Hz frame as a deployment's.**
 `MetricsHub` reports a `remotes[]` row per remote target the `StatsRegistry`
 has actually seen — counters only, so an un-allowlisted key is not several
@@ -694,7 +750,7 @@ and two mockup trees that are tracked in git, never built and never served.
 ## `check.mjs`
 
 The runner, and the reason `npm run check` means something. `walk(src)` recurses
-for `*.check.mjs` and sorts what it finds -- 21 verifiers today -- because a
+for `*.check.mjs` and sorts what it finds -- 24 verifiers today -- because a
 hard-coded list stops covering a verifier the moment somebody adds or renames
 one, which is the same failure as not having the verifier at all. The list it
 replaced lived in the project's working notes and had drifted to naming ten of
@@ -705,7 +761,7 @@ line. `coordinator` fetches `$DERATE_CHECK_ORIGIN/api/topology` (default
 `http://localhost:8088`) on a 2 s `AbortSignal.timeout`; `python` runs
 `python3 -c 'import sys'`; `browser` calls `findBrowser()`; `fixtures $NAME`
 asks whether that variable is set; no line at all means hermetic. Ten verifiers
-declare something, eleven declare nothing. Each requirement is probed once and
+declare something, fourteen declare nothing. Each requirement is probed once and
 memoised by key, so six coordinator verifiers cost one request.
 
 Three behaviours are load-bearing. **An unknown requirement is `fatal` -- a
@@ -802,7 +858,7 @@ why `tsc -b` is a checker here and never a compiler.
 `include: ["vite.config.ts"]`, and that is the whole project. Its `lib` is
 `ES2023` with no DOM, which is the reason `vite.config.ts` declares `process`
 for itself rather than being handed node's globals. Nothing else in the folder
-is covered by it -- `check.mjs` and the 21 `*.check.mjs` files are JavaScript,
+is covered by it -- `check.mjs` and the 24 `*.check.mjs` files are JavaScript,
 `allowJs` is set in neither project, and they are checked by being run.
 
 ## `.gitignore`

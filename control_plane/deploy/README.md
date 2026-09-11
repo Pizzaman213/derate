@@ -248,6 +248,24 @@ The one place that knows sparkrun's command line, verified against
 and reading `sparkrun/cli/_common.py`. When sparkrun's flags change, this is the
 only edit.
 
+**0.3.8 has also been checked end to end, and the constant is deliberately not
+bumped** -- it names what the box runs, and bumping it ahead of the box would
+make `test_we_can_still_talk_to_the_sparkrun_we_verified_against` skip instead
+of gate. What was checked, so the next person does not redo it: every flag in
+`KNOBS` is still in `cli/_common.py`; every key a synthesized recipe writes is
+still in `core/recipe.py::_KNOWN_KEYS`; `cluster check-job --json` is
+byte-identical on both versions; the `[N/6] Label` step headers
+`progress.py` matches are unchanged. Two things did move, and both are fixed
+here rather than worked around: the cluster handle gained a second hex segment
+(`CLUSTER_ID_RE`, which lost a live workload over it), and 0.3.8 warns that the
+recipe's `VLLM_CACHE_ROOT` overrides a runtime-cache mount it now manages
+itself -- a warning, not a failure, and `runtime_cache:` is the key it suggests
+if this is ever moved.
+
+The reason to care about 0.3.7+ at all is `SPARKRUN_DATA_PARALLEL_VERSION`: it
+is the first release that can launch a pure data-parallel cluster, which is the
+shape cross-node expert parallel takes. See `data_parallel_refusal`.
+
 `KNOBS` is the table, and its order is the order in the rendered command. Every
 `Knob` carries a `recipe_key` even when it has a `cli_flag`, because a CLI
 override still has to land on a `{recipe_key}` the synthesized template
@@ -277,8 +295,12 @@ deployment launched from it reaches READY, passes the identity check, and refuse
 every upload. `VLLM_CACHE_ROOT` is pointed into `RUNTIME_CACHE_DIR` because vLLM
 resolves it under `HOME=/tmp` in a `--rm` container, so every launch of every
 model recompiled from cold. SGLang gets `TORCHINDUCTOR_CACHE_DIR` and
-`TRITON_CACHE_DIR` -- PyTorch's own names, and said out loud to be unverified,
-since that image is not on this box. `tts` sets `sparkrun_runtime="vllm"` on
+`TRITON_CACHE_DIR` -- PyTorch's own names, verified 2026-09-10 against
+`scitrera/dgx-spark-sglang:0.5.12` by launching for real and reading the host
+side of the bind mount: `TRITON_CACHE_DIR` holds real compiled kernels that
+survive the container, and `TORCHINDUCTOR_CACHE_DIR` stays empty because this
+recipe never passes `--enable-torch-compile`, so Inductor is never invoked at
+all. `tts` sets `sparkrun_runtime="vllm"` on
 purpose: sparkrun's runtime field selects an *orchestration* plugin, every plugin
 renders the recipe's explicit `command:` verbatim, and there is no plugin for a
 runtime sparkrun has never heard of. Its `cache_env` is the voice library, not a

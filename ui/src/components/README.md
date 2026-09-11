@@ -1,6 +1,6 @@
 # components
 
-Nine files, 800 lines, imported by 34 modules across `tabs/`, `sidebar/` and
+Thirteen files, imported by 43 modules across `tabs/`, `sidebar/` and
 `inspectors/` — `shell/` is the one screen folder that takes nothing from here.
 Each one exists to make a design rule structural rather than remembered: a
 server sentence that cannot be paraphrased because the component that renders it
@@ -9,8 +9,9 @@ because null takes a different picture, a refusal that cannot be waived without
 ticking a box whose text names the measurement being waived.
 
 The dependency runs one way. Nothing here imports from a screen; the only
-non-React imports in the whole folder are `../format`, `../api/types` and, in
-`CacheTable.tsx`, two of its neighbours.
+non-React imports in the whole folder are `../format`, `../api/types` and a
+few components' own neighbours — `CacheTable.tsx` takes two, and `Select.tsx`/
+`Combobox.tsx` each take `listNav.ts` and `useDismiss.ts`.
 
 ## Layout
 
@@ -25,6 +26,10 @@ non-React imports in the whole folder are `../format`, `../api/types` and, in
 | `Copyable.tsx` | 86 | a command block with a copy button that works on a plain-HTTP LAN address |
 | `Panel.tsx` | 72 | `Section` and `Disclosure` — rules, not gaps and shadows |
 | `Popover.tsx` | 90 | a field-sized disclosure that hands `close` to its children |
+| `Select.tsx` | 189 | a closed-choice dropdown, styled to replace a plain `<select>` |
+| `Combobox.tsx` | 158 | free text with filtered suggestions, styled to replace `<input list>` + `<datalist>` |
+| `listNav.ts` | 70 | pure index/filter arithmetic `Select` and `Combobox` share — not a component, see below |
+| `useDismiss.ts` | 54 | the pointerdown/Escape/blur trio `Select` and `Combobox` share, lifted out of `Popover.tsx` |
 
 ## `Verbatim.tsx`
 
@@ -259,6 +264,68 @@ dismiss the panel when that is the whole gesture; a machine tick deliberately
 does not, because you are usually choosing several and closing after each one
 would make that four gestures.
 
+This dismissal trio now also lives in `useDismiss.ts`, lifted out verbatim for
+`Select.tsx` and `Combobox.tsx` to share (below) — `Popover.tsx` itself has not
+been switched onto it. With zero importers there is no live behavior to
+protect either way; doing so remains a same-risk, someday cleanup rather than
+part of building the other two.
+
+## `Select.tsx` and `Combobox.tsx`
+
+The one on-brand look every pick-a-value control in the app renders through:
+`Select` replaces a plain `<select>`, `Combobox` replaces `<input list>` +
+`<datalist>`. Two files, not one component with a mode flag — the keyboard and
+ARIA contract each implements is genuinely different, not just differently
+skinned. Both consume `styles/derate.css`'s `.ddwrap`/`.ddtrigger`/`.ddpanel`/
+`.ddopt` rules (from the block right after `.pop .popfoot`), sized to at least
+the trigger's own width rather than `.pop`'s fixed 260px minimum, since the
+sidebar's own column can be narrower than that.
+
+`Select<T extends string>({ id, 'aria-label', value, options, onChange,
+disabled, className, style })` is the WAI-ARIA "select-only combobox" pattern:
+a real `<button role="combobox">` that keeps DOM focus for the whole
+interaction — arrow keys, Home/End and letter-typeahead move
+`aria-activedescendant`, never focus itself, so Tab always just leaves and
+`useDismiss`'s blur handler closes the panel as a side effect, with no focus
+trap to build or maintain. Arrow keys and Home/End **stage** a choice while
+open (move the active row, never call `onChange`) and only Enter, Space or a
+click **commits** it — Escape is therefore a pure cancel, because nothing was
+written yet. Closed, though, Home/End and a typed letter commit immediately,
+matching what a native `<select>` does without being opened first.
+`SelectOption.label` is a plain `string`, never `ReactNode`: every call site's
+label, including the one with a computed price suffix
+(`tabs/models/BackendPicker.tsx`), is already just a template-literal string.
+
+`Combobox({ id, 'aria-label', value, onChange, suggestions, placeholder,
+disabled, spellCheck, autoComplete, maxVisible, className, style })` is always
+plain `string` — free text with arbitrary values allowed, never a closed
+union. There is no staging step: every keystroke calls `onChange` directly,
+because the input already **is** the value, exactly like the `<input>` it
+replaces. `aria-autocomplete="list"`, deliberately not `"both"` — `"both"`
+auto-completes inline into the field and would silently mutate typed text,
+which is the one thing a field promising arbitrary values must never do.
+Arrow keys move the highlighted suggestion without touching what was typed;
+Enter with a suggestion highlighted commits it, Enter with nothing highlighted
+leaves the typed text exactly as it was. Home, End and Left/Right are left
+alone on purpose — this control's trigger is a real text input, so those keys
+keep their native cursor-movement meaning rather than being repurposed the way
+`Select` repurposes them on its button. `maxVisible` (default 50) plus
+`listNav.ts`'s `capMatches` caps a several-hundred-row suggestion list with a
+footer ("N more — keep typing to narrow"), reusing `.pop .popfoot`'s visual
+weight, so a large catalogue stays "a list you type into" rather than one you
+scroll — the reasoning `tabs/settings/ProviderBackupPanel.tsx`'s own code
+already named for the `<datalist>` this replaced.
+
+**Why `listNav.ts` and `useDismiss.ts` are shared and the keyboard/ARIA logic
+is not.** The dismissal trio is the exact same behavior, needed unmodified by
+both — sharing it is deduplicating already-correct code, not inventing a
+speculative abstraction. `moveActive`'s clamped index arithmetic is likewise
+identical for both. But `Select` stages a choice and `Combobox` never does;
+forcing the two through one shared "keyboard engine" would produce a mode-flag
+component, which is the kind of abstraction this folder otherwise avoids.
+Neither `listNav.ts` nor `useDismiss.ts` is itself a component, which is why
+neither appears in the importer table below.
+
 ## The seam with the screens
 
 Every consumer is a screen module, and it imports by path — there is no
@@ -268,11 +335,13 @@ Every consumer is a screen module, and it imports by path — there is no
 |---|---|---|
 | `Verbatim` | 22 | every surface that renders a server sentence |
 | `Lamp` | 16 | roster, routing, activity, model cards, the node page |
+| `Select` | 8 | appearance, serve panel, models toolbar (x2), voice fields (x2), provider kind, pull provider, backend picker, routing policy |
 | `Readout` | 8 | dashboard aggregates and strip, roster, node board, filesystems, the verdict, the node inspector |
 | `Bars` | 7 | the verdict, the node board, the roster, activity, two storage cards, the deployment inspector |
 | `Panel` | 3 | plan section, quantization ladder, serve panel — `Disclosure` only |
 | `OverrideGate` | 2 | `tabs/models/Verdict.tsx`, `tabs/models/QuantLadder.tsx` |
 | `CacheTable` | 2 | `tabs/models/InstalledModelsCard.tsx`, `tabs/storage/ModelCacheCard.tsx` |
+| `Combobox` | 2 | `tabs/settings/KeyField.tsx`, `tabs/settings/ProviderBackupPanel.tsx` (x2) |
 | `Copyable` | 1 | `tabs/settings/AddNodeCard.tsx` |
 | `Popover` | 0 | — |
 
@@ -352,9 +421,14 @@ caller, because neither is a prop the caller can turn off.
 - **The clipboard is unavailable or refuses.** Fall through to `execCommand`;
   if that fails too, a `--warn` line says so and points at the block, which is
   selectable and scrollable by hand. Unmounting mid-report clears the timer.
-- **A press lands outside an open `Popover`.** `pointerdown` closes it and the
-  press still reaches its target. Escape closes it and returns focus to the
-  trigger; focus leaving the wrapper closes it too.
+- **A press lands outside an open `Popover`, `Select` or `Combobox`.**
+  `pointerdown` closes it and the press still reaches its target. Escape
+  closes it and returns focus to the trigger; focus leaving the wrapper closes
+  it too — the same `useDismiss.ts` behavior, shared by all three.
+- **A `Combobox` matches nothing.** A non-empty, unmatched query shows one
+  muted, non-interactive row rather than silently collapsing to an empty
+  panel — a missing match is shown as missing, the same rule `Readout`,
+  `SegmentBar` and `ProportionBar` already apply to a missing reading.
 
 ## Deliberately not built
 
@@ -378,6 +452,18 @@ seconds. One consumer does not justify a global surface.
 as past the live line would put three colour regions in a bar whose whole thesis
 is that colour reports state rather than category, and two rules of equal weight
 read as a range rather than as a measurement and its context.
+
+**Multi-select, per-option `disabled`, and a portal for `Select`/`Combobox`.**
+No call site needs any of the three: every current use picks exactly one
+value, no option is individually disabled (`BackendPicker` disables the whole
+control, not one row), and `main`/`aside` are both `overflow: hidden` for the
+same reason `Popover` stays unportalled. All three are small, additive changes
+whenever a call site actually needs one.
+
+**Virtualizing `Combobox`'s suggestion list.** A render cap (`maxVisible`,
+default 50) plus a "N more" footer was chosen instead, because "several
+hundred options" — the case this was built for — doesn't need real windowing,
+only a ceiling on how much of the list ever mounts.
 
 **A muted variant of `Verbatim`.** `size` changes scale and nothing else. A
 server sentence set at `unit` size is still content, and giving it the `.unit`

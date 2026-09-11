@@ -42,6 +42,7 @@ curated, cached and serving rather than three rows each saying a third of it.
 | `ParamBreakdownTable.tsx` | 82 | where the parameters are, and why two totals differ |
 | `QuantTableCard.tsx` | 85 | the quantization table exactly as the gateway reports it |
 | `DegreeFields.tsx` | 102 | TP and PP, owned as a set; `null` means the planner picks |
+| `SpeculativeField.tsx` | 95 | which speculative method to serve with; `null` means one token per step |
 | `CustomServes.tsx` | 58 | replaying a hand-written launch command |
 | `InstalledModelsCard.tsx` | 49 | what is already on the cluster's disks, read-only |
 | `rows.check.mjs` | 726 | the browser-side fold against the live coordinator's real payloads |
@@ -206,11 +207,23 @@ cannot run it" is an answer and an empty card is not.
 
 The rest split in two, and the split is the point. Most of what a hub search
 turns up for a popular model is GGUF and there is no llama.cpp runtime here: for
-Qwen3-30B-A3B, thirty-seven of forty-one. The gateway ranks on fit before
-servability, so its ordering puts the four launchable rows at 29, 30, 31 and 39.
+Qwen3-30B-A3B, thirty-seven of forty-two. The gateway ranks on fit before
+servability — `capacity_api.py::_rank_key` sorts on fit tier then size and never
+consults `launchable` — so a 30 GB GGUF that fits outranks the smaller
+safetensors row that is the only thing vLLM can start.
 `partitionForRuntime` fixes what is seen without touching the ordering — rank
 order is preserved exactly inside each group — and re-sorting in the browser
-would be the second answer that misleads. Serve is **absent** on a row that
+would be the second answer that misleads.
+
+**Where the launchable rows land is a snapshot, not a property.** This passage
+used to record them at 29, 30, 31 and 39; today they are at 1, 38, 39, 40 and
+41. It moves with the hub listing and with every change to the fit arithmetic,
+because the fit tier is the outer sort key — the KV-margin commits of
+2026-09-10 were enough to shift one launchable row to the top. `rows.check.mjs`
+therefore prints the positions as evidence and asserts only what does not move:
+that the partition preserves the gateway's order and never becomes a second
+ordering. An assertion on the magnitude was there until 2026-09-11 and was
+inverted — fixing `_rank_key` would have broken it. Serve is **absent** on a row that
 cannot be served rather than present and dead: a disabled button reads as "not
 right now" when the truth is "not by this route at all".
 

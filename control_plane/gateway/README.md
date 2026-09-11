@@ -261,10 +261,20 @@ Without it a benched target reads as `healthy: false` for a deployment that
   touches an acceptance criterion. It stays terminal.
 - **A parked-request gauge *in the SSE frame*.** `metrics.snapshot()`'s
   `queue_depth` counts in-flight upstream requests, so parked ones are still
-  invisible there, and adding a field would touch the frozen 4.8 frame shape.
-  Parking now emits an event on the way in and on the way out carrying the
-  wait and the outcome, so the queue is no longer ungauged -- the numbers are
-  in `GET /api/history/events`, just not in the live frame.
+  invisible there. Parking emits an event on the way in and on the way out
+  carrying the wait AND the outcome, so the queue is no longer ungauged -- the
+  numbers are in `GET /api/history/events`, just not in the live frame. That
+  is the actual reason it stays out: a gauge samples, and what was wanted here
+  was every wait and how it ended, which a 1 Hz sample cannot carry.
+
+  This bullet used to give a second reason -- that adding a field would touch
+  "the frozen 4.8 frame shape". That premise no longer holds and saying so is
+  the point of writing it down. `00-architecture.md` is retired, no contract in
+  `control_plane/contracts/` describes this payload, and the frame has grown
+  twice since: `remotes[]`, and a per-deployment `speculative` block carrying
+  what the engine counted about its own drafting. A field earns a place on the
+  frame when it is a LEVEL somebody watches change -- throughput, queue depth,
+  acceptance -- and not when it is a sequence of discrete outcomes.
 
 ---
 

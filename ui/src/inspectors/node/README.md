@@ -32,6 +32,7 @@ bottom, then the right.
 | `ResidentProcesses.tsx` | 108 | what is holding the GPU, whether or not derate launched it |
 | `NodeRuntimeCard.tsx` | 296 | a runtime already listening here, and the one click that makes it a target |
 | `EventsAndLogs.tsx` | 173 | what happened on this machine, in its own words, capped and saying so |
+| `NodeLogFiles.tsx` | — | `node.log`/`proxy.log`, tailed over `GET /api/nodes/{id}/logs` -- not rendered by `NodeInspector` itself; Settings -> Instance is its only caller so far |
 | `Terminal.tsx` | 300 | xterm over a WebSocket to the node, loaded on demand |
 
 ## `NodeInspector.tsx`
@@ -64,10 +65,14 @@ a unified-memory one.
 `/api/deployments` is a ledger that keeps every attempt for a week, so nine
 failed tries at four models are nine rows all naming this node — and each one
 drew a full serving block, lamp and plan line and four readouts and three
-charts, for a container that does not exist. `runners()` is imported from
+charts, for a container that does not exist. `runners()` and
+`runningOrPrevious()` (the `here`/`previous` split, including the fallback to
+the last terminal attempt when nothing is running now) are both imported from
 `tabs/cluster/layout`, the floor's and the dashboard strip's own filter,
-deliberately not a fourth spelling of the same set: a machine cannot be serving
-something here and idle there.
+deliberately not a fourth spelling of the same set: a machine cannot be
+serving something here and idle there. `tabs/settings/InstanceCard.tsx` calls
+the same `runningOrPrevious()` for the same node, so the two surfaces cannot
+disagree about what "here" means.
 
 The header carries both identities the label may be standing in front of — the
 `node_id` every deployment, link and routing target is keyed by, and the
@@ -349,6 +354,24 @@ handler that shipped them. `module:lineno` goes in the row's `title` attribute:
 it is what you want once you have decided a line matters, and noise on every
 line until then.
 
+## `NodeLogFiles.tsx`
+
+`NodeLogFiles({ nodeId })` tails `node.log` or `proxy.log` — the control
+plane's own process log (`control_plane/logfiles.py`), not a served model's
+stdout (`DeploymentLog`) and not the structured archive (`EventsAndLogs`
+above). `GET /api/nodes/{id}/logs` proxies to the node agent's own
+`GET /agent/logs`, the same shape `_agent_processes` already uses to reach a
+node directly.
+
+**Same rule as `EventsAndLogs`, extended to a new surface.** A file toggle and
+a line-count choice are the only controls — no query box, no logger filter.
+Read on demand and refreshed by hand, like `DeploymentLog`: a file tail has no
+"is this actively streaming" signal to poll against.
+
+Not yet wired into `NodeInspector` itself — its only caller today is
+`tabs/settings/InstanceCard.tsx`, which renders it alongside this folder's
+other panels for the node/deployment an operator picks there.
+
 ## `Terminal.tsx`
 
 `NodeTerminal({ nodeId })` is xterm over a WebSocket to
@@ -396,9 +419,16 @@ and about SSH keys the node's container mounts, is not hedged.
 
 ## The seam with the rest of the UI
 
-`NodeInspector` is imported by exactly one file, `shell/Sheet.tsx`, which
-resolves `sheet.kind === 'node'` against the polled `cluster` roster and hands
-the row down. Nothing else in the tree imports anything from this folder.
+`NodeInspector` itself is imported by exactly one file, `shell/Sheet.tsx`,
+which resolves `sheet.kind === 'node'` against the polled `cluster` roster and
+hands the row down. Its children are not so exclusive any more:
+`tabs/settings/InstanceCard.tsx` imports `ServingBlock`, `RequestsTable`,
+`ResidentProcesses`, `NodeRuntimeCard`, `EventsAndLogs`, `DeploymentLog` and
+`NodeLogFiles` directly, so an operator can see the same panels from Settings
+without opening the sheet. Every one of them takes plain props and reads
+shared app context (`useBackend`, `useSelection`, `state/history.ts`'s hooks)
+rather than anything scoped to `NodeInspector`, which is what makes this
+possible without change to any of the seven.
 
 Everything else crosses outward:
 
@@ -419,8 +449,9 @@ Everything else crosses outward:
   by calling its own `load()` — a resident model and an accepted pull are on the
   wire nowhere else. `nodeRuntime` is a read, not a write: the probe behind
   `load()`.
-- **`tabs/cluster/layout.ts`** hands over `runners()` and `edgeMeasured()`, so
-  the node page and the cluster floor cannot disagree about what is running or
+- **`tabs/cluster/layout.ts`** hands over `runners()`, `runningOrPrevious()`
+  and `edgeMeasured()`, so the node page, the Settings instance picker and the
+  cluster floor cannot disagree about what is running, what ran here last, or
   about what counts as a measured link.
 - **`tabs/dashboard/Chart.tsx`** supplies `Chart` and `ChartGrid`; the four
   node traces and the three per-deployment traces are the same component the
@@ -524,7 +555,9 @@ the wire to throttle, so there is still no control.
 
 **A cluster-wide log browser.** `EventsAndLogs` is one node's recent lines over
 the page's window. No query box, no logger picker — those are the two things
-that would turn a diagnostic strip into a different product.
+that would turn a diagnostic strip into a different product. `NodeLogFiles`
+adds a second log surface, the raw files, under the identical rule: a file
+toggle and a line-count choice, and nothing that searches.
 
 **A kill for anything derate launched.** `gpu_procs.attribute()` sets
 `killable=False` on any process it can match to a live deployment, and

@@ -31,6 +31,7 @@ full  = resolver.resolve_full("openai/gpt-oss-120b")  # + warnings, support, rea
 | `avatars.py` | 291 | publisher marks, resolved coordinator-side and cached forever |
 | `quant_detect.py` | 282 | which quantization scheme a repo ships, in order of trust |
 | `params.py` | 277 | parameter accounting by bucket, reconciled against the weight index |
+| `speculators.py` | 227 | which speculative-decoding methods a checkpoint declares, and what each costs |
 | `cache.py` | 250 | the disk cache: sha-pinned entries never expire, floating refs get a TTL |
 | `imageprobe.py` | 248 | asks the runtime image what it can load, instead of keeping a list |
 | `types.py` | 223 | `Resolution`, `RuntimeSupport`, `QuantVariant` — the provenance `ModelShape` has no room for |
@@ -316,6 +317,60 @@ capped at 0.995 of the total rather than something rounder, because Kimi K2 is
 98.9 percent routed experts and a lower cap would refuse to split it. A drift
 above 5 percent between the measured and analytic totals warns that the active
 split is approximate.
+
+## `speculators.py`
+
+`detect(mapped, breakdown, ...)` answers which speculative-decoding methods a
+checkpoint can be served with, and what each one costs. Two rules.
+
+**Read what the config declares, never the architecture name.** There is more
+than one mechanism and a checkpoint can carry two at once:
+`tests/resolver_data/deepseek-v4-flash.config.json` has
+`num_nextn_predict_layers: 1` *and* `dspark_block_size: 5`. A table keyed on
+`DeepseekV4ForCausalLM` would have to pick one; the config says both, in fields
+the runtime reads too. `ngram` is offered for every model including the ones
+that declare nothing — it drafts by matching output against the prompt, loads
+no weights, and needs no support from the checkpoint. That is what makes a
+dense model like Qwen3-8B answerable on its own screen rather than blank.
+
+**Never offer what cannot be budgeted.** DSpark comes back with
+`draft_params=None` and `launchable=False`: `dspark_target_layer_ids` names
+layers the model already has, so it is not a decoder layer's worth of new
+weights the way the MTP module is — but "not that" is not a figure, and this
+build has not read the rank-256 markov head's parameterisation out of a
+checkpoint. It is detected, named, and refused. The whole product is a gate
+that refuses launches which will run out of memory, and a method whose weight
+cost is unknown is a launch nothing has checked.
+
+The MTP cost is derived as the exact inverse of `resolver.py`'s own
+subtraction — `weight_bytes_after * mtp / total_params`, not
+`mtp * bytes_per_param` — so turning speculative decoding on adds back
+precisely what excluding the module took away. On a mixed-precision repo those
+two differ by gigabytes, and the difference lands in the fit gate.
+
+`head_option(head, base_shape, ...)` is the other half, and it is the one that
+reaches models the target's config cannot describe. A draft head published in
+its own repository -- `AngelSlim/Qwen3-4B_eagle3`, `RadixArk/Qwen3.8-27B-DSpark`
+-- is a repo like any other, so the same mapper sizes it and the same weight
+index measures it. Four things must hold, each a sentence rather than an
+exception: the class it declares must be recognised (prefix-matched, because
+the pinned image registers 61 speculator classes and grows every release), the
+image must register it, `hidden_size` and `vocab_size` must match the target
+(a head reads the residual stream directly, so a mismatch is a load failure and
+not a quality question), and its shards must be *measured* -- the analytic split
+for a head is a floor, landing 16 percent low on the one head whose shards can
+be counted, and under-charging is the wrong direction for a memory gate.
+
+This is also why `Qwen/Qwen3-Next-80B-A3B-Instruct` reports no MTP: its own
+config declares no `num_nextn_predict_layers` while the image loads
+`Qwen3NextMTP` perfectly well from a separate repository. A config-only check
+is right about the config and silent about the ecosystem, and `head_option` is
+where the ecosystem is answered.
+
+What the *image* can load is a separate question and lives in `imageprobe.py`:
+that module now keeps the `_SPECULATIVE_DECODING_MODELS` set it used to compute
+and discard. A method the config declares and the image cannot load is a launch
+that clears every gate here and dies at load.
 
 ## `cache.py`
 

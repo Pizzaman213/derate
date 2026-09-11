@@ -518,6 +518,12 @@ It is deliberately a diagnostic strip and not a log browser — there is no sear
 box — so for anything wider, read the files, where the access lines are still
 there.
 
+**Settings → Instance** can now read a tail of both files itself, over
+`GET /api/nodes/{id}/logs` — pick the node, and the log files panel there
+tails `node.log` or `proxy.log` without a shell on the machine. It carries the
+same rule as the diagnostic strip: a file toggle and a line-count choice, no
+search box, and only the live file — a rotated backup still needs the machine.
+
 ---
 
 **Next:** back to the [project README](../../README.md) for the install path and

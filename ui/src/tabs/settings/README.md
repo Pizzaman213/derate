@@ -27,6 +27,7 @@ reference, and which of the environment and `secrets.json` answered to it.
 | `KeyField.tsx` | 137 | the two-mode credential field, shared by the add form and the per-row editor |
 | `keyfield.ts` | 131 | the pure half: shape warnings, minted names, predicted ids, key-state prose |
 | `ScopeCards.tsx` | 101 | three read-only cards — planned, reversed, and never |
+| `InstanceCard.tsx` | — | pick a node and, optionally, a deployment on it; renders NodeInspector's own panels plus `NodeLogFiles` |
 | `ReliabilityCard.tsx` | 61 | one toggle, `auto_restart_crashed_deployments`, with its source |
 | `ClusterCard.tsx` | 42 | five read-only cluster facts, and two rows deliberately absent |
 | `AppearanceCard.tsx` | 29 | the theme select, moved out of the header |
@@ -295,6 +296,30 @@ the model catalog browser, the deep-dive metrics page, the log browser
 kill verb to avoid and which is now that hole opened deliberately behind
 `DERATE_SHELL=1`.
 
+## `InstanceCard.tsx`
+
+Settings → Instance: a node `<select>` and a deployment `<select>`, and below
+them, whichever of `NodeInspector`'s own panels apply — `ServingBlock`,
+`RequestsTable`, `ResidentProcesses`, `NodeRuntimeCard`, `EventsAndLogs`,
+`DeploymentLog`, and the new `NodeLogFiles` (`inspectors/node/`) — reused
+directly rather than reimplemented, so this card and the node sheet cannot
+silently disagree about what a machine is doing. `runningOrPrevious`
+(`tabs/cluster/layout.ts`) is shared with `NodeInspector` for the same reason.
+
+**It adds no selection state of its own.** The picker reads and writes
+`?node=`/`?dep=`, the query params every other screen already shares, so a
+link to `/settings?node=X&dep=Y` opens this card pre-filled — see
+`SettingsTab.tsx`'s lazy `useState` initializer, which is what makes the
+first render land here instead of on Connection.
+
+**`NodeLogFiles` gets no search box, on purpose.** Same rule `EventsAndLogs`
+already follows (see `ScopeCards.tsx`'s "Searchable logs" row): a file toggle
+(`node.log`/`proxy.log`) and a line-count choice are the only controls. It
+reads `GET /api/nodes/{id}/logs`, which proxies to the node agent's own
+`GET /agent/logs` — the coordinator's own process log, not a deployment's
+serving log (`DeploymentLog`) and not the structured archive
+(`EventsAndLogs`).
+
 ## `ReliabilityCard.tsx`
 
 One switch — `auto_restart_crashed_deployments` — with `SOURCE_LABEL` under it
@@ -343,10 +368,10 @@ the fourteen files directly; `KeyField`, `keyfield.ts` and
 </div>
 ```
 
-Seven sub-tabs: Connection (`CoordinatorCard` + `ClusterCard`), Nodes
-(`AddNodeCard` + `NodesCard`), Storage, Providers, Policy, Appearance, About.
-Storage is the one composed from outside this folder — four cards from
-`tabs/storage/`.
+Sub-tabs: Connection (`CoordinatorCard` + `ClusterCard`), Nodes
+(`AddNodeCard` + `NodesCard`), Instance (`InstanceCard`), Storage, Providers,
+Policy, Appearance, About. Storage is the one composed from outside this
+folder — four cards from `tabs/storage/`.
 
 **Every section stays mounted and is hidden with `hidden`, not unmounted.**
 `AddNodeCard` holds a minted enrollment token, its countdown and the list of
@@ -365,6 +390,7 @@ Outward, the cards call `state/backend` and `state/resources`:
 - `mintEnrollment`, `revokeEnrollment` → `POST /api/enroll`,
   `DELETE /api/enroll/{token_id}`
 - `admit`, `removeNode` → `POST /api/nodes/{id}/admit`, `DELETE /api/nodes/{id}`
+- `nodeLogTail` → `GET /api/nodes/{id}/logs`, called by `NodeLogFiles`
 - `useSettings`, `patchSettings`
 - `api/origin`'s `normalizeBase` and `describeBase`, which are pure, and
   `setCoordinatorBase`, which writes localStorage and wakes every subscriber

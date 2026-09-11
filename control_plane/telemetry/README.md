@@ -142,7 +142,7 @@ runs on a timer rather than on reconcile. That is a direct correction:
 `deploy/store.py`'s `purge_expired()` is called only from `reconcile()`, which
 runs once per restart, so a process that stays up never collects anything.
 
-Rollups are what make a year affordable. Raw samples cost about 8 MB per node
+Rollups are what make a year affordable. Raw samples cost about 12 MB per node
 per day; the 1-minute rows that summarise them cost about 10 KB, and the hourly
 rows about 170 bytes. Only closed buckets are rolled — `ROLL_LAG_S` (120s) keeps
 an in-flight second from producing a row that is wrong the instant after it is
@@ -226,7 +226,7 @@ them.
 
 Local to this package, and nothing here is a frozen contract. Every horizon is a
 default chosen against arithmetic rather than a round number: a node sample is
-roughly 96 bytes on disk, so thirty days at 1 Hz is about 250 MB per node — but
+roughly 140 bytes on disk, so thirty days at 1 Hz is about 365 MB per node — but
 a request row is roughly 260 bytes, which is 2.2 GB/day at a sustained 100 rps.
 That asymmetry is why `REQUESTS_RAW_RETENTION_S` is 7 days against
 `SAMPLES_RAW_RETENTION_S`'s 30. Six variables bind at runtime:
