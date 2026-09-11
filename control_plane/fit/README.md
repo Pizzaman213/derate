@@ -117,6 +117,63 @@ machine.
 is "allocatable right now", not "usable", because it is not what the hardware
 could spend — it is what was left at the moment we looked.
 
+### Speculative decoding is charged into the existing terms
+
+`FitRequest.speculative` is trailing and defaulted, and `None` — the ordinary
+case — changes nothing at all. Set, `memory_breakdown` adds the draft's weights
+to `weights` and the cache for its drafted positions to `kv_cache`, rather than
+inventing terms of their own. That is the point: every refusal string,
+`_largest_context`, `max_context_that_fits` and the headroom arithmetic then
+work unchanged, instead of each having to learn about a second kind of memory.
+
+The draft head is divided by tensor parallel and **not** multiplied by
+`stage_fraction`. A runtime places it on one pipeline stage rather than
+spreading it across them, so charging it a stage's share would under-budget
+precisely the rank that holds it — and a warning says so, beside the
+uneven-stages one that exists for the same reason.
+
+`speculative_decode_tps_range` returns a floor and a ceiling and never a single
+number:
+
+    ceiling = base * (k + 1) / (1 + k * draft_ratio)   every draft accepted
+    floor   = base         / (1 + k * draft_ratio)     none accepted
+
+where `draft_ratio` is the draft's parameters over the model's active ones. The
+draft's own bandwidth cost is subtracted from both ends, which makes the ceiling
+tighter than a bare `(k+1)x` — and makes the **floor lower than the ordinary
+rate**, which is the half of the trade a recommendation is tempted to leave out:
+a method that drafts with real weights and gets nothing accepted is slower than
+not speculating at all. ngram's `draft_ratio` is zero, so its floor is the
+ordinary rate exactly.
+
+`speculative_best_k` is the other half, and the one that narrows the range.
+Given `accept_cumulative[i]` -- the fraction of draft rounds in which position
+`i` was accepted, read off the engine by `control_plane/metrics_scrape.py` --
+
+    E[accepted](k) = sum(accept_cumulative[:k])
+    TPS(k)         = base * (1 + E[accepted](k)) / speculative_overhead(k, ratio)
+
+The series is CUMULATIVE, not conditional: a draft is only checked at position 2
+if position 1 was accepted first, which is what makes that a plain sum rather
+than a chain of products, and means nothing assumes the positions are
+independent. They are not.
+
+`speculative_overhead` is shared with the range above rather than written twice,
+and that is load-bearing: all-ones acceptance reproduces the ceiling *exactly*
+and all-zeros the floor, so a measured point always lands inside the range the
+screen already showed. `tests/unit/test_spec_measure.py` pins both ends,
+because that invariant is the only thing tying the measured number to the
+claim it narrows.
+
+There is deliberately no assumed acceptance rate anywhere in that function.
+Where a real workload lands between the two ends is a property of the workload,
+derate does not measure it, and `speculative_reason` says so in the sentence it
+hands the screen. An estimate there would be a throughput figure this project
+cannot back, which is the one thing every number on these screens is supposed
+not to be. `gateway/strength.py` keeps routing on `predicted_decode_tps`, the
+base figure — routing on a ceiling would prefer a deployment for a speedup
+nobody measured.
+
 ## `capacity.py`
 
 `largest_runnable(shapes, nodes, ...)` returns one `CapacityRow` per shape and
@@ -263,13 +320,24 @@ else. `gateway/capacity_api.py` and `inventory/api.py` both import it.
 
 ## `constants.py`
 
-Eight names, three of them read through `getattr(_k, NAME, default)` against
-`contracts/constants.py`, which defines none of the three today — so all three
+Nine names, four of them read through `getattr(_k, NAME, default)` against
+`contracts/constants.py`, which defines none of the four today — so all four
 run on the local default: `ACTIVATION_CHUNK_TOKENS` (2048),
-`DECODE_EFFICIENCY` (0.55 — real runtimes land near half the pure
-memory-bandwidth ceiling) and `CONTEXT_ROUNDING` (512, because page sizes are
-powers of two and a suggestion of 18944 is easier to act on than 18991).
-Contracts win the moment they define one, without an edit here.
+`DECODE_EFFICIENCY` (0.55), `DECODE_EFFICIENCY_BEST` (0.75) and
+`CONTEXT_ROUNDING` (512, because page sizes are powers of two and a suggestion
+of 18944 is easier to act on than 18991). Contracts win the moment they define
+one, without an edit here.
+
+**The two efficiencies are the two ends of one range, and neither is an
+average.** Seven checkpoints measured on a GB10 through `tests/decode_sweep.py`
+imply efficiencies from 0.560 (LFM2.5-350M) to 0.738 (Qwen3-1.7B) — a 28%
+spread, so no single constant describes them and the best one available is
+still 16% wrong for somebody. 0.55 is at or below all of them, so the figure
+the degraded threshold judges and the router seeds from never over-promises;
+0.75 is the highest rounded up, so the empty-cache end is a real upper bound
+rather than a guess that the hardware sometimes beats. At 0.70 it would not be:
+Qwen3-1.7B decodes above it. No MoE is in that corpus — nothing large enough
+fit on the box while it was taken.
 `MAX_CONTEXT_SEARCH` (2^21), `MAX_SEARCH_NODES` (64), `KV_ELEM_BYTES`,
 `KV_FALLBACK_DTYPE` and `QUANT_SUGGESTION_ORDER` are local outright.
 

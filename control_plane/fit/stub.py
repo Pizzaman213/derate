@@ -1,8 +1,18 @@
-"""Day 0 stub. Callable by F and G before the real calculator lands.
+"""Day 0 stub. Callable before the real calculator lands.
 
-FITS below 100 GiB, WONT_FIT above, with a plausible breakdown either way.
-Delete at integration. A stub that returns invalid contract types is worse
-than no stub, so this returns the same shapes the real calculator does.
+FITS below 100 GiB, WONT_FIT above, with a plausible breakdown either way. A
+stub that returns invalid contract types is worse than no stub, so this
+returns the same shapes the real calculator does.
+
+The real calculator landed and `node.py` wires it in production behind
+`GatewayDeps(strict=True, ...)`, which refuses to start if any port -- this
+one included -- is still missing. This file stayed anyway, and picked up a
+second job: `contracts/routes.py`'s `_gateway_app()` imports `StubFit`
+directly to compose a full gateway app with no real dependencies, purely to
+ask Starlette which routes it answers for `docs/CONTRACTS.md`. It's also the
+`FitPort` fake `__init__.py` exports for `tests/unit/test_fit.py`,
+`test_setup.py`, `test_gateway_runtime.py`, `test_gateway_restart.py` and
+`test_gateway.py`.
 """
 
 from __future__ import annotations

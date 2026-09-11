@@ -1,22 +1,24 @@
-"""Capacity questions the planner asks, answered by Agent D when D exists.
+"""Capacity questions the planner asks, answered by `control_plane.fit` when
+it exports them.
 
 The planner needs exactly two numbers from the fit calculator:
 
     min_nodes_required(shape, profile, context, max_seqs) -> int
     kv_bytes_per_token(shape, kv_dtype) -> float
 
-Agent D owns both and exports them from ``control_plane.fit``. Until that lands,
-this module answers them itself, using the memory budget from the fit
-specification so the two implementations agree on method even before they agree
-on the last byte.
+`control_plane.fit` owns both and exports them. If it is not importable, or
+does not yet export them, this module answers them itself, using the memory
+budget from the fit specification so the two implementations agree on method
+even before they agree on the last byte.
 
 The fallback is deliberately conservative: it may ask for one node more than
 strictly necessary, never one fewer. Over-provisioning produces a slower plan;
 under-provisioning produces an OOM five minutes into a model load.
 
 This lives in the planner's own package rather than in ``control_plane/fit/``
-because that path belongs to Agent D. When D's module appears it is imported and
-wins; nothing here is edited.
+because that path belongs to the fit calculator. It is imported lazily and by
+name (see `default_fit_helpers` below) so the planner never hard-depends on a
+module version that might not export what it expects.
 """
 
 from __future__ import annotations
@@ -37,8 +39,8 @@ from .constants import DEFAULT_KV_DTYPE, MAX_NODES_CONSIDERED
 
 log = logging.getLogger(__name__)
 
-# Bytes per KV element. Agent C owns the weight quantization table; KV cache
-# dtype is a separate axis and a much shorter list.
+# Bytes per KV element. The resolver's quantization table owns weight
+# quantization; KV cache dtype is a separate axis and a much shorter list.
 _KV_ELEM_BYTES: dict[str, float] = {
     "fp32": 4.0,
     "fp16": 2.0,
@@ -47,13 +49,13 @@ _KV_ELEM_BYTES: dict[str, float] = {
     "int8": 1.0,
 }
 
-# Prefill chunk used to size compute scratch. Agent D owns the authoritative
-# value; 2048 is the figure the fit specification names.
+# Prefill chunk used to size compute scratch. `control_plane.fit` owns the
+# authoritative value; 2048 is the figure the fit specification names.
 _ACTIVATION_CHUNK_TOKENS = 2048
 
 
 class FitHelpers(Protocol):
-    """The slice of Agent D the planner depends on."""
+    """The slice of `control_plane.fit` the planner depends on."""
 
     def min_nodes_required(
         self,
@@ -162,8 +164,19 @@ def min_nodes_required(
     range works, which the caller surfaces rather than silently truncating.
     """
     usable = profile.usable_memory()
-    weights = shape.total_params * shape.bytes_per_param()
-    replicated = shape.vision_params * shape.bytes_per_param()
+    # Vision params come OUT of the shardable pool and are charged whole in
+    # `replicated` below, exactly as `calculator.weight_bytes_per_rank` does.
+    # Until 2026-09-11 they were left in `weights` as well and added again as
+    # `replicated`, so a vision checkpoint was charged its tower twice.
+    vision = min(max(0, shape.vision_params), shape.total_params)
+    weights = (shape.total_params - vision) * shape.bytes_per_param()
+    replicated = vision * shape.bytes_per_param()
+    # Routed experts are deliberately NOT divided by an expert-parallel degree
+    # here, though the real calculator now divides them. This function has no
+    # plan -- it is searching for a node COUNT -- and its whole promise is that
+    # it may ask for one node more than strictly necessary and never one fewer.
+    # Dividing experts would make it optimistic, which is the one direction a
+    # floor may not move.
     kv = kv_total_bytes(shape, kv_dtype, context, max_seqs)
     activations = activation_bytes(shape, max_seqs)
     layers = max(1, shape.num_layers)
@@ -205,7 +218,7 @@ class _FallbackFit:
 
 
 def default_fit_helpers() -> FitHelpers:
-    """Agent D's helpers if they exist, the conservative fallback otherwise.
+    """`control_plane.fit`'s helpers if they exist, the conservative fallback otherwise.
 
     Imported lazily and by name so that the planner does not hard-depend on a
     module that may land after it, and so that a partially written fit package
@@ -230,7 +243,7 @@ def default_fit_helpers() -> FitHelpers:
         log.warning(
             "control_plane.fit is not importable; planner falling back to its "
             "own conservative capacity arithmetic (source=%r) instead of "
-            "Agent D's calculator",
+            "the real fit calculator",
             _FallbackFit.source,
             exc_info=True,
         )

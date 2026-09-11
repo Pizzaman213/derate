@@ -62,6 +62,8 @@ GPT_OSS_120B = ModelShape(
     num_experts=128,
     num_experts_per_token=4,
     active_params=5_130_000_000,
+    # Measured off the live resolver, 2026-09-11: 98.1% of the checkpoint.
+    routed_expert_params=114_661_785_600,
     sliding_window=128,
     layers_with_full_attention=18,
 )
@@ -96,6 +98,9 @@ QWEN3_30B_A3B = ModelShape(
     num_experts=128,
     num_experts_per_token=8,
     active_params=3_338_000_000,
+    # Measured off the live resolver, 2026-09-11: 95.0% of the checkpoint.
+    # The fit gate divides these by the expert-parallel degree.
+    routed_expert_params=28_991_029_248,
 )
 
 DEEPSEEK_V3 = ModelShape(
@@ -111,6 +116,8 @@ DEEPSEEK_V3 = ModelShape(
     num_experts=256,
     num_experts_per_token=8,
     active_params=37_000_000_000,
+    # Measured off the live resolver, 2026-09-11: 97.4% of the checkpoint.
+    routed_expert_params=653_908_770_816,
     mla_latent_dim=512,
     mla_rope_dim=64,  # qk_rope_head_dim in the published config
 )

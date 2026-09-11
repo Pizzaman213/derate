@@ -400,6 +400,32 @@ already-degraded case. `_ep_rejection` names which gate failed, and an
 unmeasured link gets its own fourth sentence rather than being reported as a
 bandwidth of zero.
 
+**Those three gates govern the RECOMMENDATION, and `plan_for` is the way past
+them.** No two-Spark cluster can clear 40 GB/s, so the planner will never choose
+expert parallel on this class of machine and the operator's own EP is the only
+one that will ever run here — which is why it is a field in the Serve panel
+rather than an API you reach by hand. The plan it returns says whose decision it
+was: `_justification`'s expert branch keeps the "keeps its overlap benefit"
+argument only when `cross_node_ep_allowed`, and otherwise reads "this shape was
+asked for rather than chosen" followed by `_ep_gate_clause` — the refusal's own
+words, so there is one vocabulary rather than two. `_render` then drops that same
+`EP=` line from the plan's `rejected` list, because a plan must not list its own
+chosen shape as rejected. It shipped doing exactly that: an override came back
+asserting GDR was enabled in `reason` while `rejected` said it was disabled, in
+one payload.
+
+**The expert-parallel degree is `dp * tp`, and `ep_rejection` enforces it.**
+vLLM builds no rank group for expert parallel — `--enable-expert-parallel` is a
+boolean and there is no number to give it — so the size is whatever data and
+tensor parallel already made. Two shapes satisfy that and both are real:
+`tp=1, dp=ep` across machines, which is what `enumerate_candidates` emits, and
+`tp=ep, dp=1` inside one multi-GPU box. Anything else asks for one degree and
+silently gets another. The single-node upgrade in `_score` used to emit
+`tp=1, ep=gpus, dp=1`, which is one rank on one GPU with `gpus-1` idle behind a
+plan claiming the experts were split; it now picks a degree out of
+`valid_ep_degrees & valid_tp_degrees` and sets both, because that same TP shards
+attention.
+
 **Every rejection line is a sentence, and `_plural` exists so they read like
 one.** "1 exchange", "160 exchanges". `_node_list` caps at three names and then
 says "and N more" rather than printing a wall of node ids.

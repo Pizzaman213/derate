@@ -22,11 +22,22 @@ ACTIVATION_DTYPE_BYTES = 2
 # is 160 cross-node exchanges per output token against pipeline's one.
 ALLREDUCES_PER_LAYER = 2
 
-# Below this concurrency a latency target flips the answer to tensor parallel.
-# Measured on GPT-OSS-120B across two Sparks: TP reaches roughly 40 tok/s at
-# single stream against pipeline's 29, because a 2-stage pipeline with no batch
-# to fill it leaves half the stages idle. Above single-stream the ordering
-# reverses and pipeline wins decisively.
+# Below this concurrency a latency target flips the answer to tensor parallel,
+# because a 2-stage pipeline with no batch to fill it leaves half the stages
+# idle. Above single stream the ordering reverses and pipeline wins.
+#
+# The mechanism is arithmetic and exact: at one in-flight request the bubble
+# `(p-1)/p` cancels the `1/p` compute saving exactly, so a pipeline costs what
+# ONE machine would cost at every degree -- see the note under
+# `comm.pipeline_bubble_fraction`. Adding stages buys capacity, never speed.
+#
+# This comment used to cite "roughly 40 tok/s at single stream against
+# pipeline's 29" as measured on GPT-OSS-120B across two Sparks. NO RECORD OF
+# THAT MEASUREMENT EXISTS in `data_dir()/measurements/`, and the file header
+# above says to change the comment first and not to change a value you cannot
+# support. So it is demoted here to what it is -- an uncited claim -- rather
+# than left reading as evidence. The value stands on the arithmetic, which
+# does not need it.
 LATENCY_CONCURRENCY_CEILING = 2
 
 # Pipeline bubble guard. With fewer than this many in-flight requests per stage

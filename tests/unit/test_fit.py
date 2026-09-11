@@ -12,6 +12,7 @@ import math
 
 import pytest
 
+from control_plane.fit.constants import DECODE_EFFICIENCY, DECODE_EFFICIENCY_BEST
 from control_plane.contracts import (
     COMM_BUFFER_BYTES,
     DEGRADED_TPS_THRESHOLD,
@@ -486,6 +487,119 @@ def test_pipeline_charges_the_busiest_stage_not_the_average():
     assert stage_fraction(LLAMA_3_3_70B, 2) == pytest.approx(0.5)
 
 
+class TestExpertParallelDividesRoutedWeights:
+    """Until 2026-09-11 ``expert_parallel`` divided nothing.
+
+    ``weight_bytes_per_rank`` divided by tensor parallel and the pipeline
+    stage fraction and by nothing else, so an EP plan was charged the whole
+    checkpoint on every rank -- while ``deploy/recipes.py`` passed
+    ``--enable-expert-parallel`` on exactly those plans and the engine really
+    did place ``num_experts/ep`` of the experts per rank. Nothing in the suite
+    related ``breakdown.weights`` to ``expert_parallel`` in either direction,
+    so the over-count was invisible.
+    """
+
+    def test_expert_parallel_divides_the_routed_share(self):
+        """Measured on the real thing: DeepSeek-V4-Flash was charged 276.0 GiB
+        per rank at ep=8 across eight nodes and 276.0 GiB at ep=1 on one --
+        byte-identical."""
+        whole = weight_bytes_per_rank(DEEPSEEK_V3, make_plan())
+        sharded = weight_bytes_per_rank(
+            DEEPSEEK_V3, make_plan(ep=8, dp=8, node_ids=tuple(f"n{i}" for i in range(8)))
+        )
+        assert sharded < whole, "expert parallel must divide the routed experts"
+
+        # Exactly: the dense remainder whole, the routed share over ep.
+        routed_fraction = (
+            DEEPSEEK_V3.routed_expert_params / DEEPSEEK_V3.total_params
+        )
+        expected = whole * (1 - routed_fraction) + whole * routed_fraction / 8
+        assert sharded == pytest.approx(expected)
+
+    def test_a_dense_model_is_untouched_by_expert_parallel(self):
+        """The field is 0 on a dense checkpoint, and 0 must divide nothing."""
+        assert LLAMA_3_3_70B.routed_expert_params == 0
+        plan_ids = tuple(f"n{i}" for i in range(8))
+        assert weight_bytes_per_rank(
+            LLAMA_3_3_70B, make_plan(ep=8, dp=8, node_ids=plan_ids)
+        ) == weight_bytes_per_rank(LLAMA_3_3_70B, make_plan())
+
+    def test_an_unsized_expert_split_charges_the_experts_whole(self):
+        """0 means NOT DERIVED, never "no experts", and it has to degrade in
+        the refusing direction -- which is the behaviour every model had
+        before the field existed."""
+        unsized = dataclasses.replace(DEEPSEEK_V3, routed_expert_params=0)
+        plan_ids = tuple(f"n{i}" for i in range(8))
+        assert weight_bytes_per_rank(
+            unsized, make_plan(ep=8, dp=8, node_ids=plan_ids)
+        ) == weight_bytes_per_rank(unsized, make_plan())
+
+    def test_tensor_parallel_is_never_double_counted_against_expert_parallel(self):
+        """``max(tp, ep)``, not ``tp * ep``. A gate may be too strict and may
+        not be too generous, and the planner emits only ``tp>1, ep=1`` or
+        ``tp=1, ep=world`` -- so on anything else this under-divides."""
+        plan_ids = ("n0", "n1", "n2", "n3")
+        both = weight_bytes_per_rank(DEEPSEEK_V3, make_plan(tp=2, ep=2, node_ids=plan_ids))
+        tp_only = weight_bytes_per_rank(DEEPSEEK_V3, make_plan(tp=2, node_ids=plan_ids))
+        assert both == tp_only, "ep below tp must not divide a second time"
+
+
+class TestAWeightsRefusalNamesItsSplit:
+    """"weights alone are 141.2 GiB per rank" reads identically whether that is
+    a third of the checkpoint or the whole of it, so "it needs three nodes" and
+    "it needs two nodes and we counted twice" were indistinguishable."""
+
+    def _refusal(self, shape, plan, nodes):
+        result = FitCalculator().check(
+            request(shape, context=8192, seqs=1, plan=plan), list(nodes)
+        )
+        assert result.verdict is Verdict.WONT_FIT
+        assert result.limiting_term == "weights"
+        return result.reason
+
+    def test_a_one_kv_head_checkpoint_says_tensor_parallel_is_impossible(self):
+        """DeepSeek-V4-Flash publishes ONE KV head, so no TP degree above 1
+        divides both head counts -- it is charged whole correctly, and nothing
+        on screen used to say so."""
+        one_head = dataclasses.replace(
+            DEEPSEEK_V3, num_kv_heads=1, num_attention_heads=64, mla_latent_dim=None
+        )
+        reason = self._refusal(
+            one_head,
+            make_plan(dp=2, node_ids=("spark-01", "spark-02")),
+            (SPARK_01, SPARK_02),
+        )
+        assert "1 KV head" in reason
+        assert "no tensor-parallel degree above 1" in reason
+
+    def test_a_split_plan_names_the_degrees_it_used(self):
+        reason = self._refusal(
+            DEEPSEEK_V3,
+            make_plan(tp=2, node_ids=("spark-01", "spark-02")),
+            (SPARK_01, SPARK_02),
+        )
+        assert "Charged at TP 2 x PP 1" in reason
+
+    def test_data_parallel_says_it_replicates(self):
+        """Adding data-parallel ranks is the fix an operator reaches for, and
+        it is the one fix that cannot work: every rank holds a full copy."""
+        reason = self._refusal(
+            LLAMA_3_3_70B,
+            make_plan(dp=2, node_ids=("spark-01", "spark-02")),
+            (SPARK_01, SPARK_02),
+        )
+        assert "replicates the model" in reason
+
+    def test_the_overage_says_it_is_not_weights_alone(self):
+        """``over`` is the whole six-term overage interpolated into a sentence
+        whose subject is weights, which is why the two numbers never
+        reconciled by hand."""
+        reason = self._refusal(
+            LLAMA_3_3_70B, make_plan(), (SPARK_01,)
+        )
+        assert "not by weights alone" in reason
+
+
 def test_expert_parallel_buffers_are_charged():
     """The term other planners forget, which is why their configurations OOM on
     the first batch."""
@@ -816,6 +930,78 @@ def test_predict_decode_tps_falls_off_as_the_cache_grows():
     assert loaded < empty
 
 
+def test_the_reported_decode_figure_is_a_range_and_the_ends_bracket_reality(fit):
+    """Decode reads the cache for the tokens actually PRESENT, so one number
+    cannot describe both a fresh request and one that has filled the context.
+
+    Measured on a real GB10: the fit gate predicted 61.5 tok/s for Qwen3-0.6B at
+    8192 context and the engine's own counters reported 120.3 over ~320-token
+    requests. The prediction was not wrong about full context -- it was answering
+    a question nobody asked. Both ends now ship, and a mid-cache rate has to sit
+    between them or the range is not a range.
+    """
+    result = fit.check(request(GPT_OSS_120B, context=32768, seqs=1), ONE_SPARK)
+    low = result.predicted_decode_tps
+    high = result.predicted_decode_tps_empty
+    assert low is not None and high is not None
+    assert high > low, "an empty cache decodes faster than a full one"
+
+    mid = predict_decode_tps(
+        GPT_OSS_120B, 273.0, kv_cache_bytes(GPT_OSS_120B, 16384, 1, "auto")
+    )
+    assert low < mid < high, "half the context lands inside the range"
+
+
+def test_the_low_end_is_exactly_what_shipped_before_the_range(fit):
+    """The additive half of the change, pinned.
+
+    `predicted_decode_tps` still charges the cache at the FULL requested
+    context, byte for byte as before, because the degraded threshold and the
+    routing strength rung both read it and neither should move for a display
+    change. Only the second, faster end is new.
+    """
+    for context in (2048, 8192, 32768):
+        result = fit.check(request(GPT_OSS_120B, context=context, seqs=1), ONE_SPARK)
+        expected = predict_decode_tps(
+            GPT_OSS_120B, 273.0, kv_cache_bytes(GPT_OSS_120B, context, 1, "auto")
+        )
+        assert result.predicted_decode_tps == pytest.approx(expected, abs=1e-9)
+
+
+def test_the_spread_widens_with_context_rather_than_being_a_constant(fit):
+    """Why the old single figure was wrong by a VARYING amount, not a fixed one.
+
+    The gap between the two ends is the cache term, so it grows with the context
+    asked for. Measured: 1.96x at 8192 and 2.85x at 40960 on the same hardware.
+    A single corrective constant could never have fixed this.
+    """
+    narrow = fit.check(request(GPT_OSS_120B, context=2048, seqs=1), ONE_SPARK)
+    wide = fit.check(request(GPT_OSS_120B, context=131072, seqs=1), ONE_SPARK)
+    assert (
+        wide.predicted_decode_tps_empty / wide.predicted_decode_tps
+        > narrow.predicted_decode_tps_empty / narrow.predicted_decode_tps
+    )
+
+
+def test_a_refusal_still_says_how_fast_it_would_have_been(fit):
+    """Both ends ride every verdict, refusals included -- a plan that will not
+    fit is exactly when somebody wants to know what they would have got."""
+    result = fit.check(request(LLAMA_3_3_70B, context=8192, seqs=16), ONE_SPARK)
+    assert result.verdict is Verdict.WONT_FIT
+    assert result.predicted_decode_tps is not None
+    assert result.predicted_decode_tps_empty is not None
+
+
+def test_the_range_states_both_ends_and_the_context_they_belong_to(fit):
+    """The string is the product. It has to name the context the slow end is
+    for, or the two numbers are a spread with no units on the spread."""
+    result = fit.check(request(GPT_OSS_120B, context=32768, seqs=1), ONE_SPARK)
+    assert "at short context" in result.reason
+    assert "falling to" in result.reason
+    assert "32768" in result.reason
+    assert "per sequence" in result.reason.lower()
+
+
 # --------------------------------------------------------------------------
 # day 0 stub
 # --------------------------------------------------------------------------
@@ -1036,6 +1222,101 @@ class TestRefusalOnAMachineWithNoGPU:
         assert "NVIDIA GB10" in reason, reason
 
 
+class TestRefusalOnAMachineDeliberatelyServingFromItsCPU:
+    """The same two sentences, for a machine that is doing what it was chosen
+    to do and has simply run out of RAM.
+
+    The class above covers a node with `addressable_memory == 0` and
+    `device_class` GB10 -- a Spark whose probe came back empty, where "has no
+    GPU memory at all" is the right sentence and the GPU is where to look. A
+    Pi serving on `llamacpp` reaches the same branch with the same zero and a
+    completely different meaning, and the old strings described it as broken
+    rather than as small.
+    """
+
+    def _profile(self):
+        from control_plane.contracts import DeviceClass, NodeProfile
+
+        return NodeProfile(
+            node_id="connor-pi",
+            hostname="connor-pi",
+            address="10.0.0.9",
+            device_class=DeviceClass.CPU,
+            gpu_name="",
+            gpu_count=0,
+            total_memory=0,
+            addressable_memory=0,
+            memory_bandwidth_gbps=0.0,
+            compute_capability="",
+            driver_version="",
+        )
+
+    def _reason(self, fit):
+        from tests.fixtures import QWEN3_30B_A3B
+
+        node = self._profile()
+        result = fit.check(
+            request(QWEN3_30B_A3B, plan=make_plan(node_ids=[node.node_id])),
+            [node],
+        )
+        assert result.verdict is Verdict.WONT_FIT
+        return result.reason
+
+    def test_it_does_not_call_a_working_machine_broken(self, fit):
+        reason = self._reason(fit)
+        assert "has no GPU memory at all" not in reason, reason
+        assert "serves from host memory" in reason, reason
+
+    def test_the_remedy_is_more_memory_rather_than_different_hardware(self, fit):
+        """"A machine with GPU memory" is the right remedy for the Spark case
+        and the wrong one here: it reads as "buy different hardware" when the
+        real answer is that this model does not fit in this machine's RAM at
+        any quantity."""
+        reason = self._reason(fit)
+        assert "a machine with GPU memory" not in reason, reason
+        assert "more memory than this machine has" in reason, reason
+        # Still no node count: a CPU node cannot carry a rank of a multi-node
+        # plan either, since the only runtime that places here does not shard.
+        assert "no number of these holds it" in reason, reason
+
+
+def test_an_unmeasured_bandwidth_predicts_no_rate_rather_than_zero(fit):
+    """`predict_decode_tps` returns 0.0 for an unknown bandwidth, which is the
+    right answer for a function returning a float and the wrong one to put on
+    the wire.
+
+    `FitResult.predicted_decode_tps` is `float | None`, every renderer tests
+    `!= null`, and `Readout` prints a finite 0 as "0.0" -- so a machine nobody
+    has measured would have advertised "predicted decode 0.0 tok/s", a rate
+    stated with a decimal point that no measurement produced.
+
+    A CPU node is the first hardware here that reaches it: `probe.py` leaves
+    `memory_bandwidth_gbps` at 0.0 for anything not in its known table, on the
+    stated grounds that guessing "would be indistinguishable from a
+    measurement".
+    """
+    import dataclasses
+
+    from tests.fixtures import QWEN3_30B_A3B, SPARK_01
+
+    unmeasured = dataclasses.replace(SPARK_01, memory_bandwidth_gbps=0.0)
+    result = fit.check(
+        request(QWEN3_30B_A3B, plan=make_plan(node_ids=[unmeasured.node_id])),
+        [unmeasured],
+    )
+
+    assert result.predicted_decode_tps is None
+    assert result.predicted_decode_tps_empty is None
+
+    # And a machine that HAS been measured is untouched: the guard must not
+    # suppress a real figure.
+    measured = fit.check(
+        request(QWEN3_30B_A3B, plan=make_plan(node_ids=[SPARK_01.node_id])),
+        [SPARK_01],
+    )
+    assert measured.predicted_decode_tps and measured.predicted_decode_tps > 0
+
+
 # ---------------------------------------------------------------------------
 # A refusal never reports a quantity of nothing
 # ---------------------------------------------------------------------------
@@ -1168,3 +1449,71 @@ class TestLadderContextSkipsRungsThatHoldNothing:
         context, rung = self._ctx([self._rung("bf16")], allocatable=nothing)
         assert rung is None
         assert context > 0, "a context of 0 is a refusal dressed as a choice"
+
+
+# --- the two ends of the decode range, and the corpus behind them -----------
+
+#: What seven real checkpoints actually decoded at on a GB10 at 273 GB/s,
+#: measured through `tests/decode_sweep.py` off vLLM's own counters:
+#: (model, active weight bytes, measured tok/s). The efficiency each implies
+#: runs 0.560 to 0.738 -- which is why `DECODE_EFFICIENCY` stayed conservative
+#: and grew a companion rather than being replaced by their average.
+MEASURED_GB10 = (
+    ("LiquidAI/LFM2.5-350M", 0.71e9, 214.9),
+    ("Qwen/Qwen2.5-0.5B-Instruct", 0.99e9, 159.0),
+    ("Qwen/Qwen3-0.6B", 1.50e9, 123.2),
+    ("Qwen/Qwen3-4B-AWQ", 2.67e9, 71.2),
+    ("Qwen/Qwen3-1.7B", 4.06e9, 49.2),
+    ("microsoft/Phi-3.5-mini-instruct", 7.64e9, 22.9),
+    ("Qwen/Qwen3-4B", 8.04e9, 21.7),
+)
+
+
+def test_the_optimistic_end_is_an_upper_bound_on_every_measured_model():
+    """The property the second constant exists for.
+
+    A range whose top end the hardware beats is not a range. Every one of the
+    seven measured checkpoints has to land at or below the empty-cache figure,
+    and at 0.70 one of them (Qwen3-1.7B, which achieved 0.738) does not -- which
+    is why the constant is 0.75 and not the corpus mean of 0.652.
+    """
+    escaped = [
+        name
+        for name, weights, measured in MEASURED_GB10
+        if measured > 273e9 / weights * DECODE_EFFICIENCY_BEST
+    ]
+    assert not escaped, f"measured above the optimistic end: {escaped}"
+
+
+def test_the_conservative_end_never_over_promises():
+    """The other half of the same argument.
+
+    `DECODE_EFFICIENCY` is at or below every efficiency observed, so the figure
+    the degraded threshold judges and the router seeds from is never optimistic.
+    Over-promising is the failure that matters here: a model marked FITS that
+    decodes unusably slowly is worse than one marked degraded that does not.
+    """
+    for name, weights, measured in MEASURED_GB10:
+        conservative = 273e9 / weights * DECODE_EFFICIENCY
+        assert conservative <= measured, f"{name} over-promised by the low end"
+
+
+def test_the_two_constants_stay_in_order():
+    """Trivial, and worth pinning: swapping them would invert every range on
+    every card while every test above still passed."""
+    assert DECODE_EFFICIENCY < DECODE_EFFICIENCY_BEST
+
+
+def test_the_efficiency_argument_defaults_to_the_conservative_one():
+    """Every caller that predates the choice must keep getting what it got.
+
+    `head_scan` ranks heads against this function and `speculative.ts::speedup`
+    divides two of its results, so a changed default would move a scan baseline
+    and a speedup multiple that nothing in this change is about.
+    """
+    assert predict_decode_tps(LLAMA_3_3_70B, 273.0, 0) == predict_decode_tps(
+        LLAMA_3_3_70B, 273.0, 0, efficiency=DECODE_EFFICIENCY
+    )
+    assert predict_decode_tps(
+        LLAMA_3_3_70B, 273.0, 0, efficiency=DECODE_EFFICIENCY_BEST
+    ) > predict_decode_tps(LLAMA_3_3_70B, 273.0, 0)

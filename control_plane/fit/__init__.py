@@ -8,7 +8,7 @@
 ``FitResult.ok`` covers FITS and FITS_DEGRADED. Degraded is not a failure: the
 model loads, it is just slow, and sometimes that is what someone wants.
 
-Agent E calls :func:`kv_bytes_per_token` and :func:`min_nodes_required`.
+The planner calls :func:`kv_bytes_per_token` and :func:`min_nodes_required`.
 """
 
 from .calculator import (

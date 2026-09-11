@@ -63,7 +63,7 @@ def kv_bytes_per_token(shape: ModelShape, kv_dtype: str) -> float:
     rate, so a windowed model's real cache is at or below this figure times the
     context. Use :func:`kv_cache_bytes` when you need the real total.
 
-    Exported for Agent E.
+    Exported for the planner.
     """
     return shape.num_layers * per_layer_per_token_bytes(shape, kv_dtype)
 

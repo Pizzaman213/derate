@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from control_plane.contracts import (
     EP_VIABLE_THRESHOLD,
     TP_VIABLE_THRESHOLD,
+    UNMEASURED_COLLECTIVE_LATENCY_US,
     LinkMeasurement,
     ModelShape,
     NodeProfile,
@@ -90,6 +91,12 @@ class _Facts:
     context: int
     kv_dtype: str
     min_nodes: int
+    #: Positions a speculative step puts through the model at once -- the
+    #: draft's window plus the token being verified, so k+1, and 1 for an
+    #: ordinary launch. It multiplies the wire payload and nothing else; see
+    #: `comm.estimated_step_seconds`. The fit gate already charges these
+    #: positions, so a plan that ignored them costed a launch nobody asked for.
+    speculative_window: int = 1
     #: True when the caller named the nodes and every one of them is in the
     #: group, unlike hardware included. Suppresses the exclusion clause (nothing
     #: was excluded) and arms the pooling warning instead.
@@ -110,17 +117,54 @@ class _Facts:
         return self.link.all_reduce_gbps if self.link else 0.0
 
     @property
+    def latency_measured(self) -> bool:
+        """Whether a rung actually timed a COLLECTIVE on this link.
+
+        False is the ordinary answer today: only nccl-tests measures one, and
+        the `ib_write_bw` rung declines rather than offering an `ib_write_lat`
+        for a different operation. `comm.link_seconds` charges
+        `UNMEASURED_COLLECTIVE_LATENCY_US` when this is False, and a plan whose
+        family choice turned on the wire owes the operator that sentence --
+        the figure is defensible and it is still not a measurement.
+        """
+        return self.link is not None and self.link.latency_us is not None
+
+    @property
+    def latency_clause(self) -> str:
+        """The half-sentence a reason appends when the wire cost was assumed."""
+        if self.latency_measured:
+            return ""
+        return (
+            f" (no collective latency has been measured on this link, so each "
+            f"exchange is charged at {UNMEASURED_COLLECTIVE_LATENCY_US:.0f} "
+            f"microseconds, which is this hardware class's nccl-tests figure "
+            f"with GPUDirect RDMA off and is not a measurement of this one)"
+        )
+
+    @property
     def gdr(self) -> bool:
         return bool(self.link and self.link.gpudirect_rdma)
 
     @property
     def latency_override(self) -> bool:
-        """Batch-1 decode is the one regime where tensor parallel wins here.
+        """Batch-1 decode is a regime where tensor parallel wins here.
 
         Measured on GPT-OSS-120B across two Sparks: roughly 40 tok/s under
         tensor parallel against 29 under pipeline at single stream. A 2-stage
         pipeline with no batch to fill it idles half the time, and no amount of
-        link bandwidth fixes that. Above single stream the ordering reverses.
+        link bandwidth fixes that.
+
+        This used to end "Above single stream the ordering reverses."
+        **Retracted 2026-09-11.** The single-stream half reproduces -- pipeline
+        measured 28 tok/s on the same model -- but the reversal does not: at
+        concurrency 16 tensor parallel was still 1.37-1.50x ahead on this
+        model and 1.6-1.9x on Qwen3-8B. So "the one regime" became "a regime",
+        and what happens above single stream is not something this planner
+        knows. See TODO.md's Evidence section for the runs.
+
+        `planner/constants.py` already demotes the 40-vs-29 figure to an
+        uncited claim, since no record of it exists in `data_dir()/
+        measurements/`. The two now say the same thing.
         """
         return (
             self.target == LATENCY_TARGET
@@ -295,6 +339,7 @@ class Planner:
         *,
         context_length: int | None = None,
         kv_dtype: str = DEFAULT_KV_DTYPE,
+        speculative_window: int = 1,
         allow_mixed_hardware: bool = False,
     ) -> ParallelismPlan:
         """The recommended plan.
@@ -313,6 +358,7 @@ class Planner:
             concurrency,
             context_length=context_length,
             kv_dtype=kv_dtype,
+            speculative_window=speculative_window,
             allow_mixed_hardware=allow_mixed_hardware,
         )
         return ranked[0]
@@ -332,6 +378,7 @@ class Planner:
         *,
         context_length: int | None = None,
         kv_dtype: str = DEFAULT_KV_DTYPE,
+        speculative_window: int = 1,
         allow_mixed_hardware: bool = False,
     ) -> list[ParallelismPlan]:
         """Every legal plan, ranked, best first.
@@ -352,6 +399,7 @@ class Planner:
             context_length,
             kv_dtype,
             allow_mixed_hardware=allow_mixed_hardware,
+            speculative_window=speculative_window,
         )
         return self._render(self._score(facts), facts)
 
@@ -372,6 +420,14 @@ class Planner:
                 # A plan must not list its own chosen shape in its rejected
                 # list; the reason carries the capacity caveat instead.
                 pre = [l for l in preamble if not l.startswith("single node: illegal")]
+            elif chosen.kind is ParallelismKind.EXPERT:
+                # Same rule, same reason, and this is the case that made it
+                # visible: an operator-chosen EP plan carried `EP=2: GPUDirect
+                # RDMA is disabled` in `rejected` while its own `reason`
+                # recommended the shape. `_justification` now states that gate
+                # itself, so dropping the line here removes a contradiction
+                # rather than hiding the caveat.
+                pre = [l for l in preamble if not l.startswith("EP=")]
             rejected = pre + [
                 line for other, line in enumerate(lines) if other != index
             ]
@@ -404,6 +460,7 @@ class Planner:
         data_parallel: int = 1,
         context_length: int | None = None,
         kv_dtype: str = DEFAULT_KV_DTYPE,
+        speculative_window: int = 1,
     ) -> ParallelismPlan:
         """The plan for degrees an operator chose, with the planner's own words.
 
@@ -443,6 +500,7 @@ class Planner:
             context_length,
             kv_dtype,
             allow_mixed_hardware=True,
+            speculative_window=speculative_window,
         )
         scored = self._score(facts)
 
@@ -480,6 +538,7 @@ class Planner:
                     cand.ep,
                     cand.dp,
                     facts.concurrency,
+                    facts.speculative_window,
                 ),
             )
         ]
@@ -514,6 +573,7 @@ class Planner:
         context_length: int | None,
         kv_dtype: str,
         allow_mixed_hardware: bool = False,
+        speculative_window: int = 1,
     ) -> _Facts:
         # `groups` stays the real partition either way, so the pooling warning
         # can name the odd nodes exactly as the exclusion note would have.
@@ -534,6 +594,7 @@ class Planner:
             context=context,
             kv_dtype=kv_dtype,
             min_nodes=min_nodes,
+            speculative_window=max(1, speculative_window),
             pooled=pooled,
         )
 
@@ -566,6 +627,7 @@ class Planner:
                         cand.ep,
                         cand.dp,
                         facts.concurrency,
+                        facts.speculative_window,
                     ),
                 )
             )
@@ -584,9 +646,22 @@ class Planner:
                 # cannot run TP=6 (neither count is divisible by 6) and would
                 # fail at load. Use the largest degree that actually divides,
                 # and note the idle GPUs when that degree falls short.
+                #
+                # A MoE box wants BOTH degrees, not EP alone. vLLM builds no
+                # rank group for expert parallel -- the expert-parallel size is
+                # `dp * tp` -- so `tp=1, ep=gpus, dp=1` renders
+                # `--tensor-parallel-size 1 --enable-expert-parallel`, which is
+                # one rank, one GPU and no sharding at all: the plan claimed
+                # EP=gpus and the engine ran EP=1, with `gpus-1` GPUs idle.
+                # Setting `tp = ep` is what makes the flag mean the degree, and
+                # it is why the legal degree now has to divide the head counts
+                # as well as the expert count -- attention is sharded by that
+                # same TP.
                 if facts.shape.is_moe:
-                    ep = max(valid_ep_degrees(facts.shape, gpus))
-                    tp = 1
+                    both = valid_ep_degrees(facts.shape, gpus) & valid_tp_degrees(
+                        facts.shape, gpus
+                    )
+                    ep = tp = max(both)
                 else:
                     tp = max(valid_tp_degrees(facts.shape, gpus))
                     ep = 1
@@ -703,7 +778,15 @@ class Planner:
             degree = max(cand.tp, cand.ep, 1)
             idle_note = ""
             if degree < gpus:
-                what = "expert count" if facts.shape.is_moe else "head counts"
+                # Both counts for a MoE box, and that is not a wording
+                # change: `_score` now picks a degree that divides the head
+                # counts too, because the same TP shards attention while the
+                # experts shard across those ranks.
+                what = (
+                    "head counts and the expert count"
+                    if facts.shape.is_moe
+                    else "head counts"
+                )
                 idle_note = (
                     f"; only {degree} of {gpus} GPUs on this node divide the "
                     f"{what} evenly, so {_plural(gpus - degree, 'GPU')} "
@@ -722,11 +805,29 @@ class Planner:
             )
 
         if chosen.kind is ParallelismKind.EXPERT:
+            if facts.cross_node_ep_allowed:
+                return (
+                    f"measured all-reduce is {bw} with GPUDirect RDMA enabled and the "
+                    f"group is {facts.group.size} nodes wide, so the MoE all-to-all "
+                    f"keeps its overlap benefit and sharding "
+                    f"{facts.shape.num_experts} experts {cand.ep} ways beats "
+                    f"replicating them at concurrency {c}"
+                )
+            # The operator asked for a shape the planner rules out, which is what
+            # `plan_for` exists to allow. Same treatment the forced-TP branch
+            # below gets, and for the same reason: the branch above asserted GDR
+            # and a wide cluster unconditionally, so an override read as a
+            # recommendation while this plan's own `rejected` list said the
+            # opposite in the same payload. "asked for rather than chosen" is
+            # the existing phrase for it, and `_ep_gate_clause` is the refusal's
+            # own words -- one vocabulary rather than two.
             return (
-                f"measured all-reduce is {bw} with GPUDirect RDMA enabled and the group "
-                f"is {facts.group.size} nodes wide, so the MoE all-to-all keeps its "
-                f"overlap benefit and sharding {facts.shape.num_experts} experts "
-                f"{cand.ep} ways beats replicating them at concurrency {c}"
+                f"{facts.shape.num_experts} experts shard {cand.ep} ways across "
+                f"{cand.dp} data-parallel attention ranks, and all "
+                f"{_plural(comm.expert_exchanges_per_step(facts.shape, cand.ep), 'expert all-to-all')} "
+                f"per token cross a {bw} link -- so this shape was asked for "
+                f"rather than chosen; the planner rules cross-node expert "
+                f"parallel out here because {self._ep_gate_clause(facts)}"
             )
 
         if not facts.measured:
@@ -748,6 +849,7 @@ class Planner:
                 f"{_plural(comm.pipeline_exchanges_per_step(cand.pp), 'exchange')} against "
                 f"tensor parallel's {comm.human_bytes(tp_bytes)} over "
                 f"{_plural(comm.tensor_exchanges_per_step(facts.shape, 2), 'exchange')}"
+                + facts.latency_clause
             )
 
         if facts.latency_override and facts.link_gbps < TP_VIABLE_THRESHOLD:
@@ -756,6 +858,7 @@ class Planner:
                 f"pipeline and half the stages would idle, so tensor parallel wins "
                 f"single-stream decode despite the {bw} link being below the {thresh} "
                 f"threshold that governs batched serving"
+                + facts.latency_clause
             )
 
         if facts.link_gbps < TP_VIABLE_THRESHOLD:
@@ -861,8 +964,13 @@ class Planner:
 
         return out
 
-    def _ep_rejection(self, facts: _Facts) -> str:
-        ep = facts.group.size
+    def _ep_gate_clause(self, facts: _Facts) -> str:
+        """Which cross-node expert-parallel gate did not clear, as one clause.
+
+        Lifted out of `_ep_rejection` so the refusal and an operator-chosen EP
+        plan's own reason are the SAME sentence rather than two spellings of
+        one -- the reasoning `legality.py`'s refusal header already states.
+        """
         if not facts.measured:
             why = (
                 "no link measurement is available and cross-node all-to-all cannot be "
@@ -887,7 +995,10 @@ class Planner:
                 f"pipeline parallel does not already buy, while still adding an "
                 f"all-to-all neither of those needs"
             )
-        return f"EP={ep}: {why}"
+        return why
+
+    def _ep_rejection(self, facts: _Facts) -> str:
+        return f"EP={facts.group.size}: {self._ep_gate_clause(facts)}"
 
     def _rejection_line(self, cand: _Scored, chosen: _Scored, facts: _Facts) -> str:
         label = cand.candidate.label()
@@ -934,12 +1045,24 @@ class Planner:
                     f"room to overlap communication with compute, so it ranks below "
                     f"{chosen.candidate.label()} at concurrency {c}"
                 )
+            # "which would dominate at concurrency N" used to end this
+            # sentence. The exchange count and the payload are computed; that
+            # clause was asserted, and this project's own measurement
+            # contradicts it -- TP=2 ran 1.37-1.50x FASTER than PP=2 on
+            # gpt-oss-120b at concurrency 16, and 1.6-1.9x on Qwen3-8B, at the
+            # exact bandwidth this line refuses. The counts stay because they
+            # are facts; the verdict on what they cost above single stream
+            # goes, because nothing here has measured it.
             return (
                 f"{label}: measured all-reduce {bw} is below the "
-                f"{TP_VIABLE_THRESHOLD:.0f} GB/s threshold; "
-                f"{comm.ALLREDUCES_PER_LAYER} all-reduces per layer across "
-                f"{facts.shape.num_layers} layers is {_plural(exch, 'cross-node exchange')} "
-                f"and {volume} per step, which would dominate at concurrency {c}"
+                f"{TP_VIABLE_THRESHOLD:.0f} GB/s threshold, so pipeline is "
+                f"ranked first. {comm.ALLREDUCES_PER_LAYER} all-reduces per "
+                f"layer across {facts.shape.num_layers} layers is "
+                f"{_plural(exch, 'cross-node exchange')} and {volume} per step. "
+                f"Above single stream derate has not measured which of the two "
+                f"is faster for this shape, and on its own hardware tensor "
+                f"parallel has won that comparison -- send "
+                f"parallelism.tensor_parallel={tp} with node_ids to try it"
             )
 
         if cand.kind is ParallelismKind.PIPELINE and chosen.kind is not ParallelismKind.PIPELINE:

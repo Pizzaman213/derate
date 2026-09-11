@@ -424,6 +424,108 @@ def test_pipeline_bubble_shrinks_as_concurrency_rises():
     assert comm.pipeline_bubble_fraction(1, 1) == 0.0
 
 
+def test_adding_machines_to_a_pipeline_at_single_stream_buys_no_speed_at_all():
+    """Exact, not approximate, and the reason a huge model wants TP.
+
+    compute falls as 1/p, the bubble is (p-1)/p, and 1/(1-bubble) is p. They
+    cancel, so the step costs what ONE machine would cost if it could hold the
+    model -- at every degree. A longer pipeline buys capacity and nothing else
+    while nothing is in flight.
+    """
+    from tests.fixtures import SPARK_01
+
+    one = comm.compute_seconds_per_step(DEEPSEEK_V3, SPARK_01, 1)
+    for p in (2, 4, 8, 16, 32):
+        compute = comm.compute_seconds_per_step(DEEPSEEK_V3, SPARK_01, p)
+        effective = compute / (1.0 - comm.pipeline_bubble_fraction(p, 1))
+        assert effective == pytest.approx(one, rel=1e-9), p
+
+
+def test_the_tensor_parallel_exchange_count_does_not_depend_on_the_degree():
+    """Which is why its wire cost is a FLOOR rather than something more
+    machines divide. It is 6.7% of a DeepSeek-V3 step at tp=2 and 53.5% at
+    tp=32 -- the floor is what stops tensor parallel scaling, not bandwidth."""
+    counts = {n: comm.tensor_exchanges_per_step(DEEPSEEK_V3, tp=n) for n in (2, 4, 8, 32)}
+    assert len(set(counts.values())) == 1, counts
+    assert counts[2] == DEEPSEEK_V3.num_layers * 2
+
+
+def test_replicating_attention_halves_the_exchange_count():
+    """The one lever on the count itself. A parameter, not a constant, so the
+    variant can be priced without claiming derate can make vLLM adopt it."""
+    full = comm.tensor_exchanges_per_step(DEEPSEEK_V3, tp=8)
+    halved = comm.tensor_exchanges_per_step(DEEPSEEK_V3, tp=8, allreduces_per_layer=1)
+    assert halved * 2 == full
+
+
+def test_replicating_attention_is_cheap_for_mla_and_dear_for_a_dense_model():
+    """It is paid for with a duplicated KV cache, so it is a good trade exactly
+    where the cache is small. DeepSeek's MLA caches ~4.7x less per token than a
+    dense GQA 70B -- i.e. it is cheapest on the models that need the most nodes
+    and therefore suffer most from the fixed floor above."""
+    from control_plane.fit import kv as fit_kv
+
+    assert comm.attention_replicated_is_cheap(DEEPSEEK_V3)
+    assert not comm.attention_replicated_is_cheap(LLAMA_3_3_70B)
+
+    mla = fit_kv.kv_bytes_per_token(DEEPSEEK_V3, "fp16")
+    dense = fit_kv.kv_bytes_per_token(LLAMA_3_3_70B, "fp16")
+    assert dense / mla > 4.0, (dense, mla)
+
+
+def test_a_speculative_window_multiplies_the_payload_and_not_the_bubble():
+    """The half that is arithmetic, and the half that is not.
+
+    k+1 positions genuinely cross the wire, so the payload scales -- that is
+    the fix. The bubble deliberately does NOT move: claiming the drafted
+    positions fill a pipeline as microbatches asserts something about vLLM's
+    scheduler that nothing here has measured.
+    """
+    from tests.fixtures import SPARK_01
+
+    link = dataclasses.replace(
+        faster_link(LINK_SPARK_10G, 23.15, gdr=False), latency_us=40.0
+    )
+    plain = comm.estimated_step_seconds(
+        DEEPSEEK_V3, SPARK_01, link, 8, 1, 1, 1, 1, speculative_window=1
+    )
+    spec = comm.estimated_step_seconds(
+        DEEPSEEK_V3, SPARK_01, link, 8, 1, 1, 1, 1, speculative_window=11
+    )
+    # More positions cost more per STEP...
+    assert spec > plain
+    # ...and far less per token, because the exchange count did not move.
+    assert spec / 8.33 < plain / 2.0
+
+    # The bubble is untouched: a pipeline plan costs the same either way.
+    pp_plain = comm.estimated_step_seconds(
+        DEEPSEEK_V3, SPARK_01, link, 1, 8, 1, 1, 1, speculative_window=1
+    )
+    pp_spec = comm.estimated_step_seconds(
+        DEEPSEEK_V3, SPARK_01, link, 1, 8, 1, 1, 1, speculative_window=11
+    )
+    assert comm.pipeline_bubble_fraction(8, 1) == pytest.approx(7 / 8)
+    assert pp_spec == pytest.approx(pp_plain, rel=0.02), (
+        "the pipeline bubble must not move on a speculative window -- that is "
+        "the unmeasured half"
+    )
+
+
+def test_a_plan_costed_without_a_window_is_the_window_of_one():
+    """Absence is the contract for "one token per step", which is what every
+    plan meant before the planner had heard of speculation."""
+    from tests.fixtures import SPARK_01
+
+    link = dataclasses.replace(
+        faster_link(LINK_SPARK_10G, 23.15, gdr=False), latency_us=40.0
+    )
+    assert comm.estimated_step_seconds(
+        DEEPSEEK_V3, SPARK_01, link, 2, 1, 1, 1, 4
+    ) == comm.estimated_step_seconds(
+        DEEPSEEK_V3, SPARK_01, link, 2, 1, 1, 1, 4, speculative_window=1
+    )
+
+
 def test_bubble_guard_warns_below_four_in_flight_per_stage():
     """Pipeline at low concurrency gets a warning, not a silent recommendation."""
     planner = Planner(fit=FixedFit(2))
@@ -522,6 +624,28 @@ def test_a_multi_gpu_node_is_one_host_even_though_its_world_size_is_not_one():
     assert plan.kind is ParallelismKind.SINGLE_NODE
     assert plan.node_ids == ["ws-twin"]
     assert plan.expert_parallel == 2, "MoE shards experts across the GPUs in the box"
+
+
+def test_a_single_node_expert_plan_carries_the_tp_that_makes_it_real():
+    """EP=gpus with TP=1 and DP=1 shards nothing, and says it shards everything.
+
+    vLLM builds no rank group for expert parallel -- its size is ``dp * tp`` --
+    so the old ``Candidate(tp=1, pp=1, ep=gpus, dp=1)`` rendered
+    ``--tensor-parallel-size 1 --enable-expert-parallel``: one rank, one GPU,
+    EP=1 at the engine, and ``gpus-1`` GPUs idle behind a plan claiming the
+    experts were split. The degree therefore has to divide the head counts as
+    well as the expert count, because that same TP shards attention.
+    """
+    twin = dataclasses.replace(WS_3090, gpu_count=2, node_id="ws-twin")
+    plan = Planner(fit=FixedFit(1)).plan(
+        QWEN3_30B_A3B, [twin], None, "throughput", 8, context_length=4096
+    )
+
+    assert plan.tensor_parallel == plan.expert_parallel == 2
+    assert plan.data_parallel == 1
+    # Legal by the rule the override path enforces, which the old shape was not.
+    assert plan.expert_parallel == plan.tensor_parallel * plan.data_parallel
+    assert "TP=2 attention + EP=2" in plan.reason
 
 
 def test_multi_gpu_single_node_override_only_emits_legal_degrees():
@@ -863,6 +987,74 @@ class TestPlanFor:
             tensor_parallel=2, pipeline_parallel=2, context_length=32768,
         )
         assert plan.world_size == 4
+
+    def test_a_forced_expert_plan_never_claims_the_gates_cleared(self):
+        """Same class as the forced-TP case above, and the same fix.
+
+        `_justification`'s EXPERT branch was unconditional, so an operator's
+        EP plan on this estate came back reading "measured all-reduce is
+        10.2 GB/s with GPUDirect RDMA enabled ... so the MoE all-to-all keeps
+        its overlap benefit" -- three gates asserted, none of them cleared,
+        while the same payload's `rejected` list carried the refusal that says
+        GDR is disabled. Both sentences, one response.
+        """
+        plan = Planner().plan_for(
+            QWEN3_30B_A3B, SPARKS[:2], LINK_SPARK_10G, "throughput", 8,
+            expert_parallel=2, data_parallel=2,
+        )
+
+        assert plan.kind is ParallelismKind.EXPERT
+        assert "RDMA enabled" not in plan.reason
+        assert "keeps its overlap benefit" not in plan.reason
+        assert "asked for rather than chosen" in plan.reason
+        # The gate it walked past, in the refusal's own words.
+        assert "GPUDirect RDMA is disabled" in plan.reason
+
+    def test_a_forced_expert_plan_does_not_reject_itself(self):
+        """A plan must not list its own chosen shape in its rejected list.
+
+        The single-node branch has always been filtered for this; EP was not,
+        so the structural `EP=...` preamble sat in `rejected` on the very plan
+        it argued against. `_justification` states that gate itself now.
+        """
+        plan = Planner().plan_for(
+            QWEN3_30B_A3B, SPARKS[:2], LINK_SPARK_10G, "throughput", 8,
+            expert_parallel=2, data_parallel=2,
+        )
+
+        assert not any(r.startswith("EP=") for r in plan.rejected)
+
+    def test_expert_parallel_is_refused_when_it_is_not_dp_times_tp(self):
+        """vLLM builds no rank group for EP -- its size IS ``dp * tp``.
+
+        So a plan asking for EP=2 while DP x TP is 1 asks the runtime for one
+        degree and gets another, silently: nothing in vLLM reads an
+        expert-parallel number, only the boolean flag.
+        """
+        with pytest.raises(IllegalDegrees) as caught:
+            Planner().plan_for(
+                QWEN3_30B_A3B, SPARKS[:2], LINK_SPARK_10G, "throughput", 8,
+                expert_parallel=2,
+            )
+        assert "requires DP x TP = 2" in str(caught.value)
+        assert caught.value.refusals[0].axis == "expert_parallel"
+
+    def test_both_shapes_that_mean_expert_parallel_are_legal(self):
+        """Cross-node is DP attention; inside one box it is TP attention."""
+        planner = Planner()
+        cross = planner.plan_for(
+            QWEN3_30B_A3B, SPARKS[:2], LINK_SPARK_10G, "throughput", 8,
+            expert_parallel=2, data_parallel=2,
+        )
+        assert (cross.tensor_parallel, cross.data_parallel) == (1, 2)
+
+        twin = dataclasses.replace(WS_3090, gpu_count=2, node_id="ws-twin")
+        inside = planner.plan_for(
+            QWEN3_30B_A3B, [twin], None, "throughput", 8,
+            expert_parallel=2, tensor_parallel=2, context_length=4096,
+        )
+        assert (inside.tensor_parallel, inside.data_parallel) == (2, 1)
+        assert inside.expert_parallel == 2
 
 
 class TestPooling:

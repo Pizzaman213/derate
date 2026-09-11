@@ -1,9 +1,13 @@
 """Day-0 stub of ``PlannerPort``.
 
-Agents F and H need something callable before the real planner is wired. This
-returns a fixed PP=2 plan with a fixed reason and reads nothing. It is deleted
-at integration; if it is still imported anywhere after the planner is wired,
-that is the bug.
+This returns a fixed PP=2 plan with a fixed reason and reads nothing. The real
+planner landed and `node.py` wires it in production behind
+`GatewayDeps(strict=True, ...)`, which refuses to start if any port -- this
+one included -- is still missing. This file stayed anyway: `__init__.py`
+exports `StubPlanner` as this package's public fake, and it's what
+`tests/unit/test_planner.py`, `test_setup.py`, `test_gateway_runtime.py`,
+`test_gateway_restart.py` and `test_gateway.py` reach for wherever a test
+needs a `PlannerPort` without running the real placement logic.
 
 A stub that returns invalid contract types is worse than no stub, so this one
 returns a real ``ParallelismPlan`` with a non-empty reason and a non-empty

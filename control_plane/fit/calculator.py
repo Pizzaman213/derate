@@ -14,7 +14,8 @@ is a bug in this file.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
 
 from control_plane.humanize import binary_bytes
 from control_plane.contracts import (
@@ -22,6 +23,7 @@ from control_plane.contracts import (
     COMM_BUFFER_BYTES,
     DEFAULT_GUARDRAIL,
     DEGRADED_TPS_THRESHOLD,
+    DeviceClass,
     EP_EXTRA_BUFFER_BYTES,
     FRAMEWORK_OVERHEAD,
     FitRequest,
@@ -31,6 +33,7 @@ from control_plane.contracts import (
     NodeProfile,
     ParallelismKind,
     ParallelismPlan,
+    SpeculativeSpec,
     Verdict,
 )
 
@@ -38,6 +41,7 @@ from .constants import (
     ACTIVATION_CHUNK_TOKENS,
     CONTEXT_ROUNDING,
     DECODE_EFFICIENCY,
+    DECODE_EFFICIENCY_BEST,
     MAX_CONTEXT_SEARCH,
     MAX_SEARCH_NODES,
     QUANT_SUGGESTION_ORDER,
@@ -142,7 +146,10 @@ def _dedup(items: list[str]) -> list[str]:
 
 
 def predict_decode_tps(
-    shape: ModelShape, bandwidth_gbps: float, kv_read_bytes: float
+    shape: ModelShape,
+    bandwidth_gbps: float,
+    kv_read_bytes: float,
+    efficiency: float = DECODE_EFFICIENCY,
 ) -> float:
     """Decode tokens per second, single stream, memory-bandwidth bound.
 
@@ -155,6 +162,13 @@ def predict_decode_tps(
     ``kv_read_bytes`` is the unsharded cache for one sequence, matching the
     unsharded weight term: tensor parallel divides both the bytes and multiplies
     the aggregate bandwidth, so the ratio holds.
+
+    ``efficiency`` defaults to the conservative constant, which is what every
+    caller wanted before there was a choice. The fit gate passes
+    ``DECODE_EFFICIENCY_BEST`` for the optimistic end of the range it reports;
+    see ``fit/constants.py``, which carries the measured corpus behind both
+    numbers. Nothing else should pass it -- a caller that wants the honest
+    spread wants both ends, not the flattering one.
     """
     if bandwidth_gbps <= 0:
         return 0.0
@@ -163,7 +177,198 @@ def predict_decode_tps(
     if bytes_per_token <= 0:
         return 0.0
     ceiling = (bandwidth_gbps * 1e9) / bytes_per_token
-    return ceiling * DECODE_EFFICIENCY
+    return ceiling * efficiency
+
+
+def speculative_decode_tps_range(
+    shape: ModelShape,
+    bandwidth_gbps: float,
+    kv_read_bytes: float,
+    spec: SpeculativeSpec,
+) -> tuple[float, float]:
+    """Decode tokens per second under speculative decoding, floor and ceiling.
+
+    One verify step reads every active weight once, exactly as an ordinary
+    decode step does, and settles up to ``k + 1`` positions instead of one. It
+    also reads the draft's own weights ``k`` times to produce those tokens. So
+    against the ordinary rate:
+
+    * **ceiling** -- every drafted token accepted::
+
+          base * (k + 1) / (1 + k * draft_ratio)
+
+    * **floor** -- none accepted, and the draft read for nothing::
+
+          base / (1 + k * draft_ratio)
+
+    where ``draft_ratio`` is the draft's parameters over the model's active
+    ones, so the draft's own bandwidth cost is already subtracted from both
+    ends. That makes the ceiling tighter than a bare ``(k+1)x``, and it makes
+    the floor **lower than the ordinary rate**, which is the half of this that
+    a recommendation must not hide: speculative decoding on a workload that
+    never accepts a draft is slower than not using it.
+
+    What decides where in that range a real workload lands is the acceptance
+    rate, and derate does not measure acceptance rate. There is deliberately no
+    assumed constant in this function -- an estimate here would be a throughput
+    figure this project cannot back, which is the one thing every number on
+    these screens is supposed not to be. Both ends are returned; the caller
+    states them both.
+
+    ngram has ``draft_params == 0``, so its floor is the ordinary rate exactly
+    and its ceiling is ``(k + 1)x``: it reads no weights to draft with.
+    """
+    base = predict_decode_tps(shape, bandwidth_gbps, kv_read_bytes)
+    k = max(0, int(spec.num_speculative_tokens))
+    if base <= 0 or k == 0:
+        return base, base
+    overhead = speculative_overhead(k, draft_ratio(shape, spec.draft_params))
+    return base / overhead, base * (k + 1) / overhead
+
+
+def draft_ratio(shape: ModelShape, draft_params: int) -> float:
+    """The draft's parameters over the model's active ones.
+
+    Zero for ngram, which reads no weights to draft with, and zero for a shape
+    that reports no active parameters -- in both cases the draft costs no
+    bandwidth and the overhead term below collapses to 1.
+    """
+    active = shape.effective_active_params or 0
+    return (max(0, draft_params) / active) if active > 0 else 0.0
+
+
+def speculative_overhead(k: int, ratio: float) -> float:
+    """What a verify step costs in bandwidth, relative to an ordinary one.
+
+    ``1 + k * ratio``: the target's weights are read once either way, plus the
+    draft's weights once per drafted token. Factored out rather than written
+    twice because it is the denominator of BOTH the range this module states
+    and the measured figure ``speculative_best_k`` solves for -- and a second
+    copy is how the two would come to disagree about the same launch.
+    """
+    return 1.0 + max(0, int(k)) * max(0.0, ratio)
+
+
+@dataclass(frozen=True)
+class KPoint:
+    """What one drafted-token count is worth, given measured acceptance."""
+
+    k: int
+    #: Drafted tokens settled per step, measured. Not counting the bonus token.
+    expected_accepted: float
+    tps: float
+
+
+def speculative_best_k(
+    base_tps: float, ratio: float, accept_cumulative: Sequence[float]
+) -> list[KPoint]:
+    """Throughput at every drafted-token count, from measured acceptance.
+
+    ``accept_cumulative[i]`` is the fraction of draft rounds in which position
+    ``i`` was accepted -- vLLM's own
+    ``num_accepted_tokens_per_pos / num_drafts``. It is CUMULATIVE, not
+    conditional: a draft is only checked at position 2 if position 1 was
+    accepted first. That is what makes the sum below correct without assuming
+    the positions are independent, which they are not.
+
+        E[accepted](k) = sum(accept_cumulative[:k])
+        TPS(k)         = base * (1 + E[accepted](k)) / (1 + k * ratio)
+
+    The two ends of ``speculative_decode_tps_range`` are the two ends of this:
+    all-ones acceptance reproduces its ceiling exactly and all-zeros its floor,
+    so a measured point always lands inside the range the screen already
+    showed. Both are asserted in the tests, because that invariant is the only
+    thing tying this number to the claim it narrows.
+
+    Returns a point per ``k`` from 1 to however many positions were measured,
+    in order. ``max(..., key=tps)`` is the best one; it is deliberately not
+    computed here, so a caller can show the curve rather than only its peak --
+    the shape is what says whether the optimum is sharp or flat.
+    """
+    if base_tps <= 0:
+        return []
+    points: list[KPoint] = []
+    running = 0.0
+    for k, share in enumerate(accept_cumulative, start=1):
+        running += max(0.0, float(share))
+        points.append(
+            KPoint(
+                k=k,
+                expected_accepted=running,
+                tps=base_tps * (1.0 + running) / speculative_overhead(k, ratio),
+            )
+        )
+    return points
+
+
+def speculative_weight_bytes_per_rank(
+    plan: ParallelismPlan, spec: SpeculativeSpec | None
+) -> float:
+    """The draft's weights on the rank that carries them.
+
+    Divided by tensor parallel, which shards the draft head with the model, and
+    NOT multiplied by ``stage_fraction``: a runtime places the draft head on one
+    pipeline stage -- the last -- rather than spreading it over all of them.
+    Charging it a stage's share would under-budget precisely the rank that
+    holds it, and the budget here is taken against the busiest rank everywhere
+    else too (see the uneven-stages warning in :func:`memory_breakdown`).
+    """
+    if spec is None:
+        return 0.0
+    return max(0, spec.draft_bytes) / max(1, plan.tensor_parallel)
+
+
+def speculative_kv_bytes_per_rank(
+    shape: ModelShape,
+    plan: ParallelismPlan,
+    max_seqs: int,
+    kv_dtype: str,
+    spec: SpeculativeSpec | None,
+    context: int = 0,
+) -> float:
+    """Cache the draft costs: its drafted positions, and its own KV.
+
+    Two terms, and leaving the second out killed real launches.
+
+    **The drafted positions.** A verify step holds ``k`` speculative positions
+    per sequence in the target's cache alongside the accepted context, at the
+    ordinary full-attention rate. Small -- a few hundred KB at k=5 and one
+    sequence.
+
+    **The draft's own cache.** A separately loaded head is a transformer with
+    its own layers, and vLLM allocates a KV cache for it out of the same
+    budget. That term is NOT small, and it does not scale with ``k`` at all --
+    it scales with context, exactly like the target's. Which is also why
+    walking ``k`` down does not rescue a launch this term sank.
+
+    Leaving it out made the fit gate say `fits` and the engine refuse to
+    start::
+
+        ValueError: To serve at least one request with the model's max seq len
+        (8192), 1.37 GiB KV cache is needed, which is larger than the
+        available KV cache memory (1.17 GiB)
+
+    1.17 GiB is what derate handed vLLM. The head was 5 layers against
+    Qwen3-4B's 36, and 5/36 of 1.17 is 0.16 -- the gap, to within rounding.
+    ``draft_kv_ratio`` is that fraction, computed from the head's own shape by
+    ``resolver/speculators.py`` rather than guessed here.
+    """
+    if spec is None:
+        return 0.0
+    divisor = kv_divisor(shape, plan)
+    drafted = 0.0
+    k = max(0, int(spec.num_speculative_tokens))
+    if k > 0:
+        drafted = kv_bytes_per_token(shape, kv_dtype) * k * max(0, int(max_seqs))
+    own = 0.0
+    ratio = max(0.0, float(getattr(spec, "draft_kv_ratio", 0.0) or 0.0))
+    if ratio > 0:
+        # The target's whole cache at this context, scaled by the head's share.
+        # Sharded by the target's divisor: tensor parallel splits the draft
+        # alongside the model, and a head is built to the target's attention
+        # geometry, which is what lets one ratio answer for both.
+        own = kv_cache_bytes(shape, context, max_seqs, kv_dtype) * ratio
+    return (drafted + own) / divisor
 
 
 def _candidate_shards(n: int, shape: ModelShape) -> list[ParallelismPlan]:
@@ -282,6 +487,24 @@ def weight_bytes_per_rank(
     ``vision_params * bytes_per_param()`` and subtracted out of the measured
     total to get the shardable remainder, floored at zero so a measured total
     smaller than the computed vision share cannot go negative.
+
+    **Routed experts are divided by the expert-parallel degree.** Until
+    2026-09-11 this divided by tensor parallel and the pipeline stage fraction
+    and by nothing else, so an EP plan was charged the entire checkpoint on
+    every rank: DeepSeek-V4-Flash measured 276.0 GiB per rank at ``ep=8, dp=8``
+    across eight nodes and 276.0 GiB at ``ep=1`` on one -- byte-identical --
+    while ``deploy/recipes.py`` passed ``--enable-expert-parallel`` on exactly
+    those plans and the engine really did place ``num_experts/ep`` of them per
+    rank. The planner emits that candidate for every MoE checkpoint
+    (``legality.py``'s cross-node EP, and ``planner.py``'s single-node
+    multi-GPU upgrade), so the over-count was reachable on any multi-GPU MoE
+    box.
+
+    ``shape.routed_expert_params`` is 0 when the split could not be derived,
+    and 0 means the whole checkpoint stays dense here -- the behaviour every
+    model had before the field existed, which is the refusing direction.
+    Shared experts are deliberately not in that figure: every rank reads them
+    on every token, so they shard like any dense weight.
     """
     bpp = shape.bytes_per_param()
     vision = min(max(0, shape.vision_params), shape.total_params)
@@ -290,8 +513,30 @@ def weight_bytes_per_rank(
         shardable_bytes = max(0.0, total_weight_bytes - vision_bytes)
     else:
         shardable_bytes = (shape.total_params - vision) * bpp
+
     tp = max(1, plan.tensor_parallel)
-    return shardable_bytes * stage_fraction(shape, plan.pipeline_parallel) / tp
+    ep = max(1, plan.expert_parallel)
+
+    # Proportional, never re-derived from params: a measured on-disk total is
+    # authoritative for capacity (resolver/params.py says so for the same
+    # reason), so the routed share is taken as a FRACTION of whatever basis
+    # won above rather than priced separately from the dtype formula. Pricing
+    # it separately would mix a measured total with a formula subtrahend and
+    # could drive the dense remainder negative.
+    routed_bytes = 0.0
+    if ep > tp and shape.routed_expert_params > 0 and shape.total_params > 0:
+        routed_fraction = min(
+            1.0, shape.routed_expert_params / float(shape.total_params)
+        )
+        routed_bytes = shardable_bytes * routed_fraction
+
+    dense_bytes = shardable_bytes - routed_bytes
+    # `max(tp, ep)` rather than `tp * ep`, deliberately conservative: the
+    # planner only ever emits `tp>1, ep=1` or `tp=1, ep=world`, and on any
+    # other combination this under-divides rather than over-divides. A gate
+    # may be too strict and may not be too generous.
+    per_rank = dense_bytes / tp + routed_bytes / max(tp, ep)
+    return per_rank * stage_fraction(shape, plan.pipeline_parallel)
 
 
 def replicated_bytes_per_rank(shape: ModelShape) -> float:
@@ -341,12 +586,19 @@ def memory_breakdown(
     kv_dtype: str,
     chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
     weight_bytes: int | None = None,
+    speculative: SpeculativeSpec | None = None,
 ) -> tuple[MemoryBreakdown, list[str]]:
     """Per-rank memory, and everything worth warning about while computing it.
 
     ``weight_bytes`` is the resolver's measured total, forwarded to
     :func:`weight_bytes_per_rank`; ``None`` (the default) prices weights from
     the dtype formula instead.
+
+    ``speculative`` adds the draft's weights and the cache for its drafted
+    positions to the existing terms rather than to new ones. That is the whole
+    reason it is charged here: every refusal string, ``_largest_context``,
+    ``max_context_that_fits`` and the headroom arithmetic downstream then work
+    unchanged, instead of each needing to learn about a second kind of memory.
     """
     warnings: list[str] = []
 
@@ -394,10 +646,30 @@ def memory_breakdown(
             "modeled"
         )
 
+    spec_weights = speculative_weight_bytes_per_rank(plan, speculative)
+    spec_kv = speculative_kv_bytes_per_rank(
+        shape, plan, max_seqs, kv_dtype, speculative, context
+    )
+    if speculative is not None:
+        k = speculative.num_speculative_tokens
+        warnings.append(
+            f"speculative decoding ({speculative.method.value}, {k} drafted "
+            f"token{'s' if k != 1 else ''}) is charged "
+            f"{_gib(spec_weights)} of draft weights and {_gib(spec_kv)} of cache "
+            f"for the drafted positions"
+        )
+        if spec_weights > 0 and plan.pipeline_parallel > 1:
+            warnings.append(
+                "the draft head sits on one pipeline stage rather than being "
+                "split across them, so its weights are charged whole to the "
+                "rank that holds it rather than divided by "
+                f"PP={plan.pipeline_parallel}"
+            )
+
     kv_total = kv_cache_bytes(shape, context, max_seqs, kv_dtype)
     breakdown = MemoryBreakdown(
-        weights=int(weight_bytes_per_rank(shape, plan, weight_bytes)),
-        kv_cache=int(kv_total / kv_divisor(shape, plan)),
+        weights=int(weight_bytes_per_rank(shape, plan, weight_bytes) + spec_weights),
+        kv_cache=int(kv_total / kv_divisor(shape, plan) + spec_kv),
         activations=int(activation_bytes(shape, max_seqs, context, chunk_tokens)),
         comm_buffers=int(comm_buffer_bytes(plan)),
         replicated=int(replicated_bytes_per_rank(shape)),
@@ -483,12 +755,60 @@ class FitCalculator:
             req.kv_dtype,
             self.chunk_tokens,
             req.weight_bytes,
+            req.speculative,
         )
         warnings.extend(budget_warnings)
         headroom = usable - breakdown.total
 
+        # ONE sequence, deliberately and regardless of `req.max_concurrent_seqs`:
+        # `predict_decode_tps` is a single-stream, bandwidth-bound model, and
+        # the cache it must be handed is therefore one sequence's. Passing the
+        # plan's concurrency here would not produce an aggregate rate -- it
+        # would produce a slower per-sequence one and label it neither. What
+        # this figure IS gets stated on screen instead; see `_speculative_range`
+        # for the same boundary drawn around the speculative range.
         kv_read = kv_cache_bytes(shape, req.context_length, 1, req.kv_dtype)
-        tps = predict_decode_tps(shape, bandwidth, kv_read)
+        # `None` rather than 0.0 when nothing knows this hardware's memory
+        # bandwidth. `predict_decode_tps` returns 0.0 for an unknown bandwidth,
+        # which is the right answer for a function returning a float and the
+        # wrong one to put on the wire: `FitResult.predicted_decode_tps` is
+        # `float | None`, every renderer tests `!= null`, and `Readout` prints
+        # a finite 0 as "0.0". So a machine nobody has measured would have
+        # advertised "predicted decode 0.0 tok/s" -- a rate, stated with a
+        # decimal point, that no measurement produced.
+        #
+        # A CPU node is the first hardware here that reaches this: `probe.py`
+        # leaves `memory_bandwidth_gbps` at 0.0 for anything not in its known
+        # table, on the stated grounds that "guessing a number here would be
+        # indistinguishable from a measurement". None carries that same
+        # position one layer out, and the card drops the line instead.
+        tps = predict_decode_tps(shape, bandwidth, kv_read) if bandwidth > 0 else None
+        # The other end of the same range, and the honest half of the answer.
+        # `kv_read` above is the cache for a sequence at the FULL requested
+        # context, so `tps` is the rate once the context is full -- the slowest
+        # this will ever decode. Decoding reads the tokens actually present, so
+        # a fresh request is faster, and measured on this hardware the gap is
+        # roughly 2x: 61.5 predicted against 120.3 measured for Qwen3-0.6B at
+        # 8192 with ~320-token requests.
+        #
+        # An empty cache rather than some notional typical length, because a
+        # typical is a guess and this is not: it is the same call `head_scan`
+        # makes for its own baseline, so the card and the scan now agree on one
+        # number instead of quietly disagreeing about two.
+        tps_empty = (
+            predict_decode_tps(
+                shape, bandwidth, 0.0, efficiency=DECODE_EFFICIENCY_BEST
+            )
+            if bandwidth > 0
+            else None
+        )
+        # Computed once and attached to every return below, refusals included:
+        # a launch that will not fit is exactly when somebody wants to know
+        # what they would have got, and the range is the same arithmetic
+        # whichever verdict the memory produces.
+        spec_floor, spec_ceiling, spec_reason = self._speculative_range(
+            req, shape, bandwidth, kv_read, tps
+        )
         max_ctx = self._largest_context(
             shape,
             plan,
@@ -496,6 +816,7 @@ class FitCalculator:
             req.max_concurrent_seqs,
             req.kv_dtype,
             weight_bytes=req.weight_bytes,
+            speculative=req.speculative,
         )
 
         ranks = sum(max(1, n.gpu_count) for n in used)
@@ -508,7 +829,18 @@ class FitCalculator:
                 reason=(
                     f"Won't fit: the plan wants {plan.world_size} ranks "
                     f"(TP {plan.tensor_parallel} x PP {plan.pipeline_parallel} "
-                    f"x DP {plan.data_parallel}) but only {ranks} GPU"
+                    f"x DP {plan.data_parallel}"
+                    # world_size is TP x PP x DP and does not include EP, so
+                    # naming only those three describes an expert-parallel
+                    # plan without the degree that decides its memory. Named
+                    # separately rather than multiplied in, because that is
+                    # exactly what it is.
+                    + (
+                        f", with EP {plan.expert_parallel}"
+                        if plan.expert_parallel > 1
+                        else ""
+                    )
+                    + f") but only {ranks} GPU"
                     f"{'s' if ranks != 1 else ''} were supplied. Add "
                     f"{plan.world_size - ranks} more, or replan for {ranks}."
                 ),
@@ -518,6 +850,10 @@ class FitCalculator:
                 # sharding that does not exist here and would not round-trip.
                 max_context_that_fits=None,
                 predicted_decode_tps=tps,
+                predicted_decode_tps_empty=tps_empty,
+                speculative_decode_tps_floor=spec_floor,
+                speculative_decode_tps_ceiling=spec_ceiling,
+                speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
             )
@@ -541,6 +877,10 @@ class FitCalculator:
                 limiting_term=term,
                 max_context_that_fits=reported_ctx,
                 predicted_decode_tps=tps,
+                predicted_decode_tps_empty=tps_empty,
+                speculative_decode_tps_floor=spec_floor,
+                speculative_decode_tps_ceiling=spec_ceiling,
+                speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
             )
@@ -577,11 +917,27 @@ class FitCalculator:
                     min(max_ctx, req.native_window)
                 ),
                 predicted_decode_tps=tps,
+                predicted_decode_tps_empty=tps_empty,
+                speculative_decode_tps_floor=spec_floor,
+                speculative_decode_tps_ceiling=spec_ceiling,
+                speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
             )
 
-        if tps < DEGRADED_TPS_THRESHOLD:
+        # `tps is not None` and not a truthiness test, and the difference is
+        # the whole point of making this nullable: None means nobody has
+        # measured this machine's memory bandwidth, and a verdict of
+        # FITS_DEGRADED is a claim about a rate. Refusing to judge is the only
+        # honest answer -- the memory fits, and how fast it will decode is a
+        # question this build cannot answer for this hardware.
+        #
+        # It errs toward FITS, which is worth stating: a slow machine will be
+        # reported as fitting rather than as degraded until somebody measures
+        # its bandwidth. That is the same direction every other unmeasured
+        # quantity in this project errs, and the alternative is a degraded
+        # badge derived from an absence.
+        if tps is not None and tps < DEGRADED_TPS_THRESHOLD:
             bytes_per_token = (
                 shape.effective_active_params * shape.bytes_per_param() + kv_read
             )
@@ -602,6 +958,10 @@ class FitCalculator:
                 limiting_term="bandwidth",
                 max_context_that_fits=max_ctx,
                 predicted_decode_tps=tps,
+                predicted_decode_tps_empty=tps_empty,
+                speculative_decode_tps_floor=spec_floor,
+                speculative_decode_tps_ceiling=spec_ceiling,
+                speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
             )
@@ -615,15 +975,109 @@ class FitCalculator:
             reason=(
                 f"Fits: {_gib(breakdown.total)} of {_gib(usable)} "
                 f"{_budget_word(basis)} per "
-                f"rank, {_gib(headroom)} headroom. Predicted decode "
-                f"{tps:.0f} tok/s. Context could go to {ceiling}"
+                f"rank, {_gib(headroom)} headroom. "
+                # The rate clause is dropped whole rather than printed with a
+                # zero in it. `probe.py` refuses to guess a memory bandwidth
+                # because "guessing a number here would be indistinguishable
+                # from a measurement"; a sentence claiming 0 tok/s would be
+                # worse than that -- it is a measurement nobody made, and it
+                # is also wrong.
+                + (
+                    f"Predicted decode {tps_empty:.0f} tok/s at short context, "
+                    f"falling to {tps:.0f} tok/s at {req.context_length}. "
+                    f"Per sequence. "
+                    if tps is not None and tps_empty is not None
+                    else "Nothing has measured this machine's memory bandwidth, "
+                    "so no decode rate is predicted. "
+                )
+                + f"Context could go to {ceiling}"
                 f"{max_ctx} tokens at {req.max_concurrent_seqs} sequences."
             ),
             limiting_term="none",
             max_context_that_fits=max_ctx,
             predicted_decode_tps=tps,
+            predicted_decode_tps_empty=tps_empty,
+            speculative_decode_tps_floor=spec_floor,
+            speculative_decode_tps_ceiling=spec_ceiling,
+            speculative_reason=spec_reason,
             warnings=_dedup(warnings),
             budget_basis=basis,
+        )
+
+    def _speculative_range(
+        self,
+        req: FitRequest,
+        shape: ModelShape,
+        bandwidth: float,
+        kv_read: float,
+        base_tps: float | None,
+    ) -> tuple[float | None, float | None, str]:
+        """The two ends of the speculative range, and the sentence for them.
+
+        ``(None, None, "")`` when the request did not ask for speculative
+        decoding, which is the overwhelmingly common case and must add nothing
+        to the result.
+
+        The sentence states both ends and then states that derate does not know
+        where between them a workload lands. That last clause is not hedging --
+        it is the difference between this and a throughput claim, and removing
+        it would leave a number on screen that nothing here measured.
+        """
+        spec = req.speculative
+        if spec is None:
+            return None, None, ""
+        # No bandwidth reading, no range. Every number below is that reading
+        # multiplied by something, so a range computed without it would be a
+        # pair of zeros presented as a floor and a ceiling -- and this is the
+        # card that says out loud it will not turn a range into a single
+        # number. It must not turn an absence into a range either.
+        if base_tps is None:
+            return (
+                None,
+                None,
+                "Nothing has measured this machine's memory bandwidth, so the "
+                "speculative range cannot be computed for it.",
+            )
+        floor, ceiling = speculative_decode_tps_range(shape, bandwidth, kv_read, spec)
+        k = spec.num_speculative_tokens
+        drafted = f"{k} drafted token{'s' if k != 1 else ''}"
+        if spec.draft_params <= 0:
+            cost = (
+                "It drafts without loading any weights, so the floor is the "
+                "ordinary rate rather than below it"
+            )
+        else:
+            cost = (
+                f"The floor is BELOW the {base_tps:.0f} tok/s above: nothing "
+                f"accepted means the draft head was read for nothing"
+            )
+        # Both ends are PER SEQUENCE, because `predict_decode_tps` is single
+        # stream and `kv_read` above is deliberately computed for one sequence.
+        # At a batch the arithmetic stops describing the machine: the target's
+        # weights are read once for the whole batch either way, so drafting k
+        # extra positions per sequence buys back no bandwidth and costs a
+        # verify pass over k+1 times as many positions. That is a compute
+        # question and derate has no compute model, so this says where its own
+        # answer stops rather than extrapolating one.
+        batched = (
+            ""
+            if req.max_concurrent_seqs <= 1
+            else (
+                f" Both figures are for ONE sequence, and this plan is sized "
+                f"for {req.max_concurrent_seqs}: speculative decoding pays "
+                f"most when the batch is small enough that decoding is bound "
+                f"by memory bandwidth, and derate has not measured where that "
+                f"stops on this hardware."
+            )
+        )
+        return (
+            floor,
+            ceiling,
+            f"{spec.method.value}, {drafted}: between {floor:.0f} and "
+            f"{ceiling:.0f} tok/s per sequence. The ceiling is every drafted "
+            f"token accepted. {cost}. Where in that range a real workload "
+            f"lands depends on the acceptance rate, which derate does not "
+            f"measure, so this build cannot narrow it further.{batched}",
         )
 
     def _budget(
@@ -689,6 +1143,7 @@ class FitCalculator:
         weight_bytes: int | None = None,
         *,
         allocatable: Mapping[str, int] | None = None,
+        speculative: SpeculativeSpec | None = None,
     ) -> int:
         """Largest context that fits this plan on these nodes, on a
         ``CONTEXT_ROUNDING`` grain. Verified, never extrapolated. 0 means not
@@ -698,11 +1153,53 @@ class FitCalculator:
         resolver's measured total instead of the dtype formula -- see
         :func:`weight_bytes_per_rank`. Optional and additive: every existing
         caller that omits it gets the formula basis unchanged.
+
+        ``speculative`` is additive on the same terms, and it has to be here
+        rather than only in ``evaluate``: this is what a request with no
+        context is judged at, so deriving one without the draft's weights would
+        pick a window the very next fit check then refuses.
         """
         used, _ = self._participating(plan, nodes)
         _, usable, _, _ = self._budget(used, allocatable)
         return self._largest_context(
-            shape, plan, usable, max_seqs, kv_dtype, weight_bytes=weight_bytes
+            shape,
+            plan,
+            usable,
+            max_seqs,
+            kv_dtype,
+            weight_bytes=weight_bytes,
+            speculative=speculative,
+        )
+
+    def max_seqs(
+        self,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        nodes: list[NodeProfile],
+        context: int,
+        kv_dtype: str,
+        ceiling: int,
+        weight_bytes: int | None = None,
+        *,
+        allocatable: Mapping[str, int] | None = None,
+    ) -> int:
+        """Most concurrent sequences that fit at this context. The public seam
+        onto the search ``_largest_max_seqs`` already performs.
+
+        The mirror of ``max_context`` above, and it exists for the same reason:
+        a request that names no concurrency has to be given one, and picking a
+        number before the placement is known is exactly what the context
+        derivation refuses to do. Until 2026-09-11 nothing asked -- absence
+        meant 1, so every deployment on this cluster served one sequence at a
+        time and a decode step's weight read produced a single token.
+
+        0 means not even one sequence fits, which is a refusal for the gate to
+        phrase, not a concurrency to launch at.
+        """
+        used, _ = self._participating(plan, nodes)
+        _, usable, _, _ = self._budget(used, allocatable)
+        return self._largest_max_seqs(
+            shape, plan, usable, context, kv_dtype, ceiling, weight_bytes
         )
 
     # -- internals --------------------------------------------------------
@@ -740,9 +1237,17 @@ class FitCalculator:
         kv_dtype: str,
         usable: int,
         weight_bytes: int | None = None,
+        speculative: SpeculativeSpec | None = None,
     ) -> bool:
         breakdown, _ = memory_breakdown(
-            shape, plan, context, max_seqs, kv_dtype, self.chunk_tokens, weight_bytes
+            shape,
+            plan,
+            context,
+            max_seqs,
+            kv_dtype,
+            self.chunk_tokens,
+            weight_bytes,
+            speculative,
         )
         return breakdown.total <= usable
 
@@ -786,12 +1291,20 @@ class FitCalculator:
         max_seqs: int,
         kv_dtype: str,
         weight_bytes: int | None = None,
+        speculative: SpeculativeSpec | None = None,
     ) -> int:
         step = CONTEXT_ROUNDING
 
         def fits(units: int) -> bool:
             return self._fits_at(
-                shape, plan, units * step, max_seqs, kv_dtype, usable, weight_bytes
+                shape,
+                plan,
+                units * step,
+                max_seqs,
+                kv_dtype,
+                usable,
+                weight_bytes,
+                speculative,
             )
 
         if not fits(1):
@@ -810,7 +1323,7 @@ class FitCalculator:
         # Never report a context we have not verified. The search is monotonic
         # so this loop should not run, and it costs nothing if it does not.
         while result > 0 and not self._fits_at(
-            shape, plan, result, max_seqs, kv_dtype, usable, weight_bytes
+            shape, plan, result, max_seqs, kv_dtype, usable, weight_bytes, speculative
         ):
             result -= step
         return max(0, result)
@@ -867,6 +1380,18 @@ class FitCalculator:
             # is a machine that plainly does have GPU memory. Saying otherwise
             # about real hardware would be a worse lie than the one this
             # branch exists to remove.
+            #
+            # A CPU node reaches this branch too, and the old sentence was
+            # wrong for it in a way worth separating out. "A machine with GPU
+            # memory" is a remedy for a Spark that reported nothing; for a Pi
+            # deliberately serving on its CPU it reads as "buy different
+            # hardware" when the real answer is that this model does not fit
+            # in this machine's RAM at any quantity. Both are still "no number
+            # of these holds it" -- a CPU node cannot carry a rank of a
+            # multi-node plan either, since `shards=False` on the only runtime
+            # that places here -- so only the noun changes.
+            if node.device_class is DeviceClass.CPU:
+                return "more memory than this machine has; no number of these holds it"
             return "a machine with GPU memory; no number of these holds it"
         n = min_nodes_required(
             req.shape,
@@ -914,6 +1439,91 @@ class FitCalculator:
                 return name, params_per_rank * bpp
         return None
 
+    @staticmethod
+    def _split_note(req: FitRequest) -> str:
+        """How the per-rank weight figure was divided, and -- when it was not
+        -- why not.
+
+        Without this, "weights alone are 141.2 GiB per rank" reads identically
+        whether that is a third of the checkpoint or the whole of it, and the
+        operator cannot tell "it needs three nodes" from "it needs two nodes
+        and we counted twice". Both were seen on the same day:
+        ``DeepSeek-V4-Flash-0731`` publishes ONE KV head, so no tensor-parallel
+        degree above 1 is legal and it is charged whole correctly, while
+        ``gpt-oss-120b`` has eight and splits. Nothing on screen distinguished
+        them.
+
+        The legality rule is the one ``_candidate_shards`` already applies: a
+        TP degree must divide both head counts.
+        """
+        shape = req.shape
+        tp = max(1, req.plan.tensor_parallel)
+        pp = max(1, req.plan.pipeline_parallel)
+        ep = max(1, req.plan.expert_parallel)
+
+        # Why TP is 1, when it is: a degree must divide both head counts, so a
+        # checkpoint with one KV head has no legal degree above 1 however many
+        # machines are free. That is the difference between "buy another node"
+        # and "no number of nodes will tensor-shard this".
+        tp_impossible = bool(shape.num_kv_heads) and not any(
+            shape.num_attention_heads % d == 0 and shape.num_kv_heads % d == 0
+            for d in range(2, max(2, req.plan.world_size) + 1)
+        )
+        heads_clause = (
+            f"this checkpoint publishes {shape.num_kv_heads} KV head"
+            f"{'s' if shape.num_kv_heads != 1 else ''} against "
+            f"{shape.num_attention_heads} attention heads, which admits no "
+            f"tensor-parallel degree above 1"
+        )
+
+        # When expert parallel really did divide something, "charged whole"
+        # would contradict the clause that follows it. Only the dense
+        # remainder is whole in that case, and the sentence has to say which.
+        whole = (
+            "Dense weights charged whole"
+            if ep > 1 and shape.routed_expert_params > 0
+            else "Charged whole"
+        )
+
+        parts: list[str] = []
+        if tp > 1 or pp > 1:
+            parts.append(f"Charged at TP {tp} x PP {pp}")
+        elif req.plan.world_size <= 1:
+            head = f"{whole}: one rank, so there is nothing to split"
+            parts.append(f"{head} -- and {heads_clause}" if tp_impossible else head)
+        elif max(1, req.plan.data_parallel) > 1:
+            # Data parallel replicates rather than shards. Every rank holds a
+            # full copy by design, so this is correct and needs saying: the
+            # per-rank figure is not going to fall by adding data-parallel
+            # ranks, which is the fix an operator would otherwise reach for.
+            parts.append(
+                f"{whole}: data parallel {req.plan.data_parallel} "
+                f"replicates the model, so every rank holds a full copy"
+                + (f", and {heads_clause}" if tp_impossible else "")
+            )
+        elif tp_impossible:
+            parts.append(f"{whole}: {heads_clause}")
+        else:
+            parts.append(f"{whole}: this plan splits no dense weights")
+
+        if ep > 1:
+            if shape.routed_expert_params > 0:
+                share = shape.routed_expert_params / float(shape.total_params or 1)
+                parts.append(
+                    f"its routed experts are {share:.0%} of the checkpoint and "
+                    f"were divided across {ep} expert-parallel ranks"
+                )
+            else:
+                # 0 means the split was never derived, and the gate then
+                # charges them whole. Saying so is the difference between a
+                # refusal an operator can act on and one they cannot.
+                parts.append(
+                    f"expert parallel is {ep}, but this checkpoint's routed "
+                    f"expert parameters could not be sized, so they are charged "
+                    f"whole to every rank"
+                )
+        return "; ".join(parts)
+
     def _weights_reason(
         self,
         req: FitRequest,
@@ -938,7 +1548,19 @@ class FitCalculator:
         if suggestion:
             name, size = suggestion
             fixes.append(f"requantize to {name} ({_gib(size)} per rank)")
-        if live:
+        if live and node.addressable_memory <= 0:
+            # Under a live basis the sentence normally cites the static
+            # ceiling as well, so a reader can see how much of the gap is the
+            # operating system. A machine with no GPU has no such ceiling --
+            # `usable_memory` is `addressable_memory * guardrail` and both are
+            # 0 -- so the clause rendered "its 90% static ceiling is 0.0 GiB",
+            # which is the same "quantity of nothing" the branch below was
+            # written to remove, reintroduced through the other arm.
+            #
+            # For a CPU node the live reading is not one of two numbers worth
+            # comparing: it is the only number there is.
+            where = f"on {node.node_id}, which serves from host memory"
+        elif live:
             where = (
                 f"on {node.node_id}; its {self.guardrail:.0%} static ceiling is "
                 f"{_gib(node.usable_memory(self.guardrail))}"
@@ -949,7 +1571,18 @@ class FitCalculator:
             # addressable on " -- with an empty device name, because
             # `gpu_name` is "" on such a profile -- which describes a GPU with
             # nothing left rather than a machine that has no GPU.
-            where = f"{node.node_id} has no GPU memory at all"
+            #
+            # Split in two once a machine with no GPU could be a serving node.
+            # "has no GPU memory at all" is the right sentence for a Spark
+            # whose probe came back empty -- something is wrong and the GPU is
+            # where to look. It is the wrong sentence for a Pi that is doing
+            # exactly what it was chosen to do and has simply run out of RAM,
+            # because it describes the machine as broken rather than as small.
+            where = (
+                f"{node.node_id} serves from host memory and has no GPU"
+                if node.device_class is DeviceClass.CPU
+                else f"{node.node_id} has no GPU memory at all"
+            )
         else:
             where = (
                 f"{self.guardrail:.0%} of {_gib(node.addressable_memory)} "
@@ -958,8 +1591,9 @@ class FitCalculator:
         return (
             f"Won't fit: weights alone are {_gib(held)} per rank{replicated_note} "
             f"against {_gib(usable)} {_budget_word(basis)} "
-            f"({where}). Over budget by {_gib(over)} in "
-            f"total. Context and concurrency cannot fix this at "
+            f"({where}). {self._split_note(req)}. "
+            f"Over budget by {_gib(over)} across the whole per-rank budget, not "
+            f"by weights alone. Context and concurrency cannot fix this at "
             f"{shape.dtype} on {ranks} rank{'s' if ranks != 1 else ''} — it "
             f"needs {_options(fixes)}."
         )

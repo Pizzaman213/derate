@@ -233,6 +233,83 @@ FALLBACK_CONTEXT = 8192
 MIN_USEFUL_CONTEXT = 4096
 
 
+#: Most concurrent sequences derived for a request that named none.
+#:
+#: A CEILING on a derivation, not a default: the fit gate answers how many
+#: sequences the memory holds, and on a small model that answer runs to the
+#: hundreds. Past some point more slots stop buying throughput and start
+#: buying preemption, and nothing here has measured where that is.
+#:
+#: 16 because it is the only batched concurrency this project has ever
+#: measured on this hardware -- the TP-vs-PP run in TODO.md, 600+ requests per
+#: arm at 131072 context with zero errors. vLLM's own default is 1024, which
+#: is not a number anybody chose for a Spark. Raise it when a sweep says to.
+MAX_DERIVED_CONCURRENCY = 16
+
+
+def concurrency_for(
+    fit: Any,
+    shape: ModelShape,
+    plan: ParallelismPlan,
+    nodes: list[NodeProfile],
+    *,
+    kv_dtype: str,
+    context: int = MIN_USEFUL_CONTEXT,
+    ceiling: int = MAX_DERIVED_CONCURRENCY,
+    weight_bytes: int | None = None,
+    allocatable: Mapping[str, int] | None = None,
+) -> int:
+    """The concurrency to serve one model at, when the caller named none.
+
+    The mirror of ``context_for`` below, and it exists because that function's
+    own opening comment states a principle the concurrency path did not
+    follow: absence means "choose one", and the choice is made once the plan
+    and the machines are known. Until 2026-09-11 absence meant **1** --
+    literally ``int(payload.get("concurrency") or 1)`` -- so every deployment
+    on this cluster launched ``--max-num-seqs 1`` and each decode step's
+    weight read produced a single token. Decode is bandwidth bound; the
+    weights are read once per step whatever the batch holds.
+
+    **Derived at a fixed reference context, not at the real one.** The two
+    cannot both be solved from each other: ``context_for`` already takes
+    concurrency as an input. So this asks the narrower question --
+    *how many sequences fit at a window worth having* (``MIN_USEFUL_CONTEXT``)
+    -- and the real context is then derived at the answer. Picking the
+    reference rather than iterating keeps one derivation explicable; a
+    fixed-point search between two budgets would not be.
+
+    Never returns 0. A model with no room for a second sequence still serves
+    one, and the refusal for a model with room for none belongs to the gate,
+    phrased in its own sentence, not to a caller that silently launched at
+    zero.
+    """
+    solve = getattr(fit, "max_seqs", None)
+    if not callable(solve) or ceiling < 1:
+        # A port that cannot solve for concurrency cannot be asked to choose
+        # one. Degrades to what every launch did before this existed, for the
+        # reason `context_for` degrades to FALLBACK_CONTEXT: the launch path
+        # refuses separately and loudly when there is no fit gate, and that
+        # refusal is not this function's to pre-empt.
+        return 1
+
+    kwargs: dict[str, Any] = {}
+    try:
+        params = inspect.signature(solve).parameters
+    except (TypeError, ValueError):  # builtins, C callables, exotic proxies
+        params = {}
+    varkw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if allocatable is not None and ("allocatable" in params or varkw):
+        kwargs["allocatable"] = allocatable
+
+    try:
+        fits = solve(shape, plan, nodes, context, kv_dtype, ceiling, weight_bytes, **kwargs)
+    except Exception:
+        log.exception("concurrency derivation failed for %s", shape.model_id)
+        return 1
+
+    return max(1, min(int(fits), ceiling))
+
+
 def _clamp_context(largest: int, native_window: int | None) -> int:
     """The context rule itself: the model's own window, or what fits, whichever
     is smaller.
@@ -257,6 +334,7 @@ def context_for(
     weight_bytes: int | None = None,
     allocatable: Mapping[str, int] | None = None,
     native_window: int | None = None,
+    speculative: Any | None = None,
 ) -> int:
     """The context to judge one model at, when the caller named none.
 
@@ -299,6 +377,8 @@ def context_for(
         kwargs["weight_bytes"] = weight_bytes
     if allocatable is not None and ("allocatable" in params or varkw):
         kwargs["allocatable"] = allocatable
+    if speculative is not None and ("speculative" in params or varkw):
+        kwargs["speculative"] = speculative
 
     try:
         largest = solve(shape, plan, nodes, max_seqs, kv_dtype, **kwargs)
