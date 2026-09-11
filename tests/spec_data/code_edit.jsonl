@@ -1,0 +1,10 @@
+{"prompt": "Here is a python function:\n\n```python\ndef load_config(path):\n    with open(path) as f:\n        return json.load(f)\n```\n\nAdd error handling. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a python function:\n\n```python\ndef mean(xs):\n    return sum(xs) / len(xs)\n```\n\nAdd a docstring. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a python function:\n\n```python\nclass Cache:\n    def __init__(self):\n        self.store = {}\n\n    def get(self, key):\n        return self.store[key]\n```\n\nAdd type annotations. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a python function:\n\n```python\ndef parse_port(raw):\n    return int(raw)\n```\n\nAdd error handling. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a python function:\n\n```python\ndef fetch(url):\n    return urllib.request.urlopen(url).read()\n```\n\nAdd a docstring. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a javascript function:\n\n```javascript\nfunction total(items) {\n  return items.reduce((a, b) => a + b.price, 0)\n}\n```\n\nAdd type annotations. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a javascript function:\n\n```javascript\nasync function getUser(id) {\n  const r = await fetch(`/api/users/${id}`)\n  return r.json()\n}\n```\n\nAdd error handling. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a python function:\n\n```python\ndef divide(a, b):\n    return a / b\n```\n\nAdd a docstring. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a python function:\n\n```python\ndef latest(rows):\n    return sorted(rows, key=lambda r: r['ts'])[-1]\n```\n\nAdd type annotations. Return the whole function.", "max_tokens": 192}
+{"prompt": "Here is a javascript function:\n\n```javascript\nfunction slug(title) {\n  return title.toLowerCase().split(' ').join('-')\n}\n```\n\nAdd error handling. Return the whole function.", "max_tokens": 192}

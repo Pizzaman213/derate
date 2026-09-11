@@ -1,0 +1,54 @@
+# Captured from a REAL vLLM engine on the development box, 2026-09-10.
+#
+# Qwen/Qwen3-0.6B served as Qwen3-0.6B-ngram, launched by derate with
+#   --speculative-config {"method": "ngram", "num_speculative_tokens": 10}
+# on NVIDIA GB10, vLLM 0.28.1rc1.dev462+g9ca97b28b.d20260906, and driven
+# with a repetitive code-echo prompt -- the workload ngram is actually
+# good at, which is why acceptance here is high rather than typical.
+#
+# Nothing below is hand-written. The per-position series sums to the
+# aggregate (664 + 581*4 + 498*5 = 5478), which is the consistency
+# check SpecDecode.consistent makes, and it holds because these are the
+# engine's own numbers rather than a plausible-looking set.
+# HELP vllm:spec_decode_num_drafts_total Number of spec decoding drafts.
+# TYPE vllm:spec_decode_num_drafts_total counter
+vllm:spec_decode_num_drafts_total{engine="0",model_name="Qwen3-0.6B-ngram"} 747.0
+# HELP vllm:spec_decode_num_drafts_created Number of spec decoding drafts.
+# TYPE vllm:spec_decode_num_drafts_created gauge
+vllm:spec_decode_num_drafts_created{engine="0",model_name="Qwen3-0.6B-ngram"} 1.7890809135888078e+09
+# HELP vllm:spec_decode_num_draft_tokens_total Number of draft tokens.
+# TYPE vllm:spec_decode_num_draft_tokens_total counter
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="Qwen3-0.6B-ngram"} 7470.0
+# HELP vllm:spec_decode_num_draft_tokens_created Number of draft tokens.
+# TYPE vllm:spec_decode_num_draft_tokens_created gauge
+vllm:spec_decode_num_draft_tokens_created{engine="0",model_name="Qwen3-0.6B-ngram"} 1.78908091358883e+09
+# HELP vllm:spec_decode_num_accepted_tokens_total Number of accepted tokens.
+# TYPE vllm:spec_decode_num_accepted_tokens_total counter
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="Qwen3-0.6B-ngram"} 5478.0
+# HELP vllm:spec_decode_num_accepted_tokens_created Number of accepted tokens.
+# TYPE vllm:spec_decode_num_accepted_tokens_created gauge
+vllm:spec_decode_num_accepted_tokens_created{engine="0",model_name="Qwen3-0.6B-ngram"} 1.7890809135888453e+09
+# HELP vllm:spec_decode_num_accepted_tokens_per_pos_total Accepted tokens per draft position.
+# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_total counter
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="0"} 664.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="1"} 581.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="2"} 581.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="3"} 581.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="4"} 581.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="5"} 498.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="6"} 498.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="7"} 498.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="8"} 498.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="Qwen3-0.6B-ngram",position="9"} 498.0
+# HELP vllm:spec_decode_num_accepted_tokens_per_pos_created Accepted tokens per draft position.
+# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_created gauge
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="0"} 1.7890809135888648e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="1"} 1.7890809135888712e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="2"} 1.789080913588877e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="3"} 1.7890809135888822e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="4"} 1.7890809135888875e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="5"} 1.7890809135888932e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="6"} 1.7890809135888987e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="7"} 1.789080913588904e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="8"} 1.789080913588909e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="Qwen3-0.6B-ngram",position="9"} 1.789080913588914e+09

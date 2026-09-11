@@ -1,0 +1,10 @@
+{"prompt": "Write a short paragraph about why interconnect bandwidth matters when a model is split across two machines.", "max_tokens": 192}
+{"prompt": "Explain in a few sentences what makes unified memory different from discrete GPU memory.", "max_tokens": 192}
+{"prompt": "Describe the tradeoff between a larger context window and more concurrent sequences.", "max_tokens": 192}
+{"prompt": "Write a short note to a colleague explaining why a launch was refused for running out of memory.", "max_tokens": 192}
+{"prompt": "Explain what speculative decoding is to someone who has never heard of it.", "max_tokens": 192}
+{"prompt": "Write a paragraph on why measuring a thing beats estimating it.", "max_tokens": 192}
+{"prompt": "Describe what happens during the first thirty seconds of loading a large language model.", "max_tokens": 192}
+{"prompt": "Explain why a model that fits on paper might still fail to start on a busy machine.", "max_tokens": 192}
+{"prompt": "Write a short reflection on naming things well in software.", "max_tokens": 192}
+{"prompt": "Describe the difference between throughput and latency for someone new to serving models.", "max_tokens": 192}
