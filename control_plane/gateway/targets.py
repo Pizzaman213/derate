@@ -1,6 +1,6 @@
 """Build the routable view of the cluster.
 
-Local deployments (Agent F) and remote provider models (Agent I) are merged
+Local deployments and remote provider models are merged
 into one target list per ``served_name``. A model served both locally and
 remotely is one entry with several targets behind it; the client never learns
 which answered.
@@ -126,6 +126,19 @@ def build_index(
     power: dict[str, float] = {n.profile.node_id: n.power_watts for n in nodes}
 
     for dep in deployments:
+        # Switched off by the operator. This is the ONE seam -- `/v1/models`
+        # enumerates `index.targets`, the router selects from it, the chat
+        # picker and the topology graph read it -- so a single edit takes the
+        # model off all of them together rather than one at a time. Exactly
+        # what `provider.enabled` does a few lines below, for the same reason.
+        #
+        # It lands in `pending` rather than being dropped, so the 503 body can
+        # still say the deployment exists. The container is still up and still
+        # holding its memory; this is not a stop.
+        if not dep.serving:
+            if dep.state not in states.TERMINAL:
+                index.pending.setdefault(dep.served_name, []).append(dep)
+            continue
         if dep.state not in ROUTABLE_STATES or not dep.backend_url:
             if dep.state not in states.TERMINAL:
                 index.pending.setdefault(dep.served_name, []).append(dep)
