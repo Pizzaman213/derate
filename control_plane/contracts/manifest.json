@@ -82,8 +82,65 @@
           "type": "tuple[str, ...]",
           "optional": true,
           "default": []
+        },
+        {
+          "name": "speculative",
+          "type": "SpeculativeSpec | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "origin",
+          "type": "DeploymentOrigin",
+          "optional": true,
+          "default": "launched"
+        },
+        {
+          "name": "enforce_eager",
+          "type": "bool",
+          "optional": true,
+          "default": false
+        },
+        {
+          "name": "cudagraph_capture_sizes",
+          "type": "tuple[int, ...] | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "kv_dtype",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "quantization",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "serving",
+          "type": "bool",
+          "optional": true,
+          "default": true
+        },
+        {
+          "name": "image",
+          "type": "str | None",
+          "optional": true,
+          "default": null
         }
       ]
+    },
+    "DeploymentOrigin": {
+      "kind": "enum",
+      "module": "control_plane.contracts.deployment",
+      "base": "str",
+      "members": {
+        "LAUNCHED": "launched",
+        "ADOPTED": "adopted"
+      }
     },
     "DeploymentPort": {
       "kind": "protocol",
@@ -169,6 +226,12 @@
           "type": "int | None",
           "optional": true,
           "default": null
+        },
+        {
+          "name": "speculative",
+          "type": "SpeculativeSpec | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -226,6 +289,30 @@
           "type": "str",
           "optional": true,
           "default": "static"
+        },
+        {
+          "name": "speculative_decode_tps_floor",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "speculative_decode_tps_ceiling",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "speculative_reason",
+          "type": "str",
+          "optional": true,
+          "default": ""
+        },
+        {
+          "name": "predicted_decode_tps_empty",
+          "type": "float | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -286,7 +373,7 @@
         },
         {
           "name": "latency_us",
-          "type": "float",
+          "type": "float | None",
           "optional": false
         },
         {
@@ -456,6 +543,12 @@
         },
         {
           "name": "vision_params",
+          "type": "int",
+          "optional": true,
+          "default": 0
+        },
+        {
+          "name": "routed_expert_params",
           "type": "int",
           "optional": true,
           "default": 0
@@ -946,6 +1039,58 @@
         "COST_AWARE": "cost_aware"
       }
     },
+    "SpeculativeMethod": {
+      "kind": "enum",
+      "module": "control_plane.contracts.plan",
+      "base": "str",
+      "members": {
+        "MTP": "mtp",
+        "DSPARK": "dspark",
+        "NGRAM": "ngram",
+        "EAGLE": "eagle",
+        "EAGLE3": "eagle3",
+        "MEDUSA": "medusa",
+        "DFLASH": "dflash"
+      }
+    },
+    "SpeculativeSpec": {
+      "kind": "dataclass",
+      "module": "control_plane.contracts.plan",
+      "fields": [
+        {
+          "name": "method",
+          "type": "SpeculativeMethod",
+          "optional": false
+        },
+        {
+          "name": "num_speculative_tokens",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "draft_bytes",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "draft_params",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "model",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "draft_kv_ratio",
+          "type": "float",
+          "optional": true,
+          "default": 0.0
+        }
+      ]
+    },
     "TargetKind": {
       "kind": "enum",
       "module": "control_plane.contracts.routing",
@@ -1326,6 +1471,10 @@
     "TP_VIABLE_THRESHOLD": {
       "module": "control_plane.contracts.constants",
       "value": 40.0
+    },
+    "UNMEASURED_COLLECTIVE_LATENCY_US": {
+      "module": "control_plane.contracts.constants",
+      "value": 40.0
     }
   },
   "derived": {
@@ -1409,7 +1558,8 @@
       "value": [
         "vllm",
         "sglang",
-        "tts"
+        "tts",
+        "llamacpp"
       ],
       "why": "the launcher owns which runtimes exist, because a runtime without a RuntimeSpec cannot be launched whatever else claims to know it",
       "copies": [
@@ -1438,6 +1588,21 @@
       "default": "",
       "owner": "tests/load/loadtest.py",
       "note": ""
+    },
+    "DERATE_API_TOKEN": {
+      "default": null,
+      "owner": "control_plane/gateway/settings.py",
+      "note": "opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op"
+    },
+    "DERATE_AUTO_ADOPT_CONTAINERS": {
+      "default": "1",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "0 disables the background scan that reconstructs a deployment record for a derate-launched sparkrun container running with no matching entry in the deployment store"
+    },
+    "DERATE_AUTO_ADOPT_RUNTIMES": {
+      "default": "1",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "0 disables the background scan that registers a detected external runtime (e.g. Ollama) as a provider without a human clicking Adopt; the manual POST /api/nodes/{id}/runtime route is unaffected either way"
     },
     "DERATE_BASE_URL": {
       "default": "http://localhost:8088",
@@ -1544,6 +1709,11 @@
       "owner": "control_plane/registry/config.py",
       "note": "unset: find the coordinator over mDNS"
     },
+    "DERATE_LLAMACPP_IMAGE": {
+      "default": null,
+      "owner": "control_plane/deploy/flags.py",
+      "note": "the CPU runtime's image; the default is a CPU build, so a CUDA llama.cpp tag has to be named here to be used"
+    },
     "DERATE_LOAD_LOGS": {
       "default": null,
       "owner": "tests/load/harness.py",
@@ -1583,6 +1753,26 @@
       "default": "",
       "owner": "control_plane/links/measure.py",
       "note": ""
+    },
+    "DERATE_NCCL_AUTOCALIBRATE": {
+      "default": "1",
+      "owner": "control_plane/links/service.py",
+      "note": "0 stops a link measurement also calibrating a never-calibrated pair. Calibration costs one two-rank collective per candidate setting and runs only when nothing is stored for that pair and image, so it is once per pair per image rather than per measurement"
+    },
+    "DERATE_NCCL_ENV": {
+      "default": null,
+      "owner": "control_plane/deploy/manager.py",
+      "note": "NAME=VALUE,... rendered into a multi-rank launch's recipe env: block. Every name is checked against the image's own NCCL_TUNABLES first, because NCCL ignores an unknown one silently. No default on purpose: nothing has measured a collective on this fabric, and NCCL already picks a protocol by message size. See tests/nccl_sweep.py"
+    },
+    "DERATE_NCCL_MASTER": {
+      "default": "127.0.0.1",
+      "owner": "tests/nccl_sweep.py",
+      "note": "rendezvous address for the two-rank collective harness"
+    },
+    "DERATE_NCCL_PORT": {
+      "default": "29555",
+      "owner": "tests/nccl_sweep.py",
+      "note": "rendezvous port for the same; not a served port"
     },
     "DERATE_NCCL_TESTS_DIR": {
       "default": null,

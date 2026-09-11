@@ -19,12 +19,14 @@ Every value that crosses the wire as a string.
 
 | Type | Values | Defined in |
 |---|---|---|
+| `DeploymentOrigin` | `launched`, `adopted` | `control_plane.contracts.deployment` |
 | `DeploymentState` | `planned`, `launching`, `ready`, `degraded`, `failed`, `stopping`, `stopped` | `control_plane.contracts.deployment` |
 | `DeviceClass` | `gb10`, `discrete`, `apple`, `cpu`, `unknown` | `control_plane.contracts.hardware` |
 | `Modality` | `text`, `embedding`, `speech`, `transcription` | `control_plane.contracts.modality` |
 | `ParallelismKind` | `single_node`, `tensor`, `pipeline`, `expert`, `hybrid` | `control_plane.contracts.plan` |
 | `ProviderKind` | `openrouter`, `openai`, `anthropic`, `together`, `groq`, `ollama`, `custom` | `control_plane.contracts.providers` |
 | `RoutingPolicy` | `least_outstanding`, `round_robin`, `weighted_capacity`, `cache_affinity`, `failover`, `local_first`, `cost_aware` | `control_plane.contracts.routing` |
+| `SpeculativeMethod` | `mtp`, `dspark`, `ngram`, `eagle`, `eagle3`, `medusa`, `dflash` | `control_plane.contracts.plan` |
 | `TargetKind` | `local`, `remote` | `control_plane.contracts.routing` |
 | `Verdict` | `fits`, `fits_degraded`, `wont_fit` | `control_plane.contracts.plan` |
 
@@ -51,6 +53,14 @@ Every value that crosses the wire as a string.
 | `modality` | `Modality` | yes |
 | `extra_args` | `tuple[str, ...]` | yes |
 | `custom_command` | `tuple[str, ...]` | yes |
+| `speculative` | `SpeculativeSpec | None` | yes |
+| `origin` | `DeploymentOrigin` | yes |
+| `enforce_eager` | `bool` | yes |
+| `cudagraph_capture_sizes` | `tuple[int, ...] | None` | yes |
+| `kv_dtype` | `str | None` | yes |
+| `quantization` | `str | None` | yes |
+| `serving` | `bool` | yes |
+| `image` | `str | None` | yes |
 
 ### `FitRequest`
 
@@ -65,6 +75,7 @@ Every value that crosses the wire as a string.
 | `plan` | `ParallelismPlan` | no |
 | `weight_bytes` | `int | None` | yes |
 | `native_window` | `int | None` | yes |
+| `speculative` | `SpeculativeSpec | None` | yes |
 
 ### `FitResult`
 
@@ -82,6 +93,10 @@ Every value that crosses the wire as a string.
 | `predicted_decode_tps` | `float | None` | no |
 | `warnings` | `list[str]` | yes |
 | `budget_basis` | `str` | yes |
+| `speculative_decode_tps_floor` | `float | None` | yes |
+| `speculative_decode_tps_ceiling` | `float | None` | yes |
+| `speculative_reason` | `str` | yes |
+| `predicted_decode_tps_empty` | `float | None` | yes |
 
 ### `GpuProcess`
 
@@ -105,7 +120,7 @@ Every value that crosses the wire as a string.
 | `dst` | `str` | no |
 | `all_reduce_gbps` | `float` | no |
 | `sendrecv_gbps` | `float` | no |
-| `latency_us` | `float` | no |
+| `latency_us` | `float | None` | no |
 | `gpudirect_rdma` | `bool` | no |
 | `measured_at` | `float` | no |
 | `method` | `str` | no |
@@ -146,6 +161,7 @@ Every value that crosses the wire as a string.
 | `mla_latent_dim` | `int | None` | yes |
 | `mla_rope_dim` | `int | None` | yes |
 | `vision_params` | `int` | yes |
+| `routed_expert_params` | `int` | yes |
 | `is_encoder_decoder` | `bool` | yes |
 
 ### `NodeProfile`
@@ -273,6 +289,19 @@ Every value that crosses the wire as a string.
 | `targets` | `list[RouteTarget]` | yes |
 | `sticky_ttl_s` | `int` | yes |
 
+### `SpeculativeSpec`
+
+`control_plane.contracts.plan`
+
+| Field | Type | Optional |
+|---|---|---|
+| `method` | `SpeculativeMethod` | no |
+| `num_speculative_tokens` | `int` | no |
+| `draft_bytes` | `int` | no |
+| `draft_params` | `int` | no |
+| `model` | `str | None` | yes |
+| `draft_kv_ratio` | `float` | yes |
+
 ## Ports
 
 The interfaces components hold each other to.
@@ -305,6 +334,7 @@ The interfaces components hold each other to.
 | `GB10_TOTAL_MEMORY` | `137438953472` | `control_plane.contracts.constants` |
 | `QUANT_INFO` | (33 entries) | `control_plane.contracts.quant` |
 | `TP_VIABLE_THRESHOLD` | `40.0` | `control_plane.contracts.constants` |
+| `UNMEASURED_COLLECTIVE_LATENCY_US` | `40.0` | `control_plane.contracts.constants` |
 
 ## Derived facts
 
@@ -355,17 +385,18 @@ the canonical value.
 
 ### `runtime_names`
 
-- **Canonical**: `control_plane.deploy.flags:SUPPORTED_RUNTIMES` = `vllm`, `sglang`, `tts`
+- **Canonical**: `control_plane.deploy.flags:SUPPORTED_RUNTIMES` = `vllm`, `sglang`, `tts`, `llamacpp`
 - **Why not in `contracts/`**: the launcher owns which runtimes exist, because a runtime without a RuntimeSpec cannot be launched whatever else claims to know it
 - **Checked copies**: `control_plane.resolver.support:RUNTIMES`
 
 ## HTTP surface
 
-### Coordinator gateway (78 routes)
+### Coordinator gateway (83 routes)
 
 | Method | Path |
 |---|---|
 | GET | `/api/activity` |
+| GET | `/api/alerts` |
 | GET | `/api/capacity` |
 | GET | `/api/catalog` |
 | GET | `/api/cluster` |
@@ -373,6 +404,7 @@ the canonical value.
 | POST | `/api/deployments` |
 | DELETE | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}` |
+| PATCH | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}/logs` |
 | GET | `/api/docs` |
 | GET | `/api/enroll` |
@@ -386,12 +418,14 @@ the canonical value.
 | GET | `/api/links` |
 | POST | `/api/links/measure` |
 | POST | `/api/links/reach` |
+| POST | `/api/links/tune` |
 | GET | `/api/memory` |
 | GET | `/api/metrics/stream` |
 | GET | `/api/models` |
 | GET | `/api/models/detail` |
 | GET | `/api/models/quant-table` |
 | GET | `/api/models/search` |
+| GET | `/api/models/speculative-heads` |
 | GET | `/api/models/variants` |
 | GET | `/api/nodes` |
 | GET | `/api/nodes/candidates` |
@@ -400,6 +434,7 @@ the canonical value.
 | GET | `/api/nodes/{node_id}` |
 | POST | `/api/nodes/{node_id}/admit` |
 | PUT | `/api/nodes/{node_id}/label` |
+| GET | `/api/nodes/{node_id}/logs` |
 | GET | `/api/nodes/{node_id}/memory` |
 | GET | `/api/nodes/{node_id}/processes` |
 | DELETE | `/api/nodes/{node_id}/processes/{pid}` |
@@ -444,12 +479,14 @@ the canonical value.
 | POST | `/v1/embeddings` |
 | GET | `/v1/models` |
 
-### Node agent (11 routes)
+### Node agent (13 routes)
 
 | Method | Path |
 |---|---|
+| GET | `/agent/containers` |
 | GET | `/agent/health` |
 | GET | `/agent/journal` |
+| GET | `/agent/logs` |
 | GET | `/agent/models/cache` |
 | DELETE | `/agent/models/cache/{folder}` |
 | GET | `/agent/processes` |
@@ -472,6 +509,9 @@ default. A blank default means absence is itself the answer.
 | `DERATE_ALLOWED_ORIGINS` | `` | `control_plane/gateway/settings.py` |
 | `DERATE_ALLOW_BRIDGE` |  | `control_plane/registry/config.py` — the container refuses bridge networking unless this is set |
 | `DERATE_API_KEY` | `` | `tests/load/loadtest.py` |
+| `DERATE_API_TOKEN` |  | `control_plane/gateway/settings.py` — opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op |
+| `DERATE_AUTO_ADOPT_CONTAINERS` | `1` | `control_plane/gateway/settings.py` — 0 disables the background scan that reconstructs a deployment record for a derate-launched sparkrun container running with no matching entry in the deployment store |
+| `DERATE_AUTO_ADOPT_RUNTIMES` | `1` | `control_plane/gateway/settings.py` — 0 disables the background scan that registers a detected external runtime (e.g. Ollama) as a provider without a human clicking Adopt; the manual POST /api/nodes/{id}/runtime route is unaffected either way |
 | `DERATE_BASE_URL` | `http://localhost:8088` | `tests/load/loadtest.py` |
 | `DERATE_BUILD` |  | `control_plane/version.py` — stamped into the image; absent means a source checkout |
 | `DERATE_CACHE_DIR` |  | `control_plane/resolver/cache.py` — also read by registry/storage.py |
@@ -493,6 +533,7 @@ default. A blank default means absence is itself the answer.
 | `DERATE_IMAGE` | `ghcr.io/pizzaman213/derate/node:latest` | `install.sh` |
 | `DERATE_INSTALL_SH` |  | `control_plane/gateway/enroll_api.py` — override the installer script the coordinator serves |
 | `DERATE_JOIN` |  | `control_plane/registry/config.py` — unset: find the coordinator over mDNS |
+| `DERATE_LLAMACPP_IMAGE` |  | `control_plane/deploy/flags.py` — the CPU runtime's image; the default is a CPU build, so a CUDA llama.cpp tag has to be named here to be used |
 | `DERATE_LOAD_LOGS` |  | `tests/load/harness.py` |
 | `DERATE_LOG_BACKUPS` | `LOG_BACKUPS` | `control_plane/logfiles.py` — rotated files kept, per file |
 | `DERATE_LOG_DIR` |  | `control_plane/paths.py` — where node.log and proxy.log are written; unset means <project root>/logs -- /opt/derate/logs in the image, which is a layer and not the volume |
@@ -501,6 +542,10 @@ default. A blank default means absence is itself the answer.
 | `DERATE_LOG_MAX_BYTES` | `LOG_MAX_BYTES` | `control_plane/logfiles.py` — rotation size, per file |
 | `DERATE_MPIRUN` |  | `control_plane/links/measure.py` |
 | `DERATE_MPIRUN_ARGS` | `` | `control_plane/links/measure.py` |
+| `DERATE_NCCL_AUTOCALIBRATE` | `1` | `control_plane/links/service.py` — 0 stops a link measurement also calibrating a never-calibrated pair. Calibration costs one two-rank collective per candidate setting and runs only when nothing is stored for that pair and image, so it is once per pair per image rather than per measurement |
+| `DERATE_NCCL_ENV` |  | `control_plane/deploy/manager.py` — NAME=VALUE,... rendered into a multi-rank launch's recipe env: block. Every name is checked against the image's own NCCL_TUNABLES first, because NCCL ignores an unknown one silently. No default on purpose: nothing has measured a collective on this fabric, and NCCL already picks a protocol by message size. See tests/nccl_sweep.py |
+| `DERATE_NCCL_MASTER` | `127.0.0.1` | `tests/nccl_sweep.py` — rendezvous address for the two-rank collective harness |
+| `DERATE_NCCL_PORT` | `29555` | `tests/nccl_sweep.py` — rendezvous port for the same; not a served port |
 | `DERATE_NCCL_TESTS_DIR` |  | `control_plane/links/measure.py` |
 | `DERATE_NODE_ID` |  | `control_plane/registry/config.py` — unset: derived from the hostname |
 | `DERATE_OFFLINE` |  | `control_plane/resolver/resolver.py` — answer from cache and fixtures, never reach the network |

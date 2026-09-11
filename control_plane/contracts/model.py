@@ -43,6 +43,18 @@ class ModelShape:
     # Replicated per node when sharding, never split
     vision_params: int = 0
 
+    # Routed expert weights: the mirror of vision_params. That one is held
+    # whole by every rank; this one is SPLIT across expert-parallel ranks,
+    # because `--enable-expert-parallel` places num_experts/ep of them on
+    # each. Shared experts are not counted here -- they are read on every
+    # token by every rank and stay whole, like any dense weight.
+    #
+    # 0 means "not derived", never "no experts", and it degrades in the
+    # refusing direction: the fit gate then charges the whole checkpoint to
+    # every rank, which is what it did for every model before this field
+    # existed.
+    routed_expert_params: int = 0
+
     # Encoder-decoder (Whisper family). KV cache math (fit/kv.py) only prices
     # the decoder's self-attention, so on a shape where this is True that
     # figure is a floor: cross-attention cache over the encoder's own output

@@ -17,8 +17,9 @@ from .constants import (
     GB10_MEM_BANDWIDTH,
     GB10_TOTAL_MEMORY,
     TP_VIABLE_THRESHOLD,
+    UNMEASURED_COLLECTIVE_LATENCY_US,
 )
-from .deployment import Deployment, DeploymentState
+from .deployment import Deployment, DeploymentOrigin, DeploymentState
 from .hardware import (
     DeviceClass,
     GpuProcess,
@@ -34,6 +35,8 @@ from .plan import (
     MemoryBreakdown,
     ParallelismKind,
     ParallelismPlan,
+    SpeculativeMethod,
+    SpeculativeSpec,
     Verdict,
 )
 from .ports import (
@@ -61,7 +64,9 @@ __all__ = [
     "GB10_MEM_BANDWIDTH",
     "GB10_TOTAL_MEMORY",
     "TP_VIABLE_THRESHOLD",
+    "UNMEASURED_COLLECTIVE_LATENCY_US",
     "Deployment",
+    "DeploymentOrigin",
     "DeploymentPort",
     "DeploymentState",
     "DeviceClass",
@@ -79,6 +84,8 @@ __all__ = [
     "NodeState",
     "ParallelismKind",
     "ParallelismPlan",
+    "SpeculativeMethod",
+    "SpeculativeSpec",
     "PlannerPort",
     "Provider",
     "ProviderKind",

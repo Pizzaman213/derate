@@ -155,7 +155,17 @@ class LinkMeasurement:
     dst: str  # node_id
     all_reduce_gbps: float  # what governs tensor parallel
     sendrecv_gbps: float  # what governs pipeline handoff and KV transfer
-    latency_us: float
+    # Cost of ONE cross-node COLLECTIVE, which is what the planner multiplies
+    # by the exchange count. None means no rung measured one -- and that is a
+    # real state, not a defect: `ib_write_bw` can only offer `ib_write_lat`, a
+    # one-sided 2-byte RDMA write, which is a different operation from a
+    # two-rank all-reduce (that additionally carries a kernel launch, a
+    # reduction and a synchronisation). Reporting the write as the collective
+    # made this field ~28x optimistic and it is the single most
+    # decision-sensitive input the planner has, so the honest answer is
+    # absence. See UNMEASURED_COLLECTIVE_LATENCY_US for what is charged
+    # instead, and `links/measure.py` for the rung that now declines.
+    latency_us: float | None
     gpudirect_rdma: bool
     measured_at: float
     method: str  # "nccl-tests" | "ib_write_bw" | "manual"

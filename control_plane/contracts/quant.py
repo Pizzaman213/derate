@@ -1,4 +1,4 @@
-"""The quantization table. Owned by Agent C.
+"""The quantization table. Owned by the resolver.
 
 Real bytes per parameter, including block scales and zero points -- not nominal
 bit width. Nominal bit width understates footprint and is the systematic error
@@ -12,7 +12,7 @@ always one of its keys.
 The day-0 placeholder that stood here carried q5_k_m at 0.6875 and q3_k_m at
 0.4921875, which are the pure-K-block figures. The _M mixes name a per-tensor
 mix that lands higher and lower respectively; the values below are the ones
-frozen in the architecture doc and the Agent C brief, and they supersede it.
+frozen in the architecture doc, and they supersede it.
 """
 
 from __future__ import annotations
