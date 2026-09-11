@@ -1,0 +1,3036 @@
+{
+ "engine": "vllm",
+ "version": "0.28.1rc1.dev462+g9ca97b28b.d20260906",
+ "flags": [
+  {
+   "names": [
+    "--additional-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--aggregate-engine-logging"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--all2all-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "allgather_reducescatter",
+    "deepep_high_throughput",
+    "deepep_low_latency",
+    "deepep_v2",
+    "flashinfer_all2allv",
+    "flashinfer_nvlink_one_sided",
+    "flashinfer_nvlink_two_sided",
+    "mori_high_throughput",
+    "mori_low_latency",
+    "naive",
+    "nixl_ep",
+    "pplx"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--allow-credentials",
+    "--no-allow-credentials"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--allow-deprecated-quantization",
+    "--no-allow-deprecated-quantization"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--allowed-headers"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--allowed-local-media-path"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--allowed-media-domains"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--allowed-methods"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--allowed-origins"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--api-key"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--api-server-count",
+    "-asc"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--async-scheduling",
+    "--no-async-scheduling"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--attention-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--attention-config",
+    "-ac"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--block-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--chat-template"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--chat-template-content-format"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "openai",
+    "string"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--code-revision"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cohere-format"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cohere-is-reasoning-model",
+    "--no-cohere-is-reasoning-model"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--collect-detailed-traces"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": [
+    "None",
+    "all",
+    "all,model",
+    "all,worker",
+    "model",
+    "model,all",
+    "model,worker",
+    "worker",
+    "worker,all",
+    "worker,model"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--compilation-config",
+    "-cc"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--config-format"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--convert"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "classify",
+    "embed",
+    "none"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cp-kv-cache-interleave-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cpu-distributed-timeout-seconds"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cpu-offload-gb"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cpu-offload-params"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cudagraph-capture-sizes"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--cudagraph-metrics",
+    "--no-cudagraph-metrics"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-address",
+    "-dpa"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-backend",
+    "-dpb"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-external-lb",
+    "--no-data-parallel-external-lb",
+    "-dpe"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-hybrid-lb",
+    "--no-data-parallel-hybrid-lb",
+    "-dph"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-multi-port-external-lb",
+    "-dpm"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-rank",
+    "-dpn"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-rpc-port",
+    "-dpp"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-size",
+    "-dp"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-size-local",
+    "-dpl"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-start-rank",
+    "-dpr"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--data-parallel-supervisor-port"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dbo-decode-token-threshold"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dbo-prefill-token-threshold"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dcp-comm-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "None",
+    "a2a",
+    "ag_rs"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dcp-kv-cache-interleave-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dcp-q-replicate",
+    "--no-dcp-q-replicate"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--decode-context-parallel-size",
+    "-dcp"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--default-chat-template-kwargs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--default-mm-loras"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--device-ids"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--diffusion-config",
+    "-dc"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-access-log-for-endpoints"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-cascade-attn",
+    "--no-disable-cascade-attn"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-chunked-mm-input",
+    "--no-disable-chunked-mm-input"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-custom-all-reduce",
+    "--no-disable-custom-all-reduce"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-fastapi-docs",
+    "--no-disable-fastapi-docs"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-hybrid-kv-cache-manager",
+    "--no-disable-hybrid-kv-cache-manager"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-log-stats"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-nccl-for-dp-synchronization",
+    "--no-disable-nccl-for-dp-synchronization"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-sliding-window",
+    "--no-disable-sliding-window"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--disable-uvicorn-access-log",
+    "--no-disable-uvicorn-access-log"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--distributed-executor-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--distributed-timeout-seconds"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--download-dir"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dp-supervisor-probe-failure-threshold"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dp-supervisor-probe-interval-s"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dp-supervisor-probe-timeout-s"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dp-sync-interval"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--dtype"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "bfloat16",
+    "float",
+    "float16",
+    "float32",
+    "half"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ec-manager-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ec-transfer-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-auto-tool-choice",
+    "--no-enable-auto-tool-choice"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-batch-sharded-sampling",
+    "--no-enable-batch-sharded-sampling"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-bf16x3-router-gemm",
+    "--no-enable-bf16x3-router-gemm"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-chunked-prefill",
+    "--no-enable-chunked-prefill"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-cumem-allocator",
+    "--no-enable-cumem-allocator"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-dbo",
+    "--no-enable-dbo"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-elastic-ep",
+    "--no-enable-elastic-ep"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-ep-weight-filter",
+    "--no-enable-ep-weight-filter"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-eplb",
+    "--no-enable-eplb"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-expert-parallel",
+    "--no-enable-expert-parallel",
+    "-ep"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-fault-tolerance",
+    "--no-enable-fault-tolerance"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-flash-late-interaction",
+    "--no-enable-flash-late-interaction"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-flashinfer-autotune",
+    "--no-enable-flashinfer-autotune"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-force-include-usage",
+    "--no-enable-force-include-usage"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-layerwise-nvtx-tracing",
+    "--no-enable-layerwise-nvtx-tracing"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-log-deltas",
+    "--no-enable-log-deltas"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-log-outputs",
+    "--no-enable-log-outputs"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-log-requests",
+    "--no-enable-log-requests"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-logging-iteration-details",
+    "--no-enable-logging-iteration-details"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-lora",
+    "--no-enable-lora"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-mamba-cache-stochastic-rounding",
+    "--no-enable-mamba-cache-stochastic-rounding"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-mfu-metrics",
+    "--no-enable-mfu-metrics"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-mixed-moe-lora-format",
+    "--no-enable-mixed-moe-lora-format"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-mm-embeds",
+    "--no-enable-mm-embeds"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-moe-shared-loras",
+    "--no-enable-moe-shared-loras"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-nccl-comm-suspend",
+    "--no-enable-nccl-comm-suspend"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-offline-docs",
+    "--no-enable-offline-docs"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-per-request-metrics",
+    "--no-enable-per-request-metrics"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-prefix-caching",
+    "--no-enable-prefix-caching"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-prompt-embeds",
+    "--no-enable-prompt-embeds"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-prompt-tokens-details",
+    "--no-enable-prompt-tokens-details"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-request-id-headers",
+    "--no-enable-request-id-headers"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-return-routed-experts",
+    "--no-enable-return-routed-experts"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-server-load-tracking",
+    "--no-enable-server-load-tracking"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-sleep-mode",
+    "--no-enable-sleep-mode"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-ssl-refresh",
+    "--no-enable-ssl-refresh"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-tokenizer-info-endpoint",
+    "--no-enable-tokenizer-info-endpoint"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-tower-connector-lora",
+    "--no-enable-tower-connector-lora"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enable-trace-replay",
+    "--no-enable-trace-replay"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--enforce-eager",
+    "--no-enforce-eager"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--eplb-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--exclude-tools-when-tool-choice-none",
+    "--no-exclude-tools-when-tool-choice-none"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--expert-placement-strategy"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "linear",
+    "round_robin"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--fail-on-environ-validation",
+    "--no-fail-on-environ-validation"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--fault-tolerance-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--fingerprint-mode"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "custom",
+    "full",
+    "hash",
+    "none"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--fingerprint-value"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--fully-sharded-loras",
+    "--no-fully-sharded-loras"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--gdn-prefill-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "cutedsl",
+    "flashinfer",
+    "triton"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--generation-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--gpu-memory-utilization"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--grpc"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--h11-max-header-count"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--h11-max-incomplete-event-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--headless"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--hf-config-path"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--hf-overrides"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--hf-token"
+   ],
+   "takes_value": true,
+   "nargs": "?",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--host"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ignore-patterns"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--interleave-mm-strings",
+    "--no-interleave-mm-strings"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--io-processor-plugin"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ir-op-priority"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--jit-monitor-mode"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "error",
+    "warn"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--jit-monitor-verbose",
+    "--no-jit-monitor-verbose"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kda-prefill-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "flashkda",
+    "triton"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kernel-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-cache-dtype"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "bfloat16",
+    "float16",
+    "fp8",
+    "fp8_ds_mla",
+    "fp8_e4m3",
+    "fp8_e5m2",
+    "fp8_inc",
+    "fp8_per_token_head",
+    "int4_per_token_head",
+    "int8_per_token_head",
+    "nvfp4",
+    "nvfp4_4over6",
+    "nvfp4_ds_mla",
+    "turboquant_3bit_nc",
+    "turboquant_4bit_nc",
+    "turboquant_k3v4_nc",
+    "turboquant_k8v4"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-cache-dtype-skip-layers"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-cache-memory-bytes"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-cache-metrics",
+    "--no-kv-cache-metrics"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-cache-metrics-sample"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-events-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-offloading-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "lmcache",
+    "native"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-offloading-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-sharing-fast-prefill",
+    "--no-kv-sharing-fast-prefill"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--kv-transfer-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--language-model-only",
+    "--no-language-model-only"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--limit-mm-per-prompt"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--linear-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "aiter",
+    "auto",
+    "b12x",
+    "conch",
+    "cutlass",
+    "deep_gemm",
+    "emulation",
+    "exllama",
+    "fbgemm",
+    "flashinfer_b12x",
+    "flashinfer_cudnn",
+    "flashinfer_cutedsl",
+    "flashinfer_cutlass",
+    "flashinfer_trtllm",
+    "humming",
+    "machete",
+    "marlin",
+    "torch",
+    "triton",
+    "xpu",
+    "xpu_woq"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--load-format"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--log-config-file"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--log-error-stack",
+    "--no-log-error-stack"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--logits-processors"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--logprobs-mode"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "processed_logits",
+    "processed_logprobs",
+    "raw_logits",
+    "raw_logprobs"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--long-prefill-token-threshold"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--lora-dtype"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "bfloat16",
+    "float16"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--lora-modules"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--lora-target-modules"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mamba-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mamba-block-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mamba-cache-dtype"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "bfloat16",
+    "float16",
+    "float32"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mamba-cache-mode"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "align",
+    "all",
+    "none"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mamba-cache-philox-rounds"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mamba-ssm-cache-dtype"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "bfloat16",
+    "float16",
+    "float32"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mamba-ssu-algorithm"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "None",
+    "auto",
+    "horizontal",
+    "simple",
+    "vertical"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--master-addr"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--master-port"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-cpu-loras"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-cudagraph-capture-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-log-len"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-logprobs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-lora-rank"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "1",
+    "128",
+    "16",
+    "256",
+    "32",
+    "320",
+    "512",
+    "64",
+    "8"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-loras"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-model-len"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-num-batched-tokens"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-num-queued-reqs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-num-queued-tokens"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-num-scheduled-tokens"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-num-seqs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--max-parallel-loading-workers"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--media-io-kwargs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--middleware"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": true
+  },
+  {
+   "names": [
+    "--mm-device-do-normalize",
+    "--no-mm-device-do-normalize"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-encoder-attn-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-encoder-attn-dtype"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "None",
+    "fp8"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-encoder-fp8-scale-path"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-encoder-fp8-scale-save-margin"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-encoder-fp8-scale-save-path"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-encoder-only",
+    "--no-mm-encoder-only"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-encoder-tp-mode"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "data",
+    "weights"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-hasher-algorithm"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "blake3",
+    "sha256",
+    "sha512"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-ipc-gpu-memory-gb"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-processor-cache-gb"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-processor-cache-type"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "lru",
+    "shm"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-processor-device"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "cpu",
+    "cuda"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-processor-kwargs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-shm-cache-max-object-size-mb"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--mm-tensor-ipc"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "direct_rpc",
+    "torch_shm"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--model"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--model-class-overrides"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--model-impl"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--model-loader-extra-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--moe-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "aiter",
+    "aiter_triton_mxfp4_bf16",
+    "auto",
+    "b12x",
+    "batched_triton",
+    "cutlass",
+    "deep_gemm",
+    "deep_gemm_mega_moe",
+    "emulation",
+    "flashinfer_b12x",
+    "flashinfer_cutedsl",
+    "flashinfer_cutlass",
+    "flashinfer_moe_ep_mega_cutedsl",
+    "flashinfer_moe_ep_mega_deep_gemm",
+    "flashinfer_trtllm",
+    "flydsl",
+    "hpc",
+    "humming",
+    "marlin",
+    "triton",
+    "triton_unfused"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--nnodes",
+    "-n"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--node-rank",
+    "-r"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--num-gpu-blocks-override"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--numa-bind",
+    "--no-numa-bind"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--numa-bind-cpus"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--numa-bind-nodes"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--offload-backend"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "prefetch",
+    "uva"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--offload-group-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--offload-num-in-group"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--offload-params"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--offload-prefetch-step"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--optimization-level"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--otlp-traces-endpoint"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--override-generation-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--per-request-spec-decode-metrics"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "detailed",
+    "none",
+    "summary"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--performance-mode"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "balanced",
+    "interactivity",
+    "throughput"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--pipeline-parallel-size",
+    "-pp"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--pooler-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--port"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--prefill-context-parallel-size",
+    "-pcp"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--prefill-schedule-interval"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--prefix-cache-retention-interval"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--prefix-caching-hash-algo"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "sha256",
+    "sha256_cbor",
+    "xxhash",
+    "xxhash_cbor"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--prefix-match-unit"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--profiler-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--pt-load-map-location"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--quantization",
+    "-q"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--quantization-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ray-workers-use-nsight",
+    "--no-ray-workers-use-nsight"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--reasoning-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--reasoning-parser"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--reasoning-parser-plugin"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--renderer-num-workers"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--replayssm-buffer-len"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--response-role"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--return-sampling-mask",
+    "--no-return-sampling-mask"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--return-tokens-as-token-ids",
+    "--no-return-tokens-as-token-ids"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--revision"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--root-path"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--runner"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "auto",
+    "draft",
+    "generate",
+    "pooling"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--safetensors-load-strategy"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "None",
+    "eager",
+    "lazy",
+    "prefetch",
+    "torchao"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--safetensors-prefetch-block-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--safetensors-prefetch-num-threads"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--scheduler-cls"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--scheduler-reserve-full-isl",
+    "--no-scheduler-reserve-full-isl"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--scheduling-policy"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "fcfs",
+    "priority"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--seed"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--served-model-name"
+   ],
+   "takes_value": true,
+   "nargs": "+",
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--show-hidden-metrics-for-version"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--shutdown-timeout"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--skip-mm-profiling",
+    "--no-skip-mm-profiling"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--skip-tokenizer-init",
+    "--no-skip-tokenizer-init"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--spec-method"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "None",
+    "bailing_hybrid_mtp",
+    "bailing_hybrid_v3_mtp",
+    "custom_class",
+    "deepseek_mtp",
+    "dflash",
+    "dots3_note_mtp",
+    "draft_model",
+    "dspark",
+    "eagle",
+    "eagle3",
+    "ernie_mtp",
+    "exaone4_5_mtp",
+    "exaone_moe_mtp",
+    "extract_hidden_states",
+    "gemma4_mtp",
+    "glm4_moe_lite_mtp",
+    "glm4_moe_mtp",
+    "glm5_next_mtp",
+    "glm_ocr_mtp",
+    "hy_v3_mtp",
+    "hy_v4_mtp",
+    "inkling_mtp",
+    "kimi_k3_mtp",
+    "longcat_flash_mtp",
+    "medusa",
+    "mimo_mtp",
+    "mimo_v2_mtp",
+    "minimax_m3_mtp",
+    "mlp_speculator",
+    "mtp",
+    "nemotron_h_mtp",
+    "ngram",
+    "ngram_gpu",
+    "pangu_ultra_moe_mtp",
+    "qwen3_5_mtp",
+    "qwen3_next_mtp",
+    "qwen4_exp_mtp",
+    "step3p5_mtp",
+    "suffix"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--spec-model"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--spec-tokens"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--specialize-active-lora",
+    "--no-specialize-active-lora"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--speculative-config",
+    "-sc"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--sse-keep-alive-interval"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ssl-ca-certs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ssl-cert-reqs"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ssl-certfile"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ssl-ciphers"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ssl-keyfile"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--stream-interval"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--structured-outputs-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tensor-parallel-size",
+    "-tp"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tokenizer"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tokenizer-mode"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tokenizer-revision"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tokens-only",
+    "--no-tokens-only"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tool-call-parser"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tool-parser-plugin"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--tool-server"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--trust-remote-code",
+    "--no-trust-remote-code"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--trust-request-chat-template",
+    "--no-trust-request-chat-template"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--ubatch-size"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--uds"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--use-fp64-gumbel",
+    "--no-use-fp64-gumbel"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--use-replayssm",
+    "--no-use-replayssm"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--use-tqdm-on-load",
+    "--no-use-tqdm-on-load"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--uvicorn-log-level"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "critical",
+    "debug",
+    "error",
+    "info",
+    "trace",
+    "warning"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--video-pruning-method"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": [
+    "evs",
+    "vidcom2"
+   ],
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--video-pruning-rate"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--watermark"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--weight-transfer-config"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--worker-cls"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "--worker-extension-cls"
+   ],
+   "takes_value": true,
+   "nargs": null,
+   "choices": null,
+   "repeatable": false
+  },
+  {
+   "names": [
+    "-h",
+    "--help"
+   ],
+   "takes_value": false,
+   "nargs": 0,
+   "choices": null,
+   "repeatable": false
+  }
+ ]
+}

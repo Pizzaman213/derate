@@ -25,25 +25,55 @@ import subprocess
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from control_plane.contracts import (
     DEFAULT_GUARDRAIL,
     ModelShape,
     ParallelismPlan,
     RegistryPort,
+    SpeculativeSpec,
 )
 
-from .flags import KNOBS_BY_NAME, SPARKRUN_BIN, RuntimeSpec, runtime_spec
+from .flags import KNOBS_BY_NAME, RuntimeSpec, runtime_spec, sparkrun_binary
 from .recipes import RecipeSpec, materialize, synthesize
 
 from control_plane.paths import data_dir
 
 logger = logging.getLogger(__name__)
 
+#: How long to wait for a killed sparkrun to flush its pipes before giving up
+#: on its partial output. It has had SIGKILL; this is a drain, not a wait.
+_KILL_DRAIN_S = 5.0
+
+#: Asking docker which container a cluster id is in is a local socket call on
+#: the snapshot path, so it gets a short leash of its own.
+_DOCKER_PS_TIMEOUT_S = 5.0
+
+
+def _docker_binary() -> str:
+    """Resolved rather than assumed, the same way `SparkrunAdapter.binary` is.
+
+    Falls back to the bare name so a PATH that resolves it at exec time still
+    works -- and so the failure, if there is one, is an OSError the callers
+    above already treat as "no reading".
+    """
+    return shutil.which("docker") or "docker"
+
 #: `Cluster:   sparkrun_c02f6a8db07f` in `sparkrun run` output. This is the
 #: handle for stop, logs, and liveness checks.
-CLUSTER_ID_RE = re.compile(r"^\s*Cluster:\s+(sparkrun_[0-9a-f]{6,})\s*$", re.MULTILINE)
+#:
+#: The trailing segments are not decoration. sparkrun 0.2.40 printed one hex
+#: run, 0.3.8 prints two (`sparkrun_6579cd9ba54b79f5_1a209ee6d1e8`), and an
+#: expression anchored after the first one matched neither -- so a launch that
+#: had genuinely worked, containers up on both hosts, came back as "sparkrun
+#: exited 0 but printed no cluster id; cannot track this workload" and was
+#: recorded FAILED with the workload still running. A handle this cannot read
+#: is a workload nothing can stop, so the shape is kept deliberately loose:
+#: any number of underscore-joined hex runs.
+CLUSTER_ID_RE = re.compile(
+    r"^\s*Cluster:\s+(sparkrun_[0-9a-f]{6,}(?:_[0-9a-f]{6,})*)\s*$", re.MULTILINE
+)
 #: `  Head:    10.0.0.1`
 HEAD_HOST_RE = re.compile(r"^\s*Head:\s+(\S+)\s*$", re.MULTILINE)
 #: Solo launches print no Head line, only the target.
@@ -192,7 +222,7 @@ class SparkrunAdapter:
         registry: RegistryPort | None = None,
         *,
         recipe_dir: Path | str | None = None,
-        binary: str = SPARKRUN_BIN,
+        binary: str | None = None,
         base_port: int = 8100,
         gpu_memory_utilization: float = DEFAULT_GUARDRAIL,
         launch_timeout_s: float = 1800.0,
@@ -203,7 +233,9 @@ class SparkrunAdapter:
         self.recipe_dir = (
             Path(recipe_dir) if recipe_dir is not None else data_dir() / "recipes"
         )
-        self.binary = binary
+        # None, not the constant: an explicit binary is the caller's and wins,
+        # and everything else asks the environment now rather than at import.
+        self.binary = binary if binary is not None else sparkrun_binary()
         self.base_port = base_port
         self.gpu_memory_utilization = gpu_memory_utilization
         self.launch_timeout_s = launch_timeout_s
@@ -257,8 +289,14 @@ class SparkrunAdapter:
         port: int | None = None,
         gpu_memory_utilization: float | None = None,
         kv_cache_memory_bytes: int | None = None,
+        speculative: SpeculativeSpec | None = None,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        enforce_eager: bool = False,
+        cudagraph_capture_sizes: tuple[int, ...] | None = None,
+        kv_dtype: str | None = None,
+        quantization: str | None = None,
+        nccl_env: Mapping[str, str] | None = None,
     ) -> RecipeSpec:
         return synthesize(
             shape,
@@ -283,9 +321,19 @@ class SparkrunAdapter:
             # and there is no sensible constant to fall back to. Absent, the
             # runtime sizes its own cache exactly as it did before.
             kv_cache_memory_bytes=kv_cache_memory_bytes,
+            # Also no adapter-level default, and for a stronger reason than the
+            # byte count above: this one is not a number the adapter could
+            # sensibly guess at all. It is a decision somebody made on the model
+            # screen, priced by the fit gate against this checkpoint.
+            speculative=speculative,
             recipe_dir=self.recipe_dir,
             extra_args=extra_args,
             custom_command=custom_command,
+            enforce_eager=enforce_eager,
+            cudagraph_capture_sizes=cudagraph_capture_sizes,
+            kv_dtype=kv_dtype,
+            quantization=quantization,
+            nccl_env=nccl_env,
         )
 
     def render_command(
@@ -301,7 +349,13 @@ class SparkrunAdapter:
         recipe: RecipeSpec | None = None,
         gpu_memory_utilization: float | None = None,
         kv_cache_memory_bytes: int | None = None,
+        speculative: SpeculativeSpec | None = None,
         extra_args: tuple[str, ...] = (),
+        enforce_eager: bool = False,
+        cudagraph_capture_sizes: tuple[int, ...] | None = None,
+        kv_dtype: str | None = None,
+        quantization: str | None = None,
+        nccl_env: Mapping[str, str] | None = None,
     ) -> list[str]:
         """The exact argv that will run. Pure: no subprocess, no filesystem.
 
@@ -315,7 +369,12 @@ class SparkrunAdapter:
         recipe = recipe or self.recipe_for(
             plan, shape, runtime, ctx, max_seqs, served_name=name, port=chosen_port,
             gpu_memory_utilization=gpu_memory_utilization,
-            kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
+            speculative=speculative, extra_args=extra_args,
+            enforce_eager=enforce_eager, cudagraph_capture_sizes=cudagraph_capture_sizes,
+            kv_dtype=kv_dtype,
+            quantization=quantization,
+            nccl_env=nccl_env,
         )
 
         values: dict[str, Any] = {
@@ -370,9 +429,15 @@ class SparkrunAdapter:
         port: int | None = None,
         gpu_memory_utilization: float | None = None,
         kv_cache_memory_bytes: int | None = None,
+        speculative: SpeculativeSpec | None = None,
         on_output: Callable[[str], None] | None = None,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        enforce_eager: bool = False,
+        cudagraph_capture_sizes: tuple[int, ...] | None = None,
+        kv_dtype: str | None = None,
+        quantization: str | None = None,
+        nccl_env: Mapping[str, str] | None = None,
     ) -> LaunchResult:
         """Run the invocation and parse the handle back out.
 
@@ -393,8 +458,13 @@ class SparkrunAdapter:
         recipe = self.recipe_for(
             plan, shape, runtime, ctx, max_seqs, served_name=name, port=chosen_port,
             gpu_memory_utilization=gpu_memory_utilization,
-            kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
+            speculative=speculative, extra_args=extra_args,
             custom_command=custom_command,
+            enforce_eager=enforce_eager, cudagraph_capture_sizes=cudagraph_capture_sizes,
+            kv_dtype=kv_dtype,
+            quantization=quantization,
+            nccl_env=nccl_env,
         )
         materialize(recipe)
         argv = self.render_command(
@@ -402,6 +472,11 @@ class SparkrunAdapter:
             served_name=name, port=chosen_port, recipe=recipe,
             gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=kv_cache_memory_bytes,
+            speculative=speculative,
+            enforce_eager=enforce_eager, cudagraph_capture_sizes=cudagraph_capture_sizes,
+            kv_dtype=kv_dtype,
+            quantization=quantization,
+            nccl_env=nccl_env,
         )
         hosts = self.hosts_for(plan.node_ids)
 
@@ -554,6 +629,80 @@ class SparkrunAdapter:
             return ""
         return proc.stdout + proc.stderr
 
+    #: sparkrun's own serve-log path inside a solo container. A literal, like
+    #: every other sparkrun fact this module reads: `sparkrun logs` itself
+    #: runs `docker exec <container> tail -f --lines N` against exactly this
+    #: file (orchestration/ssh.py), and manager.py's own comment names it too.
+    SERVE_LOG_PATH = "/tmp/sparkrun_serve.log"
+
+    def log_snapshot(
+        self,
+        cluster_id: str,
+        *,
+        hosts: Sequence[str] | None = None,
+        tail: int = 200,
+        timeout: float = 10.0,
+    ) -> str:
+        """A bounded, NON-FOLLOWING read of the same log `logs()` follows.
+
+        `sparkrun logs` has no no-follow mode -- `--tail` is documented as
+        "number of log lines before following" -- so every call to it is a
+        subscription. CLAUDE.md says so in as many words: that command "is
+        subscribed to, never polled". A caller that wants one snapshot every
+        minute is polling it, and on a LOCAL docker socket each poll strands a
+        `tail -f` inside the container for as long as the container lives:
+        killing the client does not reach a process dockerd started. Measured
+        here before this existed, one container held 1195 of them and another
+        2994, one per minute since launch.
+
+        So the snapshot path does not go through `sparkrun logs` at all. It
+        reads the same file with a `tail -n` that exits on its own, which is
+        what a snapshot always wanted. Remote hosts still fall back to
+        `logs()`: over ssh the strand does not happen, because ssh tears the
+        remote command down with its client.
+        """
+        name = self._local_container(cluster_id)
+        if name is None:
+            return self.logs(cluster_id, hosts=hosts, tail=tail, timeout=timeout)
+        argv = [
+            _docker_binary(), "exec", name,
+            "tail", "-n", str(tail), self.SERVE_LOG_PATH,
+        ]
+        try:
+            proc = self._run(argv, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            return _decode(exc.stdout)
+        except OSError:
+            logger.debug("could not read the serve log for %s", cluster_id, exc_info=True)
+            return ""
+        # A non-zero exit is an absent file or a container that went away
+        # mid-read. Both are "no log", never a raise: the caller is keeping
+        # evidence, not depending on it.
+        return proc.stdout if proc.returncode == 0 else ""
+
+    def _local_container(self, cluster_id: str) -> str | None:
+        """The container this cluster id is running in ON THIS MACHINE, or None.
+
+        None means "not here, or docker could not be asked" -- absence of
+        evidence, and the caller falls back to sparkrun rather than treating
+        it as absence of a container.
+        """
+        try:
+            proc = self._run(
+                [
+                    _docker_binary(), "ps",
+                    "--filter", "name=^%s_" % cluster_id,
+                    "--format", "{{.Names}}",
+                ],
+                timeout=_DOCKER_PS_TIMEOUT_S,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if proc.returncode != 0:
+            return None
+        names = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        return names[0] if names else None
+
     def stream_logs(
         self,
         cluster_id: str,
@@ -617,14 +766,68 @@ class SparkrunAdapter:
     # -- plumbing ---------------------------------------------------------
 
     def _run(self, argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        """`subprocess.run`, except a timeout kills the whole process GROUP.
+
+        This was `subprocess.run(..., timeout=)` and that is a leak, not a
+        style question. `sparkrun logs` is a CLI in front of a `docker exec
+        ... tail -f`, so it never returns and this call ALWAYS times out --
+        and `subprocess.run`'s own timeout kills the CLI it started and
+        nothing underneath it. Over ssh that is harmless, because ssh tears
+        the remote command down when its client dies. Against a LOCAL docker
+        socket -- which is how a containerized node reaches its own
+        deployments -- the exec'd process outlives the client and runs for as
+        long as the container does.
+
+        Measured on this box before the fix: 1195 of one container's 1208
+        processes were `tail -f --lines 200 /tmp/sparkrun_serve.log`, exactly
+        one per minute since launch, because `_snapshot_serving_log` calls
+        `logs()` every `SERVING_LOG_SNAPSHOT_S`. Another was at 2994, being
+        watched by two coordinators. `LogStream.close` already guarded this
+        for the streaming path and says why; every other caller of this method
+        did not, and `logs()` is the one that runs on a timer.
+
+        `hasattr` rather than a platform name, for the reason the rest of this
+        codebase gives: `os.killpg` is the thing being asked about, so ask
+        about it.
+        """
+        group = hasattr(os, "killpg") and hasattr(os, "getpgid") and hasattr(os, "setsid")
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             env=self.env,
-            check=False,
+            start_new_session=group,
         )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_group(proc, group=group)
+            try:
+                # Drain whatever it managed to write. Callers of `logs()` read
+                # exactly this partial output and it is the whole point of the
+                # call, so losing it here would trade one bug for another.
+                out, err = proc.communicate(timeout=_KILL_DRAIN_S)
+            except subprocess.TimeoutExpired:  # pragma: no cover - it was killed
+                out, err = "", ""
+            raise subprocess.TimeoutExpired(
+                argv, timeout, output=out, stderr=err
+            ) from None
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen, *, group: bool) -> None:
+        """SIGKILL the process group, falling back to the process itself."""
+        if group:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                return
+            except OSError:
+                logger.debug("could not kill the sparkrun process group", exc_info=True)
+        try:
+            proc.kill()
+        except OSError:  # pragma: no cover - already gone
+            pass
 
     def _run_streamed(
         self,
