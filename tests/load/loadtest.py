@@ -404,6 +404,23 @@ def build_body(model: Model, args, nonce: str) -> dict:
         }
         if args.stream:
             body["stream"] = True
+            # Ask for the usage block. Without it vLLM sends none in a
+            # stream, so `chunk_tokens` falls through to counting SSE frames
+            # and the streamed tok/s column rests on one frame being one
+            # token. Measured here 2026-09-11 against a live Qwen3-1.7B at
+            # concurrency 1, that coincidence HOLDS exactly -- 64 frames, 64
+            # completion tokens -- so this is not the explanation for the
+            # 255-vs-273 and 349-vs-409 gaps in TODO.md's TP/PP table, and
+            # that gap remains unexplained.
+            #
+            # Worth asking for anyway: the column stops depending on a
+            # coincidence nobody is checking, and it stops being one that
+            # speculative decoding breaks by construction, since a verify step
+            # settles k+1 positions and nothing says they arrive as k+1
+            # frames. The final usage frame carries no delta, so nothing
+            # downstream changes -- `chunk_tokens` already prefers
+            # usage.completion_tokens when it is there.
+            body["stream_options"] = {"include_usage": True}
         return body
     if model.modality == "embedding":
         return {"model": model.id, "input": prompt}

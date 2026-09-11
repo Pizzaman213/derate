@@ -109,6 +109,11 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 LOG_MAX_BYTES = 32 * 1024 * 1024
 LOG_BACKUPS = 3
 
+#: Cap on how much of the live file :func:`tail` reads, regardless of
+#: ``limit`` -- what keeps a 32 MiB file (or one pathological line with no
+#: newlines in it) from being read whole just to answer "the last 500 lines".
+TAIL_MAX_BYTES = 2 * 1024 * 1024
+
 
 def _env_flag(name: str, default: bool, env: Mapping[str, str]) -> bool:
     raw = env.get(name)
@@ -280,3 +285,68 @@ def paths(env: Mapping[str, str] | None = None) -> dict[str, Path]:
     """Where the two files are, whether or not anything is installed."""
     folder = logs_dir(os.environ if env is None else env)
     return {"dir": folder, "node": folder / NODE_LOG, "proxy": folder / PROXY_LOG}
+
+
+def tail(
+    which: str,
+    *,
+    limit: int = 500,
+    max_bytes: int = TAIL_MAX_BYTES,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """The last *limit* lines of ``node.log`` or ``proxy.log``. Never raises.
+
+    Reads only the live file -- not its rotated ``.1``/``.2``/``.3`` backups
+    -- and only the last *max_bytes* of it, via one seek from the end, so a
+    caller asking for the last 500 lines never pays for reading the full
+    32 MiB the file is allowed to grow to. ``truncated: True`` means the byte
+    cap was hit before *limit* lines were found -- there may be more history
+    in the file than this read could reach.
+
+    *which* must be ``"node"`` or ``"proxy"``; anything else is a programmer
+    error, not a value that can arrive off the wire, so it raises rather than
+    degrading like the rest of this function does.
+    """
+    if which not in ("node", "proxy"):
+        raise ValueError(f"which must be 'node' or 'proxy', not {which!r}")
+    path = paths(env)[which]
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            offset = max(0, size - max_bytes)
+            f.seek(offset)
+            raw = f.read()
+    except FileNotFoundError:
+        return {
+            "lines": [],
+            "path": str(path),
+            "truncated": False,
+            "available": False,
+            "reason": f"No {path.name} yet on this machine.",
+        }
+    except OSError as exc:
+        log.warning("could not read %s (%s)", path, exc)
+        return {
+            "lines": [],
+            "path": str(path),
+            "truncated": False,
+            "available": False,
+            "reason": f"{path.name} could not be read: {exc}.",
+        }
+
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.split("\n")
+    if offset > 0:
+        # The seek almost certainly landed mid-line; that leading fragment is
+        # not a real line and would otherwise be mistaken for the oldest one.
+        lines = lines[1:]
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    kept = lines[-limit:]
+    return {
+        "lines": kept,
+        "path": str(path),
+        "truncated": offset > 0 and len(lines) <= limit,
+        "available": True,
+        "reason": None,
+    }

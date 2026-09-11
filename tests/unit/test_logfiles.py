@@ -290,6 +290,62 @@ class TestBounded:
         assert handler.backupCount == logfiles.LOG_BACKUPS
 
 
+# -- reading a tail back -------------------------------------------------
+
+
+class TestTail:
+    def test_a_missing_file_is_unavailable_not_an_error(self, tmp_path):
+        result = logfiles.tail("node", env={"DERATE_LOG_DIR": str(tmp_path)})
+        assert result == {
+            "lines": [],
+            "path": str(tmp_path / logfiles.NODE_LOG),
+            "truncated": False,
+            "available": False,
+            "reason": f"No {logfiles.NODE_LOG} yet on this machine.",
+        }
+
+    def test_fewer_lines_than_the_limit_come_back_whole(self, tmp_path):
+        (tmp_path / logfiles.NODE_LOG).write_text("a\nb\nc\n", encoding="utf-8")
+        result = logfiles.tail("node", limit=10, env={"DERATE_LOG_DIR": str(tmp_path)})
+        assert result["lines"] == ["a", "b", "c"]
+        assert result["available"] is True
+        assert result["truncated"] is False
+
+    def test_more_lines_than_the_limit_keeps_only_the_newest(self, tmp_path):
+        (tmp_path / logfiles.NODE_LOG).write_text(
+            "\n".join(f"line {i}" for i in range(100)) + "\n", encoding="utf-8"
+        )
+        result = logfiles.tail("node", limit=3, env={"DERATE_LOG_DIR": str(tmp_path)})
+        assert result["lines"] == ["line 97", "line 98", "line 99"]
+        # There was more file than this asked for, but the byte cap was never
+        # touched -- the two truncation reasons must not be conflated.
+        assert result["truncated"] is False
+
+    def test_a_file_bigger_than_max_bytes_is_read_bounded_and_says_so(self, tmp_path):
+        lines = [f"line {i:05d} of a large file" for i in range(20000)]
+        whole = "\n".join(lines) + "\n"
+        (tmp_path / logfiles.PROXY_LOG).write_text(whole, encoding="utf-8")
+        max_bytes = 4096
+        result = logfiles.tail(
+            "proxy", limit=500, max_bytes=max_bytes, env={"DERATE_LOG_DIR": str(tmp_path)}
+        )
+        # Ground truth computed on the whole file, so the bounded read's
+        # partial-leading-line handling is checked against a real split
+        # rather than trusted blind.
+        expected = whole.split("\n")
+        if expected and expected[-1] == "":
+            expected = expected[:-1]
+        # The byte cap left fewer lines available than the 500 asked for --
+        # that shortfall is exactly what "truncated" reports.
+        assert 0 < len(result["lines"]) < 500
+        assert result["lines"] == expected[-len(result["lines"]):]
+        assert result["truncated"] is True
+
+    def test_which_must_be_node_or_proxy(self, tmp_path):
+        with pytest.raises(ValueError):
+            logfiles.tail("bogus", env={"DERATE_LOG_DIR": str(tmp_path)})
+
+
 # -- the worker path stays light ---------------------------------------------
 
 

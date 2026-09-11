@@ -57,7 +57,91 @@ def _taskset(cores: str) -> list[str]:
 # loop, which then answers nothing at 0% CPU while still being alive. That is
 # the harness wedging its own subject and then reporting it as a gateway
 # failure, and it is exactly the class of lie this harness exists to catch.
-LOG_DIR = os.environ.get("DERATE_LOAD_LOGS") or tempfile.mkdtemp(prefix="derate-load-logs-")
+#: The prefix `log_dir()` names its directory with, and the one the sweep
+#: below matches. One string, so a rename cannot leave the sweep hunting for
+#: the old spelling.
+LOG_DIR_PREFIX = "derate-load-logs-"
+
+_log_dir: str | None = None
+
+
+def log_dir() -> str:
+    """Where subprocess logs go, created on FIRST USE rather than at import.
+
+    This was a module-level ``tempfile.mkdtemp`` and that is where the stray
+    directories came from. ``tests/unit/test_load.py`` imports this module, and
+    pytest imports every test module during collection -- so ``pytest -m "not
+    slow"``, which deselects every load test without running one, still left a
+    fresh empty directory behind on every single run. Measured on this box: 96
+    directories, 92 of them empty. Killed runs were blamed for it; collection
+    was doing most of it.
+
+    Deferring the mkdtemp to the first ``Proc`` means a run that never starts a
+    process never makes a directory, which is the honest behaviour and removes
+    the leak at its source rather than sweeping after it.
+    """
+    global _log_dir
+    if _log_dir is None:
+        _log_dir = os.environ.get("DERATE_LOAD_LOGS") or tempfile.mkdtemp(
+            prefix=LOG_DIR_PREFIX
+        )
+    return _log_dir
+
+#: How old a stray directory must be before the sweep will touch it. Generous
+#: on purpose: another harness may be running on this box right now, and its
+#: directory is empty for the moment between mkdtemp and the first Proc.start.
+STALE_LOG_DIR_AGE_S = 3600.0
+
+
+def sweep_stale_log_dirs(*, now: float | None = None) -> list[str]:
+    """Remove EMPTY `derate-load-logs-*` directories left by killed runs.
+
+    :func:`log_dir` creates with no cleanup: a run killed before its teardown
+    -- which is most of the interesting ones, since wedging the subject is
+    what this harness exists to catch -- leaves its directory behind for ever.
+    The import-time leak this module used to have is fixed above; this clears
+    what both causes already left on disk.
+
+    Three rules, each load-bearing:
+
+    * **Empty only.** A directory with files in it is the log tail of a run
+      that died, which is evidence somebody may still want. The four non-empty
+      ones here are exactly that.
+    * **`os.rmdir`, never `shutil.rmtree`.** If a concurrent harness writes
+      into a directory between the listdir and the call, rmdir fails
+      harmlessly where rmtree would delete a live run's logs.
+    * **Never raises.** A permission error, a directory that vanished under
+      us, or a `/tmp` that is not there at all must not fail a load run that
+      was only ever asking for somewhere to put a log file.
+
+    Returns the paths actually removed, so a caller can say what it did.
+    """
+    now = time.time() if now is None else now
+    parent = tempfile.gettempdir()
+    mine = os.path.abspath(_log_dir) if _log_dir is not None else None
+    removed: list[str] = []
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return removed
+    for name in names:
+        if not name.startswith(LOG_DIR_PREFIX):
+            continue
+        path = os.path.join(parent, name)
+        if mine is not None and os.path.abspath(path) == mine:
+            continue  # this run's own directory, which is legitimately empty
+        try:
+            if not os.path.isdir(path):
+                continue
+            if os.listdir(path):
+                continue  # holds evidence from a killed run
+            if now - os.stat(path).st_mtime < STALE_LOG_DIR_AGE_S:
+                continue  # may belong to a harness running right now
+            os.rmdir(path)
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
 
 
 class Proc:
@@ -65,7 +149,7 @@ class Proc:
         self.name = name
         self.argv = _taskset(cores) + argv
         self.popen: subprocess.Popen | None = None
-        self.log_path = os.path.join(LOG_DIR, f"{name}.log")
+        self.log_path = os.path.join(log_dir(), f"{name}.log")
         self._log = None
 
     def start(self) -> None:
@@ -125,6 +209,13 @@ class Cluster:
         self.max_seqs = max_seqs
         self.backend_procs: list[Proc] = []
         self.gateway_proc: Proc | None = None
+        # A run beginning is the one moment it is safe to clear what previous
+        # runs abandoned: nothing is measuring yet, so the syscalls cost
+        # nothing that would land in a result. Deliberately not at import
+        # time -- `pytest -m "not slow"` imports test_load.py just to deselect
+        # it, and deleting files during collection is not something a
+        # deselected test should do.
+        sweep_stale_log_dirs()
         self.client = httpx.Client(timeout=30.0)
         # Control-plane calls get their own short timeout so a saturated
         # component fails fast and visibly instead of hanging the harness.
