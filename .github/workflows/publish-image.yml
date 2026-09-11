@@ -39,6 +39,27 @@
 # `verify` is the better half of why dev is on the list: the check now runs on
 # the branch the work is on, instead of first reporting on main, where a red
 # suite is already merged.
+#
+# `verify` used to build the UI and run its checks against nothing -- no
+# coordinator was ever listening, so every verifier that needs one
+# (registry, rows, voices, allowlist, the browser-driven screens) skipped
+# silently instead of running. It now boots a real, isolated coordinator
+# first (ports 18080/18081, a throwaway data dir -- never :8080/:8088, which
+# a real node might be using) and runs `npm run check -- --strict`, which
+# turns a forgotten wire-up back into a red build. A new route-smoke step
+# drives every method+path `control_plane/contracts/routes.json` declares
+# against that same coordinator and fails on a 5xx -- the one thing nothing
+# else in this workflow sends a real HTTP request to check.
+#
+# Neither of those needs a GPU or `sparkrun`: they prove the gateway's own
+# surface still answers, not that a launch still works. Proving a real
+# launch still works -- sparkrun, docker, vLLM, a real generated token --
+# needs actual GPU hardware this workflow does not have and deliberately
+# does not reach for with a self-hosted runner (a public repo's own risk).
+# tests/unit/test_gateway.py::test_a_real_tiny_model_launches_and_answers
+# does that check; it stays a `slow`-marked manual run against a real
+# coordinator (DERATE_E2E_ORIGIN), the same way the TTS/Whisper round trip
+# already does, rather than a gate on this file.
 name: publish image
 
 on:
@@ -102,6 +123,38 @@ jobs:
         working-directory: ui
         run: npm run build
 
+      # screens.check.mjs drives "the Chromium already in the Playwright
+      # cache" -- true on a machine that has run `npm run screens` before,
+      # never true on a fresh runner.
+      - name: Install Playwright browser
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      # Isolated on purpose: 18080/18081, never 8080/8088, so this can never
+      # collide with a real node. DERATE_ROLE is left unset -- the same
+      # ~3s-mDNS-timeout-then-self-promote role resolution a lone real node
+      # already goes through (control_plane/registry/bootstrap.py) -- and
+      # DERATE_UI_DIR points at the dist this job just built, so the
+      # verifiers below see the UI this push would actually ship.
+      - name: Start coordinator
+        run: |
+          set -e
+          DERATE_ROLE=auto DERATE_PORT=18080 DERATE_AGENT_PORT=18081 \
+            DERATE_DATA_DIR="$RUNNER_TEMP/derate-ci-data" \
+            DERATE_UI_DIR="$GITHUB_WORKSPACE/ui/dist" \
+            nohup python3 -m control_plane.node > "$RUNNER_TEMP/coordinator.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/coordinator.pid"
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:18080/v1/models > /dev/null; then
+              echo "coordinator up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "coordinator never came up:"
+          cat "$RUNNER_TEMP/coordinator.log"
+          exit 1
+
       # There is no UI test runner. The *.check.mjs verifiers ARE the UI's
       # test suite, and each exists because a class of bug is invisible to
       # types: the URL scheme, the graph layout, the quantization ladder, the
@@ -113,12 +166,27 @@ jobs:
       # live coordinator and was not on the list.
       #
       # Both now live in ui/check.mjs, which reads each file's `// requires:`
-      # line, probes once, and reports a skip as a skip. A runner has no
-      # coordinator, no captured fixtures and no browser, so those verifiers
-      # skip here and are named in the output rather than counted as passes.
+      # line, probes once, and reports a skip as a skip. A coordinator is up
+      # and a browser is installed above, so --strict turns any remaining
+      # skip into a failure instead of a silent pass.
       - name: Verifiers
         working-directory: ui
-        run: npm run check
+        env:
+          DERATE_CHECK_ORIGIN: http://localhost:18080
+        run: npm run check -- --strict
+
+      # Every method+path control_plane/contracts/routes.json declares,
+      # fired at the coordinator started above. A liveness check, not a
+      # correctness check -- a 404 on a made-up resource id is the right
+      # answer; only a 5xx fails. See tests/unit/test_route_smoke.py.
+      - name: API route smoke test
+        env:
+          DERATE_E2E_ORIGIN: http://localhost:18080
+        run: python -m pytest -q -m slow tests/unit/test_route_smoke.py
+
+      - name: Stop coordinator
+        if: always()
+        run: kill "$(cat "$RUNNER_TEMP/coordinator.pid")" 2>/dev/null || true
 
   publish:
     needs: verify

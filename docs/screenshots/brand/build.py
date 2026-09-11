@@ -2,10 +2,13 @@
 
     python3 docs/screenshots/brand/build.py
 
-Writes four files: the bare lockup (`derate-lockup{,-dark}.svg`) and the banner
-the README heads with (`derate-banner{,-dark}.svg`), which is the same lockup on
-a field of the app's own panel colour with the project's one-line claim under
-it. Needs fonttools (with brotli, for woff2) and `cd ui && npm install`, which
+Writes six files: the bare lockup (`derate-lockup{,-dark}.svg`), the banner the
+README heads with (`derate-banner{,-dark}.svg`), and a 16:9 card
+(`derate-card{,-dark}.svg`) for contexts that want the mark on a fixed-ratio
+field rather than a width-driven strip -- a social preview, a slide, a repo
+thumbnail. All three are the same lockup on a field of the app's own panel
+colour; the banner adds the project's one-line claim under it, the card does
+not. Needs fonttools (with brotli, for woff2) and `cd ui && npm install`, which
 is where the IBM Plex Sans files come from. Takes no arguments.
 
 Everything here is a COPY of something that lives elsewhere -- the monogram is
@@ -366,8 +369,34 @@ for suffix, theme in THEMES.items():
         )
     )
 
+# --- the 16:9 card ----------------------------------------------------------
+CARD_W = 1600.0
+CARD_H = CARD_W * 9 / 16
+CARD_INK_W = 640.0          # the lockup's ink width on the card: 40% of CARD_W
+CARD_RADIUS = 24.0
+
+card_scale = CARD_INK_W / LOCK_W
+card_logo_h = LOCK_H * card_scale
+card_x = (CARD_W - CARD_INK_W) / 2
+card_y = (CARD_H - card_logo_h) / 2
+
+for suffix, theme in THEMES.items():
+    (HERE / f"derate-card{suffix}.svg").write_text(
+        svg(
+            CARD_W,
+            CARD_H,
+            f'<rect width="{CARD_W}" height="{CARD_H}" rx="{CARD_RADIUS}"'
+            f' fill="{theme["panel"]}"/>'
+            + lockup(theme["ink"], card_x, card_y, card_scale,
+                     pulse=theme["flow"]),
+            TEXT,
+            head=REDUCED_MOTION,
+        )
+    )
+
 print(f"lockup  {LOCK_W + 2 * PAD:.2f} x {LOCK_H + 2 * PAD:.2f}")
 print(f"banner  {BANNER_W:.0f} x {BANNER_H:.2f}, logo scale {logo_scale:.3f}")
+print(f"card    {CARD_W:.0f} x {CARD_H:.2f}, logo scale {card_scale:.3f}")
 print(f"derived gap {gap_em:.4f} em, mark centre {centre_em:.4f} em from the baseline")
 for name in sorted(p.name for p in HERE.glob("derate-*.svg")):
     print(f"  wrote {name}")
