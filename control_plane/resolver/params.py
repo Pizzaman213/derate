@@ -155,8 +155,23 @@ def analytic_breakdown(m: Mapped, vision_cfg: dict[str, Any] | None = None) -> P
     layers = m.num_layers
     b = ParamBreakdown()
 
-    b.embedding = m.vocab_size * hidden
-    b.lm_head = 0 if m.tie_word_embeddings else m.vocab_size * hidden
+    if m.draft_vocab_size:
+        # A speculative-decoding head, not a model. It reads the target's
+        # embedding rather than carrying one, and its output head covers only
+        # its own reduced vocabulary -- which is the whole reason a head is
+        # cheap enough to be worth running.
+        #
+        # Both halves are measured rather than assumed.
+        # `AngelSlim/Qwen3-4B_eagle3` (1 layer, hidden 2560, vocab 151936,
+        # draft_vocab 32000) reports 218,429,056 parameters on the hub. One
+        # layer plus a 32000-row head is 218M; add the target's embedding and
+        # it would be 607M, add a full-vocab head as well and 778M. Only the
+        # first reading matches the shards.
+        b.embedding = 0
+        b.lm_head = m.draft_vocab_size * hidden
+    else:
+        b.embedding = m.vocab_size * hidden
+        b.lm_head = 0 if m.tie_word_embeddings else m.vocab_size * hidden
     b.attention = layers * attention_params_per_layer(m)
     b.norms = layers * 2 * hidden + hidden
 
@@ -207,6 +222,11 @@ class ParamAccounting:
     vision_params: int
     breakdown: ParamBreakdown
     warnings: list[str]
+    #: Routed expert parameters, capped against the measured total the same way
+    #: the active-parameter split caps them -- one value, computed once, used
+    #: for both. The fit gate divides these by the expert-parallel degree; 0
+    #: means they could not be sized, and the gate then charges them whole.
+    routed_expert_params: int = 0
 
 
 def reconcile(
@@ -251,6 +271,11 @@ def reconcile(
         )
 
     active: int | None = None
+    # Computed once and used twice: it decides the active-parameter split
+    # below, and it is what the fit gate divides by the expert-parallel
+    # degree. Two derivations of "how much of this checkpoint is routed
+    # experts" would be two answers that can disagree.
+    routed = 0
     if m.is_moe:
         # Kimi K2 is 98.9 percent routed experts, so the cap that stops a
         # nonsense split has to sit above that.
@@ -274,4 +299,5 @@ def reconcile(
         vision_params=int(breakdown.vision),
         breakdown=breakdown,
         warnings=warnings,
+        routed_expert_params=int(max(0, routed)),
     )

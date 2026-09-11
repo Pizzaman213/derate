@@ -179,6 +179,7 @@ class FakeDeployments:
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
         modality=Modality.TEXT, extra_args=(), custom_command=(),
+        enforce_eager=False, cudagraph_capture_sizes=None, kv_dtype=None,
     ):
         if extra_args and custom_command:
             raise ValueError(
@@ -195,6 +196,11 @@ class FakeDeployments:
             max_concurrent_seqs=max_seqs,
             extra_args=tuple(extra_args),
             custom_command=tuple(custom_command),
+            # Recorded because the route's whole job for this field is to
+            # forward it: the fit gate has already sized the cache at this
+            # width, and a fake that swallowed it would let the route pass a
+            # test for behaviour it does not have.
+            kv_dtype=kv_dtype,
         )
         self.launched.append(dep)
         self.deployments.append(dep)
@@ -278,6 +284,8 @@ def make_deployment(
     modality=Modality.TEXT,
     extra_args=(),
     custom_command=(),
+    kv_dtype=None,
+    serving=True,
 ) -> Deployment:
     fit = fits()
     fit.predicted_decode_tps = predicted_tps
@@ -303,7 +311,89 @@ def make_deployment(
         modality=modality,
         extra_args=tuple(extra_args),
         custom_command=tuple(custom_command),
+        kv_dtype=kv_dtype,
+        serving=serving,
     )
+
+
+class TestADeploymentCanBeTakenOffTheApiWithoutStoppingIt:
+    """The provider allowlist's missing twin.
+
+    A provider model is switched off by editing `enabled_models`, and
+    `ProviderService.servable()` feeds `build_index`, so `/v1/models`, routing,
+    the chat picker and the topology graph all change together with no restart.
+    A deployment had no equivalent: the only off switch was DELETE, which kills
+    the container.
+
+    `Deployment.serving` is that switch, and `build_index` is the one seam --
+    the same line `provider.enabled` is checked on. The container keeps running
+    and keeps holding its GPU memory, which is the whole difference from a stop
+    and is why every surface that draws it says so.
+    """
+
+    def _index(self, *deployments):
+        from control_plane.gateway.stats import StatsRegistry
+        from control_plane.gateway.targets import build_index
+
+        return build_index(
+            list(deployments),
+            [],
+            [],
+            StatsRegistry(),
+            GatewaySettings(),
+            lambda _tid: False,
+        )
+
+    def test_a_serving_deployment_is_a_route(self):
+        dep = make_deployment("d1", "llama", backend_url="http://127.0.0.1:8001/v1")
+        index = self._index(dep)
+        assert [t.target_id for t in index.targets["llama"]] == ["d1"]
+
+    def test_a_switched_off_deployment_is_not_a_route(self):
+        dep = make_deployment(
+            "d1", "llama", backend_url="http://127.0.0.1:8001/v1", serving=False
+        )
+        index = self._index(dep)
+        assert "llama" not in index.targets
+
+    def test_it_is_still_recorded_as_existing(self):
+        """`pending` is what a 503 body reads. The deployment has not gone --
+        it is up, holding its memory, and deliberately unreachable, and an
+        answer of "no such model" would be untrue."""
+        dep = make_deployment(
+            "d1", "llama", backend_url="http://127.0.0.1:8001/v1", serving=False
+        )
+        index = self._index(dep)
+        assert [d.deployment_id for d in index.pending["llama"]] == ["d1"]
+
+    def test_switching_one_off_leaves_its_siblings_routable(self):
+        on = make_deployment("d1", "llama", backend_url="http://127.0.0.1:8001/v1")
+        off = make_deployment(
+            "d2", "llama", backend_url="http://127.0.0.1:8002/v1", serving=False
+        )
+        index = self._index(on, off)
+        assert [t.target_id for t in index.targets["llama"]] == ["d1"]
+
+    def test_the_flag_survives_a_store_round_trip(self):
+        """It has to be DURABLE. `admission.py`'s blocks are in-memory and
+        `reconcile()` re-derives them twice a second, so a switch held there
+        would come back on the next restart."""
+        from control_plane.deploy.store import decode, encode
+
+        dep = make_deployment(
+            "d1", "llama", backend_url="http://127.0.0.1:8001/v1", serving=False
+        )
+        assert decode(encode(dep)).serving is False
+
+    def test_a_record_written_before_the_field_existed_is_on_the_api(self):
+        """Defaulting the absence to False would silently take every
+        pre-upgrade deployment off `/v1/models`."""
+        from control_plane.deploy.store import decode, encode
+
+        dep = make_deployment("d1", "llama", backend_url="http://127.0.0.1:8001/v1")
+        raw = encode(dep)
+        raw.pop("serving")
+        assert decode(raw).serving is True
 
 
 def make_provider(
@@ -1330,10 +1420,10 @@ def test_a_provider_logo_is_served_by_the_coordinator(monkeypatch, tmp_path):
     fetches and this route serves, rather than the page reaching out."""
     app, seen = _logo_app(monkeypatch, tmp_path)
     with TestClient(app) as client:
-        # Cold: an immediate 404 while the fetch is kicked off behind it. A
+        # Cold: an immediate 204 while the fetch is kicked off behind it. A
         # screen never waits on a picture.
         first = client.get("/api/providers/openrouter/logo")
-        assert first.status_code == 404
+        assert first.status_code == 204
         for _ in range(50):
             reply = client.get("/api/providers/openrouter/logo")
             if reply.status_code == 200:
@@ -1346,18 +1436,48 @@ def test_a_provider_logo_is_served_by_the_coordinator(monkeypatch, tmp_path):
     assert seen == ["openrouter"], "one fetch, not one per request"
 
 
-def test_a_provider_with_no_mark_stays_a_404_and_is_not_refetched(monkeypatch, tmp_path):
-    """404 is an ordinary answer here: the Cluster tab draws a monogram tile
-    underneath, so a miss is simply never painted over. Without the negative
-    cache it would also be a network request per repaint."""
+def test_a_provider_with_no_mark_stays_a_204_and_is_not_refetched(monkeypatch, tmp_path):
+    """204 is the ordinary answer here: the provider is real, there is just
+    nothing to paint, and the Cluster tab draws a monogram tile underneath so
+    the miss is never painted over. Without the negative cache it would also
+    be a network request per repaint.
+
+    It was a 404 until an adopted ollama box -- a provider that has no vendor
+    mark and never will -- made `screens.check.mjs` fail on its rule that the
+    coordinator must answer everything the UI asks it."""
     app, seen = _logo_app(monkeypatch, tmp_path, body=None)
     with TestClient(app) as client:
         for _ in range(30):
             client.get("/api/providers/openrouter/logo")
             time.sleep(0.01)
         final = client.get("/api/providers/openrouter/logo")
-    assert final.status_code == 404
+    assert final.status_code == 204
     assert len(seen) == 1, f"a miss must be remembered, saw {len(seen)} fetches"
+
+
+def test_the_alerts_route_answers_empty_on_a_bare_gateway():
+    """A screen whose whole job is to be empty when things are fine must not
+    show an error when nothing is watching. An all-stub gateway has no book,
+    and "nothing is wrong" is the right answer from it -- not a 503."""
+    with TestClient(create_app(GatewayDeps())) as bare:
+        reply = bare.get("/api/alerts")
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["alerts"] == []
+    assert "observing_since" in body and "measured_at" in body
+
+
+def test_the_alerts_route_is_reachable_beneath_a_mounted_ui(tmp_path):
+    """The trap every new route has to be tested against: a StaticFiles mount
+    at "/" answers index.html for anything registered below it."""
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<!doctype html><title>derate</title>")
+    app = create_app(GatewayDeps(), settings=GatewaySettings(cluster_id="c-test", ui_dir=str(ui)))
+    with TestClient(app) as client:
+        reply = client.get("/api/alerts")
+    assert reply.status_code == 200
+    assert reply.headers["content-type"].startswith("application/json")
 
 
 def test_an_unknown_provider_logo_is_a_404_naming_the_provider(monkeypatch, tmp_path):
@@ -1371,7 +1491,11 @@ def test_an_unknown_provider_logo_is_a_404_naming_the_provider(monkeypatch, tmp_
 def test_the_logo_route_is_reachable_even_when_the_ui_is_mounted(tmp_path):
     """The trap every new route has to be tested against: a StaticFiles mount
     at "/" answers index.html for anything registered below it -- and an <img>
-    handed an HTML document renders as a broken picture, not as an error."""
+    handed an HTML document renders as a broken picture, not as an error.
+
+    204 is a stronger proof of reachability than the 404 this used to assert:
+    a static mount can return 200-with-HTML and it can miss, but it can never
+    invent a 204."""
     ui = tmp_path / "ui"
     ui.mkdir()
     (ui / "index.html").write_text("<!doctype html><title>derate</title>")
@@ -1381,8 +1505,12 @@ def test_the_logo_route_is_reachable_even_when_the_ui_is_mounted(tmp_path):
     )
     with TestClient(app) as client:
         reply = client.get("/api/providers/openrouter/logo")
-    assert reply.status_code == 404
-    assert not reply.headers["content-type"].startswith("text/html")
+    # A real provider with no mark: answered, nothing to draw.
+    assert reply.status_code == 204
+    assert reply.content == b""
+    # The point of the test: index.html would have been 200 text/html. A 204
+    # carries no body and no content-type, so there is nothing to confuse.
+    assert "text/html" not in reply.headers.get("content-type", "")
 
 
 def test_the_logo_route_declares_a_path_parameter_not_a_query_field():
@@ -1400,7 +1528,9 @@ def test_the_logo_route_answers_without_any_ports_wired():
     provider the way the rest of the surface does, not assume a richer port."""
     with TestClient(create_app(GatewayDeps())) as bare:
         reply = bare.get("/api/providers/openrouter/logo")
-    assert reply.status_code == 404
+    # Resolved, and answered "nothing to draw" -- not a 500 from reaching for
+    # a `get` the day-0 store does not have.
+    assert reply.status_code == 204
     assert reply.status_code != 500
 
 
@@ -2240,6 +2370,37 @@ def test_whisper_transcribes_what_the_tts_runtime_just_said():
         "Whisper heard %r; the words it missed from %r were %s"
         % (text, SPOKEN, sorted(said - heard))
     )
+
+
+@pytest.mark.slow
+def test_a_real_tiny_model_launches_and_answers():
+    """The cheapest possible proof that a plain text launch still works end
+    to end: fit gate, planner, sparkrun, vLLM, and a real generated token --
+    not just a deployment record that reaches "ready".
+
+    ``EleutherAI/pythia-70m`` is a real, small (~70M param) causal LM with no
+    chat template, so this goes through ``/v1/completions`` (a bare prompt
+    string) rather than ``/v1/chat/completions`` -- the point is to prove the
+    launch and the runtime work, not to depend on this checkpoint having been
+    instruction-tuned.
+    """
+    origin = _require_coordinator()
+
+    launched = _launch(origin, "EleutherAI/pythia-70m", "vllm")
+    dep = launched["deployment_id"]
+    try:
+        record = _wait_ready(origin, dep, timeout=600)
+        reply = httpx.post(origin + "/v1/completions", timeout=120, json={
+            "model": record["served_name"],
+            "prompt": "The capital of France is",
+            "max_tokens": 16,
+        })
+    finally:
+        _stop(origin, dep)
+
+    assert reply.status_code == 200, reply.text[:2000]
+    text = reply.json()["choices"][0]["text"]
+    assert text.strip(), "a 200 with no text is not a completion"
 
 
 # ---------------------------------------------------------------------------
@@ -3400,6 +3561,326 @@ def test_metrics_stream_sustains_its_cadence_to_multiple_subscribers():
         assert set(payload) == {"ts", "cluster", "nodes", "deployments", "remotes"}
         assert payload["deployments"][0]["deployment_id"] == "d-a"
         assert payload["nodes"][0]["node_id"] == "spark-01"
+
+
+def _exposition(reading, spec=None):
+    """A Prometheus body carrying what *reading* holds.
+
+    The hub fetches a body and parses it twice, so the double is a body and
+    not a parsed object -- otherwise these tests would prove the fold and skip
+    the parsing, which is where the metric names live.
+    """
+    if reading is None:
+        return None
+    lines = [
+        'vllm:prefix_cache_queries_total{engine="0"} %f' % reading.queries,
+        'vllm:prefix_cache_hits_total{engine="0"} %f' % reading.hits,
+    ]
+    if spec is not None:
+        lines += [
+            'vllm:spec_decode_num_drafts_total{engine="0"} %f' % spec.drafts,
+            'vllm:spec_decode_num_draft_tokens_total{engine="0"} %f' % spec.draft_tokens,
+            'vllm:spec_decode_num_accepted_tokens_total{engine="0"} %f'
+            % spec.accepted_tokens,
+        ]
+        for i, value in enumerate(spec.accepted_per_pos):
+            lines.append(
+                'vllm:spec_decode_num_accepted_tokens_per_pos_total'
+                '{engine="0",position="%d"} %f' % (i, value)
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _hub_with(deployments, monkeypatch, readings, specs=None):
+    """A hub whose engine scrape returns *readings* by backend url."""
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+    from control_plane import metrics_scrape
+
+    specs = specs or {}
+    monkeypatch.setattr(
+        metrics_scrape,
+        "fetch",
+        lambda url, **kw: _exposition(readings.get(url), specs.get(url)),
+    )
+    return MetricsHub(
+        registry=FakeRegistry(),
+        deployments=FakeDeployments(deployments),
+        stats=StatsRegistry(),
+        settings=GatewaySettings(),
+    )
+
+
+def test_the_prefix_cache_rate_is_a_window_not_the_engines_lifetime(monkeypatch):
+    """One read is the engine's whole life since it started. The panel asks
+    what the cache is doing now, so the first round only sets a baseline and
+    the second answers."""
+    from control_plane.metrics_scrape import PrefixCache
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    readings = {"http://a/v1": PrefixCache(queries=1000.0, hits=900.0)}
+    hub = _hub_with([dep], monkeypatch, readings)
+
+    asyncio.run(hub._sample_prefix_cache())
+    # 90% over its lifetime, and deliberately not reported: nothing has been
+    # measured over any window yet.
+    assert hub.snapshot()["cluster"]["cache_hit_pct"] is None
+
+    readings["http://a/v1"] = PrefixCache(queries=1200.0, hits=1000.0)
+    asyncio.run(hub._sample_prefix_cache())
+    # 100 hits in 200 queries since the baseline: 50%, not the 83% lifetime.
+    assert hub.snapshot()["cluster"]["cache_hit_pct"] == 50.0
+
+
+def test_an_idle_engine_has_no_hit_rate_rather_than_zero(monkeypatch):
+    """Asked nothing is not missed everything. A confident 0% on an idle
+    cluster is the fabricated number this frame's own comment forbids."""
+    from control_plane.metrics_scrape import PrefixCache
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    readings = {"http://a/v1": PrefixCache(queries=1000.0, hits=900.0)}
+    hub = _hub_with([dep], monkeypatch, readings)
+    asyncio.run(hub._sample_prefix_cache())
+    asyncio.run(hub._sample_prefix_cache())  # identical read: no traffic
+    assert hub.snapshot()["cluster"]["cache_hit_pct"] is None
+
+
+def test_an_unreachable_backend_drops_its_baseline_rather_than_bridging_it(
+    monkeypatch,
+):
+    """A backend that goes away and comes back must not have the whole outage
+    differenced into one window."""
+    from control_plane.metrics_scrape import PrefixCache
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    readings = {"http://a/v1": PrefixCache(queries=1000.0, hits=900.0)}
+    hub = _hub_with([dep], monkeypatch, readings)
+    asyncio.run(hub._sample_prefix_cache())
+
+    readings["http://a/v1"] = None  # metrics off, 404, host gone -> fetch None
+    asyncio.run(hub._sample_prefix_cache())
+    assert hub.snapshot()["cluster"]["cache_hit_pct"] is None
+    assert hub._cache_prev == {}
+
+    # Back, with a much larger lifetime total. The next round is a baseline
+    # again, not a window covering everything that happened while it was away.
+    readings["http://a/v1"] = PrefixCache(queries=90000.0, hits=80000.0)
+    asyncio.run(hub._sample_prefix_cache())
+    assert hub.snapshot()["cluster"]["cache_hit_pct"] is None
+
+
+def test_only_a_ready_vllm_is_scraped_for_a_prefix_cache(monkeypatch):
+    """sglang and tts export no such series, and a LAUNCHING backend is not
+    listening. Both would cost a connection attempt every round for nothing."""
+    from control_plane.metrics_scrape import PrefixCache
+
+    ready = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    starting = make_deployment(
+        "d-b", "llama-3.3-70b", backend_url="http://b/v1",
+        state=DeploymentState.LAUNCHING,
+    )
+    other = make_deployment("d-c", "llama-3.3-70b", backend_url="http://c/v1")
+    object.__setattr__(other, "runtime", "sglang")
+
+    asked = []
+    readings = {"http://a/v1": PrefixCache(queries=10.0, hits=5.0)}
+    hub = _hub_with([ready, starting, other], monkeypatch, readings)
+    from control_plane import metrics_scrape
+
+    def record(url, **kw):
+        asked.append(url)
+        return _exposition(readings.get(url))
+
+    monkeypatch.setattr(metrics_scrape, "fetch", record)
+    asyncio.run(hub._sample_prefix_cache())
+    assert asked == ["http://a/v1"]
+
+
+def test_engines_are_summed_across_the_cluster_not_averaged(monkeypatch):
+    """Two deployments of very different sizes: the cluster figure is one
+    ratio of totals, so the busy one dominates -- which is right. Averaging
+    the two rates would let an idle engine's 100% pull the number up."""
+    from control_plane.metrics_scrape import PrefixCache
+
+    a = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    b = make_deployment("d-b", "llama-3.3-70b", backend_url="http://b/v1")
+    readings = {
+        "http://a/v1": PrefixCache(queries=0.0, hits=0.0),
+        "http://b/v1": PrefixCache(queries=0.0, hits=0.0),
+    }
+    hub = _hub_with([a, b], monkeypatch, readings)
+    asyncio.run(hub._sample_prefix_cache())
+
+    readings["http://a/v1"] = PrefixCache(queries=1000.0, hits=100.0)
+    readings["http://b/v1"] = PrefixCache(queries=10.0, hits=10.0)
+    asyncio.run(hub._sample_prefix_cache())
+    # 110 hits in 1010 queries = 10.9%, not the mean of 10% and 100%.
+    assert hub.snapshot()["cluster"]["cache_hit_pct"] == 10.9
+
+
+# -- what the engine counted about its own speculation ----------------------
+#
+# The fit gate states a floor and a ceiling for speculative decoding and says
+# in its own sentence that the acceptance rate between them is not measured.
+# These put the ENGINE's own count of it on the frame -- beside that range,
+# never in place of it, and never as an assumed constant.
+
+
+def test_a_speculating_deployment_reports_measured_acceptance(monkeypatch):
+    from control_plane.metrics_scrape import PrefixCache, SpecDecode
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    readings = {"http://a/v1": PrefixCache(queries=0.0, hits=0.0)}
+    specs = {"http://a/v1": SpecDecode()}
+    hub = _hub_with([dep], monkeypatch, readings, specs)
+    asyncio.run(hub._sample_prefix_cache())
+    assert hub.snapshot()["deployments"][0]["speculative"] is None, "baseline only"
+
+    # 100 draft rounds at k=3: position 0 landed 80 times, 1 fifty, 2 twenty.
+    specs["http://a/v1"] = SpecDecode(
+        drafts=100.0, draft_tokens=300.0, accepted_tokens=150.0,
+        accepted_per_pos=[80.0, 50.0, 20.0],
+    )
+    asyncio.run(hub._sample_prefix_cache())
+
+    spec = hub.snapshot()["deployments"][0]["speculative"]
+    assert spec["drafts"] == 100
+    assert spec["draft_tokens"] == 300
+    assert spec["accepted_tokens"] == 150
+    # 150 of 300 proposed tokens were kept.
+    assert spec["acceptance"] == 0.5
+    # vLLM's own definition: the per-position series over num_drafts, and
+    # CUMULATIVE -- position 2 is only checked when 1 was accepted first.
+    assert spec["acceptance_per_pos"] == [0.8, 0.5, 0.2]
+    # The figure that maps onto a speedup: 1.5 drafted tokens settle per step.
+    assert spec["accepted_per_step"] == 1.5
+
+
+def test_the_frame_carries_what_a_real_engine_really_counted(monkeypatch):
+    """The whole path, on numbers nobody composed.
+
+    `tests/fixtures/vllm_ngram_spec_real.txt` was scraped off a vLLM this
+    project launched with ngram at k=10 and drove with a repetitive prompt.
+    Feeding it through the hub must produce exactly the block the deployment
+    sheet drew: 73.3% kept, 7.33 drafted tokens settling per step, and the
+    real cumulative curve 0.89 -> 0.78 -> 0.67.
+
+    The first read is a cold engine, so the window IS the fixture's totals --
+    which is what makes the assertion readable while still exercising the
+    difference.
+    """
+    from pathlib import Path
+    from control_plane import metrics_scrape
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+
+    body = (
+        Path(__file__).resolve().parents[1] / "fixtures" / "vllm_ngram_spec_real.txt"
+    ).read_text()
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    bodies = iter(["", body])
+    monkeypatch.setattr(metrics_scrape, "fetch", lambda url, **kw: next(bodies))
+    hub = MetricsHub(
+        registry=FakeRegistry(),
+        deployments=FakeDeployments([dep]),
+        stats=StatsRegistry(),
+        settings=GatewaySettings(),
+    )
+
+    asyncio.run(hub._sample_prefix_cache())
+    assert hub.snapshot()["deployments"][0]["speculative"] is None
+
+    asyncio.run(hub._sample_prefix_cache())
+    spec = hub.snapshot()["deployments"][0]["speculative"]
+    assert spec["drafts"] == 747
+    assert spec["draft_tokens"] == 7470
+    assert spec["accepted_tokens"] == 5478
+    assert spec["acceptance"] == 0.7333
+    assert spec["accepted_per_step"] == 7.3333
+    assert spec["acceptance_per_pos"] == [
+        0.8889, 0.7778, 0.7778, 0.7778, 0.7778,
+        0.6667, 0.6667, 0.6667, 0.6667, 0.6667,
+    ]
+
+
+def test_a_deployment_that_drafted_nothing_has_no_acceptance_rate(monkeypatch):
+    """Most deployments run no draft head, and their series read zero. An
+    acceptance rate for a model that never drafted is not 0%, it is not a
+    thing -- and the card has to keep saying the rate is unmeasured."""
+    from control_plane.metrics_scrape import PrefixCache, SpecDecode
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    readings = {"http://a/v1": PrefixCache(queries=0.0, hits=0.0)}
+    specs = {"http://a/v1": SpecDecode()}
+    hub = _hub_with([dep], monkeypatch, readings, specs)
+    asyncio.run(hub._sample_prefix_cache())
+    asyncio.run(hub._sample_prefix_cache())
+    assert hub.snapshot()["deployments"][0]["speculative"] is None
+
+
+def test_acceptance_is_a_window_not_the_engines_whole_life(monkeypatch):
+    """Same rule as the prefix cache: these counters are cumulative, so a
+    single read is the engine's lifetime and answers the wrong question."""
+    from control_plane.metrics_scrape import PrefixCache, SpecDecode
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    readings = {"http://a/v1": PrefixCache(queries=0.0, hits=0.0)}
+    # A long, excellent history: 900 of 1000 proposed tokens accepted.
+    specs = {"http://a/v1": SpecDecode(
+        drafts=1000.0, draft_tokens=1000.0, accepted_tokens=900.0,
+        accepted_per_pos=[900.0],
+    )}
+    hub = _hub_with([dep], monkeypatch, readings, specs)
+    asyncio.run(hub._sample_prefix_cache())
+
+    # ...and a bad recent window: 10 more drafts, 1 accepted.
+    specs["http://a/v1"] = SpecDecode(
+        drafts=1010.0, draft_tokens=1010.0, accepted_tokens=901.0,
+        accepted_per_pos=[901.0],
+    )
+    asyncio.run(hub._sample_prefix_cache())
+    spec = hub.snapshot()["deployments"][0]["speculative"]
+    # 0.1 for the window, not the 0.89 lifetime figure.
+    assert spec["acceptance"] == 0.1
+
+
+def test_a_per_position_series_that_does_not_add_up_is_not_reported(monkeypatch):
+    """Read mid-update, or an image that changed shape. Either way it is not
+    a number to put on a screen."""
+    from control_plane.metrics_scrape import PrefixCache, SpecDecode
+
+    dep = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    readings = {"http://a/v1": PrefixCache(queries=0.0, hits=0.0)}
+    specs = {"http://a/v1": SpecDecode()}
+    hub = _hub_with([dep], monkeypatch, readings, specs)
+    asyncio.run(hub._sample_prefix_cache())
+
+    specs["http://a/v1"] = SpecDecode(
+        drafts=100.0, draft_tokens=300.0, accepted_tokens=150.0,
+        accepted_per_pos=[10.0, 5.0],  # sums to 15, not 150
+    )
+    asyncio.run(hub._sample_prefix_cache())
+    assert hub.snapshot()["deployments"][0]["speculative"] is None
+
+
+def test_a_remote_target_carries_the_speculative_key_as_null(monkeypatch):
+    """One reader draws a remote band and a local one, so the two payloads
+    carry the same names. We cannot scrape somebody else's engine, and "no
+    reading" is the honest answer -- not a missing key."""
+    from control_plane.gateway.metrics import MetricsHub
+    from control_plane.gateway.stats import StatsRegistry
+
+    stats = StatsRegistry()
+    stats.get("openrouter:qwen/qwen3-30b-a3b").complete(tokens=40, duration_s=1.0)
+    hub = MetricsHub(
+        registry=FakeRegistry(),
+        deployments=FakeDeployments(),
+        stats=stats,
+        settings=GatewaySettings(),
+        providers=FakeProviders([make_provider()]),
+    )
+    assert hub.snapshot()["remotes"][0]["speculative"] is None
 
 
 def test_a_provider_model_reports_throughput_on_the_same_frame_as_a_deployment():
@@ -4599,7 +5080,7 @@ def test_create_deployment_maps_a_launch_value_error_to_400():
     """M-11: a launch-time input validation error is a 400, not a 502."""
 
     class RejectingDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=()):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), enforce_eager=False, cudagraph_capture_sizes=None):
             raise ValueError("model id is not a safe command argument")
 
     deployments = RejectingDeployments()
@@ -4632,7 +5113,7 @@ def test_a_launch_onto_a_node_already_running_the_model_is_a_409():
     )
 
     class OccupiedDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=()):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), enforce_eager=False, cudagraph_capture_sizes=None):
             raise DuplicateDeployment(running, clash="model")
 
     deps = build_deps(deployments=OccupiedDeployments())
@@ -4660,7 +5141,7 @@ def test_a_launch_that_really_did_fail_is_still_a_502():
     """The 409 is keyed on the conflict, not on any exception reaching here."""
 
     class BrokenDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=()):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), enforce_eager=False, cudagraph_capture_sizes=None):
             raise RuntimeError("sparkrun exited 1")
 
     deps = build_deps(deployments=BrokenDeployments())
@@ -5209,6 +5690,107 @@ def test_link_measure_returns_503_when_every_rung_fails():
     assert "spark-02" in reply.json()["error"]["message"]
 
 
+# ---- the interconnect tuning, on the wire -----------------------------------
+
+
+def test_a_link_carries_its_tuning_and_whether_a_probe_is_running(tmp_path, monkeypatch):
+    """Both fields ride `_links_for`, which feeds /api/cluster, /api/topology
+    AND /api/links -- so the screen sees the same answer wherever it looks.
+
+    `measuring` is the one `LinkService.measuring()` has existed for since it
+    was written (`links/README.md`: "so the screen can say a measurement is
+    running") and which nothing had ever read. Survivable at thirty seconds a
+    probe; a calibration is minutes.
+    """
+    from control_plane import measurements as M
+
+    records = tmp_path / "nccl"
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: records)
+    image = "ghcr.io/pizzaman213/derate/vllm-audio:latest"
+    for env, decode_us, bulk in (({}, 17.7, 8.1), ({"NCCL_MAX_NCHANNELS": "2"}, 17.4, 17.7)):
+        for size, us, bw in ((M.DECODE_COLLECTIVE_BYTES, decode_us, 0.3),
+                             (M.BULK_COLLECTIVE_BYTES, 1.0, bulk)):
+            M.save_nccl(M.NcclRecord(
+                src="spark-01", dst="spark-02", nccl_version="2.31.2", image=image,
+                size_band=M.band(size), microseconds=us, busbw_gbps=bw,
+                env=env, measured_at=1.0,
+            ))
+
+    class BusyLinks(StubLinks):
+        def measuring(self):
+            return [("spark-01", "spark-02")]
+
+    deps = build_deps()
+    deps.links = BusyLinks()
+    with TestClient(create_app(deps)) as client:
+        links = client.get("/api/links").json()
+
+    pair = next(l for l in links if {l["src"], l["dst"]} == {"spark-01", "spark-02"})
+    assert pair["measuring"] is True
+    assert pair["tuning"]["calibrated"] is True
+    assert pair["tuning"]["env"] == {"NCCL_MAX_NCHANNELS": "2"}
+    # The evidence, not just the verdict: a reader has to be able to check the
+    # choice rather than trust it.
+    assert len(pair["tuning"]["rows"]) == 4
+
+
+def test_an_uncalibrated_pair_says_so_rather_than_borrowing_a_number(tmp_path, monkeypatch):
+    """`calibrated: false` with an empty env -- never another pair's setting,
+    and never a row measured under a different image."""
+    from control_plane import measurements as M
+
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: tmp_path / "empty")
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        links = client.get("/api/links").json()
+    assert links, "the default registry has three nodes, so three pairs"
+    for pair in links:
+        assert pair["tuning"] == {"calibrated": False, "env": {}, "rows": []}
+        assert pair["measuring"] is False
+
+
+def test_tune_returns_before_the_work_does(tmp_path):
+    """A calibration is one two-rank collective per candidate -- minutes. A
+    route that held the request open for that would tie up a worker, trip any
+    proxy in front, and say nothing while it waited. 202 and a thread."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowLinks(StubLinks):
+        def calibrate(self, a, b, *, image=None):
+            started.set()
+            release.wait(timeout=10)
+            return 4
+
+    deps = build_deps()
+    deps.links = SlowLinks()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/api/links/tune", json={"a": "spark-01", "b": "spark-02"})
+        assert reply.status_code == 202
+        assert reply.json()["measuring"] is True
+        assert started.wait(timeout=5), "the calibration actually started"
+        release.set()
+
+
+def test_tune_refuses_a_bad_pair_and_a_port_that_cannot_calibrate():
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        assert client.post("/api/links/tune", json={}).status_code == 400
+        assert client.post(
+            "/api/links/tune", json={"a": "spark-01", "b": "spark-01"}
+        ).status_code == 400
+
+    class NoCalibrate(StubLinks):
+        calibrate = None
+
+    deps = build_deps()
+    deps.links = NoCalibrate()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/api/links/tune", json={"a": "spark-01", "b": "spark-02"})
+    # A link port without calibration is a legal port -- the day-0 stub is one.
+    assert reply.status_code == 501
+
+
 # ---- a dtype sizes, it does not launch --------------------------------------
 #
 # `_plan_and_fit` accepts a `dtype` and hands it to the resolver as a
@@ -5239,6 +5821,17 @@ def test_plan_still_accepts_a_dtype_because_it_starts_nothing():
 
 
 def test_launch_refuses_a_dtype_that_would_size_one_model_and_start_another():
+    """A dtype this build cannot force is still refused, and for the original
+    reason.
+
+    Until 2026-09-11 EVERY dtype was refused here, because neither serve
+    command carried `--quantization` and honouring one would have budgeted
+    4-bit weights and started 16-bit ones. Both templates carry it now, so
+    the blanket refusal became wrong -- but this half of it did not: a GGUF
+    scheme is llama.cpp's format, nothing here launches one, and forcing it
+    would be exactly the size-one-start-another failure the guard was written
+    for.
+    """
     deps = build_deps()
     with TestClient(create_app(deps)) as client:
         reply = client.post(
@@ -5250,11 +5843,37 @@ def test_launch_refuses_a_dtype_that_would_size_one_model_and_start_another():
         )
     assert reply.status_code == 400
     error = reply.json()["error"]
-    assert error["code"] == "dtype_not_launchable"
-    # The message has to name the missing flag, or the reader is left thinking
-    # they passed the wrong dtype rather than that the mechanism is absent.
-    assert "--quantization" in error["message"]
+    # The message still has to say what went wrong and what to do instead, or
+    # the reader is left thinking they passed the wrong dtype rather than that
+    # this scheme has no loader here.
+    assert "budgeted for something smaller" in error["message"]
     assert "different repository" in error["message"]
+    # ...and it names the ones that DO work, which the blanket refusal could
+    # not, because none of them did.
+    assert "nvfp4" in error["message"]
+
+
+def test_a_forceable_dtype_is_no_longer_refused_out_of_hand():
+    """The other half: `--quantization` exists now, so a scheme the pinned
+    image's own registry holds is a launchable request.
+
+    `render_quantization` maps nvfp4 onto `modelopt_fp4`, which was read off
+    the image rather than a changelog. Whether this particular stub launch
+    then succeeds is not the point -- what is pinned is that it is not
+    rejected for being a dtype."""
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "dtype": "nvfp4",
+            },
+        )
+    if reply.status_code == 400:
+        message = reply.json()["error"]["message"]
+        assert "cannot be forced" not in message, message
+        assert "different repository" not in message, message
 
 
 def test_launch_refuses_the_dtype_before_it_resolves_anything():
@@ -5295,7 +5914,7 @@ def test_launch_without_a_dtype_is_untouched_by_the_guard():
         ):
             reply = client.post("/api/deployments", json=body)
             assert reply.status_code != 400 or (
-                reply.json()["error"]["code"] != "dtype_not_launchable"
+                "cannot be forced" not in reply.json()["error"]["message"]
             ), body
 
 
@@ -5329,6 +5948,84 @@ def test_launch_without_extra_args_is_untouched_by_the_field():
             reply = client.post("/api/deployments", json=body)
             assert reply.status_code == 201, body
             assert reply.json()["extra_args"] == []
+
+
+# -- kv_dtype: the one launch field the fit gate has ALREADY believed -------
+
+
+def test_launch_with_a_kv_dtype_reaches_the_deployment_manager():
+    """Unlike extra_args, this one is not merely launch-only: `_plan_and_fit`
+    reads it and sizes the cache with it. It used to stop there -- the gate
+    halved bytes-per-token for fp8, approved a context on that, passed the
+    halved byte budget, and told the engine nothing about the width. The
+    budget was honoured so nothing OOMed; the operator got half the context
+    the gate promised, silently."""
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "kv_dtype": "fp8",
+            },
+        )
+    assert reply.status_code == 201, reply.text
+    assert deployments.launched[0].kv_dtype == "fp8", "the gate sized at fp8"
+    assert reply.json()["kv_dtype"] == "fp8", "and the record says so"
+
+
+def test_the_default_width_is_not_forwarded_and_changes_nothing():
+    """`settings.default_kv_dtype` is fp16, which means "the model's own" and
+    renders no flag. It must not be sent: a port that predates the field --
+    the day-0 stub among them -- keeps working for every launch that is not
+    actually asking for a narrower cache."""
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    with TestClient(create_app(deps)) as client:
+        for body in (
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct"},
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "kv_dtype": None},
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "kv_dtype": "fp16"},
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "kv_dtype": "auto"},
+        ):
+            reply = client.post("/api/deployments", json=body)
+            assert reply.status_code == 201, (body, reply.text)
+            assert reply.json()["kv_dtype"] is None, body
+
+
+def test_a_width_this_build_cannot_serve_is_a_400_before_anything_is_planned():
+    """`fit/kv.py` prices int8 at one byte and this image's CacheConfig
+    cannot be asked for it. Refusing late would be a plan and a resolve spent
+    on an answer that cannot be launched; refusing silently would be the
+    original bug."""
+    deployments = FakeDeployments()
+    deps = build_deps(deployments=deployments)
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "kv_dtype": "int8",
+            },
+        )
+    assert reply.status_code == 400, reply.text
+    assert "int8" in reply.json()["error"]["message"]
+    assert deployments.launched == [], "nothing was planned, let alone launched"
+
+
+def test_launch_refuses_a_non_string_kv_dtype():
+    deps = build_deps()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "kv_dtype": ["fp8"],
+            },
+        )
+    assert reply.status_code == 400
+    assert "kv_dtype" in reply.json()["error"]["message"]
 
 
 def test_launch_refuses_a_non_string_extra_args():

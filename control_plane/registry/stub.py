@@ -1,8 +1,12 @@
 """Day-0 stub. Returns the fixture nodes so downstream agents are never blocked.
 
-Deleted at integration. Everything here is static: no probing, no HTTP, no
-background loops. It exists so that D, E, F, G and H can import a RegistryPort
-and get valid contract types out of it within the first hour.
+The real registry landed and `node.py` wires it in production behind
+`GatewayDeps(strict=True, ...)`, which refuses to start if any port -- this
+one included -- is still missing. This file stayed anyway: everything here is
+static (no probing, no HTTP, no background loops), which is exactly what
+makes it the `RegistryPort` fake `__init__.py` exports and that
+`tests/unit/test_registry.py`, `test_node_naming.py`, `test_history_api.py`,
+`test_gateway_runtime.py` and `test_gateway.py` reach for.
 
 The profiles come from ``tests/fixtures`` when that package is importable, so
 the stub cannot drift from the frozen fixtures. Inside the container image,

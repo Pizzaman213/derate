@@ -192,6 +192,11 @@ def test_a_node_with_no_gpu_is_not_asked_about_quantization():
     describe -- a Raspberry Pi in the roster made every model look like it had
     a hardware blocker, complete with empty parentheses where the GPU name
     would be. It also set ok False for a model the real node runs fine.
+
+    Unchanged by the arrival of a CPU runtime, and the reason string is where
+    that shows: such a node can now serve, so it is no longer "not a candidate
+    for anything", but every question this check asks is about a CUDA
+    capability and none of them is about it.
     """
     from tests.fixtures import node_state
 
@@ -204,7 +209,10 @@ def test_a_node_with_no_gpu_is_not_asked_about_quantization():
     assert nodes["skipped"] == [
         {
             "node_id": _no_gpu_profile().node_id,
-            "reason": "no GPU memory; derate launches CUDA runtimes only",
+            "reason": (
+                "no GPU, so there is no silicon generation to check a CUDA "
+                "quantization scheme against"
+            ),
         }
     ]
 
@@ -252,11 +260,24 @@ def test_detail_says_so_when_the_resolver_cannot_describe_a_model(client):
 
 @pytest.mark.parametrize(
     "dtype,launchable",
-    [("bf16", True), ("awq_int4", True), ("q4_k_m", False), ("iq4_xs", False)],
+    [("bf16", True), ("awq_int4", True), ("q4_k_m", True), ("iq4_xs", True)],
 )
-def test_gguf_schemes_are_marked_unlaunchable_with_a_reason(client, dtype, launchable):
-    """Serve must be absent, not merely disabled, on a format nothing here can
-    load -- and the row has to say why rather than leaving a dead control."""
+def test_a_scheme_is_launchable_when_some_runtime_here_loads_it(
+    client, dtype, launchable
+):
+    """Launchability follows the runtime table, and nothing else.
+
+    The GGUF rows flipped when the `llamacpp` runtime arrived, and that is the
+    whole point of the change: this payload's job is to mirror what
+    `POST /api/deployments` would decide, so a Serve button drawn from it
+    cannot disagree with the launch it triggers. While no runtime read GGUF,
+    "ok: false" was that mirror; now that one does, "ok: true" is.
+
+    Kept parameterized over both families rather than narrowed to the ones
+    that changed, because the property being held is the general one -- a
+    scheme is launchable exactly when some runtime here loads it -- and the
+    bf16/awq rows are what stop that from being satisfied by returning True.
+    """
     from dataclasses import replace
 
     from control_plane.gateway.serialize import resolution_payload
@@ -275,13 +296,54 @@ def test_gguf_schemes_are_marked_unlaunchable_with_a_reason(client, dtype, launc
         )
     )
     assert payload["launchable"]["ok"] is launchable
-    if not launchable:
-        assert "llama.cpp" in payload["launchable"]["reason"]
 
 
-def test_a_single_gguf_file_is_never_launchable():
-    """Both serve templates take a repository path. An hf:// file reference is
-    not one, and recipes.py's command allowlist would happily pass it through."""
+def test_a_scheme_no_runtime_loads_is_refused_with_the_runtime_s_own_sentence(
+    client,
+):
+    """The inverse of the test above, which would otherwise pass on a build
+    where every scheme were launchable.
+
+    `nf4` is loadable by vllm and by nothing else here, so it is a poor
+    example; a GGUF scheme on an architecture llama.cpp has no converter for
+    is the real shape of "nothing here loads this", and the reason has to be
+    the runtime's own words rather than a rewrite."""
+    from dataclasses import replace
+
+    from control_plane.gateway.serialize import resolution_payload
+    from control_plane.resolver.support import build_verdict
+    from control_plane.resolver.types import ParamSource, QuantSource, Resolution
+    from tests.fixtures import MODEL_SHAPES
+
+    shape = replace(MODEL_SHAPES["llama-3.3-70b"], dtype="q4_k_m")
+    verdict = build_verdict(("NotARealArchitectureForCausalLM",), "q4_k_m")
+    payload = resolution_payload(
+        Resolution(
+            shape=shape,
+            revision="main",
+            param_source=ParamSource.SAFETENSORS_HEADERS,
+            quant_source=QuantSource.QUANT_CONFIG,
+            support=verdict,
+        )
+    )
+    assert payload["launchable"]["ok"] is False
+    assert payload["launchable"]["reason"]
+
+
+def test_a_remote_gguf_file_is_launchable_and_a_local_one_is_not():
+    """The two halves of what used to be one refusal.
+
+    "A single GGUF file is not a launchable target" rested on two facts. One
+    was about the serve templates -- they took a repository path, not a file --
+    and `llamacpp` plus `flags.llamacpp_model_spec` ended that: an
+    `hf://owner/repo/file.gguf` reference is rewritten into the
+    `owner/repo:QUANT` spelling its launcher parses.
+
+    The other fact is still true and is not about formats at all: a `.gguf`
+    PATH names a file on the coordinator, and the container starts on the node
+    the plan placed it on. That one has to keep refusing, and it is the same
+    refusal `flags.llamacpp_model_refusal` makes at the door -- said here early
+    enough that the button is never drawn."""
     from dataclasses import replace
 
     from control_plane.gateway.serialize import resolution_payload
@@ -303,8 +365,20 @@ def test_a_single_gguf_file_is_never_launchable():
             support=build_verdict(("LlamaForCausalLM",), shape.dtype),
         )
     )
-    assert payload["launchable"]["ok"] is False
-    assert "repositor" in payload["launchable"]["reason"]
+    assert payload["launchable"]["ok"] is True
+
+    local = replace(shape, model_id="/home/somebody/models/Qwen3-30B-A3B.gguf")
+    local_payload = resolution_payload(
+        Resolution(
+            shape=local,
+            revision="main",
+            param_source=ParamSource.GGUF_TENSORS,
+            quant_source=QuantSource.GGUF_FILE_TYPE,
+            support=build_verdict(("LlamaForCausalLM",), local.dtype),
+        )
+    )
+    assert local_payload["launchable"]["ok"] is False
+    assert "repositor" in local_payload["launchable"]["reason"]
 
 
 # ---- MTP --------------------------------------------------------------------
@@ -433,6 +507,115 @@ def test_hub_search_still_returns_empty_for_an_ordinary_miss():
     client = HubClient()
     client._get = lambda *a, **k: _Resp()  # type: ignore[assignment]
     assert client.search("nothing-like-this") == []
+
+
+class TestAnUnsizedVariantIsNeverJudged:
+    """The 2.4x bug, at the seam where it was introduced.
+
+    ``file_bytes`` was documented as "measured or absent, never an estimate
+    dressed as a size" -- honest about the SIZE and silent about the VERDICT
+    computed when it is absent. Handed ``None``, ``weight_bytes_per_rank``
+    falls back to ``total_params * BYTES_PER_PARAM[dtype]``, so the row went
+    out with a confident verdict and a Serve button.
+
+    Measured on ``Qwen/Qwen3.8-Flash-Next`` on 2026-09-11:
+    ``GET /api/models/variants`` returned 58 rows, and the six carrying
+    ``file_bytes: None`` were exactly the six vLLM-launchable ones. Every one
+    answered ``fits_degraded``, ``launchable: true``, ``shard_count: 1``,
+    ``shard_files: []``; ``nvidia/Qwen3.8-Flash-Next-NVFP4`` claimed 57.9 GiB
+    to spare at an assumed 4.5 bits/weight. Downloaded, it is 132.7 GB across
+    11 shards, and the gate handed the real figure refuses it: 111.8 GiB per
+    rank against 107.7 usable. Predicted 47.3, measured 111.8.
+
+    The rule is the one ``resolver/speculators.py`` already applies to a draft
+    head whose shards cannot be counted -- name it and refuse it.
+    """
+
+    @staticmethod
+    def _variant(repo_id, *, launchable, file_bytes):
+        from control_plane.resolver.types import QuantVariant
+
+        return QuantVariant(
+            dtype="nvfp4",
+            label=repo_id.split("/")[-1],
+            repo_id=repo_id,
+            source="repo_name",
+            file_bytes=file_bytes,
+            launchable=launchable,
+        )
+
+    def test_a_launchable_variant_with_no_measured_shards_is_unsized(self):
+        from control_plane.gateway.capacity_api import _unsized
+
+        assert _unsized(self._variant("acme/x-NVFP4", launchable=True, file_bytes=None))
+
+    def test_a_measured_variant_is_judged(self):
+        from control_plane.gateway.capacity_api import _unsized
+
+        assert not _unsized(
+            self._variant("acme/x-NVFP4", launchable=True, file_bytes=132_680_249_378)
+        )
+
+    def test_a_gguf_row_is_never_caught_by_this(self):
+        """A GGUF variant is not launchable and is priced from its own measured
+        files. 51 of the 58 rows on the model above were measured GGUF."""
+        from control_plane.gateway.capacity_api import _unsized
+
+        assert not _unsized(
+            self._variant("acme/x-GGUF", launchable=False, file_bytes=None)
+        )
+
+    def test_the_refusal_names_the_repository_and_why(self):
+        from control_plane.gateway.capacity_api import _unsized_reason
+
+        reason = _unsized_reason(
+            self._variant(
+                "nvidia/Qwen3.8-Flash-Next-NVFP4", launchable=True, file_bytes=None
+            )
+        )
+        assert "nvidia/Qwen3.8-Flash-Next-NVFP4" in reason
+        assert "does not budget what it cannot measure" in reason
+        # A refusal names what to change. This one is usually a token.
+        assert "HF_TOKEN" in reason
+
+    def test_an_unsized_row_is_never_recommended(self):
+        """``_recommend`` filters on ``fits``, and an unjudged row has none --
+        so this holds by construction. Pinned because the construction is what
+        would silently change."""
+        from control_plane.gateway.capacity_api import _recommend
+
+        rows = [
+            {
+                "label": "unsized",
+                "verdict": None,
+                "fits": None,
+                "file_bytes": None,
+                "launchable": True,
+                "repo_id": "acme/unsized",
+                "dtype": "nvfp4",
+                "bits_per_weight": 4.5,
+            }
+        ]
+        assert _recommend(rows) is None
+
+    def test_an_unsized_row_sorts_below_every_judged_one(self):
+        from control_plane.gateway.capacity_api import _ranked
+
+        rows = _ranked(
+            [
+                {
+                    "label": "unsized", "verdict": None, "fits": None,
+                    "file_bytes": None, "launchable": True,
+                    "repo_id": "a/unsized", "dtype": "nvfp4", "bits_per_weight": 4.5,
+                },
+                {
+                    "label": "refused", "verdict": "wont_fit", "fits": False,
+                    "file_bytes": int(90e9), "launchable": True,
+                    "repo_id": "a/refused", "dtype": "nvfp4", "bits_per_weight": 4.5,
+                },
+            ]
+        )
+        assert [r["label"] for r in rows] == ["refused", "unsized"]
 
 
 class TestVariantOrdering:
@@ -907,22 +1090,32 @@ class TestCapacityWithNoConfiguration:
         assert body["budget_basis"] == "host_memory"
         assert self._rows(body), "a 200 with no rows is a 503 wearing a hat"
 
-    def test_the_host_basis_says_nothing_here_can_be_launched(self):
-        """The containment on the whole feature.
+    def test_the_host_basis_says_what_the_budget_is_and_what_can_serve_it(self):
+        """The caveat that rides a host-memory budget, and how it changed.
 
-        Sizing against host RAM makes the gate print "fits" for a model that
-        cannot load on that machine, and the gate's sentence is the product.
-        So every row carries the caveat and the report says `local_serving` is
-        false -- a verdict you cannot act on must not grow a Serve button.
+        This asserted the opposite until the `llamacpp` runtime arrived, and
+        the old assertion was right at the time: sizing against host RAM makes
+        the gate print "fits" for a model that could not load on a machine with
+        no GPU at all, so every row carried "nothing here can be launched" and
+        `local_serving` was false -- a verdict you cannot act on must not grow
+        a Serve button.
+
+        Half of that is still true. The budget IS host memory, it IS a live
+        reading of a pool the operating system shares rather than a ceiling,
+        and the rows still say so. The other half stopped being true the
+        moment something could launch there, and a caveat sending somebody to
+        a provider when the machine in front of them can serve is worse than
+        no caveat.
         """
         with self._cpu_only_client() as client:
             body = client.get("/api/capacity").json()
 
-        assert body["local_serving"] is False
+        assert body["local_serving"] is True
+        assert body["budget_basis"] == "host_memory"
         for row in self._rows(body):
             joined = " ".join(row["warnings"])
             assert "no GPU was found" in joined, row["warnings"]
-            assert "provider" in joined, row["warnings"]
+            assert "llamacpp" in joined, row["warnings"]
 
     def test_the_static_side_is_withheld_rather_than_reported_as_zero(self):
         """The static ceiling is derived from addressable memory, which is 0

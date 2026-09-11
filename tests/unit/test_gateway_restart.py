@@ -212,6 +212,92 @@ def test_a_wont_fit_relaunch_counts_as_a_failed_attempt_and_eventually_gives_up(
     run(_run_coordinator(ctx, body))
 
 
+def test_a_crash_loop_spends_the_budget_once_and_then_stops(monkeypatch):
+    """The loop that actually ran on this box: 1,094 relaunches in two days.
+
+    Every attempt SUCCEEDED at launching -- `_retry_loop` returns on
+    "launched", which means submitted, not READY -- and the new deployment
+    then died during startup, emitting another FAILED. `_handle` minted a
+    fresh `_RestartState` for it, `attempts` went back to 0, and
+    MAX_RESTART_ATTEMPTS bounded nothing. The tell in the logs was that every
+    gap was exactly RESTART_BACKOFF_S[0]: the counter never reached the
+    second rung, let alone the third.
+
+    The budget has to survive the relaunch, because a relaunch is not
+    evidence of anything. Only READY is, and `_handle` clears the state there.
+    """
+    monkeypatch.setattr(restart_module, "RESTART_BACKOFF_S", FAST_BACKOFF)
+    ctx, deployments = build_ctx()
+    deployment = crashed_deployment()
+    deployments.deployments.append(deployment)
+
+    async def body(coordinator):
+        # The first crash. Every relaunch after it launches fine and then
+        # crashes too -- exactly what a model dying at startup does.
+        deployments.bus.emit(**crash_event(deployment))
+        for _ in range(400):
+            if exhausted_events(ctx):
+                break
+            for dep in list(deployments.launched):
+                if dep.state is not DeploymentState.FAILED:
+                    dep.state = DeploymentState.FAILED
+                    deployments.bus.emit(**crash_event(dep))
+            await asyncio.sleep(0.01)
+
+        attempted = attempted_events(ctx)
+        assert [a["attempt"] for a in attempted] == [1, 2, 3], attempted
+        assert len(exhausted_events(ctx)) == 1
+        assert len(deployments.launched) == restart_module.MAX_RESTART_ATTEMPTS, (
+            "a crash loop must cost exactly the budget, not one relaunch per crash"
+        )
+
+        # And it stays given up: further crashes neither relaunch nor
+        # re-announce exhaustion.
+        before = len(deployments.launched)
+        for dep in list(deployments.launched):
+            deployments.bus.emit(**crash_event(dep))
+        await asyncio.sleep(0.05)
+        assert len(deployments.launched) == before
+        assert len(exhausted_events(ctx)) == 1, "gave up once, said so once"
+
+    run(_run_coordinator(ctx, body))
+
+
+def test_a_model_that_comes_back_ready_gets_its_budget_back(monkeypatch):
+    """The other half of the rule. The budget is spent per OUTAGE, not per
+    process lifetime -- a model that recovers and crashes again a week later
+    must get three fresh tries, or the first flap in a long uptime would
+    permanently disarm the feature."""
+    monkeypatch.setattr(restart_module, "RESTART_BACKOFF_S", FAST_BACKOFF)
+    ctx, deployments = build_ctx()
+    deployment = crashed_deployment()
+    deployments.deployments.append(deployment)
+
+    async def body(coordinator):
+        deployments.bus.emit(**crash_event(deployment))
+        for _ in range(200):
+            if deployments.launched:
+                break
+            await asyncio.sleep(0.01)
+        assert len(deployments.launched) == 1
+
+        relaunched = deployments.launched[0]
+        deployments.bus.emit(**ready_event(deployment.served_name, relaunched.deployment_id))
+        await asyncio.sleep(0.05)
+
+        # A later crash starts from a full budget.
+        relaunched.state = DeploymentState.FAILED
+        deployments.bus.emit(**crash_event(relaunched))
+        for _ in range(200):
+            if len(deployments.launched) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(deployments.launched) == 2, "READY cleared the count"
+        assert [a["attempt"] for a in attempted_events(ctx)] == [1, 1]
+
+    run(_run_coordinator(ctx, body))
+
+
 def test_a_duplicate_deployment_exception_is_treated_as_success_not_failure(monkeypatch):
     monkeypatch.setattr(restart_module, "RESTART_BACKOFF_S", FAST_BACKOFF)
 

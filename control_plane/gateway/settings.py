@@ -8,6 +8,13 @@ import os
 from dataclasses import dataclass, field
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 @dataclass
 class GatewaySettings:
     # --- server ---
@@ -39,6 +46,34 @@ class GatewaySettings:
             for origin in os.environ.get("DERATE_ALLOWED_ORIGINS", "").split(",")
             if origin.strip()
         )
+    )
+
+    # Optional bearer token gating every /api request (see auth.py). Empty
+    # (the default) installs no check at all -- every workflow that talks to
+    # /api without a token today keeps working unchanged.
+    api_token: str | None = field(
+        default_factory=lambda: os.environ.get("DERATE_API_TOKEN") or None
+    )
+
+    # --- auto-adopt ---
+    # Both reverse a stance this codebase otherwise holds deliberately --
+    # providers/detect.py and deploy/manager.py both document that discovery
+    # proposes and a human accepts. Defaulting these on is a considered
+    # override of that stance, not an oversight, so both are individually
+    # switchable back to the manual-only behavior.
+    #
+    # Registers a runtime detect_runtime() finds on a roster node (e.g.
+    # Ollama) as a provider on a timer, instead of only when a human opens
+    # that node's sheet and clicks Adopt (control_plane/providers/autoadopt.py).
+    auto_adopt_runtimes: bool = field(
+        default_factory=lambda: _env_flag("DERATE_AUTO_ADOPT_RUNTIMES", True)
+    )
+    # Reconstructs a deployment record for a sparkrun-launched container that
+    # is running but has no matching entry in the deployment store -- e.g. a
+    # lost store file, or a launch that raced a coordinator restart
+    # (control_plane/deploy/manager.py, DeploymentManager._scan_for_orphans).
+    auto_adopt_containers: bool = field(
+        default_factory=lambda: _env_flag("DERATE_AUTO_ADOPT_CONTAINERS", True)
     )
 
     # --- upstream proxying ---
@@ -110,7 +145,7 @@ class GatewaySettings:
     tokens_per_message_overhead: int = 4
     retry_after_default_s: int = 2
     # Deployment does not carry a KV dtype, so admission assumes the runtime
-    # default. Agent D's kv_bytes_per_token supersedes this when available.
+    # default. The fit calculator's kv_bytes_per_token supersedes this when available.
     default_kv_dtype: str = "fp16"
 
     # --- failover ---
@@ -200,3 +235,8 @@ class GatewaySettings:
     metrics_interval_s: float = 1.0
     metrics_rate_window_s: float = 10.0
     metrics_queue_depth: int = 8
+    # The prefix-cache scrape's own clock, deliberately ten times slower than
+    # the frame it feeds. It is a blocking HTTP call per ready vLLM, and the
+    # figure it produces is a windowed rate -- a shorter window would be a
+    # noisier number about the same fact, bought with more requests.
+    prefix_cache_interval_s: float = 10.0

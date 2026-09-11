@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from control_plane.paths import data_dir
-from typing import Callable
+from typing import Callable, Literal
 
 from control_plane.contracts import NodeProfile
 from control_plane.telemetry import NULL_SINK, TelemetrySink
@@ -32,15 +32,20 @@ from control_plane.version import build_id
 
 from . import modelcache, reach, shell_config, storage
 from .config import (
+    PROBE_MISSES_DEGRADED,
     PROFILE_REPROBE_INTERVAL_S,
     ROLE_WORKER,
     TELEMETRY_INTERVAL_S,
 )
+from .containers import read_container_membership
 from .probe import probe_local
-from .profiles import profile_supersedes
+from control_plane.telemetry.events import RegistryEvents
+
+from .profiles import profile_diff, profile_supersedes
 from .discovery import Advertiser
 from .procs import KillRefused, kill_gpu_process
 from .serde import (
+    containers_to_dict,
     processes_to_dict,
     profile_to_dict,
     storage_to_dict,
@@ -50,6 +55,7 @@ from .telemetry import (
     RingBuffer,
     TelemetrySample,
     read_gpu_processes,
+    TELEMETRY_TIMEOUT_S,
     read_telemetry,
 )
 
@@ -70,8 +76,14 @@ class NodeAgent:
         sink: TelemetrySink = NULL_SINK,
         token: str | None = None,
         data_root: Path | str | None = None,
+        events: "RegistryEvents | None" = None,
     ) -> None:
         self.profile = profile
+        # Defaulted, never required: every existing construction of a NodeAgent
+        # keeps working and records nothing, which is the same contract
+        # NULL_SINK gives the sink. A worker gets the node-side half of the
+        # registry's events and no bus at all -- see RegistryEvents.
+        self._events = events or RegistryEvents(sink=sink, node_id=profile.node_id)
         self.role = role
         self.cluster_id = cluster_id
         self.port = port
@@ -91,6 +103,16 @@ class NodeAgent:
         # matters is that somebody asked over the network.
         self._last_polled: float | None = None
         self._running = False
+        # Edge state for the two hysteresised events above. Counters rather
+        # than timers: at a fixed 1 Hz a count IS a duration, and a timer would
+        # need its own clock discipline for no extra truth.
+        self._probe_misses = 0
+        self._probe_degraded = False
+        self._probe_since: float | None = None
+        self._throttle_clear = 0
+        self._throttle_active = False
+        self._throttle_since: float | None = None
+        self._throttle_reasons: tuple[str, ...] = ()
         self._advertiser = advertiser
         # Defaults to the no-op sink, so a NodeAgent still constructs and
         # tests on a machine with telemetry switched off.
@@ -149,6 +171,14 @@ class NodeAgent:
         """
         return processes_to_dict(self.node_id, await read_gpu_processes())
 
+    async def containers_payload(self) -> dict:
+        """Which of the processes above belong to a docker container, and its
+        name -- read on demand, for the same reason ``processes_payload`` is:
+        this is one nvidia-smi call and one ``docker ps`` per request, and
+        only worth paying while something is actually asking.
+        """
+        return containers_to_dict(self.node_id, await read_container_membership())
+
     async def storage_payload(self) -> dict:
         """Disk capacity and our share of it, read on demand.
 
@@ -167,6 +197,29 @@ class NodeAgent:
             log.exception("storage probe failed")
             return storage_to_dict(None, self.node_id)
         return storage_to_dict(payload, self.node_id)
+
+    async def logs_payload(self, which: str, limit: int) -> dict:
+        """This node's own ``node.log`` or ``proxy.log``, tailed. Never raises.
+
+        Distinct from a deployment's serving log: this is the control
+        plane's own process log, read straight off ``logfiles.py``'s files.
+        """
+        from control_plane import logfiles
+
+        try:
+            payload = await asyncio.to_thread(logfiles.tail, which, limit=limit)
+        except Exception:
+            log.exception("log tail failed")
+            return {
+                "lines": [],
+                "path": None,
+                "truncated": False,
+                "available": False,
+                "reason": "The log could not be read on this node.",
+            }
+        payload["node_id"] = self.node_id
+        payload["which"] = which
+        return payload
 
     async def model_cache_payload(self) -> dict:
         """The downloaded weights on this node, read on demand.
@@ -321,13 +374,99 @@ class NodeAgent:
     # ------------------------------------------------------------------
 
     async def sample_once(self) -> TelemetrySample | None:
-        sample = await read_telemetry(self.profile, now=self._clock())
+        reasons: list[str] = []
+        sample = await read_telemetry(
+            self.profile, now=self._clock(), note=reasons.append
+        )
         if sample is not None:
             self._ring.add(sample)
             # The ring is unchanged: it still answers /agent/telemetry and the
             # UI's 60-second graph. This is the copy that outlives the process.
             self._sink.sample(self.node_id, sample)
+        self._note_probe(sample, reasons)
+        self._note_throttle(sample)
         return sample
+
+    def _note_probe(self, sample: TelemetrySample | None, reasons: list[str]) -> None:
+        """Say out loud when we stop being able to see this node.
+
+        ``read_telemetry`` returning None leaves the previous ring entry in
+        place, so a wedged nvidia-smi and an idle GPU produce the same flat
+        line and only ``sample_ts`` betrays the difference -- if anyone looks.
+        A month later "the node was quiet" and "we went blind" are the same
+        picture.
+
+        Three consecutive misses in, one success out. The asymmetry is
+        ``record_health``'s, and it is what makes this safe to emit at 1 Hz: a
+        probe that genuinely flaps never reaches three and never fires at all,
+        while a wedged one fires exactly once on entry and once on recovery.
+        An un-hysteresised edge here would write 86,400 rows a day into the one
+        table retention never evicts.
+        """
+        if sample is not None:
+            if self._probe_degraded:
+                self._probe_degraded = False
+                self._events.probe_recovered(
+                    self.node_id,
+                    degraded_s=round(self._clock() - (self._probe_since or 0.0), 1),
+                    misses=self._probe_misses,
+                )
+            self._probe_misses = 0
+            self._probe_since = None
+            return
+        self._probe_misses += 1
+        if self._probe_misses < PROBE_MISSES_DEGRADED or self._probe_degraded:
+            return
+        self._probe_degraded = True
+        self._probe_since = self._clock()
+        latest = self._ring.latest
+        self._events.probe_degraded(
+            self.node_id,
+            reason=reasons[-1] if reasons else "unknown",
+            consecutive_misses=self._probe_misses,
+            timeout_s=TELEMETRY_TIMEOUT_S,
+            last_good_ts=latest.ts if latest else None,
+        )
+
+    def _note_throttle(self, sample: TelemetrySample | None) -> None:
+        """The discrete companion to the 1 Hz throttle column.
+
+        The column answers "how much"; this answers "why", and it is the half
+        that survives -- ``events`` is never size-evicted while raw samples are
+        dropped a day at a time at the archive cap. Same 3-in/1-out hysteresis:
+        a GPU that ticks a thermal bit for one second in sixty is not an
+        incident, and at 1 Hz an unguarded edge is two rows a second.
+        """
+        if sample is None or sample.throttled is None:
+            return
+        if not sample.throttled:
+            if self._throttle_active:
+                self._throttle_active = False
+                self._events.throttle_cleared(
+                    self.node_id,
+                    throttled_s=self._clock() - (self._throttle_since or self._clock()),
+                    reasons=self._throttle_reasons,
+                )
+                self._throttle_reasons = ()
+            self._throttle_clear = 0
+            return
+        self._throttle_reasons = sample.throttle_reasons
+        if self._throttle_active:
+            return
+        self._throttle_clear += 1
+        if self._throttle_clear < PROBE_MISSES_DEGRADED:
+            return
+        self._throttle_active = True
+        self._throttle_since = self._clock()
+        self._events.throttle_entered(
+            self.node_id,
+            sample.throttle_reasons,
+            temperature_c=sample.temperature_c,
+            power_watts=sample.power_watts,
+            utilization_pct=sample.utilization_pct,
+            sm_clock_mhz=sample.sm_clock_mhz,
+            sm_clock_max_mhz=sample.sm_clock_max_mhz,
+        )
 
     def note_polled(self) -> None:
         """Somebody just asked this agent for its health over HTTP."""
@@ -375,12 +514,18 @@ class NodeAgent:
             return False
         if fresh == self.profile:
             return False
+        # Named fields, not just device_class: a driver upgrade leaves the
+        # class alone, so this used to log "gb10 -> gb10" and record nothing at
+        # all about the thing that actually moved.
+        changed = profile_diff(self.profile, fresh)
         log.info(
-            "hardware changed on %s: %s -> %s",
+            "hardware changed on %s: %s",
             self.profile.node_id,
-            self.profile.device_class.value,
-            fresh.device_class.value,
+            ", ".join(
+                f"{k} {v['from']} -> {v['to']}" for k, v in changed.items()
+            ) or "no named field",
         )
+        self._events.profile_changed(self.profile.node_id, changed, reason="reprobe")
         # Publishing is the point, not bookkeeping: /agent/profile reads this
         # attribute, so replacing it IS how the coordinator finds out. A
         # re-probe the node kept to itself would fix nothing.
@@ -478,12 +623,23 @@ def create_agent_app(node_agent: NodeAgent):
     async def get_processes() -> dict:
         return await node_agent.processes_payload()
 
+    @app.get("/agent/containers")
+    async def get_containers() -> dict:
+        return await node_agent.containers_payload()
+
     @app.get("/agent/storage")
     async def get_storage() -> dict:
         # Uncredentialed, like /agent/profile and /agent/telemetry. It reads
         # capacity and the sizes of files this product wrote; the one route on
         # this surface that changes the machine is the kill below.
         return await node_agent.storage_payload()
+
+    @app.get("/agent/logs")
+    async def get_logs(which: Literal["node", "proxy"] = "node", tail: int = 500) -> dict:
+        # Uncredentialed, like /agent/storage and /agent/processes: read-only,
+        # and the redacting filter on the handler already keeps a key out of
+        # the file this serves -- there is nothing secret left here to gate.
+        return await node_agent.logs_payload(which, max(1, min(tail, 5000)))
 
     @app.get("/agent/models/cache")
     async def get_model_cache() -> dict:

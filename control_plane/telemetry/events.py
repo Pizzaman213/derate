@@ -13,6 +13,7 @@ column says which one an event came from.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from .records import NULL_SINK, TelemetrySink
@@ -41,9 +42,45 @@ PARK_RESOLVED = "park_resolved"
 ADMISSION_BLOCKED = "admission_blocked"
 ADMISSION_CLEARED = "admission_cleared"
 ROUTING_SOURCE_FAILED = "routing_source_failed"
+#: A provider's daily cap closing and reopening. The crossing was never
+#: recorded before: `over_budget()` was only ever ASKED, at admission time, so
+#: nothing could say when a cap was reached -- only that it currently was.
+BUDGET_REACHED = "budget_reached"
+BUDGET_CLEARED = "budget_cleared"
 STARTUP_DEGRADED = "startup_degraded"
 RESTART_ATTEMPTED = "restart_attempted"
 RESTART_EXHAUSTED = "restart_exhausted"
+
+# Registry event types. Everything a node does that an incident review asks
+# about a month later, and that today exists only as a log line -- or, in the
+# case of a driver upgrade, not even that.
+#
+# Deliberately NOT named node_unhealthy. deploy/events.py already has one, and
+# it is a different fact: it fires once per DEPLOYMENT whose plan contains the
+# node (three rows for a node hosting three models, none at all for an idle
+# one), while this fires once per node, always, carrying the miss count and the
+# probe's own error. Sharing a type name and separating them only by `source`
+# would conflate them under the events_type_ts index and make "how many times
+# did spark-02 drop" unanswerable without also knowing how many deployments it
+# was hosting at each moment.
+NODE_JOINED = "node_joined"
+NODE_LOST = "node_lost"
+NODE_RECOVERED = "node_recovered"
+NODE_REMOVED = "node_removed"
+PROFILE_CHANGED = "profile_changed"
+NODE_REBOOTED = "node_rebooted"
+AGENT_RESTARTED = "agent_restarted"
+PROBE_DEGRADED = "probe_degraded"
+PROBE_RECOVERED = "probe_recovered"
+THROTTLE_ENTERED = "throttle_entered"
+THROTTLE_CLEARED = "throttle_cleared"
+DISK_LOW = "disk_low"
+DISK_RECOVERED = "disk_recovered"
+
+# registry/agent.py::note_shell_opened has always written this literal. The
+# value is load-bearing -- history is already recorded under it -- so this
+# names the existing string rather than changing it.
+SOURCE_SHELL = "shell"
 
 
 def _new_bus():
@@ -84,6 +121,21 @@ class GatewayEvents:
 
     def breaker_closed(self, target_id: str) -> None:
         self.emit(BREAKER_CLOSED, target_id=target_id)
+
+    def budget_reached(
+        self, provider_id: str, detail: str, daily_budget_usd: float,
+        spend_today_usd: float, day: str,
+    ) -> None:
+        """A provider's cap closed. `detail` is `ProviderRuntime.budget_block`'s
+        own sentence, carried rather than recomposed."""
+        self.emit(
+            BUDGET_REACHED, provider_id=provider_id, detail=detail,
+            daily_budget_usd=daily_budget_usd, spend_today_usd=spend_today_usd,
+            day=day,
+        )
+
+    def budget_cleared(self, provider_id: str, day: str) -> None:
+        self.emit(BUDGET_CLEARED, provider_id=provider_id, day=day)
 
     def retry_refused(self, served_name: str, snapshot: dict[str, Any]) -> None:
         self.emit(RETRY_REFUSED, served_name=served_name, **snapshot)
@@ -153,3 +205,147 @@ class GatewayEvents:
             max_attempts=max_attempts,
             last_error=last_error,
         )
+
+
+class RegistryEvents:
+    """Node lifecycle and node health, written down.
+
+    Two things separate this from :class:`GatewayEvents`.
+
+    It must work with **no bus at all**. A worker runs a node agent and a
+    journal and nothing else; importing ``deploy`` to get an ``EventBus`` there
+    would pull the whole deployment manager into every worker process, which is
+    the thing ``_new_bus``'s deferral exists to prevent. So the bus is optional
+    and the sink is written to directly when there is none -- the shape
+    ``registry/agent.py::note_shell_opened`` already hand-rolls.
+
+    And ``node_id`` is a constructor argument, because the archive's ``events``
+    table takes its ``node_id`` column from the COLLECTOR's cursor -- the
+    journal's owner, not the event's subject. An event emitted on the
+    coordinator about ``spark-02`` therefore lands under the coordinator's id,
+    and ``/api/history/events?node_id=`` filters the observer. Carrying the
+    subject in the body is what makes it recoverable, and is what deploy's own
+    ``node_unhealthy`` already does.
+    """
+
+    def __init__(
+        self,
+        sink: TelemetrySink = NULL_SINK,
+        bus: "EventBus | None" = None,
+        node_id: str = "",
+    ) -> None:
+        self.bus = bus
+        self.node_id = node_id
+        self._sink = sink
+        self._taps: list[Any] = []
+        if bus is not None:
+            journal_events(bus, sink, SOURCE_REGISTRY)
+
+    def add_tap(self, fn: Any) -> None:
+        """Call *fn* synchronously for every event, bus or no bus.
+
+        `EventBus.add_tap` exists for a consumer that cannot be outrun, and
+        the same need applies here -- but on a coordinator this class is
+        constructed WITHOUT a bus and writes straight to the sink, so there is
+        no bus to tap. A live consumer would otherwise have to subscribe to
+        the archive, and the archive is a no-op on a dev box and under pytest.
+
+        Same strict contract as the bus's: non-blocking, and a tap that raises
+        is logged and ignored, because recording a fact may not break it.
+        """
+        self._taps.append(fn)
+
+    def _fire_taps(self, event: dict[str, Any]) -> None:
+        for fn in self._taps:
+            try:
+                fn(event)
+            except Exception:  # pragma: no cover - a tap of ours misbehaving
+                log.debug("registry event tap failed", exc_info=True)
+
+    def emit(self, type: str, **fields: Any) -> dict[str, Any]:
+        """Record one event. Never raises: recording a fact may not break it."""
+        fields.setdefault("node_id", self.node_id)
+        if self.bus is not None:
+            try:
+                event = self.bus.emit(type, **fields)
+            except Exception:  # pragma: no cover - a tap of ours misbehaving
+                log.debug("registry event %s could not be emitted", type, exc_info=True)
+                return {}
+            self._fire_taps(event or {"type": type, "ts": time.time(), **fields})
+            return event
+        event = {"type": type, "ts": time.time(), **fields}
+        try:
+            self._sink.event(SOURCE_REGISTRY, event)
+        except Exception:  # pragma: no cover
+            log.debug("registry event %s could not be recorded", type, exc_info=True)
+        self._fire_taps(event)
+        return event
+
+    # -- roster ----------------------------------------------------------
+
+    def node_joined(self, node_id: str, **fields: Any) -> None:
+        self.emit(NODE_JOINED, node_id=node_id, **fields)
+
+    def node_lost(
+        self, node_id: str, misses: int, last_error: str = "", **fields: Any
+    ) -> None:
+        self.emit(
+            NODE_LOST, node_id=node_id, misses=misses, last_error=last_error, **fields
+        )
+
+    def node_recovered(self, node_id: str, down_s: float, **fields: Any) -> None:
+        self.emit(NODE_RECOVERED, node_id=node_id, down_s=round(down_s, 1), **fields)
+
+    def node_removed(self, node_id: str, reason: str = "", **fields: Any) -> None:
+        self.emit(NODE_REMOVED, node_id=node_id, reason=reason, **fields)
+
+    # -- identity --------------------------------------------------------
+
+    def profile_changed(
+        self, node_id: str, changed: dict[str, Any], reason: str = ""
+    ) -> None:
+        """What moved, and what it moved from.
+
+        The whole point is the ``from``: three call sites overwrite a stored
+        profile in place on a 60s timer, so "the driver is 580.173.02" was
+        always answerable and "the driver changed at 14:02, from what" never
+        was. Half of every incident review starts there.
+        """
+        if not changed:
+            return
+        self.emit(PROFILE_CHANGED, node_id=node_id, changed=changed, reason=reason)
+
+    def node_rebooted(self, node_id: str, **fields: Any) -> None:
+        self.emit(NODE_REBOOTED, node_id=node_id, **fields)
+
+    def agent_restarted(self, node_id: str, **fields: Any) -> None:
+        """The agent process restarted while the machine did not.
+
+        Kept apart from :meth:`node_rebooted` because the pair is diagnostic in
+        a way neither is alone: the same boot id with a falling agent uptime is
+        a container problem, both moving is a real reboot, and a build that
+        changed across it is an upgrade rather than a crash.
+        """
+        self.emit(AGENT_RESTARTED, node_id=node_id, **fields)
+
+    # -- probe and hardware health ---------------------------------------
+
+    def probe_degraded(self, node_id: str, reason: str, **fields: Any) -> None:
+        self.emit(PROBE_DEGRADED, node_id=node_id, reason=reason, **fields)
+
+    def probe_recovered(self, node_id: str, **fields: Any) -> None:
+        self.emit(PROBE_RECOVERED, node_id=node_id, **fields)
+
+    def throttle_entered(self, node_id: str, reasons: tuple[str, ...], **f: Any) -> None:
+        self.emit(THROTTLE_ENTERED, node_id=node_id, reasons=list(reasons), **f)
+
+    def throttle_cleared(self, node_id: str, throttled_s: float, **f: Any) -> None:
+        self.emit(
+            THROTTLE_CLEARED, node_id=node_id, throttled_s=round(throttled_s, 1), **f
+        )
+
+    def disk_low(self, node_id: str, device: str, **fields: Any) -> None:
+        self.emit(DISK_LOW, node_id=node_id, device=device, **fields)
+
+    def disk_recovered(self, node_id: str, device: str, **fields: Any) -> None:
+        self.emit(DISK_RECOVERED, node_id=node_id, device=device, **fields)

@@ -1,9 +1,9 @@
-"""Runtime configuration and the operational constants Agent A runs on.
+"""Runtime configuration and the operational constants the registry runs on.
 
 The nine values in architecture section 4.1 are frozen and imported from
 ``contracts``. The timing constants below are *operational*: the day-0 contracts
 file carries them as additive values, and this module prefers that copy when it
-is present. The fallbacks are the literals from the Agent A brief, so the
+is present. The fallbacks are this module's own literals, so the
 registry keeps working if the additive block is reorganised. Nothing here
 redefines a frozen contract.
 """
@@ -64,6 +64,12 @@ REANNOUNCE_MAX_RETRY_S = _const("REANNOUNCE_MAX_RETRY_S", 120.0)
 
 # Telemetry: 1 Hz, 300 samples, so the UI gets 60 s of graph from a 300 s ring.
 TELEMETRY_INTERVAL_S = _const("TELEMETRY_INTERVAL_S", 1.0)
+# Consecutive 1 Hz misses before a probe is called degraded, and the same
+# count before a throttle is called real. Mirrors HEARTBEAT_MISSES_UNHEALTHY
+# deliberately: the asymmetry (three in, one out) is what stops a flapping
+# signal writing two rows a second into the events table, which is the one raw
+# table retention never evicts.
+PROBE_MISSES_DEGRADED = _const("PROBE_MISSES_DEGRADED", 3)
 TELEMETRY_RING_SAMPLES = _const("TELEMETRY_RING_SAMPLES", 300)
 
 # Display and driver context on a discrete card. Not charged on GB10, where the
@@ -79,6 +85,42 @@ DISCRETE_MEMORY_RESERVE = _const("DISCRETE_MEMORY_RESERVE", 1 * 1024**3)
 # margin we keep on top of it, for the page cache and whatever else starts
 # between the fit check and the load. 8 GiB is ~6% of the pool.
 HOST_MEMORY_RESERVE = _const("HOST_MEMORY_RESERVE", 8 * 1024**3)
+
+# The same margin, for a machine one or two orders of magnitude smaller.
+#
+# 8 GiB is ~6% of a Spark's pool and 100% of a Raspberry Pi 4's. Applying the
+# GB10 figure to a CPU node does not make it conservative, it makes every
+# model refuse: `allocatable_bytes` subtracts this from MemAvailable, and on
+# an 8 GB board with a desktop running there is not 8 GiB of MemAvailable to
+# subtract from. So the constant has to be sized for the hardware it guards.
+#
+# Deliberately a fraction with a floor rather than a flat number, because the
+# machines this covers span 4 GB to 64 GB and neither end is served by the
+# other's constant. The floor is what an idle Linux box plus derate's own node
+# agent needs to stay responsive while a model loads; the fraction is what
+# keeps the same rule sensible on a large box.
+#
+# NOTHING HAS MEASURED THIS. It is stated as a starting point rather than
+# dressed up as a finding: no CPU launch has been watched to OOM here, and the
+# number that matters -- how much a llama.cpp load transiently needs above its
+# own weights -- is an experiment nobody has run. It errs high on purpose, for
+# the reason `allocatable_bytes` already gives about the GB10 case: swapping a
+# model is not slow, it is fatal.
+CPU_HOST_MEMORY_RESERVE_FLOOR = _const("CPU_HOST_MEMORY_RESERVE_FLOOR", 1024**3)
+CPU_HOST_MEMORY_RESERVE_SHARE = _const("CPU_HOST_MEMORY_RESERVE_SHARE", 0.10)
+
+
+def cpu_host_reserve(available_bytes: int) -> int:
+    """How much of a CPU node's RAM to leave alone, given what it says is free.
+
+    Reads off MemAvailable rather than MemTotal because that is what the caller
+    has and what the kernel is actually promising; the share is therefore of
+    the spendable pool, not of the machine.
+    """
+    return max(
+        int(CPU_HOST_MEMORY_RESERVE_FLOOR),
+        int(max(0, available_bytes) * float(CPU_HOST_MEMORY_RESERVE_SHARE)),
+    )
 
 # How often a node re-reads its own hardware, and how often the coordinator
 # re-reads a member's profile. Both deliberately slow: hardware changes across

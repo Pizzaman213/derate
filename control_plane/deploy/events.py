@@ -1,8 +1,8 @@
 """Deployment event stream.
 
-Agent G consumes this: memory_critical is what tells the gateway to stop
+The gateway consumes this: memory_critical is what tells it to stop
 admitting to a deployment, and memory_cleared is what lets it start again.
-Agent H renders state_changed and launch_refused.
+The UI renders state_changed and launch_refused.
 
 Producers are background threads; consumers are asyncio tasks. emit() is
 therefore thread-safe and never blocks the producer: a subscriber that stops
@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator
 
 logger = logging.getLogger(__name__)
 
-# Event type names. Agent G codes against these constants, not string literals.
+# Event type names. The gateway codes against these constants, not string literals.
 STATE_CHANGED = "state_changed"
 LAUNCH_REFUSED = "launch_refused"
 LAUNCH_FAILED = "launch_failed"
@@ -33,6 +33,10 @@ BACKEND_LOST = "backend_lost"
 FIT_MISS = "fit_miss"
 STOP_ESCALATED = "stop_escalated"
 RECONCILED = "reconciled"
+#: A container derate never recorded a launch for, adopted into the same
+#: state machine as anything reconcile() rehydrates. See
+#: DeploymentManager.adopt and deploy/autoadopt.py.
+ADOPTED = "adopted"
 
 #: Memory fraction at which we warn and mark DEGRADED.
 MEMORY_WARN_FRACTION = 0.90

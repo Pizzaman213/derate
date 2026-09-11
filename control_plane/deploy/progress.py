@@ -30,7 +30,7 @@ One class of line is not progress at all and is read first rather than last:
 the runtime announcing that it is dying. A launch whose engine exits inside a
 container that sleeps forever otherwise looks alive to everything else in the
 system, and is waited out for the full readiness timeout. `_RUNTIME_FATAL`
-below is deliberately four literals long.
+below is deliberately short, and every literal in it is cited.
 
 Where the markers come from, so a version bump can be checked rather than
 guessed:
@@ -50,13 +50,15 @@ guessed:
                     range`, `Capturing CUDA graphs`, `Available KV cache
                     memory`, `init engine (profile, create kv cache, warmup
                     model)`.
-  SGLang            NOT verified against an image -- the SGLang container is
-                    not on the box this was written on. Its markers are
-                    absent rather than guessed, which costs a phase caption
-                    and nothing else: the manager still seeds `loading` when
-                    the container comes up (see manager._wait_for_ready), so
-                    an unrecognised runtime reports one phase less precisely
-                    instead of reporting something untrue.
+  SGLang            read out of a real launch, not guessed: Qwen/Qwen3-0.6B
+                    on scitrera/dgx-spark-sglang:0.5.9-t5 (sglang reports its
+                    own version as "0.0.0" -- a vendor-image defect, not a
+                    fact about the launch -- torch 2.10.0, cuda 13.1), on a
+                    DGX Spark, 2026-09-10. The progress markers below are
+                    still absent -- the launch never reached `starting`, so
+                    there was nothing to verify a "loading" or "starting"
+                    phase against -- but the fatal ones are not: see
+                    `_RUNTIME_FATAL`.
 """
 
 from __future__ import annotations
@@ -220,6 +222,20 @@ _RUNTIME_MARKERS: tuple[tuple[str | re.Pattern[str], str], ...] = (
     ("init engine", "starting"),
     ("Application startup complete", "starting"),
     ("Uvicorn running on", "starting"),
+    # llama.cpp's, read off a real launch rather than written from the source:
+    # `ghcr.io/ggml-org/llama.cpp:server` (0.4.0-dev, build 10902, aarch64)
+    # serving unsloth/Qwen3-0.6B-GGUF:Q4_K_M on this box, 2026-09-11. Its log
+    # is prefixed with a timestamp and a severity (`0.06.717.405 I srv
+    # llama_server: model loaded`), so every marker here is matched anywhere in
+    # the line rather than anchored, exactly like the others above.
+    ("load_model: loading model", "loading"),
+    # Same rule as "Loading weights took": this says loading FINISHED, so it
+    # belongs to the step after it. There is very little after it for this
+    # runtime -- no compile, no graph capture -- which is why a llama.cpp
+    # launch goes from `loading` to a port that answers in about a second.
+    ("llama_server: model loaded", "starting"),
+    ("srv    load_model: initializing", "starting"),
+    ("llama_server: listening on", "starting"),
 )
 
 #: The runtime announcing its own death, which is not the same event as the
@@ -259,6 +275,24 @@ _RUNTIME_MARKERS: tuple[tuple[str | re.Pattern[str], str], ...] = (
 #: transformers are its dependencies), and `tests/unit/test_tts_runtime.py` asserts
 #: the two strings match so the copy cannot drift.
 #:
+#: The sixth and seventh are sglang's, and until 2026-09-10 this tuple had
+#: none: no sglang container had ever been launched on a box that could watch
+#: one die. A solo launch of Qwen/Qwen3-0.6B against
+#: scitrera/dgx-spark-sglang:0.5.9-t5 found the gap directly -- the engine
+#: crashed in `init_memory_pool` (`RuntimeError: Not enough memory. Please try
+#: to increase --mem-fraction-static.`, a sizing bug fixed separately in
+#: `deploy/manager.py::_launch_utilization`) and the deployment sat at
+#: `state=launching, last_error=None` for the full timeout, because nothing in
+#: this tuple matched a single line sglang printed.
+#:
+#: "Received sigquit from a child process. It usually means the child failed."
+#: is sglang's own top-level process saying one of its workers (scheduler,
+#: detokenizer, tokenizer manager) died -- general to WHICH child and WHY, the
+#: same breadth `EngineCore encountered a fatal error.` gives vLLM. "Scheduler
+#: hit an exception:" is narrower and fires first when it is specifically the
+#: scheduler, the process that was dying in this launch -- kept for the same
+#: reason vLLM gets three overlapping markers rather than one.
+#:
 #: Nothing else belongs in this tuple. A marker here ends a launch, so "looks
 #: like an error" is not the bar -- "this line means the process is on its way
 #: out" is.
@@ -268,6 +302,22 @@ _RUNTIME_FATAL: tuple[str, ...] = (
     "Engine core initialization failed.",
     'File "/usr/local/bin/vllm"',
     "fatal: the speech server failed to start.",
+    "Received sigquit from a child process",
+    "Scheduler hit an exception:",
+    # llama.cpp's, and produced rather than predicted: running the pinned
+    # image with `-m /nope/missing.gguf` prints ten lines of increasingly
+    # general failure and ends with this one, immediately before the process
+    # exits. It is the terminal statement of the set -- `load_model: failed to
+    # load model` and `common_init_: failed to load model` are also printed
+    # and are also terminal, but this is the one that says the server is
+    # leaving rather than that a step failed.
+    #
+    # It matters more here than for the CUDA runtimes, because llama.cpp
+    # reaches a serving port in about a second: a launch that is not going to
+    # answer has already decided that by the time the first log read happens,
+    # and without this marker it would be watched for the full
+    # READY_TIMEOUT_S.
+    "llama_server: exiting due to model loading error",
 )
 
 

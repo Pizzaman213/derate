@@ -23,6 +23,7 @@ from typing import Any
 
 from control_plane.contracts import (
     Deployment,
+    DeploymentOrigin,
     DeploymentState,
     FitResult,
     MemoryBreakdown,
@@ -30,6 +31,8 @@ from control_plane.contracts import (
     ModelShape,
     ParallelismKind,
     ParallelismPlan,
+    SpeculativeMethod,
+    SpeculativeSpec,
     Verdict,
 )
 
@@ -39,7 +42,13 @@ logger = logging.getLogger(__name__)
 
 #: 2 adds Deployment.modality. decode() defaults it to TEXT, so a v1 record
 #: on disk still loads and a downgrade only loses the field.
-SCHEMA_VERSION = 2
+#:
+#: 3 adds Deployment.serving. decode() defaults it to True, which is what
+#: every record written before it existed was: on the API. The flag has to be
+#: DURABLE rather than an admission block -- `admission.py`'s three blocks are
+#: in-memory and `reconcile()` re-derives them twice a second, so a switched
+#: -off deployment would quietly come back on the next coordinator restart.
+SCHEMA_VERSION = 3
 
 #: Low-severity finding: delete() had no caller, so FAILED/STOPPED records
 #: accumulated on disk forever and were reloaded into memory on every
@@ -224,6 +233,19 @@ def encode(d: Deployment) -> dict[str, Any]:
         "modality": d.modality.value,
         "extra_args": list(d.extra_args),
         "custom_command": list(d.custom_command),
+        "speculative": (
+            {**asdict(d.speculative), "method": d.speculative.method.value}
+            if d.speculative is not None
+            else None
+        ),
+        "origin": d.origin.value,
+        "enforce_eager": d.enforce_eager,
+        "kv_dtype": d.kv_dtype,
+        "cudagraph_capture_sizes": (
+            list(d.cudagraph_capture_sizes) if d.cudagraph_capture_sizes else None
+        ),
+        "quantization": d.quantization,
+        "serving": d.serving,
     }
 
 
@@ -263,4 +285,38 @@ def decode(raw: dict[str, Any]) -> Deployment:
         # necessarily launched with none.
         extra_args=tuple(raw.get("extra_args", ())),
         custom_command=tuple(raw.get("custom_command", ())),
+        # Absent, or an explicit null, from a record launched without it --
+        # which is every record written before this field existed, and most
+        # written since.
+        speculative=_decode_speculative(raw.get("speculative")),
+        # Absent from a record written before this field existed, which was
+        # necessarily derate's own launch -- adoption did not exist yet.
+        origin=DeploymentOrigin(raw.get("origin", DeploymentOrigin.LAUNCHED.value)),
+        # Absent from a record written before this field existed, which was
+        # necessarily launched without it -- False is also the truth for such
+        # a record.
+        enforce_eager=bool(raw.get("enforce_eager", False)),
+        kv_dtype=raw.get("kv_dtype") or None,
+        # Absent, or an explicit null, from a record launched without it --
+        # which is every record written before this field existed, and most
+        # written since.
+        cudagraph_capture_sizes=(
+            tuple(raw["cudagraph_capture_sizes"])
+            if raw.get("cudagraph_capture_sizes")
+            else None
+        ),
+        # Absent means True, deliberately. A record written before this field
+        # existed was on the API, and defaulting it to False would silently
+        # take every pre-upgrade deployment off `/v1/models`.
+        quantization=raw.get("quantization") or None,
+        serving=bool(raw.get("serving", True)),
+    )
+
+
+def _decode_speculative(raw: dict[str, Any] | None) -> SpeculativeSpec | None:
+    if not raw:
+        return None
+    data = dict(raw)
+    return SpeculativeSpec(
+        **{**data, "method": SpeculativeMethod(data["method"])}
     )

@@ -1,9 +1,11 @@
 """Day 0 stubs.
 
-The whole HTTP surface served from fixtures, so Agent H can build the entire
-UI before any other component works and only switch to live data at
-integration. Every stub returns real contract types; a stub that returns
-something else is worse than no stub.
+The whole HTTP surface served from fixtures, so the UI could be built before
+any other component worked. `GatewayDeps(strict=False)` still falls back to
+these by default, and `contracts/routes.py` composes them into a dependency-
+free gateway app purely to ask Starlette which routes it answers. Every stub
+returns real contract types; a stub that returns something else is worse
+than no stub.
 
 Numbers come from the shared day-0 fixtures when they are importable, so the
 stub agrees with every other agent's tests. It falls back to equivalent local
@@ -274,6 +276,7 @@ class StubDeployments:
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
         modality=Modality.TEXT, extra_args=(), custom_command=(),
+        speculative=None,
     ) -> Deployment:
         dep = _deployment(
             f"d-{len(self._deployments) + 1}",
@@ -495,8 +498,9 @@ class StubProviders:
         return [(p.provider_id, m) for p in self._providers for m in p.models]
 
     def resolve_key(self, provider_id: str) -> str:
-        # A stub never holds real key material. Agent I resolves the real one
-        # from the environment or /data/secrets.json at request time.
+        # A stub never holds real key material. The real provider service
+        # resolves the real one from the environment or /data/secrets.json
+        # at request time.
         return "stub-key-not-real"
 
     def health(self, provider_id: str) -> tuple[bool, str | None]:

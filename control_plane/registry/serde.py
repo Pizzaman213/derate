@@ -169,6 +169,33 @@ def processes_to_dict(
     }
 
 
+def containers_to_dict(node_id: str, containers: list[dict] | None) -> dict:
+    """The container-membership payload, with its own reason for being empty.
+
+    Same ``available``/empty-list distinction as :func:`processes_to_dict`,
+    for the same reason: nvidia-smi or docker not answering at all is not the
+    same fact as this node running nothing containerized, and the two must
+    not read the same way to a caller deciding whether anything here is
+    adoptable.
+    """
+    if containers is None:
+        return {
+            "node_id": node_id,
+            "containers": [],
+            "available": False,
+            "reason": (
+                "nvidia-smi or docker did not answer on this node, so which "
+                "processes belong to which container could not be read."
+            ),
+        }
+    return {
+        "node_id": node_id,
+        "containers": containers,
+        "available": True,
+        "reason": None,
+    }
+
+
 def storage_to_dict(payload: dict | None, node_id: str) -> dict:
     """The storage payload, with its own reason for being empty.
 

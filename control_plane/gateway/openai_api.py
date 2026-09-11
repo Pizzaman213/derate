@@ -39,6 +39,18 @@ _ENDPOINT_MODALITY: dict[str, Modality] = {
     "/audio/transcriptions": Modality.TRANSCRIPTION,
 }
 
+#: Endpoints whose RESPONSE is audio bytes, which is the only thing that
+#: decides whether reading the body for a `usage` block is worth anything.
+#:
+#: This used to be inferred from the request instead -- `count_tokens = body is
+#: not None` -- and that is backwards for both audio endpoints, in opposite
+#: directions. /audio/speech sends JSON and receives MP3, so it sniffed a
+#: megabyte of audio to learn nothing; /audio/transcriptions sends multipart
+#: and receives JSON that carries a real usage block, so it refused to read the
+#: one response here worth reading. A claim about the response has to be made
+#: about the response.
+_RESPONSE_IS_AUDIO: frozenset[str] = frozenset({"/audio/speech"})
+
 #: The modalities that are genuinely a different endpoint family. TEXT and
 #: EMBEDDING are deliberately not in here: one vLLM server answers
 #: /v1/chat/completions and /v1/embeddings from the same weights, and this
@@ -321,9 +333,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         separate channel rather than overloading that one.
         """
         settings = ctx.settings
-        # An audio body has no tokens to count and nothing to read a `usage`
-        # block out of.
-        count_tokens = body is not None
+        # Audio bytes carry no usage block; everything else may. See
+        # _RESPONSE_IS_AUDIO for why this is not asked of the request.
+        count_tokens = path not in _RESPONSE_IS_AUDIO
 
         # Minted before the first thing that can refuse, so a 404 is recorded
         # as readily as a 200. Every attempt this request makes shares the id,
@@ -626,19 +638,29 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     open_upstream = getattr(
                         ctx.deps.providers, "open_upstream", None
                     )
+                    open_upstream_raw = getattr(
+                        ctx.deps.providers, "open_upstream_raw", None
+                    )
                     use_provider_service = (
                         open_upstream is not None
                         and provider_id is not None
                         and provider_upstream_id is not None
-                        # The managed path builds its payload with dict(body),
-                        # which an opaque upload has none of. A multipart
-                        # request therefore takes the raw forward below: it
-                        # still carries the provider's key and still fails over,
-                        # but the provider service's own spend accounting and
-                        # budget enforcement do not run on it. Acceptable for
-                        # now because transcription is priced per audio-minute
-                        # and nothing on this path can read that figure anyway.
-                        and content is None
+                        # A multipart upload used to be excluded here, because
+                        # the managed path builds its payload with dict(body)
+                        # and an opaque upload has none. It took the raw
+                        # forward below instead -- which carries the provider's
+                        # key and fails over, but runs none of the provider's
+                        # own accounting, so NOTHING a transcription spent was
+                        # ever recorded. `open_upstream_raw` is that path with
+                        # the body left opaque; a providers port that does not
+                        # have it still falls back exactly as before.
+                        and (
+                            content is None
+                            or (
+                                open_upstream_raw is not None
+                                and content_type is not None
+                            )
+                        )
                     )
                     if not use_provider_service and selection.provider is not None:
                         try:
@@ -674,6 +696,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         stats=ctx.stats,
                         streaming=streaming,
                         open_upstream=open_upstream,
+                        open_upstream_raw=open_upstream_raw,
+                        content=upstream_content if content is not None else None,
+                        content_type=content_type,
+                        count_tokens=count_tokens,
                         on_finish=on_finish,
                         selection=selection,
                         trace=trace,

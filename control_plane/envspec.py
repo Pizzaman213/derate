@@ -101,6 +101,9 @@ _DECLARED = (
     _v("DERATE_VLLM_IMAGE", None, "control_plane/deploy/flags.py", ""),
     _v("DERATE_SGLANG_IMAGE", None, "control_plane/deploy/flags.py", ""),
     _v("DERATE_TTS_IMAGE", None, "control_plane/deploy/flags.py", ""),
+    _v("DERATE_LLAMACPP_IMAGE", None, "control_plane/deploy/flags.py",
+       "the CPU runtime's image; the default is a CPU build, so a CUDA "
+       "llama.cpp tag has to be named here to be used"),
     _v("DERATE_TTS_VOICE_DIR", None, "control_plane/runtimes/tts.py",
        "read inside the model container, not on the node"),
     _v("DERATE_SPARKRUN_BIN", None, "control_plane/deploy/sparkrun.py",
@@ -108,13 +111,37 @@ _DECLARED = (
     _v("DERATE_IMAGE", "ghcr.io/pizzaman213/derate/node:latest", "install.sh", ""),
     _v("DERATE_ENTRYPOINT", None, "docker/entrypoint.sh", ""),
 
+    _v("DERATE_NCCL_ENV", None, "control_plane/deploy/manager.py",
+       "NAME=VALUE,... rendered into a multi-rank launch's recipe env: block. "
+       "Every name is checked against the image's own NCCL_TUNABLES first, "
+       "because NCCL ignores an unknown one silently. No default on purpose: "
+       "nothing has measured a collective on this fabric, and NCCL already "
+       "picks a protocol by message size. See tests/nccl_sweep.py"),
+
     # -- the interconnect measurement ---------------------------------------
     _v("DERATE_MPIRUN", None, "control_plane/links/measure.py", ""),
+    _v("DERATE_NCCL_AUTOCALIBRATE", "1", "control_plane/links/service.py",
+       "0 stops a link measurement also calibrating a never-calibrated pair. "
+       "Calibration costs one two-rank collective per candidate setting and "
+       "runs only when nothing is stored for that pair and image, so it is "
+       "once per pair per image rather than per measurement"),
+    _v("DERATE_NCCL_MASTER", "127.0.0.1", "tests/nccl_sweep.py",
+       "rendezvous address for the two-rank collective harness"),
+    _v("DERATE_NCCL_PORT", "29555", "tests/nccl_sweep.py",
+       "rendezvous port for the same; not a served port"),
     _v("DERATE_MPIRUN_ARGS", "", "control_plane/links/measure.py", ""),
     _v("DERATE_NCCL_TESTS_DIR", None, "control_plane/links/measure.py", ""),
 
     # -- providers -----------------------------------------------------------
     _v("DERATE_PULL_HEADROOM", "0.8", "control_plane/providers/config.py", ""),
+    _v("DERATE_AUTO_ADOPT_RUNTIMES", "1", "control_plane/gateway/settings.py",
+       "0 disables the background scan that registers a detected external "
+       "runtime (e.g. Ollama) as a provider without a human clicking Adopt; "
+       "the manual POST /api/nodes/{id}/runtime route is unaffected either way"),
+    _v("DERATE_AUTO_ADOPT_CONTAINERS", "1", "control_plane/gateway/settings.py",
+       "0 disables the background scan that reconstructs a deployment record "
+       "for a derate-launched sparkrun container running with no matching "
+       "entry in the deployment store"),
 
     # -- the shell on a node -------------------------------------------------
     _v("DERATE_SHELL", "0", "control_plane/registry/shell_config.py",
@@ -149,6 +176,8 @@ _DECLARED = (
 
     # -- the gateway ---------------------------------------------------------
     _v("DERATE_ALLOWED_ORIGINS", "", "control_plane/gateway/settings.py", ""),
+    _v("DERATE_API_TOKEN", None, "control_plane/gateway/settings.py",
+       "opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op"),
     _v("DERATE_ELECTRICITY_RATE", "0", "control_plane/gateway/main.py",
        "currency per kWh; 0 means the spend screen shows no power cost"),
     _v("DERATE_INSTALL_SH", None, "control_plane/gateway/enroll_api.py",

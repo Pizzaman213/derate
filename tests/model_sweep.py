@@ -632,6 +632,67 @@ def _default_probe_cache() -> Path:
     return Path(data_dir()) / "cache" / "runtimes"
 
 
+def sweep_curated(*, timeout: float = 120.0) -> int:
+    """Resolve every model on the curated strip, for real, against the hub.
+
+    The strip is the first thing on the models screen and the only thing on it
+    nobody chose, so a withdrawn or renamed repository is a dead row in the
+    most visible place in the product -- and until this existed, nothing
+    anywhere noticed. `tests/unit/test_catalog.py` holds the list to its shape
+    and its cap; only the network can answer whether the ids are still real.
+
+    A GATED repository is reported apart and does not fail. It is a licence
+    this box has not accepted, not a broken entry:
+    `meta-llama/Llama-3.3-70B-Instruct` has been on this list since the
+    beginning and 401s here. Counting that as a failure would make the check
+    depend on whose token is in the environment, which is exactly the kind of
+    result that gets ignored.
+    """
+    from control_plane.fit.catalog import CURATED_MODELS
+    from control_plane.resolver.resolver import ModelResolver
+    from control_plane.resolver.types import MetadataUnavailable, ModelNotFound
+
+    resolver = ModelResolver()
+    ok: list[str] = []
+    gated: list[tuple[str, str]] = []
+    broken: list[tuple[str, str]] = []
+
+    print(f"resolving {len(CURATED_MODELS)} curated models ...\n")
+    for entry in CURATED_MODELS:
+        try:
+            shape = resolver.resolve(entry.model_id)
+        except ModelNotFound as exc:
+            broken.append((entry.model_id, str(exc)))
+        except MetadataUnavailable as exc:
+            # 401/403 is a licence; anything else here is the hub failing or
+            # the repo being unreadable, and that IS a broken row.
+            text = str(exc)
+            if "gated" in text or "401" in text or "403" in text:
+                gated.append((entry.model_id, text))
+            else:
+                broken.append((entry.model_id, text))
+        except Exception as exc:  # pragma: no cover - defensive
+            broken.append((entry.model_id, f"{type(exc).__name__}: {exc}"))
+        else:
+            ok.append(entry.model_id)
+            print(
+                f"  ok      {entry.label:24} {shape.total_params / 1e9:7.1f}B "
+                f"{shape.dtype}"
+            )
+
+    for model_id, why in gated:
+        print(f"  gated   {model_id}\n            {why}")
+    for model_id, why in broken:
+        print(f"  BROKEN  {model_id}\n            {why}")
+
+    print(
+        f"\n{len(ok)} resolved, {len(gated)} gated here, {len(broken)} broken"
+    )
+    if gated and not broken:
+        print("Gated is not a failure: set HF_TOKEN to check those too.")
+    return 1 if broken else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--live", action="store_true",
@@ -639,6 +700,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=0, help="stop after N models")
     parser.add_argument("--all", action="store_true",
                         help="include provider-only models, which have no local shape")
+    parser.add_argument("--curated", action="store_true",
+                        help="resolve every id in fit/catalog.py CURATED_MODELS")
     parser.add_argument("--arch", action="store_true",
                         help="diff VLLM_ARCHITECTURES against the pinned image's registry")
     parser.add_argument("--probe-cache", default=None,
@@ -651,6 +714,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     probe_cache = Path(args.probe_cache) if args.probe_cache else _default_probe_cache()
+
+    if args.curated:
+        return sweep_curated(timeout=args.timeout)
 
     if args.arch:
         found = architecture_divergence(cache_dir=probe_cache)

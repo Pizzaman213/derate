@@ -1,6 +1,6 @@
 """Admission control: the request-level half of out-of-memory prevention.
 
-Agent F watches nodes. The gateway watches requests. Before proxying anything
+The deployment manager watches nodes. The gateway watches requests. Before proxying anything
 we estimate what it will cost in KV cache, refuse it if the deployment cannot
 afford it, and hold the commitment until the response completes.
 
@@ -22,7 +22,7 @@ from .settings import GatewaySettings
 log = logging.getLogger("gateway.admission")
 
 # Bytes per element for KV cache dtypes. Only used by the fallback estimator
-# below; Agent D's kv_bytes_per_token is preferred whenever it is available.
+# below; the fit calculator's kv_bytes_per_token is preferred whenever it is available.
 _KV_ELEMENT_BYTES = {
     "fp32": 4.0,
     "float32": 4.0,
@@ -55,7 +55,7 @@ class AdmissionDecision:
 
 
 def kv_bytes_per_token_fallback(shape: ModelShape, kv_dtype: str) -> float:
-    """Conservative per-token KV cost, used when Agent D exposes no estimator.
+    """Conservative per-token KV cost, used when the fit calculator exposes no estimator.
 
     Deliberately ignores sliding-window savings. Over-charging refuses a
     request that would have fit; under-charging OOMs the node.
@@ -149,7 +149,7 @@ class AdmissionController:
             log.info("admitting to %s again", target_id)
 
     def set_memory_critical(self, deployment_id: str, critical: bool) -> None:
-        """Called by Agent F when a deployment's memory goes critical.
+        """Called by the deployment manager when a deployment's memory goes critical.
 
         Stops new admissions. Never kills in-flight work: outstanding requests
         run to completion and release their commitments normally.

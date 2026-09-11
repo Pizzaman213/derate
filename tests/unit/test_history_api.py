@@ -20,6 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
+from control_plane.registry.telemetry import TelemetrySample
 from control_plane.telemetry import KIND_EVENT, KIND_LOG, KIND_SAMPLE
 from control_plane.telemetry.archive import Archive, open_archive
 from control_plane.telemetry.service import Telemetry
@@ -178,12 +179,19 @@ def test_the_ring_and_the_archive_return_the_same_shape(live):
     `durable`; if their SAMPLE keys also match, a UI branches on raw-vs-rollup
     and nothing else. If they ever diverge, every chart needs a third case."""
     now = time.time()
-    sample = {
-        "ts": now - 5, "memory_used": 10, "memory_total": 128, "power_w": 71.0,
-        "temp_c": 62.0, "util_pct": 34.0, "gpu_memory_used": 9,
-        "gpu_process_count": 1, "host_memory_total": 128,
-        "host_memory_available": 100, "swap_used": 0,
-    }
+    # Built from as_dict() rather than typed out, so the fixture itself cannot
+    # be the thing that diverges. A hand-written key list here would keep
+    # passing while the two real paths drifted apart -- which is the one failure
+    # this test exists to catch.
+    sample = TelemetrySample(
+        ts=now - 5, memory_used=10, memory_total=128, power_watts=71.0,
+        temperature_c=62.0, utilization_pct=34.0, gpu_memory_used=9,
+        gpu_process_count=1, host_memory_total=128,
+        host_memory_available=100, swap_used=0,
+        clock_throttle_bits=0x4, sm_clock_mhz=1500, sm_clock_max_mhz=3003,
+        swap_in_bps=0.0, swap_out_bps=1048576.0, major_faults_per_s=2.0,
+        memory_pressure_pct=11.0,
+    ).as_dict()
     _ingest(live.archive, "spark-01",
             [{"kind": KIND_SAMPLE, "ts": now - 5, "body": dict(sample)}])
     with _client(live) as client:

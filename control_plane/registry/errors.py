@@ -8,7 +8,7 @@ class RegistryError(Exception):
 
 
 class JoinRejected(RegistryError):
-    """A join attempt was refused. Agent G maps this to HTTP 403.
+    """A join attempt was refused. The gateway maps this to HTTP 403.
 
     Carries no detail about the token itself. A rejected joiner is told that it
     was rejected, not why, so a wrong-token probe cannot be used as an oracle.

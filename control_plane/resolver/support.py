@@ -189,12 +189,18 @@ VLLM_KNOWN_BROKEN: dict[str, str] = {
     ),
 }
 
-#: SGLang's, still hand-kept: the pinned image is
-#: scitrera/dgx-spark-sglang:0.5.9-t5 and it is not on the box this was
-#: written on, so there is no registry to read and no honest way to generate
-#: this the way the vllm set above is generated. It is therefore stale in the
-#: direction that refuses working models -- Gemma 4 is the current example --
-#: and a name added here has to come from a launch somebody watched.
+#: SGLang's, hand-kept and confirmed stale against a real image: the pinned
+#: tag is scitrera/dgx-spark-sglang:0.5.9-t5, but scitrera/dgx-spark-sglang:0.5.12
+#: was available to check, and its registry has both
+#: `Gemma4ForConditionalGeneration` and `Gemma4AssistantForCausalLM` -- neither
+#: of which is in this set. `imageprobe.py`'s SGLang script (added once that
+#: image existed to read) is what closes this now, the same way the vllm probe
+#: replaces the set above: `architectures_for("sglang")` prefers a probe when
+#: one has run and falls back to this set otherwise. This table is therefore
+#: only what a coordinator with no docker socket, or the exact pinned tag
+#: un-probed, answers from -- and it is still stale in the direction that
+#: refuses working models, so a name added here by hand has to come from a
+#: launch somebody watched, same as ever.
 SGLANG_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "BaichuanForCausalLM", "ChatGLMModel", "CohereForCausalLM", "DbrxForCausalLM",
@@ -282,6 +288,61 @@ def modality_for(architectures) -> str:
             return found
     return "text"
 
+#: GGUF names its architectures in ggml's lowercase style. Map them onto the
+#: transformers class names the support lists are keyed by.
+GGUF_ARCHITECTURE_NAMES: dict[str, str] = {
+    "llama": "LlamaForCausalLM",
+    "llama4": "Llama4ForConditionalGeneration",
+    "mistral": "MistralForCausalLM",
+    "mixtral": "MixtralForCausalLM",
+    "qwen2": "Qwen2ForCausalLM",
+    "qwen2moe": "Qwen2MoeForCausalLM",
+    "qwen3": "Qwen3ForCausalLM",
+    "qwen3moe": "Qwen3MoeForCausalLM",
+    "gemma": "GemmaForCausalLM",
+    "gemma2": "Gemma2ForCausalLM",
+    "gemma3": "Gemma3ForCausalLM",
+    "phi2": "PhiForCausalLM",
+    "phi3": "Phi3ForCausalLM",
+    "gpt2": "GPT2LMHeadModel",
+    "gptoss": "GptOssForCausalLM",
+    "gpt-oss": "GptOssForCausalLM",
+    "starcoder2": "Starcoder2ForCausalLM",
+    "falcon": "FalconForCausalLM",
+    "stablelm": "StableLmForCausalLM",
+    "olmo": "OlmoForCausalLM",
+    "olmo2": "Olmo2ForCausalLM",
+    "minicpm": "MiniCPMForCausalLM",
+    "command-r": "CohereForCausalLM",
+    "cohere2": "Cohere2ForCausalLM",
+    "deepseek2": "DeepseekV2ForCausalLM",
+    "deepseek3": "DeepseekV3ForCausalLM",
+    "internlm2": "InternLM2ForCausalLM",
+    "granite": "GraniteForCausalLM",
+    "chatglm": "ChatGLMModel",
+    "bloom": "BloomForCausalLM",
+    "dbrx": "DbrxForCausalLM",
+    "exaone": "ExaoneForCausalLM",
+    "glm4": "Glm4ForCausalLM",
+}
+
+
+#: What llama.cpp loads, derived from the table above rather than hand-kept.
+#:
+#: Every key in `GGUF_ARCHITECTURE_NAMES` is a ggml architecture name, and a
+#: ggml architecture name exists only because llama.cpp has a converter and a
+#: graph for that family -- that is what the name IS. So the values of that
+#: map are not a claim copied off a README, they are the same evidence the
+#: mapping itself rests on, and a new entry there teaches this runtime the
+#: architecture in the same edit.
+#:
+#: It is narrower than llama.cpp's real coverage, which is the safe direction:
+#: an architecture missing here is refused with `_elsewhere()` naming a
+#: runtime that does load it, while one wrongly present is a launch that
+#: clears every gate and dies inside a container on another machine.
+LLAMACPP_ARCHITECTURES: frozenset[str] = frozenset(GGUF_ARCHITECTURE_NAMES.values())
+
+
 #: Quantization support per runtime. Anything absent is unsupported.
 _VLLM_QUANTS: dict[str, SupportLevel] = {
     "fp32": SupportLevel.SUPPORTED, "fp16": SupportLevel.SUPPORTED,
@@ -359,6 +420,51 @@ _TTS_QUANTS: dict[str, SupportLevel] = {
 }
 
 
+#: llama.cpp reads GGUF and nothing else, so this is the first table here
+#: where the ladder the other three refuse is the ladder that works -- and the
+#: first where `fp16`/`bf16` are UNSUPPORTED rather than the easy yes.
+#:
+#: That pair is the one worth arguing. llama.cpp can hold F16 tensors, so
+#: "cannot load fp16" reads wrong at first glance. What it cannot do is read a
+#: safetensors repository, and `fp16` on a shape here overwhelmingly means
+#: exactly that -- an unquantized checkpoint in somebody's normal weights
+#: format. Saying SUPPORTED would clear a launch that dies at load, which is
+#: the failure this project spends the most effort refusing to produce.
+#:
+#: The cost is real and is stated rather than hidden: an all-F16 *GGUF* build
+#: is refused too, because nothing on a `ModelShape` distinguishes it from the
+#: safetensors case -- `evaluate_runtime` is handed a dtype and an
+#: architecture and no answer to "is this a GGUF repository". That is a gap in
+#: what a shape carries, not a fact about llama.cpp, and the refusal points at
+#: a quantized build rather than pretending the model is unservable.
+_LLAMACPP_QUANTS: dict[str, SupportLevel] = {
+    "fp32": SupportLevel.UNSUPPORTED,
+    "fp16": SupportLevel.UNSUPPORTED,
+    "bf16": SupportLevel.UNSUPPORTED,
+    "fp8": SupportLevel.UNSUPPORTED,
+    "int8": SupportLevel.UNSUPPORTED,
+    "awq_int4": SupportLevel.UNSUPPORTED,
+    "gptq_int4": SupportLevel.UNSUPPORTED,
+    "nf4": SupportLevel.UNSUPPORTED,
+    "mxfp4": SupportLevel.UNSUPPORTED,
+    "nvfp4": SupportLevel.UNSUPPORTED,
+    # The ladder, and llama.cpp is where it comes from: these are its own
+    # scheme names, produced by its own quantizer.
+    "q8_0": SupportLevel.SUPPORTED, "q6_k": SupportLevel.SUPPORTED,
+    "q5_k_m": SupportLevel.SUPPORTED, "q4_k_m": SupportLevel.SUPPORTED,
+    "q4_0": SupportLevel.SUPPORTED, "q3_k_m": SupportLevel.SUPPORTED,
+    "q2_k": SupportLevel.SUPPORTED,
+    "q4_1": SupportLevel.SUPPORTED, "q5_0": SupportLevel.SUPPORTED,
+    "q5_1": SupportLevel.SUPPORTED, "q2_k_s": SupportLevel.SUPPORTED,
+    "iq1_s": SupportLevel.SUPPORTED, "iq1_m": SupportLevel.SUPPORTED,
+    "iq2_xxs": SupportLevel.SUPPORTED, "iq2_xs": SupportLevel.SUPPORTED,
+    "iq2_s": SupportLevel.SUPPORTED, "iq2_m": SupportLevel.SUPPORTED,
+    "iq3_xxs": SupportLevel.SUPPORTED, "iq3_xs": SupportLevel.SUPPORTED,
+    "iq3_s": SupportLevel.SUPPORTED, "iq3_m": SupportLevel.SUPPORTED,
+    "iq4_xs": SupportLevel.SUPPORTED, "iq4_nl": SupportLevel.SUPPORTED,
+}
+
+
 @dataclass(frozen=True)
 class RuntimeProfile:
     name: str
@@ -378,6 +484,10 @@ RUNTIMES: dict[str, RuntimeProfile] = {
     # text-to-speech checkpoint had nowhere to run at all -- not "ran badly",
     # nowhere. control_plane/runtimes/tts.py.
     "tts": RuntimeProfile("tts", TTS_ARCHITECTURES, _TTS_QUANTS),
+    # The fourth, and the only one that does not need a GPU. It exists for the
+    # machines the other three cannot use at all -- a Raspberry Pi, a NAS, a
+    # spare x86 box -- which until now could join the roster and serve nothing.
+    "llamacpp": RuntimeProfile("llamacpp", LLAMACPP_ARCHITECTURES, _LLAMACPP_QUANTS),
 }
 
 
@@ -426,56 +536,29 @@ def architectures_for(runtime: str) -> frozenset[str]:
     return profile.architectures if profile is not None else frozenset()
 
 
-#: GGUF names its architectures in ggml's lowercase style. Map them onto the
-#: transformers class names the support lists are keyed by.
-GGUF_ARCHITECTURE_NAMES: dict[str, str] = {
-    "llama": "LlamaForCausalLM",
-    "llama4": "Llama4ForConditionalGeneration",
-    "mistral": "MistralForCausalLM",
-    "mixtral": "MixtralForCausalLM",
-    "qwen2": "Qwen2ForCausalLM",
-    "qwen2moe": "Qwen2MoeForCausalLM",
-    "qwen3": "Qwen3ForCausalLM",
-    "qwen3moe": "Qwen3MoeForCausalLM",
-    "gemma": "GemmaForCausalLM",
-    "gemma2": "Gemma2ForCausalLM",
-    "gemma3": "Gemma3ForCausalLM",
-    "phi2": "PhiForCausalLM",
-    "phi3": "Phi3ForCausalLM",
-    "gpt2": "GPT2LMHeadModel",
-    "gptoss": "GptOssForCausalLM",
-    "gpt-oss": "GptOssForCausalLM",
-    "starcoder2": "Starcoder2ForCausalLM",
-    "falcon": "FalconForCausalLM",
-    "stablelm": "StableLmForCausalLM",
-    "olmo": "OlmoForCausalLM",
-    "olmo2": "Olmo2ForCausalLM",
-    "minicpm": "MiniCPMForCausalLM",
-    "command-r": "CohereForCausalLM",
-    "cohere2": "Cohere2ForCausalLM",
-    "deepseek2": "DeepseekV2ForCausalLM",
-    "deepseek3": "DeepseekV3ForCausalLM",
-    "internlm2": "InternLM2ForCausalLM",
-    "granite": "GraniteForCausalLM",
-    "chatglm": "ChatGLMModel",
-    "bloom": "BloomForCausalLM",
-    "dbrx": "DbrxForCausalLM",
-    "exaone": "ExaoneForCausalLM",
-    "glm4": "Glm4ForCausalLM",
-}
-
-
 def normalize_architecture(name: str) -> str:
     """Accept either a transformers class name or a ggml architecture name."""
     return GGUF_ARCHITECTURE_NAMES.get(name.strip().lower(), name)
 
 
 def runtimes_serving(architectures) -> list[str]:
-    """Every runtime in this build that lists one of these architectures."""
+    """Every runtime in this build that actually loads one of these
+    architectures -- registered *and* not known to crash there.
+
+    Registration alone is not enough: `DiffusionGemmaForBlockDiffusion` is in
+    vLLM's own registry and still refused, via `VLLM_KNOWN_BROKEN`, because it
+    dies in CUDA graph capture. Pointing a reader refused on sglang or tts at
+    "the vllm runtime loads it" would be false in exactly the case where the
+    reason matters most -- the runtime that "loads" it also refuses it, for a
+    documented crash rather than a missing name.
+    """
     return [
         name
         for name in RUNTIMES
-        if any(a in architectures_for(name) for a in architectures or ())
+        if any(
+            a in architectures_for(name) and a not in RUNTIMES[name].known_broken
+            for a in architectures or ()
+        )
     ]
 
 
@@ -502,6 +585,33 @@ def quant_requirement(dtype: str) -> QuantRequirement:
         emulated_below_native=info.emulated_below_native,
         note=info.note,
     )
+
+
+def _quant_hint(runtime: str, dtype: str) -> str:
+    """The half of a quantization refusal that says where to go instead.
+
+    Two directions, and they are not symmetric. Telling somebody that GGUF
+    "belongs on a llama.cpp backend" was, for the life of that sentence, a
+    statement about a backend this project did not have; now it names one, and
+    the sentence stops being a shrug. The reverse hint is new and matters
+    more, because it is the one an operator hits by accident: llama.cpp is the
+    runtime you pick for a machine with no GPU, and then you point it at the
+    ordinary safetensors repository you already had open.
+
+    Silence for everything else. A note that does not name an alternative is
+    noise on the end of a refusal that was already clear.
+    """
+    family = quant_info(dtype).family
+    if runtime == "llamacpp":
+        if family != "gguf":
+            return (
+                "; llama.cpp reads GGUF and nothing else, so this needs a GGUF "
+                "build of the same model rather than the original weights"
+            )
+        return ""
+    if family == "gguf":
+        return "; GGUF is llama.cpp's format and belongs on a llama.cpp backend"
+    return ""
 
 
 def evaluate_runtime(
@@ -532,11 +642,7 @@ def evaluate_runtime(
             key,
             SupportLevel.UNSUPPORTED,
             f"{profile.name} cannot load {dtype} weights"
-            + (
-                "; GGUF is llama.cpp's format and belongs on a llama.cpp backend"
-                if quant_info(dtype).family == "gguf"
-                else ""
-            ),
+            + _quant_hint(key, dtype),
             version,
         )
 
@@ -558,6 +664,28 @@ def evaluate_runtime(
         arch_level, arch_reason = (
             SupportLevel.SUPPORTED,
             f"{profile.name} supports {known[0]}",
+        )
+    elif found is not None and architectures[0] in found.out_of_tree:
+        # vLLM moved this one out of tree; refusing without naming the plugin
+        # would be true and leave the reader nowhere to go, same as every
+        # other refusal here.
+        arch_level, arch_reason = (
+            SupportLevel.UNSUPPORTED,
+            f"{architectures[0]} is loaded by a plugin, not built into "
+            f"{found.provenance}: {found.out_of_tree[architectures[0]]}"
+            f"{_elsewhere(architectures, key)}",
+        )
+    elif found is not None and architectures[0] in found.removed:
+        # vLLM shipped this once and dropped it. Distinct from "never
+        # supported" for the same reason DiffusionGemma's broken-not-missing
+        # case is distinct above: the fix is different (an older image) and
+        # the operator can't tell the two apart from "is not in the list".
+        arch_level, arch_reason = (
+            SupportLevel.UNSUPPORTED,
+            f"{architectures[0]} was supported by vLLM through "
+            f"{found.removed[architectures[0]]} and is not in {found.provenance}'s "
+            f"registry -- not available in a newer image, only an older one"
+            f"{_elsewhere(architectures, key)}",
         )
     else:
         where = (

@@ -151,7 +151,9 @@ def nodes(
             sql = (
                 "SELECT node_id, ts, memory_used, memory_total, power_w, temp_c, "
                 "util_pct, gpu_memory_used, gpu_process_count, host_memory_total, "
-                "host_memory_available, swap_used FROM samples "
+                "host_memory_available, swap_used, clock_throttle_bits, "
+                "sm_clock_mhz, sm_clock_max_mhz, swap_in_bps, swap_out_bps, "
+                "major_faults_per_s, memory_pressure_pct FROM samples "
                 "WHERE ts >= ? AND ts < ?" + where + " ORDER BY ts DESC LIMIT ?"
             )
         else:
@@ -159,7 +161,11 @@ def nodes(
                 "SELECT node_id, bucket AS ts, n, power_w_avg, power_w_max, "
                 "temp_c_avg, temp_c_max, util_pct_avg, util_pct_max, "
                 "memory_used_avg, memory_used_max, gpu_memory_used_avg, "
-                "gpu_memory_used_max, host_memory_available_min, swap_used_max "
+                "gpu_memory_used_max, host_memory_available_min, swap_used_max, "
+                "throttle_bits_any, throttled_s, throttle_n, sm_clock_avg, "
+                "sm_clock_min, sm_clock_max_mhz, swap_in_bps_avg, swap_in_bps_max, "
+                "swap_out_bps_avg, swap_out_bps_max, major_faults_max, "
+                "memory_pressure_pct_avg, memory_pressure_pct_max "
                 "FROM rollup_samples WHERE step = ? AND bucket >= ? AND bucket < ?"
                 + where
                 + " ORDER BY bucket DESC LIMIT ?"

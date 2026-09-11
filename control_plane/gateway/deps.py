@@ -102,6 +102,9 @@ class GatewayContext:
     # database answers that endpoint with a sentence rather than failing to
     # start.
     inventory: "object" = None
+    # The standing-alert book. Optional and defaulted like the four above:
+    # a gateway built without one answers /api/alerts with an empty set.
+    alerts: "object" = None
     started_at: float = 0.0
     degraded_startup: list[str] = field(default_factory=list)
 

@@ -4,7 +4,7 @@ Strength, in strict order of preference (architecture 4.5):
 
 1. Measured sustained decode tok/s for this target, once at least
    ``measured_strength_min_requests`` requests have completed.
-2. Agent D's ``predicted_decode_tps`` for this shape on this node's profile.
+2. The fit calculator's ``predicted_decode_tps`` for this shape on this node's profile.
 3. ``memory_bandwidth_gbps * gpu_count`` as a last resort.
 
 Never compute strength from a spec sheet once measured throughput exists.

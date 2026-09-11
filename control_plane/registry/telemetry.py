@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from control_plane.contracts import (
     DEFAULT_GUARDRAIL,
@@ -38,12 +40,53 @@ from control_plane.contracts import (
 )
 
 from . import hostfacts
-from .config import HOST_MEMORY_RESERVE, TELEMETRY_RING_SAMPLES
-from .probe import _num
+from .config import HOST_MEMORY_RESERVE, TELEMETRY_RING_SAMPLES, cpu_host_reserve
+from .probe import _NOT_A_NUMBER, _num
 
 log = logging.getLogger(__name__)
 
-TELEMETRY_QUERY = "memory.used,memory.total,power.draw,temperature.gpu,utilization.gpu"
+#: The five fields every driver has known for years. Kept as its own constant
+#: because it is the fallback, not merely the old value -- see
+#: ``_clock_fields_ok`` below.
+TELEMETRY_QUERY_BASE = (
+    "memory.used,memory.total,power.draw,temperature.gpu,utilization.gpu"
+)
+#: ...and the three that say whether the clocks were being held down. They ride
+#: the call that already runs once a second, so they cost no extra process.
+TELEMETRY_QUERY = TELEMETRY_QUERY_BASE + (
+    ",clocks_event_reasons.active,clocks.sm,clocks.max.sm"
+)
+#: How many cells ``TELEMETRY_QUERY`` returns, and how many the fallback does.
+TELEMETRY_CELLS = 8
+TELEMETRY_CELLS_BASE = 5
+
+#: The bits that mean the clocks were held BELOW what was asked for. NVML also
+#: reports GpuIdle (0x1), ApplicationsClocksSetting (0x2), SyncBoost (0x10) and
+#: DisplayClockSetting (0x100); none of those is a derate. Including GpuIdle
+#: would light the badge on every quiet node in the fleet, which is most of them
+#: most of the time. Store the raw mask, derive the predicate from this in one
+#: place, and never test ``bits != 0``.
+CLOCK_SW_POWER_CAP = 0x4
+CLOCK_HW_SLOWDOWN = 0x8
+CLOCK_SW_THERMAL = 0x20
+CLOCK_HW_THERMAL = 0x40
+CLOCK_HW_POWER_BRAKE = 0x80
+CLOCK_THROTTLE_MASK = (
+    CLOCK_SW_POWER_CAP
+    | CLOCK_HW_SLOWDOWN
+    | CLOCK_SW_THERMAL
+    | CLOCK_HW_THERMAL
+    | CLOCK_HW_POWER_BRAKE
+)
+#: The name of each bit, for the reason line an event carries. Ordered so the
+#: hardware ones read last, because they are the serious ones.
+CLOCK_THROTTLE_NAMES = (
+    (CLOCK_SW_POWER_CAP, "sw power cap"),
+    (CLOCK_SW_THERMAL, "sw thermal"),
+    (CLOCK_HW_SLOWDOWN, "hw slowdown"),
+    (CLOCK_HW_THERMAL, "hw thermal"),
+    (CLOCK_HW_POWER_BRAKE, "hw power brake"),
+)
 # Per-process GPU memory. Works on GB10 where the aggregate fields do not.
 COMPUTE_APPS_QUERY = "pid,used_gpu_memory"
 # The same family with the name attached. Deliberately a second constant:
@@ -56,6 +99,10 @@ PROCESS_QUERY = "pid,process_name,used_gpu_memory"
 CMDLINE_MAX = 2000
 TELEMETRY_TIMEOUT_S = 2.0
 MEMINFO = Path("/proc/meminfo")
+VMSTAT = Path("/proc/vmstat")
+#: Pressure Stall Information. Optional in the kernel (CONFIG_PSI) and absent
+#: off Linux, so its absence is remembered rather than retried once a second.
+PRESSURE_MEMORY = Path("/proc/pressure/memory")
 THERMAL_ZONES = Path("/sys/class/thermal")
 PROC_STAT = Path("/proc/stat")
 # A zone reporting outside this range is handing back a sentinel rather than a
@@ -65,6 +112,37 @@ TEMP_MAX_C = 150.0
 # How long the first CPU reading waits for something to difference against.
 # /proc/stat is cumulative, so one reading carries no rate at all.
 CPU_FIRST_DELTA_S = 0.12
+# Bytes per page, for turning /proc/vmstat's page counts into a rate that is
+# comparable with swap_used. NOT 4096: this is aarch64, 16K and 64K kernels
+# exist, and hardcoding the x86 value understates paging by 4x or 16x on a
+# machine nobody would think to check.
+try:
+    PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+except (AttributeError, ValueError, OSError):  # pragma: no cover - non-POSIX
+    PAGE_SIZE = 4096
+
+
+def _round_or_none(value: float | None, places: int) -> float | None:
+    """Round for the wire, but keep None as None rather than rounding it to 0.0."""
+    return None if value is None else round(value, places)
+
+
+def _hexnum(cell: str) -> int | None:
+    """Parse one nvidia-smi integer cell that may be hexadecimal.
+
+    ``probe.py::_num`` is ``float(cell)`` and raises on ``0x0000000000000000``,
+    returning None -- so reusing it here would ship a field that is silently
+    always unknown. The clock-event mask is printed as hex and nothing else in
+    the query is, which is why this is its own parser rather than a widening of
+    that one.
+    """
+    cell = cell.strip()
+    if not cell or cell.lower() in _NOT_A_NUMBER:
+        return None
+    try:
+        return int(cell, 16) if cell.lower().startswith("0x") else int(cell)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -92,6 +170,37 @@ class TelemetrySample:
     host_memory_total: int = 0  # unified pool, GB10 only
     host_memory_available: int = 0  # kernel's own "allocatable without swapping"
     swap_used: int = 0
+    # Everything below defaults to None, never 0. On a machine with no GPU there
+    # is no throttle state and no SM clock, and 0 there would read as "measured,
+    # and it is fine" -- the same reason serde.power_reading refuses to report a
+    # GPU-less board as drawing 0 W. None means nobody looked.
+    clock_throttle_bits: int | None = None  # raw NVML mask; see CLOCK_THROTTLE_MASK
+    sm_clock_mhz: int | None = None
+    sm_clock_max_mhz: int | None = None
+    swap_in_bps: float | None = None
+    swap_out_bps: float | None = None
+    major_faults_per_s: float | None = None
+    memory_pressure_pct: float | None = None  # /proc/pressure/memory, full avg10
+
+    @property
+    def throttled(self) -> bool | None:
+        """Whether the clocks were being held BELOW what was asked for.
+
+        Tri-state on purpose. ``None`` is "no reading", which is a CPU-only node
+        or a driver too old for the field -- not a node that is running free.
+        Tests the mask rather than ``bits != 0``, because NVML also sets a bit
+        for an idle GPU and one for an operator-set clock limit, and neither is
+        a derate.
+        """
+        if self.clock_throttle_bits is None:
+            return None
+        return bool(self.clock_throttle_bits & CLOCK_THROTTLE_MASK)
+
+    @property
+    def throttle_reasons(self) -> tuple[str, ...]:
+        """The bits that were set, named. Empty when none were or none is known."""
+        bits = self.clock_throttle_bits or 0
+        return tuple(name for bit, name in CLOCK_THROTTLE_NAMES if bits & bit)
 
     @property
     def host_memory_used(self) -> int:
@@ -113,6 +222,13 @@ class TelemetrySample:
             "host_memory_total": self.host_memory_total,
             "host_memory_available": self.host_memory_available,
             "swap_used": self.swap_used,
+            "clock_throttle_bits": self.clock_throttle_bits,
+            "sm_clock_mhz": self.sm_clock_mhz,
+            "sm_clock_max_mhz": self.sm_clock_max_mhz,
+            "swap_in_bps": _round_or_none(self.swap_in_bps, 1),
+            "swap_out_bps": _round_or_none(self.swap_out_bps, 1),
+            "major_faults_per_s": _round_or_none(self.major_faults_per_s, 2),
+            "memory_pressure_pct": _round_or_none(self.memory_pressure_pct, 2),
         }
 
 
@@ -121,6 +237,7 @@ async def run_nvidia_smi_async(
     timeout: float = TELEMETRY_TIMEOUT_S,
     flag: str = "--query-gpu",
     allow_empty: bool = False,
+    note: "Callable[[str], None] | None" = None,
 ) -> list[list[str]] | None:
     """Async nvidia-smi query under a hard timeout. Returns None on any failure.
 
@@ -135,6 +252,12 @@ async def run_nvidia_smi_async(
     A slow nvidia-smi is killed rather than awaited. The poll loop keeps its
     cadence and the previous sample stays on screen, which is the correct
     failure: stale numbers beat a stalled UI.
+
+    ``note`` is called with WHY, when there is a why. Four quite different
+    failures collapsed into one ``None`` here, and the caller kept its previous
+    sample either way -- so a wedged driver and an idle GPU produced the same
+    flat line, and nothing anywhere recorded which one it had been. The values
+    are ``not_found``, ``timeout``, ``exit_nonzero`` and ``empty``.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -146,6 +269,8 @@ async def run_nvidia_smi_async(
         )
     except (FileNotFoundError, OSError) as exc:
         log.debug("nvidia-smi unavailable: %s", exc)
+        if note:
+            note("not_found")
         return None
 
     try:
@@ -157,9 +282,13 @@ async def run_nvidia_smi_async(
             await proc.wait()
         except (ProcessLookupError, OSError):
             pass
+        if note:
+            note("timeout")
         return None
 
     if proc.returncode != 0:
+        if note:
+            note("exit_nonzero")
         return None
     rows = [
         [cell.strip() for cell in line.split(",")]
@@ -168,7 +297,11 @@ async def run_nvidia_smi_async(
     ]
     if rows:
         return rows
-    return [] if allow_empty else None
+    if allow_empty:
+        return []
+    if note:
+        note("empty")
+    return None
 
 
 @dataclass(frozen=True)
@@ -317,6 +450,154 @@ async def read_cpu_utilization() -> float | None:
     return max(0.0, min(100.0, busy / span * 100.0))
 
 
+@dataclass(frozen=True)
+class _Paging:
+    """The cumulative page counters, and the moment they were read."""
+
+    ts: float
+    swap_in: int
+    swap_out: int
+    major_faults: int
+
+
+@dataclass(frozen=True)
+class PagingRates:
+    """How hard the machine is paging, right now."""
+
+    swap_in_bps: float
+    swap_out_bps: float
+    major_faults_per_s: float
+
+
+_last_paging: _Paging | None = None
+#: Remembered across calls: /proc/pressure/memory is optional in the kernel
+#: (CONFIG_PSI) and absent off Linux, and this runs once a second. Retrying and
+#: logging a missing file 86,400 times a day is its own outage.
+_pressure_available: bool | None = None
+
+
+def _read_vmstat(now: float) -> _Paging | None:
+    """The three counters that say whether the pool is actually thrashing."""
+    try:
+        text = VMSTAT.read_text()
+    except OSError:
+        return None
+    wanted = {"pswpin": 0, "pswpout": 0, "pgmajfault": 0}
+    seen = 0
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key in wanted:
+            try:
+                wanted[key] = int(value)
+            except ValueError:
+                return None
+            seen += 1
+            if seen == len(wanted):
+                break
+    if seen < len(wanted):
+        return None
+    return _Paging(
+        ts=now,
+        swap_in=wanted["pswpin"],
+        swap_out=wanted["pswpout"],
+        major_faults=wanted["pgmajfault"],
+    )
+
+
+def read_paging(now: float | None = None) -> PagingRates | None:
+    """Paging RATE since the previous call, or None when there is no answer yet.
+
+    ``swap_used`` is a level, and a level cannot tell a settled pool of cold
+    pages from a machine actively tearing itself apart -- measured on the box
+    this was written for, 4.5 GiB of swap in use at 0 pages/s out. The reserve
+    in ``HOST_MEMORY_RESERVE`` exists to prevent the second case and nothing
+    measured whether it worked.
+
+    Differenced here, on the machine that owns the counter, for the same reason
+    ``read_cpu_utilization`` differences /proc/stat here: the archive admits
+    late and out-of-order rows and deletes its oldest raw day, so it has no
+    guarantee it holds the row immediately before any other. A consumer-side
+    subtraction across a retention hole would invent a spike the size of the
+    hole -- the failure the ``gaps`` table exists to prevent, with the sign
+    flipped.
+
+    Unlike that function this one does NOT take its own short delta on the first
+    call. There the cost buys a first CPU reading that would otherwise show a
+    fabricated 0%; here it would be paid at every agent start to fill one second
+    of one chart, and None already says the right thing.
+    """
+    global _last_paging
+    now = time.time() if now is None else now
+    current = _read_vmstat(now)
+    if current is None:
+        return None
+    previous, _last_paging = _last_paging, current
+    if previous is None:
+        return None
+    span = current.ts - previous.ts
+    if span <= 0:
+        return None
+    if (
+        current.swap_in < previous.swap_in
+        or current.swap_out < previous.swap_out
+        or current.major_faults < previous.major_faults
+    ):
+        # The machine rebooted, or a counter wrapped. Either way the delta is
+        # not a rate. Report nothing and let the next call difference against
+        # the reading we just stored.
+        return None
+    return PagingRates(
+        swap_in_bps=(current.swap_in - previous.swap_in) * PAGE_SIZE / span,
+        swap_out_bps=(current.swap_out - previous.swap_out) * PAGE_SIZE / span,
+        major_faults_per_s=(current.major_faults - previous.major_faults) / span,
+    )
+
+
+def read_memory_pressure() -> float | None:
+    """Percent of the last 10s in which EVERY runnable task was stalled on memory.
+
+    The ``full`` line, not ``some``. ``some`` fires whenever any single task
+    waits on reclaim and is nonzero on a healthy machine constantly; ``full``
+    means nothing ran at all, which is the number that predicts the collapse.
+
+    ``avg10`` is a kernel-maintained 10-second average sampled at 1 Hz, so
+    consecutive samples overlap. That is deliberate: it makes the rollup MAX
+    read as "the worst 10-second window overlapping this bucket", which is what
+    an alert should fire on.
+    """
+    global _pressure_available
+    if _pressure_available is False:
+        return None
+    try:
+        text = PRESSURE_MEMORY.read_text()
+    except OSError:
+        _pressure_available = False
+        return None
+    _pressure_available = True
+    for line in text.splitlines():
+        if not line.startswith("full "):
+            continue
+        for field in line.split()[1:]:
+            key, _, value = field.partition("=")
+            if key == "avg10":
+                try:
+                    return float(value)
+                except ValueError:
+                    return None
+    return None
+
+
+def _paging_fields() -> dict[str, float | None]:
+    """The four host paging figures, as kwargs. Host facts, so both samplers use them."""
+    rates = read_paging()
+    return {
+        "swap_in_bps": rates.swap_in_bps if rates else None,
+        "swap_out_bps": rates.swap_out_bps if rates else None,
+        "major_faults_per_s": rates.major_faults_per_s if rates else None,
+        "memory_pressure_pct": read_memory_pressure(),
+    }
+
+
 async def read_host_sample(ts: float) -> TelemetrySample | None:
     """A sample for a machine with no GPU at all.
 
@@ -346,6 +627,9 @@ async def read_host_sample(ts: float) -> TelemetrySample | None:
         host_memory_total=host.total if host else 0,
         host_memory_available=host.available if host else 0,
         swap_used=host.swap_used if host else 0,
+        # A machine with no GPU still swaps, and swapping is the same signal
+        # there. The three clock fields stay None: there is no GPU to derate.
+        **_paging_fields(),
     )
 
 
@@ -450,11 +734,57 @@ async def read_gpu_processes(
     return out
 
 
+#: Tri-state. None = not yet established, True = this driver answers the clock
+#: fields, False = it does not and we stopped asking.
+_clock_fields_ok: bool | None = None
+
+
+async def _query_gpus(
+    note: "Callable[[str], None] | None" = None,
+) -> tuple[list[list[str]] | None, bool]:
+    """One --query-gpu, with the clock fields if this driver knows them.
+
+    Returns ``(rows, had_clocks)``.
+
+    An unknown field does not degrade -- it fails the WHOLE query. Verified:
+    ``--query-gpu=power.draw,temperature.gpu,not_a_real_field`` prints
+    ``Field "not_a_real_field" is not a valid field to query.`` and exits 2 with
+    no data at all. Without the fallback below, a driver too old for
+    ``clocks_event_reasons.active`` would therefore lose a GPU node ALL of its
+    telemetry rather than three fields of it, and the node would sit in the
+    roster at a permanent 0W/0C/0% while nvidia-smi worked perfectly from a
+    shell. ``probe.py::PROBE_QUERY_FALLBACK`` exists for exactly this reason and
+    exactly this shape, one query earlier in the same process.
+
+    The answer is remembered, so the cost is one extra subprocess per process
+    rather than one per second.
+    """
+    global _clock_fields_ok
+    if _clock_fields_ok is not False:
+        rows = await run_nvidia_smi_async(TELEMETRY_QUERY, note=note)
+        if rows:
+            _clock_fields_ok = True
+            return rows, True
+        if _clock_fields_ok is True:
+            # It worked before, so this is a timeout or a wedged driver rather
+            # than an unknown field. Do not downgrade on a transient.
+            return rows, True
+    rows = await run_nvidia_smi_async(TELEMETRY_QUERY_BASE, note=note)
+    if rows and _clock_fields_ok is None:
+        log.info(
+            "nvidia-smi does not know the clock-event fields; "
+            "telemetry will not report GPU throttling on this driver"
+        )
+        _clock_fields_ok = False
+    return rows, False
+
+
 async def read_telemetry(
     profile: NodeProfile,
     now: float | None = None,
     rows: list[list[str]] | None = None,
     apps_rows: list[list[str]] | None = None,
+    note: "Callable[[str], None] | None" = None,
 ) -> TelemetrySample | None:
     """Sample the local GPUs. None when nothing could be read.
 
@@ -463,8 +793,9 @@ async def read_telemetry(
     one number per metric.
     """
     ts = time.time() if now is None else now
+    had_clocks = True
     if rows is None:
-        rows = await run_nvidia_smi_async(TELEMETRY_QUERY)
+        rows, had_clocks = await _query_gpus(note=note)
     if not rows:
         # A machine with no GPU at all is a different thing from a GPU node
         # whose nvidia-smi timed out. The first has host facts worth reporting
@@ -475,6 +806,7 @@ async def read_telemetry(
         if profile.gpu_count == 0:
             return await read_host_sample(ts)
         return None
+    paging = _paging_fields()
 
     used_mib: list[float] = []
     total_mib: list[float] = []
@@ -482,12 +814,33 @@ async def read_telemetry(
     temps: list[float] = []
     utils: list[float] = []
 
+    # The clock triple has to stay ROW-PAIRED while everything else is sinked
+    # per column: on a mixed node the interesting GPU is the one being held down
+    # hardest, and a mean of two different parts describes neither. Tracked as
+    # (ratio, sm, max) and the minimum ratio wins.
+    throttle_bits: int | None = None
+    worst_clock: tuple[float, int, int] | None = None
+
     for row in rows:
-        cells = (row + [""] * 5)[:5]
-        for cell, sink in zip(cells, (used_mib, total_mib, power, temps, utils)):
+        cells = (row + [""] * TELEMETRY_CELLS)[:TELEMETRY_CELLS]
+        for cell, sink in zip(cells[:5], (used_mib, total_mib, power, temps, utils)):
             value = _num(cell)
             if value is not None:
                 sink.append(value)
+        if not had_clocks:
+            continue
+        bits = _hexnum(cells[5])
+        if bits is not None:
+            # Union across GPUs: the node is one planning unit, and any GPU
+            # being held down is the node being held down. The bitmask
+            # analogue of taking the hottest sensor.
+            throttle_bits = bits if throttle_bits is None else throttle_bits | bits
+        sm = _hexnum(cells[6])
+        sm_max = _hexnum(cells[7])
+        if sm is not None and sm_max:
+            ratio = sm / sm_max
+            if worst_clock is None or ratio < worst_clock[0]:
+                worst_clock = (ratio, sm, sm_max)
 
     memory_used = int(sum(used_mib)) * 1024**2 if used_mib else 0
     memory_total = int(sum(total_mib)) * 1024**2 if total_mib else 0
@@ -527,6 +880,10 @@ async def read_telemetry(
         host_memory_total=host_total,
         host_memory_available=host_available,
         swap_used=swap_used,
+        clock_throttle_bits=throttle_bits,
+        sm_clock_mhz=worst_clock[1] if worst_clock else None,
+        sm_clock_max_mhz=worst_clock[2] if worst_clock else None,
+        **paging,
     )
 
 
@@ -550,8 +907,37 @@ def allocatable_bytes(
     addressable slice, and the pool cannot surrender more than the kernel says is
     allocatable without swapping. Swapping a model is not slow, it is fatal, so
     the second limit is the one that usually binds.
+
+    A machine with no GPU has a third answer, and it is the reason this
+    function needed a new branch rather than a new field. ``usable_memory`` is
+    ``addressable_memory * guardrail``, which is 0 for a CPU node by
+    construction and deliberately so -- ``addressable_memory`` means "bytes
+    reachable by the GPU" and there is no GPU. That 0 used to end the story:
+    every fit against such a node refused, which was correct while no runtime
+    here could run on one.
+
+    The ``llamacpp`` runtime can, and it spends host RAM. So a CPU node's
+    budget is MemAvailable less a reserve -- the same shape as the GB10 line
+    below, with a reserve sized for the hardware (``config.cpu_host_reserve``;
+    8 GiB is ~6% of a Spark's pool and the whole of a small Pi's).
+
+    Note what this does NOT do: it never reads a static ceiling. A GPU node
+    with no sample falls back to its nameplate, because a nameplate is a real
+    fact about a device that exists. A CPU node has no such number -- its
+    ceiling is 0 -- so an unsampled CPU node returns 0 and the live path drops
+    it, which is the honest answer. "Live memory degrades to static" is the
+    rule everywhere else in this project; here there is nothing to degrade to,
+    and the refusal says so rather than inventing a budget.
     """
     ceiling = profile.usable_memory(guardrail)
+
+    if profile.device_class is DeviceClass.CPU:
+        if sample is None or sample.host_memory_available <= 0:
+            return 0
+        return max(
+            0, sample.host_memory_available - cpu_host_reserve(sample.host_memory_available)
+        )
+
     if sample is None:
         return ceiling
 

@@ -456,6 +456,14 @@ async def start_node(
     if telemetry is None:
         telemetry = _open_telemetry(config, profile, decision.role)
 
+    # One instance, both roles. The node-side half (probe health, throttle,
+    # disk, its own re-probe) is emitted by the agent on every node; the roster
+    # half is emitted by the coordinator's Registry below. A worker gets the
+    # first and never constructs the second.
+    from control_plane.telemetry.events import RegistryEvents
+
+    registry_events = RegistryEvents(sink=telemetry.sink, node_id=profile.node_id)
+
     node_agent = NodeAgent(
         profile=profile,
         role=decision.role,
@@ -465,6 +473,7 @@ async def start_node(
         sink=telemetry.sink,
         token=identity.token,
         data_root=config.data_dir,
+        events=registry_events,
     )
     await node_agent.start()
     await telemetry.start(node_id=profile.node_id)
@@ -477,6 +486,7 @@ async def start_node(
             local_profile=profile,
             role=ROLE_COORDINATOR,
             identity=identity,
+            events=registry_events,
         )
         await registry.start()
         print(banner(identity, f"http://{profile.address}:{config.coordinator_port}"))

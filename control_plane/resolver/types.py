@@ -10,8 +10,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from control_plane.contracts import ModelShape
+
+if TYPE_CHECKING:
+    # Annotation only. This module is the resolver's type floor -- it imports
+    # nothing from its siblings -- and importing one here to name a field's
+    # element type would make it the first exception.
+    from .speculators import SpeculativeOption
 
 
 class ResolverError(RuntimeError):
@@ -190,9 +197,20 @@ class Resolution:
     weight_bytes: int | None = None
     architectures: tuple[str, ...] = ()
     model_type: str = ""
+    #: What a draft head declares it was TRAINED AGAINST, from its own
+    #: ``target_model_type``. Empty for an ordinary model and for the many
+    #: heads that do not say -- absence is "did not declare", never "matches",
+    #: and `speculators.head_option` refuses only on a declared MISMATCH.
+    target_model_type: str = ""
     max_position_embeddings: int | None = None
     #: Analytic parameter split, for whoever wants to see the arithmetic.
     param_breakdown: dict[str, int] = field(default_factory=dict)
+    #: Speculative-decoding methods this checkpoint can be served with, from
+    #: ``speculators.detect``. Never empty on a resolution this build produced
+    #: -- ngram needs no model support -- but empty on one restored from a
+    #: cache written before this field existed, which is why nothing may read
+    #: it as "this model supports none".
+    speculators: tuple["SpeculativeOption", ...] = ()
     resolved_at: float = 0.0
     from_cache: bool = False
     elapsed_ms: float = 0.0

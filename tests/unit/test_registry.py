@@ -50,6 +50,7 @@ from control_plane.registry.bootstrap import (
 )
 from control_plane.registry.config import (
     HEARTBEAT_INTERVAL_S,
+    HOST_MEMORY_RESERVE,
     HEARTBEAT_MISSES_UNHEALTHY,
     HEARTBEAT_TIMEOUT_S,
     REANNOUNCE_MAX_RETRY_S,
@@ -57,6 +58,7 @@ from control_plane.registry.config import (
     ROLE_COORDINATOR,
     ROLE_WORKER,
     TELEMETRY_RING_SAMPLES,
+    cpu_host_reserve,
 )
 from control_plane.registry.discovery import Advertiser, DiscoveredPeer
 from control_plane.registry.identity import (
@@ -77,6 +79,7 @@ from control_plane.registry.telemetry import (
     TelemetrySample,
     TelemetryStore,
     allocatable_bytes,
+    allocatable_bytes_or_none,
     read_compute_apps,
     read_host_memory,
     read_telemetry,
@@ -1168,7 +1171,7 @@ def test_node_agent_serves_three_payloads():
 
 def test_node_agent_telemetry_after_a_sample(monkeypatch):
     agent = NodeAgent(SPARK_01, clock=lambda: 100.0)
-    async def fake_read(profile, now=None):
+    async def fake_read(profile, now=None, **kw):
         return TelemetrySample(now or 0.0, 5, 10, 1.0, 2.0, 3.0)
 
     monkeypatch.setattr("control_plane.registry.agent.read_telemetry", fake_read)
@@ -1182,7 +1185,7 @@ def test_node_agent_telemetry_after_a_sample(monkeypatch):
 def test_node_agent_start_stop_is_clean(monkeypatch):
     calls = []
 
-    async def fake_read(profile, now=None):
+    async def fake_read(profile, now=None, **kw):
         calls.append(1)
         return TelemetrySample(0.0, 1, 2, 0.0, 0.0, 0.0)
 
@@ -1652,7 +1655,7 @@ def test_join_admit_health_and_telemetry_over_real_http(tmp_path, monkeypatch):
     httpx = pytest.importorskip("httpx")
     from control_plane.registry import HttpAgentClient, create_agent_app
 
-    async def fake_read(profile, now=None):
+    async def fake_read(profile, now=None, **kw):
         return TelemetrySample(
             ts=now or 1000.0, memory_used=int(profile.addressable_memory * 0.78),
             memory_total=profile.total_memory, power_watts=71.0,
@@ -1900,6 +1903,84 @@ def test_allocatable_without_a_sample_is_the_static_ceiling():
     """Before the first poll, the ceiling is all we know. Say so, do not say 0."""
     profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
     assert allocatable_bytes(profile, None) == profile.usable_memory()
+
+
+# ---- a machine with no GPU, which can now serve ------------------------------
+
+
+def _cpu_profile(node_id: str = "connor-pi") -> NodeProfile:
+    """What `_probe_cpu` actually writes: every memory field 0, no gpu_name.
+
+    Built by hand rather than through `probe_local` because the point is the
+    SHAPE of the profile -- a zeroed one -- and probing depends on what this
+    box happens to be.
+    """
+    return NodeProfile(
+        node_id=node_id,
+        hostname=node_id,
+        address="10.0.0.9",
+        device_class=DeviceClass.CPU,
+        gpu_name="",
+        gpu_count=0,
+        total_memory=0,
+        addressable_memory=0,
+        memory_bandwidth_gbps=0.0,
+        compute_capability="",
+        driver_version="",
+    )
+
+
+def _host_sample(available: int) -> TelemetrySample:
+    return TelemetrySample(
+        ts=1.0, memory_used=2 * GIB, memory_total=8 * GIB,
+        power_watts=0.0, temperature_c=45.0, utilization_pct=3.0,
+        host_memory_total=8 * GIB, host_memory_available=available,
+    )
+
+
+def test_a_cpu_node_gets_a_budget_from_its_live_host_reading():
+    """`usable_memory` is `addressable_memory * guardrail`, which is 0 for a
+    machine with no GPU and deliberately so -- that field means "bytes
+    reachable by the GPU" and there is no GPU. That 0 used to end the story and
+    every fit against such a node refused, which was correct while no runtime
+    here could run on one.
+
+    `llamacpp` spends host RAM, so the budget is MemAvailable less a reserve --
+    the same shape as the GB10 line, with a reserve sized for the hardware.
+    """
+    profile = _cpu_profile()
+    budget = allocatable_bytes(profile, _host_sample(6 * GIB))
+
+    assert budget > 0
+    # The reserve is subtracted, so the budget is strictly below what the
+    # kernel says is available -- never equal to it.
+    assert budget < 6 * GIB
+    assert budget == 6 * GIB - cpu_host_reserve(6 * GIB)
+
+
+def test_the_cpu_reserve_is_not_the_gb10_one():
+    """8 GiB is ~6% of a Spark's pool and the whole of a small Pi's. Applying
+    the GB10 constant to a CPU node does not make it conservative, it makes
+    every model refuse: there is not 8 GiB of MemAvailable on an 8 GB board
+    with a desktop running, so the subtraction floors at zero every time."""
+    assert cpu_host_reserve(6 * GIB) < HOST_MEMORY_RESERVE
+    assert allocatable_bytes(_cpu_profile(), _host_sample(6 * GIB)) > 0
+
+
+def test_a_cpu_node_nobody_has_sampled_refuses_rather_than_falling_back():
+    """The one place in derate where a missing live reading refuses instead of
+    degrading, and the asymmetry is deliberate.
+
+    A GPU node with no sample falls back to its nameplate (the test above
+    this section), because a nameplate describes a real device. A CPU node has
+    no nameplate -- its ceiling is 0 and always will be -- so there is nothing
+    to fall back TO, and returning that 0 is the honest answer rather than a
+    budget nobody measured.
+    """
+    assert allocatable_bytes(_cpu_profile(), None) == 0
+    assert allocatable_bytes_or_none(_cpu_profile(), None) is None
+    # And a sample whose /proc/meminfo read failed is the same absence.
+    assert allocatable_bytes(_cpu_profile(), _host_sample(0)) == 0
 
 
 def test_allocatable_falls_back_when_the_pool_is_unreadable():

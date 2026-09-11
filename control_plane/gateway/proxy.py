@@ -968,6 +968,10 @@ class UpstreamProxy:
         trace=None,
         attempt_no: int = 0,
         reopen=None,
+        content: bytes | None = None,
+        content_type: str | None = None,
+        open_upstream_raw=None,
+        count_tokens: bool = True,
     ) -> Attempt | None:
         """One target's turn, routed through a provider's own ``open_upstream``.
 
@@ -991,7 +995,15 @@ class UpstreamProxy:
         target_stats = stats.get(target.target_id)
         target_stats.begin()
         started = time.monotonic()
-        accounting = _StreamAccounting(started) if streaming else _BodyAccounting(started)
+        if not count_tokens:
+            # The response is audio bytes: there is no usage block in it and
+            # buffering it to look for one costs a megabyte to learn nothing.
+            # `forward` has had this branch all along; this method did not.
+            accounting = _NoAccounting(started)
+        else:
+            accounting = (
+                _StreamAccounting(started) if streaming else _BodyAccounting(started)
+            )
         finished = False
 
         def settle(
@@ -1049,7 +1061,15 @@ class UpstreamProxy:
         # there -- every branch below except the final one -- the generator
         # is already fully unwound and __aexit__ must not be called: the
         # context manager was never successfully entered.
-        manager = open_upstream(provider_id, upstream_id, body, streaming, endpoint=path)
+        if content is not None:
+            # An opaque upload: multipart, which has no dict to build a payload
+            # from. Same class, same gates, same accounting -- only the body
+            # differs. See ProviderService.open_upstream_raw.
+            manager = open_upstream_raw(
+                provider_id, upstream_id, content, content_type, endpoint=path
+            )
+        else:
+            manager = open_upstream(provider_id, upstream_id, body, streaming, endpoint=path)
         try:
             upstream = await manager.__aenter__()
         except ProviderNotAdmittingError:

@@ -354,6 +354,14 @@ class Router:
         targets = index.targets.get(served_name, [])
         if any(self._admission.is_blocked(t.target_id) for t in targets):
             return False
+        # Switched off by the operator, which is the same class of answer as
+        # an admission block and needs the same treatment -- but it cannot be
+        # caught by the loop above, because a non-serving deployment is not in
+        # `targets` at all. It is in `pending`, so the check has to happen
+        # here or a deliberate switch-off reads as a ten second stall followed
+        # by the 503 it was always going to be.
+        if any(not d.serving for d in index.pending.get(served_name, [])):
+            return False
         return self.recently_eligible(served_name)
 
     def recently_eligible(self, served_name: str) -> bool:

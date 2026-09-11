@@ -22,6 +22,14 @@ SECRETS_FILE = "secrets.json"
 # Model lists refresh on add, on demand, and on this timer.
 PROVIDER_REFRESH_S = 6 * 3600
 
+# How often the background scan re-probes the roster for a runtime nobody
+# has adopted yet (control_plane/providers/autoadopt.py). Short enough that
+# "auto" feels immediate -- detect_runtime's own timeout is 1.5s per probe
+# kind and there is currently one kind, so a full-roster round is cheap --
+# and independent of PROVIDER_REFRESH_S above, which is about refreshing an
+# ALREADY-adopted provider's model list, not finding a new one.
+RUNTIME_AUTOADOPT_INTERVAL_S = 30.0
+
 # 429 backoff, exponential between these bounds, when the upstream sends no
 # Retry-After of its own. A rate-limited provider is temporarily unavailable,
 # not unhealthy.

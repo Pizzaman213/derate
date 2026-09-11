@@ -36,6 +36,7 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from ..providers.detect import detect_runtime, set_resident
+from ..providers.service import existing_provider_for
 from . import errors
 
 log = logging.getLogger(__name__)
@@ -59,22 +60,12 @@ def create_router(ctx) -> APIRouter:
         return getattr(ctx.deps.registry, "_client", None)
 
     def _existing_provider(base_url: str):
-        """A provider already registered against this base_url, or None.
-
-        Compared on the URL rather than on the node, because that is what makes
-        two entries a duplicate as far as routing is concerned. Trailing
-        slashes are normalised; nothing else is, since a different port or
-        scheme really is a different upstream.
-        """
-        want = (base_url or "").rstrip("/")
+        """A provider already registered against this base_url, or None."""
         try:
             providers = ctx.deps.providers.list()
         except Exception:
             return None
-        for p in providers or []:
-            if str(getattr(p, "base_url", "") or "").rstrip("/") == want:
-                return p
-        return None
+        return existing_provider_for(providers, base_url)
 
     @router.get("/api/nodes/{node_id}/runtime")
     async def get_runtime(node_id: str) -> Response:

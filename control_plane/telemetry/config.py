@@ -4,8 +4,11 @@ Kept local to this package. Nothing here is a frozen contract.
 
 Every horizon below is a default that a deployment can move, but the defaults
 are chosen against real arithmetic rather than round numbers. At 1 Hz a node
-sample is roughly 96 bytes on disk, so thirty days of raw samples is about
-250 MB per node -- nothing on a Spark's NVMe. A request row is roughly 260
+sample is roughly 140 bytes on disk, so thirty days of raw samples is about
+365 MB per node -- nothing on a Spark's NVMe. (It was 102 bytes and 265 MB
+before the clock-derate and paging columns; both figures are measured against
+twenty thousand real GB10 rows, not estimated, so they can be re-measured the
+same way when the shape moves again.) A request row is roughly 260
 bytes, which is also nothing at demo rates and 2.2 GB/day at a sustained 100
 requests per second. That asymmetry is why ``REQUESTS_RAW_RETENTION_S`` is
 shorter than ``SAMPLES_RAW_RETENTION_S``: the rollups carry the long story for

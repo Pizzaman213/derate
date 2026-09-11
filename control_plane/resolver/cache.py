@@ -27,6 +27,7 @@ from typing import Any
 from control_plane.contracts import ModelShape
 from control_plane.paths import data_dir
 
+from .speculators import SpeculativeOption
 from .types import (
     ParamSource,
     QuantRequirement,
@@ -48,7 +49,27 @@ from .types import (
 #: it now serves. The entries would have expired on their own within the TTL;
 #: this makes it immediate, which matters because the stale reading is
 #: `launchable: false` on exactly the models the new runtime exists for.
-SCHEMA_VERSION = 4
+#:
+#: 5 adds `speculators`, and it is the same failure in a new place: an entry
+#: written before that field existed deserializes to an empty tuple, which is
+#: indistinguishable on the wire from "this checkpoint declares no speculative
+#: method" -- a claim that is never true, since ngram needs no model support at
+#: all. Expiring them immediately is the only reading that cannot be wrong.
+#:
+#: 6 adds `target_model_type`, and it is the same failure a third time. An
+#: entry written before that field existed deserializes to `""`, which means
+#: "this head declared nothing about its target" -- and that is precisely the
+#: value that makes `speculators.head_option` let it through. So a vision head
+#: cached under schema 5 would keep being offered for a text model of the same
+#: width, which is the bug the field was added to fix.
+#:
+#: 7 adds `routed_expert_params`, and it is the same failure a fourth time.
+#: The field decodes to 0 on an entry written before it existed, and 0 means
+#: "not derived" -- so the fit gate charges the routed experts whole to every
+#: rank, which is exactly the over-count the field was added to end. Unlike
+#: the three above this one errs toward refusing rather than inviting, but a
+#: cached MoE checkpoint would still be told it needs nodes it does not.
+SCHEMA_VERSION = 7
 
 DEFAULT_TTL_SECONDS = float(os.environ.get("DERATE_RESOLVER_TTL", 24 * 3600))
 
@@ -114,8 +135,10 @@ def to_dict(res: Resolution) -> dict[str, Any]:
         "weight_bytes": res.weight_bytes,
         "architectures": list(res.architectures),
         "model_type": res.model_type,
+        "target_model_type": res.target_model_type,
         "max_position_embeddings": res.max_position_embeddings,
         "param_breakdown": dict(res.param_breakdown),
+        "speculators": [opt.as_dict() for opt in res.speculators],
         "resolved_at": res.resolved_at,
     }
 
@@ -144,8 +167,16 @@ def from_dict(data: dict[str, Any]) -> Resolution:
         weight_bytes=data.get("weight_bytes"),
         architectures=tuple(data.get("architectures", ())),
         model_type=data.get("model_type", ""),
+        target_model_type=data.get("target_model_type", ""),
         max_position_embeddings=data.get("max_position_embeddings"),
         param_breakdown=dict(data.get("param_breakdown", {})),
+        # Absent on an entry written before speculative decoding existed. Left
+        # empty rather than re-derived here: this function has the stored dict
+        # and not the config it came from, and a guess made from the former
+        # would be indistinguishable on the wire from a real detection.
+        speculators=tuple(
+            SpeculativeOption.from_dict(opt) for opt in data.get("speculators", [])
+        ),
         resolved_at=data.get("resolved_at", 0.0),
     )
 
@@ -243,8 +274,10 @@ def _as_hit(res: Resolution) -> Resolution:
         weight_bytes=res.weight_bytes,
         architectures=res.architectures,
         model_type=res.model_type,
+        target_model_type=res.target_model_type,
         max_position_embeddings=res.max_position_embeddings,
         param_breakdown=dict(res.param_breakdown),
+        speculators=tuple(res.speculators),
         resolved_at=res.resolved_at,
         from_cache=True,
     )

@@ -19,7 +19,7 @@ from contextlib import contextmanager
 import pytest
 
 from control_plane.deploy.events import FIT_MISS, EventBus
-from control_plane.telemetry import RequestRecord, RequestTrace
+from control_plane.telemetry import KIND_SAMPLE, RequestRecord, RequestTrace
 from control_plane.telemetry.archive import Archive
 from control_plane.telemetry.events import SOURCE_DEPLOY, GatewayEvents, journal_events
 from control_plane.telemetry.hist import Hist, merged
@@ -1244,3 +1244,375 @@ def test_the_gateway_still_gets_its_event_bus():
     events = telemetry.gateway_events
     assert events is telemetry.gateway_events, "built once, then cached"
     events.breaker_opened("d-1", failures=3, cooldown_s=30.0)
+
+
+# --- additive sample columns, and the migration that adds them --------------
+#
+# Every test below exists because a specific way of getting this wrong is
+# invisible to the type checker and to a green suite: a bitmask that averages,
+# a NULL that reads as a zero, a driver that refuses one field and costs a node
+# all of its telemetry.
+
+
+def _sample_body(**kw):
+    """A sample body carrying the eleven original keys, plus whatever is asked."""
+    body = {
+        "memory_used": 1, "memory_total": 2, "power_w": 10.0, "temp_c": 50.0,
+        "util_pct": 5.0, "gpu_memory_used": 1, "gpu_process_count": 0,
+        "host_memory_total": 3, "host_memory_available": 3, "swap_used": 0,
+    }
+    body.update(kw)
+    return body
+
+
+def _sample_rows(base, count=1, **kw):
+    return [
+        {"seq": i + 1, "ts": base + i, "kind": KIND_SAMPLE,
+         "body": json.dumps(_sample_body(**kw))}
+        for i in range(count)
+    ]
+
+
+def _cols(path, table="samples"):
+    conn = sqlite3.connect(path)
+    try:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    finally:
+        conn.close()
+
+
+def _strip_new_columns(path):
+    """Rewind a file to the shape it had before the additive columns existed."""
+    from control_plane.telemetry.archive import _ADDITIONS
+
+    conn = sqlite3.connect(path)
+    try:
+        for table, additions in _ADDITIONS.items():
+            for name, _ in additions:
+                conn.execute(f"ALTER TABLE {table} DROP COLUMN {name}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_an_archive_without_the_new_columns_gains_them(tmp_path):
+    """The migration is the whole reason any of the new fields can ship.
+
+    Gated on PRAGMA table_info rather than on a recorded version, because
+    Archive.__init__ stamps meta.schema_version unconditionally on every open --
+    so the instant SCHEMA_VERSION moved to 2 every archive in the field claimed
+    to be at 2, and a ladder keyed on that would skip exactly the files that
+    need converting.
+    """
+    path = tmp_path / "old.db"
+    Archive(path).close()
+    _strip_new_columns(path)
+    assert "clock_throttle_bits" not in _cols(path)
+
+    archive = Archive(path)
+    archive.ingest("n1", {"rows": _sample_rows(1000.0, clock_throttle_bits=0x4),
+                          "next": 2, "head": 2, "dropped": 0})
+    assert "clock_throttle_bits" in _cols(path)
+    assert "throttled_s" in _cols(path, "rollup_samples")
+    got = archive.conn.execute("SELECT clock_throttle_bits FROM samples").fetchone()
+    assert got[0] == 0x4, "the row that triggered the migration must still land"
+    archive.close()
+
+
+def test_the_migration_is_idempotent_and_converges_from_half_applied(tmp_path):
+    """Each ALTER is its own implicit transaction, so a process killed between
+    two of them leaves a half-migrated file. Asking the database what it holds
+    converges; a version ladder would have stamped 'done' and never looked."""
+    path = tmp_path / "half.db"
+    Archive(path).close()
+    _strip_new_columns(path)
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE samples ADD COLUMN clock_throttle_bits INTEGER")
+    conn.commit()
+    conn.close()
+
+    archive = Archive(path)
+    archive._ensure_schema()
+    after = _cols(path)
+    archive._migrated = False
+    archive._ensure_schema()
+    assert _cols(path) == after, "a second pass must add nothing"
+    assert {"clock_throttle_bits", "sm_clock_mhz", "memory_pressure_pct"} <= after
+    archive.close()
+
+
+def test_a_failed_migration_costs_the_new_fields_and_not_the_old_ones(tmp_path):
+    """A read-only or full volume must not escalate.
+
+    Without the effective-column intersection, _SAMPLE_COLS would name columns
+    that do not exist and every executemany would raise `no such column` --
+    turning "seven fields missing" into "no telemetry ingested at all" for as
+    long as the disk stayed full.
+    """
+    path = tmp_path / "ro.db"
+    Archive(path).close()
+    _strip_new_columns(path)
+
+    archive = Archive(path)
+    archive.conn.execute("PRAGMA query_only=1")
+    archive._ensure_schema()
+    assert "clock_throttle_bits" not in archive._sample_cols
+    assert "memory_used" in archive._sample_cols
+    archive.conn.execute("PRAGMA query_only=0")
+
+    # The disk recovers; the next ingest migrates and widens on its own.
+    archive.ingest("n1", {"rows": _sample_rows(1000.0), "next": 2, "head": 2, "dropped": 0})
+    assert "clock_throttle_bits" in archive._sample_cols
+    archive.close()
+
+
+def test_a_row_from_an_older_agent_lands_as_null_not_zero(tmp_path):
+    """The whole old-agent story, in one assertion.
+
+    A zero here would say "checked, and this GPU is not throttled" about a node
+    that never looked -- the same fabricated measurement serde.power_reading
+    refuses to make about a GPU-less board.
+    """
+    archive = Archive(tmp_path / "mixed.db")
+    archive.ingest("n1", {"rows": _sample_rows(1000.0), "next": 2, "head": 2, "dropped": 0})
+    row = archive.conn.execute(
+        "SELECT clock_throttle_bits, memory_pressure_pct, memory_used FROM samples"
+    ).fetchone()
+    assert row[0] is None and row[1] is None, "absent is not zero"
+    assert row[2] == 1, "and the fields it did send still land"
+    archive.close()
+
+
+def test_a_bucket_of_throttle_bits_unions_rather_than_maxes(tmp_path):
+    """MAX() over a bitmask silently loses the low bits.
+
+    One second at 0x4 (power cap) and one at 0x20 (thermal) gives MAX = 0x20,
+    and the power cap disappears from the record entirely. The bits are
+    disjoint, so a sum of per-bit maxima reconstructs the OR exactly.
+    """
+    from control_plane.telemetry import retention
+
+    archive = Archive(tmp_path / "bits.db")
+    base = 1_700_000_040.0  # a minute boundary, so one bucket holds them all
+    rows = [
+        {"seq": 1, "ts": base, "kind": KIND_SAMPLE,
+         "body": json.dumps(_sample_body(clock_throttle_bits=0x4))},
+        {"seq": 2, "ts": base + 1, "kind": KIND_SAMPLE,
+         "body": json.dumps(_sample_body(clock_throttle_bits=0x20))},
+    ]
+    archive.ingest("n1", {"rows": rows, "next": 3, "head": 3, "dropped": 0})
+    retention._roll(archive.conn, archive, base - 60, base + 60, retention.STEP_1M)
+
+    got = archive.conn.execute(
+        "SELECT throttle_bits_any, throttled_s, throttle_n FROM rollup_samples"
+    ).fetchone()
+    assert got[0] == 0x24, "both reasons must survive the roll"
+    assert got[1] == 2, "two seconds throttled"
+    assert got[2] == 2, "and two samples were able to answer"
+    archive.close()
+
+
+def test_a_bucket_nothing_could_answer_reports_unknown_rather_than_healthy(tmp_path):
+    """throttle_n is the denominator that keeps throttled_s honest.
+
+    `NULL & mask` is NULL and `CASE WHEN NULL` falls to ELSE 0, so without a
+    separate count every CPU-only and every old-agent row would read as
+    "checked, not throttled" and dilute the figure toward zero.
+    """
+    from control_plane.telemetry import retention
+
+    archive = Archive(tmp_path / "unknown.db")
+    base = 1_700_000_040.0
+    archive.ingest("n1", {"rows": _sample_rows(base, 3), "next": 9, "head": 9, "dropped": 0})
+    retention._roll(archive.conn, archive, base - 60, base + 60, retention.STEP_1M)
+    got = archive.conn.execute(
+        "SELECT n, throttled_s, throttle_n FROM rollup_samples"
+    ).fetchone()
+    assert got[0] == 3, "the bucket saw three samples"
+    assert got[2] == 0, "none of which could answer the throttle question"
+    assert got[1] == 0
+    # n > 0 with throttle_n == 0 is what lets a reader render "--" instead of
+    # "0 s throttled". Collapsing the two is the bug.
+    archive.close()
+
+
+def test_an_hourly_average_ignores_the_minutes_that_had_no_reading():
+    """A latent bug in the 1h roll that the first nullable column steps on.
+
+    SUM(x_avg * n) / SUM(n) skips NULL products in the numerator while still
+    counting those minutes in the denominator, so an hour half of whose minutes
+    had no reading reports half the true average -- and it does so exactly
+    during a fleet upgrade, when the chart is least trustworthy.
+    """
+    from control_plane.telemetry.retention import _weighted_avg
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE r(n INTEGER, x REAL)")
+    conn.executemany("INSERT INTO r VALUES(?, ?)", [(60, 40.0)] * 30 + [(60, None)] * 30)
+    naive = conn.execute("SELECT SUM(x * n) / SUM(n) FROM r").fetchone()[0]
+    fixed = conn.execute(f"SELECT {_weighted_avg('x')} FROM r").fetchone()[0]
+    assert naive == pytest.approx(20.0), "the shape of the bug, pinned"
+    assert fixed == pytest.approx(40.0), "the average of the minutes that answered"
+
+
+# --- registry events: the node facts that were only ever log lines ----------
+
+
+class _Recorder:
+    """A sink that keeps what it was given, and nothing else."""
+
+    def __init__(self):
+        self.events = []
+
+    def sample(self, node_id, sample):
+        pass
+
+    def request(self, record):
+        pass
+
+    def event(self, source, event):
+        self.events.append((source, event))
+
+    def log(self, entry):
+        pass
+
+    def types(self):
+        return [e["type"] for _, e in self.events]
+
+
+def test_a_registry_event_records_its_subject_not_just_its_observer():
+    """The archive takes events.node_id from the COLLECTOR's cursor -- the
+    journal's owner. So an event the coordinator emits about spark-02 lands
+    under the coordinator's id, and /api/history/events?node_id= filters the
+    observer. Carrying the subject in the body is what makes it recoverable."""
+    from control_plane.telemetry.events import RegistryEvents, SOURCE_REGISTRY
+
+    sink = _Recorder()
+    events = RegistryEvents(sink=sink, node_id="coordinator")
+    events.node_lost("spark-02", misses=3, last_error="connection refused")
+
+    source, event = sink.events[0]
+    assert source == SOURCE_REGISTRY
+    assert event["node_id"] == "spark-02", "the body names the subject"
+    assert event["last_error"] == "connection refused"
+
+
+def test_a_profile_change_records_what_moved_and_what_it_moved_from():
+    """The reason this exists at all: both re-probe paths detect a change and
+    then logged only device_class -- the one field a driver upgrade does not
+    move. A driver going 580.173.02 -> 581.0.1 logged 'gb10 -> gb10'."""
+    from control_plane.contracts import DeviceClass, NodeProfile
+    from control_plane.registry.profiles import profile_diff
+    from control_plane.telemetry.events import RegistryEvents
+
+    def profile(**kw):
+        base = dict(
+            node_id="spark-01", hostname="h", address="10.0.0.1",
+            device_class=DeviceClass.GB10, gpu_name="NVIDIA GB10", gpu_count=1,
+            total_memory=1, addressable_memory=1, memory_bandwidth_gbps=273.0,
+            compute_capability="12.1", driver_version="580.173.02",
+        )
+        base.update(kw)
+        return NodeProfile(**base)
+
+    changed = profile_diff(profile(), profile(driver_version="581.0.1"))
+    assert changed == {"driver_version": {"from": "580.173.02", "to": "581.0.1"}}
+
+    sink = _Recorder()
+    RegistryEvents(sink=sink).profile_changed("spark-01", changed, reason="reprobe")
+    assert sink.events[0][1]["changed"]["driver_version"]["from"] == "580.173.02"
+
+
+def test_a_profile_that_did_not_change_records_nothing():
+    """The diff is the trigger as well as the payload. Without this, a 60s
+    re-probe timer would write a row a minute per node into the one table
+    retention never evicts."""
+    from control_plane.telemetry.events import RegistryEvents
+
+    sink = _Recorder()
+    RegistryEvents(sink=sink).profile_changed("spark-01", {}, reason="reprobe")
+    assert sink.events == []
+
+
+def test_a_node_going_down_and_coming_back_records_one_of_each(tmp_path):
+    """Both edges must be guarded. The unhealthy branch already had
+    `and state.healthy`; the recovery branch did not, and without a guard it
+    would emit on every heartbeat of a healthy node forever."""
+    from control_plane.registry.config import HEARTBEAT_MISSES_UNHEALTHY, RegistryConfig
+    from control_plane.registry.registry import Registry
+    from control_plane.telemetry.events import RegistryEvents
+
+    sink = _Recorder()
+    # tmp_path, not the default: a Registry built bare reads and WRITES the real
+    # data dir, and a test that rehydrates somebody's live roster is a test that
+    # can corrupt it.
+    registry = Registry(
+        config=RegistryConfig(data_dir=tmp_path),
+        events=RegistryEvents(sink=sink, node_id="coordinator"),
+    )
+    registry.enroll_local(_gb10_profile())
+    node_id = registry.local_node_id
+
+    for _ in range(HEARTBEAT_MISSES_UNHEALTHY + 2):
+        registry.record_health(node_id, ok=False)
+    for _ in range(3):
+        registry.record_health(node_id, ok=True)
+
+    assert sink.types().count("node_lost") == 1, "once per outage, not once per miss"
+    assert sink.types().count("node_recovered") == 1, "and once per recovery"
+
+
+def _gb10_profile(node_id="spark-01"):
+    from control_plane.contracts import DeviceClass, NodeProfile
+
+    return NodeProfile(
+        node_id=node_id, hostname="spark", address="10.0.0.1",
+        device_class=DeviceClass.GB10, gpu_name="NVIDIA GB10", gpu_count=1,
+        total_memory=128 * 1024**3, addressable_memory=110 * 1024**3,
+        memory_bandwidth_gbps=273.0, compute_capability="12.1",
+        driver_version="580.173.02",
+    )
+
+
+def test_a_flapping_probe_records_nothing_and_a_wedged_one_records_once(monkeypatch):
+    """The rule that makes a 1 Hz event source safe.
+
+    `events` is the one raw table retention never evicts, so an un-hysteresised
+    edge on a wedged nvidia-smi writes 86,400 rows a day forever. Three
+    consecutive misses in, one success out -- the same asymmetry
+    Registry.record_health uses. A probe that genuinely alternates never
+    reaches three and so never fires at all, which is the case that would
+    otherwise be noisiest.
+    """
+    import control_plane.registry.agent as agent_mod
+    from control_plane.registry.agent import NodeAgent
+    from control_plane.registry.telemetry import TelemetrySample
+
+    def run(pattern):
+        sink = _Recorder()
+        agent = NodeAgent(profile=_gb10_profile(), sink=sink)
+        remaining = list(pattern)
+
+        async def fake_read(profile, now=None, note=None, **kw):
+            if not remaining.pop(0):
+                if note:
+                    note("timeout")
+                return None
+            return TelemetrySample(
+                ts=now or 0.0, memory_used=1, memory_total=2, power_watts=1.0,
+                temperature_c=2.0, utilization_pct=3.0,
+            )
+
+        monkeypatch.setattr(agent_mod, "read_telemetry", fake_read)
+        while remaining:
+            asyncio.run(agent.sample_once())
+        return sink.types()
+
+    assert run([True, False, True, False, True, False, True]) == [], (
+        "an alternating probe never reaches three consecutive misses"
+    )
+    assert run([True] + [False] * 6 + [True, True]) == [
+        "probe_degraded",
+        "probe_recovered",
+    ], "a wedged probe says so once, and says once when it comes back"
+    assert run([True] * 4) == [], "a healthy probe is silent"

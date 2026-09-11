@@ -36,6 +36,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.routing import Mount
 
 from . import (
+    alerts_api,
     capacity_api,
     enroll_api,
     internal_api,
@@ -45,9 +46,12 @@ from . import (
     shell_api,
     ui_api,
 )
+from control_plane.deploy.autoadopt import ContainerAutoAdopter
 from control_plane.inventory import api as inventory_api
+from control_plane.providers.autoadopt import RuntimeAutoAdopter
 
 from .admission import AdmissionController
+from .auth import is_unauthorized
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
 from .csrf import is_cross_site_write
@@ -192,7 +196,7 @@ _EVENT_MEMORY_CRITICAL = "event_memory_critical"
 
 
 async def _consume_deployment_events(ctx: GatewayContext, events) -> None:
-    """React to Agent F's memory events by pausing or resuming admission.
+    """React to the deployment manager's memory events by pausing or resuming admission.
 
     A memory_critical event means the deployment must stop admitting new
     requests immediately, not at the next 0.5s admission reconcile poll --
@@ -383,6 +387,27 @@ def create_app(
     # alongside the services passed into it above.
     restart = RestartCoordinator(ctx)
 
+    # Wires deps.registry and deps.providers together to do, on a timer,
+    # exactly what runtime_api.py's manual POST route does on a click. See
+    # autoadopt.py for why this overrides detect.py's own "discovery
+    # proposes, a human accepts" stance on purpose.
+    autoadopt = RuntimeAutoAdopter(
+        registry=deps.registry,
+        providers=deps.providers,
+        enabled=settings.auto_adopt_runtimes,
+    )
+    # Same idea, the other gap: a container derate itself launched but lost
+    # track of (a store file lost, a launch that raced a restart). See
+    # deploy/autoadopt.py for why the fit/plan it reconstructs are real
+    # arithmetic rather than placeholders, just not decided in advance.
+    container_autoadopt = ContainerAutoAdopter(
+        registry=deps.registry,
+        resolver=deps.resolver,
+        fit=deps.fit,
+        deployments=deps.deployments,
+        enabled=settings.auto_adopt_containers,
+    )
+
     # The model registry. Guarded because it is a convenience over stores that
     # are all still readable without it: a coordinator that cannot open the
     # database must still serve, and /api/models says why rather than 500ing.
@@ -393,6 +418,31 @@ def create_app(
         ctx.inventory = ModelInventory(data_path("models.db"))
     except Exception:
         log.exception("model registry unavailable; /api/models will say so")
+
+    # The standing-alert book, folded from events that already exist. Taps
+    # rather than subscriptions: a tap runs on the producer's thread and
+    # cannot be outrun, and the registry's emitter has no bus on a
+    # coordinator, so a tap is the only live feed there is.
+    # Budget crossings have no emitter until now: node.py builds the provider
+    # service before the telemetry bundle exists.
+    attach_events = getattr(deps.providers, "attach_events", None)
+    if attach_events is not None and ctx.events is not None:
+        try:
+            attach_events(ctx.events)
+        except Exception:
+            log.exception("provider events unavailable; budget crossings go unreported")
+
+    try:
+        from control_plane.alerts import AlertBook
+
+        ctx.alerts = AlertBook()
+        ctx.alerts.attach(
+            deploy_bus=getattr(deps.deployments, "bus", None),
+            registry_events=getattr(deps.registry, "events", None),
+            gateway_bus=getattr(ctx.events, "bus", None),
+        )
+    except Exception:
+        log.exception("alert book unavailable; /api/alerts will answer empty")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -413,6 +463,15 @@ def create_app(
         await _optional_step(ctx, "deployments.start", deps.deployments, "start")
         # 5. Provider service starts its refresh/backoff loop.
         await _optional_step(ctx, "providers", deps.providers, "start", "refresh_loop")
+        # Started alongside it: the background scan that adopts a runtime
+        # detect_runtime() finds on a roster node without a human clicking
+        # Adopt. A concrete component built above, not a deps.* port, so it
+        # is awaited directly rather than through _optional_step.
+        await autoadopt.start()
+        # Depends on deployments.reconcile() above having already rehydrated
+        # every record derate DOES have -- this only ever proposes adopting
+        # what is left after that, never races it.
+        await container_autoadopt.start()
 
         if settings.coordinator_node_id is None:
             settings.coordinator_node_id = _resolve_coordinator_node(ctx, deps)
@@ -437,7 +496,7 @@ def create_app(
             telemetry.watch_deployments(deploy_bus)
         ctx.events.startup_degraded(ctx.degraded_startup)
 
-        # Agent F's memory events, when the port offers them: memory_critical
+        # The deployment manager's memory events, when the port offers them: memory_critical
         # stops admission to that deployment within one event, not at the
         # next 0.5s admission reconcile poll -- the poll stays as a backstop
         # for anything that misses this stream, not as the primary path.
@@ -473,6 +532,8 @@ def create_app(
             # holding a connection, and shutting down under them would hang
             # both sides rather than answering.
             parking.close()
+            await container_autoadopt.stop()
+            await autoadopt.stop()
             await metrics.stop()
             await restart.stop()
             await router.stop()
@@ -548,6 +609,24 @@ def create_app(
             )
         return await call_next(request)
 
+    # Opt-in: a no-op unless DERATE_API_TOKEN is set. See auth.py for why
+    # /v1 and /api/nodes/join are not covered by this check.
+    @app.middleware("http")
+    async def _api_token_guard(request, call_next):
+        if is_unauthorized(
+            path=request.url.path,
+            authorization=request.headers.get("authorization"),
+            token=settings.api_token,
+        ):
+            return error_response(
+                401,
+                "Missing or invalid API token. Send it as "
+                "'Authorization: Bearer <token>'.",
+                "authentication_error",
+                "invalid_api_token",
+            )
+        return await call_next(request)
+
     app.include_router(openai_api.create_router(ctx))
     app.include_router(internal_api.create_router(ctx))
     # Above the StaticFiles mount below, and it must stay there: a Starlette
@@ -580,6 +659,9 @@ def create_app(
     # cluster's very first screen would parse index.html as JSON and show
     # nothing, on the one boot where the person has no idea what to expect.
     app.include_router(setup_api.create_router(ctx))
+
+    # Above the mount, same rule as every router here.
+    app.include_router(alerts_api.create_router(ctx))
 
     @app.get("/healthz")
     async def healthz():

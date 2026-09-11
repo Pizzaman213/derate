@@ -131,6 +131,18 @@ def _int(value: Any) -> int | None:
     return None
 
 
+def _int_tuple(value: Any) -> tuple[int, ...]:
+    """A config list of integers, with every unreadable entry dropped.
+
+    A string is not treated as a sequence here even though it is iterable:
+    ``"40"`` would come back as ``(4, 0)``, which is a layer list nobody wrote.
+    """
+    if not isinstance(value, (list, tuple)):
+        return ()
+    out = [_int(item) for item in value]
+    return tuple(item for item in out if item is not None)
+
+
 def _is_stack(config: dict[str, Any]) -> bool:
     """Does this dict describe a transformer stack we can size?
 
@@ -272,8 +284,37 @@ class Mapped:
 
     # Extras
     num_nextn_predict_layers: int = 0
+    # DeepSeek-V4's own speculator, which is not the MTP module above and does
+    # not replace it -- deepseek-v4-flash declares both. Read here rather than
+    # inferred from the architecture name for the same reason every other field
+    # in this table is: the config is the thing the runtime reads too.
+    #
+    # `dspark_target_layer_ids` names layers the model already has, so unlike
+    # `num_nextn_predict_layers` it does NOT imply a decoder layer's worth of
+    # extra parameters, and nothing here converts it into one.
+    #: A speculator head's OWN output vocabulary, which is smaller than the
+    #: target's and is the field that makes it cheap. `AngelSlim/Qwen3-4B_eagle3`
+    #: declares vocab_size 151936 and draft_vocab_size 32000, and measures
+    #: 218,429,056 parameters -- which is one layer plus a 32000-row head and
+    #: NO embedding at all. Charging it the target's vocab twice would price it
+    #: at 778M, three and a half times over.
+    draft_vocab_size: int = 0
+    dspark_block_size: int = 0
+    dspark_target_layer_ids: tuple[int, ...] = ()
+    dspark_markov_rank: int = 0
     max_position_embeddings: int | None = None
     model_type: str = ""
+    #: What a DRAFT HEAD says it was trained against, from its own
+    #: ``target_model_type``. Empty for an ordinary model and for most heads --
+    #: only some declare it -- so absence means "did not say", never "matches".
+    #:
+    #: It is the only signal that separates a vision head from a text one. The
+    #: geometry cannot: ``AngelSlim/Qwen3-VL-30B-A3B-Instruct_eagle3``,
+    #: ``nvidia/Qwen3-30B-A3B-Thinking-2507-Eagle3`` and
+    #: ``Qwen/Qwen3-30B-A3B`` all report hidden_size 2048, vocab_size 151936
+    #: and vision_params 0. The VL head declares ``target_model_type:
+    #: "qwen3_vl"`` and the text head declares nothing at all.
+    target_model_type: str = ""
     architectures: tuple[str, ...] = ()
     warnings: list[str] = field(default_factory=list)
 
@@ -430,6 +471,12 @@ def map_config(config: dict[str, Any]) -> Mapped:
     ).lower()
     arch_names = tuple(root.get("architectures") or cfg.get("architectures") or ())
     model_type = str(cfg.get("model_type") or root.get("model_type") or "")
+    # A head's claim about its TARGET, not about itself. Read from the root as
+    # well as the text config because a head's config is flat more often than
+    # not.
+    target_model_type = str(
+        root.get("target_model_type") or cfg.get("target_model_type") or ""
+    )
     # Gated MLPs carry three matrices per layer, ungated two. Nearly everything
     # current is gated, including Gemma, whose activation name does not say so.
     gated = True
@@ -469,8 +516,13 @@ def map_config(config: dict[str, Any]) -> Mapped:
             )
         ),
         model_type=model_type,
+        target_model_type=target_model_type,
         architectures=arch_names,
         num_nextn_predict_layers=_int(cfg.get("num_nextn_predict_layers")) or 0,
+        draft_vocab_size=_int(cfg.get("draft_vocab_size")) or 0,
+        dspark_block_size=_int(cfg.get("dspark_block_size")) or 0,
+        dspark_target_layer_ids=_int_tuple(cfg.get("dspark_target_layer_ids")),
+        dspark_markov_rank=_int(cfg.get("dspark_markov_rank")) or 0,
         warnings=warnings,
         is_encoder_decoder=is_encoder_decoder,
     )

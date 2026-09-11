@@ -100,6 +100,21 @@ class FakeRegistry:
         self._nodes[node_id].healthy = healthy
 
 
+class FakeLiveRegistry(FakeRegistry):
+    """`FakeRegistry` plus the live-allocatable extra `RegistryPort` does not
+    declare, for tests that need to tell the real `registry.allocatable_or_none`
+    figure apart from the crude `memory_total - memory_used` fallback -- the
+    distinction `_launch_utilization`'s sglang path now depends on.
+    """
+
+    def __init__(self, *profiles, allocatable: dict[str, int] | None = None):
+        super().__init__(*profiles)
+        self._allocatable = dict(allocatable or {})
+
+    def allocatable_or_none(self, node_id: str) -> int | None:
+        return self._allocatable.get(node_id)
+
+
 class FakeAdapter(SparkrunAdapter):
     """SparkrunAdapter with the subprocess calls replaced.
 
@@ -142,8 +157,10 @@ class FakeAdapter(SparkrunAdapter):
 
     def launch(
         self, plan, shape, runtime, ctx, max_seqs, *, served_name=None, port=None,
-        gpu_memory_utilization=None, kv_cache_memory_bytes=None, on_output=None,
-        extra_args=(), custom_command=(),
+        gpu_memory_utilization=None, kv_cache_memory_bytes=None, speculative=None,
+        on_output=None, extra_args=(), custom_command=(),
+        enforce_eager=False, cudagraph_capture_sizes=None, kv_dtype=None,
+        quantization=None, nccl_env=None,
     ):
         if self.fail_with is not None:
             raise self.fail_with
@@ -167,8 +184,32 @@ class FakeAdapter(SparkrunAdapter):
             # Rendered exactly as the real adapter renders it, for the same
             # reason the share above is: a fake that dropped the KV budget
             # would let the manager pass a number nothing ever checks.
-            kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
+            # And again for the same reason: a fake that dropped the
+            # speculative spec would let the manager pass a --speculative-config
+            # that never reaches a recipe, while the fit gate had already
+            # charged the draft's weights against the launch.
+            speculative=speculative,
+            extra_args=extra_args,
             custom_command=custom_command,
+            enforce_eager=enforce_eager,
+            cudagraph_capture_sizes=cudagraph_capture_sizes,
+            # Same reason as the KV BYTE budget four lines up, and the one
+            # that actually bit: the gate sizes the cache at this WIDTH and
+            # then passes the halved budget. A fake that dropped the width
+            # would let the manager pass a cap with no width and the test
+            # suite would agree with the bug.
+            kv_dtype=kv_dtype,
+            # Same reason as the width above, one term heavier: the gate
+            # prices the WEIGHTS at this scheme, and bytes-per-parameter
+            # differs by 3.5x between bf16 and nvfp4. A fake that dropped it
+            # would let the manager pass a scheme that reaches no recipe while
+            # the verdict had already been computed at it.
+            quantization=quantization,
+            # Same reason as every other pass-through here: a fake that
+            # dropped it would let the manager pass NCCL settings that reach
+            # no recipe, while the refusal above had already approved them.
+            nccl_env=nccl_env,
         )
         self.recipes.append(recipe.content)
         materialize(recipe)
@@ -539,6 +580,40 @@ def test_the_vllm_image_is_the_one_that_can_read_an_audio_file():
     assert recipes.container_image(spec, {}) == spec.default_image
 
 
+def test_sglangs_runtime_spec_fields(tmp_path):
+    """The sglang counterpart to the vLLM test above -- direct assertions on
+    the data, not just the behavior it drives. Every sglang-specific launch
+    detail in this project flows through these fields and nothing branches
+    on the string "sglang" anywhere else in `sparkrun.py`/`recipes.py`, so a
+    wrong value here is a wrong launch with no other test to catch it."""
+    spec = RUNTIMES["sglang"]
+    assert spec.default_image == "scitrera/dgx-spark-sglang:0.5.9-t5"
+    assert spec.default_image_env == "DERATE_SGLANG_IMAGE"
+    # sglang's own name for concurrency, not vLLM's max_num_seqs -- this is
+    # what `test_render_command_sglang_uses_its_own_concurrency_key` already
+    # exercises behaviorally; this is the same fact, read directly.
+    assert spec.max_seqs_key == "max_running_requests"
+    assert spec.expert_parallel_arg == "--enable-ep-moe"
+    # No flag exists to carry one, so the fit gate still prices speculative
+    # decoding and the launch path refuses it outright -- never estimated.
+    assert spec.speculative_config_arg is None
+    # Every flag sglang's launch actually reads; a rendering test proves these
+    # reach a command, this proves the template names them at all.
+    for flag in (
+        "--model-path", "--tp-size", "--pp-size", "--context-length",
+        "--max-running-requests", "--mem-fraction-static",
+    ):
+        assert flag in spec.command_template
+    assert "python3 -m sglang.launch_server" in spec.command_template
+    assert "python3 -m sglang.launch_server" in spec.custom_command_prefix
+
+    # The one knob, proven to actually move: the operator's override reaches
+    # the rendered image, and the default stands without one.
+    custom = "my-registry/sglang:dev"
+    assert recipes.container_image(spec, {"DERATE_SGLANG_IMAGE": custom}) == custom
+    assert recipes.container_image(spec, {}) == spec.default_image
+
+
 def test_the_audio_dockerfile_builds_on_the_image_it_is_a_layer_over():
     """Two files name the base and they have to agree, or the audio image is
     a pip layer over a vLLM nobody is running."""
@@ -568,6 +643,117 @@ def test_a_runtime_that_cannot_shard_refuses_the_degrees_before_the_launch():
     # And it is a property of the runtime, not of the number: vllm shards.
     assert sharding_refusal("vllm", 4, 2, 2, 2) is None
     assert sharding_refusal("sglang", 2, 2) is None
+
+
+# ==========================================================================
+# CUDA graph capture trim: enforce_eager and cudagraph_capture_sizes.
+# ==========================================================================
+
+
+def test_render_cudagraph_capture_sizes_renders_plain_space_separated_ints():
+    from control_plane.deploy.flags import render_cudagraph_capture_sizes
+
+    assert render_cudagraph_capture_sizes([1, 2, 4, 8]) == "1 2 4 8"
+    # Every element round-trips through int() before rendering, so there is
+    # no metacharacter surface here the way there is for speculative_config --
+    # this is the whole reason no whole-string grammar guards the result.
+    assert render_cudagraph_capture_sizes([16]) == "16"
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        [],
+        [0, 1, 2],
+        [-1, 2, 4],
+        [4, 2, 1],  # not ascending
+        [1, 2, 2, 4],  # duplicate
+    ],
+)
+def test_render_cudagraph_capture_sizes_rejects_bad_input(sizes):
+    from control_plane.deploy.flags import render_cudagraph_capture_sizes
+
+    with pytest.raises(ValueError):
+        render_cudagraph_capture_sizes(sizes)
+
+
+def test_only_vllm_is_told_about_graph_capture_trim():
+    from control_plane.deploy.flags import graph_capture_refusal
+
+    assert graph_capture_refusal("vllm", True, None) is None
+    assert graph_capture_refusal("vllm", False, (1, 2, 4)) is None
+    assert graph_capture_refusal("vllm", False, None) is None
+    # Both refusals name the runtime, same shape as speculative_refusal, and
+    # are checked independently -- either lever alone is enough to refuse.
+    for runtime in ("sglang", "tts"):
+        eager_refusal = graph_capture_refusal(runtime, True, None)
+        assert eager_refusal is not None and runtime in eager_refusal
+        sizes_refusal = graph_capture_refusal(runtime, False, (1, 2, 4))
+        assert sizes_refusal is not None and runtime in sizes_refusal
+    # Asking for neither is never refused, on any runtime.
+    for runtime in ("vllm", "sglang", "tts"):
+        assert graph_capture_refusal(runtime, False, None) is None
+
+
+def test_enforce_eager_reaches_the_generated_command(tmp_path):
+    recipe = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        enforce_eager=True,
+    )
+    assert "--enforce-eager" in recipe.content
+
+
+def test_no_enforce_eager_means_no_change_to_the_command(tmp_path):
+    baseline = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+    )
+    assert "--enforce-eager" not in baseline.content
+
+
+def test_cudagraph_capture_sizes_reach_the_generated_command(tmp_path):
+    """Like kv_cache_memory_bytes and speculative_config, the command block
+    keeps the `{cudagraph_capture_sizes}` placeholder literally -- sparkrun's
+    own recipe engine substitutes it from `defaults:` when it runs the
+    recipe, not this process. So the two things to check are that the
+    placeholder was appended to the command at all, and that `defaults:`
+    carries the rendered value it will be filled in with."""
+    recipe = synthesize(
+        fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        cudagraph_capture_sizes=(1, 2, 4, 8),
+    )
+    assert "--cudagraph-capture-sizes {cudagraph_capture_sizes}" in recipe.content
+    # Plain digits and spaces, never JSON-quoted like speculative_config --
+    # the rendered value never starts with `{`.
+    assert "cudagraph_capture_sizes: 1 2 4 8" in recipe.content
+
+
+def test_cudagraph_capture_sizes_not_told_to_sglang_or_tts(tmp_path):
+    """Neither runtime has cudagraph_capture_sizes_arg set, so the value is
+    accepted (no refusal lives in synthesize() itself -- that is manager.py's
+    job) but never reaches the command, exactly like speculative_config_arg
+    being None for these two."""
+    recipe = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "sglang", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        cudagraph_capture_sizes=(1, 2, 4),
+    )
+    assert "cudagraph-capture-sizes" not in recipe.content
+    assert "cudagraph_capture_sizes" not in recipe.content
+
+
+def test_enforce_eager_and_cudagraph_capture_sizes_together_is_rejected(tmp_path):
+    """Contradictory: enforce_eager disables graph capture entirely, so a
+    trimmed capture list has nothing left to apply to."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        synthesize(
+            fx.GPT_OSS_120B, fx.pp2_plan(), "vllm", 65536, 512, "gpt-oss-120b",
+            port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+            enforce_eager=True,
+            cudagraph_capture_sizes=(1, 2, 4),
+        )
 
 
 def test_synthesized_recipe_is_deterministic(tmp_path):
@@ -921,6 +1107,34 @@ def test_custom_command_pins_host_port_served_name_after_operator_text(tmp_path)
     assert command_block.index("whatever-i-want") < command_block.index(
         "--served-model-name {served_model_name}"
     )
+
+
+def test_custom_command_works_for_sglang_too(tmp_path):
+    """Every custom_command test above uses runtime="vllm" -- this is the
+    only one that exercises `_SGLANG_CUSTOM_PREFIX`, the operator-supplied-
+    flags path for the other real runtime. Same three claims: the operator's
+    tokens land and none of sglang's plan-derived flags do, `{model}` is
+    still the resolved id, and the routing triple is still appended
+    generically afterward (the append logic is runtime-agnostic, but nothing
+    had ever proven it agnostic *for sglang specifically* until this)."""
+    custom_command = ("--tp-size", "1", "--mem-fraction-static", "0.5")
+    recipe = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "sglang", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.9, recipe_dir=tmp_path,
+        custom_command=custom_command,
+    )
+    assert "python3 -m sglang.launch_server" in recipe.content
+    assert "vllm serve" not in recipe.content
+    assert " ".join(custom_command) in recipe.content
+    assert recipe.content.count("{model}") == 1
+    assert "{max_model_len}" not in recipe.content
+    assert "{max_running_requests}" not in recipe.content
+    assert "--trust-remote-code" not in recipe.content
+
+    command_block = recipe.content.split("command: |\n", 1)[1]
+    assert command_block.index("--mem-fraction-static") < command_block.index(
+        "--served-model-name {served_model_name}"
+    )
     assert "--host {host}" in command_block
     assert "--port {port}" in command_block
 
@@ -1061,6 +1275,74 @@ def test_launch_stores_a_safe_custom_command_on_the_deployment(tmp_path):
     manager.close()
 
 
+def test_launch_stores_enforce_eager_and_cudagraph_capture_sizes(tmp_path):
+    manager = make_manager(tmp_path)
+    deployment = manager.launch(
+        fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+        enforce_eager=True,
+    )
+    assert deployment.state is S.LAUNCHING
+    assert deployment.enforce_eager is True
+    assert deployment.cudagraph_capture_sizes is None
+
+    deployment2 = manager.launch(
+        # A different node than the first launch's plan -- one node runs one
+        # copy of a model, so reusing spark-01/spark-02 here would be refused
+        # as a DuplicateDeployment rather than exercising this field.
+        fx.GPT_OSS_120B, fx.single_node_plan("spark-03"), fx.fits(), "vllm", 65536, 256,
+        served_name="gpt-oss-120b-trimmed",
+        cudagraph_capture_sizes=(1, 2, 4, 8),
+    )
+    assert deployment2.enforce_eager is False
+    assert deployment2.cudagraph_capture_sizes == (1, 2, 4, 8)
+    manager.close()
+
+
+def test_launch_refuses_enforce_eager_and_cudagraph_capture_sizes_together(tmp_path):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+            enforce_eager=True,
+            cudagraph_capture_sizes=(1, 2, 4),
+        )
+    assert manager.list() == []
+    manager.close()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"enforce_eager": True},
+    {"cudagraph_capture_sizes": (1, 2, 4)},
+])
+def test_launch_refuses_graph_capture_options_alongside_custom_command(tmp_path, kwargs):
+    """Same reasoning as speculative + custom_command: a custom command
+    replaces every plan-derived flag, so neither lever would survive it."""
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256,
+            custom_command=("--gpu-memory-utilization", "0.5"),
+            **kwargs,
+        )
+    assert manager.list() == []
+    manager.close()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"enforce_eager": True},
+    {"cudagraph_capture_sizes": (1, 2, 4)},
+])
+def test_launch_refuses_graph_capture_options_on_a_runtime_that_cannot_take_them(tmp_path, kwargs):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="tts"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "tts", 65536, 256,
+            **kwargs,
+        )
+    assert manager.list() == []
+    manager.close()
+
+
 # ==========================================================================
 # Acceptance: an illegal state transition raises rather than silently
 # correcting.
@@ -1160,6 +1442,147 @@ def test_health_probe_hits_the_origin_not_the_v1_base(tmp_path):
         assert seen == ["/health"]
     finally:
         server.shutdown()
+
+
+def _health_server(good_path: str):
+    """A server that answers 200 on exactly *good_path*, 404 elsewhere, and
+    records every path it was asked for, in order."""
+    import http.server
+    import threading as _t
+
+    seen: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            seen.append(self.path)
+            self.send_response(200 if self.path == good_path else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    _t.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
+def test_health_path_is_tried_first_when_given(tmp_path):
+    """`RuntimeSpec.health_path` was dead data until today -- nothing read
+    it. This is the read: a caller that passes it gets it tried before the
+    module's own default ladder."""
+    from control_plane.deploy.health import probe as real_probe
+
+    server, seen = _health_server("/custom")
+    try:
+        url = "http://127.0.0.1:%d/v1" % server.server_port
+        healthy, reason = real_probe(url, timeout=2.0, health_path="/custom")
+        assert healthy is True and reason is None
+        assert seen == ["/custom"]
+    finally:
+        server.shutdown()
+
+
+def test_health_path_falls_back_to_the_usual_ladder(tmp_path):
+    """A runtime-specific path that does not answer is not the end of the
+    probe -- the existing `/health` then `/v1/models` fallback still runs."""
+    from control_plane.deploy.health import probe as real_probe
+
+    server, seen = _health_server("/v1/models")
+    try:
+        url = "http://127.0.0.1:%d/v1" % server.server_port
+        healthy, reason = real_probe(url, timeout=2.0, health_path="/custom")
+        assert healthy is True and reason is None
+        assert seen == ["/custom", "/health", "/v1/models"]
+    finally:
+        server.shutdown()
+
+
+def test_health_path_omitted_is_pixel_identical_to_before(tmp_path):
+    """The regression net: every runtime's real `health_path` is `"/health"`
+    today, so passing nothing -- what every caller did before this existed --
+    must still try exactly `/health` once, not `/health` twice."""
+    from control_plane.deploy.health import probe as real_probe
+
+    server, seen = _health_server("/health")
+    try:
+        url = "http://127.0.0.1:%d/v1" % server.server_port
+        healthy, _ = real_probe(url, timeout=2.0)
+        assert healthy is True
+        assert seen == ["/health"]
+    finally:
+        server.shutdown()
+
+
+def test_health_path_equal_to_the_default_is_not_tried_twice(tmp_path):
+    """Passing `health_path="/health"` explicitly -- what every runtime's
+    spec actually holds today -- must not double the round trip either."""
+    from control_plane.deploy.health import probe as real_probe
+
+    server, seen = _health_server("/health")
+    try:
+        url = "http://127.0.0.1:%d/v1" % server.server_port
+        healthy, _ = real_probe(url, timeout=2.0, health_path="/health")
+        assert healthy is True
+        assert seen == ["/health"]
+    finally:
+        server.shutdown()
+
+
+def test_the_manager_threads_the_runtimes_own_health_path_through(tmp_path):
+    """End to end: the wiring is live, not cosmetic. A `probe_fn` that
+    records its kwargs sees sglang's real `health_path` -- and, monkeypatched
+    to something else, sees THAT instead, proving the manager reads the spec
+    rather than a remembered constant."""
+    from control_plane.deploy import flags as flags_module
+
+    calls: list[dict] = []
+
+    def recording_probe(backend_url, *, timeout=3.0, expect_model=None, health_path=None):
+        calls.append({"health_path": health_path})
+        return True, None
+
+    manager = make_manager(tmp_path, probe=recording_probe)
+    try:
+        dep = manager.launch(
+            fx.AUDIO8_TTS_0_6B, fx.single_node_plan(fx.SPARK_01.node_id), fx.fits(),
+            "sglang", 4096, 1,
+        )
+        assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+        assert calls and calls[-1]["health_path"] == "/health"
+
+        # A hypothetical future sglang spec with a different endpoint reaches
+        # the probe too -- this is the line that proves it is read live.
+        calls.clear()
+        original = flags_module.RUNTIMES["sglang"].health_path
+        object.__setattr__(flags_module.RUNTIMES["sglang"], "health_path", "/sglang-health")
+        try:
+            manager.tick()
+            assert wait_for(lambda: calls)
+            assert calls[-1]["health_path"] == "/sglang-health"
+        finally:
+            object.__setattr__(flags_module.RUNTIMES["sglang"], "health_path", original)
+    finally:
+        manager.close()
+
+
+def test_an_older_probe_fn_without_health_path_still_works(tmp_path):
+    """The duck-typing guard: a `probe_fn` written before this kwarg existed
+    -- most of this file's fakes and lambdas -- must not see it at all, or
+    every one of them would start raising a TypeError."""
+
+    def old_style_probe(backend_url, timeout=3.0, expect_model=None):
+        return True, None
+
+    manager = make_manager(tmp_path, probe=old_style_probe)
+    try:
+        dep = manager.launch(
+            fx.AUDIO8_TTS_0_6B, fx.single_node_plan(fx.SPARK_01.node_id), fx.fits(),
+            "sglang", 4096, 1,
+        )
+        assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    finally:
+        manager.close()
 
 
 # ==========================================================================
@@ -2548,6 +2971,36 @@ def test_the_rendered_command_is_accepted_by_real_sparkrun(tmp_path):
     assert HEAD_HOST_RE.search(output).group(1) == fx.SPARK_01.address
 
 
+def test_the_cluster_handle_is_read_from_every_sparkrun_that_prints_one():
+    """Hermetic, because the version installed here is not the only one.
+
+    The test above asks the sparkrun on THIS box, so it can only ever catch a
+    format change after somebody upgrades -- and the failure that change causes
+    is the worst kind. sparkrun 0.3.8 prints a two-segment id where 0.2.40
+    printed one; the expression anchored after the first segment matched
+    neither, so a launch whose containers were up on both hosts came back
+    "exited 0 but printed no cluster id", was recorded FAILED, and left a
+    workload running that nothing had a handle to stop.
+    """
+    from control_plane.deploy.sparkrun import CLUSTER_ID_RE
+
+    cases = {
+        # 0.2.40
+        "Cluster:   sparkrun_a76d4b9fdb7c": "sparkrun_a76d4b9fdb7c",
+        # 0.3.8, observed on a real two-node launch
+        "Cluster:   sparkrun_6579cd9ba54b79f5_1a209ee6d1e8": (
+            "sparkrun_6579cd9ba54b79f5_1a209ee6d1e8"
+        ),
+    }
+    for line, expected in cases.items():
+        match = CLUSTER_ID_RE.search(line)
+        assert match is not None, line
+        assert match.group(1) == expected
+        # The handle is also the container-name prefix `_local_container`
+        # filters on, so the whole thing has to come back, not a prefix of it.
+        assert ("%s_node_0" % expected).startswith(match.group(1) + "_")
+
+
 @needs_sparkrun
 def test_synthesized_recipes_validate_for_every_runtime(tmp_path):
     from control_plane.deploy.flags import SUPPORTED_RUNTIMES
@@ -2868,6 +3321,33 @@ def _terminal_dep(i: int) -> Deployment:
     )
 
 
+def test_a_record_written_before_the_graph_capture_fields_existed_still_decodes():
+    """store.encode()/decode() are hand-written, not a generic dataclass
+    walker (see the codec's own comment), so a new field has to be added to
+    both explicitly or it silently vanishes across a coordinator restart."""
+    from control_plane.deploy import store as store_module
+
+    dep = _terminal_dep(0)
+    raw = store_module.encode(dep)
+    assert raw["enforce_eager"] is False
+    assert raw["cudagraph_capture_sizes"] is None
+
+    # Simulate a record written before these two keys existed at all.
+    del raw["enforce_eager"]
+    del raw["cudagraph_capture_sizes"]
+    decoded = store_module.decode(raw)
+    assert decoded.enforce_eager is False
+    assert decoded.cudagraph_capture_sizes is None
+
+    # And the values genuinely round-trip when a record does carry them.
+    eager_dep = dataclasses.replace(
+        dep, enforce_eager=True, cudagraph_capture_sizes=(1, 2, 4, 8)
+    )
+    round_tripped = store_module.decode(store_module.encode(eager_dep))
+    assert round_tripped.enforce_eager is True
+    assert round_tripped.cudagraph_capture_sizes == (1, 2, 4, 8)
+
+
 def test_the_store_keeps_only_the_newest_terminal_records(tmp_path):
     """The age window cannot help: a retry storm's records are all minutes old.
 
@@ -3005,6 +3485,391 @@ def test_the_kept_log_is_what_log_tail_answers_once_the_buffer_is_gone(tmp_path)
     assert any("No available memory" in line for line in answer["lines"]), answer
 
 
+def test_a_slow_serving_snapshot_cannot_resurrect_the_file_the_archive_ate(tmp_path):
+    """The snapshot thread must not outlive the failure it raced.
+
+    `_snapshot_serving_log` runs in its own thread and its read takes real
+    time -- a `docker exec` against the node. So a deployment can reach FAILED
+    while that read is in flight, AFTER `_archive_log` has folded the snapshot
+    into the archive and deleted it. Writing then puts the file back, and
+    `log_tail` prefers a snapshot over an archive, so the post-mortem silently
+    reverts to the rolling serving log.
+
+    Found by making the read slower: the previous implementation polled
+    `sparkrun logs`, which returned instantly from the fake, and the race
+    simply never opened wide enough to see.
+    """
+    from control_plane.deploy.manager import FAILED_LOG_DIR
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    manager.adapter.log_tail = "INFO nominal: serving at 40 tok/s"
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    assert wait_for((tmp_path / FAILED_LOG_DIR / ("%s.log" % dep.deployment_id)).exists)
+
+    # The snapshot thread, arriving late with what the backend said while it
+    # was still healthy.
+    record = manager._records[dep.deployment_id]
+    manager._snapshot_serving_log(record)
+
+    snapshot = manager.serving_log_dir / ("%s.log" % dep.deployment_id)
+    assert not snapshot.exists(), "a terminal deployment kept no serving snapshot"
+
+    manager._records[dep.deployment_id].log_lines.clear()
+    answer = manager.log_tail(dep.deployment_id)
+    assert answer["source"] == "archive", answer
+
+
+# -- NCCL, which nothing configured at all until 2026-09-11
+
+
+def test_a_measured_record_reaches_the_launch_without_anyone_asking(tmp_path, monkeypatch):
+    """The point of calibrating: a pair that has been measured launches tuned,
+    with no operator action and no flag."""
+    from control_plane import measurements as M
+
+    records = tmp_path / "nccl"
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: records)
+    nodes = fx.pp2_plan().node_ids
+    for env, decode_us, bulk in (({}, 17.7, 7.7), ({"NCCL_MAX_NCHANNELS": "2"}, 17.4, 18.1)):
+        for size, us, bw in ((M.DECODE_COLLECTIVE_BYTES, decode_us, 0.3),
+                             (M.BULK_COLLECTIVE_BYTES, 1.0, bulk)):
+            M.save_nccl(M.NcclRecord(
+                src=nodes[0], dst=nodes[1], nccl_version="2.31.2", image="img",
+                size_band=M.band(size), microseconds=us, busbw_gbps=bw,
+                env=env, measured_at=1.0,
+            ))
+
+    manager = make_manager(tmp_path)
+    monkeypatch.delenv("DERATE_NCCL_ENV", raising=False)
+    manager.launch(fx.QWEN3_30B_A3B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 1)
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert "NCCL_MAX_NCHANNELS: 2" in manager.adapter.recipes[0]
+
+
+def test_prefill_heavy_traffic_bumps_the_setting_at_the_next_launch(tmp_path, monkeypatch):
+    """End to end: a model whose OWN traffic is prompt-dominated relaunches on
+    the bulk-tuned setting, with nobody asking for it.
+
+    NCCL reads its environment once at communicator init and vLLM builds that
+    communicator once at engine startup, so this cannot happen per request --
+    the next launch is the only moment the choice exists. Which is why the
+    input has to be what the LAST incarnation actually served.
+    """
+    from control_plane import measurements as M
+
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: tmp_path / "nccl")
+    monkeypatch.setattr(M, "workload_records_dir", lambda: tmp_path / "work")
+    monkeypatch.delenv("DERATE_NCCL_ENV", raising=False)
+    nodes = fx.pp2_plan().node_ids
+    for env, decode_us, bulk in (
+        ({}, 17.69, 8.09),
+        ({"NCCL_MAX_NCHANNELS": "2"}, 17.45, 17.68),
+        ({"NCCL_MAX_NCHANNELS": "4"}, 21.87, 18.55),
+    ):
+        for size, us, bw in ((M.DECODE_COLLECTIVE_BYTES, decode_us, 0.3),
+                             (M.BULK_COLLECTIVE_BYTES, 1.0, bulk)):
+            M.save_nccl(M.NcclRecord(
+                src=nodes[0], dst=nodes[1], nccl_version="2.31.2", image="img",
+                size_band=M.band(size), microseconds=us, busbw_gbps=bw,
+                env=env, measured_at=1.0,
+            ))
+
+    # A summariser: 8k-token prompts, 50-token answers.
+    M.save_workload(M.WorkloadRecord("summary", 0.99, 8000.0, 50.0))
+    manager = make_manager(tmp_path)
+    manager.launch(fx.QWEN3_30B_A3B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 1,
+                   served_name="summary")
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert "NCCL_MAX_NCHANNELS: 4" in manager.adapter.recipes[0], (
+        "prefill-dominated traffic should take the bulk winner"
+    )
+
+
+def test_interactive_traffic_keeps_the_setting_that_regresses_nothing(tmp_path, monkeypatch):
+    """The same records, the same pair, different traffic -- and the decode
+    guard holds. This is the case the guard exists for: a regression here is
+    paid dozens of times per output token."""
+    from control_plane import measurements as M
+
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: tmp_path / "nccl")
+    monkeypatch.setattr(M, "workload_records_dir", lambda: tmp_path / "work")
+    monkeypatch.delenv("DERATE_NCCL_ENV", raising=False)
+    nodes = fx.pp2_plan().node_ids
+    for env, decode_us, bulk in (
+        ({}, 17.69, 8.09),
+        ({"NCCL_MAX_NCHANNELS": "2"}, 17.45, 17.68),
+        ({"NCCL_MAX_NCHANNELS": "4"}, 21.87, 18.55),
+    ):
+        for size, us, bw in ((M.DECODE_COLLECTIVE_BYTES, decode_us, 0.3),
+                             (M.BULK_COLLECTIVE_BYTES, 1.0, bulk)):
+            M.save_nccl(M.NcclRecord(
+                src=nodes[0], dst=nodes[1], nccl_version="2.31.2", image="img",
+                size_band=M.band(size), microseconds=us, busbw_gbps=bw,
+                env=env, measured_at=1.0,
+            ))
+
+    M.save_workload(M.WorkloadRecord("chat", 0.06, 50.0, 800.0))
+    manager = make_manager(tmp_path)
+    manager.launch(fx.QWEN3_30B_A3B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 1,
+                   served_name="chat")
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert "NCCL_MAX_NCHANNELS: 2" in manager.adapter.recipes[0]
+
+
+def test_the_operator_setting_wins_over_the_record(tmp_path, monkeypatch):
+    """The escape hatch. A value measured since, or one this box needs for a
+    reason no sweep captured, must not be argued with by a stored row."""
+    from control_plane import measurements as M
+
+    records = tmp_path / "nccl"
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: records)
+    nodes = fx.pp2_plan().node_ids
+    for env, bulk in (({}, 7.7), ({"NCCL_MAX_NCHANNELS": "2"}, 18.1)):
+        for size, bw in ((M.DECODE_COLLECTIVE_BYTES, 0.3), (M.BULK_COLLECTIVE_BYTES, bulk)):
+            M.save_nccl(M.NcclRecord(
+                src=nodes[0], dst=nodes[1], nccl_version="2.31.2", image="img",
+                size_band=M.band(size), microseconds=17.0, busbw_gbps=bw,
+                env=env, measured_at=1.0,
+            ))
+
+    monkeypatch.setenv("DERATE_NCCL_ENV", "NCCL_MAX_NCHANNELS=8")
+    manager = make_manager(tmp_path)
+    manager.launch(fx.QWEN3_30B_A3B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 1)
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert "NCCL_MAX_NCHANNELS: 8" in manager.adapter.recipes[0]
+
+
+def test_an_unmeasured_pair_launches_exactly_as_it_always_did(tmp_path, monkeypatch):
+    """`{}` is the ordinary answer and it is not a gap. Every launch before
+    calibration existed was untuned, and one that finds no record has to be
+    identical to those -- not tuned with somebody else's numbers."""
+    from control_plane import measurements as M
+
+    monkeypatch.setattr(M, "nccl_records_dir", lambda: tmp_path / "empty")
+    monkeypatch.delenv("DERATE_NCCL_ENV", raising=False)
+    manager = make_manager(tmp_path)
+    manager.launch(fx.QWEN3_30B_A3B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 1)
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert "NCCL_" not in manager.adapter.recipes[0]
+
+
+def test_nccl_settings_reach_the_recipe_env_block(tmp_path, monkeypatch):
+    """The env: block is derate's ONE channel into the container -- the recipe
+    format has no volumes: key -- and it is how VLLM_CACHE_ROOT already gets
+    in. A tensor-parallel decode step pays dozens of collectives of a few KB
+    each, so per-collective overhead is essentially the whole wire cost, and
+    until now nothing in control_plane/ set a single NCCL variable."""
+    monkeypatch.setenv("DERATE_NCCL_ENV", "NCCL_PROTO=LL,NCCL_MIN_NCHANNELS=2")
+    manager = make_manager(tmp_path)
+    manager.launch(fx.QWEN3_30B_A3B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 1)
+    assert wait_for(lambda: manager.adapter.recipes)
+    body = manager.adapter.recipes[0]
+    assert "NCCL_PROTO: LL" in body
+    assert "NCCL_MIN_NCHANNELS: 2" in body
+    # ...beside the cache root, not instead of it.
+    assert "VLLM_CACHE_ROOT" in body
+
+
+def test_a_single_rank_launch_is_told_no_nccl_settings(tmp_path, monkeypatch):
+    """There is no communicator to configure. Setting them anyway would put
+    variables in an environment nothing reads, which reads as tuning that
+    happened."""
+    monkeypatch.setenv("DERATE_NCCL_ENV", "NCCL_PROTO=LL")
+    manager = make_manager(tmp_path)
+    manager.launch(fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 1)
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert "NCCL_PROTO" not in manager.adapter.recipes[0]
+
+
+def test_a_variable_this_nccl_does_not_read_refuses_the_launch(tmp_path, monkeypatch):
+    """The failure this closes. NCCL reads its environment once at init and
+    ignores an unknown name with no warning and no error, so a typo produces a
+    launch that reports as tuned and runs the defaults. `NCCL_TUNABLES` is the
+    image's own string table -- the LOADED libnccl.so.2, not what
+    `torch.cuda.nccl.version()` reports, which is the version torch was
+    compiled against and differs -- so the name is checked before anything
+    starts."""
+    monkeypatch.setenv("DERATE_NCCL_ENV", "NCCL_PROTOO=LL")
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="not read by the NCCL in this image"):
+        manager.launch(fx.QWEN3_30B_A3B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 1)
+    assert manager.list() == []
+
+
+def test_the_tunable_table_is_the_images_own(tmp_path):
+    """Read off libnccl.so.2's string table, not a changelog -- the same
+    evidence rule VLLM_KV_CACHE_DTYPES follows. The small-message knobs are
+    the ones derate's regime turns on, so their absence would be the bug."""
+    from control_plane.deploy.flags import NCCL_TUNABLES
+
+    for name in (
+        "NCCL_PROTO", "NCCL_ALGO", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS",
+        "NCCL_NTHREADS", "NCCL_BUFFSIZE", "NCCL_IB_QPS_PER_CONNECTION",
+    ):
+        assert name in NCCL_TUNABLES, name
+    assert "NCCL_PROTOO" not in NCCL_TUNABLES
+    assert len(NCCL_TUNABLES) > 200
+
+
+def test_no_nccl_default_is_shipped(tmp_path):
+    """Deliberate, and the test exists so it stays deliberate. Nothing has
+    measured a collective on this fabric; forcing the small-message protocol
+    would slow the large-message path prefill uses. A value in here would be a
+    guess wearing a measurement's clothes."""
+    monkeypatch_free = make_manager(tmp_path)
+    import os as _os
+
+    assert "DERATE_NCCL_ENV" not in _os.environ or not _os.environ["DERATE_NCCL_ENV"]
+    assert monkeypatch_free._nccl_env_for(fx.pp2_plan()) == {}
+
+
+# -- the KV cache DTYPE, which the gate priced and the launcher could not ask for
+
+
+def _vllm_recipe(tmp_path, **kw):
+    return recipes.synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "vllm", 8192, 16, "m",
+        port=8101, gpu_memory_utilization=0.5, kv_cache_memory_bytes=8 << 30,
+        recipe_dir=tmp_path, **kw
+    ).content
+
+
+def test_the_width_the_gate_sized_with_reaches_the_engine(tmp_path):
+    """End to end, through the manager: the whole point of the field.
+
+    Before this, `--kv-cache-memory-bytes` travelled and the WIDTH did not.
+    The gate halves `kv_bytes_per_token` for fp8, approves a context on that,
+    and hands over the halved byte budget; the engine filled it with fp16
+    entries. The budget was honoured so nothing OOMed, and the operator got
+    half the context they were promised with nothing anywhere saying so.
+    Both halves now travel or neither does.
+    """
+    manager = make_manager(tmp_path)
+    d = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 40960, 1,
+        kv_dtype="fp8",
+    )
+    assert wait_for(lambda: manager.adapter.recipes)
+    body = manager.adapter.recipes[0]
+    assert "kv_cache_dtype: fp8" in body
+    assert "--kv-cache-dtype {kv_cache_dtype}" in body
+    # ...and it is on the record, so a coordinator restart relaunches at the
+    # same width rather than at the runtime's default.
+    assert d.kv_dtype == "fp8"
+    assert manager.get(d.deployment_id).kv_dtype == "fp8"
+
+
+def test_the_record_survives_a_round_trip_through_the_store(tmp_path):
+    """A restart that forgot the width would relaunch at the model's own and
+    silently halve the context a second time -- the identical bug, moved."""
+    from control_plane.deploy import store
+
+    manager = make_manager(tmp_path)
+    d = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 40960, 1,
+        kv_dtype="fp8",
+    )
+    back = store.decode(store.encode(d))
+    assert back.kv_dtype == "fp8"
+    # And a record written before the field existed decodes as the runtime's
+    # own default rather than as a width nobody chose.
+    raw = store.encode(d)
+    del raw["kv_dtype"]
+    assert store.decode(raw).kv_dtype is None
+
+
+def test_a_width_the_runtime_cannot_be_told_refuses_the_launch(tmp_path):
+    """`speculative` and `enforce_eager` both refuse rather than drop. This
+    one has to, because the caller has ALREADY been handed a fit verdict
+    computed at the width."""
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="half the context"):
+        manager.launch(
+            fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "sglang", 40960, 1,
+            kv_dtype="fp8",
+        )
+    assert manager.list() == [], "nothing was recorded"
+    assert manager.adapter.launches == []
+
+
+def test_a_width_alongside_a_custom_command_refuses(tmp_path):
+    """A custom command replaces every plan-derived flag, so --kv-cache-dtype
+    would be the one thing that silently did not survive the replacement --
+    while the gate had already sized for it."""
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        manager.launch(
+            fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 40960, 1,
+            kv_dtype="fp8", custom_command=("vllm", "serve", "x"),
+        )
+
+
+def test_the_model_default_kv_dtype_passes_no_flag(tmp_path):
+    """Today's behaviour, and it must not change. `fp16` in derate's
+    vocabulary means "the model's own", which is exactly the case where
+    passing nothing is right."""
+    for kv in (None, "auto", "fp16", "bf16"):
+        assert "--kv-cache-dtype" not in _vllm_recipe(tmp_path, kv_dtype=kv), kv
+
+
+def test_fp8_reaches_the_launch_command_and_the_defaults_block(tmp_path):
+    """The bug this closes: the fit gate halves `kv_bytes_per_token` for fp8
+    and approves a context on that basis, then passes only the halved BYTE
+    budget. The engine filled it with fp16 entries and the operator silently
+    got half the context the gate promised. Width and cap now both travel."""
+    body = _vllm_recipe(tmp_path, kv_dtype="fp8")
+    assert "--kv-cache-dtype {kv_cache_dtype}" in body
+    assert "kv_cache_dtype: fp8" in body
+    # Its partner is still there: a cap without a width was the whole problem.
+    assert "--kv-cache-memory-bytes {kv_cache_memory_bytes}" in body
+
+
+def test_a_dtype_this_build_cannot_request_raises_before_a_recipe_exists(tmp_path):
+    """`fit/kv.py::KV_ELEM_BYTES` prices int8 and fp32; this image's
+    `CacheConfig` accepts neither. Silently dropping the flag is the failure
+    mode -- the gate would already have believed it."""
+    for kv in ("int8", "fp32", "nonsense"):
+        with pytest.raises(ValueError):
+            _vllm_recipe(tmp_path, kv_dtype=kv)
+
+
+def test_the_refusal_names_what_a_runtime_cannot_be_told(tmp_path):
+    """Same shape as speculative_refusal and graph_capture_refusal: asked
+    before a launch, never discovered by one."""
+    from control_plane.deploy.flags import kv_cache_dtype_refusal
+
+    assert kv_cache_dtype_refusal("vllm", "fp8") is None
+    assert kv_cache_dtype_refusal("vllm", "fp16") is None
+    assert kv_cache_dtype_refusal("vllm", None) is None
+    # A runtime with no flag for it refuses rather than dropping it.
+    for runtime in ("sglang", "tts"):
+        why = kv_cache_dtype_refusal(runtime, "fp8")
+        assert why and "half the context" in why, (runtime, why)
+    # And an unserveable width refuses on every runtime.
+    assert kv_cache_dtype_refusal("vllm", "int8")
+
+
+def test_the_accepted_values_come_from_the_image_not_a_changelog():
+    """`VLLM_KV_CACHE_DTYPES` was read off the pinned image's own
+    CacheConfig. Everything derate can RENDER must be in it, or the launch
+    dies at load having cleared every gate."""
+    from control_plane.deploy.flags import (
+        VLLM_KV_CACHE_DTYPES, _KV_DTYPE_TO_VLLM, render_kv_cache_dtype,
+    )
+    for key, rendered in _KV_DTYPE_TO_VLLM.items():
+        if rendered is not None:
+            assert rendered in VLLM_KV_CACHE_DTYPES, key
+        assert render_kv_cache_dtype(key) == rendered
+
+
 def test_only_the_newest_failed_logs_are_kept(tmp_path):
     """A box that fails a lot is the one you want the last few from."""
     from control_plane.deploy.manager import FAILED_LOG_DIR, FAILED_LOGS_KEPT
@@ -3030,6 +3895,268 @@ def test_only_the_newest_failed_logs_are_kept(tmp_path):
     assert (kept_dir / ("%s.log" % dep.deployment_id)).exists()
 
 
+def test_a_serving_deployment_is_snapshotted_to_disk_while_it_is_up(tmp_path):
+    """log_lines stops being fed at READY, so without this the backend's own
+    output while serving lives nowhere until something goes wrong and asks
+    for it -- which is exactly the moment a wedged or rebooting host cannot
+    answer the ask."""
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe)
+    manager.adapter.log_tail = "INFO nominal: serving at 40 tok/s"
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+
+    manager.tick()
+    snapshot = manager.serving_log_dir / ("%s.log" % dep.deployment_id)
+    assert wait_for(snapshot.exists), "no serving-log snapshot was written"
+    assert "nominal: serving at 40 tok/s" in snapshot.read_text()
+    manager.close()
+
+
+def test_reconcile_does_not_restart_the_retention_clock_on_a_settled_record(tmp_path):
+    """`store.purge_expired` keys TERMINAL_RETENTION_S off the file's mtime --
+    "a record's file is rewritten on every state change, so its mtime is
+    exactly when it settled". Reconcile used to re-save every terminal record
+    it loaded, unchanged, which made that false: a coordinator restarted more
+    often than the window aged out nothing, and only the count cap did any
+    work. Seen live as 201 of 205 records sharing one boot timestamp.
+    """
+    manager = make_manager(tmp_path)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 1
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    manager.stop(dep.deployment_id)
+    assert wait_for(lambda: manager.get(dep.deployment_id).state in TERMINAL)
+
+    path = next(pathlib.Path(tmp_path).rglob("%s.json" % dep.deployment_id))
+    settled_at = path.stat().st_mtime
+    os.utime(path, (settled_at - 7200, settled_at - 7200))
+    aged = path.stat().st_mtime
+
+    # A fresh manager over the same directory: the reconcile a restart runs.
+    reborn = make_manager(tmp_path)
+    reborn.reconcile()
+
+    assert path.stat().st_mtime == pytest.approx(aged, abs=1.0), (
+        "an unchanged terminal record must keep the mtime that says when it "
+        "settled; rewriting it restarts the retention window"
+    )
+
+
+def test_the_in_memory_records_are_capped_the_same_way_disk_is(tmp_path):
+    """Disk and the route were both bounded and `_records` was not, so the
+    crash loop that left 200 files held 1,094 entries in the process. The
+    route's own limit hid it."""
+    from control_plane.deploy.store import TERMINAL_RECORDS_KEPT
+
+    manager = make_manager(tmp_path)
+    # Real failures, not forced transitions: the adapter refuses every launch,
+    # so each one walks the ordinary LAUNCHING -> FAILED path a crash loop
+    # walks. Forcing the state instead races the launch worker.
+    manager.adapter.fail_with = LaunchError("the backend died during startup", raw="")
+
+    # One at a time: `_find_conflict` refuses a second copy of a model on a
+    # node while the first is still LAUNCHING, which is exactly the serialising
+    # a real crash loop also does.
+    for i in range(TERMINAL_RECORDS_KEPT + 25):
+        dep = manager.launch(
+            fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 1,
+            served_name="crashloop-%03d" % i,
+        )
+        did = dep.deployment_id
+        assert wait_for(
+            lambda: manager.get(did) is None or manager.get(did).state in TERMINAL,
+            timeout=10.0,
+        ), i
+
+    finished = [d for d in manager.list() if d.state in TERMINAL]
+    assert len(finished) <= TERMINAL_RECORDS_KEPT, (
+        "%d terminal records held in memory against a cap of %d"
+        % (len(finished), TERMINAL_RECORDS_KEPT)
+    )
+
+
+def test_a_kept_log_is_never_visible_half_written(tmp_path):
+    """`Path.write_text` creates the file empty and fills it afterwards, so a
+    reader landing in that window gets a truncated log with nothing to say so
+    -- and `log_tail` reads these files from a request thread while the
+    snapshot timer rewrites them from its own.
+
+    Caught as a flake first: the cadence test below read `st_mtime` as soon as
+    the path existed and got the CREATE time, then saw the file change 1.3ms
+    later when the content landed. The fix is the same one
+    `deploy/store.py` already uses for a deployment record.
+    """
+    from control_plane.deploy.manager import _atomic_log_write
+
+    path = tmp_path / "d-1.log"
+    _atomic_log_write(path, "INFO first\n")
+    assert path.read_text() == "INFO first\n"
+
+    # A write that dies partway leaves the previous answer standing, rather
+    # than an empty or half-filled file where a log used to be.
+    import os as _os
+
+    real_replace = _os.replace
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    _os.replace = boom
+    try:
+        with pytest.raises(OSError):
+            _atomic_log_write(path, "INFO second, never lands\n")
+    finally:
+        _os.replace = real_replace
+
+    assert path.read_text() == "INFO first\n", "the old log survived"
+    # And nothing was left behind for _prune_serving_logs to trip over.
+    assert list(tmp_path.glob(".tmp-*")) == []
+
+
+def test_the_write_in_flight_is_not_mistaken_for_a_kept_log(tmp_path):
+    """`_prune_serving_logs` globs `*.log` and keeps the newest N. A temp
+    file named `*.log` would be counted as one of them -- and could evict a
+    real snapshot."""
+    from control_plane.deploy.manager import _atomic_log_write
+    import tempfile as _tempfile
+
+    seen = []
+    real = _tempfile.mkstemp
+
+    def spy(**kwargs):
+        seen.append(kwargs.get("suffix"))
+        return real(**kwargs)
+
+    _tempfile.mkstemp = spy
+    try:
+        _atomic_log_write(tmp_path / "d-1.log", "x\n")
+    finally:
+        _tempfile.mkstemp = real
+    assert seen and not any((sfx or "").endswith(".log") for sfx in seen)
+
+
+def test_the_serving_snapshot_is_not_retaken_every_tick(tmp_path):
+    """A `sparkrun logs` round trip to every serving deployment on every 5s
+    health tick is a cost nobody asked to pay per model. Cadence is its own
+    clock, controlled here rather than by real sleeps."""
+    from control_plane.deploy.manager import SERVING_LOG_SNAPSHOT_S
+
+    class FakeClock:
+        def __init__(self, start: float) -> None:
+            self.now = start
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = FakeClock(1_000_000.0)
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, clock=clock)
+    manager.adapter.log_tail = "INFO first snapshot"
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+
+    manager.tick()
+    snapshot = manager.serving_log_dir / ("%s.log" % dep.deployment_id)
+    assert wait_for(snapshot.exists)
+    written_at = snapshot.stat().st_mtime
+
+    # Well inside the cadence window: a second tick right away must not
+    # re-read the backend.
+    manager.adapter.log_tail = "INFO should not be written yet"
+    manager.tick()
+    time.sleep(0.1)  # a wrongly-dispatched snapshot thread a chance to land
+    assert snapshot.stat().st_mtime == written_at
+    assert "should not be written yet" not in snapshot.read_text()
+
+    clock.now += SERVING_LOG_SNAPSHOT_S + 1
+    manager.tick()
+    assert wait_for(lambda: "should not be written yet" in snapshot.read_text())
+    manager.close()
+
+
+def test_archive_log_falls_back_to_the_serving_snapshot_when_the_buffer_is_empty(tmp_path):
+    """A deployment that crashes after READY has an empty in-memory buffer --
+    it stops being fed at that transition -- so without the rolling snapshot
+    the failed-launches archive would hold only the state machine's own
+    sentence, never the runtime's own output. The post-mortem's own read, run
+    right as the backend goes, sees nothing here on purpose: a real crash
+    often leaves an unreachable host or a container whose log the next
+    attempt has already truncated, which is the case this is standing in
+    for."""
+    from control_plane.deploy.manager import FAILED_LOG_DIR
+
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+
+    manager.adapter.log_tail = "CUDA error: an illegal memory access was encountered"
+    manager.tick()
+    snapshot = manager.serving_log_dir / ("%s.log" % dep.deployment_id)
+    assert wait_for(snapshot.exists), "no serving-log snapshot was written"
+
+    manager.adapter.log_tail = ""
+    probe.kill(dep.backend_url)
+    manager.tick()
+    manager.tick()
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+
+    kept = tmp_path / FAILED_LOG_DIR / ("%s.log" % dep.deployment_id)
+    assert wait_for(kept.exists), "the failed launch kept no log"
+    assert "illegal memory access" in kept.read_text()
+    # Spent once it is folded into the failed deployment's own archive.
+    assert not snapshot.exists()
+    manager.close()
+
+
+def test_a_serving_log_snapshot_survives_a_control_plane_restart_the_crash_did_not(
+    tmp_path,
+):
+    """The hole this whole mechanism exists to close: a crash concurrent with
+    the control plane itself going down. reconcile() resolves a record's
+    state from evidence alone (see _evidence) and never calls _archive_log,
+    so without a snapshot already on disk from before the crash, nothing
+    survives to explain it."""
+    registry = FakeRegistry(fx.SPARK_01, fx.SPARK_02)
+    first = make_manager(tmp_path, registry=registry)
+    first.adapter.log_tail = "CUDA error: an illegal memory access was encountered"
+    dep = first.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: first.get(dep.deployment_id).state is S.READY)
+
+    first.tick()
+    snapshot = first.serving_log_dir / ("%s.log" % dep.deployment_id)
+    assert wait_for(snapshot.exists), "no serving-log snapshot was written"
+    first.close()
+
+    # A fresh process: no buffer, and a container this adapter never launched
+    # so is_running() reports it gone -- what a reboot leaves behind.
+    adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    probe = FakeProbe(healthy_by_default=False)
+    second = DeploymentManager(
+        adapter, registry, state_dir=tmp_path, probe_fn=probe,
+        autostart=False, ready_poll_interval_s=0.01, ready_timeout_s=5.0,
+    )
+    adopted = second.reconcile()
+
+    assert adopted == []
+    assert second.get(dep.deployment_id).state in (S.FAILED, S.STOPPED)
+
+    answer = second.log_tail(dep.deployment_id)
+    assert answer["source"] == "snapshot", answer
+    assert any("illegal memory access" in line for line in answer["lines"]), answer
+    second.close()
+
+
 def test_a_state_dir_that_cannot_be_written_does_not_fail_the_launch(tmp_path):
     """Losing the evidence is bad; reporting that as the launch's own failure,
     on a launch that already failed, is worse."""
@@ -3051,6 +4178,11 @@ def test_a_state_dir_that_cannot_be_written_does_not_fail_the_launch(tmp_path):
 
     assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
     assert "stopped answering" in manager.get(dep.deployment_id).last_error
+    # The post-mortem thread deletes this deployment's serving-log snapshot
+    # once it has folded it in, which is what tells us that thread -- and not
+    # just the FAILED transition -- has finished, so log_tail is not racing it.
+    snapshot = manager.serving_log_dir / ("%s.log" % dep.deployment_id)
+    assert wait_for(lambda: not snapshot.exists())
     assert manager.log_tail(dep.deployment_id)["source"] in ("buffer", "read", "none")
 
 
@@ -3887,6 +5019,44 @@ def test_the_tts_server_announces_its_own_death_and_the_marker_is_one_string():
     assert alive is None or not alive.fatal
 
 
+def test_sglang_announces_its_own_death_too():
+    """Until 2026-09-10 this tuple had no sglang markers at all -- no sglang
+    container had ever been launched on a box that could watch one die.
+
+    A real launch of Qwen/Qwen3-0.6B against
+    scitrera/dgx-spark-sglang:0.5.9-t5 crashed in `init_memory_pool` after
+    weights had already loaded, and sat at `state=launching, last_error=None`
+    for the full timeout: the container stayed up exactly as a solo vLLM
+    launch's does, and nothing here matched a single line sglang printed.
+    These are that launch's own lines, not invented ones.
+    """
+    from control_plane.deploy import progress
+
+    died = progress.from_runtime_log(
+        "[2026-09-10 21:18:40] Received sigquit from a child process. It "
+        "usually means the child failed."
+    )
+    assert died.fatal is True
+
+    # Narrower and fires first when it is specifically the scheduler -- the
+    # process that was actually dying in this launch -- one line above the
+    # sigquit announcement above in the real log.
+    scheduler_died = progress.from_runtime_log(
+        "[2026-09-10 21:18:40] Scheduler hit an exception: Traceback (most "
+        "recent call last):\n"
+        "RuntimeError: Not enough memory. Please try to increase "
+        "--mem-fraction-static. Current value: "
+        "self.server_args.mem_fraction_static=0.05"
+    )
+    assert scheduler_died.fatal is True
+
+    # An ordinary line from the same server is not a death.
+    alive = progress.from_runtime_log(
+        "[2026-09-10 21:18:31] Init torch distributed ends. elapsed=0.29 s"
+    )
+    assert alive is None or not alive.fatal
+
+
 def test_the_tts_server_prints_the_marker_before_it_gives_up(caplog, monkeypatch):
     """Printed by `main`, not merely defined beside it.
 
@@ -4054,6 +5224,63 @@ def test_the_compile_cache_is_pointed_somewhere_that_survives_the_container(tmp_
     assert "env:\n" in tts
     assert "DERATE_TTS_VOICE_DIR: %s/voices" % RUNTIME_CACHE_DIR in tts
 
+    # sglang compiles too (Inductor and Triton both), and the same unwritable
+    # HOME applies -- this is the one runtime's cache_env the audit that found
+    # the gaps above flagged as having zero coverage at all.
+    sglang_env = dict(runtime_spec("sglang").cache_env)
+    assert sglang_env == {
+        "TORCHINDUCTOR_CACHE_DIR": RUNTIME_CACHE_DIR + "/sglang/inductor",
+        "TRITON_CACHE_DIR": RUNTIME_CACHE_DIR + "/sglang/triton",
+    }
+    sglang = recipes.synthesize(
+        fx.AUDIO8_TTS_0_6B,
+        fx.single_node_plan(),
+        "sglang",
+        4096,
+        8,
+        "sglang",
+        port=8100,
+        gpu_memory_utilization=0.90,
+        recipe_dir=tmp_path / "recipes",
+    ).content
+    assert "env:\n" in sglang
+    assert "TORCHINDUCTOR_CACHE_DIR: %s/sglang/inductor" % RUNTIME_CACHE_DIR in sglang
+    assert "TRITON_CACHE_DIR: %s/sglang/triton" % RUNTIME_CACHE_DIR in sglang
+
+
+def test_the_sglang_recipe_actually_names_sglangs_own_flags(tmp_path):
+    """The forward direction of what `test_deploy_adopt.py`'s
+    `test_an_sglang_serve_command_reads_its_own_flag_names` already checks
+    in reverse (parsing a running container's command back into a spec).
+    Nothing renders the template and reads the result until this -- every
+    other sglang test either checks one flag incidentally
+    (`test_render_command_sglang_uses_its_own_concurrency_key`) or checks the
+    negative space (`test_a_runtime_that_cannot_be_told_its_kv_size_is_not_told`).
+    """
+    recipe = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "sglang", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.25, recipe_dir=tmp_path,
+    ).content
+
+    assert "python3 -m sglang.launch_server" in recipe
+    assert "vllm serve" not in recipe
+    for flag in (
+        "--model-path {model}",
+        "--tp-size {tensor_parallel}",
+        "--pp-size {pipeline_parallel}",
+        "--context-length {max_model_len}",
+        "--max-running-requests {max_running_requests}",
+        "--mem-fraction-static {gpu_memory_utilization}",
+    ):
+        assert flag in recipe, "sglang command template drops %r" % flag
+    assert "--trust-remote-code" in recipe
+    # And the defaults block actually carries a value for the one key whose
+    # name differs from vLLM's (max_running_requests, not max_num_seqs) --
+    # the exact mismatch `test_render_command_sglang_uses_its_own_concurrency_key`
+    # proves reaches sparkrun's CLI; this proves it reaches the recipe file too.
+    assert "\n  max_running_requests: 64" in recipe
+    assert "max_num_seqs" not in recipe
+
 
 # ==========================================================================
 # What share of the GPU a launch asks for.
@@ -4170,6 +5397,82 @@ def test_the_launch_asks_for_what_the_node_can_actually_give(tmp_path):
     recipe = next(iter((tmp_path / "recipes").glob("*.yaml"))).read_text()
     assert "gpu_memory_utilization: %.2f" % asked in recipe
     manager.close()
+    assert dep.state is not None
+
+
+def test_sglang_asks_for_a_share_of_free_memory_not_total(tmp_path):
+    """The bug a real launch found, reproduced without a container.
+
+    sglang's `--mem-fraction-static` divides by its own in-container FREE
+    memory at load time, not the device's total the way vLLM's flag does --
+    verified against sglang 0.5.12's own
+    `model_runner_kv_cache_mixin.py::_profile_available_bytes`. A real launch
+    of Qwen/Qwen3-0.6B on spark-26af, 2026-09-10 -- this fit breakdown is that
+    launch's own numbers -- asked for 5% of the node's ~120.6 GiB total (the
+    old, vLLM-shaped computation, and MIN_UTILIZATION's floor exactly) and
+    crashed in `init_memory_pool` with "Not enough memory" right after the
+    weights had already loaded. 5% of the live allocatable ~12 GiB would have
+    been plenty; the fix asks for ~25% of it instead of ~5% of the total.
+
+    Same node, same question, two runtimes: vLLM's own figure is the
+    regression-net test above and is untouched; this is sglang's.
+    """
+    from control_plane.contracts import FitResult, MemoryBreakdown, Verdict
+
+    GIB = 1024**3
+    registry = FakeLiveRegistry(
+        fx.SPARK_01, fx.SPARK_02, allocatable={fx.SPARK_01.node_id: int(12 * GIB)}
+    )
+    node = registry.get_node(fx.SPARK_01.node_id)
+    # The live total and the crude memory_total - memory_used free figure a
+    # node with other work on it reports -- deliberately NOT what the fix
+    # should key off for sglang, to prove it does not fall back to either.
+    node.memory_total = int(120.58 * GIB)
+    node.memory_used = int(95.94 * GIB)
+
+    small_fit = FitResult(
+        verdict=Verdict.FITS,
+        breakdown=MemoryBreakdown(
+            weights=1_503_300_328,
+            kv_cache=469_762_048,
+            activations=50_939_392,
+            comm_buffers=0,
+            replicated=0,
+            framework_overhead=1_073_741_824,
+        ),
+        usable_per_node=int(12 * GIB),
+        headroom=int(9 * GIB),
+        reason="fits",
+        limiting_term="none",
+        max_context_that_fits=88576,
+        predicted_decode_tps=76.0,
+        warnings=[],
+    )
+
+    manager = make_manager(tmp_path, registry=registry, probe=FakeProbe())
+    try:
+        dep = manager.launch(
+            fx.AUDIO8_TTS_0_6B,
+            fx.single_node_plan(fx.SPARK_01.node_id),
+            small_fit,
+            "sglang",
+            4096,
+            1,
+        )
+        assert wait_for(lambda: manager.adapter.launches)
+        argv = manager.adapter.launches[-1]
+        asked = float(argv[argv.index("--gpu-mem") + 1])
+    finally:
+        manager.close()
+
+    # ~25% of the 12 GiB live allocatable. The old, buggy computation landed
+    # exactly on MIN_UTILIZATION (0.05) for these real numbers -- asking this
+    # much more is the fix, not noise.
+    assert asked > 0.20, (
+        "asked sglang for only %.3f -- looks like the old computation "
+        "(device TOTAL, floored at 0.05), not the live allocatable" % asked
+    )
+    assert asked < 0.90
     assert dep.state is not None
 
 
@@ -4325,3 +5628,61 @@ def test_a_serving_deployment_reads_its_log_live_rather_than_replaying_it(tmp_pa
     assert answer["source"] == "read"
     assert any("only exists now" in line for line in answer["lines"])
     manager.close()
+
+
+def test_a_pure_data_parallel_plan_is_refused_before_it_is_attempted():
+    """Measured, not theorised: vLLM takes the flags, sparkrun cannot start it.
+
+    `openai/gpt-oss-20b` at EP=2/DP=2 across two Sparks got the whole command
+    (`'data_parallel_size': 2, 'enable_expert_parallel': True` in vLLM's own
+    non-default-args line) and reached `Started DP Coordinator process`. It
+    then sat there: sparkrun's cluster path waits for the head to bind the
+    torch-distributed master port before starting any worker, and a plan whose
+    tensor x pipeline is 1 never emits `--master-port`, so rank 1 was never
+    launched and the head waited for it until the 128s timeout.
+    """
+    from control_plane.deploy.flags import data_parallel_refusal, sharding_refusal
+
+    refusal = data_parallel_refusal(1, 1, 2, "0.2.40")
+    assert refusal is not None
+    assert "master port" in refusal
+    # Reached through the gate the launch path already calls, on a runtime that
+    # shards -- the early `spec.shards` return used to skip every check.
+    assert sharding_refusal("vllm", 1, 1, 2, 2, "0.2.40") == refusal
+
+    # The shapes that do work are not refused.
+    assert data_parallel_refusal(1, 1, 1, "0.2.40") is None   # no data parallel
+    assert data_parallel_refusal(2, 1, 1, "0.2.40") is None   # single-node EP: tp=ep
+    assert data_parallel_refusal(2, 1, 2, "0.2.40") is None   # a real replica, tp>1
+    assert sharding_refusal("vllm", 2, 1, 2, 1, "0.2.40") is None
+
+
+def test_the_data_parallel_refusal_lifts_on_a_launcher_that_fixed_it():
+    """A version gate, not a permanent one.
+
+    sparkrun 0.3.7 added `native_rendezvous_port`, which returns None under pure
+    data parallelism so the workers start without waiting for a port nothing
+    binds. Found by bisecting the released wheels: 0.3.0-0.3.6 lack the hook,
+    0.3.7 has it. Verified on 0.3.8 by launching `openai/gpt-oss-20b` at
+    EP=2/DP=2 across two Sparks -- both ranks resident, a completion served, and
+    vLLM's own system_fingerprint ending `-dp2-ep`.
+    """
+    from control_plane.deploy.flags import (
+        SPARKRUN_DATA_PARALLEL_VERSION,
+        data_parallel_refusal,
+        launcher_does_data_parallel,
+    )
+
+    assert launcher_does_data_parallel("0.3.6") is False
+    assert launcher_does_data_parallel(SPARKRUN_DATA_PARALLEL_VERSION) is True
+    assert launcher_does_data_parallel("0.3.8") is True
+    assert data_parallel_refusal(1, 1, 2, "0.3.8") is None
+    assert SPARKRUN_DATA_PARALLEL_VERSION in data_parallel_refusal(1, 1, 2, "0.2.40")
+
+    # A version that cannot be read is not permission. The argument defaults to
+    # None, so "could not ask" and "the caller forgot" arrive identically, and
+    # reading either as a pass would disable the gate silently.
+    assert launcher_does_data_parallel(None) is None
+    assert launcher_does_data_parallel("2026.1-nightly") is None
+    assert data_parallel_refusal(1, 1, 2, None) is not None
+    assert data_parallel_refusal(1, 1, 2, "2026.1-nightly") is not None

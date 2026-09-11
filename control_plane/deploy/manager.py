@@ -21,8 +21,11 @@ Four rules this file exists to enforce:
 
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 import socket
+import tempfile
 import threading
 import time
 import uuid
@@ -31,8 +34,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
 
+from control_plane import measurements
 from control_plane.contracts import (
     Deployment,
+    DeploymentOrigin,
     DeploymentState as S,
     FitResult,
     Modality,
@@ -40,19 +45,31 @@ from control_plane.contracts import (
     NodeState,
     ParallelismPlan,
     RegistryPort,
+    SpeculativeSpec,
     Verdict,
 )
 from control_plane.procmatch import matches_deployment
 
 from . import events as ev
+from .. import alerts
 from .events import EventBus
 from .fsm import SERVING, TERMINAL, check as fsm_check
 from .health import HEALTH_PATHS, probe, wrong_model
 from .progress import LaunchProgress, advance as advance_progress, from_launcher, from_runtime_log
+from .flags import (
+    graph_capture_refusal,
+    kv_cache_dtype_refusal,
+    llamacpp_model_refusal,
+    quantization_refusal,
+    nccl_env_refusal,
+    parse_nccl_env,
+    runtime_spec,
+    speculative_refusal,
+)
 from .recipes import check_extra_args_safe, check_recipe_identifiers
 from .sparkrun import LaunchError, SparkrunAdapter, default_served_name, is_oom
 from .utilization import utilization_for
-from .store import DeploymentStore
+from .store import TERMINAL_RECORDS_KEPT, DeploymentStore
 
 from control_plane.paths import data_dir
 
@@ -130,6 +147,45 @@ FAILED_LOG_DIR = "failed-launches"
 #: How many of them to keep. A box that fails a lot is exactly the box you
 #: want the last few from, and 500 lines each is not a disk decision.
 FAILED_LOGS_KEPT = 50
+#: Where a SERVING deployment's own log is mirrored while it is still up, so
+#: a crash concurrent with this process dying does not cost the evidence too.
+#:
+#: log_lines (see _Record) stops being fed at the READY transition -- see
+#: log_tail's own docstring -- so without this, everything the backend prints
+#: for however long it serves is gone the moment nobody is left to run
+#: _post_mortem's one bounded read after the fact. One file per deployment,
+#: overwritten each snapshot rather than appended: this is a rolling tail,
+#: never a growing log.
+SERVING_LOG_DIR = "serving-logs"
+#: How often a SERVING deployment's log is snapshotted to disk. Slower than
+#: the 5s health tick on purpose -- this is a `sparkrun logs` round trip to
+#: the node, not a socket probe, and every deployment pays it.
+SERVING_LOG_SNAPSHOT_S = 60.0
+
+
+def _atomic_log_write(path: Path, text: str) -> None:
+    """Write a kept log so no reader ever sees it half-formed.
+
+    Same shape as `deploy/store.py::_atomic_write` and here for the same
+    reason: `log_tail` reads these files from a request thread while the
+    snapshot timer rewrites them from its own, and `Path.write_text` creates
+    the file empty and fills it afterwards -- a reader landing in that window
+    gets a truncated log and no indication that is what happened.
+
+    The temp file is deliberately NOT named `*.log`: `_prune_serving_logs`
+    globs that pattern and would count a half-written temporary as one of the
+    snapshots it keeps.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".part")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 STOP_CONFIRM_TIMEOUT_S = 30.0
 #: Per-request budget when talking to a node agent during a forced stop.
 #: Long enough to cover the agent's own SIGTERM grace plus SIGKILL wait.
@@ -304,6 +360,12 @@ class _Record:
     #: is no way to serve a screen. Bounded, because a startup log is not a
     #: durable record and this one lives in the coordinator's memory.
     log_lines: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_BUFFER_LINES))
+    #: clock() time of the last serving-log snapshot written for this
+    #: deployment, or 0.0 for one never taken. Watch-thread only, so no lock
+    #: is needed to read it -- only the compare-and-set in
+    #: _maybe_snapshot_log takes one, to keep two ticks from both deciding a
+    #: snapshot is due and racing the same file.
+    log_snapshot_at: float = 0.0
 
     @property
     def cluster_id(self) -> str | None:
@@ -325,6 +387,26 @@ class _Record:
     def admitting(self) -> bool:
         """False once any node crosses critical. The gateway reads this."""
         return "critical" not in self.node_severity.values()
+
+
+def _accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
+    """Whether *fn* takes keyword *name* -- a signature probe, not a try/except.
+
+    Mirrors `gateway/livefit.py::_accepts_allocatable` exactly, for the same
+    reason: `try/except TypeError` around the call would also swallow a
+    genuine TypeError raised *inside* the probe, turning a real bug into a
+    silent fallback.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):  # builtins, C callables, exotic proxies
+        return False
+    for param in sig.parameters.values():
+        if param.name == name:
+            return True
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
 
 
 class DeploymentManager:
@@ -353,6 +435,7 @@ class DeploymentManager:
         self.registry = registry
         self.store = DeploymentStore(state_dir / "deployments")
         self.failed_log_dir = state_dir / FAILED_LOG_DIR
+        self.serving_log_dir = state_dir / SERVING_LOG_DIR
         #: Nodes with an engine between `docker run` and ready. See
         #: _hold_starting: two vLLM startups on one node bill each other's
         #: allocations to their own memory budget, so they are serialised.
@@ -371,6 +454,14 @@ class DeploymentManager:
         self._probe_offset = 0
         self._id_factory = id_factory or (lambda: "d-%s" % uuid.uuid4().hex[:8])
         self._probe = probe_fn
+        # `health_path` is an additive deviation from the pre-existing
+        # `probe_fn` signature, exactly the situation
+        # `gateway/livefit.py::_accepts_allocatable` already solves for a
+        # registry port: checked once here rather than at every call, since
+        # `probe_fn` is fixed for the manager's lifetime, so a test double
+        # that predates this kwarg keeps working unchanged instead of raising
+        # a TypeError the first time a launch reaches it.
+        self._probe_accepts_health_path = _accepts_kwarg(probe_fn, "health_path")
         self._port_free = port_free_fn
 
         self._lock = threading.RLock()
@@ -395,6 +486,11 @@ class DeploymentManager:
         modality: Modality = Modality.TEXT,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        speculative: SpeculativeSpec | None = None,
+        enforce_eager: bool = False,
+        cudagraph_capture_sizes: tuple[int, ...] | None = None,
+        kv_dtype: str | None = None,
+        quantization: str | None = None,
     ) -> Deployment:
         """Refuse, render, run, then watch for readiness.
 
@@ -439,6 +535,94 @@ class DeploymentManager:
                 "appends to the generated serve command, custom_command replaces "
                 "it, and a request cannot mean both at once"
             )
+        # Same rule, one step further on: a custom command replaces every
+        # plan-derived flag, so appending --speculative-config to it would be
+        # the one thing that survived the replacement. Refused rather than
+        # silently dropped, because the fit gate has already charged the
+        # draft's memory against this launch and a caller who saw that charge
+        # is entitled to assume the flag went with it.
+        if speculative is not None and custom_command:
+            raise ValueError(
+                "speculative decoding and custom_command are mutually exclusive: "
+                "a custom command replaces the plan-derived flags, so the "
+                "--speculative-config the fit gate budgeted for would not be "
+                "among them. Put the flag in the custom command itself, or drop "
+                "the custom command."
+            )
+        if speculative is not None:
+            refusal = speculative_refusal(runtime, speculative.method.value)
+            if refusal is not None:
+                raise ValueError(refusal)
+        if enforce_eager and cudagraph_capture_sizes:
+            raise ValueError(
+                "enforce_eager and cudagraph_capture_sizes are mutually "
+                "exclusive: enforce_eager disables CUDA graph capture "
+                "entirely, leaving nothing for a trimmed capture list to "
+                "apply to"
+            )
+        # Same rule as speculative above, for the same reason: a custom
+        # command replaces every plan-derived flag, so either lever would be
+        # the one thing that silently did not survive the replacement.
+        if (enforce_eager or cudagraph_capture_sizes) and custom_command:
+            raise ValueError(
+                "enforce_eager/cudagraph_capture_sizes and custom_command are "
+                "mutually exclusive: a custom command replaces the "
+                "plan-derived flags, so neither would be among them. Put the "
+                "flag in the custom command itself, or drop the custom "
+                "command."
+            )
+        refusal = graph_capture_refusal(runtime, enforce_eager, cudagraph_capture_sizes)
+        if refusal is not None:
+            raise ValueError(refusal)
+        # Refused rather than dropped, and this one matters more than the two
+        # above: the caller has ALREADY been given a fit verdict computed at
+        # this width. Silently not passing it is the one failure mode the
+        # operator cannot see -- the launch succeeds, honours the halved byte
+        # budget, and serves half the context the gate approved.
+        refusal = kv_cache_dtype_refusal(runtime, kv_dtype)
+        if refusal is not None:
+            raise ValueError(refusal)
+        # The same rule one term heavier. `kv_dtype` decides how wide a CACHE
+        # entry is; this decides how wide a WEIGHT is, and `BYTES_PER_PARAM`
+        # differs by 3.5x between bf16 and nvfp4 -- so a dropped flag here
+        # budgets a checkpoint the engine is not going to load.
+        refusal = quantization_refusal(runtime, quantization)
+        if refusal is not None:
+            raise ValueError(refusal)
+        # A fifth of the same kind, and the only one about the MODEL rather
+        # than a flag. A local .gguf path resolves here and names nothing on
+        # the node the container starts on, which is the whole point of a CPU
+        # runtime: that node is somewhere else.
+        refusal = llamacpp_model_refusal(runtime, shape.model_id)
+        if refusal is not None:
+            raise ValueError(refusal)
+        if quantization and custom_command:
+            raise ValueError(
+                "quantization and custom_command are mutually exclusive: a "
+                "custom command replaces the plan-derived flags, so "
+                "--quantization would not be among them -- and the fit gate "
+                "has already priced this deployment's weights at that scheme. "
+                "Put the flag in the custom command itself, or drop the "
+                "custom command."
+            )
+        # Checked at the door, like the three above. NCCL reads its
+        # environment once at communicator init and ignores an unknown name
+        # without warning, so a misspelling would launch, report as tuned, and
+        # run the defaults -- the same silent-drop failure the kv_dtype
+        # refusal exists for.
+        world = max(1, plan.tensor_parallel * plan.pipeline_parallel * plan.data_parallel)
+        nccl_env = self._nccl_env_for(plan, name)
+        refusal = nccl_env_refusal(runtime, nccl_env, world_size=world)
+        if refusal is not None:
+            raise ValueError(refusal)
+        if kv_dtype and custom_command:
+            raise ValueError(
+                "kv_dtype and custom_command are mutually exclusive: a custom "
+                "command replaces the plan-derived flags, so --kv-cache-dtype "
+                "would not be among them -- and the fit gate has already "
+                "sized this deployment's cache at that width. Put the flag in "
+                "the custom command itself, or drop the custom command."
+            )
 
         with self._lock:
             conflict = self._find_conflict(name, shape.model_id, plan.node_ids)
@@ -462,6 +646,13 @@ class DeploymentManager:
                 modality=modality,
                 extra_args=tuple(extra_args),
                 custom_command=tuple(custom_command),
+                speculative=speculative,
+                enforce_eager=enforce_eager,
+                cudagraph_capture_sizes=(
+                    tuple(cudagraph_capture_sizes) if cudagraph_capture_sizes else None
+                ),
+                kv_dtype=kv_dtype or None,
+                quantization=quantization or None,
             )
             port = self._allocate_port()
             record = _Record(deployment=deployment, handle={"port": port})
@@ -588,6 +779,9 @@ class DeploymentManager:
             if left_behind:
                 record.deployment.last_error = left_behind
             self._transition(record, S.STOPPED)
+        # An orderly stop, not a crash: nothing about this deployment's log is
+        # a question anybody will ask once it is confirmed down.
+        self._delete_serving_log(deployment_id)
 
     def _kill_through_agents(
         self, record: _Record, cluster_id: str | None
@@ -678,6 +872,26 @@ class DeploymentManager:
 
         return killed, "; ".join(notes) if notes else None
 
+    def _forget_surplus_terminal(self) -> None:
+        """Drop all but the newest TERMINAL_RECORDS_KEPT finished records.
+
+        The same rule and the same number `store.purge_surplus` applies to
+        disk, so `get()` answers None for exactly the ids a restart would no
+        longer rehydrate -- rather than the two disagreeing until the next
+        boot. Live deployments are never dropped, whatever the count.
+
+        Insertion order is the age order: `_records` is a dict and a record is
+        inserted when it is created, so the oldest terminal entries are simply
+        the earliest ones still present.
+        """
+        with self._lock:
+            terminal = [
+                did for did, rec in self._records.items()
+                if rec.deployment.state in TERMINAL
+            ]
+            for did in terminal[: max(0, len(terminal) - TERMINAL_RECORDS_KEPT)]:
+                self._records.pop(did, None)
+
     def list(self) -> list[Deployment]:
         with self._lock:
             return [r.deployment for r in self._records.values()]
@@ -686,6 +900,36 @@ class DeploymentManager:
         with self._lock:
             record = self._records.get(deployment_id)
             return record.deployment if record else None
+
+    def set_serving(self, deployment_id: str, serving: bool) -> Deployment | None:
+        """Offer this deployment on the API, or stop offering it.
+
+        NOT a state transition, which is why it does not go through
+        ``_transition``: the container is untouched, the process keeps
+        running and keeps holding its GPU memory, and the FSM has nothing to
+        say about it. What changes is whether ``targets.build_index`` treats
+        it as a route -- the same seam a provider's ``enabled_models``
+        allowlist uses, so ``/v1/models``, routing, the chat picker and the
+        topology graph all move together.
+
+        Persisted rather than held in the admission controller: those blocks
+        are in-memory and ``reconcile()`` re-derives them twice a second, so a
+        switched-off deployment would come back on the next restart -- or
+        sooner.
+
+        Returns the updated record, or ``None`` if there is no such
+        deployment. Idempotent.
+        """
+        with self._lock:
+            record = self._records.get(deployment_id)
+            if record is None:
+                return None
+            deployment = record.deployment
+            if deployment.serving == serving:
+                return deployment
+            deployment.serving = serving
+            self.store.save(deployment, record.handle)
+            return deployment
 
     def handles(self) -> dict[str, dict]:
         """The sparkrun handle behind each record, for callers that must match
@@ -730,7 +974,17 @@ class DeploymentManager:
     def _archive_log(self, record: _Record) -> None:
         """Write this failed launch's log somewhere the next attempt cannot reach.
 
-        Called on the way into FAILED, so the lines are still in the buffer.
+        Called on the way into FAILED, so the launch's own lines are still in
+        the buffer -- but that buffer stops being FED at the READY transition
+        (see log_tail's own docstring), not cleared, so for a deployment that
+        crashed after reaching READY it holds only stale launch-time output,
+        nothing about the crash itself. `_maybe_snapshot_log` has been
+        keeping a separate, rolling account of what the backend printed while
+        it was serving, on disk rather than in this buffer, specifically so
+        it survives a crash concurrent with this process dying; appended
+        after the buffer's own lines, it is the one place the crash itself
+        shows up.
+
         The file is self-contained -- what was being launched, what killed it,
         then every line -- because the person opening it has a deployment id
         and a question, not this process's memory.
@@ -743,6 +997,14 @@ class DeploymentManager:
         with self._lock:
             lines = list(record.log_lines)
             last_error = deployment.last_error or ""
+        snapshot_lines = self._serving_log_lines(deployment.deployment_id, limit=LOG_BUFFER_LINES)
+        if snapshot_lines:
+            lines = lines + snapshot_lines
+        # Whatever this deployment had going into FAILED, the rolling snapshot
+        # is spent: a retry is a new deployment id with its own, and keeping a
+        # stale one around under the old id answers a question nobody can ask
+        # any more.
+        self._delete_serving_log(deployment.deployment_id)
         if not lines and not last_error:
             return
         header = [
@@ -786,14 +1048,191 @@ class DeploymentManager:
             logger.warning("could not read the kept log %s", path, exc_info=True)
             return []
 
+    def _maybe_snapshot_log(self, record: _Record) -> None:
+        """Dispatch a bounded read of a SERVING deployment's log, at most once
+        every SERVING_LOG_SNAPSHOT_S per deployment.
+
+        Called from tick(). Dispatched onto its own thread, the same way
+        _post_mortem_and_keep is: an SSH round trip to a wedged host must
+        never hold up this tick's health probing or state transitions for
+        every other deployment.
+        """
+        if not record.cluster_id:
+            return
+        now = self._clock()
+        with self._lock:
+            if now - record.log_snapshot_at < SERVING_LOG_SNAPSHOT_S:
+                return
+            record.log_snapshot_at = now
+        threading.Thread(
+            target=self._snapshot_serving_log,
+            args=(record,),
+            name="derate-logsnap-%s" % record.deployment.deployment_id,
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _nccl_env_for(plan: ParallelismPlan, served_name: str | None = None) -> dict[str, str]:
+        """NCCL settings for this launch, or an empty dict.
+
+        Read from `DERATE_NCCL_ENV` per launch rather than cached, so a value
+        an operator has just measured applies to the next deployment without
+        a coordinator restart.
+
+        **There is no default here and there must not be one.** A tensor
+        parallel decode step moves ~5.6 KB per exchange and pays dozens of
+        exchanges, so the wire cost is per-collective overhead rather than
+        bytes, and NCCL_PROTO/NCCL_MIN_NCHANNELS plausibly move it. Plausibly
+        is not measured: nothing in this project has ever timed a collective
+        on this fabric, forcing the small-message protocol would slow the
+        large-message path prefill uses, and a constant in here would be the
+        guess the rest of this module refuses to make. `tests/nccl_sweep.py`
+        is what turns it into a number.
+
+        Single-rank plans get nothing: there is no communicator to configure,
+        and `nccl_env_refusal` says so rather than setting it anyway.
+        """
+        world = max(1, plan.tensor_parallel * plan.pipeline_parallel * plan.data_parallel)
+        if world <= 1:
+            return {}
+
+        # Measured first, operator second. A record is a fact about THIS pair
+        # of machines -- `measurements.tuning_env` returns `{}` for a pair,
+        # image or library version nobody has measured, which is the ordinary
+        # case and leaves the launch exactly as it has always been.
+        #
+        # Every pair the plan spans has to agree. A value measured on A<->B is
+        # not a fact about A<->C, and one environment covers the whole job, so
+        # a disagreement means there is no single answer and the honest one is
+        # to apply nothing.
+        measured: dict[str, str] = {}
+        nodes = list(plan.node_ids or ())
+        pairs = [(a, b) for i, a in enumerate(nodes) for b in nodes[i + 1:]]
+        if pairs:
+            # What KIND of traffic this served model actually gets, from its
+            # own `vllm:prompt_tokens_total` vs `vllm:generation_tokens_total`.
+            # "balanced" until it has run once, which is the honest default:
+            # nothing is known about a model nobody has sent anything to.
+            prefer = (
+                measurements.preference_for(served_name) if served_name else "balanced"
+            )
+            found = [measurements.tuning_env(a, b, prefer=prefer) for a, b in pairs]
+            if found and all(f == found[0] for f in found):
+                measured = dict(found[0])
+            elif any(found):
+                logger.info(
+                    "not applying NCCL tuning for %s: the pairs disagree (%s)",
+                    "+".join(nodes), found,
+                )
+
+        # The operator's own setting wins outright. It is the escape hatch for
+        # a value measured since, or one this box needs for a reason no sweep
+        # captured.
+        merged = {**measured, **parse_nccl_env(os.environ.get("DERATE_NCCL_ENV"))}
+        return merged
+
+    def _snapshot_serving_log(self, record: _Record) -> None:
+        """The same bounded read _post_mortem does after a failure, taken
+        early and kept on disk, so the file is never more than
+        SERVING_LOG_SNAPSHOT_S stale. Never raises."""
+        cluster_id = record.cluster_id
+        if not cluster_id:
+            return
+        # log_snapshot, never logs(): this runs on a SERVING_LOG_SNAPSHOT_S
+        # timer, and `sparkrun logs` follows for ever, so polling it stranded
+        # one `tail -f` per minute per deployment inside the container. See
+        # SparkrunAdapter.log_snapshot for the measurement.
+        tail = self.adapter.log_snapshot(
+            cluster_id, hosts=record.hosts, tail=200, timeout=POST_MORTEM_READ_S
+        )
+        lines = [ln for ln in (tail or "").splitlines() if ln.strip()]
+        if not lines:
+            return
+        with self._lock:
+            # This runs in its own thread and the read above takes real time,
+            # so the deployment can reach FAILED while it is in flight --
+            # after `_archive_log` has already folded the snapshot into the
+            # archive and DELETED it. Writing now would resurrect the file it
+            # just consumed, and `log_tail` prefers a snapshot over an
+            # archive, so the answer would silently go back to being the
+            # rolling serving log instead of the post-mortem.
+            #
+            # A snapshot is only ever meaningful for a deployment that is
+            # still serving. Once it is not, the archive is the record.
+            if record.deployment.state in TERMINAL:
+                return
+        try:
+            self.serving_log_dir.mkdir(parents=True, exist_ok=True)
+            path = self.serving_log_dir / ("%s.log" % record.deployment.deployment_id)
+            # Atomically, like deploy/store.py writes a record, and for the
+            # same reason: `log_tail` reads this file from another thread on
+            # any request for a serving deployment's log, and `write_text`
+            # creates it empty and fills it afterwards -- so a reader that
+            # arrives in between gets a truncated log and no error. The
+            # rename makes the old contents visible until the new ones are
+            # complete.
+            _atomic_log_write(path, "\n".join(lines) + "\n")
+            self._prune_serving_logs()
+        except Exception:
+            logger.warning(
+                "could not keep the serving log for %s",
+                record.deployment.deployment_id,
+                exc_info=True,
+            )
+
+    def _prune_serving_logs(self) -> None:
+        """Newest FAILED_LOGS_KEPT, by the time each was written.
+
+        The regular exit -- _archive_log deletes a deployment's own snapshot
+        once it has read it -- does not cover every path in: reconcile()
+        resolves a record straight to FAILED or STOPPED on the evidence
+        alone (see _evidence) without ever calling _archive_log, so a
+        snapshot orphaned that way outlives its deployment until this catches
+        it.
+        """
+        kept = sorted(
+            self.serving_log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        for stale in kept[FAILED_LOGS_KEPT:]:
+            stale.unlink(missing_ok=True)
+
+    def _delete_serving_log(self, deployment_id: str) -> None:
+        """Drop deployment_id's rolling snapshot. Never raises."""
+        try:
+            (self.serving_log_dir / ("%s.log" % deployment_id)).unlink(missing_ok=True)
+        except Exception:
+            logger.debug(
+                "could not remove the serving log for %s", deployment_id, exc_info=True
+            )
+
+    def _serving_log_lines(self, deployment_id: str, *, limit: int) -> list[str]:
+        """The kept serving-time snapshot for *deployment_id*, or none. Never
+        raises."""
+        path = self.serving_log_dir / ("%s.log" % deployment_id)
+        try:
+            return path.read_text().splitlines()[-limit:]
+        except FileNotFoundError:
+            return []
+        except Exception:
+            logger.warning("could not read the serving log %s", path, exc_info=True)
+            return []
+
     def log_tail(self, deployment_id: str, *, limit: int = LOG_BUFFER_LINES) -> dict[str, Any]:
         """What this deployment's launcher and backend have said.
 
-        Three sources, and the caller is told which one it got:
+        Four sources, and the caller is told which one it got:
 
         ``"buffer"`` -- the lines the manager already streamed while the
         launch was in flight, served straight out of memory. Free, live, and
         safe to poll.
+
+        ``"snapshot"`` -- the rolling, serving-time log _maybe_snapshot_log
+        keeps on disk. Reached when a deployment crashed after reaching
+        READY and this process has restarted since -- the buffer stops being
+        fed at that transition (see the note below) and is empty on a fresh
+        record, and _archive_log never ran for it (reconcile() resolves a
+        record from evidence alone; see _evidence). Without this a crash
+        concurrent with the control plane going down would leave nothing.
 
         ``"archive"`` -- the file written on the way into FAILED, for a
         launch that failed before this process last restarted. The buffer is
@@ -815,7 +1254,13 @@ class DeploymentManager:
             if record is None:
                 # No record and possibly still a kept log: the records are
                 # swept after a week and the file outlives nothing, but the
-                # order of the two is not this method's business.
+                # order of the two is not this method's business. The two
+                # are mutually exclusive in practice -- _archive_log deletes
+                # a deployment's snapshot once it has folded it in -- so
+                # which is checked first only matters when neither exists.
+                snapped = self._serving_log_lines(deployment_id, limit=limit)
+                if snapped:
+                    return {"lines": snapped, "source": "snapshot", "cluster_id": None}
                 kept = self._archived_log(deployment_id, limit=limit)
                 if kept:
                     return {"lines": kept, "source": "archive", "cluster_id": None}
@@ -836,11 +1281,19 @@ class DeploymentManager:
         if lines and (following or terminal):
             return {"lines": lines, "source": "buffer", "cluster_id": cluster_id}
         # The buffer is memory, so a coordinator that has restarted since the
-        # failure has the record and none of the lines. `sparkrun logs` below
-        # cannot help there either -- the container is gone, or the relaunch
-        # truncated its log -- so the file written on the way into FAILED is
-        # the only copy left, and it is named as its own source rather than
-        # passed off as the live read it is not.
+        # failure has the record and none of the lines -- and, for a
+        # deployment reconcile() resolved to FAILED/STOPPED straight from
+        # evidence, no failed-launches archive either, because _archive_log
+        # never ran for it. The rolling snapshot is what survives that: at
+        # most SERVING_LOG_SNAPSHOT_S stale, and written while the deployment
+        # was still up rather than after the fact.
+        snapped = self._serving_log_lines(deployment_id, limit=limit)
+        if snapped:
+            return {"lines": snapped, "source": "snapshot", "cluster_id": cluster_id}
+        # `sparkrun logs` below cannot help either -- the container is gone,
+        # or the relaunch truncated its log -- so the file written on the way
+        # into FAILED is the only copy left, and it is named as its own
+        # source rather than passed off as the live read it is not.
         kept = self._archived_log(deployment_id, limit=limit)
         if kept:
             return {"lines": kept, "source": "archive", "cluster_id": cluster_id}
@@ -895,6 +1348,7 @@ class DeploymentManager:
         adopted: list[Deployment] = []
         for deployment, handle in self.store.load_all():
             record = _Record(deployment=deployment, handle=handle)
+            was_state, was_error = deployment.state, deployment.last_error
             resolved, reason = self._evidence(record)
             deployment.state = resolved
             if reason:
@@ -902,7 +1356,17 @@ class DeploymentManager:
             with self._lock:
                 self._records[deployment.deployment_id] = record
             if resolved in TERMINAL:
-                self.store.save(deployment, handle)
+                # Only when reconcile actually learned something. A blind
+                # re-save rewrites the file, and `store.purge_expired` keys
+                # TERMINAL_RETENTION_S off mtime -- "a record's file is
+                # rewritten on every state change, so its mtime is exactly
+                # when it settled". Rewriting an unchanged terminal record
+                # makes that false and restarts the retention clock, so a
+                # coordinator bounced more often than the window ages out
+                # nothing at all and only the count cap does any work. Seen
+                # on this box: 201 of 205 records shared one boot timestamp.
+                if resolved is not was_state or deployment.last_error != was_error:
+                    self.store.save(deployment, handle)
             else:
                 self.store.save(deployment, handle)
                 adopted.append(deployment)
@@ -925,6 +1389,85 @@ class DeploymentManager:
         if adopted:
             self.start()
         return adopted
+
+    def adopt(
+        self,
+        *,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        fit: FitResult,
+        runtime: str,
+        served_name: str,
+        backend_url: str,
+        context_length: int,
+        max_concurrent_seqs: int,
+        cluster_id: str,
+        node_address: str,
+        port: int,
+        modality: Modality = Modality.TEXT,
+    ) -> Deployment | None:
+        """Record a container this manager never launched. None if it is
+        already recorded.
+
+        The other half of :meth:`reconcile`'s exception: that method
+        rehydrates state for a record already on disk, this creates the
+        record in the first place, straight into READY and without an FSM
+        check, for the same reason -- the evidence (a container already
+        running, already identified by ``/v1/models``) is stronger than
+        anything a transition could add. Callers are expected to have made
+        that identification already; this does not re-probe.
+
+        *shape*/*plan*/*fit* are real, not placeholders -- ``plan`` is built
+        from the running process's own flags rather than the planner, and
+        ``fit`` from the fit calculator's ordinary pure arithmetic against
+        the static ceiling (never a live reading: the container's own
+        allocation is already part of what "live" would report, which would
+        make the number this call produces describe memory the process
+        itself is holding). Both are honestly computed, just not decided in
+        advance -- which is exactly what ``Deployment.origin`` exists to say
+        rather than leave the caller to guess from a suspiciously-late
+        ``started_at``.
+        """
+        with self._lock:
+            if any(h.get("cluster_id") == cluster_id for h in self.handles().values()):
+                return None
+            deployment = Deployment(
+                deployment_id=self._id_factory(),
+                served_name=served_name,
+                shape=shape,
+                plan=plan,
+                fit=fit,
+                runtime=runtime,
+                state=S.READY,
+                backend_url=backend_url,
+                context_length=context_length,
+                max_concurrent_seqs=max_concurrent_seqs,
+                started_at=self._clock(),
+                last_error=None,
+                modality=modality,
+                origin=DeploymentOrigin.ADOPTED,
+            )
+            handle = {"cluster_id": cluster_id, "hosts": [node_address], "port": port}
+            record = _Record(deployment=deployment, handle=handle)
+            self._records[deployment.deployment_id] = record
+            self.store.save(deployment, handle)
+        self.bus.emit(
+            ev.ADOPTED,
+            deployment_id=deployment.deployment_id,
+            served_name=deployment.served_name,
+            model_id=shape.model_id,
+            node_ids=list(plan.node_ids),
+            backend_url=backend_url,
+        )
+        logger.info(
+            "adopted %s (%s) on %s as %s, not launched by this coordinator",
+            deployment.served_name,
+            shape.model_id,
+            node_address,
+            deployment.deployment_id,
+        )
+        self.start()
+        return deployment
 
     # -- lifecycle of the manager itself ----------------------------------
 
@@ -1059,16 +1602,41 @@ class DeploymentManager:
         was written against three launches that died this way in a row, one of
         them a 0.5B model the fit gate had passed at 1.8 GiB into 24.0 GiB.
 
-        The denominator is the node's LIVE total, because that is the number
-        the runtime itself divides by; `profile.total_memory` is the probe's
-        figure and does not always agree. Nothing to divide by, or no node to
-        ask, returns None and the adapter's own default stands -- the same way
-        every other live reading in this system degrades rather than blocks.
+        The denominator is runtime-specific, and the two this project launches
+        do not agree. vLLM's `--gpu-memory-utilization` is read against the
+        device's LIVE TOTAL -- `profile.total_memory` is the probe's figure and
+        does not always agree with what the runtime itself divides by. SGLang's
+        `--mem-fraction-static` is read against the device's LIVE FREE memory
+        *at the moment it starts loading*, not the total -- verified by reading
+        sglang 0.5.12's own `model_runner_kv_cache_mixin.py::_profile_available_bytes`:
+
+            rest_memory = post_model_load_memory - pre_model_load_memory * (1 - f)
+
+        which rearranges to `pre_model_load_memory * f - weights_consumed`. On a
+        DGX Spark running other work, free is a small fraction of total -- on
+        the node a real launch hit this on, live total was ~120.6 GiB and live
+        allocatable ~24.6 GiB raw (tighter still once host memory binds, see
+        `registry.allocatable_or_none`). Handing sglang vLLM's denominator asks
+        for the right RATIO of the wrong TOTAL: confirmed on a real launch of
+        Qwen/Qwen3-0.6B on spark-26af, 2026-09-10 -- `--mem-fraction-static
+        0.05`, sized against the ~120.6 GiB total, left sglang only a sliver of
+        its own ~21.6 GiB in-container free memory to work with, which went
+        negative once weights were subtracted and crashed in
+        `init_memory_pool` with "Not enough memory." (`deploy/progress.py`'s
+        `_RUNTIME_FATAL` previously had no marker for that crash either; fixed
+        separately, and the two fixes are meant to land together -- better
+        sizing makes this far less likely, the marker makes it visible if it
+        still happens.)
+
+        Nothing to divide by, or no node to ask, returns None and the
+        adapter's own default stands -- the same way every other live reading
+        in this system degrades rather than blocks.
         """
         node_ids = list(record.deployment.plan.node_ids)
         if not node_ids or self.registry is None:
             return None
         needed = record.deployment.fit.breakdown.total
+        runtime = record.deployment.runtime
         smallest: float | None = None
         for node_id in node_ids:
             try:
@@ -1078,10 +1646,14 @@ class DeploymentManager:
                 state = None
             if state is None or not getattr(state, "memory_total", 0):
                 return None
-            free = max(0, state.memory_total - (state.memory_used or 0))
+            live = self._live_allocatable(node_id)
+            free = live if live is not None else max(0, state.memory_total - (state.memory_used or 0))
+            denominator = free if runtime == "sglang" else state.memory_total
+            if denominator <= 0:
+                return None
             share = utilization_for(
                 needed_bytes=needed,
-                device_total_bytes=state.memory_total,
+                device_total_bytes=denominator,
                 free_bytes=free,
             )
             # The plan runs on every node at once, and one flag covers them
@@ -1089,6 +1661,67 @@ class DeploymentManager:
             # others and is refused on that one.
             smallest = share if smallest is None else min(smallest, share)
         return smallest
+
+    def _live_allocatable(self, node_id: str) -> int | None:
+        """*node_id*'s live allocatable bytes, read the one way the fit gate
+        already trusts -- `registry.allocatable_or_none`, which additionally
+        binds on live HOST memory on a GB10, usually the tighter constraint.
+
+        Duck-typed rather than declared on `RegistryPort`: the port promises
+        only `list_nodes`/`get_node`/`healthy_nodes`, so a registry stub that
+        implements neither extra method (most test doubles) falls back to the
+        caller's own cruder `memory_total - memory_used`, exactly as before
+        this existed. `available_memory` is the older, always-answers variant,
+        preferred second for the same reason `gateway/livefit.py::allocatable_map`
+        prefers `allocatable_or_none` first: it can say "nobody has measured
+        this" instead of a static ceiling wearing a live number's clothes.
+        """
+        probe = getattr(self.registry, "allocatable_or_none", None)
+        if not callable(probe):
+            probe = getattr(self.registry, "available_memory", None)
+        if not callable(probe):
+            return None
+        try:
+            value = probe(node_id)
+        except Exception:
+            logger.debug("could not read live allocatable for %s", node_id, exc_info=True)
+            return None
+        return int(value) if value is not None else None
+
+    def _health_kwargs(self, deployment: Any) -> dict[str, str | None]:
+        """`{"health_path": ...}` to splat into `self._probe`, or `{}`.
+
+        Empty, not `{"health_path": None}`, when `self._probe` does not
+        accept the kwarg at all (`_probe_accepts_health_path` is False) --
+        passing the key at all would raise a TypeError on an older `probe_fn`
+        test double regardless of the value, so the key itself has to be
+        absent, not merely `None`.
+
+        Takes the deployment rather than a bare runtime string and reads it
+        with `getattr(..., "runtime", None)`: some hanging-probe test doubles
+        build a minimal stand-in object carrying only the fields their own
+        test needs, and `.runtime` is not always one of them. A missing
+        runtime degrades exactly like an unrecognised one, below.
+
+        `RuntimeSpec.health_path` was dead data until this existed -- every
+        runtime's value is `"/health"` today, matching `HEALTH_PATHS[0]`
+        exactly, so wiring it in changes no launch's behavior now and stops a
+        future runtime with a genuinely different liveness endpoint from
+        being silently ignored the way this one was. `runtime_spec` raises
+        `ValueError` on an unrecognised name; degrading to no override here
+        follows the same rule as the probe call sites themselves -- a lookup
+        failure must not crash the watch thread, only fall back to the old
+        behavior.
+        """
+        if not self._probe_accepts_health_path:
+            return {}
+        runtime = getattr(deployment, "runtime", None)
+        if not runtime:
+            return {}
+        try:
+            return {"health_path": runtime_spec(runtime).health_path}
+        except ValueError:
+            return {}
 
     def _hold_starting(self, node_ids: tuple[str, ...], deadline: float) -> bool:
         """Wait until no other engine is starting on any of *node_ids*.
@@ -1217,6 +1850,24 @@ class DeploymentManager:
                 # _launch_kv_cache_bytes: this is what takes the launch's
                 # budget out of the hands of whatever else is on the device.
                 kv_cache_memory_bytes=kv_bytes,
+                # Read off the record rather than recomputed, exactly like the
+                # plan and the fit above it: this is the decision the launch was
+                # approved with, and a fresh resolve here could offer a
+                # different one.
+                speculative=deployment.speculative,
+                enforce_eager=deployment.enforce_eager,
+                cudagraph_capture_sizes=deployment.cudagraph_capture_sizes,
+                # Off the record, like the plan and the fit: this is the width
+                # the gate sized with, and re-reading a setting here could
+                # hand the engine a different one.
+                kv_dtype=deployment.kv_dtype,
+                # Off the record for the same reason, and more so: this is the
+                # width the WEIGHTS were priced at.
+                quantization=deployment.quantization,
+                # Recomputed here rather than stored: these are an operator's
+                # current tuning, not a property of the deployment, and a
+                # relaunch should pick up a value measured since.
+                nccl_env=self._nccl_env_for(deployment.plan, deployment.served_name),
                 # Everything before the container exists is inside this call:
                 # the image pull and the weights. Read it as it is printed or
                 # it is not readable at all -- the output is in a pipe until
@@ -1363,6 +2014,7 @@ class DeploymentManager:
                     url,
                     timeout=self._ready_probe_timeout(),
                     expect_model=deployment.served_name,
+                    **self._health_kwargs(deployment),
                 )
                 if healthy:
                     with self._lock:
@@ -1513,8 +2165,15 @@ class DeploymentManager:
         """
         deployment = record.deployment
         breakdown = deployment.fit.breakdown
+        # One author for the sentence. It used to exist only as lazy %-args in
+        # the logger.error below, so an alert could not carry the gate's own
+        # words without composing a second copy of them.
+        summary = alerts.fit_miss_sentence(
+            deployment.served_name, breakdown.total, deployment.fit.usable_per_node
+        )
         self.bus.emit(
             ev.FIT_MISS,
+            summary=summary,
             deployment_id=deployment.deployment_id,
             served_name=deployment.served_name,
             model_id=deployment.shape.model_id,
@@ -1545,13 +2204,7 @@ class DeploymentManager:
             predicted_headroom=deployment.fit.headroom,
             actual_error=detail.strip()[-4000:],
         )
-        logger.error(
-            "fit miss: %s passed the gate with %d bytes predicted per node "
-            "against %d usable, then failed with an out-of-memory error",
-            deployment.served_name,
-            breakdown.total,
-            deployment.fit.usable_per_node,
-        )
+        logger.error("%s", summary)
 
     # -- the watch loop ---------------------------------------------------
 
@@ -1584,6 +2237,12 @@ class DeploymentManager:
             self._check_memory(record, nodes)
             self._apply_backend_probe(record, probe_results.get(record.deployment.deployment_id))
             self._settle_state(record)
+            # After the probe, not before: a record _apply_backend_probe just
+            # failed out has nothing worth snapshotting, and its own log is
+            # already being kept by the post-mortem thread that transition
+            # started.
+            if record.deployment.state in SERVING:
+                self._maybe_snapshot_log(record)
 
     def _ready_probe_timeout(self) -> float:
         """Per-path budget for the probe inside the readiness loop.
@@ -1659,6 +2318,7 @@ class DeploymentManager:
                     record.deployment.backend_url,
                     timeout=probe_timeout,
                     expect_model=record.deployment.served_name,
+                    **self._health_kwargs(record.deployment),
                 )
             except Exception as exc:  # a probe_fn must never crash the watch thread
                 outcome = (False, "probe raised %s: %s" % (type(exc).__name__, exc))
@@ -1873,6 +2533,12 @@ class DeploymentManager:
                 self.store.purge_surplus()
             except Exception:
                 logger.warning("could not sweep terminal records", exc_info=True)
+            # And the same cap in memory. Disk and the route were both bounded
+            # while `self._records` was not, so the crash loop that wrote 200
+            # files held 1,094 entries in this process -- the route's own limit
+            # hid it. One rule, so a long-lived coordinator's memory matches
+            # what a restart would rebuild.
+            self._forget_surplus_terminal()
         self.bus.emit(
             ev.STATE_CHANGED,
             deployment_id=deployment.deployment_id,
@@ -1992,7 +2658,11 @@ class DeploymentManager:
             # this call handed the record straight to READY. The reason is
             # kept now instead of discarded, because "a stranger is on your
             # port" is the one thing here worth reporting.
-            healthy, why = self._probe(url, expect_model=deployment.served_name)
+            healthy, why = self._probe(
+                url,
+                expect_model=deployment.served_name,
+                **self._health_kwargs(deployment),
+            )
             if healthy:
                 if deployment.state is S.STOPPING:
                     # A stop we never finished. Finish it.

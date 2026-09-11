@@ -11,7 +11,6 @@ from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import Any
 
-from control_plane.contracts.quant import quant_info
 from control_plane.contracts import (
     Deployment,
     DeviceClass,
@@ -368,29 +367,31 @@ def _launchable(res: Any, shape: Any) -> dict:
     """Whether this can be served here at all, and why not when it cannot.
 
     Mirrors what ``POST /api/deployments`` will decide, so a Serve button drawn
-    from this cannot disagree with the launch it triggers. GGUF is the case
-    that matters: both serve command templates take a repository path, not a
-    ``.gguf`` file, and nothing in the runtime tables claims to load one.
+    from this cannot disagree with the launch it triggers.
+
+    GGUF used to be refused outright here, on two grounds that have come apart.
+    One was a fact about the serve commands -- they took a repository path and
+    not a file -- and the other was a fact about this build: "there is no
+    llama.cpp runtime here". The second stopped being true, and with it the
+    first: `llamacpp` takes exactly this format, and
+    `flags.llamacpp_model_spec` turns an ``hf://owner/repo/file.gguf``
+    reference into the repository spelling its launcher parses.
+
+    What survives is the case neither runtime family can serve: a ``.gguf``
+    path on THIS machine. The launch happens on the node the plan placed it
+    on, and a local path names nothing there -- the same refusal
+    `flags.llamacpp_model_refusal` makes at the door, said early enough to
+    keep the button from being drawn.
     """
     model_id = str(shape.model_id or "")
-    if model_id.startswith("hf://") or model_id.lower().endswith(".gguf"):
+    if model_id.lower().endswith(".gguf") and not model_id.startswith("hf://"):
         return {
             "ok": False,
             "reason": (
-                "a single GGUF file is not a launchable target: both serve "
-                "commands take a repository path, not a file"
-            ),
-        }
-    try:
-        family = quant_info(shape.dtype).family
-    except Exception:  # an unpriced dtype is the resolver's problem, not ours
-        family = ""
-    if family == "gguf":
-        return {
-            "ok": False,
-            "reason": (
-                f"{shape.dtype} is a llama.cpp format; neither vllm nor sglang "
-                "is verified to load it, and there is no llama.cpp runtime here"
+                "a GGUF file on this machine is not a launchable target: the "
+                "server starts on the node the plan placed it on, and a path "
+                "here names nothing there. Name the repository it came from "
+                "instead"
             ),
         }
     support = getattr(res, "support", None)
@@ -539,6 +540,27 @@ def fit_payload(fit: FitResult) -> dict:
     return data
 
 
+def speculative_payload(spec) -> dict | None:
+    """What speculative decoding a verdict was taken with, or None.
+
+    ``None`` is the ordinary answer and means one token per step. It is not the
+    same as an object with ``num_speculative_tokens: 0``, and nothing here
+    invents one: a client reading a null knows the question was not asked,
+    where a zero would read as an answer.
+    """
+    if spec is None:
+        return None
+    return {
+        "method": spec.method.value,
+        "num_speculative_tokens": spec.num_speculative_tokens,
+        "draft_bytes": spec.draft_bytes,
+        "draft_params": spec.draft_params,
+        # The head's repository, for a method whose draft ships separately.
+        # Null for the methods the target's own checkpoint carries.
+        "model": spec.model,
+    }
+
+
 #: How much of `last_error` the LIST carries. The detail route carries all of
 #: it, and the launch log under it carries the rest of the story.
 #:
@@ -593,6 +615,28 @@ def deployment_payload(deployment: Deployment, *, error_chars: int | None = None
         "fit": fit_payload(deployment.fit) if deployment.fit else None,
         "extra_args": list(deployment.extra_args),
         "custom_command": list(deployment.custom_command),
+        "speculative": speculative_payload(deployment.speculative),
+        "origin": deployment.origin.value,
+        "enforce_eager": deployment.enforce_eager,
+        "cudagraph_capture_sizes": (
+            list(deployment.cudagraph_capture_sizes)
+            if deployment.cudagraph_capture_sizes
+            else None
+        ),
+        # The width the gate sized with AND the engine was told. Echoed
+        # because the two used to be able to disagree silently, and a field
+        # that reads the record is the only way to see that they no longer
+        # can. None is the model's own dtype.
+        "kv_dtype": deployment.kv_dtype,
+        # Whether this deployment is offered on the API. False means the
+        # container is still up and still holding its GPU memory and simply
+        # is not on `/v1/models` -- every surface that draws this has to say
+        # the memory is still held, or an idle 30 GiB goes invisible.
+        # The scheme the gate priced the weights at AND the engine was told.
+        # Echoed for the reason kv_dtype is: the two used to be able to
+        # disagree silently. None is the checkpoint's own packing.
+        "quantization": deployment.quantization,
+        "serving": deployment.serving,
     }
 
 
@@ -722,5 +766,80 @@ def routing_payload(
                 "admission_blocks": admission_blocks.get(t.target_id),
             }
             for t in config.targets
+        ],
+    }
+
+
+def measurement(record) -> dict:
+    """One `measurements.SpecRecord` as the screen reads it.
+
+    Named here rather than inlined at its call sites because there are now two
+    -- the plan's `speculative_options` and the head scan's ranking -- and the
+    UI's `SpeculativeMeasurement` is one interface. Two copies of a wire shape
+    is the thing `test_single_source` exists to catch, and the copy always
+    loses a field first.
+
+    An allowlist like everything else in this module: `asdict` would put
+    `accept_cumulative` on the wire, which is a per-position array the screen
+    never reads and the largest field in the record.
+    """
+    return {
+        "workload": record.workload,
+        "best_k": record.best_k,
+        "best_tps": record.best_tps,
+        "baseline_tps": record.baseline_tps,
+        "mean_acceptance": record.mean_acceptance,
+        "drafts": record.drafts,
+        "measured_at": record.measured_at,
+        "gpu_name": record.gpu_name,
+        "runtime_version": record.runtime_version,
+        "basis": record.basis,
+    }
+
+
+def link_tuning(
+    src: str, dst: str, *, image: str, prefer: str = "balanced"
+) -> dict:
+    """One pair's NCCL calibration as the screen reads it.
+
+    Here rather than in `measurements.py` for the reason `measurement` above
+    gives: a wire shape belongs in one place, and `test_single_source` exists
+    to catch the second copy. An allowlist, not `asdict`.
+
+    **`calibrated` is a separate field from `env`, and that is the whole
+    point.** `tuning_env` answers `{}` for two states a reader must tell apart:
+    nobody has measured this pair, and somebody measured it and the DEFAULT
+    won. Collapsing them offers to redo finished work and reports a completed
+    calibration as a gap.
+
+    `rows` carries the evidence, not just the verdict. The choice is a trade
+    between two regimes four decades apart in message size, so "chose
+    NCCL_MAX_NCHANNELS=2" is an assertion while "=4 was faster in bulk and 24%
+    slower at decode" is the argument. A screen showing only the winner cannot
+    be checked by the person reading it.
+
+    Keyed by the CURRENT image: a row taken under another NCCL is a different
+    measurement, and reporting it would be showing a number from a library
+    this cluster is not running.
+    """
+    from control_plane import measurements
+
+    rows = measurements.matching_nccl(src, dst, image=image)
+    if not rows:
+        return {"calibrated": False, "env": {}, "rows": []}
+    return {
+        "calibrated": True,
+        "env": measurements.tuning_env(src, dst, image=image, prefer=prefer),
+        "nccl_version": rows[0].nccl_version,
+        "measured_at": max(r.measured_at for r in rows),
+        "rows": [
+            {
+                "size_band": r.size_band,
+                "microseconds": r.microseconds,
+                "busbw_gbps": r.busbw_gbps,
+                "env": dict(r.env),
+                "error": r.error,
+            }
+            for r in sorted(rows, key=lambda r: (r.size_band, sorted(r.env.items())))
         ],
     }

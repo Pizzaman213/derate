@@ -1,15 +1,21 @@
 """Day-0 in-memory deployment manager.
 
-Fakes the lifecycle with timers so Agent G can build routing before sparkrun
-is wired: LAUNCHING for three seconds, then READY with a fake backend URL.
+Fakes the lifecycle with timers so the gateway's routing can be built before
+sparkrun is wired: LAUNCHING for three seconds, then READY with a fake backend
+URL.
 
 It is a stub in exactly one respect -- nothing is launched. Everything else
 is the real behaviour: the same FSM, the same refusal on WONT_FIT carrying
-Agent D's reason verbatim, the same event names and payloads on the same bus.
+the fit calculator's reason verbatim, the same event names and payloads on the same bus.
 A stub that returns a shape the real thing does not is worse than no stub, so
 this one is deliberately boring.
 
-Deleted at integration.
+The real manager landed and `node.py` wires it in production behind
+`GatewayDeps(strict=True, ...)`, which refuses to start if any port -- this
+one included -- is still missing. This file stayed anyway: `__init__.py`
+exports `StubDeploymentManager` as this package's public fake, and
+`tests/unit/test_deploy.py` reaches for it wherever a test needs a
+`DeploymentPort` without a real sparkrun behind it.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from control_plane.contracts import (
     Modality,
     ModelShape,
     ParallelismPlan,
+    SpeculativeSpec,
     Verdict,
 )
 
@@ -79,6 +86,9 @@ class StubDeploymentManager:
         modality: Modality = Modality.TEXT,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        speculative: SpeculativeSpec | None = None,
+        kv_dtype: str | None = None,
+        quantization: str | None = None,
     ) -> Deployment:
         name = served_name or default_served_name(shape)
         if fit.verdict is Verdict.WONT_FIT:
@@ -112,6 +122,16 @@ class StubDeploymentManager:
                 modality=modality,
                 extra_args=tuple(extra_args),
                 custom_command=tuple(custom_command),
+                speculative=speculative,
+                # Recorded even though the stub launches nothing: it renders a
+                # real recipe, and a screen developed against a stub that
+                # drops this would be developed against the very bug the
+                # field closes.
+                kv_dtype=kv_dtype or None,
+                # Same reason as the width above, one term heavier: a screen
+                # developed against a stub that drops this is developed
+                # against the bug the field closes.
+                quantization=quantization or None,
             )
             record = _Record(deployment=deployment, handle={"port": port})
             self._records[deployment.deployment_id] = record
@@ -151,7 +171,7 @@ class StubDeploymentManager:
             record = self._records.get(deployment_id)
             return record.deployment if record else None
 
-    # -- rest of Agent F's surface ----------------------------------------
+    # -- rest of the deployment manager's surface --------------------------
 
     def render_command(
         self,
@@ -184,8 +204,8 @@ class StubDeploymentManager:
         self.close()
 
     # -- test hooks -------------------------------------------------------
-    # Agent G needs to exercise admission control and failover before there
-    # is a real cluster to do it on.
+    # So the gateway's admission control and failover can be exercised
+    # without a real cluster to do it on.
 
     def simulate_memory(self, deployment_id: str, node_id: str, used_pct: float) -> None:
         """Drive a node's memory percentage and emit what the real watch would."""

@@ -2813,3 +2813,138 @@ def test_the_service_puts_a_recovered_provider_back_in_front_of_routing(tmp_path
     # And a request that gets through settles it for good.
     run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
     assert service.health("openrouter") == (True, None)
+
+
+# -- the multipart path -----------------------------------------------------
+#
+# `/v1/audio/transcriptions` used to bypass this class entirely: the managed
+# path builds its payload with dict(body), an opaque upload has none, so a
+# transcription took a raw forward that carried the key and nothing else.
+# Nothing it spent was ever recorded -- which also meant the daily budget gate
+# it passes on the way in never saw the traffic it was gating.
+
+
+async def _raw(service, provider_id, upstream_id, content, content_type, endpoint):
+    async with service.open_upstream_raw(
+        provider_id, upstream_id, content, content_type, endpoint=endpoint
+    ) as opened:
+        return b"".join([chunk async for chunk in opened.body])
+
+
+MULTIPART = (
+    b"--BOUNDARY\r\n"
+    b'Content-Disposition: form-data; name="model"\r\n\r\n'
+    b"whisper-1\r\n"
+    b"--BOUNDARY\r\n"
+    b'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n\r\n'
+    b"RIFFfake\r\n"
+    b"--BOUNDARY--\r\n"
+)
+MULTIPART_TYPE = "multipart/form-data; boundary=BOUNDARY"
+
+
+def test_a_transcription_is_forwarded_byte_for_byte_under_its_own_content_type(tmp_path):
+    """The boundary is part of the body's meaning: rewriting the header, or
+    re-encoding the body, invalidates the upload."""
+    upstream = Upstream()
+    upstream.chat_responses.append(httpx.Response(200, json={"text": "hello"}))
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+
+    run(_raw(service, "openrouter", "openai/gpt-4o-mini", MULTIPART,
+             MULTIPART_TYPE, "audio/transcriptions"))
+
+    sent = upstream.requests[-1]
+    assert sent.content == MULTIPART
+    assert sent.headers["content-type"] == MULTIPART_TYPE
+
+
+def test_a_transcriptions_reported_cost_is_banked(tmp_path):
+    """The usage block OpenRouter returns on a transcription, verbatim in
+    shape. `providers/usage.py` already reads `cost` and the `input_tokens`/
+    `output_tokens` spellings -- the only reason none of it was ever recorded
+    is that these bytes never reached this class."""
+    upstream = Upstream()
+    upstream.chat_responses.append(
+        httpx.Response(
+            200,
+            json={
+                "text": "the transcript",
+                "usage": {
+                    "seconds": 9.2,
+                    "type": "tokens",
+                    "total_tokens": 113,
+                    "input_tokens": 83,
+                    "output_tokens": 30,
+                    "cost": 0.000508,
+                },
+            },
+        )
+    )
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+
+    run(_raw(service, "openrouter", "openai/gpt-4o-mini", MULTIPART,
+             MULTIPART_TYPE, "audio/transcriptions"))
+
+    assert service.spend_today("openrouter") == pytest.approx(0.000508)
+    payload = service.public_dict("openrouter")
+    assert payload["requests_today"] == 1
+    assert payload["metered_requests_today"] == 1
+    assert payload["tokens_today"] == {"input": 83, "output": 30}
+
+
+def test_a_transcription_nobody_can_price_is_still_counted(tmp_path):
+    """Accounting and pricing are separate. A response with no usage block --
+    a duration-priced whisper-1, a Custom box -- must leave a mark, or a day
+    of audio traffic renders as "$0.00, nothing served today"."""
+    upstream = Upstream(models={"data": [{"id": "llama-3.3-70b"}]})
+    upstream.chat_responses.append(httpx.Response(200, json={"text": "no usage here"}))
+    service = make_service(tmp_path, upstream)
+    service.add({"provider_id": "groq", "kind": ProviderKind.GROQ, "api_key_ref": KEY_REF})
+    enable_all(service, "groq")
+
+    run(_raw(service, "groq", "llama-3.3-70b", MULTIPART,
+             MULTIPART_TYPE, "audio/transcriptions"))
+
+    payload = service.public_dict("groq")
+    assert payload["requests_today"] == 1
+    assert payload["unpriced_requests_today"] == 1
+    assert payload["spend_today_usd"] == 0.0
+    # No token counts at all, rather than a measured-looking pair of zeros.
+    assert payload["tokens_today"] == {"input": 0, "output": 0}
+
+
+def test_a_provider_over_budget_refuses_a_transcription_before_it_is_sent(tmp_path):
+    """The cap is enforceable without knowing this request's price -- it reads
+    what has already been spent. This is the half that was missing: the gate
+    ran, but nothing multipart spent ever moved the number it reads."""
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service, daily_budget_usd=0.01)
+    entry = service._entry("openrouter")
+    entry.runtime.record_usage(
+        service._now(), 0, 0, None, None, metered_cost_usd=5.0
+    )
+
+    before = len(upstream.requests)
+    with pytest.raises(ProviderNotAdmittingError):
+        run(_raw(service, "openrouter", "openai/gpt-4o-mini", MULTIPART,
+                 MULTIPART_TYPE, "audio/transcriptions"))
+    # Refused before a byte left: the upload never reached the network.
+    assert len(upstream.requests) == before
+
+
+def test_a_raw_upstream_still_latches_an_auth_failure(tmp_path):
+    """One retry ladder for both body shapes, so the raw path cannot quietly
+    stop matching the JSON one."""
+    upstream = Upstream()
+    upstream.chat_responses.append(httpx.Response(401, json={"error": "bad key"}))
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+
+    with pytest.raises(UpstreamError) as caught:
+        run(_raw(service, "openrouter", "openai/gpt-4o-mini", MULTIPART,
+                 MULTIPART_TYPE, "audio/transcriptions"))
+    assert caught.value.status_code == 401
+    assert service._entry("openrouter").runtime.auth_rejected is True

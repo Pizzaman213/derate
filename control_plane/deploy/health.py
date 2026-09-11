@@ -122,7 +122,11 @@ def _models(origin: str, timeout: float) -> tuple[list[str] | None, str | None]:
 
 
 def probe(
-    backend_url: str, *, timeout: float = 3.0, expect_model: str | None = None
+    backend_url: str,
+    *,
+    timeout: float = 3.0,
+    expect_model: str | None = None,
+    health_path: str | None = None,
 ) -> tuple[bool, str | None]:
     """Is the backend answering -- and, when asked, is it ours?
 
@@ -139,6 +143,15 @@ def probe(
     liveness probe. It is the pre-existing situation, not a new fault, and
     refusing it would kill deployments behind proxies that never spoke this
     dialect.
+
+    `health_path`, when given, REPLACES the first liveness path rather than
+    adding one: every runtime's own `RuntimeSpec.health_path` is `"/health"`
+    today, the same as `HEALTH_PATHS[0]`, so a caller that always threads it
+    through costs nothing now and stops a future runtime with a genuinely
+    different liveness endpoint from being silently ignored. Replacing rather
+    than prepending also keeps the round-trip count -- and
+    `manager.py`'s `hard_deadline = probe_timeout * len(HEALTH_PATHS)` budget
+    built on it -- unchanged.
     """
     origin = backend_origin(backend_url)
     if expect_model:
@@ -161,8 +174,11 @@ def probe(
             )
         # Nothing learned. Fall through to liveness, whose own wording is the
         # right one for a port that did not answer at all.
+    paths = HEALTH_PATHS
+    if health_path and health_path != HEALTH_PATHS[0]:
+        paths = (health_path,) + tuple(p for p in HEALTH_PATHS if p != health_path)
     last: str | None = None
-    for path in HEALTH_PATHS:
+    for path in paths:
         url = origin + path
         try:
             with urllib.request.urlopen(url, timeout=timeout) as response:

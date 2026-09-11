@@ -1,11 +1,17 @@
 """Day 0 stub: one fake OpenRouter provider, three models, canned tokens.
 
-Agent G wires LOCAL_FIRST against this before any real key exists. It is not a
-mock object: it is the real :class:`ProviderService` driven through an
+Wires LOCAL_FIRST against this before any real key exists. It is not a mock
+object: it is the real :class:`ProviderService` driven through an
 ``httpx.MockTransport``, so discovery, streaming, usage accounting, backoff and
-redaction all run the code that will run in production. Only the network is fake.
+redaction all run the code that will run in production. Only the network is
+fake.
 
-Delete the wiring, not the service, at integration.
+The wiring the original note meant to delete was `node.py`'s call site, and
+that happened: production supplies real providers behind
+`GatewayDeps(strict=True, ...)`, which refuses to start if any port is still
+missing. This file stayed: `__init__.py` exports `build_stub_service` and
+`stub_transport` as this package's public fake, and
+`tests/unit/test_providers.py` is what actually reaches for them.
 """
 
 from __future__ import annotations

@@ -115,27 +115,47 @@ def allocatable_map(
     return budgets, excluded, None
 
 
-def drop_zero_addressable(
+def drop_unbudgetable(
     nodes: list[NodeProfile], budgets: dict[str, int]
 ) -> tuple[dict[str, int], list[dict[str, str]]]:
-    """Remove nodes that report no addressable memory at all.
+    """Remove nodes that have no memory a model could be placed in.
 
-    A node whose profile says zero addressable bytes -- a container that could
-    not probe its GPU, say -- would otherwise be the argmin of every budget and
-    make every verdict WONT_FIT. Dropping it silently would be its own lie, so
-    each removal is recorded and surfaces in the refusal.
+    A node with nothing to spend would otherwise be the argmin of every budget
+    and make every verdict WONT_FIT. Dropping it silently would be its own lie,
+    so each removal is recorded and surfaces in the refusal.
+
+    This was `drop_zero_addressable`, and the rename is the change. The test
+    was `addressable_memory <= 0`, which is a question about a GPU -- and for
+    as long as every runtime needed one, that was the same question as "can
+    anything be placed here". It is not any more. A CPU node reports zero
+    addressable bytes for the honest reason that it has no GPU, and the
+    `llamacpp` runtime places models on it out of host RAM.
+
+    So the test moved to the budget itself: a node is dropped when its measured
+    budget is zero, whatever hardware produced that zero. That keeps every case
+    the old name covered -- a container that could not probe its GPU still
+    reports 0 addressable and, having no host budget path either, still
+    reports 0 here -- while letting a machine with real, measured, spendable
+    memory stay in. `telemetry.allocatable_bytes` is what decides, which is
+    also the only place that knows how a given device class is budgeted.
     """
     by_id = {n.node_id: n for n in nodes}
     kept: dict[str, int] = {}
     excluded: list[dict[str, str]] = []
     for node_id, value in budgets.items():
         profile = by_id.get(node_id)
-        if profile is not None and profile.addressable_memory <= 0:
+        if value <= 0:
             excluded.append(
                 {
                     "node_id": node_id,
-                    "reason": "reports 0 addressable bytes and was excluded "
-                    "from the memory budget",
+                    "reason": (
+                        "reports no memory a model could be placed in and was "
+                        "excluded from the budget"
+                        if profile is None or profile.addressable_memory > 0
+                        else "has no GPU memory and nothing has measured any "
+                        "host memory it could serve from, so it was excluded "
+                        "from the budget"
+                    ),
                 }
             )
             continue

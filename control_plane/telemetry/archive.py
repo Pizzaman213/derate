@@ -25,7 +25,14 @@ from .records import KIND_EVENT, KIND_LOG, KIND_REQUEST, KIND_SAMPLE
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+#: Documentation, NOT the migration gate. ``__init__`` stamps this into ``meta``
+#: unconditionally on every open, before anything else runs -- so the instant
+#: this becomes 2, every archive in the field claims to be at 2 whether or not
+#: it has the columns. A ladder keyed on it would skip the migration on exactly
+#: the files that need it. ``_ensure_schema`` asks ``PRAGMA table_info`` what
+#: the database actually holds instead. ``PRAGMA user_version`` is no better: it
+#: is 0 on every archive written so far and has never been read.
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples(
@@ -41,6 +48,13 @@ CREATE TABLE IF NOT EXISTS samples(
   host_memory_total     INTEGER,
   host_memory_available INTEGER,
   swap_used             INTEGER,
+  clock_throttle_bits   INTEGER,
+  sm_clock_mhz          INTEGER,
+  sm_clock_max_mhz      INTEGER,
+  swap_in_bps           REAL,
+  swap_out_bps          REAL,
+  major_faults_per_s    REAL,
+  memory_pressure_pct   REAL,
   PRIMARY KEY(node_id, ts)
 ) WITHOUT ROWID;
 
@@ -137,6 +151,12 @@ CREATE TABLE IF NOT EXISTS rollup_samples(
   gpu_memory_used_avg REAL, gpu_memory_used_max INTEGER,
   host_memory_available_min INTEGER,
   swap_used_max INTEGER,
+  throttle_bits_any INTEGER, throttled_s INTEGER, throttle_n INTEGER,
+  sm_clock_avg REAL, sm_clock_min INTEGER, sm_clock_max_mhz INTEGER,
+  swap_in_bps_avg REAL, swap_in_bps_max REAL,
+  swap_out_bps_avg REAL, swap_out_bps_max REAL,
+  major_faults_max REAL,
+  memory_pressure_pct_avg REAL, memory_pressure_pct_max REAL,
   PRIMARY KEY(step, node_id, bucket)
 ) WITHOUT ROWID;
 
@@ -170,7 +190,48 @@ _SAMPLE_COLS = (
     "host_memory_total",
     "host_memory_available",
     "swap_used",
+    "clock_throttle_bits",
+    "sm_clock_mhz",
+    "sm_clock_max_mhz",
+    "swap_in_bps",
+    "swap_out_bps",
+    "major_faults_per_s",
+    "memory_pressure_pct",
 )
+
+#: Columns added after the first release, and the migration that adds them to a
+#: file created before they existed. Additive only: a row written before a
+#: column existed must read NULL, because "nobody measured this in March" is not
+#: "March had zero throttling" -- the null-vs-zero rule this package enforces
+#: everywhere else, applied to time instead of to hardware. Never NOT NULL and
+#: never a DEFAULT; SQLite would refuse the first on a WITHOUT ROWID table
+#: anyway, and the second would fabricate the measurement.
+_ADDITIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "samples": (
+        ("clock_throttle_bits", "INTEGER"),
+        ("sm_clock_mhz", "INTEGER"),
+        ("sm_clock_max_mhz", "INTEGER"),
+        ("swap_in_bps", "REAL"),
+        ("swap_out_bps", "REAL"),
+        ("major_faults_per_s", "REAL"),
+        ("memory_pressure_pct", "REAL"),
+    ),
+    "rollup_samples": (
+        ("throttle_bits_any", "INTEGER"),
+        ("throttled_s", "INTEGER"),
+        ("throttle_n", "INTEGER"),
+        ("sm_clock_avg", "REAL"),
+        ("sm_clock_min", "INTEGER"),
+        ("sm_clock_max_mhz", "INTEGER"),
+        ("swap_in_bps_avg", "REAL"),
+        ("swap_in_bps_max", "REAL"),
+        ("swap_out_bps_avg", "REAL"),
+        ("swap_out_bps_max", "REAL"),
+        ("major_faults_max", "REAL"),
+        ("memory_pressure_pct_avg", "REAL"),
+        ("memory_pressure_pct_max", "REAL"),
+    ),
+}
 
 _REQUEST_COLS = (
     "request_id",
@@ -229,6 +290,16 @@ def connect(path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+def _sample_insert(cols: tuple[str, ...]) -> str:
+    return (
+        "INSERT OR REPLACE INTO samples(node_id, ts, "
+        + ", ".join(cols)
+        + ") VALUES(?, ?, "
+        + ", ".join("?" * len(cols))
+        + ")"
+    )
+
+
 class Archive:
     """Typed, queryable, retained. Coordinator only."""
 
@@ -244,6 +315,72 @@ class Archive:
             "INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
+        # Optimistic: a database this constructor just created from _SCHEMA has
+        # every column, and _ensure_schema narrows these if it turns out not to.
+        # Seeded here rather than left unset so an Archive is usable before the
+        # first ingest, which is what the tests construct.
+        self._migrated = False
+        self._sample_cols: tuple[str, ...] = _SAMPLE_COLS
+        self._sample_sql = _sample_insert(_SAMPLE_COLS)
+
+    def _ensure_schema(self) -> None:
+        """Add any column this build wants that the file does not have.
+
+        Gated on ``PRAGMA table_info`` -- what the database actually holds --
+        rather than on a recorded version number. Three properties follow, and
+        each is the reason a version ladder was rejected:
+
+        *Idempotent by construction.* It asks rather than remembers, so a file
+        created by ``_SCHEMA`` (which already carries every column) finds
+        nothing to do and a migrated one is never re-migrated.
+
+        *Self-healing.* Each ``ALTER TABLE`` is its own implicit transaction, so
+        a process killed between two of them leaves a half-migrated file. The
+        next pass converges on it. A ladder would have stamped "done" and never
+        looked again.
+
+        *Cheap.* ``ADD COLUMN`` rewrites the schema row, not the table -- O(1)
+        even on the multi-gigabyte archive this runs against in production.
+
+        A failure here must not escalate. If the volume is read-only or full the
+        ALTERs fail, and then ``_SAMPLE_COLS`` would name columns that do not
+        exist and every ``executemany`` would raise ``no such column`` -- turning
+        "seven fields missing" into "no telemetry ingested at all" for as long as
+        the disk stays full. So the effective column list is intersected with
+        what is really there, one warning is logged, and ``_migrated`` stays
+        False so the next pass retries.
+        """
+        if self._migrated:
+            return
+        conn = self._conn
+        try:
+            for table, additions in _ADDITIONS.items():
+                present = {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                }
+                for name, decl in additions:
+                    if name not in present:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            self._migrated = True
+        except Exception:
+            log.warning("telemetry archive migration failed", exc_info=True)
+        # Whether or not the ALTERs worked, write down what the file can take.
+        try:
+            present = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
+        except Exception:
+            return
+        cols = tuple(c for c in _SAMPLE_COLS if c in present)
+        if cols != self._sample_cols:
+            missing = [c for c in _SAMPLE_COLS if c not in present]
+            if missing:
+                log.warning(
+                    "telemetry archive is missing %d sample column(s); "
+                    "ingesting the rest: %s",
+                    len(missing),
+                    ", ".join(missing),
+                )
+            self._sample_cols = cols
+            self._sample_sql = _sample_insert(cols)
 
     def close(self) -> None:
         """Close the connection, but not out from under a writer.
@@ -300,6 +437,11 @@ class Archive:
 
         conn = self._conn
         with self._lock:
+            # Before BEGIN, deliberately: an ALTER inside the batch transaction
+            # could roll the batch back, and this has to have run before the
+            # first INSERT that names a new column -- which is why it lives here
+            # and not only on the compaction timer sixty seconds later.
+            self._ensure_schema()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 if rows:
@@ -364,7 +506,9 @@ class Archive:
                 continue
 
             if kind == KIND_SAMPLE:
-                samples.append((node_id, ts, *(body.get(c) for c in _SAMPLE_COLS)))
+                samples.append(
+                    (node_id, ts, *(body.get(c) for c in self._sample_cols))
+                )
             elif kind == KIND_REQUEST:
                 if not body.get("request_id"):
                     continue
@@ -410,14 +554,7 @@ class Archive:
 
         conn = self._conn
         if samples:
-            conn.executemany(
-                "INSERT OR REPLACE INTO samples(node_id, ts, "
-                + ", ".join(_SAMPLE_COLS)
-                + ") VALUES(?, ?, "
-                + ", ".join("?" * len(_SAMPLE_COLS))
-                + ")",
-                samples,
-            )
+            conn.executemany(self._sample_sql, samples)
         if requests:
             conn.executemany(
                 "INSERT OR REPLACE INTO requests(" + ", ".join(_REQUEST_COLS) + ") "

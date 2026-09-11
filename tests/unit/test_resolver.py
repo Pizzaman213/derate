@@ -1331,6 +1331,35 @@ class TestRuntimeSupport:
         assert entry.level is SupportLevel.UNSUPPORTED
         assert "llama.cpp" in entry.reason
 
+    def test_sglang_architectures_directly(self):
+        """Every other sglang-architecture test reads this set through
+        `build_verdict`/`architectures_for` -- real coverage, but mediated.
+        This is the set itself: a known member, a known non-member (Whisper,
+        which `test_vllm_supports_whisper_and_sglang_says_it_does_not` already
+        proves the *consequence* of), and the real find this session's probe
+        fix caught -- `Gemma4ForConditionalGeneration` was missing here while
+        a real sglang image registered it, which is exactly the staleness this
+        table's own docstring warns about and a direct check catches fastest."""
+        from control_plane.resolver.support import SGLANG_ARCHITECTURES
+
+        assert "LlamaForCausalLM" in SGLANG_ARCHITECTURES
+        assert "WhisperForConditionalGeneration" not in SGLANG_ARCHITECTURES
+        # Stale as of this table's own docstring -- asserted absent on
+        # purpose, so the day someone fixes the static list by hand (rather
+        # than through a probe) this test fails and says to update the
+        # docstring alongside it, not just the set.
+        assert "Gemma4ForConditionalGeneration" not in SGLANG_ARCHITECTURES
+
+    def test_sglang_quants_directly(self):
+        from control_plane.resolver.support import _SGLANG_QUANTS
+
+        assert _SGLANG_QUANTS["bf16"] is SupportLevel.SUPPORTED
+        assert _SGLANG_QUANTS["nvfp4"] is SupportLevel.SUPPORTED
+        # No GGUF path at all -- stated key by key in the table, not left to
+        # an absent-key default, and this is the direct check of that.
+        assert _SGLANG_QUANTS["q4_k_m"] is SupportLevel.UNSUPPORTED
+        assert _SGLANG_QUANTS["nf4"] is SupportLevel.UNSUPPORTED
+
     def test_ggml_architecture_names_are_understood(self):
         assert build_verdict(("qwen2",), "bf16").for_runtime("vllm").ok
 
@@ -1895,6 +1924,20 @@ class TestQuantVariants:
                 return ModelInfo(
                     model_id, "sha", tuple(files), None, None, (), file_sizes=files
                 )
+            if model_id == "acme/Widget-7B-AWQ":
+                # A sibling quantization repository, with real shards. A
+                # search hit carries no file list, so until `_size_launchable`
+                # existed this row went out with `file_bytes=None` and the
+                # capacity ladder priced it from the dtype formula.
+                files = {
+                    "model-00001-of-00002.safetensors": 3_000_000_000,
+                    "model-00002-of-00002.safetensors": 1_400_000_000,
+                    # Not a shard a runtime loads, and not counted.
+                    "original/consolidated.safetensors": 9_900_000_000,
+                }
+                return ModelInfo(
+                    model_id, "sha", tuple(files), None, None, (), file_sizes=files
+                )
             if model_id != "acme/Widget-7B-GGUF":
                 return ModelInfo(model_id, "sha", (), None, None, ())
             files = {
@@ -1984,15 +2027,94 @@ class TestQuantVariants:
         assert own.launchable is False
         assert "choose one" in own.note
 
-    def test_no_gguf_file_is_launchable(self, monkeypatch):
-        """Both serve command templates take a repository path, not a file."""
+    def test_a_gguf_file_is_launchable_now_that_something_launches_it(
+        self, monkeypatch
+    ):
+        """Inverted when the `llamacpp` runtime arrived, and deliberately.
+
+        This asserted the opposite for the life of the project, on a reason
+        that was true when it was written: no runtime here read llama.cpp's
+        format, so a `.gguf` row was a row nobody could act on. `llamacpp`
+        reads exactly this, and `flags.llamacpp_model_spec` turns the file
+        reference into the repository spelling its launcher parses.
+
+        The row that flipped is the FILE row and only that one -- see the
+        sibling test below, which holds the repository-level rows refused for
+        a reason the new runtime does not touch.
+        """
         variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
-        assert all(not v.launchable for v in variants if v.source == "gguf_file")
+        files = [v for v in variants if v.source == "gguf_file"]
+        assert files, "the fixture should offer at least one .gguf build"
+        assert all(v.launchable for v in files)
+
+    def test_a_gguf_repository_is_still_not_launchable_by_its_own_id(
+        self, monkeypatch
+    ):
+        """The other half of the rule above, and the reason they differ.
+
+        A repository holding nine quantizations does not say which one a
+        launch would get -- sparkrun would glob the cache and take the
+        lexicographically first, which is a choice nobody made. That was never
+        "no runtime loads this format", so a runtime that does changes nothing
+        here.
+        """
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        repos = [
+            v for v in variants
+            if v.source in ("repo_name", "tags") and v.dtype.startswith("q")
+        ]
+        assert all(not v.launchable for v in repos)
 
     def test_a_safetensors_quantization_repo_is_launchable(self, monkeypatch):
         variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
         awq = [v for v in variants if v.repo_id.endswith("-AWQ")][0]
         assert awq.launchable is True and awq.dtype == "awq_int4"
+
+    def test_a_launchable_sibling_repo_is_sized_not_left_to_a_formula(
+        self, monkeypatch
+    ):
+        """The 2.4x bug at its source.
+
+        A ``repo_name`` variant is built from a search hit, and a search hit
+        carries no file list -- so these rows used to go out with
+        ``file_bytes=None``, which the capacity ladder then priced from the
+        dtype formula and reported as a confident verdict. On
+        ``Qwen/Qwen3.8-Flash-Next`` that read 47.3 GiB per rank against a real
+        111.8.
+
+        Only root-level ``model*.safetensors`` count: this repo also ships an
+        ``original/`` copy of the same weights, and counting it would double
+        the footprint.
+        """
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        awq = [v for v in variants if v.repo_id.endswith("-AWQ")][0]
+        assert awq.file_bytes == 4_400_000_000
+        assert awq.shard_count == 2
+        assert awq.shard_files == (
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        )
+
+    def test_a_sibling_repo_that_cannot_be_read_stays_unsized(self, monkeypatch):
+        """Gated repositories, 429s and hub outages are ordinary here. They
+        must degrade to "not sized" and never fail the enumeration -- the
+        gateway is what turns the remaining absence into a refusal."""
+        from control_plane.resolver.types import MetadataUnavailable
+
+        resolver = self._resolver(monkeypatch)
+        real = resolver.client.model_info
+
+        def gated(model_id, revision="main"):
+            if model_id == "acme/Widget-7B-AWQ":
+                raise MetadataUnavailable("gated; set HF_TOKEN")
+            return real(model_id, revision)
+
+        monkeypatch.setattr(resolver.client, "model_info", gated)
+        variants = resolver.quant_variants("acme/Widget-7B-GGUF")
+        awq = [v for v in variants if v.repo_id.endswith("-AWQ")][0]
+        assert awq.file_bytes is None
+        # ...and the rest of the enumeration survived it.
+        assert len(variants) > 5
 
     def test_variants_are_unique(self, monkeypatch):
         variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")

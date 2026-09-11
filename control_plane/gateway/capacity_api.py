@@ -274,6 +274,226 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             headers={"Cache-Control": "public, max-age=3600"},
         )
 
+    @router.get("/api/models/speculative-heads")
+    async def speculative_heads(
+        model_id: str = "", limit: int = 12, refresh: int = 0
+    ) -> Response:
+        """Every way this model can speculate, priced and ranked, plus a pick.
+
+        Deliberately NOT folded into `/api/plan`. That route answers on every
+        keystroke in the Serve panel, and a cold scan here is a dozen hub
+        searches plus a resolve per candidate -- 39 of them for Qwen3-30B-A3B.
+
+        Nothing here launches anything, so it answers on a box with no free
+        memory at all -- which is the half of speculative decoding that stays
+        useful when the cluster is full.
+
+        **Answered once per model, not once per view.** The scan is written to
+        `head_scan.save_scan` keyed by the model AND the image version, so the
+        second view is free and the control can offer a recommendation without
+        being asked for one. `?refresh=1` goes past the record; `from_cache`
+        and `scanned_at` say which happened.
+
+        **The checkpoint's own options are in the same ranking as the hub's.**
+        `mtp` declared by `num_nextn_predict_layers` and a separately-published
+        EAGLE3 head are alternatives to each other, and two lists would make
+        the reader compare them by hand.
+
+        **`recommended_head` is not the top row, and cannot be.** The ranking
+        is a ceiling, ngram wins it by construction -- see
+        `head_scan.WEIGHTLESS_NOTE` -- and within a method family it ties. The
+        pick applies `head_scan.recommend`; `caveat` keeps saying what the
+        ranking does and does not mean.
+        """
+        wanted = (model_id or "").strip()
+        if not wanted:
+            return errors.error_response(
+                400, "model_id is required.", "invalid_request_error",
+                "invalid_request",
+            )
+        top = max(1, min(int(limit), 50))
+        # Keyed by the limit too. It truncates the payload, so one entry served
+        # for every limit hands a caller asking for 40 whatever the caller
+        # asking for 6 got.
+        memo = f"{wanted}|{top}"
+        if not refresh:
+            cached = _heads_cache.get(memo)
+            if cached is not None:
+                return JSONResponse(cached)
+
+        resolver = ctx.deps.resolver
+        if not callable(getattr(resolver, "search_models", None)) or not callable(
+            getattr(resolver, "resolve_full", None)
+        ):
+            return JSONResponse({
+                "model_id": wanted, "heads": [], "recommended": [], "rejected": [],
+                "note": "this resolver cannot search the hub for draft heads",
+            })
+
+        def work() -> dict:
+            from control_plane import head_scan, measurements
+            from control_plane.resolver import support
+
+            base = resolver.resolve_full(wanted)
+            probed = support.probed("vllm")
+            specs = getattr(probed, "speculators", None) if probed else None
+            version = getattr(probed, "version", "") if probed else ""
+
+            hit = None if refresh else head_scan.cached_scan(wanted, version or "")
+            if hit is not None:
+                usable, rejected, scanned_at = hit
+                from_cache = True
+            else:
+                rows = head_scan.candidates(resolver, wanted)
+                usable, rejected = head_scan.price(
+                    resolver, base.shape, rows,
+                    frozenset(specs) if specs else None,
+                    target_model_type=getattr(base, "model_type", "") or "",
+                )
+                scanned_at = time.time()
+                head_scan.save_scan(
+                    wanted, version or "", usable, rejected, scanned_at
+                )
+                from_cache = False
+
+            # The checkpoint's own options, ranked beside the hub's. `model_id`
+            # is the TARGET for these -- for `mtp` the draft ships inside the
+            # checkpoint, so naming the head means naming the model itself, and
+            # `declared_by` is what tells a reader where it came from.
+            #
+            # Unlaunchable ones are left out rather than listed as rejections:
+            # checkpoint DSpark is detected and refused with its own sentence,
+            # and the picker below already shows it saying so. A ranking row
+            # with no ceiling would be a third place to say the same thing.
+            builtin = [
+                ({"model_id": wanted, "downloads": None, "builtin": True}, option)
+                for option in (getattr(base, "speculators", ()) or ())
+                if option.launchable
+            ]
+
+            gpu, bandwidth = None, 0.0
+            try:
+                for node in ctx.deps.registry.healthy_nodes():
+                    if node.profile.memory_bandwidth_gbps:
+                        gpu = getattr(node.profile, "gpu_name", None)
+                        bandwidth = node.profile.memory_bandwidth_gbps
+                        break
+            except Exception:
+                gpu, bandwidth = None, 0.0
+
+            baseline, scored = head_scan.rank(
+                usable + builtin, base.shape, bandwidth or 273.0
+            )
+
+            # What a sweep actually got, per method, on THIS hardware under
+            # THIS image. `matching` does the keying and a mismatch misses --
+            # a measurement does not travel between unlike machines.
+            measured: dict[str, list] = {}
+            for method in {option.method.value for _, _, option in scored}:
+                try:
+                    measured[method] = measurements.matching(
+                        wanted, method, gpu_name=gpu,
+                        memory_bandwidth_gbps=bandwidth or None,
+                        runtime_version=version or None,
+                    )
+                except Exception:
+                    measured[method] = []
+            best_measured = {
+                method: max(r.best_tps for r in rows)
+                for method, rows in measured.items() if rows
+            }
+
+            pick = head_scan.recommend(scored, best_measured)
+            # Keyed by (model id, method): a built-in and a hub head can carry
+            # the same repository -- `mtp` names the target -- and an id alone
+            # would mark both when only one was chosen.
+            picked = {(r[1]["model_id"], r[2].method.value)
+                      for r in head_scan.shortlist(
+                          [s for s in scored if (s[2].draft_params or 0) > 0],
+                          4)}
+            chosen = (pick[1]["model_id"], pick[2].method.value) if pick else None
+
+            def row_of(ceiling, row, option) -> dict:
+                return {
+                    "model_id": row["model_id"],
+                    "method": option.method.value,
+                    "max_tokens": option.max_tokens,
+                    "default_tokens": option.default_tokens,
+                    "draft_bytes": option.draft_bytes,
+                    "draft_params": option.draft_params,
+                    "source": option.source,
+                    "declared_by": option.declared_by,
+                    "ceiling_tps": ceiling,
+                    "downloads": row.get("downloads"),
+                    "recommended": (row["model_id"], option.method.value) in picked,
+                    "note": option.note,
+                    "measured": [
+                        serialize.measurement(r)
+                        for r in measured.get(option.method.value, ())
+                    ],
+                }
+
+            # The recommendations ALWAYS survive the limit. Truncating first
+            # dropped the dflash and dspark picks off a `limit=6` answer and
+            # left one lonely asterisk on an all-EAGLE3 list -- the one thing
+            # this endpoint exists to show.
+            shown = scored[:top] + [
+                s for s in scored[top:]
+                if (s[1]["model_id"], s[2].method.value) in picked
+            ]
+            weightless = [s for s in scored if (s[2].draft_params or 0) == 0]
+            return {
+                "model_id": wanted,
+                "baseline_tps": baseline,
+                "scanned_at": scanned_at,
+                "from_cache": from_cache,
+                "heads": [row_of(*s) for s in shown],
+                # The single pick, as a whole row rather than an id: the screen
+                # renders it beside a checkbox before anything is selected, so
+                # it needs the method, the cost and the token count too.
+                "recommended_head": row_of(*pick) if pick else None,
+                # One per method family, best-established first. Separate from
+                # `heads` because the top of a ranking and the thing to try are
+                # not the same: the ceiling ties within a family, so the pick
+                # is by downloads and will often not be the top row.
+                "recommended": [
+                    s[1]["model_id"] for s in scored
+                    if (s[1]["model_id"], s[2].method.value) in picked
+                ],
+                "rejected": [
+                    {"model_id": row.get("model_id", ""), "reason": str(why)}
+                    for row, why in rejected[:20]
+                ],
+                "rejected_total": len(rejected),
+                # Only when there IS one to explain away. Printed unconditionally
+                # it would tell somebody about a row that is not on their screen.
+                "ngram_note": head_scan.WEIGHTLESS_NOTE if weightless else "",
+                "caveat": (
+                    "Ranked by ceiling \u2014 every drafted token accepted. That "
+                    "rewards a small head with a high k, and within a method "
+                    "family it barely separates anything. Which of these is "
+                    "actually fastest depends on the acceptance rate, which is "
+                    "only knowable by measuring."
+                ),
+            }
+
+        try:
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(work), timeout=_HEADS_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse({
+                "model_id": wanted, "heads": [], "recommended": [], "rejected": [],
+                "note": f"the hub did not answer within {_HEADS_TIMEOUT_S:.0f}s",
+            })
+        except Exception as exc:
+            log.exception("scanning heads for %s failed", wanted)
+            return errors.error_response(
+                502, str(exc), "server_error", "head_scan_failed",
+            )
+        _heads_cache.put(memo, payload)
+        return JSONResponse(payload)
+
     @router.get("/api/models/search")
     async def model_search(q: str = "", limit: int = 40) -> Response:
         """Models from three places at once, local first, none of them resolved.
@@ -699,7 +919,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             budgets, excluded, unavailable = livefit.allocatable_map(
                 ctx.deps.registry, [p.node_id for p in profiles]
             )
-            budgets, zero_excluded = livefit.drop_zero_addressable(profiles, budgets)
+            budgets, zero_excluded = livefit.drop_unbudgetable(profiles, budgets)
             excluded = excluded + zero_excluded
         excluded = excluded + skipped + unknown_ids
 
@@ -730,10 +950,30 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             {plan_for(shape).tensor_parallel for shape, _l, _w in shapes}
         ) if plan_for and shapes else [1]
 
+        # The caveat that rides every row under a host basis. Its second half
+        # used to be "Nothing here can be launched on this machine -- serve it
+        # from a provider", which was the honest containment while every
+        # runtime needed a GPU: sizing against host RAM would otherwise print
+        # "fits" for a model that could not load there at all.
+        #
+        # A CPU runtime changes which half is true. The budget is still host
+        # memory and still worth saying -- it is a live reading of a pool the
+        # operating system shares, not a ceiling -- but "nothing can be
+        # launched" is now false, and a caveat that tells somebody to go
+        # elsewhere when the machine in front of them can serve is worse than
+        # no caveat at all.
         host_note = (
-            f"sized against the host memory {profiles[0].node_id} reports, "
-            f"not against GPU memory: no GPU was found on it. Nothing here "
-            f"can be launched on this machine -- serve it from a provider."
+            (
+                f"sized against the host memory {profiles[0].node_id} reports, "
+                f"not against GPU memory: no GPU was found on it. Serve these "
+                f"on llamacpp, which runs on the CPU and reads GGUF builds."
+            )
+            if _serves_from_host_memory()
+            else (
+                f"sized against the host memory {profiles[0].node_id} reports, "
+                f"not against GPU memory: no GPU was found on it. Nothing here "
+                f"can be launched on this machine -- serve it from a provider."
+            )
         ) if host_basis else None
 
         out: dict[str, Any] = {
@@ -747,7 +987,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             "nodes": [p.node_id for p in profiles],
             "tensor_parallel": tp_used,
             "budget_basis": "host_memory" if host_basis else "gpu",
-            "local_serving": not host_basis,
+            "local_serving": not host_basis or _serves_from_host_memory(),
             "measured_at": time.time(),
             "excluded": excluded,
             "unresolved": unresolved,
@@ -830,6 +1070,13 @@ class _TTLCache:
 
 _variant_cache = _TTLCache(_VARIANTS_TTL_S)
 _search_cache = _TTLCache(_SEARCH_TTL_S, limit=128)
+
+#: Head scans are far more expensive than a search -- a resolve per
+#: candidate -- and the answer moves only when somebody publishes a new
+#: head, so it is cached for much longer and asked for far less often.
+_HEADS_TTL_S = 30 * 60.0
+_HEADS_TIMEOUT_S = 60.0
+_heads_cache = _TTLCache(_HEADS_TTL_S, limit=64)
 #: Enumerations that FAILED, so a retry is cheap.
 #:
 #: ``_variant_cache`` is only ever written on success, which meant a model
@@ -841,6 +1088,44 @@ _search_cache = _TTLCache(_SEARCH_TTL_S, limit=128)
 #: -- it fails on the first listing and is already cheap.
 _VARIANT_FAIL_TTL_S = 60.0
 _variant_fail_cache = _TTLCache(_VARIANT_FAIL_TTL_S, limit=64)
+
+
+def _unsized(variant) -> bool:
+    """A row this gate must not judge: launchable, and never measured.
+
+    ``file_bytes`` is documented below as measured or absent, never an
+    estimate dressed as a size -- and that was honest about the SIZE and
+    silent about the VERDICT computed when it is absent. Handed ``None``,
+    ``weight_bytes_per_rank`` falls back to ``total_params`` times the
+    dtype's table figure, and the row goes out with a full-confidence
+    verdict, a headroom and a Serve button.
+
+    Measured on ``Qwen/Qwen3.8-Flash-Next``: an assumed 4.5 bits/weight
+    predicted 47.3 GiB per rank where the checkpoint really holds 111.8.
+    2.4x, in the direction that turns a refusal into an invitation --
+    62 GiB of claimed headroom that was really 4.1 GiB of overflow.
+
+    ``resolver.quant_variants`` now sizes these before they get here, so
+    this is the residue: a gated repository, a hub 429, a repo that
+    publishes no weight index at all. The rule is the one
+    ``speculators.py`` already applies to a draft head whose shards cannot
+    be counted -- name it and refuse it, because derate does not budget
+    what it cannot measure.
+
+    A GGUF row is never launchable and is priced from its own measured
+    files, so this never fires on one.
+    """
+    return bool(variant.launchable) and variant.file_bytes is None
+
+
+def _unsized_reason(variant) -> str:
+    return (
+        f"{variant.repo_id} publishes no readable weight index, so its size "
+        f"could only be estimated from its config -- and for a memory gate "
+        f"that estimate is a guess in the direction that invites a launch. "
+        f"derate does not budget what it cannot measure. Check the "
+        f"repository is public and HF_TOKEN is set if it is gated."
+    )
 
 
 def _variant_verdicts(
@@ -905,7 +1190,10 @@ def _variant_verdicts(
     # Same fallback as `/api/capacity`, for the same reason: on a machine with
     # no GPU the ladder is the only thing that can say how big these files are
     # and whether the box could hold them at all, and a blank column says
-    # nothing. `local_serving` below is what stops it growing a Serve button.
+    # nothing. `local_serving` below says whether a Serve button may be drawn
+    # from it -- which used to be "no, this was budgeted against host memory"
+    # and is now a question for the runtime table. See
+    # `_serves_from_host_memory`.
     host_basis = False
     if not profiles:
         host_budget = _host_budget(ctx, all_profiles)
@@ -946,7 +1234,8 @@ def _variant_verdicts(
         "nodes": [],
         "probed_node": None,
         "budget_basis": "host_memory" if host_basis else "gpu",
-        "local_serving": bool(profiles) and not host_basis,
+        "local_serving": bool(profiles)
+        and (not host_basis or _serves_from_host_memory()),
         "tensor_parallel": 1,
         # The two denominators, so the caption can name the number the verdicts
         # were taken against instead of leaving the reader to assume it was the
@@ -994,6 +1283,9 @@ def _variant_verdicts(
             )
         shapes = []
         for index, variant in enumerate(variants):
+            if _unsized(variant):
+                # Never judged, so never judged wrongly. See _unsized.
+                continue
             shapes.append(
                 (
                     dataclasses.replace(base_shape, dtype=variant.dtype),
@@ -1107,7 +1399,13 @@ def _variant_verdicts(
                 "verdict": row.verdict if row else None,
                 "fits": row.fits if row else None,
                 "headroom": row.headroom if row else None,
-                "reason": row.reason if row else "",
+                # An unsized row was never handed to the gate, so it has no
+                # verdict and every field above stays null. It still owes the
+                # reader a sentence, and the sentence is why -- not "not
+                # checked", which reads as a spinner that has not landed yet.
+                "reason": row.reason if row else (
+                    _unsized_reason(variant) if _unsized(variant) else ""
+                ),
                 "predicted_decode_tps": row.predicted_decode_tps if row else None,
                 # What this row was judged at. The caller named no context on
                 # the default path, so the gate chose one -- and a verdict
@@ -1124,7 +1422,9 @@ def _variant_verdicts(
                 "static_verdict": spec.verdict if spec else None,
                 "static_fits": spec.fits if spec else None,
                 "static_headroom": spec.headroom if spec else None,
-                "static_reason": spec.reason if spec else "",
+                "static_reason": spec.reason if spec else (
+                    _unsized_reason(variant) if _unsized(variant) else ""
+                ),
                 "static_predicted_decode_tps": (
                     spec.predicted_decode_tps if spec else None
                 ),
@@ -1290,6 +1590,32 @@ def _plan_for(ctx: GatewayContext, profiles: list):
     return build
 
 
+def _serves_from_host_memory() -> bool:
+    """Whether any runtime in this build places a model in host RAM.
+
+    `local_serving` used to be `not host_basis`, and that was a correct
+    shorthand exactly once: while every runtime needed a GPU, "we had to
+    budget against host memory" and "nothing here can serve this" were the
+    same statement. The ladder said so on screen -- *"against host memory -- no
+    GPU was found there, so nothing below can be served from it"* -- and the
+    Serve button was withheld on that basis.
+
+    `llamacpp` places into host RAM deliberately, so the shorthand is now
+    false: a GPU-less box budgeted against its own RAM is a box that can
+    serve. Asked of the runtime table rather than hardcoded, so a build
+    without that runtime -- or with a second one -- answers for itself.
+
+    Lazily imported for the reason every other `deploy.flags` use in this
+    package is: nothing under `control_plane/gateway/` may depend on
+    `control_plane.deploy` being importable.
+    """
+    try:
+        from control_plane.deploy.flags import RUNTIMES
+    except Exception:  # pragma: no cover - deploy not installed
+        return False
+    return any(spec.memory_pool == "host" for spec in RUNTIMES.values())
+
+
 def _host_budget(ctx: GatewayContext, profiles: list) -> dict[str, int]:
     """Host memory, for machines the fit gate has no GPU budget for.
 
@@ -1335,17 +1661,23 @@ def _quant_node_check(ctx: GatewayContext, resolution: Any) -> dict:
     on pre-Blackwell silicon a runtime that emulates MXFP4 upcasts the weights
     to bf16 and quadruples them, which the fit check was not told about.
 
-    Only nodes that could actually hold the model are asked. ``healthy_nodes()``
-    filters on liveness alone, so it includes machines the probe found no GPU on
-    -- and those answer every quantization question with "compute capability ''
-    is unreadable", which describes a silicon generation problem on hardware
-    that has no silicon to describe. Worse, it set ``ok`` False for a model
-    every real node can run. The predicate is the one this file already applies
-    at the capacity probe and ``livefit.drop_zero_addressable`` applies to
-    budgets: zero addressable bytes means not a candidate.
+    Only nodes with a GPU are asked, and here that is the right filter even
+    though a CPU node can now serve. ``healthy_nodes()`` filters on liveness
+    alone, so it includes machines the probe found no GPU on -- and those
+    answer every quantization question with "compute capability '' is
+    unreadable", which describes a silicon generation problem on hardware that
+    has no silicon to describe. Worse, it set ``ok`` False for a model every
+    real node can run.
+
+    The `llamacpp` runtime did not change this. Every question
+    ``QuantRequirement.check`` asks is about a CUDA capability -- does this
+    silicon have the tensor cores that scheme needs -- and a machine with no
+    GPU is not a node that answers "no", it is a node the question is not
+    about. What changed is only the sentence: "derate launches CUDA runtimes
+    only" was true when it was written and is not now.
 
     Skipped nodes are reported rather than dropped, for the reason
-    ``drop_zero_addressable`` gives: dropping one silently is its own lie.
+    ``drop_unbudgetable`` gives: dropping one silently is its own lie.
     ``ok`` keeps its meaning -- "no candidate objected" -- so a cluster with no
     candidates at all leaves it True and lets ``skipped`` carry the story.
     """
@@ -1368,7 +1700,10 @@ def _quant_node_check(ctx: GatewayContext, resolution: Any) -> dict:
             skipped.append(
                 {
                     "node_id": profile.node_id,
-                    "reason": "no GPU memory; derate launches CUDA runtimes only",
+                    "reason": (
+                        "no GPU, so there is no silicon generation to check a "
+                        "CUDA quantization scheme against"
+                    ),
                 }
             )
             continue

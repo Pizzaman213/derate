@@ -13,7 +13,9 @@ import dataclasses
 import itertools
 import json
 import logging
+import os
 import shlex
+import threading
 from functools import partial
 import time
 from pathlib import Path
@@ -28,12 +30,20 @@ from control_plane.contracts import (
     FitRequest,
     Modality,
     RoutingPolicy,
+    SpeculativeMethod,
+    SpeculativeSpec,
     Verdict,
 )
-from control_plane.fit.capacity import context_for
+from control_plane.fit.capacity import (
+    MAX_DERIVED_CONCURRENCY,
+    concurrency_for,
+    context_for,
+)
+from control_plane.planner.constants import LATENCY_CONCURRENCY_CEILING
 from control_plane.providers import AdapterUnsupportedError, UnknownProviderError, UpstreamError
 from control_plane.planner import (
     Candidate,
+    DEFAULT_KV_DTYPE,
     IllegalDegrees,
     homogeneous_groups,
     pooling_note,
@@ -68,6 +78,10 @@ _MIXED_HW_PARAM = "allow_mixed_hardware"
 #: Request keys that make placement the operator's rather than the planner's.
 _PLACEMENT_PARAM = "node_ids"
 _DEGREES_PARAM = "parallelism"
+
+#: Speculative decoding, when the operator turned it on. Absent means one token
+#: per step, which is what every request sent before this key existed meant.
+_SPECULATIVE_PARAM = "speculative"
 
 #: The four axes a caller may name. A key omitted from `parallelism` means 1,
 #: never "whatever the planner would have picked": defaulting to the
@@ -149,6 +163,34 @@ class _PlanOutcome:
     #: prose): enough to say what is legal without shipping a rejection list
     #: per entry.
     alternatives: list = dataclasses.field(default_factory=list)
+    #: Every speculative method this checkpoint declares, whether or not one
+    #: was asked for, so the screen can offer them without a second round trip.
+    #: An entry with `launchable: false` is named and refused, not hidden --
+    #: "derate found DSpark and cannot price it" is a more useful thing to read
+    #: than silence.
+    speculative_options: list = dataclasses.field(default_factory=list)
+    #: What one of these machines actually decoded at, when anything has. None
+    #: is the ordinary answer and means nobody has run this model on this
+    #: hardware yet -- never a stand-in for the prediction, which is stated
+    #: beside it and is still true.
+    measured_decode: dict | None = None
+    #: The KV cache element width the gate SIZED WITH, after the settings
+    #: default has been applied. It rides here rather than being re-derived
+    #: at the launch call site because the two must be one value: the gate
+    #: halves `kv_bytes_per_token` for fp8 and approves a context on that
+    #: basis, so a launch that does not pass the same width gets the halved
+    #: byte budget filled with full-width entries -- half the context the
+    #: gate promised, no error anywhere.
+    kv_dtype: str = DEFAULT_KV_DTYPE
+    #: The weight quantization the CALLER forced, or None to let the runtime
+    #: read it off the checkpoint. Distinct from `shape.dtype`, which is the
+    #: forced value once an override was applied and the checkpoint's own
+    #: otherwise -- the launch needs to know which of the two it is looking
+    #: at, because only a forced one may render a `--quantization` flag.
+    quantization: str | None = None
+    #: What was actually charged, echoed back. None when the request asked for
+    #: none, which is the ordinary case.
+    speculative: object | None = None
 
 def _parse_node_ids(payload: dict) -> list[str] | None:
     """The machines the operator named, or None when they named none.
@@ -211,6 +253,152 @@ def _parse_degrees(payload: dict) -> dict[str, int] | None:
     return out
 
 
+def _parse_speculative(payload: dict) -> tuple[str, int, str | None] | None:
+    """The method and drafted-token count the operator asked for, or None.
+
+    Shape only. Whether *this* checkpoint offers that method, and what the
+    draft costs, are questions this function cannot answer -- the resolution
+    holds both -- so it returns the request's own two values and
+    ``_speculative_spec`` below turns them into a priced
+    :class:`SpeculativeSpec` or refuses.
+    """
+    if _SPECULATIVE_PARAM not in payload:
+        return None
+    raw = payload.get(_SPECULATIVE_PARAM)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{_SPECULATIVE_PARAM} must be an object with a method and a "
+            f"num_speculative_tokens, or be omitted"
+        )
+    method = raw.get("method")
+    if not isinstance(method, str) or not method:
+        raise ValueError(f"{_SPECULATIVE_PARAM}.method is required")
+    tokens = raw.get("num_speculative_tokens")
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
+        raise ValueError(
+            f"{_SPECULATIVE_PARAM}.num_speculative_tokens must be an integer of "
+            f"at least 1"
+        )
+    head = raw.get("model")
+    if head is not None and (not isinstance(head, str) or not head):
+        raise ValueError(
+            f"{_SPECULATIVE_PARAM}.model must be the head's repository id, or be "
+            f"omitted for a method the target's own checkpoint carries"
+        )
+    return method, tokens, head
+
+
+def _speculative_spec(resolution, asked, *, resolve_head=None, image_speculators=None):
+    """A priced ``SpeculativeSpec``, or a refusal naming what is on offer.
+
+    Every number in the returned spec comes from the resolution, never from the
+    request: a caller may choose the method and how many tokens to draft, and
+    may not tell the fit gate what the draft weighs. That is the whole point of
+    charging it -- a caller-supplied cost would be a budget the operator wrote
+    for themselves.
+    """
+    if asked is None:
+        return None, None
+    method, tokens, head_id = asked
+
+    # An externally-published head. The target's config says nothing about it
+    # -- that is what makes it external -- so the option is built from the
+    # head's OWN resolution, and the method comes from the class it declares
+    # rather than from what the caller typed beside it.
+    if head_id:
+        spec_detect = _speculative_detect()
+        if spec_detect is None:
+            raise ValueError(
+                "this build cannot describe a speculative head, so it will "
+                "not budget one"
+            )
+        if resolve_head is None:
+            raise ValueError(
+                "a speculative head has to be resolved before it can be "
+                "budgeted, and this gateway has no resolver that can do it"
+            )
+        if head_id == resolution.shape.model_id:
+            raise ValueError(
+                f"{head_id} is the model being served; a draft head is a "
+                f"separate, smaller repository trained to predict for it"
+            )
+        try:
+            head = resolve_head(head_id)
+        except Exception as exc:
+            raise ValueError(
+                f"could not resolve the speculative head {head_id}: {exc}"
+            ) from exc
+        option = spec_detect.head_option(
+            head, resolution.shape, image_speculators=image_speculators,
+            # What the TARGET is, so a head that declares a different one is
+            # refused. Absent on an older resolution, which degrades to the
+            # geometry-only gates rather than refusing anything.
+            target_model_type=getattr(resolution, "model_type", "") or "",
+        )
+        if not option.launchable:
+            raise ValueError(option.note)
+        if tokens > option.max_tokens:
+            raise ValueError(
+                f"{option.method.value} with {head_id} drafts at most "
+                f"{option.max_tokens} token"
+                f"{'s' if option.max_tokens != 1 else ''} per step, not {tokens}"
+            )
+        return (
+            SpeculativeSpec(
+                method=option.method,
+                num_speculative_tokens=tokens,
+                draft_bytes=int(option.draft_bytes or 0),
+                draft_params=int(option.draft_params or 0),
+                model=head_id,
+                draft_kv_ratio=float(getattr(option, "draft_kv_ratio", 0.0) or 0.0),
+            ),
+            option,
+        )
+
+    options = list(getattr(resolution, "speculators", ()) or ())
+    if not options:
+        raise ValueError(
+            f"{_SPECULATIVE_PARAM} was requested but this build has not "
+            f"determined which speculative methods {resolution.shape.model_id} "
+            f"supports; re-resolve the model and try again"
+        )
+    offered = {opt.method.value: opt for opt in options}
+    option = offered.get(method)
+    if option is None:
+        raise ValueError(
+            f"{resolution.shape.model_id} does not offer speculative method "
+            f"{method!r}. It offers: {', '.join(sorted(offered))}."
+        )
+    if not option.launchable:
+        # `note` is the resolver's own sentence and says why. Shown whole
+        # rather than summarised, on the same terms as every other refusal
+        # string in this project.
+        raise ValueError(
+            f"{method} cannot be launched on {resolution.shape.model_id}: "
+            f"{option.note}"
+        )
+    if tokens > option.max_tokens:
+        raise ValueError(
+            f"{method} on {resolution.shape.model_id} drafts at most "
+            f"{option.max_tokens} token"
+            f"{'s' if option.max_tokens != 1 else ''} per step, not {tokens}"
+        )
+    # No second value: a built-in method's option is already on
+    # `speculative_options`. A head's cannot be -- nothing knew it existed
+    # until the request named it -- which is why the head branch returns one.
+    return (
+        SpeculativeSpec(
+            method=SpeculativeMethod(method),
+            num_speculative_tokens=tokens,
+            draft_bytes=int(option.draft_bytes or 0),
+            draft_params=int(option.draft_params or 0),
+        ),
+        None,
+    )
+
+
 def _legal_degrees(shape, node_count: int) -> dict[str, list[int]]:
     """What each axis could legally have been, so a refusal is actionable."""
     return {
@@ -238,6 +426,18 @@ def _rejection_for(recommended, plan) -> str | None:
     return next((r for r in recommended.rejected if r.startswith(prefix)), None)
 
 
+def _default_vllm_image() -> str:
+    """The image a tuning record is keyed by, from the one place that owns it.
+
+    `deploy/flags.py` holds the runtime specs, so the default lives there and
+    not in a second string here -- a copy would drift and a record keyed by the
+    drifted one would miss for ever while looking calibrated.
+    """
+    from control_plane.deploy.flags import runtime_spec
+
+    return runtime_spec("vllm").default_image
+
+
 def _rank_plans(
     planner,
     shape,
@@ -249,6 +449,7 @@ def _rank_plans(
     context_length,
     kv_dtype,
     allow_mixed_hardware,
+    speculative_window=1,
 ):
     """The ranked plans, best first, from whichever surface this planner has.
 
@@ -258,17 +459,37 @@ def _rank_plans(
     works; it just cannot say what it ranked second.
     """
     kwargs = {"context_length": context_length, "kv_dtype": kv_dtype}
+    # Spread only when it would change an answer, on the same terms the launch
+    # path spreads `speculative`: absence is the contract for "one token per
+    # step", which is what every plan meant before the planner had heard of a
+    # draft window. A port that predates the field therefore keeps working
+    # untouched for every ordinary plan, and only a speculative request can
+    # meet one that cannot take it -- where it degrades rather than 500s.
+    if speculative_window > 1:
+        kwargs["speculative_window"] = speculative_window
     alternatives = getattr(planner, "alternatives", None)
     if callable(alternatives):
-        return alternatives(
-            shape,
-            nodes,
-            link,
-            target,
-            concurrency,
-            allow_mixed_hardware=allow_mixed_hardware,
-            **kwargs,
-        )
+        try:
+            return alternatives(
+                shape,
+                nodes,
+                link,
+                target,
+                concurrency,
+                allow_mixed_hardware=allow_mixed_hardware,
+                **kwargs,
+            )
+        except TypeError:
+            kwargs.pop("speculative_window", None)
+            return alternatives(
+                shape,
+                nodes,
+                link,
+                target,
+                concurrency,
+                allow_mixed_hardware=allow_mixed_hardware,
+                **kwargs,
+            )
     try:
         return [planner.plan(shape, nodes, link, target, concurrency, **kwargs)]
     except TypeError:
@@ -276,7 +497,39 @@ def _rank_plans(
         return [planner.plan(shape, nodes, link, target, concurrency)]
 
 
-def _select_nodes(registry, nodes, requested, warnings: list[str]):
+def _placement_refusal(registry, runtime: str, node_id: str, profile) -> str | None:
+    """`flags.placement_refusal`, with the live reading fetched for it.
+
+    Lazily imported for exactly the reason `_sharding_refusal` below is: this
+    module is the gateway's and `control_plane.deploy` is not always installed
+    behind it.
+
+    The live budget is read through the registry rather than passed in, because
+    only a host-pool runtime needs it and fetching it for every placement on
+    every plan request would put a telemetry read on a path that answers on
+    every keystroke in the Serve panel.
+    """
+    try:
+        from control_plane.deploy.flags import RUNTIMES, placement_refusal
+    except Exception:  # pragma: no cover - deploy not installed
+        return (
+            None
+            if profile.addressable_memory > 0
+            else f"The machine '{node_id}' reports no addressable GPU memory, "
+            f"so nothing can be placed on it."
+        )
+    spec = RUNTIMES.get(runtime)
+    live = None
+    if spec is not None and spec.memory_pool == "host":
+        try:
+            live = registry.allocatable_or_none(node_id)
+        except Exception:
+            log.exception("live memory lookup failed for %s while planning", node_id)
+            live = None
+    return placement_refusal(runtime, node_id, profile.addressable_memory, live)
+
+
+def _select_nodes(registry, nodes, requested, warnings: list[str], runtime: str = "vllm"):
     """The named machines, in the order named, or a refusal saying why not.
 
     Three cases, told apart with `registry.get_node` so the reason is the real
@@ -323,17 +576,21 @@ def _select_nodes(registry, nodes, requested, warnings: list[str]):
                 param=_PLACEMENT_PARAM,
                 extra={"unhealthy_node_ids": [node_id]},
             )
-        # A machine that reports no GPU memory cannot carry a rank. The fit
-        # gate already drops these from the live budget so they cannot become
-        # the argmin (`livefit.drop_zero_addressable`); naming one explicitly
-        # deserves the same answer said out loud, rather than a plan built
-        # around a machine that can hold nothing.
-        if profile.addressable_memory <= 0:
+        # Whether this RUNTIME can be placed on this MACHINE, which is two
+        # questions where it used to be one. The fit gate already drops a node
+        # with nothing to spend from the live budget so it cannot become the
+        # argmin (`livefit.drop_unbudgetable`); naming one explicitly deserves
+        # the same answer said out loud, rather than a plan built around a
+        # machine that can hold nothing.
+        #
+        # `flags.placement_refusal` owns the rule -- see its docstring for why
+        # a CPU runtime refuses on a missing live reading where every other
+        # path in this project degrades to a static one.
+        refusal = _placement_refusal(registry, runtime, node_id, profile)
+        if refusal is not None:
             raise _PlacementRefused(
                 400,
-                f"The machine '{node_id}' reports no addressable GPU memory, "
-                f"so nothing can be placed on it. It can still be a cluster "
-                f"member; it cannot be a serving node.",
+                refusal,
                 "node_has_no_memory",
                 param=_PLACEMENT_PARAM,
                 extra={"unusable_node_ids": [node_id]},
@@ -384,12 +641,54 @@ def _check_every_node_used(plan, nodes, requested_nodes, requested_degrees) -> N
     )
 
 
+def _launcher_version(deployments) -> str | None:
+    """The installed sparkrun's version, or None when it cannot be asked.
+
+    Through whatever the manager is actually holding rather than a fresh
+    adapter, so a test double or a `DERATE_SPARKRUN_BIN` override is the thing
+    reported. Every step degrades to None: a stub manager has no adapter, and
+    `version()` shells out, which can time out.
+    """
+    adapter = getattr(deployments, "adapter", None)
+    version = getattr(adapter, "version", None)
+    if not callable(version):
+        return None
+    try:
+        return version()
+    except Exception:
+        return None
+
+
+def _data_parallel_refusal(
+    tensor_parallel: int,
+    pipeline_parallel: int,
+    data_parallel: int = 1,
+    launcher_version: str | None = None,
+):
+    """Why a pure data-parallel plan cannot be launched, or None.
+
+    Its own wrapper rather than a branch of ``_sharding_refusal`` because the
+    two answer different questions and so must carry different error codes:
+    `runtime_cannot_shard` is about the runtime, and this one is about the
+    launcher, on a runtime that shards perfectly well. Lazily imported for the
+    reason the one below is.
+    """
+    try:
+        from control_plane.deploy.flags import data_parallel_refusal
+    except Exception:
+        return None
+    return data_parallel_refusal(
+        tensor_parallel, pipeline_parallel, data_parallel, launcher_version
+    )
+
+
 def _sharding_refusal(
     runtime: str,
     tensor_parallel: int,
     pipeline_parallel: int,
     expert_parallel: int = 1,
     data_parallel: int = 1,
+    launcher_version: str | None = None,
 ):
     """Why this runtime cannot run these degrees, or None.
 
@@ -410,7 +709,182 @@ def _sharding_refusal(
             pipeline_parallel,
             expert_parallel,
             data_parallel,
+            launcher_version,
         )
+    except ValueError:
+        return None
+
+
+def _image_speculators() -> frozenset[str] | None:
+    """Which speculator classes the runtime image registers, or None.
+
+    None means the image could not be asked -- no docker, no image, a probe
+    that timed out -- and it must never be read as "this image supports none".
+    The head check treats None as "no opinion" for exactly the reason
+    `imageprobe.py` degrades rather than raising: the better answer is used
+    when it is there, and its absence is not a refusal.
+    """
+    try:
+        from control_plane.resolver import support
+    except Exception:
+        return None
+    # The same recorded probe `architectures_for` reads, so the speculator
+    # answer and the servable answer always come from one container start and
+    # one image. `probed()` is None until the resolver's background probe
+    # lands, and on a coordinator with no docker it stays None forever.
+    found = support.probed("vllm")
+    specs = getattr(found, "speculators", None) if found is not None else None
+    return frozenset(specs) if specs else None
+
+
+def _attach_measurements(options: list[dict], model_id: str, nodes: list) -> list[dict]:
+    """Add any measured record that is about THIS model on THESE machines.
+
+    A record is a fact about one workload on one GPU under one image
+    (`control_plane/measurements.py` says why each of those is part of the key),
+    so the criteria are read off the plan's own nodes rather than off the
+    coordinator's. A sweep taken on a GB10 must not be cited for a launch the
+    planner just placed on something else.
+
+    Every matching workload is attached, not the best one. Which to believe is
+    the reader's call -- acceptance on code that mostly copies its input is a
+    different number from acceptance on prose, and picking one here would be
+    picking the flattering one.
+
+    Failure is silence. A missing record, an unreadable estate and a
+    coordinator with no measurements at all are the same thing to the screen:
+    the range is still stated, and it is still true.
+    """
+    if not options:
+        return options
+    try:
+        from control_plane import measurements
+    except Exception:
+        return options
+
+    gpu = bandwidth = None
+    for node in nodes:
+        if getattr(node, "memory_bandwidth_gbps", 0):
+            gpu = getattr(node, "gpu_name", None)
+            bandwidth = node.memory_bandwidth_gbps
+            break
+    version = None
+    try:
+        from control_plane.resolver import support
+
+        probed = support.probed("vllm")
+        version = getattr(probed, "version", None) if probed else None
+    except Exception:
+        version = None
+
+    out: list[dict] = []
+    for option in options:
+        try:
+            found = measurements.matching(
+                model_id, option.get("method", ""), gpu_name=gpu,
+                memory_bandwidth_gbps=bandwidth, runtime_version=version,
+            )
+        except Exception:
+            log.exception("reading speculative measurements failed")
+            found = []
+        out.append({
+            **option,
+            "measured": [serialize.measurement(r) for r in found],
+        })
+    return out
+
+
+def _measured_decode(model_id: str, nodes: list, context_length: int) -> dict | None:
+    """The measured decode rate for THIS model on THESE machines, or None.
+
+    The same argument as :func:`_attach_measurements`, applied to the ordinary
+    decode rate rather than the speculative one: a record is a fact about one
+    model on one GPU under one image, so the criteria come off the plan's own
+    nodes and a mismatch on any of them misses rather than approximating.
+
+    Cited BESIDE the predicted range and never in place of it. The range is
+    still what is true for a context nobody has run; this says what one machine
+    actually did, and on the box this was written for the two disagreed by 2x --
+    which is the whole reason the range now has two ends.
+
+    Context matters here in a way it does not for acceptance: decode reads the
+    cache for the tokens actually present, so a rate measured at 300 tokens is
+    not the rate at 8192. The band is matched on, and `matching_decode` orders
+    nearest-first rather than excluding, so a neighbouring band is offered
+    rather than nothing at all.
+
+    Failure is silence, on the same terms as the speculative path.
+    """
+    try:
+        from control_plane import measurements
+    except Exception:
+        return None
+
+    gpu = bandwidth = None
+    for node in nodes:
+        if getattr(node, "memory_bandwidth_gbps", 0):
+            gpu = getattr(node, "gpu_name", None)
+            bandwidth = node.memory_bandwidth_gbps
+            break
+    if gpu is None:
+        return None
+    try:
+        found = measurements.matching_decode(
+            model_id,
+            gpu_name=gpu,
+            memory_bandwidth_gbps=bandwidth,
+            context_band=measurements.band(context_length),
+        )
+    except Exception:
+        log.exception("reading decode measurements failed")
+        return None
+    if not found:
+        return None
+    best = found[0]
+    return {
+        "decode_tps": best.decode_tps,
+        "context_band": best.context_band,
+        "concurrency_band": best.concurrency_band,
+        "requests": best.requests,
+        "measured_at": best.measured_at,
+        # What the gate said when this was taken, so a reader can see the
+        # disagreement rather than having to recompute it against a prediction
+        # that may since have moved.
+        "predicted_tps": best.predicted_tps,
+    }
+
+
+def _speculative_detect():
+    """`resolver.speculators`, imported lazily like every other heavy import here.
+
+    Returns a module or None. None means external heads cannot be priced, which
+    is a refusal on that path and nothing at all on every other one.
+    """
+    try:
+        from control_plane.resolver import speculators
+
+        return speculators
+    except Exception:
+        return None
+
+
+def speculative_refusal(runtime: str, method: str) -> str | None:
+    """Why this runtime cannot be told to speculate, or None.
+
+    Lazily imported for exactly the reason ``_sharding_refusal`` above is, and
+    it degrades the same way -- but NOT on the same terms in one respect worth
+    stating: a missing ``control_plane.deploy`` here means no refusal, and a
+    request that then launches decodes one token per step while the screen
+    beside it says otherwise. That is only reachable on a gateway with no
+    deployment package at all, which cannot launch anything, so there is no
+    launch left to mislead.
+    """
+    try:
+        from control_plane.deploy.flags import speculative_refusal as refusal
+    except Exception:
+        return None
+    try:
+        return refusal(runtime, method)
     except ValueError:
         return None
 
@@ -778,13 +1252,23 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     # a context picked before the placement is a number, not a fit.
     raw_context = payload.get("context")
     context_length = int(raw_context) if raw_context else None
-    concurrency = int(payload.get("concurrency") or 1)
+    # Absent is not 1, for the same reason absent is not 8192 above. Until
+    # 2026-09-11 this line read `int(payload.get("concurrency") or 1)`, three
+    # lines under a comment explaining why that is the wrong shape of answer --
+    # so every deployment on this cluster launched `--max-num-seqs 1` and each
+    # decode step's weight read produced one token. Resolved below, once the
+    # plan and the machines it lands on are known.
+    raw_concurrency = payload.get("concurrency")
+    concurrency = int(raw_concurrency) if raw_concurrency else None
     target = payload.get("target") or "throughput"
     kv_dtype = payload.get("kv_dtype") or ctx.settings.default_kv_dtype
     dtype = payload.get("dtype")
     runtime = payload.get("runtime") or "vllm"
     requested_nodes = _parse_node_ids(payload)
     requested_degrees = _parse_degrees(payload)
+    # Parsed here (shape only) and priced below, once the resolution that knows
+    # what the draft weighs exists.
+    requested_speculative = _parse_speculative(payload)
 
     # Prefer resolve_full when the port exposes it: it carries warnings
     # worth showing and, on mixed-precision repos, real measured weight
@@ -807,6 +1291,43 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         if callable(resolve_full)
         else None
     )
+
+    # What this checkpoint could be served with, and what the operator asked
+    # for out of that set. Both need the resolution: the options are read off
+    # it, and the price of the one chosen comes from it rather than from the
+    # request. A port with no `resolve_full` offers nothing, which is honest --
+    # it never told us what the model declares.
+    speculative_options = [
+        opt.as_dict() for opt in getattr(resolution, "speculators", ()) or ()
+    ] if callable(resolve_full) else []
+    speculative, head_option = (
+        await asyncio.to_thread(
+            _speculative_spec,
+            resolution,
+            requested_speculative,
+            # A head is a repository, so pricing one costs a hub resolution --
+            # hence the worker thread, and hence passing the resolver in rather
+            # than reaching for it: this function is handed ports, not globals.
+            resolve_head=resolve_full,
+            image_speculators=_image_speculators(),
+        )
+        if callable(resolve_full)
+        else (None, None)
+    )
+    # A named head joins the offered list, so the screen can name what it found
+    # -- the class, the measured size, the target width it matches -- instead of
+    # showing generic copy beside a head it has already priced.
+    if head_option is not None:
+        speculative_options = speculative_options + [head_option.as_dict()]
+    if requested_speculative is not None and not callable(resolve_full):
+        raise ValueError(
+            "speculative decoding needs a resolver that reports what a "
+            "checkpoint declares, and this one does not"
+        )
+    if speculative is not None:
+        refusal = speculative_refusal(runtime, speculative.method.value)
+        if refusal is not None:
+            raise ValueError(refusal)
 
     # Same question `create_deployment` asks before it will launch --
     # asked here too so a dry run cannot say "fits, click Serve" about an
@@ -833,7 +1354,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     placement_warnings: list[str] = []
     if requested_nodes is not None:
         nodes = _select_nodes(
-            ctx.deps.registry, nodes, requested_nodes, placement_warnings
+            ctx.deps.registry, nodes, requested_nodes, placement_warnings, runtime
         )
 
     link = None
@@ -857,10 +1378,23 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
             nodes,
             link,
             target,
-            concurrency,
+            # Provisional when the caller named none: the real figure is
+            # derived below, against the plan this call produces. The order
+            # cannot be the other way round -- `concurrency_for` needs a plan
+            # and a set of machines to ask its question of.
+            concurrency or 1,
             context_length=context_length,
             kv_dtype=kv_dtype,
             allow_mixed_hardware=pool,
+            # k+1 positions go through the model per step, not one, and every
+            # byte of them crosses the wire. The fit gate has charged them
+            # since speculation landed; the planner costed every plan as if a
+            # single token crossed until 2026-09-11.
+            speculative_window=(
+                getattr(speculative, "num_speculative_tokens", 0) + 1
+                if speculative is not None
+                else 1
+            ),
         )
     )
     recommended = ranked[0]
@@ -889,7 +1423,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
                     nodes,
                     link,
                     target,
-                    concurrency,
+                    concurrency or 1,
                     context_length=context_length,
                     kv_dtype=kv_dtype,
                     **requested_degrees,
@@ -927,10 +1461,41 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     budgets, excluded, live_reason = livefit.allocatable_map(
         ctx.deps.registry, [n.node_id for n in plan_nodes]
     )
-    budgets, zero_excluded = livefit.drop_zero_addressable(plan_nodes, budgets)
+    budgets, zero_excluded = livefit.drop_unbudgetable(plan_nodes, budgets)
     excluded = excluded + zero_excluded
     if not budgets and live_reason is None:
         live_reason = "every node was excluded from the live memory budget"
+
+    # Derived here, and in this order, for the reason `context_length` is:
+    # the question is "how many sequences will this plan hold on these
+    # machines right now", and neither the plan nor the live budget existed
+    # further up. Derived AFTER the plan rather than before it on purpose --
+    # asking the planner for a node count at a concurrency nobody has agreed
+    # to yet would demand machines to serve a batch that was never requested,
+    # and could refuse a launch that fits. This way the batch is whatever the
+    # chosen plan has room for.
+    if concurrency is None:
+        concurrency = await asyncio.to_thread(
+            partial(
+                concurrency_for,
+                ctx.deps.fit,
+                shape,
+                plan,
+                plan_nodes,
+                kv_dtype=kv_dtype,
+                # A latency-targeted request is asking for the single-stream
+                # regime, and the planner already has a constant that says
+                # where that stops. Deriving 16 for it would hand back a plan
+                # chosen for batch 1.
+                ceiling=(
+                    LATENCY_CONCURRENCY_CEILING
+                    if target == "latency"
+                    else MAX_DERIVED_CONCURRENCY
+                ),
+                weight_bytes=weight_bytes,
+                allocatable=budgets or None,
+            )
+        )
 
     if context_length is None:
         context_length = await asyncio.to_thread(
@@ -945,6 +1510,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
                 weight_bytes=weight_bytes,
                 allocatable=budgets or None,
                 native_window=native_window,
+                speculative=speculative,
             )
         )
 
@@ -956,6 +1522,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         plan=plan,
         weight_bytes=weight_bytes,
         native_window=native_window,
+        speculative=speculative,
     )
 
     fit, fit_live, unavailable = await asyncio.to_thread(
@@ -1020,9 +1587,18 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         "rejection": _rejection_for(recommended, plan),
     }
 
+    # Decorated here and not where the options were built: a measurement is a
+    # fact about particular hardware, and which machines this plan lands on is
+    # not known until the planner has placed it. `head_option` is already in
+    # the list by now, so a named external head is cited on the same terms.
+    speculative_options = _attach_measurements(
+        speculative_options, shape.model_id, plan_nodes
+    )
+
     return _PlanOutcome(
         shape=shape,
         plan=plan,
+        measured_decode=_measured_decode(shape.model_id, plan_nodes, context_length),
         fit=fit,
         fit_live=fit_live,
         capacity=capacity,
@@ -1035,6 +1611,10 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         degrees=degrees,
         recommended=recommended,
         alternatives=[serialize.plan_degrees_payload(p) for p in ranked],
+        speculative_options=speculative_options,
+        speculative=speculative,
+        kv_dtype=kv_dtype,
+        quantization=dtype,
     )
 
 
@@ -1078,7 +1658,25 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     def _links_for(node_ids: list[str]):
         """Every pair, measured or not. Never emit a bandwidth figure that was
         not measured: an unmeasured pair carries measured=false and no numbers.
+
+        Also carries the NCCL tuning for the pair, and whether a probe is in
+        flight. The second is what `LinkService.measuring()` has existed for
+        since it was written -- `links/README.md`: "so the screen can say a
+        measurement is running" -- and nothing has ever read it. That was
+        survivable while a probe took thirty seconds. A calibration is one
+        two-rank collective per candidate setting, so it is minutes, and an
+        action that long with no sign of life reads as a button that did
+        nothing.
         """
+        try:
+            inflight = {tuple(sorted(p)) for p in ctx.deps.links.measuring()}
+        except Exception:
+            # A port without the method is a port that cannot say, which is
+            # not the same as "nothing is running" -- but it is the only
+            # answer available, and refusing to serve the link list over it
+            # would be worse.
+            inflight = set()
+        image = os.environ.get("DERATE_VLLM_IMAGE") or _default_vllm_image()
         out = []
         for i, a in enumerate(node_ids):
             for b in node_ids[i + 1 :]:
@@ -1087,13 +1685,23 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 except Exception:
                     log.exception("link lookup failed for %s/%s", a, b)
                     link = None
+                # Same for every pair, measured or not: a link nobody has
+                # probed can still have been calibrated, and one that is being
+                # worked on right now has to say so.
+                extra = {
+                    "measuring": tuple(sorted((a, b))) in inflight,
+                    "tuning": serialize.link_tuning(a, b, image=image),
+                }
                 if link is None:
-                    out.append({"src": a, "dst": b, "measured": False, "stale": False})
+                    out.append(
+                        {"src": a, "dst": b, "measured": False, "stale": False, **extra}
+                    )
                     continue
                 payload = serialize.link_payload(link)
                 payload["measured"] = True
                 payload["stale"] = (time.time() - link.measured_at) > STALE_LINK_AGE_S
                 payload["medium"] = _medium(link.method)
+                payload.update(extra)
                 out.append(payload)
         return out
 
@@ -1378,6 +1986,59 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         payload, error = await _agent_processes(node_id)
         return error if error is not None else JSONResponse(payload)
 
+    @router.get("/api/nodes/{node_id}/logs")
+    async def node_logs(node_id: str, which: str = "node", tail: int = 500) -> Response:
+        """This node's own ``node.log``/``proxy.log`` -- the control plane's
+        process log, written by ``logfiles.py``.
+
+        Distinct from ``/api/deployments/{id}/logs`` (a served model's own
+        stdout) and ``/api/history/logs`` (the structured, queryable
+        archive): this is the plain-text file an operator would otherwise
+        need a shell on the machine to read.
+        """
+        if which not in ("node", "proxy"):
+            return errors.error_response(
+                400,
+                "which must be 'node' or 'proxy'.",
+                "invalid_request_error",
+                "invalid_which",
+            )
+        agent_url = None
+        lookup = getattr(ctx.deps.registry, "agent_url", None)
+        if callable(lookup):
+            try:
+                agent_url = lookup(node_id)
+            except Exception:
+                log.exception("agent url lookup failed")
+        if not agent_url:
+            return errors.error_response(
+                404,
+                f"No agent URL for node '{node_id}'; its log files cannot be read.",
+                "invalid_request_error",
+                "node_agent_unreachable",
+            )
+        import httpx
+
+        limit = max(1, min(int(tail), 5000))
+        try:
+            async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/logs",
+                    params={"which": which, "tail": limit},
+                )
+                res.raise_for_status()
+                payload = res.json()
+        except Exception as exc:
+            log.warning("log read failed for %s: %s", node_id, exc)
+            return errors.error_response(
+                502,
+                f"The node agent on '{node_id}' did not answer: "
+                f"{errors.detail(exc, _redactor())}",
+                "server_error",
+                "node_agent_unreachable",
+            )
+        return JSONResponse(payload)
+
     @router.delete("/api/nodes/{node_id}/processes/{pid}")
     async def kill_node_process(node_id: str, pid: int) -> Response:
         payload, error = await _agent_processes(node_id)
@@ -1576,6 +2237,57 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.get("/api/links")
     async def list_links() -> JSONResponse:
         return JSONResponse(_links_for([n.profile.node_id for n in _nodes()]))
+
+    @router.post("/api/links/tune")
+    async def tune_link(request: Request) -> Response:
+        """Start a calibration for a pair. Returns before it finishes.
+
+        Unlike `/api/links/measure`, which blocks for the thirty seconds a
+        probe takes, this cannot: a calibration runs one two-rank collective
+        per candidate setting and takes minutes. Holding a request open that
+        long would tie up a worker, time out in any proxy in front of this, and
+        tell the caller nothing while it waited.
+
+        So it returns `202` with `measuring: true` and the work continues on a
+        thread. The caller watches the `measuring` field on `/api/links`, which
+        the cluster screen already polls -- which also means the state survives
+        a page reload and is the same for two people looking at once, neither
+        of which a local spinner manages.
+        """
+        try:
+            payload = await request.json()
+            a, b = payload["a"], payload["b"]
+        except Exception:
+            return errors.error_response(
+                400, "Body must be {\"a\": node_id, \"b\": node_id}.",
+                "invalid_request_error", "invalid_request",
+            )
+        if a == b:
+            return errors.error_response(
+                400, "A link needs two distinct nodes.",
+                "invalid_request_error", "invalid_request",
+            )
+        calibrate = getattr(ctx.deps.links, "calibrate", None)
+        if not callable(calibrate):
+            # A link port without calibration is a legal port -- the day-0 stub
+            # is one. Say so rather than 500ing on a missing attribute.
+            return errors.error_response(
+                501, "This link service cannot calibrate.",
+                "invalid_request_error", "not_supported",
+            )
+
+        image = os.environ.get("DERATE_VLLM_IMAGE") or _default_vllm_image()
+
+        def _run() -> None:
+            try:
+                calibrate(a, b, image=image)
+            except Exception:
+                log.exception("calibration of %s/%s failed", a, b)
+
+        threading.Thread(
+            target=_run, name=f"derate-calibrate-{a}-{b}", daemon=True
+        ).start()
+        return JSONResponse({"a": a, "b": b, "measuring": True}, status_code=202)
 
     @router.post("/api/links/measure")
     async def measure_link(request: Request) -> Response:
@@ -2314,11 +3026,32 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         the lab LAN pointed at a coordinator that does have it -- and so no
         provider domain is handed to a third party.
 
-        A 404 is an ordinary answer here, not a fault: the Cluster tab draws a
-        monogram tile underneath and the miss is simply never painted over. So
-        a cold cache answers 404 immediately and starts the fetch behind it
+        **Two different answers, and they are different status codes.** A
+        provider this coordinator has never heard of is a 404 -- that is a
+        request about something that does not exist. A provider that exists
+        and simply has no mark to paint is a **204**: the question was
+        answered, and the answer is "nothing to draw".
+
+        It used to be 404 for both, on the reasoning that "a 404 is an
+        ordinary answer here, not a fault". That reasoning is right about the
+        product and wrong about the code: the Cluster tab does draw a monogram
+        underneath and never paints over it, but a same-origin request the UI
+        makes and the coordinator refuses is indistinguishable, to anything
+        watching, from a route that is broken. `screens.check.mjs` gates on
+        exactly that -- "the coordinator answered everything it was asked" --
+        and it had been failing on an adopted ollama box, which has no vendor
+        mark and never will.
+
+        The batch route below (`/api/publishers/avatars`) had already reached
+        the better shape for the same problem, and says so: `null` means "no
+        mark, stop asking". This is that answer in one status code.
+
+        A cold cache still answers immediately and starts the fetch behind it
         rather than holding the response open; the next render gets the mark.
-        Nothing on this path is ever allowed to make a screen wait.
+        Nothing on this path is ever allowed to make a screen wait -- which is
+        why "no mark yet" and "no mark ever" share the 204. The route could
+        not tell them apart when both were 404 either, and the UI's retry is
+        the next page load in both cases.
         """
         try:
             providers = ctx.deps.providers.list()
@@ -2344,10 +3077,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         if not cache.is_fresh_miss(provider_id):
             asyncio.create_task(_warm_logo(cache, provider))
-        return errors.error_response(
-            404, f"No logo for '{provider_id}'.",
-            "invalid_request_error", "logo_not_found",
-        )
+        # 204, not 404: the provider is real and the question was answerable.
+        # An empty body fails an <image> decode exactly as a 404 did, so the
+        # monogram underneath still shows and the UI path is unchanged.
+        return Response(status_code=204)
 
     @router.get("/api/publishers/avatars")
     async def publisher_avatars(request: Request) -> Response:
@@ -2516,6 +3249,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "shape": serialize.shape_payload(out.shape),
                 "plan": serialize.plan_payload(out.plan),
                 "fit": serialize.fit_payload(out.fit) if out.fit else None,
+                # Beside the range, never instead of it. See _measured_decode.
+                "measured_decode": out.measured_decode,
                 # The live verdict, budgeted against what the nodes can
                 # actually hand out right now. None when nothing could read
                 # them -- never a fabricated stand-in for the static answer.
@@ -2546,6 +3281,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     else None
                 ),
                 "alternatives": out.alternatives,
+                # What this checkpoint could speculate with, and what this
+                # verdict was taken with. Both, for the same reason `context`
+                # and `concurrency` are both echoed: the options say what the
+                # control may offer, and the echo says what the numbers beside
+                # it were actually computed under.
+                "speculative_options": out.speculative_options,
+                "speculative": serialize.speculative_payload(out.speculative),
             }
         )
 
@@ -2613,28 +3355,27 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         model_id = payload.get("model_id") if isinstance(payload, dict) else None
 
-        # A dtype sizes; it does not launch. `_plan_and_fit` passes it to the
-        # resolver as a quantization override, which changes bytes-per-param in
-        # the fit arithmetic and nothing else: neither serve command template in
-        # deploy/flags.py carries --quantization, and the only model identifier
-        # either one interpolates is {model}, filled from shape.model_id
-        # (deploy/recipes.py). Honouring a dtype here would budget for 4-bit
-        # weights and then start the repo's real 16-bit ones -- the precise
-        # out-of-memory kill the fit gate exists to refuse. /api/plan still
-        # takes it, because "what would this cost at q4_k_m" is a fair question
-        # to ask while nothing is being started.
-        if isinstance(payload, dict) and payload.get("dtype"):
-            return errors.error_response(
-                400,
-                "A dtype cannot be launched. It changes only the sizing "
-                "arithmetic: neither serve command template carries "
-                "--quantization, so the runtime would load this repository's "
-                "own weights at their real precision while the fit check "
-                "budgeted for something smaller. A quantization variant is a "
-                "different repository -- pass that repository's id as model_id.",
-                "invalid_request_error",
-                "dtype_not_launchable",
-            )
+        # A dtype used to be refused here outright, and the reason given was
+        # that neither serve command template carried --quantization -- so
+        # honouring one would budget for 4-bit weights and then start the
+        # repository's real 16-bit ones, the precise out-of-memory kill this
+        # gate exists to refuse.
+        #
+        # That premise stopped being true on 2026-09-11: both templates carry
+        # `quantization_arg` now, `flags.render_quantization` maps a derate
+        # scheme onto a name read off the pinned image's OWN registry, and
+        # `flags.quantization_refusal` refuses a runtime that cannot be told
+        # -- rather than dropping the flag, which is what made the blanket
+        # refusal the right answer before.
+        #
+        # What survives is the half that was always load-bearing: a scheme
+        # this build cannot actually request is still refused, and refused
+        # BEFORE a resolve and a planner search are spent on it. That check is
+        # `render_quantization` below, which raises by name for every GGUF
+        # scheme (llama.cpp's format, not launchable here at all), for nf4
+        # (needs a bitsandbytes loader this image does not carry) and for
+        # int8. Its message says to pass the variant repository's own id
+        # instead, which is still the right move for those.
 
         # Free-text CLI tokens, for a model the standard recipe doesn't cover.
         # Read here, not inside _plan_and_fit: unlike dtype these never touch
@@ -2669,12 +3410,104 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "invalid_request",
                 )
 
+        served_name = payload.get("served_name") if isinstance(payload, dict) else None
+        if served_name is not None and (
+            not isinstance(served_name, str) or not served_name.strip()
+        ):
+            return errors.error_response(
+                400,
+                "served_name must be the name clients will pass as \"model\", "
+                "or be omitted to derive one from the model id.",
+                "invalid_request_error",
+                "invalid_request",
+            )
+        served_name = served_name.strip() if served_name else None
+
         extra_args = _parse_cli_tokens("extra_args")
         if isinstance(extra_args, Response):
             return extra_args
         custom_command = _parse_cli_tokens("custom_command")
         if isinstance(custom_command, Response):
             return custom_command
+
+        # A launch-only choice, like extra_args/custom_command above: it
+        # changes startup time and decode-graph behavior, not memory sizing,
+        # so it is read here rather than inside _plan_and_fit and never
+        # reaches the fit gate.
+        enforce_eager = payload.get("enforce_eager") if isinstance(payload, dict) else None
+        if enforce_eager is not None and not isinstance(enforce_eager, bool):
+            return errors.error_response(
+                400,
+                "enforce_eager must be a boolean.",
+                "invalid_request_error",
+                "invalid_request",
+            )
+        enforce_eager = bool(enforce_eager)
+
+        # Local, like `sharding_refusal` and `speculative_refusal` above:
+        # the gateway does not import deploy internals at module scope.
+        from control_plane.deploy.flags import (
+            render_kv_cache_dtype,
+            render_quantization,
+        )
+
+        # Unlike the two above, this one IS a fit-gate input -- `_plan_and_fit`
+        # reads it and sizes the cache with it. Validated here anyway, before
+        # a resolve and a planner search are spent on a width the launch will
+        # have to refuse. Only a dtype the caller NAMED is checked: the
+        # settings default is resolved in `_plan_and_fit` and nowhere else, so
+        # there is no second copy of it here to drift.
+        raw_kv_dtype = payload.get("kv_dtype") if isinstance(payload, dict) else None
+        if raw_kv_dtype is not None:
+            if not isinstance(raw_kv_dtype, str):
+                return errors.error_response(
+                    400,
+                    "kv_dtype must be a string naming a KV cache element width.",
+                    "invalid_request_error",
+                    "invalid_request",
+                )
+            try:
+                render_kv_cache_dtype(raw_kv_dtype)
+            except ValueError as exc:
+                return errors.error_response(
+                    400, str(exc), "invalid_request_error", "invalid_request"
+                )
+
+        # A FIT-GATE input, like kv_dtype above and heavier: `_plan_and_fit`
+        # passes it to the resolver as a dtype override, so every weight
+        # figure in the verdict the caller is about to be shown is computed at
+        # this scheme. Validated here so a scheme this build cannot request
+        # fails before a resolve and a planner search are spent on it.
+        raw_quantization = payload.get("dtype") if isinstance(payload, dict) else None
+        if raw_quantization is not None:
+            if not isinstance(raw_quantization, str):
+                return errors.error_response(
+                    400,
+                    "dtype must be a string naming a weight quantization scheme.",
+                    "invalid_request_error",
+                    "invalid_request",
+                )
+            try:
+                render_quantization(raw_quantization)
+            except ValueError as exc:
+                return errors.error_response(
+                    400, str(exc), "invalid_request_error", "invalid_request"
+                )
+
+        cudagraph_capture_sizes = (
+            payload.get("cudagraph_capture_sizes") if isinstance(payload, dict) else None
+        )
+        if cudagraph_capture_sizes is not None:
+            if not isinstance(cudagraph_capture_sizes, list) or not cudagraph_capture_sizes or not all(
+                isinstance(n, int) and not isinstance(n, bool) for n in cudagraph_capture_sizes
+            ):
+                return errors.error_response(
+                    400,
+                    "cudagraph_capture_sizes must be a non-empty list of integers.",
+                    "invalid_request_error",
+                    "invalid_request",
+                )
+            cudagraph_capture_sizes = tuple(cudagraph_capture_sizes)
 
         try:
             out = await _plan_and_fit(ctx, payload)
@@ -2709,6 +3542,25 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     400, reason, "invalid_request_error", "runtime_unsupported"
                 )
 
+        # A shape the launcher cannot start, ahead of the runtime question
+        # because it is the more specific one: vLLM shards fine, and this is
+        # sparkrun's cluster path refusing to bring up a pure data-parallel
+        # job. Its own code, because "the runtime cannot shard" would send a
+        # caller looking at the wrong thing.
+        dp_problem = _data_parallel_refusal(
+            plan.tensor_parallel,
+            plan.pipeline_parallel,
+            plan.data_parallel,
+            _launcher_version(ctx.deps.deployments),
+        )
+        if dp_problem:
+            return errors.error_response(
+                400,
+                dp_problem,
+                "invalid_request_error",
+                "launcher_cannot_data_parallel",
+            )
+
         # A runtime that cannot shard, handed a plan that shards. Checked here
         # and not inside the launcher because this is the last place a refusal
         # is still a 400 the caller can act on: past it, the machines are
@@ -2719,6 +3571,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             plan.pipeline_parallel,
             plan.expert_parallel,
             plan.data_parallel,
+            _launcher_version(ctx.deps.deployments),
         )
         if sharding_problem:
             return errors.error_response(
@@ -2899,14 +3752,68 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     context_length,
                     concurrency,
                     modality=out.modality,
+                    # The name clients pass as "model", when the caller wants
+                    # one of their own. Absent, the manager derives it from the
+                    # model id, which is what every launch did before this.
+                    #
+                    # It exists because the served-name rule is cluster-wide --
+                    # `manager._find_conflict` refuses a second deployment
+                    # answering to a name already in use, anywhere -- so two
+                    # copies of one model, however they are placed, need
+                    # distinct names or one of them is refused. That docstring
+                    # already said replication "has to be asked for under its
+                    # own name"; there was no way to ask.
+                    #
+                    # Not validated here: `manager.launch` runs
+                    # `check_recipe_identifiers` on it before any record
+                    # exists, and a second copy of that grammar is a second
+                    # thing to keep in step with `deploy/recipes.py`.
+                    **({"served_name": served_name} if served_name else {}),
                     extra_args=extra_args,
                     custom_command=custom_command,
+                    enforce_eager=enforce_eager,
+                    cudagraph_capture_sizes=cudagraph_capture_sizes,
+                    # Spread rather than sent as None, on the same terms as
+                    # `node_ids` on the plan request: absence is the contract
+                    # for "one token per step", which is what every launch did
+                    # before this existed. `deployments` is a port the gateway
+                    # composes and does not own -- including the stub whose
+                    # whole job is to have nothing on it -- so a port that
+                    # predates this field keeps working untouched, and one that
+                    # cannot take it fails loudly on the only requests where
+                    # that matters: the ones where somebody asked to speculate
+                    # and the fit gate already charged the draft's memory.
+                    **({"speculative": out.speculative} if out.speculative else {}),
+                    # Spread on exactly the terms `speculative` is, and for
+                    # the same reason: sent only when it would change the
+                    # command, so a port that predates the field keeps working
+                    # for every launch that asks for the model's own width --
+                    # and fails loudly on the only ones where dropping it
+                    # matters, the ones the fit gate has already sized narrow.
+                    **(
+                        {"kv_dtype": out.kv_dtype}
+                        if render_kv_cache_dtype(out.kv_dtype) is not None
+                        else {}
+                    ),
+                    # Spread on exactly the same terms, and this is the one
+                    # that closes the gap: the `dtype` override has always
+                    # re-priced the fit gate and has never reached the launch
+                    # command, so a plan approved at nvfp4 launched a
+                    # checkpoint in its own bf16 with a budget sized for
+                    # something 3.5x smaller.
+                    **(
+                        {"quantization": out.quantization}
+                        if out.quantization
+                        and render_quantization(out.quantization) is not None
+                        else {}
+                    ),
                 )
             )
         except ValueError as exc:
             # An input validation error -- e.g. a command-unsafe model id, an
             # extra_args/custom_command token check_extra_args_safe rejected,
-            # or both fields sent at once -- not a
+            # enforce_eager/cudagraph_capture_sizes sent together or alongside
+            # custom_command, or a runtime that cannot take either -- not a
             # launch that genuinely failed.
             return errors.error_response(
                 400, str(exc), "invalid_request_error", "invalid_request"
@@ -2954,6 +3861,66 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return JSONResponse(
             serialize.deployment_payload(deployment), status_code=201
         )
+
+    @router.patch("/api/deployments/{deployment_id}")
+    async def patch_deployment(deployment_id: str, request: Request) -> Response:
+        """Offer a deployment on the API, or stop offering it.
+
+        `{"serving": false}` takes the model off `/v1/models`, out of routing,
+        off the chat picker and off the topology graph together -- one seam,
+        `targets.build_index`, exactly as a provider's `enabled_models`
+        allowlist works. **The container keeps running and keeps holding its
+        GPU memory**; DELETE is what stops it.
+
+        Mirrors `patch_provider` above, including the `rebuild(force_scores=
+        True)` that makes the edit take effect with no restart and nothing
+        else to press.
+        """
+        set_serving = getattr(ctx.deps.deployments, "set_serving", None)
+        if not callable(set_serving):
+            return _not_implemented("Deployment update", "deployment manager")
+        try:
+            patch = await request.json()
+        except Exception:
+            return errors.error_response(
+                400, "Body must be JSON.", "invalid_request_error", "invalid_json"
+            )
+        if not isinstance(patch, dict) or "serving" not in patch:
+            return errors.error_response(
+                400,
+                "Body must be an object with a 'serving' boolean. It is the "
+                "only field this route edits.",
+                "invalid_request_error",
+                "invalid_request",
+            )
+        serving = patch["serving"]
+        if not isinstance(serving, bool):
+            # Not coerced. "false" and 0 are both truthy-adjacent in ways that
+            # would silently do the opposite of what was asked, and this route
+            # decides whether a model is reachable.
+            return errors.error_response(
+                400,
+                f"'serving' must be true or false, not {type(serving).__name__}.",
+                "invalid_request_error",
+                "invalid_request",
+            )
+        try:
+            deployment = await asyncio.to_thread(set_serving, deployment_id, serving)
+        except Exception as exc:
+            log.exception("deployment update failed")
+            return errors.error_response(
+                400,
+                f"Could not update deployment. {errors.detail(exc, _redactor())}",
+                "invalid_request_error",
+                "deployment_update_failed",
+            )
+        if deployment is None:
+            return errors.error_response(
+                404, f"No deployment '{deployment_id}'.",
+                "invalid_request_error", "deployment_not_found",
+            )
+        ctx.router.rebuild(force_scores=True)
+        return JSONResponse(serialize.deployment_payload(deployment))
 
     @router.delete("/api/deployments/{deployment_id}")
     async def delete_deployment(deployment_id: str) -> Response:

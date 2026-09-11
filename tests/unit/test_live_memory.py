@@ -172,15 +172,18 @@ def test_a_port_without_the_parameter_degrades_instead_of_raising():
 
 
 def test_zero_addressable_node_is_excluded_not_silently_refused():
-    """A node reporting no addressable memory would be the argmin of every
-    budget and make every verdict WONT_FIT."""
+    """A node with nothing to spend would be the argmin of every budget and
+    make every verdict WONT_FIT."""
     dead = dataclasses.replace(SPARK_01, node_id="worker-docker", addressable_memory=0)
-    kept, excluded = livefit.drop_zero_addressable(
+    kept, excluded = livefit.drop_unbudgetable(
         [SPARK_01, dead], {SPARK_01.node_id: 15 * GIB, "worker-docker": 0}
     )
     assert set(kept) == {SPARK_01.node_id}
     assert excluded and excluded[0]["node_id"] == "worker-docker"
-    assert "0 addressable" in excluded[0]["reason"]
+    # The wording moved with the rule: the test is now "has nothing to spend",
+    # not "has no GPU", because a CPU node reports 0 addressable for an honest
+    # reason and can still be served from.
+    assert "excluded from the budget" in excluded[0]["reason"]
 
 
 # -- the wire ---------------------------------------------------------------

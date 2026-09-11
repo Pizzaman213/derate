@@ -49,19 +49,71 @@ CHUNK_S = 86400.0
 #: version of the same loop, trusting only its file measure, ran forever.
 MAX_EVICT_DAYS = 400
 
-_SAMPLE_ROLL_1M = """
+from control_plane.registry.telemetry import CLOCK_THROTTLE_NAMES, CLOCK_THROTTLE_MASK
+
+
+def _bit_union(column: str) -> str:
+    """SQL that unions a bitmask across a GROUP BY.
+
+    SQLite has no BIT_OR aggregate, and MAX() is not a stand-in: one sample at
+    0x4 (power cap) and one at 0x20 (thermal) would give 0x20 and the power cap
+    would simply vanish. The bits are disjoint, so a sum of per-bit maxima
+    reconstructs the OR exactly. Generated from CLOCK_THROTTLE_NAMES rather than
+    written out, so the mask has one home and this cannot drift from it.
+    """
+    return " + ".join(f"MAX({column} & {bit})" for bit, _ in CLOCK_THROTTLE_NAMES)
+
+
+def _weighted_avg(column: str) -> str:
+    """A 1m->1h weighted average that a NULL minute cannot dilute.
+
+    The plain form ``SUM(x_avg * n) / SUM(n)`` skips NULL products in the
+    numerator while still counting those minutes in the denominator, so an hour
+    half of whose minutes had no reading reports half the true average. Every
+    column predating this was non-NULL by construction, so it never bit; the
+    genuinely optional ones make it bite immediately, and it would do so exactly
+    during a fleet upgrade -- when the chart is least trustworthy and most
+    likely to be believed.
+
+    Residual and deliberate: a minute is still weighted by its full ``n`` even
+    if only three of its sixty samples carried a reading. Fixing that exactly
+    needs a per-field count column each. Partial minutes only happen mid-upgrade
+    or while a probe is flapping, and every pre-existing column has the same
+    property implicitly.
+    """
+    return (
+        f"SUM({column} * n) / "
+        f"NULLIF(SUM(CASE WHEN {column} IS NULL THEN 0 ELSE n END), 0)"
+    )
+
+
+_SAMPLE_ROLL_1M = f"""
 INSERT OR REPLACE INTO rollup_samples(
   step, node_id, bucket, n,
   power_w_avg, power_w_max, temp_c_avg, temp_c_max,
   util_pct_avg, util_pct_max, memory_used_avg, memory_used_max,
   gpu_memory_used_avg, gpu_memory_used_max,
-  host_memory_available_min, swap_used_max)
+  host_memory_available_min, swap_used_max,
+  throttle_bits_any, throttled_s, throttle_n,
+  sm_clock_avg, sm_clock_min, sm_clock_max_mhz,
+  swap_in_bps_avg, swap_in_bps_max, swap_out_bps_avg, swap_out_bps_max,
+  major_faults_max, memory_pressure_pct_avg, memory_pressure_pct_max)
 SELECT
   ?, node_id, CAST(ts / ? AS INTEGER) * ?, COUNT(*),
   AVG(power_w), MAX(power_w), AVG(temp_c), MAX(temp_c),
   AVG(util_pct), MAX(util_pct), AVG(memory_used), MAX(memory_used),
   AVG(gpu_memory_used), MAX(gpu_memory_used),
-  MIN(host_memory_available), MAX(swap_used)
+  MIN(host_memory_available), MAX(swap_used),
+  {_bit_union("clock_throttle_bits")},
+  -- At 1 Hz this is literally seconds throttled. COUNT(clock_throttle_bits)
+  -- rather than COUNT(*) is the denominator that keeps it honest: NULL & mask
+  -- is NULL and CASE WHEN NULL falls to ELSE 0, so without it every CPU-only
+  -- and every old-agent row would count as "checked, not throttled".
+  SUM(CASE WHEN clock_throttle_bits & {CLOCK_THROTTLE_MASK} THEN 1 ELSE 0 END),
+  COUNT(clock_throttle_bits),
+  AVG(sm_clock_mhz), MIN(sm_clock_mhz), MAX(sm_clock_max_mhz),
+  AVG(swap_in_bps), MAX(swap_in_bps), AVG(swap_out_bps), MAX(swap_out_bps),
+  MAX(major_faults_per_s), AVG(memory_pressure_pct), MAX(memory_pressure_pct)
 FROM samples
 WHERE ts >= ? AND ts < ?
 GROUP BY node_id, CAST(ts / ? AS INTEGER)
@@ -69,13 +121,17 @@ GROUP BY node_id, CAST(ts / ? AS INTEGER)
 
 # Averages roll forward weighted by the sample count behind them, so an hour
 # containing one busy minute and fifty-nine idle ones reports the truth.
-_SAMPLE_ROLL_1H = """
+_SAMPLE_ROLL_1H = f"""
 INSERT OR REPLACE INTO rollup_samples(
   step, node_id, bucket, n,
   power_w_avg, power_w_max, temp_c_avg, temp_c_max,
   util_pct_avg, util_pct_max, memory_used_avg, memory_used_max,
   gpu_memory_used_avg, gpu_memory_used_max,
-  host_memory_available_min, swap_used_max)
+  host_memory_available_min, swap_used_max,
+  throttle_bits_any, throttled_s, throttle_n,
+  sm_clock_avg, sm_clock_min, sm_clock_max_mhz,
+  swap_in_bps_avg, swap_in_bps_max, swap_out_bps_avg, swap_out_bps_max,
+  major_faults_max, memory_pressure_pct_avg, memory_pressure_pct_max)
 SELECT
   ?, node_id, CAST(bucket / ? AS INTEGER) * ?, SUM(n),
   SUM(power_w_avg * n) / SUM(n), MAX(power_w_max),
@@ -83,7 +139,14 @@ SELECT
   SUM(util_pct_avg * n) / SUM(n), MAX(util_pct_max),
   SUM(memory_used_avg * n) / SUM(n), MAX(memory_used_max),
   SUM(gpu_memory_used_avg * n) / SUM(n), MAX(gpu_memory_used_max),
-  MIN(host_memory_available_min), MAX(swap_used_max)
+  MIN(host_memory_available_min), MAX(swap_used_max),
+  {_bit_union("throttle_bits_any")},
+  SUM(throttled_s), SUM(throttle_n),
+  {_weighted_avg("sm_clock_avg")}, MIN(sm_clock_min), MAX(sm_clock_max_mhz),
+  {_weighted_avg("swap_in_bps_avg")}, MAX(swap_in_bps_max),
+  {_weighted_avg("swap_out_bps_avg")}, MAX(swap_out_bps_max),
+  MAX(major_faults_max),
+  {_weighted_avg("memory_pressure_pct_avg")}, MAX(memory_pressure_pct_max)
 FROM rollup_samples
 WHERE step = ? AND bucket >= ? AND bucket < ?
 GROUP BY node_id, CAST(bucket / ? AS INTEGER)
@@ -107,6 +170,10 @@ def compact(archive: Archive, now: float | None = None) -> dict[str, Any]:
     with archive.lock:
         conn = archive.conn
         _ensure_incremental_vacuum(conn, archive.path)
+        # An archive nobody has shipped to yet -- a coordinator with no members
+        # -- never reaches Archive.ingest, so this is the other half of the
+        # migration's coverage, and the retry for one that failed on a full disk.
+        archive._ensure_schema()
         if roll_to > roll_from:
             report["rolled_1m"] = _roll(conn, archive, roll_from, roll_to, STEP_1M)
             report["rolled_1h"] = _roll(conn, archive, roll_from, roll_to, STEP_1H)

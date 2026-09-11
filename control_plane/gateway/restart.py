@@ -32,7 +32,12 @@ from functools import partial
 from control_plane.contracts import Deployment, Verdict
 
 from .deps import GatewayContext
-from .internal_api import _plan_and_fit, _sharding_refusal
+from .internal_api import (
+    _data_parallel_refusal,
+    _launcher_version,
+    _plan_and_fit,
+    _sharding_refusal,
+)
 
 log = logging.getLogger("gateway.restart")
 
@@ -57,6 +62,12 @@ OPERATOR_STOP_REASON = "stopped during launch"
 class _RestartState:
     attempts: int = 0
     in_flight: bool = False
+    #: Set once the budget is spent, so giving up is announced exactly once.
+    #: A crash loop keeps emitting FAILED long after the last attempt, and
+    #: "derate has stopped trying" is a thing to say once, not per crash.
+    announced_exhausted: bool = False
+    #: Why the last attempt did not stick, carried so the give-up can say it.
+    last_detail: "str | None" = None
     task: "asyncio.Task | None" = field(default=None, repr=False)
 
 
@@ -99,12 +110,22 @@ async def _attempt_relaunch(
         if not ok:
             return "runtime_unsupported", None, reason
 
+    dp_problem = _data_parallel_refusal(
+        out.plan.tensor_parallel,
+        out.plan.pipeline_parallel,
+        out.plan.data_parallel,
+        _launcher_version(ctx.deps.deployments),
+    )
+    if dp_problem:
+        return "data_parallel_unsupported", None, dp_problem
+
     sharding_problem = _sharding_refusal(
         runtime,
         out.plan.tensor_parallel,
         out.plan.pipeline_parallel,
         out.plan.expert_parallel,
         out.plan.data_parallel,
+        _launcher_version(ctx.deps.deployments),
     )
     if sharding_problem:
         return "sharding_unsupported", None, sharding_problem
@@ -212,7 +233,37 @@ class RestartCoordinator:
             # A flapping health probe can fire this twice for one deployment;
             # one retry loop per served_name at a time.
             return
-        state = _RestartState(in_flight=True)
+        if existing is not None and existing.attempts >= MAX_RESTART_ATTEMPTS:
+            # Already given up on this name. Without this the budget below
+            # would be re-spent on every subsequent crash, which is the loop
+            # in a second costume.
+            #
+            # Announce it HERE as well as in `_retry_loop`, because the common
+            # crash-loop shape never reaches that one: `_retry_loop` returns on
+            # "launched", which means the relaunch was submitted, and the death
+            # comes afterwards as a fresh FAILED. So the last attempt of a
+            # crash loop exits through the success path and the only place left
+            # to say "that was the third try, I have stopped" is right here.
+            if not existing.announced_exhausted:
+                existing.announced_exhausted = True
+                self._emit_exhausted(
+                    served_name, deployment_id, existing.attempts,
+                    existing.last_detail,
+                )
+            return
+        # THE BUDGET SURVIVES THE RELAUNCH. It used to not: a fresh
+        # _RestartState was minted on every FAILED event, so `attempts` went
+        # back to 0 and MAX_RESTART_ATTEMPTS bounded consecutive submission
+        # failures rather than crashes. `_retry_loop` returns as soon as a
+        # relaunch is SUBMITTED ("launched"), not when it reaches READY, so a
+        # model that dies during startup produced: crash -> fresh budget ->
+        # sleep 5s -> relaunch -> crash -> fresh budget, for ever. Measured on
+        # this box: 1,094 launching->failed transitions over two days, every
+        # gap exactly RESTART_BACKOFF_S[0] because the counter never reached
+        # the second rung. The state is cleared on READY, above, which is the
+        # only evidence that a relaunch actually worked.
+        state = existing if existing is not None else _RestartState()
+        state.in_flight = True
         self._state[served_name] = state
         state.task = asyncio.create_task(
             self._retry_loop(served_name, deployment_id, state)
@@ -245,9 +296,14 @@ class RestartCoordinator:
                     served_name, deployment_id, state.attempts, outcome,
                     new_deployment, detail,
                 )
+                state.last_detail = detail
                 if outcome in ("launched", "conflict"):
                     return
-            self._emit_exhausted(served_name, deployment_id, state.attempts, detail)
+            if not state.announced_exhausted:
+                state.announced_exhausted = True
+                self._emit_exhausted(
+                    served_name, deployment_id, state.attempts, detail
+                )
         except asyncio.CancelledError:
             raise
         except Exception:

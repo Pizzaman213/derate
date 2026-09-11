@@ -9,6 +9,7 @@ was not.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 import threading
@@ -30,6 +31,7 @@ from control_plane.contracts.quant import (
 
 from . import gguf as gguf_mod
 from . import gguf_names, imageprobe, quant_detect, support
+from . import speculators as spec_detect
 from .cache import ShapeCache
 from .config_map import Mapped, map_config, vision_config
 from .hf import HubClient, ModelInfo, count_safetensors_params, safetensors_header
@@ -311,6 +313,17 @@ class ModelResolver:
             if not entry.ok:
                 warnings.append(f"{entry.runtime}: {entry.reason}")
 
+        # After the weight-byte adjustment above, never before: the MTP option's
+        # cost is the exact inverse of the subtraction on line 299, so it has to
+        # be derived from the figure that subtraction produced.
+        speculators = spec_detect.detect(
+            mapped,
+            breakdown,
+            total_params=accounting.total_params,
+            weight_bytes=weight_bytes,
+            bytes_per_param=shape.bytes_per_param(),
+        )
+
         return Resolution(
             shape=shape,
             revision=revision,
@@ -321,8 +334,10 @@ class ModelResolver:
             weight_bytes=weight_bytes,
             architectures=mapped.architectures,
             model_type=mapped.model_type,
+            target_model_type=mapped.target_model_type,
             max_position_embeddings=mapped.max_position_embeddings,
             param_breakdown=breakdown.as_dict(),
+            speculators=speculators,
             resolved_at=time.time(),
         )
 
@@ -607,6 +622,24 @@ class ModelResolver:
     #: note must never claim a header could not be read when it was never read.
     _MAX_HEADER_PROBES = 3
 
+    #: How many sibling quantization repositories one ``quant_variants`` call
+    #: may SIZE.
+    #:
+    #: A ``repo_name``/``tags`` variant is built from a search hit, and a search
+    #: hit carries no file list -- so until this budget existed those rows went
+    #: out with ``file_bytes=None``, which the capacity ladder then priced from
+    #: the dtype formula and reported as a confident verdict. On
+    #: ``Qwen/Qwen3.8-Flash-Next`` that read 47.3 GiB per rank against a real
+    #: 111.8: 2.4x, in the direction that turns a refusal into an invitation.
+    #:
+    #: Unlike a GGUF header probe this is cheap -- one model-info round trip,
+    #: the same call ``_resolve`` already makes, with blob sizes already in the
+    #: response. Measured against the live hub on the six launchable siblings
+    #: of that model: 0.07-0.16s each, 0.32s for all six. Eight covers every
+    #: model in the corpus with room over, and the probes run concurrently, so
+    #: the wall clock is one round trip rather than eight.
+    _MAX_SIZE_PROBES = 8
+
     @staticmethod
     def _looks_like_gguf_repo(hit_id: str, tags: tuple[str, ...] | list[str]) -> bool:
         """Does this search hit ship GGUF files?
@@ -764,6 +797,13 @@ class ModelResolver:
                     # the single most misleading answer this resolver can give
                     # about a quantization catalogue, so it is refused here
                     # rather than left for a launch to discover.
+                    #
+                    # Unchanged by the arrival of a llama.cpp runtime, and the
+                    # reason is worth keeping straight: the refusal was never
+                    # "nothing loads this format", it was "this id does not
+                    # name a set of weights". A repository holding nine
+                    # quantizations still does not. The file-level rows are
+                    # the launchable ones now.
                     launchable=(
                         not is_collection
                         and quant_info(res.shape.dtype).family != "gguf"
@@ -829,7 +869,13 @@ class ModelResolver:
                         source="repo_name",
                         downloads=downloads,
                         launchable=quant_info(key).family != "gguf",
-                        note="scheme read from the repository name",
+                        note=(
+                            "scheme read from the repository name; open it and "
+                            "choose a .gguf build, which is what a launch needs "
+                            "to name"
+                            if quant_info(key).family == "gguf"
+                            else "scheme read from the repository name"
+                        ),
                     )
                 )
                 continue
@@ -844,7 +890,13 @@ class ModelResolver:
                             source="tags",
                             downloads=downloads,
                             launchable=quant_info(key).family != "gguf",
-                            note=f"scheme read from the repository tag {tag!r}",
+                            note=(
+                                f"scheme read from the repository tag {tag!r}; "
+                                "open it and choose a .gguf build, which is "
+                                "what a launch needs to name"
+                                if quant_info(key).family == "gguf"
+                                else f"scheme read from the repository tag {tag!r}"
+                            ),
                         )
                     )
                     break
@@ -852,6 +904,70 @@ class ModelResolver:
         gguf_repos.sort(key=lambda pair: pair[0], reverse=True)
         for _, repo in gguf_repos[: self._MAX_GGUF_REPOS]:
             self._gguf_file_variants(repo, add_to=add, budget=budget)
+        return self._size_launchable(variants)
+
+    def _size_launchable(self, variants: list[QuantVariant]) -> list[QuantVariant]:
+        """Measure the shards of every launchable variant that has no size yet.
+
+        A variant built from a search hit knows its repository and nothing
+        about its files, and a launchable row with no size is the one thing
+        this module must not emit: the capacity ladder prices an absent
+        ``file_bytes`` from the dtype formula and answers with a full-
+        confidence verdict, so "we never looked" reaches the screen as "loads
+        with 54.7 GiB to spare".
+
+        Sized here rather than at the point each variant is built, because the
+        search loop yields duplicates and dedupes them through ``add`` -- one
+        probe per surviving repository, not one per hit.
+
+        A probe that fails leaves ``file_bytes`` ``None``. Gated repositories,
+        429s and hub outages are ordinary here and must degrade to "not sized",
+        never fail the enumeration; ``capacity_api`` is what turns the
+        remaining absence into a refusal.
+        """
+        if self.offline:
+            return variants
+
+        wanted = [
+            index
+            for index, v in enumerate(variants)
+            if v.launchable and v.file_bytes is None and v.gguf_file is None
+        ]
+        if not wanted:
+            return variants
+        wanted = wanted[: self._MAX_SIZE_PROBES]
+
+        def measure(index: int) -> tuple[int, ModelInfo | None]:
+            return index, self._safe_model_info(variants[index].repo_id, "main")
+
+        # One round trip each, run together: eight sequential hub calls is the
+        # 20s ladder timeout again with extra steps.
+        with ThreadPoolExecutor(max_workers=min(4, len(wanted))) as pool:
+            measured = list(pool.map(measure, wanted))
+
+        for index, info in measured:
+            if info is None:
+                continue
+            total = _shard_bytes(info)
+            if not total:
+                continue
+            # The same rule the GGUF path follows: a size is the sum of a named
+            # set of files, so the count travels with it. Without this a row
+            # reports 123.6 GiB beside a shard count of 1 and the two disagree
+            # about what is being described.
+            shards = sorted(
+                name
+                for name in info.file_sizes
+                if name.endswith(".safetensors") and "/" not in name
+            )
+            canonical = [n for n in shards if n.startswith("model")]
+            shards = canonical or shards
+            variants[index] = dataclasses.replace(
+                variants[index],
+                file_bytes=total,
+                shard_count=len(shards) or 1,
+                shard_files=tuple(shards),
+            )
         return variants
 
     def _dtype_from_header(self, repo_id: str, filename: str) -> str | None:
@@ -989,10 +1105,16 @@ class ModelResolver:
                 file_bytes=entry["bytes"] if entry["measured"] else None,
                 shard_count=shards,
                 shard_files=tuple(sorted(entry["files"])),
-                # A single .gguf file is not a launchable target: both serve
-                # command templates take a repository path, and no runtime here
-                # claims to load llama.cpp's format anyway.
-                launchable=False,
+                # Launchable since there is a llama.cpp runtime to launch it
+                # on, and this is the ONE GGUF row that should be: it names a
+                # specific file, so `resolver/gguf.py` has read its tensor
+                # directory and `file_bytes` is measured rather than
+                # estimated. The repository-level rows below stay refused for
+                # the opposite reason -- a repository holding nine
+                # quantizations does not say which one a launch would get, and
+                # sparkrun would pick the lexicographically first, which is a
+                # choice nobody made.
+                launchable=True,
                 note="; ".join(notes),
             )
             out.append(variant)
@@ -1076,6 +1198,7 @@ def _shape_from(model_id: str, mapped: Mapped, accounting, dtype: str) -> ModelS
         mla_rope_dim=mapped.qk_rope_head_dim,
         vision_params=accounting.vision_params,
         is_encoder_decoder=mapped.is_encoder_decoder,
+        routed_expert_params=accounting.routed_expert_params,
     )
 
 

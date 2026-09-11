@@ -2,8 +2,8 @@
 
 None of this is persisted in the frozen :class:`Provider` record beyond the
 two fields it already has. It lives here because a rate-limited provider is a
-different thing from an unhealthy one, and the difference is what Agent G
-routes on.
+different thing from an unhealthy one, and the difference is what the
+gateway routes on.
 """
 
 from __future__ import annotations
@@ -52,6 +52,10 @@ class DaySpend:
     requests: int = 0
     # Requests we served but could not price, because the provider publishes
     # no cost for that model. Surfaced so a zero spend is not read as free.
+    #: Served, but not charged. Two causes, deliberately one counter: we hold
+    #: no rate card for that model, OR the response carried no usage block at
+    #: all (audio bytes, a Custom box, Ollama). Both are "this happened and we
+    #: cannot say what it cost", which is one fact for a reader to act on.
     unpriced_requests: int = 0
     # Requests the provider itself priced, in its own response. The rest of
     # `requests - unpriced_requests` was priced from our copy of its published
@@ -251,17 +255,32 @@ class ProviderRuntime:
             return False
         return self.spend_today(now) >= self.daily_budget_usd
 
+    def budget_block(self, now: float) -> str | None:
+        """Why the cap is closed, in one sentence, or None when it is not.
+
+        The ONE author of this text. It used to be composed here and composed
+        again -- differently, dropping the "spent today" half -- in
+        `service.py::_admit`'s refusal, so an operator saw one sentence on the
+        providers screen and a shorter one in the error that refused their
+        request. Both call it now, and so does the alert that reports the
+        crossing.
+        """
+        if not self.over_budget(now):
+            return None
+        return (
+            f"daily budget of ${self.daily_budget_usd:.2f} reached "
+            f"(${self.spend_today(now):.2f} spent today)"
+        )
+
     def admission_block(self, now: float) -> str | None:
         """Why this provider is not admitting, or None when it is."""
         if self.missing_key_ref is not None:
             return f"api_key_ref {self.missing_key_ref!r} is unresolved"
         if self.rate_limited(now):
             return f"rate limited for another {self.retry_in(now):.0f}s"
-        if self.over_budget(now):
-            return (
-                f"daily budget of ${self.daily_budget_usd:.2f} reached "
-                f"(${self.spend_today(now):.2f} spent today)"
-            )
+        budget = self.budget_block(now)
+        if budget is not None:
+            return budget
         if self.auth_rejected:
             return self.last_error or "authentication rejected"
         if not self.healthy and self.failure_backoff_until <= 0.0:
@@ -324,6 +343,23 @@ class ProviderRuntime:
         ) / 1_000_000.0
         day.usd += cost
         return cost
+
+    def record_unpriced(self, now: float) -> None:
+        """One request served whose response said nothing about its usage.
+
+        Separate from :meth:`record_usage` because there are no token counts to
+        add -- not zero of them, none. Reporting zeros would put a measured
+        looking "0 in, 0 out" beside requests that really did carry tokens
+        nobody told us about.
+
+        It still counts, and that is the point. Before this existed the caller
+        returned early and incremented nothing, so a day of provider audio
+        traffic left `requests` at 0 and the Spend screen read that as "a real
+        zero. Nothing was served today."
+        """
+        day = self.day(now)
+        day.requests += 1
+        day.unpriced_requests += 1
 
     def prune_spend(self, now: float, keep_days: int = 30) -> None:
         if len(self.spend) <= keep_days:

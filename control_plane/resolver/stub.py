@@ -1,17 +1,44 @@
 """Day-0 stub. Returns the frozen fixture shapes and nothing else.
 
-Agents D and E cannot start without a ``ResolverPort`` that returns real
-contract types, so this exists from the first hour and is deleted at
-integration. It never invents a shape: an unknown id is a clear error, not a
-plausible-looking guess that silently poisons a memory calculation.
+The real resolver landed and `node.py` wires it in production behind
+`GatewayDeps(strict=True, ...)`, which refuses to start if any port -- this
+one included -- is still missing. This file stayed anyway: `__init__.py`
+exports `StubResolver` as this package's public fake, and
+`tests/unit/test_resolver.py`, `test_setup.py`, `test_gateway_models_api.py`,
+`test_gateway_runtime.py`, `test_gateway_restart.py` and `test_gateway.py`
+reach for it wherever a test needs a `ResolverPort` without the real
+HuggingFace lookup. It never invents a shape: an unknown id is a clear error,
+not a plausible-looking guess that silently poisons a memory calculation.
 """
 
 from __future__ import annotations
 
-from control_plane.contracts import ModelShape
+from control_plane.contracts import ModelShape, SpeculativeMethod
 
+from .speculators import (
+    NGRAM_DEFAULT_TOKENS,
+    NGRAM_MAX_TOKENS,
+    SpeculativeOption,
+)
 from .support import build_verdict
 from .types import ModelNotFound, ParamSource, QuantSource, Resolution
+
+#: The one speculative option a stub with no config.json can honestly offer.
+#: Built from `speculators.py`'s own constants rather than retyped, so the two
+#: cannot drift into disagreeing about how many tokens ngram drafts.
+_NGRAM_OPTION = SpeculativeOption(
+    method=SpeculativeMethod.NGRAM,
+    default_tokens=NGRAM_DEFAULT_TOKENS,
+    max_tokens=NGRAM_MAX_TOKENS,
+    draft_params=0,
+    draft_bytes=0,
+    source="method",
+    declared_by="",
+    note=(
+        "drafts by matching the recent output against the prompt, so it loads "
+        "no weights and needs no support from the checkpoint"
+    ),
+)
 
 #: Architectures for the fixture models, since ``ModelShape`` carries none.
 _FIXTURE_ARCHITECTURES: dict[str, tuple[str, ...]] = {
@@ -65,6 +92,13 @@ class StubResolver:
             support=build_verdict(architectures, shape.dtype),
             warnings=["shape came from the day-0 fixture stub, not from the hub"],
             architectures=architectures,
+            # ngram and nothing else, and it is not a placeholder. This stub
+            # has no config.json to read, so it cannot know whether a fixture
+            # shape declares an MTP module -- but ngram needs no support from
+            # any checkpoint, so offering it is the one speculative claim that
+            # is true without reading anything. An empty tuple here would be a
+            # different and false claim: that this model supports none.
+            speculators=(_NGRAM_OPTION,),
         )
 
     def resolve_gguf(self, path: str) -> ModelShape:

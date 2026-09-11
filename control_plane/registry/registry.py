@@ -16,7 +16,7 @@ import asyncio
 import hmac
 import logging
 import time
-from typing import AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable
 
 from control_plane.contracts import (
     DEFAULT_GUARDRAIL,
@@ -47,7 +47,9 @@ from .identity import ClusterIdentity, load_or_create_identity
 from .labels import normalize_label
 from .net import normalize_agent_url
 from .probe import probe_local
-from .profiles import profile_supersedes
+from control_plane.telemetry.events import RegistryEvents
+
+from .profiles import profile_diff, profile_supersedes
 from .reach import (
     COORDINATOR,
     PEER_REACH_TIMEOUT_S,
@@ -88,6 +90,25 @@ SOURCE_MANUAL = "manual"
 SOURCE_ENROLL = "enroll"
 
 
+def _opt_int(value: Any) -> int | None:
+    """int(), with absence preserved. A missing reading is not a zero one."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class Registry:
     """Implements RegistryPort, plus discovery, admission and telemetry.
 
@@ -105,8 +126,13 @@ class Registry:
         clock: Callable[[], float] = time.time,
         identity: ClusterIdentity | None = None,
         enrollment: EnrollmentStore | None = None,
+        events: RegistryEvents | None = None,
     ) -> None:
         self.config = config or RegistryConfig()
+        # Defaulted to a sinkless instance: a Registry built without telemetry
+        # -- which is every test, and any node whose data root is missing --
+        # records nothing and behaves exactly as before.
+        self._events = events or RegistryEvents()
         self._clock = clock
         self._role = role
         self._client = client or HttpAgentClient()
@@ -130,6 +156,12 @@ class Registry:
         # nobody renamed has no entry, not an entry equal to its node_id.
         self._labels: dict[str, str] = {}
         self._misses: dict[str, int] = {}
+        # Why the last probe failed, per node. check_health() returns a bare
+        # bool and swallowed the reason, so "spark-02 went unhealthy" was
+        # recorded without "because nothing was listening on :8081" -- and a
+        # month later that is the difference between a crashed agent and a
+        # cable.
+        self._last_error: dict[str, str] = {}
         self._telemetry = TelemetryStore()
         self._tasks: list[asyncio.Task] = []
         self._running = False
@@ -178,6 +210,17 @@ class Registry:
     @property
     def identity(self) -> ClusterIdentity:
         return self._identity
+
+    @property
+    def events(self):
+        """The event emitter, for a consumer that wants a tap.
+
+        Public so nothing has to reach for `_events`. See
+        `telemetry/events.py::RegistryEvents.add_tap` -- on a coordinator this
+        emitter is constructed with no bus and writes straight to the sink, so
+        a tap is the only live feed there is.
+        """
+        return self._events
 
     def agent_url(self, node_id: str) -> str | None:
         return self._agent_urls.get(node_id)
@@ -343,7 +386,7 @@ class Registry:
         """Coordinator side of the join protocol. Async: it probes back.
 
         A wrong, non-empty token is rejected before touching any state, so a
-        bad joiner leaves no trace anywhere (Agent G maps JoinRejected to
+        bad joiner leaves no trace anywhere (the gateway maps JoinRejected to
         403). An absent token is different on purpose: with nothing to check
         it against, there is nothing to reject -- the joiner is routed into
         ``offer_candidate``, the same "discovered, not yet admitted" path
@@ -605,6 +648,23 @@ class Registry:
         self._misses[node_id] = 0
         self._persist_roster()
         log.info("admitted %s as a member", node_id)
+        # admit() is the single funnel -- the UI button, add_node and
+        # handle_join's enrollment path all arrive here -- so one emit covers
+        # every way a node becomes a member. Deliberately NOT emitted from
+        # _load_roster or enroll_local: rehydrating a roster on restart and the
+        # coordinator enrolling its own machine are not joins, and firing on
+        # every process start would make the stream useless.
+        self._events.node_joined(
+            node_id,
+            hostname=profile.hostname,
+            address=profile.address,
+            agent_url=record["agent_url"],
+            device_class=profile.device_class.value,
+            gpu_name=profile.gpu_name,
+            gpu_count=profile.gpu_count,
+            addressable_memory=profile.addressable_memory,
+            member_count=len(self._members),
+        )
         return state
 
     # ------------------------------------------------------------------
@@ -654,6 +714,17 @@ class Registry:
         self._agent_urls.pop(node_id, None)
         self._labels.pop(node_id, None)
         self._misses.pop(node_id, None)
+        self._last_error.pop(node_id, None)
+        # Recorded before the drop, because the count is the interesting part:
+        # this is the only path that discards a node's telemetry, and afterwards
+        # there is nothing left to say how much went.
+        self._events.node_removed(
+            node_id,
+            was_member=was_member,
+            was_candidate=was_candidate,
+            had_samples=self._telemetry.size(node_id),
+            member_count_after=len(self._members),
+        )
         self._telemetry.drop(node_id)
         self._persist_roster()
 
@@ -847,8 +918,12 @@ class Registry:
                 f"{url.rstrip('/')}/agent/health", timeout=HEARTBEAT_TIMEOUT_S
             )
             self._record_build(node_id, body)
+            self._last_error.pop(node_id, None)
             return True
-        except ProbeFailed:
+        except ProbeFailed as exc:
+            # Kept, not swallowed. record_health() only sees a bool, so without
+            # this the event that says a node went down cannot say why.
+            self._last_error[node_id] = str(exc)[:200]
             return False
 
     def _record_build(self, node_id: str, body: object) -> None:
@@ -908,12 +983,16 @@ class Registry:
             return False
         if not profile_supersedes(fresh, state.profile) or fresh == state.profile:
             return False
+        # See agent.py: device_class alone is the field a driver upgrade does
+        # not move, so it is named here rather than logged alone.
+        changed = profile_diff(state.profile, fresh)
         log.info(
-            "node %s hardware changed: %s -> %s",
+            "node %s hardware changed: %s",
             node_id,
-            state.profile.device_class.value,
-            fresh.device_class.value,
+            ", ".join(f"{k} {v['from']} -> {v['to']}" for k, v in changed.items())
+            or "no named field",
         )
+        self._events.profile_changed(node_id, changed, reason="refresh")
         state.profile = fresh
         if node_id == self.local_node_id:
             self.local_profile = fresh
@@ -935,11 +1014,23 @@ class Registry:
         state = self._members.get(node_id)
         if state is None:
             return
+        misses_before = self._misses.get(node_id, 0)
         if ok:
             self._misses[node_id] = 0
+            was_down_since = state.last_seen
             state.last_seen = self._clock()
             if not state.healthy:
                 log.info("node %s is healthy again", node_id)
+                # Guarded on the edge. The unhealthy branch below already has
+                # `and state.healthy` and so fires once per outage; this one
+                # does not, and without the check it would emit on every
+                # heartbeat of a healthy node forever -- into the one table
+                # retention never evicts.
+                self._events.node_recovered(
+                    node_id,
+                    down_s=max(0.0, state.last_seen - was_down_since),
+                    misses=misses_before,
+                )
             state.healthy = True
             return
 
@@ -947,12 +1038,20 @@ class Registry:
         self._misses[node_id] = misses
         if misses >= HEARTBEAT_MISSES_UNHEALTHY and state.healthy:
             state.healthy = False
+            age = self._clock() - state.last_seen
             log.warning(
                 "node %s unhealthy after %d consecutive misses; keeping its last "
                 "telemetry from %.0fs ago",
                 node_id,
                 misses,
-                self._clock() - state.last_seen,
+                age,
+            )
+            self._events.node_lost(
+                node_id,
+                misses=misses,
+                last_error=self._last_error.get(node_id, ""),
+                last_seen_age_s=round(age, 1),
+                agent_url=self._agent_urls.get(node_id, ""),
             )
 
     async def health_round(self) -> None:
@@ -1033,6 +1132,18 @@ class Registry:
                 host_memory_total=int(payload.get("host_memory_total", 0)),
                 host_memory_available=int(payload.get("host_memory_available", 0)),
                 swap_used=int(payload.get("swap_used", 0)),
+                # None-preserving, deliberately unlike the eleven above. This is
+                # the one place the old-agent case is decided: an agent that
+                # predates these fields sends none of them, and a `, 0` default
+                # here would fabricate "checked, and this GPU is not throttled"
+                # for a node that never looked.
+                clock_throttle_bits=_opt_int(payload.get("clock_throttle_bits")),
+                sm_clock_mhz=_opt_int(payload.get("sm_clock_mhz")),
+                sm_clock_max_mhz=_opt_int(payload.get("sm_clock_max_mhz")),
+                swap_in_bps=_opt_float(payload.get("swap_in_bps")),
+                swap_out_bps=_opt_float(payload.get("swap_out_bps")),
+                major_faults_per_s=_opt_float(payload.get("major_faults_per_s")),
+                memory_pressure_pct=_opt_float(payload.get("memory_pressure_pct")),
             ),
         )
 
@@ -1045,7 +1156,7 @@ class Registry:
         )
 
     def available_memory(self, node_id: str, guardrail: float = DEFAULT_GUARDRAIL) -> int:
-        """Live allocatable bytes on one node. What Agent D should gate on.
+        """Live allocatable bytes on one node. What the fit calculator should gate on.
 
         ``NodeProfile.usable_memory`` is the static ceiling this hardware could
         ever spend. On a Spark that ceiling is not reachable while an operating
@@ -1127,7 +1238,7 @@ class Registry:
         return self._telemetry.history(node_id, seconds, now=self._clock())
 
     def snapshot(self) -> dict:
-        """The current picture, in the shape Agent G wraps into an SSE event.
+        """The current picture, in the shape the gateway wraps into an SSE event.
 
         Cluster throughput and deployment rows are the gateway's to add; the
         registry contributes nodes and the physical totals it actually measures.

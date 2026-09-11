@@ -1,7 +1,7 @@
 """The provider service: registry, discovery, forwarding, health, spend.
 
 Implements :class:`~control_plane.contracts.ports.ProviderPort` and the three
-extras Agent G routes on: :meth:`ProviderService.forward`,
+extras the gateway routes on: :meth:`ProviderService.forward`,
 :meth:`ProviderService.route_targets`, :meth:`ProviderService.spend_today`.
 
 The shape of the thing: the cluster is the default and a paid API is the
@@ -54,7 +54,7 @@ from .errors import (
     UpstreamError,
 )
 from .kinds import KindSpec, auth_headers, join_url, native_base, spec_for
-from .runtime import ProviderRuntime, jittered_delay, parse_retry_after
+from .runtime import ProviderRuntime, jittered_delay, parse_retry_after, utc_day
 from .secrets import (
     Redactor,
     SecretRedactingFilter,
@@ -192,6 +192,22 @@ class _Entry:
         self.models_by_upstream = {m.upstream_id: m for m in self.provider.models}
 
 
+def existing_provider_for(providers: list[Provider], base_url: str) -> Provider | None:
+    """A provider already registered against *base_url*, or None.
+
+    Compared on the URL rather than on the node, because that is what makes
+    two entries a duplicate as far as routing is concerned. Trailing slashes
+    are normalised; nothing else is, since a different port or scheme really
+    is a different upstream. Shared by the manual ``POST /api/nodes/{id}/runtime``
+    route and the background auto-adopt loop so the two cannot drift apart.
+    """
+    want = (base_url or "").rstrip("/")
+    for p in providers or []:
+        if str(getattr(p, "base_url", "") or "").rstrip("/") == want:
+            return p
+    return None
+
+
 class ProviderService:
     """Remote OpenAI-compatible upstreams as first-class route targets."""
 
@@ -204,8 +220,15 @@ class ProviderService:
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
         now: Callable[[], float] = time.time,
         refresh_interval_s: float = PROVIDER_REFRESH_S,
+        events: Any = None,
     ) -> None:
         root = Path(data_path) if data_path is not None else data_dir()
+        # Optional, and degrades: a service constructed without one accounts
+        # exactly as before and simply reports no budget crossings.
+        self._events = events
+        #: provider_id -> the budget sentence last reported, so a CROSSING is
+        #: emitted once and a standing condition is not re-emitted per request.
+        self._budget_state: dict[str, str | None] = {}
         self.redactor = Redactor()
         self.secrets = secrets or SecretStore(root / "secrets.json", redactor=self.redactor)
         # Share one redactor so a value resolved anywhere is scrubbed everywhere.
@@ -640,6 +663,8 @@ class ProviderService:
         if "daily_budget_usd" in patch:
             value = patch["daily_budget_usd"]
             entry.runtime.daily_budget_usd = None if value is None else float(value)
+            # The other crossing direction: the spend did not move, the cap did.
+            self._check_budget(entry)
         if "base_url" in patch:
             base_url = str(patch["base_url"]).strip()
             if looks_like_secret(base_url):
@@ -1071,10 +1096,10 @@ class ProviderService:
         return in_cost * COST_BLEND_INPUT_WEIGHT + out_cost * COST_BLEND_OUTPUT_WEIGHT
 
     def route_targets(self) -> list[RouteTarget]:
-        """Every remote model as a target Agent G can merge with local ones.
+        """Every remote model as a target the gateway can merge with local ones.
 
         ``strength`` stays zero: it is a normalized score over local hardware
-        and we have not measured a remote. ``weight`` is Agent G's to compute.
+        and we have not measured a remote. ``weight`` is the gateway's to compute.
         """
         now = self._now()
         targets: list[RouteTarget] = []
@@ -1122,9 +1147,17 @@ class ProviderService:
     # -- forwarding --------------------------------------------------------
 
 
-    def _prepare(
-        self, provider_id: str, upstream_id: str, body: dict, stream: bool, endpoint: str
-    ) -> tuple[_Entry, str, dict[str, str], dict]:
+    def _admit(
+        self, provider_id: str, upstream_id: str, endpoint: str
+    ) -> tuple[_Entry, str, dict[str, str]]:
+        """Every gate a forwarded request passes, and the credentials it needs.
+
+        Split out of :meth:`_prepare` so the raw-body path runs EXACTLY these
+        checks rather than a second copy of them. Enabled, serves, rate
+        limited, over budget, key resolution and the URL join are all decisions
+        about whether this provider may be called at all -- none of them looks
+        at the body, so none of them belongs to the JSON path alone.
+        """
         entry = self._entry(provider_id)
         if not entry.spec.forwardable:
             raise AdapterUnsupportedError(
@@ -1149,13 +1182,19 @@ class ProviderService:
                 f"rate limited for another {entry.runtime.retry_in(now):.0f}s",
                 retry_after_s=entry.runtime.retry_in(now),
             )
-        if entry.runtime.over_budget(now):
-            raise ProviderNotAdmittingError(
-                provider_id,
-                f"daily budget of ${entry.runtime.daily_budget_usd:.2f} reached",
-            )
+        budget_block = entry.runtime.budget_block(now)
+        if budget_block is not None:
+            # The same sentence the providers screen shows. This used to be a
+            # second, shorter copy that omitted how much had been spent.
+            raise ProviderNotAdmittingError(provider_id, budget_block)
         key = self.resolve_key(provider_id)
         headers = auth_headers(entry.spec, key)
+        return entry, join_url(entry.provider.base_url, endpoint), headers
+
+    def _prepare(
+        self, provider_id: str, upstream_id: str, body: dict, stream: bool, endpoint: str
+    ) -> tuple[_Entry, str, dict[str, str], dict]:
+        entry, url, headers = self._admit(provider_id, upstream_id, endpoint)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream" if stream else "application/json"
 
@@ -1194,8 +1233,31 @@ class ProviderService:
             # accept the field. Spend accounting is not worth a 400.
             payload["stream_options"] = {"include_usage": True}
 
-        url = join_url(entry.provider.base_url, endpoint)
         return entry, url, headers, payload
+
+    def _prepare_raw(
+        self, provider_id: str, upstream_id: str, content_type: str, endpoint: str
+    ) -> tuple[_Entry, str, dict[str, str]]:
+        """:meth:`_admit`, with the caller's own content type carried through.
+
+        The body is opaque here, so two things `_prepare` does cannot be done
+        and the caller owns them instead:
+
+        * **The model name.** `_prepare` forces ``payload["model"] =
+          upstream_id``; in a multipart upload that field is a form part, and
+          ``gateway/openai_api.py::_rewrite_multipart_field`` has already
+          rewritten it before these bytes arrive. This trusts that.
+        * **The backend pin.** OpenRouter's ``provider: {only: [...]}`` is a
+          JSON field with no documented multipart equivalent, so an operator's
+          backend pin does not reach a transcription. Refused to invent a form
+          part for it -- a pin that silently did nothing would be worse than
+          one that visibly does not apply here.
+        """
+        entry, url, headers = self._admit(provider_id, upstream_id, endpoint)
+        # Boundary and all: rewriting it would invalidate the body.
+        headers["Content-Type"] = content_type
+        headers["Accept"] = "application/json"
+        return entry, url, headers
 
     @asynccontextmanager
     async def open_upstream(
@@ -1215,6 +1277,78 @@ class ProviderService:
         entry, url, headers, payload = await asyncio.to_thread(
             self._prepare, provider_id, upstream_id, body, stream, endpoint
         )
+        async with self._open_prepared(
+            entry, url, headers,
+            upstream_id=upstream_id, stream=stream, send={"json": payload},
+        ) as opened:
+            yield opened
+
+    @asynccontextmanager
+    async def open_upstream_raw(
+        self,
+        provider_id: str,
+        upstream_id: str,
+        content: bytes,
+        content_type: str,
+        *,
+        endpoint: str = "audio/transcriptions",
+    ) -> AsyncIterator[UpstreamResponse]:
+        """:meth:`open_upstream` for a body this gateway cannot read.
+
+        A multipart upload has no dict to build a payload from, and that alone
+        is why transcriptions used to bypass this class entirely -- taking a
+        raw forward that carried the provider's key and nothing else. Not the
+        backoff, not the auth-failure latching, not the `outstanding` counter,
+        and above all not the usage accounting: **nothing a transcription
+        spent was ever recorded**, so the daily budget gate it passes on the
+        way in never saw the traffic it was meant to be gating.
+
+        The old comment here said that was acceptable "because transcription is
+        priced per audio-minute and nothing on this path can read that figure
+        anyway". The premise is wrong for the provider that matters. OpenRouter
+        returns a usage block on its transcription responses carrying its own
+        `cost`, and `providers/usage.py` already reads exactly that field --
+        so this path prices itself the same way chat does. Where a provider
+        reports nothing, the request is still counted as unpriced rather than
+        estimated: pricing and accounting are separate, and only one of them
+        needed a figure we do not have.
+
+        Deliberately a separate method rather than a `content=` kwarg on
+        :meth:`open_upstream`. The gateway duck-types that method off the
+        providers port (`getattr(..., "open_upstream", None)`) and the test
+        doubles pin its signature, so a new keyword would raise TypeError at
+        request time against any port that predates it. A new name simply is
+        not found, and the caller falls back to the raw forward it uses today.
+
+        Never streaming: a transcription answers with one JSON document.
+        """
+        entry, url, headers = await asyncio.to_thread(
+            self._prepare_raw, provider_id, upstream_id, content_type, endpoint
+        )
+        async with self._open_prepared(
+            entry, url, headers,
+            upstream_id=upstream_id, stream=False, send={"content": content},
+        ) as opened:
+            yield opened
+
+    @asynccontextmanager
+    async def _open_prepared(
+        self,
+        entry: "_Entry",
+        url: str,
+        headers: dict[str, str],
+        *,
+        upstream_id: str,
+        stream: bool,
+        send: dict,
+    ) -> AsyncIterator[UpstreamResponse]:
+        """The wire half both open_upstream forms share.
+
+        One copy of the retry ladder, the 429/401/5xx handling, every
+        `runtime.note_*` call and the usage sniffer, because two copies is how
+        the raw path would quietly stop matching the JSON one. *send* is the
+        one thing that differs: ``{"json": payload}`` or ``{"content": bytes}``.
+        """
         client = self._client()
         timeout = httpx.Timeout(
             connect=CONNECT_TIMEOUT_S,
@@ -1231,13 +1365,13 @@ class ProviderService:
                 now = self._now()
                 try:
                     context = client.stream(
-                        "POST", url, json=payload, headers=headers, timeout=timeout
+                        "POST", url, headers=headers, timeout=timeout, **send
                     )
                     response = await context.__aenter__()
                 except httpx.HTTPError as exc:
                     runtime.note_transport_error(now, type(exc).__name__)
                     raise UpstreamError(
-                        provider_id,
+                        entry.provider.provider_id,
                         502,
                         f"could not reach upstream: {type(exc).__name__}",
                     ) from None
@@ -1254,14 +1388,14 @@ class ProviderService:
                 if status == 429:
                     seconds = runtime.note_rate_limit(now, retry_after, message)
                     raise UpstreamError(
-                        provider_id, status, message,
+                        entry.provider.provider_id, status, message,
                         body=self.redactor.scrub(raw.decode("utf-8", "replace")),
                         retry_after_s=seconds,
                     )
                 if status in (401, 403):
                     runtime.note_auth_failure(now, status, entry.provider.api_key_ref, message)
                     raise UpstreamError(
-                        provider_id, status, message,
+                        entry.provider.provider_id, status, message,
                         body=self.redactor.scrub(raw.decode("utf-8", "replace")),
                     )
                 if status >= 500 and attempt < SERVER_ERROR_RETRIES:
@@ -1271,7 +1405,7 @@ class ProviderService:
                 if status >= 500:
                     runtime.note_server_error(now, status, message)
                 raise UpstreamError(
-                    provider_id,
+                    entry.provider.provider_id,
                     status,
                     message,
                     body=self.redactor.scrub(raw.decode("utf-8", "replace")),
@@ -1367,9 +1501,70 @@ class ProviderService:
             out[name] = self.redactor.scrub(value)
         return out
 
+    def attach_events(self, events: Any) -> None:
+        """Point budget crossings at an emitter, after construction.
+
+        `node.py` builds this service before the telemetry bundle exists, so
+        the wiring happens in `gateway/app.py` where `GatewayEvents` is in
+        scope. Without it the service accounts exactly as before and simply
+        reports no crossings.
+        """
+        self._events = events
+
+    def _check_budget(self, entry: _Entry) -> None:
+        """Emit when the cap CROSSES, in either direction, and only then.
+
+        Two ways to cross and both are real: spend rises past a fixed cap, or
+        an operator lowers the cap below what has already been spent today. So
+        this is called from `_record_usage` and from `update()` rather than
+        from one of them.
+
+        `over_budget` was previously only ever ASKED -- at admission, and when
+        the providers screen rendered -- so nothing knew when the crossing
+        happened, only that it currently held. Comparing against the last
+        reported sentence is what turns that into an edge.
+        """
+        if self._events is None:
+            return
+        provider_id = entry.provider.provider_id
+        try:
+            now = self._now()
+            block = entry.runtime.budget_block(now)
+            if block == self._budget_state.get(provider_id):
+                return  # no crossing; a standing condition stays standing
+            self._budget_state[provider_id] = block
+            day = utc_day(now)
+            if block is None:
+                self._events.budget_cleared(provider_id, day)
+            else:
+                self._events.budget_reached(
+                    provider_id,
+                    detail=block,
+                    daily_budget_usd=entry.runtime.daily_budget_usd or 0.0,
+                    spend_today_usd=entry.runtime.spend_today(now),
+                    day=day,
+                )
+        except Exception:  # pragma: no cover - reporting may not break serving
+            log.debug("could not report a budget crossing", exc_info=True)
+
     def _record_usage(self, entry: _Entry, upstream_id: str, sniffer: UsageSniffer) -> None:
         usage = sniffer.result()
         if usage is None:
+            # Served, and could not be priced. Counting nothing here is what
+            # made a day of provider audio traffic render as "$0.00, idle" on
+            # the Spend screen: `rows.ts::cloudSpend` reads `requests == 0` as
+            # "nothing was served today. A real zero." -- so a response with no
+            # usage block (an MP3 from /audio/speech, a Custom box, Ollama)
+            # was a fabricated zero presented as knowledge.
+            #
+            # `unpriced_requests` already means "served but not charged"; this
+            # widens it from "no rate card for that model" to include "the
+            # response said nothing", which is one concept and needs no new
+            # field on the wire.
+            entry.runtime.record_unpriced(self._now())
+            entry.runtime.prune_spend(self._now())
+            self._spend_dirty = True
+            self._check_budget(entry)
             return
         model = entry.models_by_upstream.get(upstream_id)
         cost = entry.runtime.record_usage(
@@ -1392,6 +1587,7 @@ class ProviderService:
         # Spend is written on a timer, not per request. A disk write in the
         # hot path would cost more than the accounting is worth.
         self._spend_dirty = True
+        self._check_budget(entry)
         if self._now() - self._spend_persisted_at >= SPEND_PERSIST_INTERVAL_S:
             self._persist()
 
