@@ -59,10 +59,9 @@ from control_plane.contracts.auth import (
 from control_plane.contracts.auth import AuditAction
 from control_plane.keys import format as key_format
 
-from .csrf import is_cross_site_write, trusted_origins
+from .csrf import is_cross_site_write
 from .errors import error_response
 from control_plane.redaction import Redactor, printable
-from control_plane.telemetry.records import AccessRecord
 
 log = logging.getLogger("gateway.authz")
 access_log = logging.getLogger("gateway.access")
@@ -445,12 +444,21 @@ def _query_of(scope) -> str:
     return query[:200]
 
 
+def trusted_origins(settings) -> tuple[str, ...]:
+    """``DERATE_ALLOWED_ORIGINS`` plus ``DERATE_PUBLIC_ORIGIN`` when set."""
+    public = getattr(settings, "public_origin", "")
+    return tuple(settings.allowed_origins) + ((public,) if public else ())
+
+
 def _emit_access(scope, state: dict, *, method: str, path: str, query: str,
                  status: int | None, duration_ms: float) -> None:
     """The durable twin of the ``gateway.access`` line: an ``access`` row on
     the telemetry sink, which ``DERATE_TELEMETRY=0`` does not switch off.
     Never raises."""
     try:
+        # Imported here: AccessRecord ships with the telemetry branch, and
+        # without it the access row is skipped rather than the gateway failing.
+        from control_plane.telemetry.records import AccessRecord
         ctx = scope["app"].state.ctx
         sink = getattr(ctx, "sink", None)
         if sink is None or not hasattr(sink, "access"):
