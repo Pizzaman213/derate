@@ -58,6 +58,9 @@ class ProxyHttp:
 
 
 def build_poller(ctx: GatewayContext):
-    from control_plane.telemetry.engine_metrics import EngineMetricsPoller
+    try:
+        from control_plane.telemetry.engine_metrics import EngineMetricsPoller
+    except ImportError:  # the telemetry branch is not merged: no engine scrape
+        return None
 
     return EngineMetricsPoller(ProxyHttp(ctx.proxy), lambda: engines(ctx))
