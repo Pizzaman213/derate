@@ -75,7 +75,7 @@ export function SpeculativeField({
   const active = describes(options, chosen)
 
   return (
-    <div style={{ marginTop: 'var(--s-3)' }}>
+    <div style={{ marginTop: 'var(--space-12)' }}>
       <label
         htmlFor="sp-on"
         style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}
@@ -343,11 +343,11 @@ function Advanced({
   }
 
   return (
-    <details style={{ marginTop: 'var(--s-2)' }}>
+    <details style={{ marginTop: 'var(--space-8)' }}>
       <summary className="unit" style={{ cursor: 'pointer' }}>
         Change head
       </summary>
-      <div className="fld" style={{ maxWidth: 320, marginTop: 'var(--s-2)' }}>
+      <div className="fld" style={{ maxWidth: 320, marginTop: 'var(--space-8)' }}>
         <label htmlFor="sp-spec">Method</label>
         <Select
           id="sp-spec"
@@ -400,7 +400,7 @@ function HeadField({
 }) {
   const [text, setText] = useState(value)
   return (
-    <div className="fld" style={{ maxWidth: 320, marginTop: 'var(--s-2)' }}>
+    <div className="fld" style={{ maxWidth: 320, marginTop: 'var(--space-8)' }}>
       <label htmlFor="sp-head">Draft head repository</label>
       <input
         id="sp-head"
@@ -577,7 +577,7 @@ function HeadBrowser({
 
   const ordered = orderHeads(found.heads)
   return (
-    <div style={{ marginTop: 'var(--s-2)', display: 'grid', gap: 4 }}>
+    <div style={{ marginTop: 'var(--space-8)', display: 'grid', gap: 4 }}>
       <div className="unit">
         {found.heads.length} usable
         {found.rejected_total ? `, ${found.rejected_total} refused` : ''}

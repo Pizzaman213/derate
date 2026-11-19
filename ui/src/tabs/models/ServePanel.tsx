@@ -605,7 +605,7 @@ export function ServePanel({
           result exists on a cluster runtime, it moves inside the Verdict
           card below instead -- see the `result` branch. */}
       {!onCluster ? (
-        <div style={{ marginTop: 'var(--s-3)' }}>
+        <div style={{ marginTop: 'var(--space-12)' }}>
           <div className="sub">quantizations</div>
           <QuantLadder
             ladder={ladder}
@@ -621,7 +621,7 @@ export function ServePanel({
           />
         </div>
       ) : result ? (
-        <div style={{ marginTop: 'var(--s-3)' }}>
+        <div style={{ marginTop: 'var(--space-12)' }}>
           <Verdict
             result={result}
             checking={checking}
@@ -689,7 +689,7 @@ export function ServePanel({
           />
         </div>
       ) : (
-        <div style={{ marginTop: 'var(--s-3)' }}>
+        <div style={{ marginTop: 'var(--space-12)' }}>
           {error ? (
             <p
               className="label"
@@ -697,13 +697,13 @@ export function ServePanel({
                 color: 'var(--fault)',
                 fontWeight: 400,
                 whiteSpace: 'pre-wrap',
-                margin: '0 0 var(--s-3)',
+                margin: '0 0 var(--space-12)',
               }}
             >
               {error}
             </p>
           ) : (
-            <p className="unit" style={{ margin: '0 0 var(--s-3)' }}>
+            <p className="unit" style={{ margin: '0 0 var(--space-12)' }}>
               Checking where this fits…
             </p>
           )}
