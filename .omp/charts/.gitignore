@@ -1,9 +1,0 @@
-node_modules/
-dist/
-tests/.results/
-tests/visual/actual/
-tests/visual/diff/
-tests/visual/baseline/
-tests/.build/
-out/
-out/
