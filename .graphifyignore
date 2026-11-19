@@ -1,0 +1,15 @@
+# What graphify skips when building .omp/graph/graphify-out (gitignore syntax,
+# additive to its own noise list). Generated output, vendored trees, screenshots
+# and the design pack's own graph never belong in the code graph.
+node_modules/
+ui/dist/
+ui/screens/
+ui/mockups/
+ui/mockups-next/
+package-lock.json
+.omp/node_modules/
+.omp/design/icons/components/
+.omp/graph/
+.omp/tests/ui/.build/
+.omp/tests/ui/screens/
+docs/screenshots/

@@ -1,0 +1,5 @@
+docs/CONTRACTS.md linguist-generated=true
+control_plane/contracts/manifest.json linguist-generated=true
+control_plane/contracts/routes.json linguist-generated=true
+requirements.lock linguist-generated=true
+ui/package-lock.json linguist-generated=true

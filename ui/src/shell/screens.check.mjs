@@ -16,9 +16,8 @@
 // It writes ui/screens/<dest>.png -- one per destination in state/routes.ts,
 // enumerated from `DESTINATIONS` there rather than listed here, so a new screen
 // is captured and asserted the first time it exists,
-// which is also the point: `layout.check.mjs` writes layout-preview.svg so a
-// shape can be eyeballed with no cluster and no browser, and this is the same
-// instinct applied to the whole app. The PNGs are how a person, or Claude,
+// which is also the point: a shape should be eyeballed, not inferred, and this
+// is that instinct applied to the whole app. The PNGs are how a person, or Claude,
 // sees what the change actually did instead of inferring it from source.
 //
 // No browser is downloaded to run this. It uses the Chromium already in the
@@ -27,6 +26,8 @@
 // explicit executablePath means the driver's version does not have to match
 // the cached browser's revision.
 
+// First, for its side effect: logs in, and authenticates every fetch below.
+import { sessionCookie } from '../check/auth.mjs'
 import { execFileSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -34,6 +35,7 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { findBrowser } from '../check/browser.mjs'
 import { load, report } from '../check/harness.mjs'
+import { alignmentAudit } from '../check/alignment.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const uiRoot = join(here, '..', '..')
@@ -54,13 +56,19 @@ note(`chromium: ${browser.why}`)
 
 const get = async (p) => (await fetch(`${ORIGIN}${p}`)).json()
 
+if (!sessionCookie) {
+  console.error('no admin session: set DERATE_CHECK_ADMIN_USER / DERATE_CHECK_ADMIN_PASSWORD')
+  process.exit(1)
+}
+
 // Ids come off the live coordinator rather than being written down here. A
 // hardcoded model id rots the moment the cluster changes, and a verifier that
 // silently walks a 404 is worse than one that does not walk it at all.
-const [models, topology, deployments] = await Promise.all([
+const [models, topology, deployments, keys] = await Promise.all([
   get('/api/models').catch(() => null),
   get('/api/topology').catch(() => null),
   get('/api/deployments').catch(() => null),
+  get('/api/keys').catch(() => null),
 ])
 const someModel = models?.models?.[0]?.model_id ?? models?.[0]?.model_id ?? null
 const someNode = topology?.nodes?.[0]?.node_id ?? null
@@ -73,6 +81,9 @@ const depRank = (s) =>
   s === 'ready' ? 0 : s === 'degraded' ? 1 : s === 'launching' || s === 'planned' ? 2 : 3
 const depRows = Array.isArray(deployments) ? deployments : (deployments?.deployments ?? [])
 const someDep = [...depRows].sort((a, b) => depRank(a.state) - depRank(b.state))[0]?.served_name ?? null
+// A key that exists on this coordinator, for its detail page. Setup always
+// leaves one (the default key).
+const someKey = Array.isArray(keys) ? (keys.find((k) => !k.is_admin_key) ?? keys[0])?.key_id : null
 
 // Whether a secret reached the screen is asked with the server's own
 // Redactor, primed with the REAL stored values -- not with a shape heuristic
@@ -87,11 +98,20 @@ const secretScan = (text) =>
     'store = SecretStore()',
     'values = [v for v in store._load_file().values() if v]',
     'values += [v for k, v in __import__("os").environ.items() if k.endswith("_API_KEY") and v]',
+    // The ChatGPT sign-in tokens live in oauth.json, not secrets.json.
+    'from control_plane.paths import data_dir',
+    'from control_plane.providers.oauth_store import OAuthStore',
+    'values += [v for v in OAuthStore(data_dir() / "oauth.json", redactor=Redactor()).token_values() if v]',
     'r = Redactor()',
     '[r.remember(v) for v in values]',
     'text = sys.stdin.read()',
     'print(json.dumps({"known": len(values), "leaked": r.contains_secret(text)}))',
   ].join('\n')], { input: text, cwd: repoRoot, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }))
+
+/** derate's own key shape. Mirrors api/redact.ts DRT_KEY. Unlike a provider
+ *  key this one has a fixed, unmistakable shape, so a shape test over the
+ *  rendered text cannot cry wolf the way the one above did. */
+const DRT_KEY = /\bdrt_[a-z0-9]{10}_[A-Za-z0-9_-]{32,}/
 
 // One per destination, read out of the scheme rather than written down here.
 // This was a literal array of seven paths under a header that already claimed
@@ -102,28 +122,39 @@ const secretScan = (text) =>
 // newest thing at exactly the moment somebody adds one.
 //
 // The name is the segment, so `screens/<dest>.png` keeps the filenames it had.
+// /usage's panes are not destinations, so the walk does not reach them; they
+// are read out of the scheme too (`USAGE_SUBS`), and the overview is `usage`.
 const routes = await load(import.meta.url, '../state/routes.ts')
 const blank = routes.parse('/')
 const SCREENS = routes.DESTINATIONS.map((dest) => {
   const path = routes.href({ ...blank, dest })
   return [path.replace(/^\//, ''), path]
 })
+for (const sub of routes.USAGE_SUBS) {
+  if (sub !== 'overview') SCREENS.push([`usage-${sub}`, routes.href({ ...blank, dest: 'usage', sub })])
+}
 if (someModel) SCREENS.push(['model-detail', `/models/${someModel}`])
 if (someNode) SCREENS.push(['node-sheet', `/cluster?open=node:${someNode}`])
 if (someDep) SCREENS.push(['dep-sheet', `/dashboard?open=dep:${encodeURIComponent(someDep)}`])
+if (someKey) SCREENS.push(['keys-detail', routes.href({ ...blank, dest: 'usage', sub: 'keys', key: someKey })])
 
 mkdirSync(outDir, { recursive: true })
 
 const engine = await chromium.launch({ executablePath: browser.path })
-const page = await engine.newPage({
-  viewport: { width: 1440, height: 900 },
-  reducedMotion: 'reduce',
-  colorScheme: 'dark',
-})
+// Two pages: one signed in as the check admin, and one with no session for
+// the login screen -- which a signed-in browser is redirected away from.
+const pageOptions = { viewport: { width: 1440, height: 900 }, reducedMotion: 'reduce', colorScheme: 'dark' }
+// The widths the alignment audit measures each page at: the shot's, a laptop,
+// a phone.
+const ALIGN_WIDTHS = [1440, 1024, 390]
+const authed = await engine.newPage(pageOptions)
+await authed.context().addCookies([sessionCookie])
+const anon = await engine.newPage(pageOptions)
 
 const transcript = []
 
 for (const [name, path] of SCREENS) {
+  const page = name === 'login' ? anon : authed
   const errors = []
   const badRequests = []
   const offsite = []
@@ -157,6 +188,15 @@ for (const [name, path] of SCREENS) {
 
   const rootHeight = await page.evaluate(() => document.getElementById('root')?.getBoundingClientRect().height ?? 0)
   const text = await page.evaluate(() => document.body.innerText ?? '')
+  // Alignment breaks where text wraps, and at 1440 almost nothing wraps: the
+  // first sweep found every table bounce at 1024 and 390 and none here. So the
+  // same page is re-measured narrower -- a resize, not a reload or a shot.
+  const misaligned = []
+  for (const width of ALIGN_WIDTHS) {
+    await page.setViewportSize({ width, height: pageOptions.viewport.height })
+    for (const f of await page.evaluate(alignmentAudit)) misaligned.push(`@${width} ${f}`)
+  }
+  await page.setViewportSize(pageOptions.viewport)
 
   if (!captureOnly) {
     check(rootHeight > 0, `${name}: #root has rendered something (${Math.round(rootHeight)}px)`)
@@ -167,6 +207,15 @@ for (const [name, path] of SCREENS) {
     const scan = secretScan(text)
     if (scan.known === 0) note(`${name}: no stored secrets on this box to look for`)
     else check(!scan.leaked, `${name}: none of the ${scan.known} stored secrets is on the screen`)
+    check(!DRT_KEY.test(text), `${name}: no drt_ API key is on the screen`)
+    // Controls in one row share a centre line, a table row's cells one
+    // baseline -- check/alignment.mjs. Every offender is listed: the first one
+    // alone hides whether a fix moved the whole row or one control.
+    check(
+      misaligned.length === 0,
+      `${name}: everything laid out in a row sits on one line` +
+        (misaligned.length ? ` -- ${misaligned.length} off:\n      ${misaligned.join('\n      ')}` : ''),
+    )
   }
 
   transcript.push(`${name}  ${path}  root=${Math.round(rootHeight)}px  errors=${errors.length}  assets=${badRequests.length}`)

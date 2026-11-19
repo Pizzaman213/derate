@@ -295,7 +295,7 @@ folder assumes:
 ```
 
 Downwards, `AppShell` imports the seven destination components
-(`tabs/DashboardTab`, `ModelsTab`, `ClusterTab`, `ChatTab`, `SpendTab`,
+(`tabs/DashboardTab`, `ModelsTab`, `ClusterTab`, `ChatTab`, `UsageTab`,
 `SettingsTab`, `SetupTab`) and `sidebar/Sidebar`, and passes them nothing. They
 read `useSelection()`, `useRouter()` and the resource hooks themselves.
 

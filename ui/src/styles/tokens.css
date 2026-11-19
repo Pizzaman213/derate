@@ -1,227 +1,412 @@
-/* The entire palette. Components reference these names and never a literal
-   colour, so dark mode is a token swap rather than a second set of components.
+/* GENERATED copy of the design pack's tokens.css (.omp/design/tokens/tokens.css); regenerate there, then re-copy. */
+/* GENERATED from tokens.json by .omp/design/tokens/build.mjs — edit tokens.json, then: cd .omp && npm run tokens:build */
 
-   Three things here are load-bearing and were added deliberately:
-
-   1. --fill is SPLIT FROM --ink. They used to be the same value, which made
-      every selection indicator in the flow graph invisible: an outline drawn
-      stroke:var(--ink) on a fill:var(--fill) rect is 1.00:1 in light and
-      1.13:1 in dark. Selection is now drawn OUTSIDE the plate against the
-      page with --select-on-panel, or inside it with --select-on-fill.
-
-   2. The surface ramp runs BOTH directions. There was no token for "above the
-      page", so a dialog painted --panel over a dimmed page was invisible in
-      dark mode -- 1.07:1 against its own scrim. --panel-raised fixes it, and
-      --panel-sunk gives meter tracks something to be, since a track that
-      cannot be seen is a proportion with no denominator.
-
-   3. Status colours are PER THEME. They render as text (Readout tone="fault"),
-      and #A93A2E on #191817 is 2.81:1 -- the failure state was the least
-      readable thing in dark mode. Values below are tuned for text on --panel;
-      the heavier originals live on as -solid for fills and dots. */
-
+/* Light, plus every theme-invariant token and the component layer. */
 :root {
-  /* Surfaces, sunk -> raised. */
-  --panel-sunk: #D6D0C2;      /* meter tracks, wells */
-  --panel-recessed: #E3DED3;  /* sidebar, cards on the page */
-  --panel: #EDE9E0;           /* the page */
-  --panel-raised: #F7F4EE;    /* dialog, popover */
+  /* space */
+  --space-0: 0px;
+  --space-1: 1px;
+  --space-2: 2px;
+  --space-3: 3px;
+  --space-4: 4px;
+  --space-5: 5px;
+  --space-6: 6px;
+  --space-7: 7px;
+  --space-8: 8px;
+  --space-9: 9px;
+  --space-10: 10px;
+  --space-11: 11px;
+  --space-12: 12px;
+  --space-13: 13px;
+  --space-14: 14px;
+  --space-15: 15px;
+  --space-16: 16px;
+  --space-17: 17px;
+  --space-18: 18px;
+  --space-20: 20px;
+  --space-22: 22px;
+  --space-24: 24px;
+  --space-30: 30px;
+  --space-32: 32px;
+  --space-34: 34px;
+  --space-36: 36px;
+  --space-48: 48px;
+  --space-66: 66px;
+  --space-96: 96px;
+  /* opacity */
+  --opacity-25: 0.25;
+  --opacity-38: 0.38;
+  --opacity-45: 0.45;
+  --opacity-55: 0.55;
+  --opacity-60: 0.6;
+  --opacity-62: 0.62;
+  --opacity-72: 0.72;
+  --opacity-85: 0.85;
+  /* semantic.color */
+  --panel-sunk: #D6D0C2;
+  --panel-recessed: #E3DED3;
+  --panel: #EDE9E0;
+  --panel-raised: #F7F4EE;
   --panel-overlay: rgba(26, 25, 23, 0.35);
-  --shadow-raised: 0 6px 24px rgba(26, 25, 23, 0.16);
-
   --ink: #1A1917;
-  --ink-muted: #5C5851;       /* was #6E6A62: 4.44:1 failed AA on 12px text */
+  --ink-secondary: #423D37;
+  --ink-muted: #5C5851;
   --rule: #C9C2B4;
-  --rule-strong: #B4AC9A;     /* soft dividers, 1.86:1 -- decorative only */
-  /* Boundaries that must be PERCEIVABLE: control borders and meter-track
-     keylines. A bar whose track cannot be seen is a proportion with no
-     denominator, and a luminance step alone never survives a warm palette --
-     --panel-sunk is only 1.47:1 against the page, so the keyline does the work. */
-  --edge: #82796B;            /* 3.54:1 light, 3.85:1 dark */
-
-  /* The inverted plate, distinct from text ink. */
+  --rule-strong: #B4AC9A;
+  --edge: #82796B;
   --fill: #33302B;
   --on-fill: #EDE9E0;
   --on-fill-dim: #A8A398;
-  --select-on-panel: var(--ink);
-  --select-on-fill: var(--on-fill);
-
-  /* Signal. Tuned for TEXT on --panel; -solid for fills and dots. */
-  --live: #2F6E3A;            /* 5.08:1 */
-  --warn: #7F5C14;            /* 5.03:1 -- #8A6318 measured 4.47 and missed AA */
-  --fault: #9A3327;           /* 6.02:1 */
+  --select-on-panel: #1A1917;
+  --select-on-fill: #EDE9E0;
+  --live: #2F6E3A;
+  --warn: #7F5C14;
+  --fault: #9A3327;
+  --info: #3E6194;
   --live-solid: #3D8B4A;
   --warn-solid: #B8862C;
   --fault-solid: #A93A2E;
+  --info-solid: #4A6FA5;
   --on-signal: #EDE9E0;
-
-  /* A request in flight. An accent, not a grey: it is a real measured event
-     and the least salient mark on the drawing was the wrong call. */
   --flow: #4A6FA5;
-
-  /* The return leg: output tokens leaving. `--flow` is spent on "a request in
-     flight" and must stay spent on it, so these are their own pair -- both
-     clear of the three signal hues, so a token block can never be read as a
-     verdict. Streamed and buffered differ by hue AND by block width, so the
-     distinction survives a greyscale screenshot. Filled marks, not text, so
-     the bar is SC 1.4.11's 3:1 rather than 4.5:1; measured against --panel
-     these are 4.04:1 and 4.18:1 light, 8.65:1 and 7.31:1 dark, which puts
-     them beside --flow's own 4.22:1 rather than under it. */
   --stream: #377A86;
   --batch: #7A62A9;
-
-  /* Identity, not status. `--tag-*` colours a chat turn by WHICH MODEL it went
-     to, in a tab where the model changes between turns -- see
-     tabs/chat/tags.ts, which owns the assignment and the reasoning. Four hues,
-     each also used dashed, for eight identities; a ninth model is drawn
-     plainly rather than repeating a hue, because a wrong mark says "the same
-     model" and an absent one says "read the name".
-
-     THE ORDER IS THE USE ORDER, NOT THE SPECTRUM. A first draft ran
-     blue-teal-violet-magenta, which is how a ramp is normally written and put
-     the two closest hues on the two commonest slots: a two-model transcript
-     came out blue against teal, 29 degrees apart, and the screenshot of it is
-     the reason this paragraph exists -- the rule was correct, both models were
-     coloured, and no one could tell at a glance, which is the entire feature.
-     So the ramp is ordered blue, magenta, teal, violet: the two-model case is
-     the 100-degree pair and the worst pair anywhere is 43. Reordering these
-     lines re-pairs them, so do not tidy them into spectrum order.
-
-     Deliberately clear of --live/--warn/--fault -- nothing is within 42
-     degrees of a status hue, because a model's identity must never be readable
-     as a verdict on it. Distinct from --flow/--stream/--batch as tokens too:
-     those mean something about a request, these mean nothing but "the same one
-     as that block". They are the label TEXT as well as the rule, so the bar is
-     SC 1.4.3's 4.5:1 and not 3:1 -- 5.28 to 5.81:1 light, 7.20 to 8.67:1 dark,
-     which also leaves room under them for the 6% tint the block carries. All
-     four numbers are asserted by tabs/chat/tags.check.mjs. */
+  --accent: #4A6FA5;
+  --on-accent: rgba(255, 255, 255, 0.94);
   --tag-1: #3A51B0;
   --tag-2: #9C2E70;
   --tag-3: #0B6A6A;
   --tag-4: #7D42A4;
-
-  /* Type */
+  --hover: color-mix(in srgb, var(--ink) 5%, transparent);
+  --pressed: color-mix(in srgb, var(--ink) 9%, transparent);
+  --focus: #1A1917;
+  --focus-ring: #1A1917;
+  --shadow-raised: 0 6px 24px rgba(26, 25, 23, 0.16);
+  --avatar-1: hsl(214 66% 52%);
+  --avatar-2: hsl(172 54% 44%);
+  --avatar-3: hsl(30 70% 52%);
+  --avatar-4: hsl(348 62% 56%);
+  --avatar-5: hsl(198 64% 50%);
+  --avatar-6: hsl(140 48% 46%);
+  --avatar-7: hsl(222 50% 56%);
+  --avatar-8: hsl(16 64% 54%);
+  --avatar-9: hsl(260 46% 58%);
+  --avatar-10: hsl(44 72% 50%);
+  --limit: #9C2E70;
+  /* semantic.type */
   --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
-
   --size-readout-xl: 48px;
   --size-readout: 28px;
   --size-body: 15px;
   --size-label: 13px;
   --size-unit: 12px;
   --size-micro: 11px;
-
-  /* Plex Mono renders optically larger than Plex Sans at the same px, so a
-     mono readout beside a sans label sits high. Each mono step is one notch
-     tighter than its sans partner. */
   --size-mono-readout-xl: 46px;
   --size-mono-readout: 27px;
   --size-mono-body: 14px;
   --size-mono-label: 12px;
   --size-mono-unit: 11px;
-
-  /* Space. The 12px-base names are kept because the six shared components
-     read them; the 4px grid is added alongside for everything new. */
-  --s-1: 4px;
-  --s-2: 8px;
-  --s-3: 12px;
-  --s-4: 16px;
-  --s-5: 24px;
-  --s-6: 32px;
-  --s-7: 48px;
-  --s-half: 6px;
-  --s1: 12px;
-  --s2: 24px;
-  --s3: 36px;
-
+  --size-hero: 42px;
+  --size-h1: 26px;
+  --size-plate: 22px;
+  --size-readout-sm: 21px;
+  --size-wordmark: 18px;
+  --size-title: 17px;
+  --size-body-sm: 14px;
+  --size-title-sm: 13.5px;
+  --size-caption: 11.5px;
+  --size-badge: 10px;
+  --tracking-tight: -0.3px;
+  --tracking-snug: -0.2px;
+  --tracking-normal: 0px;
+  /* semantic.layout */
   --gutter: 20px;
   --sidebar-w: 300px;
   --control-h: 32px;
-
+  --focus-ring-width: 2px;
+  --radius-sm: 2px;
   --radius: 3px;
   --radius-lg: 6px;
-
-  --hover: color-mix(in srgb, var(--ink) 5%, transparent);
-  --pressed: color-mix(in srgb, var(--ink) 9%, transparent);
-  --focus: var(--ink);
-
+  --radius-full: 50%;
+  --z-below: -1;
+  --z-base: 0;
+  --z-sticky: 1;
+  --z-rail: 5;
+  --z-overlay: 9;
+  --opacity-faint: 0.45;
+  --opacity-muted: 0.62;
+  --opacity-dim: 0.72;
+  /* semantic.motion */
   --dur-fast: 120ms;
+  --dur-mid: 160ms;
   --dur: 180ms;
+  --dur-slow: 600ms;
+  --dur-dots: 1400ms;
+  --dur-sweep: 1600ms;
   --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --ease-default: ease;
+  --ease-inout: ease-in-out;
+  /* component */
+  --button-bg: var(--panel-raised);
+  --button-fg: var(--ink);
+  --button-border: var(--edge);
+  --button-hover-bg: var(--hover);
+  --button-pressed-bg: var(--pressed);
+  --button-disabled-fg: var(--ink-muted);
+  --button-radius: var(--radius);
+  --button-height: var(--control-h);
+  --button-pad-x: var(--space-12);
+  --button-pad-y: var(--space-6);
+  --button-font-size: var(--size-label);
+  --input-bg: var(--panel-raised);
+  --input-fg: var(--ink);
+  --input-border: var(--edge);
+  --input-placeholder: var(--ink-muted);
+  --input-radius: var(--radius);
+  --input-height: var(--control-h);
+  --input-pad-x: var(--space-8);
+  --card-bg: var(--panel-recessed);
+  --card-border: var(--rule);
+  --card-radius: var(--radius);
+  --card-shadow: none;
+  --card-pad: var(--space-12);
+  --sheet-scrim: var(--panel-overlay);
+  --sheet-bg: var(--panel-raised);
+  --sheet-shadow: var(--shadow-raised);
+  --sheet-radius: var(--radius);
+  --sheet-z: var(--z-overlay);
+  --popover-bg: var(--panel-raised);
+  --popover-border: var(--rule);
+  --popover-shadow: var(--shadow-raised);
+  --popover-radius: var(--radius);
+  --popover-z: var(--z-rail);
+  --tooltip-bg: var(--fill);
+  --tooltip-fg: var(--on-fill);
+  --tooltip-radius: var(--radius-sm);
+  --nav-fg: var(--ink-muted);
+  --nav-fg-active: var(--ink);
+  --nav-underline: var(--ink);
+  --chip-bg: var(--panel-sunk);
+  --chip-fg: var(--ink);
+  --chip-border: var(--rule);
+  --chip-radius: var(--radius-sm);
+  --chip-pad-x: var(--space-6);
+  --table-header-fg: var(--ink-muted);
+  --table-row-border: var(--rule);
+  --table-cell-pad-x: var(--space-8);
+  --table-cell-pad-y: var(--space-4);
+  --lamp-live: var(--live-solid);
+  --lamp-warn: var(--warn-solid);
+  --lamp-fault: var(--fault-solid);
+  --lamp-idle: var(--ink-muted);
+  --lamp-ring: var(--edge);
+  --readout-ink: var(--ink);
+  --readout-live: var(--live);
+  --readout-warn: var(--warn);
+  --readout-fault: var(--fault);
+  --readout-muted: var(--ink-muted);
+  --readout-stale: var(--ink-muted);
+  --bar-track: var(--panel-sunk);
+  --bar-keyline: var(--edge);
+  --bar-limiting: var(--warn-solid);
+  --qr-ink: #1A1917;
+  --qr-tile: #F7F4EE;
+  --toast-bg: var(--fill);
+  --toast-fg: var(--on-fill);
+  --toast-border: var(--edge);
+  --toast-radius: var(--radius);
+  --toast-shadow: var(--shadow-raised);
+  --toast-z: var(--z-overlay);
+  --skeleton-bg: var(--panel-sunk);
+  --skeleton-shimmer: var(--panel-recessed);
+  --graph-block-bg: var(--panel-raised);
+  --graph-block-border: var(--edge);
+  --graph-block-selected: var(--accent);
+  --graph-req: var(--flow);
+  --graph-resp: var(--stream);
+  --graph-limit: var(--limit);
+  --graph-deploy: var(--ink);
+  --graph-link: var(--edge);
+  --graph-fault: var(--fault);
+  --graph-warn: var(--warn);
+  --graph-dots: var(--rule);
 }
 
-/* Dark. The ramp inverts as a whole so "raised" still means lighter-than-page
-   and one mental model covers both themes. */
+/* Dark. The surface ramp inverts as a whole so "raised" still means lighter-than-page. */
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) {
+  :root:not([data-theme='light']):not([data-theme='high-contrast']) {
+    /* semantic.color */
     --panel-sunk: #0E0D0C;
     --panel-recessed: #141312;
     --panel: #191817;
     --panel-raised: #232120;
     --panel-overlay: rgba(0, 0, 0, 0.55);
-    --shadow-raised: 0 6px 24px rgba(0, 0, 0, 0.5);
-
     --ink: #EDE9E0;
+    --ink-secondary: #C9C2B4;
     --ink-muted: #979186;
     --rule: #423D37;
     --rule-strong: #5A544C;
     --edge: #7C746A;
-
     --fill: #E2DCD0;
     --on-fill: #191817;
     --on-fill-dim: #5A5750;
-
+    --select-on-panel: #EDE9E0;
+    --select-on-fill: #191817;
     --live: #72C182;
     --warn: #D6A64A;
     --fault: #E58273;
+    --info: #7FA3D4;
     --live-solid: #4E9E5C;
     --warn-solid: #C4922F;
     --fault-solid: #BC4A3B;
+    --info-solid: #6489BC;
     --on-signal: #191817;
-
     --flow: #7FA3D4;
     --stream: #79C0CE;
     --batch: #B49BDB;
-
+    --accent: #7FA3D4;
     --tag-1: #8CA4E2;
     --tag-2: #E88AC0;
     --tag-3: #54C6C6;
     --tag-4: #C298E4;
+    --focus: #EDE9E0;
+    --focus-ring: #EDE9E0;
+    --shadow-raised: 0 6px 24px rgba(0, 0, 0, 0.5);
+    --limit: #E88AC0;
   }
 }
 
 :root[data-theme='dark'] {
+  /* semantic.color */
   --panel-sunk: #0E0D0C;
   --panel-recessed: #141312;
   --panel: #191817;
   --panel-raised: #232120;
   --panel-overlay: rgba(0, 0, 0, 0.55);
-  --shadow-raised: 0 6px 24px rgba(0, 0, 0, 0.5);
-
   --ink: #EDE9E0;
+  --ink-secondary: #C9C2B4;
   --ink-muted: #979186;
   --rule: #423D37;
   --rule-strong: #5A544C;
   --edge: #7C746A;
-
   --fill: #E2DCD0;
   --on-fill: #191817;
   --on-fill-dim: #5A5750;
-
+  --select-on-panel: #EDE9E0;
+  --select-on-fill: #191817;
   --live: #72C182;
   --warn: #D6A64A;
   --fault: #E58273;
+  --info: #7FA3D4;
   --live-solid: #4E9E5C;
   --warn-solid: #C4922F;
   --fault-solid: #BC4A3B;
+  --info-solid: #6489BC;
   --on-signal: #191817;
-
   --flow: #7FA3D4;
   --stream: #79C0CE;
   --batch: #B49BDB;
-
+  --accent: #7FA3D4;
   --tag-1: #8CA4E2;
   --tag-2: #E88AC0;
   --tag-3: #54C6C6;
   --tag-4: #C298E4;
+  --focus: #EDE9E0;
+  --focus-ring: #EDE9E0;
+  --shadow-raised: 0 6px 24px rgba(0, 0, 0, 0.5);
+  --limit: #E88AC0;
+}
+
+/* High contrast: 7:1 text, 3:1 UI, 3px focus ring, hard outlines instead of shadows. */
+:root[data-theme='high-contrast'] {
+  /* semantic.color */
+  --panel-sunk: #E6E6E6;
+  --panel-recessed: #F2F2F2;
+  --panel: #FFFFFF;
+  --panel-raised: #FFFFFF;
+  --panel-overlay: rgba(0, 0, 0, 0.7);
+  --ink: #000000;
+  --ink-secondary: #1F1F1F;
+  --ink-muted: #3A3A3A;
+  --rule: #6B6B6B;
+  --rule-strong: #000000;
+  --edge: #000000;
+  --fill: #000000;
+  --on-fill: #FFFFFF;
+  --on-fill-dim: #CFCFCF;
+  --select-on-panel: #000000;
+  --select-on-fill: #FFFFFF;
+  --live: #0A5F1E;
+  --warn: #6B4A00;
+  --fault: #9B1500;
+  --info: #003E9C;
+  --live-solid: #0A5F1E;
+  --warn-solid: #6B4A00;
+  --fault-solid: #9B1500;
+  --info-solid: #003E9C;
+  --on-signal: #FFFFFF;
+  --flow: #003E9C;
+  --stream: #005A66;
+  --batch: #4B1E8F;
+  --accent: #003E9C;
+  --tag-1: #1F3FA0;
+  --tag-2: #8A1760;
+  --tag-3: #005B5B;
+  --tag-4: #5B1E8E;
+  --hover: rgba(0, 0, 0, 0.08);
+  --pressed: rgba(0, 0, 0, 0.16);
+  --focus: #000000;
+  --focus-ring: #000000;
+  --shadow-raised: 0 0 0 2px #000000;
+  --limit: #8A1760;
+  /* semantic.layout */
+  --focus-ring-width: 3px;
+}
+
+@media (prefers-contrast: more) {
+  :root:not([data-theme]) {
+    /* semantic.color */
+    --panel-sunk: #E6E6E6;
+    --panel-recessed: #F2F2F2;
+    --panel: #FFFFFF;
+    --panel-raised: #FFFFFF;
+    --panel-overlay: rgba(0, 0, 0, 0.7);
+    --ink: #000000;
+    --ink-secondary: #1F1F1F;
+    --ink-muted: #3A3A3A;
+    --rule: #6B6B6B;
+    --rule-strong: #000000;
+    --edge: #000000;
+    --fill: #000000;
+    --on-fill: #FFFFFF;
+    --on-fill-dim: #CFCFCF;
+    --select-on-panel: #000000;
+    --select-on-fill: #FFFFFF;
+    --live: #0A5F1E;
+    --warn: #6B4A00;
+    --fault: #9B1500;
+    --info: #003E9C;
+    --live-solid: #0A5F1E;
+    --warn-solid: #6B4A00;
+    --fault-solid: #9B1500;
+    --info-solid: #003E9C;
+    --on-signal: #FFFFFF;
+    --flow: #003E9C;
+    --stream: #005A66;
+    --batch: #4B1E8F;
+    --accent: #003E9C;
+    --tag-1: #1F3FA0;
+    --tag-2: #8A1760;
+    --tag-3: #005B5B;
+    --tag-4: #5B1E8E;
+    --hover: rgba(0, 0, 0, 0.08);
+    --pressed: rgba(0, 0, 0, 0.16);
+    --focus: #000000;
+    --focus-ring: #000000;
+    --shadow-raised: 0 0 0 2px #000000;
+    --limit: #8A1760;
+    /* semantic.layout */
+    --focus-ring-width: 3px;
+  }
 }

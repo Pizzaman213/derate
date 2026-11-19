@@ -279,6 +279,13 @@ tests `e.name === 'AbortError'`, which holds across every runtime this can run
 in. Stop is an outcome, not an error: `chatStream` returns `meta(true)` and the
 partial text stands.
 
+**An SSE error is a failed turn even after HTTP 200.** `chatStream` rejects
+OpenAI-shaped `{error:{message}}` frames as `ApiError`, with the normal API
+redaction applied before the sentence reaches Chat's existing error display.
+Already delivered text and the request id remain available, but the stream is
+cancelled without flushing pending inline markup or returning successful turn
+metadata or estimated usage. The error message is otherwise kept verbatim.
+
 ## Failure behaviour
 
 - **Non-2xx.** `ApiError` with the status, the raw body and the resolved URL.

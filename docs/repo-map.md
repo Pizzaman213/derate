@@ -17,7 +17,8 @@ you can push it. Nothing at this level is imported by the running system except
 | `Dockerfile` | 140 | the node image. One image, role at runtime |
 | `compose.yaml` | 127 | the optional single-node equivalent of the `docker run` |
 | `pyproject.toml` | 55 | the package, the console script, pytest and ruff config |
-| `requirements.txt` | 23 | the runtime pins the image installs directly |
+| `requirements.txt` | 23 | the runtime pins; the human-edited input to `requirements.lock` |
+| `requirements.lock` | — | every transitive with its sha256; what the image and CI install (`--require-hashes`) |
 | `.dockerignore` | 12 | what never reaches the build context |
 | `.gitignore` | 41 | what never reaches a commit |
 | `URL-BUNDLE.models-node.txt` | — | a generated planning snapshot of one URL's code path. Deleted from the working tree; recoverable with `git show HEAD:URL-BUNDLE.models-node.txt` |
@@ -75,7 +76,7 @@ MIT, copyright 2026 Connor Secrist, and 20 of its 34 lines are the standard
 text. The rest is a section that opens "A note, not a condition" and says so
 twice: nothing below it changes the terms. It asks anyone putting derate in
 front of real users to open an issue first, and names why -- sizing,
-placement, and the gateway's current lack of inbound authentication.
+placement, and how to hand out API keys and limits.
 `pyproject.toml` points `license-files` at this file, so it ships in the wheel.
 You would touch it only to change the copyright line.
 
@@ -98,7 +99,7 @@ The coordinator serves these exact bytes at `GET /install.sh`
 the image and falling back to the repo copy beside the code. **The script never
 contains a token** -- it serves the same bytes to everyone, and the token
 arrives on the command line the UI composes:
-`curl -fsSL {origin}/install.sh | sh -s -- --join {origin} --token {token}`.
+`f=$(mktemp) && curl -fsSL {origin}/install.sh -o "$f" && echo "{sha256}  $f" | sha256sum -c - && sh "$f" --join {origin} --token {token}`.
 
 ## `Dockerfile`
 
@@ -109,8 +110,9 @@ every target arch and the emulated half of a multi-arch build should never run
 npm. `ARG SKIP_UI=1` writes a one-line placeholder `index.html` instead of
 building; a release build never sets it, because a UI that does not compile
 should fail the image loudly. Stage `deps` builds a venv from
-`requirements.txt` plus `sparkrun==${SPARKRUN_VERSION}` (0.2.40, pinned to the
-version `control_plane/deploy/flags.py` was verified against). The runtime
+`requirements.lock` alone (`--require-hashes`, compiled from `requirements.txt`,
+which pins `sparkrun==0.2.40`, the version `control_plane/deploy/flags.py` was
+verified against). The runtime
 stage copies that venv, `control_plane/`, `docker/`, `install.sh` and the built
 UI, and sets `NVIDIA_DRIVER_CAPABILITIES=utility` -- nvidia-smi and NVML and
 nothing more, since this image probes and samples and never runs a model. The

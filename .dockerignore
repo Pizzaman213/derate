@@ -6,7 +6,13 @@
 **/.mypy_cache
 ui/node_modules
 ui/dist
+.omp/charts/node_modules
 research
 agents
 *.md
 !README.md
+logs
+.omp/work
+tests
+**/*.log
+**/*.db

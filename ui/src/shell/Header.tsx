@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
+import { Icon } from '../components/Icon'
 import { plainClick, useRouter, type Dest } from '../state/router'
-import { useCluster, useSettings } from '../state/resources'
+import { useCluster, useRouting, useSettings } from '../state/resources'
 import { useMetrics } from '../state/metrics'
 import { applyTheme, loadTheme } from '../theme'
 
@@ -9,7 +10,7 @@ const DESTS: { id: Dest; label: string }[] = [
   { id: 'models', label: 'Models' },
   { id: 'cluster', label: 'Cluster' },
   { id: 'chat', label: 'Chat' },
-  { id: 'spend', label: 'Spend' },
+  { id: 'usage', label: 'Usage' },
   { id: 'settings', label: 'Settings' },
 ]
 
@@ -36,45 +37,30 @@ export function Header({ dest }: Props) {
   const serving = deployments.filter(
     (d) => d.state === 'ready' || d.state === 'degraded',
   ).length
+  // Served names with a healthy target, provider-served ones included; the
+  // deployments count stands in only until routing has answered.
+  const routing = useRouting()
+  const servingNames = routing.data
+    ? routing.data.filter((c) => c.targets.some((t) => t.healthy)).length
+    : null
 
   return (
     <header className={stale ? 'stream-fault' : undefined}>
       {/* The monogram's solid stroke sits above the icon's own bounding-box
           centre -- the faint echo stroke below it doesn't carry the same
           visual weight -- so flex centring against the wordmark leaves the
-          mark looking high. Nudged down to match; SetupTab's copy of this
-          mark gets the same offset in setup.css. */}
-      <svg
-        width="32"
-        height="24"
-        viewBox="0 0 64 50"
-        aria-label="derate"
-        style={{ transform: 'translateY(2px)' }}
-      >
-        <path
-          d="M26 25 V39 H56"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={6}
-          strokeLinecap="square"
-          opacity={0.32}
-        />
-        <path
-          d="M8 25 H26 V11 H56"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={6}
-          strokeLinecap="square"
-        />
-      </svg>
-      <span style={{ fontWeight: 500, fontSize: 18, letterSpacing: '-.3px' }}>
+          mark looking high. `.brand-mark` nudges it down to match and sizes
+          the 24-box so the ink is the 27px it always was; SetupTab's copy
+          gets the same treatment in setup.css. */}
+      <Icon name="derate-mark" label="derate" size={24} className="brand-mark" />
+      <span style={{ fontWeight: 500, fontSize: 'var(--size-wordmark)', letterSpacing: 'var(--tracking-tight)' }}>
         derate
       </span>
 
       {cluster.data ? (
         <span className="pill mono">
           {nodes.length} nodes · {nodes.filter((n) => n.healthy).length} healthy ·{' '}
-          {serving} serving
+          {servingNames ?? serving} serving
         </span>
       ) : null}
       {settings.data?.local_only ? <span className="pill mono">cloud off</span> : null}

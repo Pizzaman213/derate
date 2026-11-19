@@ -13,8 +13,9 @@ is where the IBM Plex Sans files come from. Takes no arguments.
 
 Everything here is a COPY of something that lives elsewhere -- the monogram is
 drawn in `ui/src/shell/Header.tsx` and duplicated in `SetupTab.tsx`, the
-wordmark is the app's `--font-sans`, and the colours are `--panel`, `--ink` and
-`--ink-muted` from `ui/src/styles/tokens.css`. A README image cannot import
+wordmark is the app's `--font-sans`, and the colours are `--panel`, `--ink`,
+`--ink-muted` and `--flow`, read from `.omp/design/tokens/tokens.flat.json`
+(generated from the design pack's `tokens.json`). A README image cannot import
 from a React component or a stylesheet, so instead of eyeballing a resemblance
 this derives every proportion from what the running header actually does, and
 stays a script so a change to the mark is one command away from the README.
@@ -26,6 +27,7 @@ scale against the text, and where the mark sits relative to the baseline --
 and they are computed here in ems, so the lockup can be drawn at any size.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -80,22 +82,31 @@ M_INK_L, M_INK_R, M_INK_T, M_INK_B = 5.0, 59.0, 8.0, 42.0
 # --- what the header does --------------------------------------------------
 H_FONT, H_SVG_W, H_SVG_H, H_GAP, H_NUDGE = 18.0, 32.0, 24.0, 14.0, 2.0
 
-# ui/src/styles/tokens.css. An SVG loaded through <img> inherits no colour, so
-# `currentColor` -- what Header.tsx uses -- would come out black and vanish
-# against a dark README. Both themes are baked in and the README picks between
-# them with <picture media="(prefers-color-scheme: dark)">.
-# `flow` is the accent tokens.css reserves for "a request in flight. An accent,
+# .omp/design/tokens/tokens.flat.json. An SVG loaded through <img> inherits no
+# colour, so `currentColor` -- what Header.tsx uses -- would come out black and
+# vanish against a dark README. Both themes are baked in and the README picks
+# between them with <picture media="(prefers-color-scheme: dark)">.
+# `flow` is the accent the tokens reserve for "a request in flight. An accent,
 # not a grey: it is a real measured event" -- which is exactly what the pulse
 # running the mark depicts, so it is that token and not a colour picked here.
+_FLAT = json.loads(
+    (Path(__file__).resolve().parents[3] / ".omp" / "design" / "tokens" / "tokens.flat.json").read_text()
+)
+
+
+def _token(name: str, theme: str) -> str:
+    value = _FLAT[name]
+    return value[theme] if isinstance(value, dict) else value
+
+
 THEMES = {
-    "": {
-        "ink": "#1A1917", "muted": "#5C5851", "panel": "#EDE9E0",
-        "flow": "#4A6FA5",
-    },
-    "-dark": {
-        "ink": "#EDE9E0", "muted": "#979186", "panel": "#191817",
-        "flow": "#7FA3D4",
-    },
+    suffix: {
+        "ink": _token("ink", theme),
+        "muted": _token("ink-muted", theme),
+        "panel": _token("panel", theme),
+        "flow": _token("flow", theme),
+    }
+    for suffix, theme in (("", "light"), ("-dark", "dark"))
 }
 
 #: One cycle of the pulse. Both branches share it, so they are sequenced with

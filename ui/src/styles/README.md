@@ -1,20 +1,27 @@
 # styles
 
-The palette and the chrome, in three sheets imported exactly once. `main.tsx`
-loads them in order — `tokens.css`, `base.css`, `derate.css` — and that order is
-the cascade: the palette first, the element baseline on top of it, the
-structural chrome on top of that. No component in this app carries a literal
-colour, so dark mode is a token swap rather than a second set of components.
+The chrome, in two sheets imported exactly once, on top of a palette that is
+generated. `main.tsx` loads them in order — `styles/tokens.css`,
+`base.css`, `derate.css` — and that order is the cascade: the palette first,
+the element baseline on top of it, the structural chrome on top of that. No
+component in this app carries a literal colour, so dark mode (and high
+contrast) is a token swap rather than a second set of components.
+
+**`tokens.css` moved on 2026-11-17.** It is now generated from
+`.omp/design/tokens/tokens.json` by `cd .omp && npm run tokens:build`, and the
+contrast promises in `.omp/design/tokens/pairs.json` are enforced by
+`npm run tokens:check`. Edit `tokens.json`, never the CSS. The design
+decisions below still hold and are now the `$description` of each token.
 
 ## Layout
 
 | File | Lines | What it owns |
 |---|---|---|
-| `tokens.css` | 227 | the entire palette, the type scale, the spacing grid, and both dark-theme blocks |
+| `tokens.css` | generated | the entire palette, the type scale, the spacing grid (`--space-<px>`), motion, elevation, and the dark and high-contrast blocks |
 | `base.css` | 143 | the reset, `html`/`body`/`#root` sizing, the typographic classes, and the bare control rules |
 | `derate.css` | 1762 | the structural chrome: every screen's layout, ported from the design source |
 
-## `tokens.css`
+## `tokens.css` (now `.omp/design/tokens/`)
 
 Every colour, size, space and duration the product uses. Its header comment
 names the three decisions in it that are load-bearing, each one written after
@@ -172,17 +179,21 @@ component that fills it.
 **`flex: 1` with `min-height: 0` at every level *between* `.clusterstage` and
 the graph's own element.** `.clusterstage` is the one that is not in the chain:
 it is a column flex container on `min-height: calc(100vh - 95px)`, and it is
-`.clusterstage .floorcard` and `.clusterstage .floor` beneath it that each carry
-`flex: 1; min-height: 0`. A flex-basis of 0 means the height comes from the
-container's free space and never from the content, which is what keeps
-`ClusterGraph`'s `ResizeObserver` (`ClusterGraph.tsx`) from feeding back into
-its own size. Wrapping the floor in a block added a level to that chain, and a
-level that sizes to its content would reintroduce the loop. `.chat` documents
-the same rule as `grid-template-rows: minmax(0, 1fr)`.
+`.clusterstage .graphcard` and `.clusterstage .graph` beneath it that each
+carry `flex: 1; min-height: 0`. A flex-basis of 0 means the height comes from
+the container's free space and never from the content, which keeps React
+Flow's own measurement from feeding back into its size. React Flow's wrapper
+writes an inline `height: 100%`, which needs a definite parent height, so it
+sits inside `.graph-box`, pinned `position: absolute; inset: 0`. `.chat`
+documents the same rule as `grid-template-rows: minmax(0, 1fr)`.
 
-**`transform-box: fill-box` on `.bandsweep-move`.** Without it an SVG element
-measures percentage transforms against the whole viewport and the sweeping
-highlight leaves the floor entirely.
+**The wiring editor's chrome is plain classes over React Flow.** The `.w*`
+block and card classes (`.wnode`, `.wrow`, `.wtoolbar`, `.wcards`, …), the
+`.sock*` handle states (`.sock-edit` filled, `.sock-fixed` hollow and given
+`pointer-events` back so a press can announce why it is fixed, `.sock-valid`
+/ `.sock-dim` during a drag), `.wlabel` for wire labels and `.wparticles` for
+the particle layer. `.react-flow`'s `--xy-*` variables are mapped onto tokens
+so its own stylesheet draws nothing in a literal colour.
 
 **uPlot's cursor colours are handed back to the tokens.** `uPlot.min.css` is
 imported by `Chart.tsx` and is entirely scoped to its own `.u-*` classes, so it
@@ -204,11 +215,10 @@ so there is nothing in `base.css` to duplicate; the rule copies `base.css`'s
   until the OS or the toggle flips to dark, then loses exactly that mark. Both
   dark blocks are therefore full copies, not deltas.
 - **`prefers-reduced-motion`.** `base.css` clamps every animation and
-  transition document-wide, so the cluster floor's plate motion simply does not
-  play. `derate.css` adds the cases where "no motion" is not enough on its own:
-  `.bandsweep-move` is swapped for the static `.bandsweep-still`, and the three
-  waiting dots are pinned visible rather than animated — still visibly in
-  progress, without the movement.
+  transition document-wide, and the wiring editor's particles are not drawn
+  at all. `derate.css` adds the cases where "no motion" is not enough on its
+  own: the three waiting dots are pinned visible rather than animated — still
+  visibly in progress, without the movement.
 - **IBM Plex missing.** Both stacks fall through to a face the platform
   already has: `--font-sans` is `'IBM Plex Sans', ui-sans-serif, system-ui,
   sans-serif` and `--font-mono` is `'IBM Plex Mono', ui-monospace, 'SF Mono',

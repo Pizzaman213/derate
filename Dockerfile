@@ -17,22 +17,27 @@
 # --platform=$BUILDPLATFORM: the bundle is static files, identical for every
 # target arch, so it is built once natively instead of once per platform --
 # and the emulated half of a multi-arch build never runs npm at all.
-FROM --platform=$BUILDPLATFORM node:22-slim AS ui
+#
+# Bases are pinned by digest (the multi-arch index, so both platforms resolve
+# from it), resolved 2026-11-18 with `docker buildx imagetools inspect`. The
+# tag stays for the reader; the digest is what is pulled. Bump both together.
+FROM --platform=$BUILDPLATFORM node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS ui
 # SKIP_UI=1 builds the image without the UI. For iterating on the container
 # itself while Agent H's tree is mid-edit; a release build never sets it,
 # because a UI that does not compile should fail the image, loudly.
 ARG SKIP_UI=0
 WORKDIR /src
-# The whole context, because `COPY ui/ .` fails outright when ui/ does not
-# exist yet and this image has to build before Agent H lands.
-COPY . /src
+# Only what the UI build reads: ui/ and the design/chart pack it imports from.
+COPY ui/ /src/ui/
+COPY .omp/ /src/.omp/
 RUN mkdir -p /ui-dist \
  && if [ "$SKIP_UI" = "1" ] || [ ! -f ui/package.json ]; then \
         echo '<!doctype html><meta charset=utf-8><title>derate</title>' > /ui-dist/index.html ; \
         echo '<p>UI not built into this image.' >> /ui-dist/index.html ; \
     else \
-        cd ui \
-     && (npm ci --no-audit --no-fund || npm install --no-audit --no-fund) \
+        (cd .omp/charts && npm ci --no-audit --no-fund) \
+     && cd ui \
+     && npm ci --no-audit --no-fund \
      && npm run build \
      && cp -r dist/. /ui-dist/ ; \
     fi
@@ -40,18 +45,18 @@ RUN mkdir -p /ui-dist \
 # ---------------------------------------------------------------------------
 # Stage 2: python dependencies, into a venv we copy wholesale.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS deps
-
-# Pinned to the version this adapter's flags were verified against. Bump with
-# --build-arg SPARKRUN_VERSION=... after re-checking control_plane/deploy/flags.py.
-ARG SPARKRUN_VERSION=0.2.40
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS deps
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
- && pip install --no-cache-dir "sparkrun==${SPARKRUN_VERSION}" \
+# requirements.lock, not requirements.txt: every transitive pinned with its
+# sha256, so two builds of one commit install the same bytes and a swapped
+# wheel on the index fails the install. sparkrun is in the lock like everything
+# else (pinned in requirements.txt), so this is the only install: a second,
+# unlocked one could upgrade a locked package to satisfy its own ranges.
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
  && python -m pip uninstall -y pip
 # pip leaves the venv once it has done its job. Nothing at runtime installs a
 # package -- not derate, not sparkrun (its one mention of pip is a help string)
@@ -60,7 +65,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 # ---------------------------------------------------------------------------
 # Stage 3: the runtime image.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 # openssh-client: sparkrun drives the cluster over SSH.
 # git: sparkrun's recipe registry is a git clone and its RegistryManager shells

@@ -27,15 +27,21 @@
 // workflow used to carry a second hand-maintained copy of the same fact, and
 // it was already wrong -- models/registry.check.mjs needs a coordinator and
 // was not on the list, so committing it would have turned CI red.
+//
+// Two roots are walked: `ui/src`, and the design pack's `.omp/tests/ui`, whose
+// verifiers (static lint, generated-output freshness, component gallery and
+// layout checks) are discovered by the same rule and run with the same cwd.
+// They import their own dependencies relative to their own file, so they
+// resolve `.omp/node_modules`, not this one.
 
 import { execFile, execFileSync } from 'node:child_process'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { findBrowser } from './src/check/browser.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const src = join(here, 'src')
+const roots = [join(here, 'src'), join(here, '..', '.omp', 'tests', 'ui')].filter(existsSync)
 
 const args = process.argv.slice(2)
 const strict = args.includes('--strict') || process.env.DERATE_CHECK_STRICT === '1'
@@ -54,7 +60,7 @@ function walk(dir) {
   return found
 }
 
-const all = walk(src).sort()
+const all = roots.flatMap(walk).sort()
 
 /** The `// requires:` line, if the file has one. No line means hermetic --
  *  needs nothing but this checkout -- which is the safe default: a verifier
@@ -79,9 +85,27 @@ async function probe(kind, arg) {
   if (kind === 'hermetic') {
     result = { ok: true }
   } else if (kind === 'coordinator') {
+    // A coordinator answers /api only to a session, so "is one up" is asked
+    // the way every coordinator verifier will ask: logged in through
+    // src/check/auth.mjs as $DERATE_CHECK_ADMIN_USER. A 401 here means the
+    // credentials are missing or wrong, and that is the reason printed.
     try {
+      // The login helper arrives with the auth branch; without it the probe
+      // runs unauthenticated, which a gated coordinator answers with a 401
+      // and an ungated one with a 200.
+      await import('./src/check/auth.mjs').catch((e) => {
+        if (e?.code !== 'ERR_MODULE_NOT_FOUND') throw e
+      })
       const r = await fetch(`${ORIGIN}/api/topology`, { signal: AbortSignal.timeout(2000) })
-      result = r.ok ? { ok: true } : { ok: false, why: `${ORIGIN} answered ${r.status}` }
+      result = r.ok
+        ? { ok: true }
+        : {
+            ok: false,
+            why:
+              r.status === 401
+                ? `${ORIGIN} answered 401: set DERATE_CHECK_ADMIN_USER / DERATE_CHECK_ADMIN_PASSWORD (and DERATE_CHECK_API_KEY for /v1)`
+                : `${ORIGIN} answered ${r.status}`,
+          }
     } catch (e) {
       result = { ok: false, why: `no coordinator on ${ORIGIN} (${e.message})` }
     }
@@ -121,7 +145,7 @@ const chosen = all.filter((f) => filters.length === 0 || filters.some((q) => f.i
 if (chosen.length === 0) {
   console.error(filters.length
     ? `no verifier matches ${filters.join(', ')}`
-    : `no verifiers found under ${src}`)
+    : `no verifiers found under ${roots.join(', ')}`)
   process.exit(1)
 }
 

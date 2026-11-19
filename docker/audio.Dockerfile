@@ -24,7 +24,8 @@
 # upstream image for anyone who wants exactly it.
 
 # Bump this together with the tts image's BASE, which is the same one.
-ARG BASE=ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+# Pinned by digest 2026-11-18: see the note on BASE in tts.Dockerfile.
+ARG BASE=ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest@sha256:b62b958b2aa7d60ae71c5f30be1d83b855532cd115907f9c8cca7a3881829bed
 FROM ${BASE}
 
 # Two packages, and both are load-bearing -- soundfile alone is not enough,

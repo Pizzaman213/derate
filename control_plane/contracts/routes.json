@@ -11,12 +11,6 @@
       "methods": [
         "GET"
       ],
-      "path": "/api/alerts"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
       "path": "/api/capacity"
     },
     {
@@ -52,12 +46,6 @@
     {
       "methods": [
         "GET"
-      ],
-      "path": "/api/deployments/{deployment_id}"
-    },
-    {
-      "methods": [
-        "PATCH"
       ],
       "path": "/api/deployments/{deployment_id}"
     },
@@ -141,12 +129,6 @@
     },
     {
       "methods": [
-        "POST"
-      ],
-      "path": "/api/links/tune"
-    },
-    {
-      "methods": [
         "GET"
       ],
       "path": "/api/memory"
@@ -180,12 +162,6 @@
         "GET"
       ],
       "path": "/api/models/search"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/models/speculative-heads"
     },
     {
       "methods": [
@@ -234,12 +210,6 @@
         "PUT"
       ],
       "path": "/api/nodes/{node_id}/label"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/nodes/{node_id}/logs"
     },
     {
       "methods": [
@@ -498,15 +468,15 @@
         "GET"
       ],
       "path": "/v1/models"
+    },
+    {
+      "methods": [
+        "WEBSOCKET"
+      ],
+      "path": "/v1/realtime"
     }
   ],
   "agent": [
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/agent/containers"
-    },
     {
       "methods": [
         "GET"
@@ -518,12 +488,6 @@
         "GET"
       ],
       "path": "/agent/journal"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/agent/logs"
     },
     {
       "methods": [

@@ -43,6 +43,8 @@ export type ProviderKind =
   | 'groq'
   | 'ollama'
   | 'custom'
+  | 'chatgpt'
+  | 'claude_code'
 
 // ── GET /api/topology ────────────────────────────────────────────────────────
 
@@ -236,7 +238,27 @@ export interface ProviderKindSpec {
   /** Set when this build cannot talk to the kind at all. The server's own
    *  sentence; render it verbatim and do not offer the kind. */
   unsupported_reason: string | null
+  /** The sign-in flow for this kind; render ProviderSignIn instead of KeyField. */
+  sign_in: ProviderSignInFlow | null
 }
+
+export type ProviderSignInFlow = 'chatgpt' | 'claude'
+
+/** `POST /api/sign-in/{flow}`. No token or PKCE verifier reaches the browser. */
+export interface ProviderSignInStart {
+  attempt_id: string
+  authorize_url: string
+  /** ChatGPT uses the coordinator's loopback; Claude uses its hosted callback. */
+  redirect_uri: string
+  /** Unix seconds after which `complete` answers `sign_in_attempt_unknown`. */
+  expires_at: number
+}
+
+/** `GET /api/sign-in/{flow}/{attempt_id}`. ChatGPT's loopback can finish it. */
+export type ProviderSignInStatus =
+  | { status: 'pending' }
+  | { status: 'done'; provider_id: string }
+  | { status: 'failed'; code: string; message: string }
 
 /** `POST /api/providers/{id}/pull`. 202 once the download size is known and
  *  accepted; the transfer continues on the server. */
@@ -449,7 +471,7 @@ export interface EnrollmentRow {
 
 /** What `POST /api/enroll` returns: the row, plus the one line to paste. */
 export interface Enrollment extends EnrollmentRow {
-  /** The whole `curl ... | sh -s -- --join ... --token ...` line, composed by
+  /** The whole `curl -o ... && sha256sum -c ... && sh ... --join ... --token ...` line, composed by
    *  the coordinator so the address is its own and not the browser's. This is
    *  the only field that carries the token. */
   command: string
@@ -860,6 +882,10 @@ export interface PlanResponse {
    *  config estimate". Qualifies how trustworthy the plan/fit above are;
    *  render verbatim alongside fit.warnings, never folded into it. */
   resolver_warnings: string[]
+  /** The repo ships Python that `--trust-remote-code` would execute (its
+   *  config has `auto_map`, or it carries `.py` files); the resolver's
+   *  warning above names them. Absent on an older gateway: read as false. */
+  remote_code?: boolean
 
   /** Whose choice the machines were, and which of them carry a rank. Absent on
    *  a gateway that predates manual placement. */
@@ -912,6 +938,12 @@ export interface LaunchRequest {
    *  after it. Same tokenizing and allowlist as extra_args. Mutually
    *  exclusive with it — sending both is a 400. */
   custom_command?: string
+  /** Speculative decoding with the checkpoint's MTP module: draft tokens per
+   *  step, 1-8, vLLM only. Omitted or 0 means off. */
+  speculative_tokens?: number
+  /** Opt in to running the repository's own Python (`--trust-remote-code`).
+   *  Omitted means false: no launch runs remote code unless asked to. */
+  trust_remote_code?: boolean
   /** Speculative decoding, on the same terms as `parallelism`: the caller
    *  chooses the method and how many tokens to draft, and the coordinator
    *  prices it. Sending a cost here is not possible and not the point — a
@@ -1019,6 +1051,9 @@ export interface PlanRequest {
    *  fills that budget at full width and serves half the approved context
    *  with nothing on screen to say so. Send it to both or to neither. */
   kv_dtype?: string
+  /** Multi-token-prediction draft tokens (1-8). The fit then includes the
+   *  checkpoint's MTP module; a checkpoint without one is refused. */
+  speculative_tokens?: number
 }
 
 /** Which endpoint family a served model answers on. Mirrors
@@ -1104,6 +1139,18 @@ export interface DeploymentDTO {
    *  draws it has to say so. Absent from a gateway that predates the field;
    *  read it as `true`, which is what every deployment then was. */
   serving?: boolean
+  /** The commit sha the launch was pinned to (--revision/--code-revision),
+   *  or null when the resolver had none. Absent from an older gateway. */
+  revision?: string | null
+  /** Draft tokens per step when launched with speculative decoding (MTP);
+   *  0 when off. Absent from an older gateway; read it as 0. */
+  speculative_tokens?: number
+  /** Whether the launch opted in to the repo's own Python. Absent from an
+   *  older gateway; read it as false. */
+  trust_remote_code?: boolean
+  /** The image reference launched and its local id ("" when unknown). */
+  image?: string
+  image_id?: string
 }
 
 // ── Routing: GET /api/routing, PUT /api/routing/{served_name} ────────────────
@@ -1170,6 +1217,56 @@ export interface RoutingConfig {
   auto_reason?: string | null
   /** LOCAL_FIRST only: is traffic currently local or spilled to a remote */
   flow?: 'local' | 'spilled' | null
+  /** The operator's own rate limits on this served name, each a whole number
+   *  of 1 or more; `{}` when none. Absent from a gateway that predates
+   *  per-name limits -- the wiring editor hides its rate limit block then. */
+  limits?: RouteLimits
+  /** The operator's traffic split: target_id -> a whole number 0..100, set
+   *  only under `weighted_capacity`; `{}` when the measured weights apply.
+   *  Each target's `weight` already reflects it. */
+  shares?: Record<string, number>
+}
+
+export interface RouteLimits {
+  rpm?: number
+  tpm?: number
+}
+
+// ── Wiring: POST /api/wiring ──────────────────────────────────────────────────
+
+/** One change in a wiring batch. Launches are not ops: they go through
+ *  `POST /api/deployments` after the batch is applied. */
+export type WiringOp =
+  | { op: 'provider.patch'; provider_id: string; patch: ProviderPatch }
+  | {
+      op: 'route.set'
+      served_name: string
+      policy: RoutingPolicy
+      limits?: RouteLimits
+      /** Sent only when the split changed; `{}` hands it back to the
+       *  measured weights. */
+      shares?: Record<string, number>
+    }
+  | { op: 'route.clear'; served_name: string }
+
+export interface WiringRequest {
+  dry_run?: boolean
+  ops: WiringOp[]
+}
+
+/** One row per op, in body order. `error.code` is `not_applied` for a row
+ *  that was never attempted because an earlier one failed. */
+export interface WiringResult {
+  index: number
+  op: string | null
+  ok: boolean
+  error: { message: string; code: string } | null
+}
+
+export interface WiringResponse {
+  dry_run: boolean
+  applied: number
+  results: WiringResult[]
 }
 
 // ── Providers: GET /api/providers ────────────────────────────────────────────
@@ -1182,6 +1279,23 @@ export interface ProviderModel {
   supports_tools: boolean
   input_cost_per_mtok: number | null
   output_cost_per_mtok: number | null
+  /** USD per minute of audio for a transcription model; null/absent means
+   *  remote audio settles unpriced. */
+  price_per_minute_usd?: number | null
+  /** The backend host this model is pinned to (`backend_pins`), or null for
+   *  the upstream's own routing. When set, the two prices above are that
+   *  host's, captured when the pin was set. Only on kinds with
+   *  `supports_backend_routing`. */
+  backend_pin?: string | null
+  /** Whether OpenRouter may fall back to other hosts when the pinned one is
+   *  down (`backend_fallbacks`). False with no pin. */
+  backend_fallback?: boolean
+  /** Live admission for this upstream model, including provider-wide failures. */
+  admitting?: boolean | null
+  admission_block?: string | null
+  /** Active model-specific rate-limit error, not the provider's last failure. */
+  last_error?: string | null
+  retry_in_s?: number | null
 }
 
 /** One row of `GET /api/providers/{id}/models` -- the whole catalogue, which is
@@ -1219,14 +1333,18 @@ export interface Provider {
    *  `key_status()`. `null` is "this port cannot say" -- a store with no
    *  key_status -- and must not be rendered as a missing key. `not_needed` is
    *  a kind that takes no credential, which is not the same as one whose
-   *  credential is absent. */
-  key_state: 'set' | 'missing' | 'not_needed' | null
-  /** Which of the two places answered: an environment variable the process was
-   *  started with, or secrets.json on the coordinator. A place, never a value,
-   *  and there is no third field that could carry one. `null` whenever
-   *  `key_state` is not `set` -- and for a port that knows the state without
-   *  knowing the source. */
-  key_source: 'environment' | 'secrets.json' | null
+   *  credential is absent. `reauth` is a sign-in kind whose refresh was
+   *  refused: the provider is off until somebody signs in again. */
+  key_state: 'set' | 'missing' | 'not_needed' | 'reauth' | null
+  /** Which of the places answered: an environment variable the process was
+   *  started with, secrets.json on the coordinator, or (`oauth`) a sign-in
+   *  stored in oauth.json. A place, never a value, and there is no third
+   *  field that could carry one. `null` whenever `key_state` is `missing` --
+   *  and for a port that knows the state without knowing the source. */
+  key_source: 'environment' | 'secrets.json' | 'oauth' | null
+  /** The account a sign-in kind is signed in as (its email), or null for a
+   *  key-based kind. An identity, never a token. */
+  sign_in_account: string | null
   enabled: boolean
   priority: number
   models: ProviderModel[]
@@ -1238,8 +1356,8 @@ export interface Provider {
   // time from the provider port's own accounting, all `null` -- never `0` --
   // when the port does no accounting at all, so "never priced" and "priced at
   // zero" stay distinguishable on the wire and in the Spend/Settings screens.
-  /** Whether this provider is currently accepting new requests -- rate limit
-   *  and budget included, distinct from `healthy` above. */
+  /** Provider-wide admission (auth, reachability and budget). Model cooldowns
+   *  are reported on each entry in `models`. */
   admitting: boolean | null
   /** One sentence naming why `admitting` is false; null while it is true. */
   admission_block: string | null
@@ -1259,7 +1377,7 @@ export interface Provider {
    *  card, which cannot see prompt caching or a long-context tier -- so the
    *  two are a charge and a forecast, and the Spend screen says which. */
   metered_requests_today: number | null
-  /** Seconds until a rate-limit backoff clears; null when not backed off. */
+  /** Seconds until a provider-wide failure backoff clears. */
   retry_in_s: number | null
   /** How many models this provider actually serves -- the length of `models`,
    *  which the allowlist has already filtered. */
@@ -1305,10 +1423,17 @@ export interface ProviderSpec {
    *  must be one the provider publishes or the whole patch is a 400. */
   enabled_models?: string[]
   /** Upstream id -> the backend tag OpenRouter should be forced to for it,
-   *  sent as the complete map, like `aliases`: to clear one model's pin, send
-   *  the map without that key rather than a null value. PATCH only, and only
-   *  on a kind with `supports_backend_routing`. */
+   *  merged a key at a time: send `""` for one upstream to clear its pin.
+   *  Every tag must be one OpenRouter lists for that model or the patch is a
+   *  400. PATCH only, and only on a kind with `supports_backend_routing`. */
   backend_pins?: Record<string, string>
+  /** Upstream id -> whether OpenRouter may fall back to other hosts when the
+   *  pinned one is down. Merged a key at a time, like `backend_pins`. */
+  backend_fallbacks?: Record<string, boolean>
+  /** Upstream id -> USD per minute of audio for remote transcription, merged
+   *  a key at a time; `null` clears one. A finite number >= 0 or the patch is
+   *  a 400. Read back as each model's `price_per_minute_usd`. PATCH only. */
+  audio_prices?: Record<string, number | null>
 }
 
 /** `PATCH /api/providers/{id}` body (providers/service.py `update`). */
@@ -1325,6 +1450,8 @@ export type ProviderPatch = Partial<
     | 'aliases'
     | 'enabled_models'
     | 'backend_pins'
+    | 'backend_fallbacks'
+    | 'audio_prices'
   >
 >
 
@@ -1626,25 +1753,40 @@ export interface ChatMessage {
   content: string | ChatContentPart[]
 }
 
+/** Where a turn's reasoning came from. `'server'`: the runtime separated it
+ *  into `delta.reasoning` / `delta.reasoning_content` (it runs a reasoning
+ *  parser). `'inline'`: it arrived as `<think>` tags inside `delta.content` and
+ *  was split in the browser (it does not). */
+export type ReasoningSource = 'server' | 'inline'
+
 /** What one completed turn observed about itself.
  *
  *  Every figure here is measured in the browser or read off the wire; none is
- *  derived from a constant. `completionTokens` is the one that needs a
- *  provenance flag beside it, because there are two ways to arrive at it and
- *  they are not the same number -- see `tokensEstimated`. */
+ *  derived from a constant. The token counts need a provenance flag beside
+ *  them, because there are two ways to arrive at each and they are not the
+ *  same number -- see `tokensEstimated` and `reasoningEstimated`. */
 export interface ChatTurnMeta {
   model: string
   /** `X-Request-Id`, minted by the gateway before the first thing that can
    *  refuse, so a bad answer can be traced to the row that recorded it.
    *  `null` only if the header was absent. */
   requestId: string | null
-  /** Milliseconds to the first delta carrying text. Not to the first byte:
-   *  the gateway deliberately holds the status line until the first upstream
-   *  chunk, so the first token is the honest mark. `null` if none arrived. */
+  /** Milliseconds to the first delta carrying reasoning OR answer text. Not
+   *  to the first byte: the gateway deliberately holds the status line until
+   *  the first upstream chunk, so the first token is the honest mark. `null`
+   *  if none arrived. */
   ttftMs: number | null
+  /** Milliseconds to the first delta carrying answer text; equals `ttftMs`
+   *  when nothing was reasoned. */
+  firstContentMs?: number | null
   /** Milliseconds from send to the end of the stream. */
   elapsedMs: number | null
+  /** `usage.prompt_tokens`; never estimated, so `null` without a usage block. */
+  promptTokens?: number | null
   completionTokens: number | null
+  /** `usage.completion_tokens_details.reasoning_tokens`, else counted
+   *  reasoning frames. Part of `completionTokens`, not added to it. */
+  reasoningTokens?: number | null
   /** True when `completionTokens` counts delta frames rather than reading an
    *  upstream `usage` block. The backend draws exactly this distinction on its
    *  own request records (`tokens_estimated`); presenting a counted frame as a
@@ -1654,10 +1796,43 @@ export interface ChatTurnMeta {
    *  model thought before its first answer token. `null` when this turn
    *  carried no reasoning content at all -- not the same as `0`, which would
    *  claim a model thought for no time rather than not thinking out loud. */
-  reasoningMs: number | null
+  reasoningMs?: number | null
+  /** True when `reasoningTokens` counts frames rather than reading usage. */
+  reasoningEstimated?: boolean
+  /** `null` when no reasoning came back at all. */
+  reasoningSource?: ReasoningSource | null
+  /** `choices[0].finish_reason` of the last frame that carried one. */
+  finishReason?: string | null
   /** The reader was cancelled from the Stop button. The text is a real partial
    *  answer, not a failure. */
   stopped: boolean
+}
+
+/** The chat composer's per-request thinking control. `'default'` sends
+ *  nothing and leaves the model's own template default in charge. The levels
+ *  are vLLM's `reasoning_effort` values, spelled as it spells them. */
+export type ThinkingChoice =
+  | 'default'
+  | 'off'
+  | 'on'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+
+/** The levels among the choices: exactly what `reasoning_effort` accepts. */
+export type ThinkingLevel = Exclude<ThinkingChoice, 'default' | 'off' | 'on'>
+
+/** Extra top-level fields on a chat completion request. Both template keys
+ *  carry one value: vLLM ORs them, and each family reads only its own.
+ *  `thinking_token_budget` is vLLM's hard cap on reasoning tokens; it refuses
+ *  the field unless the deployment runs a `--reasoning-parser`. */
+export interface ChatRequestOptions {
+  chat_template_kwargs?: { enable_thinking: boolean; thinking: boolean }
+  reasoning_effort?: 'none' | ThinkingLevel
+  thinking_token_budget?: number
 }
 
 
@@ -2004,6 +2179,9 @@ export interface ModelDetail {
    *  Serve panel offers first and which route it says the model will answer
    *  on, because a speech model on `vllm` is refused, not merely slow. */
   modality?: Modality
+  /** The repo ships Python `--trust-remote-code` would run. Absent on an
+   *  older gateway. */
+  remote_code?: boolean
   max_position_embeddings: number | null
   shape: PlanShape
   is_moe: boolean
@@ -2731,4 +2909,440 @@ export interface SetupStatus {
    *  then not rendered at all -- not disabled, not explained. A step nobody can
    *  take is noise on the one screen where every word is read. */
   provider_routing: boolean
+}
+
+// ── Auth, orgs, API keys, limits, usage ──────────────────────────────────────
+//
+// Mirrors of control_plane/contracts/auth.py and contracts/telemetry.py.
+// contracts.check.mjs compares every union below against the Python enum of
+// the same name, member for member and in order.
+
+export type KeyStatus = 'active' | 'disabled' | 'expired'
+/** `route` is a served name's own rpm/tpm (`RoutingConfig.limits`). It only
+ *  ever appears in a refusal's `limit_source` (`route:rpm`); `LimitState` rows
+ *  are key and org only. */
+export type LimitScope = 'key' | 'org' | 'route'
+export type PrincipalVia = 'api_key' | 'session'
+export type AuthErrorCode =
+  | 'missing_api_key'
+  | 'invalid_api_key'
+  | 'api_key_disabled'
+  | 'api_key_expired'
+  | 'session_required'
+  | 'invalid_credentials'
+  | 'login_locked'
+  | 'setup_closed'
+  | 'auth_unavailable'
+  | 'limit_exceeded'
+  | 'max_output_tokens_exceeded'
+  | 'max_prompt_tokens_exceeded'
+  | 'limit_exceeds_org'
+  | 'allowlist_exceeds_org'
+  | 'model_not_allowed'
+  | 'setup_local_only'
+export type AuditAction =
+  | 'login'
+  | 'login_failed'
+  | 'logout'
+  | 'password_changed'
+  | 'admin_added'
+  | 'admin_removed'
+  | 'setup_admin_created'
+  | 'org_created'
+  | 'org_updated'
+  | 'org_deleted'
+  | 'key_created'
+  | 'key_updated'
+  | 'key_disabled'
+  | 'key_enabled'
+  | 'key_rotated'
+  | 'key_deleted'
+  | 'limit_changed'
+  | 'limit_raised'
+  | 'cycle_reset'
+  | 'pricing_changed'
+  | 'api_write'
+  | 'shell_opened'
+  | 'shell_closed'
+  | 'provider_created'
+  | 'provider_updated'
+  | 'provider_deleted'
+  | 'settings_changed'
+  | 'enrollment_minted'
+  | 'enrollment_revoked'
+  | 'deployment_launched'
+  | 'deployment_stopped'
+  | 'node_removed'
+  | 'node_admitted'
+  | 'node_process_killed'
+  | 'routing_changed'
+  | 'storage_deleted'
+  | 'sessions_revoked'
+  | 'node_joined'
+  | 'provider_signed_in'
+  | 'login_locked'
+  | 'key_refused'
+  | 'session_refused'
+  | 'setup_refused'
+  | 'join_rejected'
+  | 'cross_origin_refused'
+  | 'session_ip_changed'
+  | 'audit_chain_broken'
+  | 'agent_refused'
+  | 'cluster_token_rotated'
+  | 'node_runtime_model_changed'
+export type ContextBucket = '0-8k' | '8-32k' | '32-128k' | '128k+'
+export type CostBasis = 'metered' | 'estimated' | 'unpriced'
+export type FieldError = 'not_reported' | 'ambiguous_concurrency' | 'not_enabled'
+export type FallbackReason = 'cloud_pool_exhausted' | 'upstream_failed'
+
+/** `KEY_EXPIRY_DAYS` in contracts/auth.py: the only expiries a key can be
+ *  created with. Never-expiring is reserved for an admin's personal key. */
+export const KEY_EXPIRY_DAYS = [1, 10, 20, 30, 50, 100, 365] as const
+/** `NEAR_LIMIT_FRACTION`: a limit at or above this share of itself is near. */
+export const NEAR_LIMIT_FRACTION = 0.8
+/** `PASSWORD_MIN_LEN`. */
+export const PASSWORD_MIN_LEN = 12
+
+/** `GET /api/auth/state`: whether to show setup, login, or the app. */
+export interface AuthState {
+  admin_exists: boolean
+  authenticated: boolean
+  username: string | null
+  /** No admin yet and this caller is not on loopback: setup would answer
+   *  403 `setup_local_only`, so the UI shows the ssh tunnel instead. */
+  setup_local_only?: boolean
+}
+
+export interface AdminRow {
+  username: string
+  /** Null only for an admin created before emails were recorded. */
+  email: string | null
+  created_at: number
+  created_by: string | null
+}
+
+/** One live session, as `GET /api/auth/sessions` lists it (every admin's).
+ *  `session_id` is the 12-hex prefix the audit rows carry, never the cookie.
+ *  `login_ip` is where it signed in; `ip`/`user_agent` where it was last seen. */
+export interface AdminSession {
+  username: string
+  session_id: string
+  login_ip: string | null
+  ip: string | null
+  user_agent: string | null
+  created_at: number
+  last_seen_at: number
+  expires_at: number
+  /** This browser's own session. */
+  current: boolean
+}
+
+/** An org as `GET /api/orgs` lists it -- the fields the UI reads. */
+export interface OrgRow {
+  org_id: string
+  name: string
+  created_at: number
+  created_by: string
+  deleted_at: number | null
+  is_default: boolean
+}
+
+/** One configured limit, as `LimitService.states()` reports it. */
+export interface LimitState {
+  limit_type: string
+  scope: LimitScope
+  scope_id: string
+  limit: number
+  /** The configured limit, or this cycle's raise when there is one. */
+  effective_limit: number
+  used: number
+  remaining: number
+  /** Null only for a per-request cap, which has no window. */
+  resets_at: number | null
+  fraction: number
+  near: boolean
+  at: boolean
+}
+
+/** Thirty days of a key's traffic, off the telemetry archive. Null
+ *  when there is no archive -- never zeros, which would claim no traffic. */
+export interface Usage30d {
+  requests: number | null
+  tokens: number | null
+  cost_usd: number | null
+}
+
+/** A key as every endpoint but the three reveals returns it: no secret. */
+export interface ApiKeyRow {
+  key_id: string
+  name: string
+  org_id: string
+  created_by: string
+  created_at: number
+  expires_at: number | null
+  status: KeyStatus
+  disabled_at: number | null
+  disabled_by: string | null
+  disabled_reason: string | null
+  last_used_at: number | null
+  last_used_ip: string | null
+  notes: string
+  is_admin_key: boolean
+  admin_username: string | null
+  /** Null = every model `/v1/models` exposes. */
+  allowed_models: string[] | null
+  routing_policy: RoutingPolicy | null
+  limits: Record<string, number>
+  cloud_fallback_local_model: string | null
+  deleted_at: number | null
+  limit_states?: LimitState[]
+  usage_30d?: Usage30d | null
+}
+
+/** The one shape that carries a secret: `POST /api/setup/admin`,
+ *  `POST /api/keys`, `POST /api/keys/{id}/rotate`. Fetched unscrubbed, shown
+ *  once in RevealModal, never stored. */
+export interface MintedKey {
+  key: ApiKeyRow
+  secret_once: string
+}
+
+export interface SetupAdminResult extends MintedKey {
+  admin: AdminRow
+  /** False when the post-create sign-in was refused (a login lock): the
+   *  admin and key exist, no session cookie came back -- sign in instead. */
+  signed_in?: boolean
+}
+
+export interface KeyCreate {
+  name: string
+  expiry_days: number
+  limits?: Record<string, number>
+  allowed_models?: string[] | null
+  routing_policy?: RoutingPolicy | null
+  notes?: string
+  cloud_fallback_local_model?: string | null
+}
+
+export type KeyPatch = Partial<
+  Pick<
+    ApiKeyRow,
+    | 'name'
+    | 'notes'
+    | 'limits'
+    | 'allowed_models'
+    | 'routing_policy'
+    | 'cloud_fallback_local_model'
+  >
+>
+
+export interface KeyFilter {
+  status?: KeyStatus
+  near_limit?: boolean
+  expiring_days?: number
+  q?: string
+}
+
+/** One bucket x group of `GET /api/usage` (telemetry/query.py::usage). Every
+ *  optional measure is null when nothing in the bucket reported it -- never
+ *  0, which is a measurement. Why a cache or spec-decode measure is absent is
+ *  counted per FieldError code in `cache_errors` / `spec_errors`
+ *  (`{not_reported: 412}`). */
+export interface UsageBucket {
+  bucket: number
+  group: Record<string, string | number | null>
+  requests: number
+  ok: number
+  failed: number
+  /** error_class -> count. */
+  errors: Record<string, number>
+  error_rate: number | null
+  fallback_rate: number | null
+  cancel_rate: number | null
+  tokens_in: number | null
+  tokens_out: number | null
+  reasoning_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  cache_hit_rate: number | null
+  cache_errors: Partial<Record<FieldError, number>>
+  avg_prompt_tokens: number | null
+  avg_output_tokens: number | null
+  spec_drafts: number | null
+  spec_draft_tokens: number | null
+  spec_accepted_tokens: number | null
+  spec_acceptance_rate: number | null
+  spec_accepted_per_position: number[] | null
+  spec_acceptance_per_position: number[] | null
+  spec_errors: Partial<Record<FieldError, number>>
+  ttft_ms: Percentiles | null
+  latency_ms: Percentiles | null
+  queue_ms: Percentiles | null
+  tpot_ms: Percentiles | null
+  tokens_per_s: Percentiles | null
+  /** Null when nothing in the bucket was priced. */
+  cost_usd: number | null
+  metered_usd: number | null
+  estimated_usd: number | null
+  unpriced_requests: number
+  cost_basis: CostBasis | null
+}
+
+/** A latency histogram's summary. Null as a whole when no request reported
+ *  the measure. */
+export interface Percentiles {
+  n: number
+  avg: number | null
+  p50: number | null
+  p95: number | null
+  p99: number | null
+}
+
+export interface UsageResult {
+  from: number
+  to: number
+  resolution: string
+  durable: boolean
+  gaps: unknown[]
+  bucket: string
+  group_by: string[]
+  rows: UsageBucket[]
+}
+
+export interface UsageQuery {
+  start?: number | string
+  end?: number | string
+  bucket?: '1m' | '1h' | '1d'
+  group_by?: string[]
+  key_id?: string
+  org_id?: string
+  model?: string
+}
+
+/** One client request as `GET /api/requests` (and `/api/keys/{id}/requests`)
+ *  lists it: the final attempt's row, with `attempts` the true attempt count. */
+export interface RequestRow {
+  request_id: string
+  ts: number
+  served_name: string
+  status: number | null
+  attempt_no: number
+  attempts: number
+  node_id: string
+  target_id: string
+  target_kind: 'local' | 'remote' | ''
+  provider_id: string
+  deployment_id: string
+  policy: string
+  /** Null on a row written before a principal was known (an unauthenticated
+   *  401, a request refused at admission). */
+  key_id: string | null
+  key_name: string | null
+  org_id: string | null
+  error_class: string
+  error_code: string
+  retry_reason: string
+  model_requested: string | null
+  model_served: string | null
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  /** Prompt tokens the prefix cache served (OpenAI/vLLM `cached_tokens`,
+   *  Anthropic `cache_read_input_tokens`). Null with `cache_error` saying why. */
+  cache_read_tokens: number | null
+  /** Prompt tokens written to a provider-side cache (Anthropic only). */
+  cache_write_tokens: number | null
+  cache_error: FieldError | null
+  ttft_ms: number | null
+  duration_ms: number | null
+  decode_ms: number | null
+  parked_ms: number | null
+  tokens_per_s: number | null
+  tpot_p95_ms: number | null
+  cost_usd: number | null
+  finish_reason: string | null
+  client_ip: string | null
+  user_agent: string | null
+  limit_source: string | null
+  admission_code: string
+  attempt_chain:
+    | {
+        target_id: string
+        status: number | null
+        error_class: string | null
+        retry_reason: string | null
+        ms: number | null
+        /** Sanitized upstream refusal, retained with this attempt. */
+        error_message?: string | null
+        retry_after_s?: number | null
+      }[]
+    | null
+  [field: string]: unknown
+}
+
+export interface RequestsPage {
+  rows: RequestRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface RequestsQuery {
+  start?: number | string
+  end?: number | string
+  request_id?: string
+  key_id?: string
+  target_id?: string
+  provider_id?: string
+  retried?: boolean
+  status?: number | 'ok' | 'failed'
+  model?: string
+  error?: string
+  page?: number
+  page_size?: number
+}
+
+export interface AuditEntry {
+  id: number
+  ts: number
+  actor: string
+  action: AuditAction
+  target_kind: string
+  target_id: string
+  before: Record<string, unknown> | null
+  after: Record<string, unknown> | null
+  ip: string | null
+  /** The request that wrote the row (`x-request-id`); null before schema v3. */
+  request_id?: string | null
+  user_agent?: string | null
+  /** First 12 hex of the session's hash: joins to the session that acted. */
+  session_id?: string | null
+  /** The HTTP status the request answered, when the row records one. */
+  status?: number | null
+}
+
+export interface AuditPage {
+  entries: AuditEntry[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface AuditQuery {
+  start?: number
+  end?: number
+  actor?: string
+  action?: string
+  target?: string
+  page?: number
+  page_size?: number
+}
+
+export interface LocalPrice {
+  model: string
+  /** Null = unpriced: requests on it count toward no dollar limit. */
+  input_usd_per_mtok: number | null
+  output_usd_per_mtok: number | null
+  set_by: string
+  set_at: number
 }

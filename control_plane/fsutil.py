@@ -111,3 +111,27 @@ def harden_path(path: Path | str) -> bool:
     except OSError as exc:
         log.warning("could not set mode 0600 on %s: %s", path, exc)
         return False
+
+
+def private_sqlite(path: Path | str) -> bool:
+    """Make a SQLite database (and its WAL and shared-memory files) 0600.
+
+    Called before ``sqlite3.connect``. A new database is created here at 0600
+    rather than left to SQLite, which would create it at 0644 under the usual
+    umask -- and SQLite gives ``-wal`` and ``-shm`` the main file's mode, so
+    getting the main file right at birth is what keeps those private too. A
+    database already on disk at 0644, from a build before this existed, is
+    chmodded, with whichever of its companions exist. Creates the parent
+    directory. True when the main file's mode was applied.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if MODES_ARE_ENFORCED:
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
+    applied = harden_path(path)
+    if MODES_ARE_ENFORCED:
+        for suffix in ("-wal", "-shm"):
+            companion = path.with_name(path.name + suffix)
+            if companion.exists():
+                harden_path(companion)
+    return applied

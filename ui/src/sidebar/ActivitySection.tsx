@@ -26,16 +26,16 @@ export function ActivitySection() {
   return (
     <section>
       <h2>Activity</h2>
-      <div style={{ display: 'grid', gap: 12 }}>
+      <div style={{ display: 'grid', gap: 'var(--space-12)' }}>
         {rows.map((row) => (
-          <div key={row.key} style={{ display: 'grid', gap: 4 }}>
-            <div className="row" style={{ padding: '0 0 3px' }}>
+          <div key={row.key} style={{ display: 'grid', gap: 'var(--space-4)' }}>
+            <div className="row" style={{ padding: '0 0 var(--space-3)' }}>
               <span className="label" style={{ fontWeight: 500 }}>
                 {row.title}
               </span>
               <span
                 className="mono unit"
-                style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)' }}
               >
                 <Lamp
                   signal={row.signal}
@@ -73,7 +73,7 @@ export function ActivitySection() {
                 re-cased or shortened: it is more precise than any rewrite. */}
             {row.status ? <Verbatim text={row.status} size="unit" /> : null}
 
-            <div className="unit" style={{ marginTop: 2 }}>
+            <div className="unit" style={{ marginTop: 'var(--space-2)' }}>
               {row.detail}
               {row.kind === 'launch' && row.since
                 ? ` · since ${relativeTime(row.since)}`

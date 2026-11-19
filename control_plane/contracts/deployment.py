@@ -153,3 +153,36 @@ class Deployment:
     # so a value here would be a guess -- and the guess most likely to be
     # wrong is exactly the one above.
     image: str | None = None
+    # The 40-hex commit the resolver read the shape from and the launch was
+    # pinned to (--revision/--code-revision). None when the resolver had no
+    # sha (a local path, an inline config) or for a pre-pin record.
+    revision: str | None = None
+    # Draft tokens per step for MTP speculative decoding; 0 is off. Loads the
+    # checkpoint's multi-token-prediction module, so the fit charges it.
+    # Zero for every deployment launched before this field existed.
+    speculative_tokens: int = 0
+    # The operator opted in to running the repository's own Python
+    # (--trust-remote-code). False for every deployment launched before the
+    # flag became opt-in, which is what those records' commands did not say.
+    trust_remote_code: bool = False
+    # The local image id (`docker image inspect {{.Id}}`) that `image` above
+    # resolved to on the coordinator; "" when that image is not present locally.
+    # (`image` itself is declared above: the exact reference the operator chose,
+    # None meaning the runtime's pinned default, resolved at launch -- the launch
+    # path records the resolved reference there, env override included.)
+    image_id: str = ""
+
+
+#: Upper bound on Deployment.speculative_tokens.
+MAX_SPECULATIVE_TOKENS = 8
+
+
+def check_speculative_tokens(value: object) -> int:
+    """The launch's draft-token count, or ValueError naming the range."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= MAX_SPECULATIVE_TOKENS
+    ):
+        raise ValueError("speculative_tokens must be a whole number from 0 to 8.")
+    return value

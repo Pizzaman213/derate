@@ -91,7 +91,7 @@ export function SegmentBar({ segments, usable, ceiling, height = 22 }: SegmentBa
               bottom: 0,
               width: 0,
               borderLeft: '1px dashed var(--ink-muted)',
-              zIndex: 0,
+              zIndex: 'var(--z-base)',
             }}
             title="ceiling on idle hardware"
           />
@@ -102,11 +102,11 @@ export function SegmentBar({ segments, usable, ceiling, height = 22 }: SegmentBa
             style={{
               position: 'absolute',
               left: pct(usable),
-              top: -4,
-              bottom: -4,
+              top: 'calc(-1 * var(--space-4))',
+              bottom: 'calc(-1 * var(--space-4))',
               width: 0,
               borderLeft: '2px solid var(--ink)',
-              zIndex: 1,
+              zIndex: 'var(--z-sticky)',
             }}
             title="the memory this verdict was measured against"
           />
