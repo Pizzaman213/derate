@@ -1,0 +1,77 @@
+{
+  "config": {
+    "command": "rps",
+    "backends": 4,
+    "tokens": 64,
+    "ttft": 0.01,
+    "itl": 0.02,
+    "duration": 10.0,
+    "cooldown": 5.0,
+    "max_rps": 200000.0,
+    "max_streams": 8192,
+    "no_ab": false,
+    "settings": "{}",
+    "json": ".omp/work/auth-keys/load-after.json",
+    "rungs": "25,50,100,250",
+    "policy": "least_outstanding"
+  },
+  "rps": {
+    "axis": "rps",
+    "rungs": [
+      {
+        "rate": 25.0,
+        "achieved_rps": 25.0,
+        "error_rate": 0.0,
+        "p50_ms": 3.956,
+        "p99_ms": 8.07,
+        "loop_lag_p99_ms": 1.15,
+        "cpu_pct": 9.9,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": []
+      },
+      {
+        "rate": 50.0,
+        "achieved_rps": 49.99,
+        "error_rate": 0.0,
+        "p50_ms": 3.802,
+        "p99_ms": 5.65,
+        "loop_lag_p99_ms": 1.106,
+        "cpu_pct": 17.7,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": []
+      },
+      {
+        "rate": 100.0,
+        "achieved_rps": 100.0,
+        "error_rate": 0.0,
+        "p50_ms": 3.655,
+        "p99_ms": 10.234,
+        "loop_lag_p99_ms": 1.037,
+        "cpu_pct": 32.1,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": []
+      },
+      {
+        "rate": 250.0,
+        "achieved_rps": 250.0,
+        "error_rate": 0.0,
+        "p50_ms": 3.119,
+        "p99_ms": 65.838,
+        "loop_lag_p99_ms": 22.121,
+        "cpu_pct": 72.2,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": [
+          "p99 65.8 ms is 17x the idle p50 of 4.0 ms"
+        ]
+      }
+    ],
+    "derated": 100.0,
+    "stopped_by": [
+      "p99 65.8 ms is 17x the idle p50 of 4.0 ms"
+    ]
+  }
+}

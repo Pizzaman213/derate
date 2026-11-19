@@ -22,6 +22,21 @@ ui/dist/
 ui/.vite/
 *.local
 
+# Design pack (.omp/) -- generated or machine-local
+.omp/node_modules/
+.omp/graph/graphify-out/
+.omp/graph/graph.html
+.omp/graph/cache/
+# Rebuild locally with `cd .omp && npm run graph:update`.
+.omp/graph/graph.json
+.omp/graph/design-graph.json
+.omp/graph/god-nodes.json
+.omp/graph/GRAPH_REPORT.md
+.omp/tests/ui/.build/
+.omp/tests/ui/screens/
+.omp/design/screens/
+.omp/work/auth-keys/LOCK
+
 # Secrets and runtime data
 .env
 .env.*

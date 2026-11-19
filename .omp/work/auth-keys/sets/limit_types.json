@@ -1,0 +1,23 @@
+{
+ "derived_by": "python3 -c \"from control_plane.contracts.auth import LIMIT_TYPES; import json; print(json.dumps(sorted(LIMIT_TYPES)))\"",
+ "members": [
+  "budget_usd_cycle",
+  "cloud_tokens_cycle",
+  "cloud_usd_cycle",
+  "local_tokens_cycle",
+  "local_usd_cycle",
+  "max_concurrent",
+  "max_output_tokens_per_request",
+  "max_prompt_tokens_per_request",
+  "model:<id>:rpm",
+  "model:<id>:tokens_cycle",
+  "model:<id>:tpm",
+  "model:<id>:usd_cycle",
+  "requests_cycle",
+  "rpm",
+  "tokens_input_cycle",
+  "tokens_output_cycle",
+  "tokens_total_cycle",
+  "tpm"
+ ]
+}

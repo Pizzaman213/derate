@@ -1,0 +1,26 @@
+{
+ "derived_by": "grep -l \"TestClient(\" tests/unit/*.py",
+ "members": [
+  "tests/unit/test_enrollment.py",
+  "tests/unit/test_gateway.py",
+  "tests/unit/test_gateway_csrf.py",
+  "tests/unit/test_gateway_detail.py",
+  "tests/unit/test_gateway_models_api.py",
+  "tests/unit/test_gateway_runtime.py",
+  "tests/unit/test_gateway_ui_api.py",
+  "tests/unit/test_gpu_processes.py",
+  "tests/unit/test_history_api.py",
+  "tests/unit/test_inventory_api.py",
+  "tests/unit/test_live_memory.py",
+  "tests/unit/test_modelcache.py",
+  "tests/unit/test_node.py",
+  "tests/unit/test_node_naming.py",
+  "tests/unit/test_registry.py",
+  "tests/unit/test_setup.py",
+  "tests/unit/test_shell.py",
+  "tests/unit/test_storage.py",
+  "tests/unit/test_telemetry.py",
+  "tests/unit/test_topology_remotes.py",
+  "tests/unit/test_tts_runtime.py"
+ ]
+}
