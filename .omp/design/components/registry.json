@@ -1,0 +1,2207 @@
+{
+  "$description": "Every component the design pack knows. kind: shared (ui/src/components + shell/Sheet), css (a class pattern in base.css/derate.css with no component of its own), screen (maintained by pack-sync: name/path/tokens/icons only). states lists the gallery states each must render; tests is the check that renders them; spec is the DESIGN.md anchor.",
+  "components": [
+    {
+      "name": "Readout",
+      "kind": "shared",
+      "path": "ui/src/components/Readout.tsx",
+      "props": [
+        "value",
+        "decimals",
+        "unit",
+        "width",
+        "size",
+        "align",
+        "stale",
+        "tone",
+        "title"
+      ],
+      "variants": {
+        "size": [
+          "xl",
+          "readout",
+          "body"
+        ],
+        "tone": [
+          "ink",
+          "live",
+          "warn",
+          "fault",
+          "muted"
+        ]
+      },
+      "states": [
+        "default",
+        "stale",
+        "null"
+      ],
+      "tokens": [
+        "ink",
+        "live",
+        "warn",
+        "fault",
+        "ink-muted",
+        "font-mono"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/readout.check.mjs",
+      "spec": "DESIGN.md#readout",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Lamp",
+      "kind": "shared",
+      "path": "ui/src/components/Lamp.tsx",
+      "props": [
+        "signal",
+        "hollow",
+        "label",
+        "size"
+      ],
+      "variants": {
+        "signal": [
+          "live",
+          "warn",
+          "fault",
+          "idle"
+        ]
+      },
+      "states": [
+        "default",
+        "hollow"
+      ],
+      "tokens": [
+        "live",
+        "warn",
+        "fault",
+        "ink-muted",
+        "radius-full"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/lamp.check.mjs",
+      "spec": "DESIGN.md#lamp",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "SegmentBar",
+      "kind": "shared",
+      "path": "ui/src/components/Bars.tsx",
+      "props": [
+        "segments",
+        "usable",
+        "ceiling",
+        "height"
+      ],
+      "variants": {},
+      "states": [
+        "fits",
+        "overrun",
+        "limiting",
+        "no-usable"
+      ],
+      "tokens": [
+        "panel-sunk",
+        "edge",
+        "fill",
+        "fault",
+        "warn-solid",
+        "ink-muted"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/segmentbar.check.mjs",
+      "spec": "DESIGN.md#segmentbar--proportionbar",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "ProportionBar",
+      "kind": "shared",
+      "path": "ui/src/components/Bars.tsx",
+      "props": [
+        "value",
+        "width",
+        "height",
+        "tone",
+        "label"
+      ],
+      "variants": {
+        "tone": [
+          "ink",
+          "live",
+          "warn",
+          "fault",
+          "muted"
+        ]
+      },
+      "states": [
+        "value",
+        "null",
+        "zero",
+        "full"
+      ],
+      "tokens": [
+        "panel-sunk",
+        "edge",
+        "ink",
+        "live",
+        "warn",
+        "fault",
+        "ink-muted"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/proportionbar.check.mjs",
+      "spec": "DESIGN.md#segmentbar--proportionbar",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Verbatim",
+      "kind": "shared",
+      "path": "ui/src/components/Verbatim.tsx",
+      "props": [
+        "text",
+        "size"
+      ],
+      "variants": {
+        "size": [
+          "body",
+          "label",
+          "unit"
+        ]
+      },
+      "states": [
+        "default",
+        "multiline"
+      ],
+      "tokens": [
+        "ink"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/verbatim.check.mjs",
+      "spec": "DESIGN.md#verbatim--verbatimlist",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "VerbatimList",
+      "kind": "shared",
+      "path": "ui/src/components/Verbatim.tsx",
+      "props": [
+        "items"
+      ],
+      "variants": {},
+      "states": [
+        "items",
+        "empty"
+      ],
+      "tokens": [
+        "ink-muted"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/verbatim.check.mjs",
+      "spec": "DESIGN.md#verbatim--verbatimlist",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Copyable",
+      "kind": "shared",
+      "path": "ui/src/components/Copyable.tsx",
+      "props": [
+        "text",
+        "label"
+      ],
+      "variants": {},
+      "states": [
+        "idle",
+        "copied",
+        "failed"
+      ],
+      "tokens": [
+        "panel-sunk",
+        "rule",
+        "font-mono",
+        "live",
+        "fault"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/copyable.check.mjs",
+      "spec": "DESIGN.md#copyable",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "RevealModal",
+      "kind": "shared",
+      "path": "ui/src/components/RevealModal.tsx",
+      "props": [
+        "secret",
+        "keyId",
+        "onDone"
+      ],
+      "variants": {},
+      "states": [
+        "default",
+        "long"
+      ],
+      "tokens": [
+        "panel-overlay",
+        "panel-raised",
+        "shadow-raised",
+        "z-overlay",
+        "panel-sunk",
+        "rule",
+        "font-mono"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/reveal-modal.check.mjs",
+      "spec": "DESIGN.md#revealmodal",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "ProviderSignIn",
+      "kind": "shared",
+      "path": "ui/src/tabs/settings/ProviderSignIn.tsx",
+      "props": [
+        "flow",
+        "providerId",
+        "onDone",
+        "onCancel"
+      ],
+      "variants": {
+        "flow": [
+          "chatgpt",
+          "claude"
+        ]
+      },
+      "states": [
+        "start",
+        "paste",
+        "error",
+        "done"
+      ],
+      "tokens": [
+        "space-8",
+        "space-4",
+        "space-24",
+        "fault"
+      ],
+      "icons": [
+        "external-link"
+      ],
+      "tests": ".omp/tests/ui/components/provider-sign-in.check.mjs",
+      "spec": "DESIGN.md#providersignin",
+      "added": "2026-11-18"
+    },
+    {
+      "name": "OverrideGate",
+      "kind": "shared",
+      "path": "ui/src/components/OverrideGate.tsx",
+      "props": [
+        "reason",
+        "sentence",
+        "checked",
+        "onChange",
+        "onLaunch",
+        "launching",
+        "launchLabel"
+      ],
+      "variants": {},
+      "states": [
+        "unchecked",
+        "checked",
+        "launching",
+        "stacked"
+      ],
+      "tokens": [
+        "ink",
+        "warn",
+        "fault",
+        "edge"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/overridegate.check.mjs",
+      "spec": "DESIGN.md#overridegate",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "CacheTable",
+      "kind": "shared",
+      "path": "ui/src/components/CacheTable.tsx",
+      "props": [
+        "node",
+        "servedFolders",
+        "onDelete",
+        "busy"
+      ],
+      "variants": {},
+      "states": [
+        "rows",
+        "empty",
+        "busy",
+        "unavailable",
+        "read-only"
+      ],
+      "tokens": [
+        "ink-muted",
+        "rule",
+        "font-mono",
+        "fault"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/cachetable.check.mjs",
+      "spec": "DESIGN.md#cachetable",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Section",
+      "kind": "shared",
+      "path": "ui/src/components/Panel.tsx",
+      "props": [
+        "title",
+        "aside",
+        "children"
+      ],
+      "variants": {},
+      "states": [
+        "default",
+        "aside"
+      ],
+      "tokens": [
+        "rule",
+        "ink-muted"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/disclosure.check.mjs",
+      "spec": "DESIGN.md#disclosure",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Disclosure",
+      "kind": "shared",
+      "path": "ui/src/components/Panel.tsx",
+      "props": [
+        "summary",
+        "open",
+        "onToggle",
+        "children"
+      ],
+      "variants": {},
+      "states": [
+        "closed",
+        "open"
+      ],
+      "tokens": [
+        "ink-muted"
+      ],
+      "icons": [
+        "plus",
+        "minus"
+      ],
+      "tests": ".omp/tests/ui/components/disclosure.check.mjs",
+      "spec": "DESIGN.md#disclosure",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Popover",
+      "kind": "shared",
+      "path": "ui/src/components/Popover.tsx",
+      "props": [
+        "label",
+        "trigger",
+        "children"
+      ],
+      "variants": {},
+      "states": [
+        "closed",
+        "open"
+      ],
+      "tokens": [
+        "panel-raised",
+        "rule",
+        "shadow-raised",
+        "z-rail"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/popover.check.mjs",
+      "spec": "DESIGN.md#popover",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Sheet",
+      "kind": "shared",
+      "path": "ui/src/shell/Sheet.tsx",
+      "props": [],
+      "variants": {
+        "kind": [
+          "node",
+          "dep",
+          "model"
+        ]
+      },
+      "states": [
+        "node",
+        "dep",
+        "model"
+      ],
+      "tokens": [
+        "panel-overlay",
+        "panel-raised",
+        "shadow-raised",
+        "z-overlay"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/sheet.check.mjs",
+      "spec": "DESIGN.md#sheet",
+      "added": "2026-11-17",
+      "interactive": true
+    },
+    {
+      "name": "Icon",
+      "kind": "shared",
+      "path": "ui/src/components/Icon.tsx",
+      "props": [
+        "name",
+        "size",
+        "className",
+        "label",
+        "decorative"
+      ],
+      "variants": {
+        "size": [
+          "12",
+          "14",
+          "16",
+          "20",
+          "24"
+        ]
+      },
+      "states": [
+        "every-name"
+      ],
+      "tokens": [],
+      "icons": [
+        "*"
+      ],
+      "tests": ".omp/tests/ui/components/icon.check.mjs",
+      "spec": "DESIGN.md#icon",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Button",
+      "kind": "css",
+      "path": "ui/src/styles/base.css",
+      "props": [],
+      "variants": {
+        "class": [
+          "",
+          "ghost"
+        ]
+      },
+      "states": [
+        "default",
+        "disabled",
+        "pressed",
+        "icon-only",
+        "loading"
+      ],
+      "tokens": [
+        "button-bg",
+        "button-fg",
+        "button-border",
+        "button-hover-bg",
+        "button-pressed-bg",
+        "button-disabled-fg",
+        "button-radius",
+        "focus",
+        "focus-ring-width"
+      ],
+      "icons": [
+        "close",
+        "plus"
+      ],
+      "tests": ".omp/tests/ui/components/button.check.mjs",
+      "spec": "DESIGN.md#button",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Input",
+      "kind": "css",
+      "path": "ui/src/styles/base.css",
+      "props": [],
+      "variants": {
+        "element": [
+          "input",
+          "select",
+          "textarea"
+        ]
+      },
+      "states": [
+        "default",
+        "placeholder",
+        "disabled",
+        "error"
+      ],
+      "tokens": [
+        "input-bg",
+        "input-fg",
+        "input-border",
+        "input-placeholder",
+        "input-radius",
+        "fault"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/input.check.mjs",
+      "spec": "DESIGN.md#input--select--textarea",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Card",
+      "kind": "css",
+      "path": "ui/src/styles/derate.css",
+      "props": [],
+      "variants": {
+        "class": [
+          "card",
+          "card2"
+        ]
+      },
+      "states": [
+        "default",
+        "empty",
+        "error"
+      ],
+      "tokens": [
+        "card-bg",
+        "card-border",
+        "card-radius",
+        "card-pad"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/card.check.mjs",
+      "spec": "DESIGN.md#card",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Chip",
+      "kind": "css",
+      "path": "ui/src/styles/derate.css",
+      "props": [],
+      "variants": {
+        "class": [
+          "pill",
+          "pill mono",
+          "chips button"
+        ]
+      },
+      "states": [
+        "default",
+        "toggle",
+        "toggle-pressed"
+      ],
+      "tokens": [
+        "chip-bg",
+        "chip-fg",
+        "chip-border",
+        "chip-radius"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/chip.check.mjs",
+      "spec": "DESIGN.md#chip--pill",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Nav",
+      "kind": "css",
+      "path": "ui/src/styles/derate.css",
+      "props": [],
+      "variants": {},
+      "states": [
+        "default",
+        "current"
+      ],
+      "tokens": [
+        "nav-fg",
+        "nav-fg-active",
+        "nav-underline"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/nav.check.mjs",
+      "spec": "DESIGN.md#nav",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Table",
+      "kind": "css",
+      "path": "ui/src/styles/derate.css",
+      "props": [],
+      "variants": {},
+      "states": [
+        "rows",
+        "empty"
+      ],
+      "tokens": [
+        "table-header-fg",
+        "table-row-border",
+        "font-mono"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/table.check.mjs",
+      "spec": "DESIGN.md#table",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "Banner",
+      "kind": "shared",
+      "path": "ui/src/components/Banner.tsx",
+      "props": [
+        "tone",
+        "children",
+        "action"
+      ],
+      "variants": {
+        "tone": [
+          "fault",
+          "warn"
+        ]
+      },
+      "states": [
+        "default",
+        "with-action"
+      ],
+      "tokens": [
+        "fault",
+        "panel",
+        "space-16",
+        "space-3",
+        "space-8",
+        "warn"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/banner.check.mjs",
+      "spec": "DESIGN.md#banner",
+      "added": "2026-11-18"
+    },
+    {
+      "name": "PackChart",
+      "kind": "shared",
+      "path": "ui/src/components/PackChart.tsx",
+      "props": [
+        "type",
+        "title",
+        "data",
+        "height",
+        "options"
+      ],
+      "variants": {
+        "type": [
+          "stacked-bar",
+          "stacked-bar-100",
+          "grouped-bar",
+          "multi-line",
+          "pie",
+          "donut"
+        ]
+      },
+      "states": [
+        "default",
+        "empty"
+      ],
+      "tokens": [],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/packchart.check.mjs",
+      "spec": "DESIGN.md#packchart",
+      "added": "2026-11-18"
+    },
+    {
+      "name": "PasswordField",
+      "kind": "shared",
+      "path": "ui/src/components/PasswordField.tsx",
+      "props": [
+        "id",
+        "name",
+        "value",
+        "onChange",
+        "autoComplete",
+        "autoFocus",
+        "disabled",
+        "inputClassName",
+        "className",
+        "aria-invalid",
+        "aria-describedby"
+      ],
+      "variants": {},
+      "states": [
+        "hidden",
+        "shown",
+        "disabled",
+        "error"
+      ],
+      "tokens": [
+        "panel",
+        "rule",
+        "radius",
+        "space-3",
+        "space-6",
+        "space-12",
+        "focus",
+        "ink",
+        "ink-muted",
+        "panel-sunk"
+      ],
+      "icons": [
+        "eye",
+        "eye-off"
+      ],
+      "tests": ".omp/tests/ui/components/passwordfield.check.mjs",
+      "spec": "DESIGN.md#passwordfield",
+      "added": "2026-11-18"
+    },
+    {
+      "name": "BlockFrame",
+      "kind": "shared",
+      "path": "ui/src/components/BlockFrame.tsx",
+      "props": [
+        "title",
+        "sub",
+        "icon",
+        "signal",
+        "meta",
+        "selected",
+        "tone",
+        "onRemove",
+        "removeLabel",
+        "children",
+        "footer",
+        "className"
+      ],
+      "variants": {
+        "tone": [
+          "warn",
+          "fault"
+        ]
+      },
+      "states": [
+        "default",
+        "selected",
+        "with-lamp"
+      ],
+      "tokens": [
+        "graph-block-bg",
+        "graph-block-border",
+        "graph-block-selected",
+        "graph-warn",
+        "graph-fault",
+        "rule",
+        "radius",
+        "space-6",
+        "space-8",
+        "space-12"
+      ],
+      "icons": [
+        "x-circle"
+      ],
+      "tests": ".omp/tests/ui/components/blockframe.check.mjs",
+      "spec": "DESIGN.md#blockframe",
+      "added": "2026-11-18"
+    },
+    {
+      "name": "IssueList",
+      "kind": "shared",
+      "path": "ui/src/components/IssueList.tsx",
+      "props": [
+        "label",
+        "issues",
+        "empty"
+      ],
+      "variants": {
+        "level": [
+          "error",
+          "warn"
+        ]
+      },
+      "states": [
+        "errors",
+        "warnings",
+        "empty"
+      ],
+      "tokens": [
+        "fault",
+        "warn",
+        "space-6",
+        "space-8"
+      ],
+      "icons": [
+        "x-circle",
+        "alert-triangle"
+      ],
+      "tests": ".omp/tests/ui/components/issuelist.check.mjs",
+      "spec": "DESIGN.md#issuelist",
+      "added": "2026-11-18"
+    },
+    {
+      "name": "HostTable",
+      "kind": "shared",
+      "path": "ui/src/components/HostTable.tsx",
+      "props": [
+        "rows",
+        "pinned",
+        "fallback",
+        "onPin",
+        "onFallback",
+        "loading",
+        "error",
+        "disabled",
+        "className"
+      ],
+      "variants": {},
+      "states": [
+        "default",
+        "pinned",
+        "loading",
+        "error",
+        "empty"
+      ],
+      "tokens": [
+        "space-6"
+      ],
+      "icons": [],
+      "tests": ".omp/tests/ui/components/hosttable.check.mjs",
+      "spec": "DESIGN.md#hosttable",
+      "added": "2026-11-18"
+    },
+    {
+      "name": "DeploymentInspector",
+      "kind": "screen",
+      "path": "ui/src/inspectors/DeploymentInspector.tsx",
+      "tokens": [
+        "fault",
+        "fill",
+        "ink",
+        "ink-muted",
+        "on-fill",
+        "opacity-45",
+        "size-title",
+        "space-10",
+        "space-12",
+        "space-5",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "DeploymentLog",
+      "kind": "screen",
+      "path": "ui/src/inspectors/DeploymentLog.tsx",
+      "tokens": [
+        "fault"
+      ],
+      "icons": []
+    },
+    {
+      "name": "EventsAndLogs",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/EventsAndLogs.tsx",
+      "tokens": [
+        "fault",
+        "size-mono-label",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "HardwareRows",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/HardwareRows.tsx",
+      "tokens": [
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "Interconnect",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/Interconnect.tsx",
+      "tokens": [
+        "fault",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "NodeCharts",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/NodeCharts.tsx",
+      "tokens": [
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "NodeInspector",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/NodeInspector.tsx",
+      "tokens": [
+        "size-title",
+        "space-10",
+        "space-12",
+        "space-14",
+        "space-4",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "NodeRuntimeCard",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/NodeRuntimeCard.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "Provenance",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/Provenance.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "RenameNode",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/RenameNode.tsx",
+      "tokens": [
+        "fault",
+        "space-4",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "RequestsTable",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/RequestsTable.tsx",
+      "tokens": [
+        "fault",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ResidentProcesses",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/ResidentProcesses.tsx",
+      "tokens": [
+        "fault",
+        "space-8"
+      ],
+      "icons": [
+        "external-link"
+      ]
+    },
+    {
+      "name": "ServingBlock",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/ServingBlock.tsx",
+      "tokens": [
+        "space-10",
+        "space-16",
+        "space-2",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "NodeTerminal",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/Terminal.tsx",
+      "tokens": [
+        "space-10",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "WindowChips",
+      "kind": "screen",
+      "path": "ui/src/inspectors/node/WindowChips.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "AppShell",
+      "kind": "screen",
+      "path": "ui/src/shell/AppShell.tsx",
+      "tokens": [],
+      "icons": [
+        "chevron-right"
+      ]
+    },
+    {
+      "name": "Header",
+      "kind": "screen",
+      "path": "ui/src/shell/Header.tsx",
+      "tokens": [
+        "size-wordmark",
+        "tracking-tight"
+      ],
+      "icons": [
+        "derate-mark",
+        "log-out"
+      ]
+    },
+    {
+      "name": "HealthBanner",
+      "kind": "screen",
+      "path": "ui/src/shell/HealthBanner.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ActivitySection",
+      "kind": "screen",
+      "path": "ui/src/sidebar/ActivitySection.tsx",
+      "tokens": [
+        "space-12",
+        "space-2",
+        "space-3",
+        "space-4",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "CostSection",
+      "kind": "screen",
+      "path": "ui/src/sidebar/CostSection.tsx",
+      "tokens": [
+        "space-2",
+        "space-4",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "PlanSection",
+      "kind": "screen",
+      "path": "ui/src/sidebar/PlanSection.tsx",
+      "tokens": [
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "RosterSection",
+      "kind": "screen",
+      "path": "ui/src/sidebar/RosterSection.tsx",
+      "tokens": [
+        "ink-muted",
+        "opacity-55",
+        "radius",
+        "rule",
+        "space-12",
+        "space-2",
+        "space-3",
+        "space-4",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "RoutingSection",
+      "kind": "screen",
+      "path": "ui/src/sidebar/RoutingSection.tsx",
+      "tokens": [
+        "edge",
+        "fault",
+        "fill",
+        "opacity-25",
+        "opacity-55",
+        "opacity-62",
+        "panel-sunk",
+        "radius-sm",
+        "rule",
+        "space-10",
+        "space-4",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "Sidebar",
+      "kind": "screen",
+      "path": "ui/src/sidebar/Sidebar.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "AuthProvider",
+      "kind": "screen",
+      "path": "ui/src/state/auth.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "BackendProvider",
+      "kind": "screen",
+      "path": "ui/src/state/backend.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "MetricsProvider",
+      "kind": "screen",
+      "path": "ui/src/state/metrics.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "RouterProvider",
+      "kind": "screen",
+      "path": "ui/src/state/router.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "SelectionProvider",
+      "kind": "screen",
+      "path": "ui/src/state/selection.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "TelemetryProvider",
+      "kind": "screen",
+      "path": "ui/src/state/telemetry.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ActorPanel",
+      "kind": "screen",
+      "path": "ui/src/tabs/audit/ActorPanel.tsx",
+      "tokens": [
+        "ink-muted",
+        "space-12",
+        "space-16",
+        "space-2",
+        "space-4",
+        "space-6"
+      ],
+      "icons": [
+        "arrow-right"
+      ]
+    },
+    {
+      "name": "AuditTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/audit/AuditTab.tsx",
+      "tokens": [
+        "space-12",
+        "space-8"
+      ],
+      "icons": [
+        "close"
+      ]
+    },
+    {
+      "name": "AuditTable",
+      "kind": "screen",
+      "path": "ui/src/tabs/audit/AuditTable.tsx",
+      "tokens": [
+        "panel",
+        "select-on-panel",
+        "space-10"
+      ],
+      "icons": [
+        "chevron-left",
+        "chevron-right"
+      ]
+    },
+    {
+      "name": "Clip",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/Clip.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "Composer",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/Composer.tsx",
+      "tokens": [
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "Markdown",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/Markdown.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ModelList",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/ModelList.tsx",
+      "tokens": [
+        "fault",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "SessionStats",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/SessionStats.tsx",
+      "tokens": [
+        "space-4"
+      ],
+      "icons": []
+    },
+    {
+      "name": "Transcript",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/Transcript.tsx",
+      "tokens": [
+        "fault",
+        "space-4",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "DEFAULT",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/UploadFields.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "OWN",
+      "kind": "screen",
+      "path": "ui/src/tabs/chat/VoiceFields.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ChatTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/ChatTab.tsx",
+      "tokens": [
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "BalancerDialog",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/BalancerDialog.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "SplitBlock",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/blocks/Balancer.tsx",
+      "tokens": [
+        "graph-block-bg",
+        "graph-block-border",
+        "graph-block-selected",
+        "graph-fault",
+        "graph-limit",
+        "graph-req",
+        "graph-resp",
+        "graph-warn"
+      ],
+      "icons": [
+        "route"
+      ]
+    },
+    {
+      "name": "MachineBlock",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/blocks/Containers.tsx",
+      "tokens": [
+        "ink-muted"
+      ],
+      "icons": [
+        "plus",
+        "route",
+        "x-circle"
+      ]
+    },
+    {
+      "name": "EditorContext",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/blocks/editor.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ModelBlock",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/blocks/ModelBlock.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "InputBlock",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/blocks/Terminals.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "PathRegistry",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/edges.tsx",
+      "tokens": [
+        "fault",
+        "warn"
+      ],
+      "icons": [
+        "x-circle"
+      ]
+    },
+    {
+      "name": "GraphToolbar",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/GraphToolbar.tsx",
+      "tokens": [],
+      "icons": [
+        "fit-view",
+        "gauge",
+        "plus",
+        "zoom-in",
+        "zoom-out"
+      ]
+    },
+    {
+      "name": "ParticleLayer",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/ParticleLayer.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "SelectionRail",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/SelectionRail.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-4",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "WiringCanvas",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/WiringCanvas.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ClusterTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/ClusterTab.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "AggregateRow",
+      "kind": "screen",
+      "path": "ui/src/tabs/dashboard/AggregateRow.tsx",
+      "tokens": [
+        "space-16",
+        "space-4",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ChartGrid",
+      "kind": "screen",
+      "path": "ui/src/tabs/dashboard/Chart.tsx",
+      "tokens": [
+        "ink"
+      ],
+      "icons": []
+    },
+    {
+      "name": "DeploymentsStrip",
+      "kind": "screen",
+      "path": "ui/src/tabs/dashboard/DeploymentsStrip.tsx",
+      "tokens": [
+        "size-label",
+        "space-1",
+        "space-4",
+        "space-5"
+      ],
+      "icons": [
+        "external-link"
+      ]
+    },
+    {
+      "name": "HeadroomSub",
+      "kind": "screen",
+      "path": "ui/src/tabs/dashboard/HeadroomSub.tsx",
+      "tokens": [
+        "fault",
+        "ink",
+        "ink-muted",
+        "opacity-62",
+        "space-10",
+        "space-12",
+        "space-16",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "LoadSub",
+      "kind": "screen",
+      "path": "ui/src/tabs/dashboard/LoadSub.tsx",
+      "tokens": [
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "TelemetrySub",
+      "kind": "screen",
+      "path": "ui/src/tabs/dashboard/TelemetrySub.tsx",
+      "tokens": [
+        "space-10",
+        "space-16",
+        "space-4"
+      ],
+      "icons": []
+    },
+    {
+      "name": "UsageCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/dashboard/UsageCard.tsx",
+      "tokens": [
+        "space-16",
+        "space-24"
+      ],
+      "icons": []
+    },
+    {
+      "name": "DashboardTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/DashboardTab.tsx",
+      "tokens": [
+        "space-12",
+        "space-16"
+      ],
+      "icons": []
+    },
+    {
+      "name": "KeyActions",
+      "kind": "screen",
+      "path": "ui/src/tabs/keys/KeyActions.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "KeyCreate",
+      "kind": "screen",
+      "path": "ui/src/tabs/keys/KeyCreate.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-12",
+        "space-24",
+        "space-8"
+      ],
+      "icons": [
+        "plus"
+      ]
+    },
+    {
+      "name": "KeyDetail",
+      "kind": "screen",
+      "path": "ui/src/tabs/keys/KeyDetail.tsx",
+      "tokens": [
+        "space-12",
+        "space-6",
+        "space-8",
+        "space-96"
+      ],
+      "icons": [
+        "chevron-left"
+      ]
+    },
+    {
+      "name": "KeysSub",
+      "kind": "screen",
+      "path": "ui/src/tabs/keys/KeysSub.tsx",
+      "tokens": [
+        "space-10",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "KeyStats",
+      "kind": "screen",
+      "path": "ui/src/tabs/keys/KeyStats.tsx",
+      "tokens": [
+        "space-10",
+        "space-12",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "LimitsEditor",
+      "kind": "screen",
+      "path": "ui/src/tabs/keys/LimitsEditor.tsx",
+      "tokens": [
+        "fault",
+        "space-8"
+      ],
+      "icons": [
+        "close",
+        "plus"
+      ]
+    },
+    {
+      "name": "OrgsCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/keys/OrgsCard.tsx",
+      "tokens": [
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "LoginTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/login/LoginTab.tsx",
+      "tokens": [],
+      "icons": [
+        "derate-mark",
+        "lock"
+      ]
+    },
+    {
+      "name": "BackendPicker",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/BackendPicker.tsx",
+      "tokens": [
+        "space-4"
+      ],
+      "icons": []
+    },
+    {
+      "name": "BandHeading",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/BandSection.tsx",
+      "tokens": [
+        "space-8"
+      ],
+      "icons": [
+        "chevron-down"
+      ]
+    },
+    {
+      "name": "CapabilityChips",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/CapabilityChips.tsx",
+      "tokens": [
+        "space-4"
+      ],
+      "icons": []
+    },
+    {
+      "name": "CardGrid",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/CardGrid.tsx",
+      "tokens": [
+        "fault"
+      ],
+      "icons": []
+    },
+    {
+      "name": "CatalogList",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/CatalogList.tsx",
+      "tokens": [
+        "fault",
+        "space-12",
+        "space-2",
+        "space-8",
+        "warn"
+      ],
+      "icons": [
+        "chevron-right"
+      ]
+    },
+    {
+      "name": "CustomServesCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/CustomServes.tsx",
+      "tokens": [
+        "space-10",
+        "space-4",
+        "space-6"
+      ],
+      "icons": [
+        "close"
+      ]
+    },
+    {
+      "name": "DegreeFields",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/DegreeFields.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "InstalledModelsCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/InstalledModelsCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ModelCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/ModelCard.tsx",
+      "tokens": [],
+      "icons": [
+        "check"
+      ]
+    },
+    {
+      "name": "ModelInspector",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/ModelInspector.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-20",
+        "space-3",
+        "space-4",
+        "space-6",
+        "space-8"
+      ],
+      "icons": [
+        "check"
+      ]
+    },
+    {
+      "name": "NodeBoard",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/NodeBoard.tsx",
+      "tokens": [
+        "space-2",
+        "space-3",
+        "space-6",
+        "space-8",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ParamBreakdownTable",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/ParamBreakdownTable.tsx",
+      "tokens": [
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ProviderPicker",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/ProviderPicker.tsx",
+      "tokens": [
+        "space-2",
+        "space-4"
+      ],
+      "icons": []
+    },
+    {
+      "name": "PullCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/PullCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-6",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "QuantLadder",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/QuantLadder.tsx",
+      "tokens": [
+        "fault",
+        "opacity-38",
+        "panel-sunk",
+        "radius-sm",
+        "size-unit",
+        "space-10",
+        "space-2",
+        "space-4",
+        "space-6",
+        "space-8",
+        "warn"
+      ],
+      "icons": [
+        "minus"
+      ]
+    },
+    {
+      "name": "QuantTableCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/QuantTableCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-8"
+      ],
+      "icons": [
+        "minus"
+      ]
+    },
+    {
+      "name": "RouteCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/RouteCard.tsx",
+      "tokens": [
+        "space-8",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ServePanel",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/ServePanel.tsx",
+      "tokens": [
+        "fault",
+        "space-12",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "UnchosenBanner",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/UnchosenBanner.tsx",
+      "tokens": [
+        "space-6",
+        "space-8",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "Verdict",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/Verdict.tsx",
+      "tokens": [
+        "fault",
+        "ink",
+        "ink-muted",
+        "opacity-60",
+        "opacity-72",
+        "rule",
+        "space-10",
+        "space-12",
+        "space-16",
+        "space-3",
+        "space-4",
+        "space-6",
+        "space-8",
+        "warn"
+      ],
+      "icons": [
+        "alert-triangle"
+      ]
+    },
+    {
+      "name": "ModelsTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/ModelsTab.tsx",
+      "tokens": [
+        "space-16",
+        "space-6",
+        "warn"
+      ],
+      "icons": [
+        "close",
+        "search"
+      ]
+    },
+    {
+      "name": "RateLimitsSub",
+      "kind": "screen",
+      "path": "ui/src/tabs/requests/RateLimitsSub.tsx",
+      "tokens": [
+        "ink-muted",
+        "space-12",
+        "space-8",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "RequestDetail",
+      "kind": "screen",
+      "path": "ui/src/tabs/requests/RequestDetail.tsx",
+      "tokens": [
+        "space-12",
+        "space-8",
+        "warn"
+      ],
+      "icons": [
+        "chevron-left"
+      ]
+    },
+    {
+      "name": "RequestRows",
+      "kind": "screen",
+      "path": "ui/src/tabs/requests/RequestRows.tsx",
+      "tokens": [
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "RequestsSub",
+      "kind": "screen",
+      "path": "ui/src/tabs/requests/RequestsSub.tsx",
+      "tokens": [
+        "space-12",
+        "space-4",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "AddNodeCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/AddNodeCard.tsx",
+      "tokens": [
+        "fault",
+        "live",
+        "rule",
+        "space-10",
+        "space-12",
+        "space-14",
+        "space-16",
+        "space-3",
+        "space-6",
+        "space-8",
+        "space-9"
+      ],
+      "icons": []
+    },
+    {
+      "name": "AdminsCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/AdminsCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-14",
+        "space-6"
+      ],
+      "icons": [
+        "lock",
+        "trash",
+        "user"
+      ]
+    },
+    {
+      "name": "AppearanceCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/AppearanceCard.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ClusterCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/ClusterCard.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ContainmentCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/ContainmentCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-24",
+        "space-3",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "CoordinatorCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/CoordinatorCard.tsx",
+      "tokens": [
+        "fault",
+        "live",
+        "space-10",
+        "space-12",
+        "space-5",
+        "space-8",
+        "space-9"
+      ],
+      "icons": [
+        "check"
+      ]
+    },
+    {
+      "name": "KeyField",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/KeyField.tsx",
+      "tokens": [
+        "space-12",
+        "space-2",
+        "space-4",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "NodesCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/NodesCard.tsx",
+      "tokens": [
+        "fault",
+        "rule",
+        "space-10",
+        "space-12",
+        "space-14",
+        "space-3",
+        "space-8",
+        "space-9",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "PricingCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/PricingCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ProviderBackupPanel",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/ProviderBackupPanel.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-3",
+        "space-4",
+        "space-8",
+        "space-9"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ProvidersCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/ProvidersCard.tsx",
+      "tokens": [
+        "fault",
+        "ink-muted",
+        "live",
+        "panel-recessed",
+        "rule",
+        "space-10",
+        "space-12",
+        "space-3",
+        "space-4",
+        "space-6",
+        "space-8",
+        "space-9",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ReliabilityCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/ReliabilityCard.tsx",
+      "tokens": [
+        "fault",
+        "space-24",
+        "space-3",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ScopeCards",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/ScopeCards.tsx",
+      "tokens": [
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "SessionsCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/SessionsCard.tsx",
+      "tokens": [
+        "space-6"
+      ],
+      "icons": [
+        "log-out",
+        "user"
+      ]
+    },
+    {
+      "name": "SettingsTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/SettingsTab.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "AdminStep",
+      "kind": "screen",
+      "path": "ui/src/tabs/setup/AdminStep.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "Qr",
+      "kind": "screen",
+      "path": "ui/src/tabs/setup/Qr.tsx",
+      "tokens": [
+        "qr-ink"
+      ],
+      "icons": []
+    },
+    {
+      "name": "SetupTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/SetupTab.tsx",
+      "tokens": [
+        "space-12",
+        "space-16",
+        "space-24",
+        "space-32",
+        "space-8"
+      ],
+      "icons": [
+        "check",
+        "derate-mark"
+      ]
+    },
+    {
+      "name": "OverviewSub",
+      "kind": "screen",
+      "path": "ui/src/tabs/spend/OverviewSub.tsx",
+      "tokens": [
+        "fill",
+        "on-fill",
+        "on-signal",
+        "space-10",
+        "space-12",
+        "space-14",
+        "space-18",
+        "space-6",
+        "space-8",
+        "warn-solid"
+      ],
+      "icons": []
+    },
+    {
+      "name": "CollectionCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/storage/CollectionCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-6"
+      ],
+      "icons": []
+    },
+    {
+      "name": "EstateCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/storage/EstateCard.tsx",
+      "tokens": [
+        "fault",
+        "opacity-45",
+        "rule",
+        "space-10",
+        "space-12",
+        "space-4",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "FilesystemsCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/storage/FilesystemsCard.tsx",
+      "tokens": [
+        "fault",
+        "ink-muted",
+        "space-10",
+        "space-3",
+        "space-4",
+        "space-8",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ModelCacheCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/storage/ModelCacheCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "UsageTab",
+      "kind": "screen",
+      "path": "ui/src/tabs/UsageTab.tsx",
+      "tokens": [],
+      "icons": []
+    }
+  ]
+}
