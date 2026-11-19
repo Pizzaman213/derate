@@ -44,8 +44,9 @@ def enabled() -> bool:
     goes, and it still gives up the property worth most here: with the route
     absent there is nothing to fingerprint, nothing to attack, and no key
     material loaded on a node nobody intends to get a prompt on. Given this
-    `/api` surface has no authentication, binds `0.0.0.0`, and is reachable
-    across a tailnet, two gates are the point rather than redundancy.
+    `/api` surface is one admin password away (a session cookie is the only
+    thing the socket handshake checks), binds `0.0.0.0`, and is reachable
+    across a tailnet, three gates are the point rather than redundancy.
 
     Defence in depth survives one of its layers being wrong. One gate does not.
     """
@@ -106,10 +107,9 @@ def shell_key(data_dir: Path | str | None = None) -> str:
     """The secret that opens a session, or "" if there is none.
 
     Env first, then the file. **Nothing mints this over HTTP and no route
-    returns it**, which is the whole point: ``POST /api/enroll`` is
-    unauthenticated and its token buys the permanent cluster token through
-    ``POST /api/nodes/join``, so a gate built on the cluster token is a gate
-    the network can open for itself. This one has to be read off the machine.
+    returns it**, which is the whole point: the shell is a root prompt, so its
+    key is a secret that has to be read off the machine, never one a session,
+    an enrollment token or the cluster token can be traded for.
     """
     env = os.environ.get("DERATE_SHELL_KEY", "").strip()
     if env:
@@ -131,7 +131,8 @@ def ensure_key(data_dir: Path | str | None = None) -> str:
     queryable database is not out of band any more.
     """
     import secrets
-    import stat
+
+    from control_plane.fsutil import harden_fd
 
     existing = shell_key(data_dir)
     if existing:
@@ -140,13 +141,22 @@ def ensure_key(data_dir: Path | str | None = None) -> str:
     path = key_path(data_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(key + "\n", encoding="utf-8")
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        # Created 0600 and exclusively (E3): no window in which the key sits
+        # under the umask's mode, and never written through a file somebody
+        # else created first.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another process won the race (or an empty file is there): take
+        # what is on disk if it is a key, else run with this one unpersisted.
+        return shell_key(data_dir) or key
     except OSError:
         # Cannot persist it: still return it, so the process that generated it
         # can be used this run. It will differ after a restart, which is worse
         # than stable but better than no shell at all on a read-only root.
-        pass
+        return key
+    harden_fd(fd, path)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(key + "\n")
     return key
 
 

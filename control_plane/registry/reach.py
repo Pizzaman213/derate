@@ -121,16 +121,26 @@ def validate_target(url: str) -> str:
     An agent will dial whatever the coordinator names here, so the check is on
     the shape of the address rather than on trust: file:// and friends are not
     peers, and a URL with no host is a typo that would otherwise come back as
-    an obscure transport error.
+    an obscure transport error. Callers append `/agent/...` to what this
+    returns, so a `?` or `#` -- even a bare trailing one -- would turn that
+    suffix into a query or fragment and aim the request at a path of the
+    caller's choosing; and credentials have no business in a peer address.
     """
-    parsed = urlparse(url.strip())
+    target = url.strip()
+    parsed = urlparse(target)
     if parsed.scheme not in ("http", "https"):
         raise UnusableTarget(
-            f"Can only dial an http or https address; got {url.strip()!r}."
+            f"Can only dial an http or https address; got {target!r}."
         )
     if not parsed.hostname:
-        raise UnusableTarget(f"No host in {url.strip()!r}.")
-    return url.strip().rstrip("/")
+        raise UnusableTarget(f"No host in {target!r}.")
+    if parsed.username is not None or parsed.password is not None:
+        raise UnusableTarget("No credentials in a peer address.")
+    if "?" in target or "#" in target:
+        raise UnusableTarget(
+            f"A peer address is scheme://host[:port][/path]; got {target!r}."
+        )
+    return target.rstrip("/")
 
 
 async def dial(

@@ -34,7 +34,7 @@ from control_plane.gateway import enroll_api
 from control_plane.gateway.app import create_app
 from control_plane.gateway.deps import GatewayDeps
 from control_plane.registry import JoinRejected, Registry, RegistryConfig
-from control_plane.registry.bootstrap import adopt_cluster_token
+from control_plane.registry.bootstrap import adopt_credentials
 from control_plane.registry.enrollment import (
     DEFAULT_TTL_S,
     MAX_TTL_S,
@@ -44,7 +44,7 @@ from control_plane.registry.identity import CLUSTER_FILE
 from control_plane.registry.roster import ROSTER_FILE
 
 from tests.fixtures import SPARK_01, SPARK_02
-from tests.unit.test_registry import FakeClient, make_registry, run
+from tests.unit.test_registry import FakeClient, join_proof, make_registry, run
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = REPO_ROOT / "install.sh"
@@ -218,7 +218,7 @@ def test_enrollment_token_admits_straight_to_member(tmp_path):
     registry = joining_registry(tmp_path)
     minted = registry.mint_enrollment()
 
-    result = run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+    result = run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert result["status"] == "member"
     assert result["cluster_id"] == registry.cluster_id()
@@ -227,14 +227,17 @@ def test_enrollment_token_admits_straight_to_member(tmp_path):
     assert registry.candidates() == []
 
 
-def test_the_admission_hands_over_the_permanent_cluster_token(tmp_path):
-    """Without this the node locks itself out when the enrollment token dies."""
+def test_the_admission_hands_over_the_members_own_agent_token(tmp_path):
+    """Without this the node locks itself out when the enrollment token dies.
+    It is handed its own token, never the cluster token."""
     registry = joining_registry(tmp_path)
     minted = registry.mint_enrollment()
 
-    result = run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+    result = run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
-    assert result["cluster_token"] == registry.cluster_token()
+    assert result["agent_token"] == registry.agent_token("spark-02")
+    assert "cluster_token" not in result
+    assert registry.cluster_token() not in str(result)
 
 
 def test_a_member_admitted_this_way_survives_the_token_expiring(tmp_path):
@@ -246,15 +249,15 @@ def test_a_member_admitted_this_way_survives_the_token_expiring(tmp_path):
     """
     registry = joining_registry(tmp_path)
     minted = registry.mint_enrollment()
-    first = run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+    first = run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     # The enrollment token is now spent (uses=1 by default).
     with pytest.raises(JoinRejected):
-        run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     # But the node kept what it was handed, and rejoining with that works.
     again = run(
-        registry.handle_join(first["cluster_token"], SPARK_02, "http://10.0.0.12:8081")
+        registry.handle_join(join_proof(registry, first["agent_token"], SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081")
     )
     assert again["status"] == "member"
 
@@ -263,7 +266,7 @@ def test_the_enrollment_token_is_spent_by_the_join(tmp_path):
     registry = joining_registry(tmp_path)
     minted = registry.mint_enrollment(uses=1)
 
-    run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+    run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert registry.enrollments() == []
 
@@ -275,8 +278,8 @@ def test_a_two_use_token_admits_two_machines(tmp_path):
     registry = make_registry(tmp_path, client=client, token="cluster-token")
     minted = registry.mint_enrollment(uses=2)
 
-    run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
-    run(registry.handle_join(minted.token, SPARK_01, "http://10.0.0.11:8081"))
+    run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
+    run(registry.handle_join(join_proof(registry, minted.token, SPARK_01, "http://10.0.0.11:8081"), SPARK_01, "http://10.0.0.11:8081"))
 
     assert registry.get_node("spark-02") is not None
     assert registry.get_node("spark-01") is not None
@@ -294,9 +297,9 @@ def test_an_expired_enrollment_token_is_rejected_like_any_other_wrong_one(tmp_pa
     clock.advance(61)
 
     with pytest.raises(JoinRejected) as expired:
-        run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     with pytest.raises(JoinRejected) as garbage:
-        run(registry.handle_join("nonsense", SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, "nonsense", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert str(expired.value) == str(garbage.value)
     assert registry.candidates() == []
@@ -309,14 +312,14 @@ def test_a_revoked_token_no_longer_admits(tmp_path):
     assert registry.revoke_enrollment(minted.token_id) is True
 
     with pytest.raises(JoinRejected):
-        run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
 
 def test_auto_admit_false_still_only_makes_a_candidate(tmp_path):
     registry = joining_registry(tmp_path)
     minted = registry.mint_enrollment(auto_admit=False)
 
-    result = run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+    result = run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert result["status"] == "candidate"
     assert "cluster_token" not in result
@@ -327,7 +330,7 @@ def test_an_enrollment_admission_is_persisted_like_any_other(tmp_path):
     """It goes through `admit`, so it lands in the roster and survives a restart."""
     registry = joining_registry(tmp_path)
     minted = registry.mint_enrollment()
-    run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+    run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     roster = json.loads((tmp_path / ROSTER_FILE).read_text())
     assert "spark-02" in roster["members"]
@@ -342,7 +345,7 @@ def test_an_enrollment_token_still_has_to_answer_the_probe_back(tmp_path):
     minted = registry.mint_enrollment()
 
     with pytest.raises(JoinRejected):
-        run(registry.handle_join(minted.token, SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, minted.token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     assert registry.list_nodes() == []
     # And it was not spent by an attempt that never got anywhere.
     assert len(registry.enrollments()) == 1
@@ -353,7 +356,7 @@ def test_an_enrollment_token_still_has_to_answer_the_probe_back(tmp_path):
 
 def test_the_cluster_token_still_only_makes_a_candidate(tmp_path):
     registry = joining_registry(tmp_path, token="cluster-token")
-    result = run(registry.handle_join("cluster-token", SPARK_02, "http://10.0.0.12:8081"))
+    result = run(registry.handle_join(join_proof(registry, "cluster-token", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     assert result["status"] == "candidate"
     assert "cluster_token" not in result
 
@@ -367,7 +370,7 @@ def test_no_token_still_makes_a_candidate(tmp_path):
 def test_a_wrong_token_is_still_a_flat_rejection(tmp_path):
     registry = joining_registry(tmp_path)
     with pytest.raises(JoinRejected):
-        run(registry.handle_join("wrong", SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, "wrong", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     assert registry.candidates() == []
     assert registry.list_nodes() == []
 
@@ -377,29 +380,31 @@ def test_a_wrong_token_is_still_a_flat_rejection(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_adopt_persists_the_token_and_switches_to_it(tmp_path):
+def test_adopt_persists_the_agent_token_and_switches_to_it(tmp_path):
     config = RegistryConfig(data_dir=tmp_path, token="ej_short_lived")
-    updated = adopt_cluster_token(
-        config, {"cluster_token": "the-permanent-one", "cluster_id": "c-abcd"}
+    updated = adopt_credentials(
+        config, {"agent_token": "this-members-own", "cluster_id": "c-abcd"}
     )
 
-    assert updated.token == "the-permanent-one"
+    assert updated.agent_token == "this-members-own"
+    # The environment's token stays the fallback; it is never overwritten.
+    assert updated.token == "ej_short_lived"
     stored = json.loads((tmp_path / CLUSTER_FILE).read_text())
-    assert stored["token"] == "the-permanent-one"
-    assert stored["cluster_id"] == "c-abcd"
+    assert stored == {"cluster_id": "c-abcd", "agent_token": "this-members-own"}
 
 
 def test_adopt_is_a_no_op_without_a_handover(tmp_path):
     config = RegistryConfig(data_dir=tmp_path, token="mine")
-    assert adopt_cluster_token(config, {"status": "candidate"}) is config
-    assert adopt_cluster_token(config, None) is config
-    assert adopt_cluster_token(config, {"cluster_token": "mine"}) is config
+    assert adopt_credentials(config, {"status": "candidate"}) is config
+    assert adopt_credentials(config, None) is config
+    # A cluster token in an answer is not a credential anybody adopts.
+    assert adopt_credentials(config, {"cluster_token": "evil"}) is config
     assert not (tmp_path / CLUSTER_FILE).exists()
 
 
 def test_rejoin_loop_adopts_before_it_returns(tmp_path):
-    """The loop must present the permanent token on its next pass, not the
-    enrollment token it started with."""
+    """The admission's agent token is persisted before the loop returns, so
+    the next process life presents it rather than the enrollment token."""
     from control_plane.registry.bootstrap import RoleDecision, rejoin_until_admitted
 
     config = RegistryConfig(data_dir=tmp_path, token="ej_one_shot")
@@ -413,7 +418,7 @@ def test_rejoin_loop_adopts_before_it_returns(tmp_path):
             "node_id": "spark-02",
             "cluster_id": "c-abcd",
             "status": "member",
-            "cluster_token": "the-permanent-one",
+            "agent_token": "this-members-own",
         }
 
     async def no_sleep(_seconds):
@@ -430,7 +435,7 @@ def test_rejoin_loop_adopts_before_it_returns(tmp_path):
     assert result["status"] == "member"
     assert presented == ["ej_one_shot", "ej_one_shot"]
     # Persisted, so the next process life starts with the right credential.
-    assert json.loads((tmp_path / CLUSTER_FILE).read_text())["token"] == "the-permanent-one"
+    assert json.loads((tmp_path / CLUSTER_FILE).read_text())["agent_token"] == "this-members-own"
 
 
 # ----------------------------------------------------------------------
@@ -473,7 +478,7 @@ def test_minting_returns_a_command_that_runs_on_another_machine(tmp_path):
     api = coordinator_client(tmp_path)
     body = api.post("/api/enroll", json={}).json()
 
-    assert body["command"].startswith("curl -fsSL http://")
+    assert body["command"].startswith('f=$(mktemp) && curl -fsSL http://')
     assert "--join" in body["command"] and "--token" in body["command"]
     # Never localhost: the command is meant for a different box.
     assert "localhost" not in body["command"]
@@ -488,7 +493,7 @@ def test_the_minted_token_actually_admits(tmp_path):
     token = command.rsplit("--token ", 1)[1].strip()
 
     registry = api.app.state.ctx.deps.registry
-    result = run(registry.handle_join(token, SPARK_02, "http://10.0.0.12:8081"))
+    result = run(registry.handle_join(join_proof(registry, token, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert result["status"] == "member"
 
@@ -1158,3 +1163,21 @@ def test_the_public_url_names_the_repo_the_ui_will_show():
     assert enroll_api.PUBLIC_INSTALL_URL.endswith("/install.sh")
     assert enroll_api.INSTALL_REPO in enroll_api.PUBLIC_INSTALL_URL
     assert enroll_api.INSTALL_BRANCH in enroll_api.PUBLIC_INSTALL_URL
+
+
+_DIGEST = "sha256:" + "ab" * 32
+
+
+def test_the_join_command_pins_the_image_digest_when_given():
+    command = enroll_api.build_command("http://10.0.0.1:8080", "ej_x_y", b"script", image_digest=_DIGEST)
+    assert command.endswith(f"--token ej_x_y --digest {_DIGEST}")
+    assert "--digest" not in enroll_api.build_command("http://10.0.0.1:8080", "ej_x_y", b"script")
+
+
+def test_the_coordinator_reads_its_own_digest_only_when_well_formed(monkeypatch):
+    monkeypatch.setenv("DERATE_IMAGE_DIGEST", _DIGEST)
+    assert enroll_api.own_image_digest() == _DIGEST
+    monkeypatch.setenv("DERATE_IMAGE_DIGEST", "sha256:abc; rm -rf /")
+    assert enroll_api.own_image_digest() is None
+    monkeypatch.delenv("DERATE_IMAGE_DIGEST")
+    assert enroll_api.own_image_digest() is None

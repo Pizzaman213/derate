@@ -330,7 +330,7 @@ def test_agent_reach_reports_what_it_found_without_naming_the_target():
     agent = NodeAgent(SPARK_01, token="t")
 
     class Answers:
-        async def get_json(self, url, timeout):
+        async def get_json(self, url, timeout, headers=None):
             return {"status": "ok", "node_id": "spark-02"}
 
     leg = _run(agent.reach_payload("http://10.0.0.12:8081/", client=Answers()))

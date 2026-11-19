@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -674,10 +675,26 @@ def _proc_cmdline(pid: int) -> str | None:
         raw = Path("/proc/%d/cmdline" % pid).read_bytes()
     except (OSError, ValueError):
         return None
-    text = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    text = redact_api_key(
+        raw.decode("utf-8", "replace").split("\x00")
+    ).strip()
     if not text:
         return None
     return text[:CMDLINE_MAX]
+
+
+_API_KEY_VALUE = re.compile(r"(--api-key(?:=|\s+))(\S+)")
+
+
+def redact_api_key(argv: list[str]) -> str:
+    """*argv* joined with spaces, the value of ``--api-key`` replaced by ``***``.
+
+    An SGLang/vLLM server started with ``--api-key <runtime bearer>`` carries
+    the credential that opens its port directly, bypassing the gateway; the
+    process list is a token holder's read, and a token is not that bearer.
+    Matched on the joined text, so ``sh -c "... --api-key K"`` is covered too.
+    """
+    return _API_KEY_VALUE.sub(r"\1***", " ".join(argv))
 
 
 def _proc_user(pid: int) -> str | None:

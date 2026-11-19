@@ -56,16 +56,38 @@ class LocalSource:
 
 
 class HttpSource:
-    """Another node's journal, over its agent port."""
+    """Another node's journal, over its agent port.
 
-    def __init__(self, node_id: str, agent_url: str, client: Any) -> None:
+    The agent's /agent/journal is token-gated (reading it advances the trim
+    mark), so `token` supplies that node's agent token per read, given the
+    node id: it is a callable because a member's token is minted (and, for a
+    pre-upgrade member, replaced on its first re-join) after the collector exists.
+    """
+
+    def __init__(
+        self,
+        node_id: str,
+        agent_url: str,
+        client: Any,
+        token: Callable[[str], str | None] | None = None,
+    ) -> None:
         self.node_id = node_id
         self.agent_url = agent_url.rstrip("/")
         self._client = client
+        self._token = token
 
     async def read(self, since: int, limit: int, max_bytes: int) -> dict[str, Any]:
         url = f"{self.agent_url}/agent/journal?since={since}&limit={limit}"
-        return await self._client.get_json(url, timeout=config.SHIP_TIMEOUT_S)
+        token = self._token(self.node_id) if self._token is not None else None
+        headers = {"X-Derate-Token": token} if token else None
+        # The page is capped at SHIP_MAX_BYTES of rows by the agent; anything
+        # much past that is not a journal page and is not buffered (N-4).
+        return await self._client.get_json(
+            url,
+            timeout=config.SHIP_TIMEOUT_S,
+            headers=headers,
+            max_bytes=config.SHIP_MAX_BYTES * 2 + 64 * 1024,
+        )
 
 
 class Collector:
@@ -77,6 +99,7 @@ class Collector:
         *,
         client: Any = None,
         agents: Callable[[], dict[str, str]] | None = None,
+        token: Callable[[str], str | None] | None = None,
         interval_s: float | None = None,
         compact_interval_s: float = config.COMPACT_INTERVAL_S,
         max_rows: int = config.SHIP_MAX_ROWS,
@@ -86,6 +109,7 @@ class Collector:
         self.archive = archive
         self._client = client
         self._agents = agents or (lambda: {})
+        self._token = token
         self._interval_s = (
             config.ship_interval_s() if interval_s is None else interval_s
         )
@@ -101,7 +125,9 @@ class Collector:
     def add_local(self, node_id: str, journal: Journal) -> None:
         self._local[node_id] = LocalSource(node_id, journal)
 
-    def rewire(self, *, client: Any = None, agents: Any = None) -> None:
+    def rewire(
+        self, *, client: Any = None, agents: Any = None, token: Any = None
+    ) -> None:
         """Point a running collector at a client or roster it did not have.
 
         The composed node starts telemetry twice: start_node() brings the
@@ -115,6 +141,8 @@ class Collector:
             self._client = client
         if agents is not None:
             self._agents = agents
+        if token is not None:
+            self._token = token
 
     def sources(self) -> list[JournalSource]:
         out: list[JournalSource] = list(self._local.values())
@@ -127,7 +155,7 @@ class Collector:
             for node_id, url in agents.items():
                 if node_id in self._local or not url:
                     continue
-                out.append(HttpSource(node_id, url, self._client))
+                out.append(HttpSource(node_id, url, self._client, self._token))
         return out
 
     # -- one round -------------------------------------------------------
@@ -137,7 +165,11 @@ class Collector:
         collected: dict[str, int] = {}
         for source in self.sources():
             try:
-                collected[source.node_id] = await self._drain(source)
+                # Bounded as a whole (N-4): one member that answers slowly
+                # must not hold collection from every other node.
+                collected[source.node_id] = await asyncio.wait_for(
+                    self._drain(source), config.SHIP_TIMEOUT_S * self.MAX_PAGES
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -160,6 +192,9 @@ class Collector:
     async def _drain(self, source: JournalSource) -> int:
         """Pull from one node until it has nothing more, or the caps say stop."""
         total = 0
+        # Only this coordinator's own journal may write /v1 and access
+        # evidence: the gateway answers every request (N-6).
+        trusted = isinstance(source, LocalSource)
         for page in range(self.MAX_PAGES):
             if page:
                 # Hand the loop back, and give it long enough to actually
@@ -173,11 +208,11 @@ class Collector:
             if not rows:
                 if payload.get("head") is not None:
                     await asyncio.to_thread(
-                        self.archive.ingest, source.node_id, payload
+                        self.archive.ingest, source.node_id, payload, trusted=trusted
                     )
                 return total
             total += await asyncio.to_thread(
-                self.archive.ingest, source.node_id, payload
+                self.archive.ingest, source.node_id, payload, trusted=trusted
             )
             if len(rows) < self._max_rows:
                 return total

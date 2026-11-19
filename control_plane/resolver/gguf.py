@@ -101,8 +101,29 @@ GGUF_FILE_TYPES: dict[int, str] = {
 }
 
 
+#: Caps on what a GGUF header may claim (R1). ggml itself never has more than
+#: four dimensions; the rest are an order of magnitude past any real file.
+GGML_MAX_DIMS = 4
+MAX_KV_COUNT = 65_536
+MAX_ARRAY_ITEMS = 1 << 22
+HEADER_BYTE_BUDGET = 256 << 20
+#: The largest single ranged fetch a header walk may make.
+RANGE_FETCH_MAX = 64 << 20
+
+
 class _Reader:
-    """Sequential reader over a local file or an HTTP byte range source."""
+    """Sequential reader over a local file or an HTTP byte range source.
+
+    Every byte read or skipped is charged against ``HEADER_BYTE_BUDGET``, so a
+    hostile header cannot make the walk run (or fetch) without bound.
+    """
+
+    _consumed = 0
+
+    def _charge(self, n: int) -> None:
+        self._consumed += n
+        if self._consumed > HEADER_BYTE_BUDGET:
+            raise MetadataUnavailable("GGUF header exceeds 256 MiB")
 
     def read(self, n: int) -> bytes:  # pragma: no cover - interface
         raise NotImplementedError
@@ -122,6 +143,7 @@ class FileReader(_Reader):
         self._handle = handle
 
     def read(self, n: int) -> bytes:
+        self._charge(n)
         data = self._handle.read(n)
         if len(data) != n:
             raise MetadataUnavailable("GGUF file ended inside the header")
@@ -132,6 +154,7 @@ class FileReader(_Reader):
         return self._handle.tell()
 
     def skip(self, n: int) -> None:
+        self._charge(n)
         self._handle.seek(n, os.SEEK_CUR)
 
 
@@ -146,13 +169,16 @@ class RangeReader(_Reader):
         self._pos = 0
 
     def read(self, n: int) -> bytes:
+        self._charge(n)
         out = bytearray()
         while n > 0:
             local = self._pos - self._buffer_start
             available = len(self._buffer) - local
             if available <= 0:
                 self._buffer_start = self._pos
-                self._buffer = self._fetch(self._pos, max(self._chunk, n))
+                self._buffer = self._fetch(
+                    self._pos, min(max(self._chunk, n), RANGE_FETCH_MAX)
+                )
                 if not self._buffer:
                     raise MetadataUnavailable("GGUF range request returned no data")
                 local, available = 0, len(self._buffer)
@@ -167,6 +193,7 @@ class RangeReader(_Reader):
         return self._pos
 
     def skip(self, n: int) -> None:
+        self._charge(n)
         self._pos += n
 
 
@@ -261,6 +288,8 @@ def _read_value(reader: _Reader, value_type: int, *, materialize: bool = True) -
     if value_type == _ARRAY:
         (item_type,) = struct.unpack("<I", reader.read(4))
         (count,) = struct.unpack("<Q", reader.read(8))
+        if count > MAX_ARRAY_ITEMS:
+            raise MetadataUnavailable(f"implausible GGUF array length {count}")
         # Token vocabularies run to hundreds of thousands of strings. We need
         # their length, not their contents, so walk past them.
         keep = materialize and count <= 4096
@@ -297,6 +326,8 @@ def read_header(reader: _Reader, *, max_tensors: int = 2_000_000) -> GGUFHeader:
     tensor_count, kv_count = struct.unpack("<QQ", reader.read(16))
     if tensor_count > max_tensors:
         raise MetadataUnavailable(f"implausible GGUF tensor count {tensor_count}")
+    if kv_count > MAX_KV_COUNT:
+        raise MetadataUnavailable(f"implausible GGUF metadata count {kv_count}")
 
     metadata: dict[str, Any] = {}
     for _ in range(kv_count):
@@ -308,6 +339,8 @@ def read_header(reader: _Reader, *, max_tensors: int = 2_000_000) -> GGUFHeader:
     for _ in range(tensor_count):
         name = _read_string(reader)
         (n_dims,) = struct.unpack("<I", reader.read(4))
+        if n_dims > GGML_MAX_DIMS:
+            raise MetadataUnavailable(f"implausible GGUF tensor rank {n_dims}")
         dims = struct.unpack(f"<{n_dims}Q", reader.read(8 * n_dims))
         ggml_type, _offset = struct.unpack("<IQ", reader.read(12))
         tensors.append(GGUFTensor(name=name, dims=dims, ggml_type=ggml_type))

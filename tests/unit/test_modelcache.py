@@ -225,7 +225,10 @@ def test_the_agent_serves_the_cache(tmp_path, monkeypatch):
     make_repo(tmp_path, "models--org--m", blob_sizes=(2048,))
 
     client = TestClient(create_agent_app(NodeAgent(profile(), token="tok")))
-    body = client.get("/agent/models/cache").json()
+    # Token-gated since the LAN-disclosure fix: which models a node has
+    # cached is nobody else's business on the network.
+    assert client.get("/agent/models/cache").status_code == 403
+    body = client.get("/agent/models/cache", headers={"X-Derate-Token": "tok"}).json()
 
     assert body["available"] is True
     assert body["node_id"] == "spark-01"
@@ -296,7 +299,7 @@ def _gateway_with(deployments, agent_url="http://198.51.100.9:8081"):
         def agent_url(self, node_id):
             return agent_url
 
-        def cluster_token(self):
+        def agent_token(self, node_id):
             return "tok"
 
     deps = GatewayDeps()

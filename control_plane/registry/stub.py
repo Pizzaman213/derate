@@ -161,7 +161,7 @@ class StubRegistry:
     def candidates(self) -> list[dict]:
         return []
 
-    async def handle_join(self, token, profile, agent_url) -> dict:
+    async def handle_join(self, proof, profile, agent_url, *, peer=None, facts=None) -> dict:
         raise NotImplementedError("stub registry does not accept joins")
 
     def role(self) -> str:
@@ -169,6 +169,11 @@ class StubRegistry:
 
     def cluster_token(self) -> str:
         return STUB_TOKEN
+
+    def agent_token(self, node_id: str) -> str:
+        # A fixed per-node value, like the real registry's random one in shape
+        # only: the stub has no agents to present it to.
+        return "stub-agent-" + node_id
 
     def cluster_id(self) -> str:
         return STUB_CLUSTER_ID

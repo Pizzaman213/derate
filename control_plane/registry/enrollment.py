@@ -19,9 +19,10 @@ What this module deliberately does not do:
   (see AUDIT-2026-09-06), and ``POST /api/nodes/{id}/admit`` is already open to
   anyone who can reach the port. Enrollment tokens do not widen that; they also
   do not narrow it, and must not be described as fixing it.
-* It never replaces the cluster token. A node admitted this way is handed the
-  permanent token on the way in, so the enrollment token expiring cannot later
-  lock an established member out of its own cluster.
+* It is not what a member keeps. A node admitted this way is handed its own
+  agent token on the way in (``Registry._mint_agent_token``) and re-joins on
+  that, so the enrollment token expiring cannot later lock an established
+  member out of its own cluster. Nobody is handed the cluster token.
 """
 
 from __future__ import annotations
@@ -270,6 +271,12 @@ class EnrollmentStore:
         self._save()
         log.info("revoked enrollment token %s", token_id)
         return True
+
+    def live_tokens(self) -> list[EnrollmentToken]:
+        """Every live token with its secret, for checking a join proof."""
+        if self._prune():
+            self._save()
+        return list(self._tokens.values())
 
     def live(self) -> list[EnrollmentToken]:
         if self._prune():
