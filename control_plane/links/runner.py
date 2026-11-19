@@ -103,7 +103,9 @@ class SubprocessRunner:
 
     def run_on(self, host: str, argv: list[str], timeout: float = 60.0) -> CommandResult:
         remote = " ".join(shlex.quote(a) for a in argv)
-        return self.run([self._ssh, *self._ssh_opts, host, remote], timeout=timeout)
+        # "--": a host that starts with "-" is a host, never an ssh option
+        # (-oProxyCommand=... runs a command on this machine).
+        return self.run([self._ssh, *self._ssh_opts, "--", host, remote], timeout=timeout)
 
     def which(self, name: str) -> str | None:
         return shutil.which(name)

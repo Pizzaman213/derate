@@ -11,6 +11,8 @@ from dataclasses import asdict
 
 from control_plane.contracts import DeviceClass, GpuProcess, NodeProfile, NodeState
 
+from .net import valid_host
+from .probe import slugify_hostname
 from .telemetry import TelemetrySample
 
 
@@ -20,16 +22,34 @@ def profile_to_dict(profile: NodeProfile) -> dict:
     return data
 
 
+#: A node id is a hostname slug (probe.slugify_hostname) and a DNS label's
+#: length. It is a path segment (DELETE /api/nodes/{node_id}), a log field and
+#: a mDNS service name, so a peer cannot be allowed to choose anything else.
+NODE_ID_MAX_LEN = 63
+
+
 def profile_from_dict(data: dict) -> NodeProfile:
-    """Rebuild a profile from a peer. Unknown keys are dropped, not fatal."""
+    """Rebuild a profile from a peer. Unknown keys are dropped, not fatal.
+
+    Raises ValueError for an address that is not a host, and for a node id
+    that is not already in the form ``slugify_hostname`` produces -- a slash
+    makes a candidate nobody can dismiss, a newline forges a log line, and
+    ten kilobytes of id fill the candidate list with one entry each.
+    """
     try:
         device_class = DeviceClass(str(data.get("device_class", "unknown")).lower())
     except ValueError:
         device_class = DeviceClass.UNKNOWN
+    address = str(data.get("address", ""))
+    if address and not valid_host(address):
+        raise ValueError(f"invalid node address {address!r}")
+    node_id = str(data["node_id"])
+    if len(node_id) > NODE_ID_MAX_LEN or node_id != slugify_hostname(node_id):
+        raise ValueError("invalid node_id")
     return NodeProfile(
-        node_id=str(data["node_id"]),
+        node_id=node_id,
         hostname=str(data.get("hostname", "")),
-        address=str(data.get("address", "")),
+        address=address,
         device_class=device_class,
         gpu_name=str(data.get("gpu_name", "")),
         gpu_count=int(data.get("gpu_count", 0)),

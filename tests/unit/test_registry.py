@@ -40,11 +40,12 @@ from control_plane.registry import (
     probe_local,
     require_host_networking,
 )
-from control_plane.registry import nodeident
+from control_plane.registry import joinproof, nodeident
 from control_plane.registry import probe as probe_mod
 from control_plane.registry.bootstrap import (
     RoleDecision,
     join_with_held_credentials,
+    post_join,
     reannounce,
     resolve_role,
 )
@@ -63,6 +64,7 @@ from control_plane.registry.config import (
 from control_plane.registry.discovery import Advertiser, DiscoveredPeer
 from control_plane.registry.identity import (
     ClusterIdentity,
+    agent_token,
     load_or_create_identity,
     read_identity,
 )
@@ -169,7 +171,9 @@ class FakeClient:
     def revive(self, agent_url: str) -> None:
         self.down.discard(agent_url.rstrip("/"))
 
-    async def get_json(self, url: str, timeout: float) -> dict:
+    async def get_json(
+        self, url: str, timeout: float, headers: dict | None = None
+    ) -> dict:
         for suffix in ("/agent/profile", "/agent/telemetry", "/agent/health"):
             if url.endswith(suffix):
                 base = url[: -len(suffix)]
@@ -225,6 +229,13 @@ class FakeClient:
             "ms": 1.5,
             "answered_as": self.profiles[target]["node_id"],
         }
+
+
+def join_proof(registry, token, profile, agent_url):
+    """What a worker holding ``token`` sends: a proof, never the token."""
+    if not token:
+        return None
+    return joinproof.make(token, profile.node_id, agent_url, registry._clock())
 
 
 def make_registry(tmp_path, client=None, local=None, token="tok-123") -> Registry:
@@ -530,7 +541,7 @@ def test_join_with_wrong_token_is_rejected_and_leaves_no_trace(tmp_path):
     registry = make_registry(tmp_path, client=client, token="correct-token")
 
     with pytest.raises(JoinRejected):
-        run(registry.handle_join("wrong-token", SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, "wrong-token", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert registry.candidates() == []
     assert registry.list_nodes() == []
@@ -548,7 +559,7 @@ def test_join_with_missing_token_becomes_a_candidate_not_a_rejection(tmp_path):
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, token="correct-token")
     for empty in (None, ""):
-        result = run(registry.handle_join(empty, SPARK_02, "http://10.0.0.12:8081"))
+        result = run(registry.handle_join(join_proof(registry, empty, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
         assert result["status"] == "candidate"
         assert [c["node_id"] for c in registry.candidates()] == ["spark-02"]
         # Reset for the next spelling. (remove_node now raises on unknown ids,
@@ -582,7 +593,7 @@ def test_join_with_wrong_nonempty_token_still_rejected_no_candidate(tmp_path):
     registry = make_registry(tmp_path, client=client, token="correct-token")
 
     with pytest.raises(JoinRejected):
-        run(registry.handle_join("definitely-wrong", SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, "definitely-wrong", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert registry.candidates() == []
     assert registry.list_nodes() == []
@@ -660,7 +671,7 @@ def test_join_is_rejected_when_probe_back_fails(tmp_path):
     client = FakeClient()  # nothing served at that URL
     registry = make_registry(tmp_path, client=client, token="tok")
     with pytest.raises(JoinRejected):
-        run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     assert registry.candidates() == []
 
 
@@ -671,8 +682,49 @@ def test_join_is_rejected_when_probe_back_disagrees(tmp_path):
     registry = make_registry(tmp_path, client=client, token="tok")
     liar = make_profile("spark-99", address="10.0.0.12")
     with pytest.raises(JoinRejected):
-        run(registry.handle_join("tok", liar, "http://10.0.0.12:8081"))
+        run(registry.handle_join(join_proof(registry, "tok", liar, "http://10.0.0.12:8081"), liar, "http://10.0.0.12:8081"))
     assert registry.candidates() == []
+
+
+
+
+def test_tokenless_join_candidates_are_capped_before_the_probe_back(tmp_path):
+    """The join route is open and a token-less joiner becomes a candidate on a
+    probe-back alone. Past the cap every tokenless probe is refused without
+    being dialled -- a re-poll from a joiner already waiting included, since
+    it is the same caller-chosen probe-back -- and the waiting record stays."""
+    from control_plane.registry.registry import MAX_JOIN_CANDIDATES
+
+    class Counting(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gets: list[str] = []
+
+        async def get_json(self, url, timeout, headers=None):
+            self.gets.append(url)
+            return await super().get_json(url, timeout, headers)
+
+    client = Counting()
+    registry = make_registry(tmp_path, client=client, token="tok")
+    for i in range(MAX_JOIN_CANDIDATES + 1):
+        client.serve(f"http://10.0.1.{i}:8081", make_profile(f"n-{i}", address=f"10.0.1.{i}"))
+    for i in range(MAX_JOIN_CANDIDATES):
+        run(registry.handle_join(None, make_profile(f"n-{i}"), f"http://10.0.1.{i}:8081"))
+    assert len(registry.candidates()) == MAX_JOIN_CANDIDATES
+
+    probes = len(client.gets)
+    last = MAX_JOIN_CANDIDATES
+    with pytest.raises(JoinRejected, match="too many unadmitted candidates"):
+        run(registry.handle_join(None, make_profile(f"n-{last}"), f"http://10.0.1.{last}:8081"))
+    assert len(client.gets) == probes, "a refused joiner was still dialled"
+    assert len(registry.candidates()) == MAX_JOIN_CANDIDATES
+
+    probes = len(client.gets)
+    with pytest.raises(JoinRejected, match="too many unadmitted candidates"):
+        run(registry.handle_join(None, make_profile("n-0"), "http://10.0.1.0:8081"))
+    assert len(client.gets) == probes, "a re-poll past the cap was still dialled"
+    assert any(c["node_id"] == "n-0" for c in registry.candidates())
+
 
 
 def test_valid_join_creates_a_candidate_not_a_member(tmp_path):
@@ -681,7 +733,7 @@ def test_valid_join_creates_a_candidate_not_a_member(tmp_path):
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, token="tok", local=SPARK_01)
 
-    result = run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    result = run(registry.handle_join(join_proof(registry, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert result["node_id"] == "spark-02"
     assert result["cluster_id"] == registry.cluster_id()
@@ -696,7 +748,7 @@ def test_candidate_carries_what_the_ui_needs_to_show_it(tmp_path):
     client = FakeClient()
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, token="tok")
-    run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    run(registry.handle_join(join_proof(registry, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     candidate = registry.candidates()[0]
     for key in ("node_id", "hostname", "address", "gpu_name", "device_class", "agent_url", "source"):
         assert key in candidate
@@ -707,7 +759,7 @@ def test_admit_promotes_a_candidate(tmp_path):
     client = FakeClient()
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, token="tok")
-    run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    run(registry.handle_join(join_proof(registry, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     state = registry.admit("spark-02")
 
@@ -745,14 +797,14 @@ def test_rejoin_of_an_existing_member_refreshes_rather_than_duplicates(tmp_path)
     client = FakeClient()
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, token="tok")
-    run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    run(registry.handle_join(join_proof(registry, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     registry.admit("spark-02")
     registry.record_health("spark-02", False)
     registry.record_health("spark-02", False)
     registry.record_health("spark-02", False)
     assert not registry.get_node("spark-02").healthy
 
-    result = run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    result = run(registry.handle_join(join_proof(registry, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
 
     assert result["status"] == "member"
     assert len(registry.list_nodes()) == 1
@@ -1208,11 +1260,13 @@ def test_agent_app_serves_the_three_endpoints():
     from fastapi.testclient import TestClient
     from control_plane.registry import create_agent_app
 
-    agent = NodeAgent(SPARK_01, role="coordinator", cluster_id="c-1")
+    agent = NodeAgent(SPARK_01, role="coordinator", cluster_id="c-1", token="t")
     with TestClient(create_agent_app(agent)) as http:
         assert http.get("/agent/profile").json()["node_id"] == "spark-01"
         assert http.get("/agent/health").json()["role"] == "coordinator"
-        assert http.get("/agent/telemetry").status_code == 200
+        # Telemetry is an inventory of the machine: the agent token only.
+        assert http.get("/agent/telemetry").status_code == 403
+        assert http.get("/agent/telemetry", headers={"X-Derate-Token": "t"}).status_code == 200
 
 
 def test_advertiser_is_inert_without_zeroconf():
@@ -1527,7 +1581,7 @@ def test_two_nodes_form_a_cluster_with_no_configuration(tmp_path):
         return [DiscoveredPeer("spark-01", "coordinator", coordinator.cluster_id(), "10.0.0.11", 8081)]
 
     async def join(url, tok, profile, agent_url, **k):
-        return await coordinator.handle_join(tok, profile, agent_url)
+        return await coordinator.handle_join(join_proof(coordinator, tok, profile, agent_url), profile, agent_url)
 
     second = run(
         resolve_role(
@@ -1666,7 +1720,12 @@ def test_join_admit_health_and_telemetry_over_real_http(tmp_path, monkeypatch):
 
     async def scenario():
         agent_a = NodeAgent(SPARK_01, role="coordinator", cluster_id="c-http", port=8081)
-        agent_b = NodeAgent(SPARK_02, role="worker", cluster_id="c-http", port=8081)
+        # Armed the way start_node arms a pre-admission worker; the token the
+        # coordinator presents is collected on the join after admission.
+        agent_b = NodeAgent(
+            SPARK_02, role="worker", cluster_id="c-http", port=8081,
+            token=agent_token("shared", "spark-02"),
+        )
         await agent_a.start(interval=3600)  # primed once, no repeat polling
         await agent_b.start(interval=3600)
 
@@ -1699,14 +1758,20 @@ def test_join_admit_health_and_telemetry_over_real_http(tmp_path, monkeypatch):
 
         # A wrong token never reaches the probe-back, and leaves no trace.
         with pytest.raises(JoinRejected):
-            await registry.handle_join("nope", SPARK_02, url_b)
+            await registry.handle_join(join_proof(registry, "nope", SPARK_02, url_b), SPARK_02, url_b)
         assert registry.candidates() == []
 
-        result = await registry.handle_join("shared", SPARK_02, url_b)
+        result = await registry.handle_join(join_proof(registry, "shared", SPARK_02, url_b), SPARK_02, url_b)
         assert result["status"] == "candidate"
         assert [c["node_id"] for c in registry.candidates()] == ["spark-02"]
 
         registry.admit("spark-02")
+        # Its next join collects its own token, which its agent then accepts.
+        member = await registry.handle_join(
+            join_proof(registry, "shared", SPARK_02, url_b), SPARK_02, url_b
+        )
+        assert member["status"] == "member"
+        agent_b.set_token(member["agent_token"])
         await registry.health_round()
         assert registry.get_node("spark-02").healthy
 
@@ -2211,7 +2276,7 @@ def test_admitted_member_survives_a_coordinator_restart(tmp_path):
         local_profile=SPARK_01,
         client=client,
     )
-    run(first_run.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    run(first_run.handle_join(join_proof(first_run, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     first_run.admit("spark-02")
     assert sorted(s.profile.node_id for s in first_run.list_nodes()) == ["spark-01", "spark-02"]
 
@@ -2252,7 +2317,7 @@ def test_removed_node_stays_gone_after_restart(tmp_path):
         local_profile=SPARK_01,
         client=client,
     )
-    run(first_run.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    run(first_run.handle_join(join_proof(first_run, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     first_run.admit("spark-02")
     first_run.remove_node("spark-02")
 
@@ -2309,7 +2374,7 @@ def test_roster_persists_profile_and_url_not_telemetry(tmp_path):
         local_profile=SPARK_01,
         client=client,
     )
-    run(registry.handle_join("tok", SPARK_02, "http://10.0.0.12:8081"))
+    run(registry.handle_join(join_proof(registry, "tok", SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
     registry.admit("spark-02")
     registry.apply_sample(
         "spark-02",
@@ -2319,7 +2384,10 @@ def test_roster_persists_profile_and_url_not_telemetry(tmp_path):
 
     raw = json.loads((tmp_path / "registry.json").read_text())
     member = raw["members"]["spark-02"]
-    assert set(member) == {"profile", "agent_url"}
+    # Its own agent token is a static fact like its URL (minted on admission,
+    # not yet collected); live readings are not.
+    assert set(member) == {"profile", "agent_url", "agent_token", "agent_token_pending"}
+    assert member["agent_token"] == registry.agent_token("spark-02")
     assert "power_watts" not in member and "memory_used" not in member
 
 
@@ -2540,9 +2608,10 @@ def test_reach_reports_the_coordinator_leg_and_both_peer_legs(tmp_path):
     assert ("spark-01", "spark-02") not in legs
 
 
-def test_reach_asks_the_far_node_with_the_cluster_token(tmp_path):
+def test_reach_asks_the_far_node_with_its_agent_token(tmp_path):
     """/agent/reach makes a node dial an address we name. Uncredentialed, that
-    is a port scanner running inside the operator's network."""
+    is a port scanner running inside the operator's network. The credential is
+    that node's own agent token, never the cluster token."""
     client = FakeClient()
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, token="tok-123", local=SPARK_01)
@@ -2552,7 +2621,10 @@ def test_reach_asks_the_far_node_with_the_cluster_token(tmp_path):
     run(registry.check_reach("spark-01", "spark-02"))
 
     asked = [(u, h) for (u, _), h in zip(client.posts, client.headers) if u.endswith("/agent/reach")]
-    assert asked and all(h and h.get("X-Derate-Token") == "tok-123" for _, h in asked)
+    expected = registry.agent_token("spark-02")
+    assert expected != agent_token("tok-123", "spark-02")
+    assert asked and all(h and h.get("X-Derate-Token") == expected for _, h in asked)
+    assert all(h.get("X-Derate-Token") != "tok-123" for _, h in asked)
 
 
 def test_reach_keeps_a_one_way_failure_one_way(tmp_path):
@@ -3155,8 +3227,9 @@ def test_a_rejected_reannouncement_is_not_an_admission():
 
 
 def test_a_member_that_moved_is_rerouted_by_its_own_reannouncement(tmp_path):
-    """End to end against the real coordinator side: handle_join with a valid
-    token moves agent_url, refreshes the profile and clears the misses."""
+    """End to end against the real coordinator side: handle_join with the
+    member's own agent token moves agent_url, refreshes the profile and clears
+    the misses."""
     client = FakeClient()
     client.serve("http://10.0.0.12:8081", SPARK_02)
     registry = make_registry(tmp_path, client=client, local=SPARK_01)
@@ -3166,7 +3239,8 @@ def test_a_member_that_moved_is_rerouted_by_its_own_reannouncement(tmp_path):
     # The node picks up a new lease and says so itself.
     moved = dataclasses.replace(SPARK_02, address="10.0.0.55")
     client.serve("http://10.0.0.55:8081", moved)
-    run(registry.handle_join("tok-123", moved, "http://10.0.0.55:8081"))
+    own = registry.agent_token("spark-02")
+    run(registry.handle_join(join_proof(registry, own, moved, "http://10.0.0.55:8081"), moved, "http://10.0.0.55:8081"))
 
     assert registry.agent_url("spark-02") == "http://10.0.0.55:8081"
     assert registry.get_node("spark-02").profile.address == "10.0.0.55"
@@ -3200,10 +3274,11 @@ def test_readvertise_does_not_start_an_advertiser_that_never_started():
 
 
 # ---------------------------------------------------------------------------
-# A worker reads its cluster token back.
+# A worker reads its credentials back.
 #
-# adopt_cluster_token wrote it and nothing ever read it, so the write was dead
-# and the failure it exists to prevent still happened.
+# The adopted credential was once written and never read, so the write was dead
+# and the failure it exists to prevent still happened. Today it is the member's
+# own agent token, or (pre-upgrade) the cluster token kept for the migration.
 # ---------------------------------------------------------------------------
 
 
@@ -3266,7 +3341,9 @@ def make_runtime(role=ROLE_WORKER, clock=None, profile=None):
     agent = NodeAgent(profile=profile, role=role, cluster_id="c-abcd", clock=clock)
     return (
         NodeRuntime(
-            config=RegistryConfig(token="tok-123"),
+            # A member that already holds its own agent token: migration is
+            # not what these tests are about (see the one that is, below).
+            config=RegistryConfig(token="tok-123", agent_token="own-tok"),
             profile=profile,
             decision=RoleDecision(
                 role, "http://10.0.0.10:8080", True, "test", status="member"
@@ -3278,6 +3355,18 @@ def make_runtime(role=ROLE_WORKER, clock=None, profile=None):
         clock,
         agent,
     )
+
+
+def test_a_pre_upgrade_member_asks_for_its_own_token_once():
+    """The coordinator keeps polling an unmigrated member with the derived
+    token, so the silence trigger never fires for it; this one does, once."""
+    runtime, clock, agent = make_runtime()
+    runtime.config = dataclasses.replace(runtime.config, agent_token=None)
+    agent.note_polled()
+    reason = runtime._announce_trigger(1.0)
+    assert reason is not None and "agent token" in reason
+    runtime._migration_asked = True
+    assert runtime._announce_trigger(1.0) is None
 
 
 def test_a_polled_node_says_nothing():
@@ -3439,63 +3528,62 @@ def test_a_worker_that_found_nobody_at_boot_still_announces_itself():
 # ---------------------------------------------------------------------------
 # Two credentials, and only the coordinator can say which one is right.
 #
-# install.sh bakes DERATE_TOKEN into the container environment permanently, so
-# a node installed with an enrollment token presents that same token on every
-# restart forever -- long after it is spent. handle_join checks the token
-# before it checks membership, so that 403s the node out of its own cluster.
+# A member holds its own agent token (cluster.json) and presents it first: it
+# is the only credential a member's re-join is accepted on. install.sh bakes
+# DERATE_TOKEN into the container environment permanently; that one is the
+# fallback -- a fresh enrollment token carried here to re-home the machine, or
+# a pre-upgrade cluster token for the one-time migration.
 # ---------------------------------------------------------------------------
 
 
-def test_a_spent_enrollment_token_falls_back_to_the_permanent_one():
+def test_the_held_agent_token_goes_first():
     presented = []
 
     async def join(url, token, profile, agent_url):
         presented.append(token)
-        if token == "ej_spent_abc":
-            raise JoinRejected("invalid cluster token")
         return {"status": "member", "cluster_id": "c-abcd"}
 
-    config = RegistryConfig(token="ej_spent_abc", fallback_token="permanent-tok")
+    config = RegistryConfig(token="ej_spent_abc", agent_token="own-agent-tok")
     result, used = run(
         join_with_held_credentials(
             join, "http://10.0.0.10:8080", config, make_profile(), "http://10.0.0.11:8081"
         )
     )
 
-    assert presented == ["ej_spent_abc", "permanent-tok"]
-    assert used == "permanent-tok"
+    assert presented == ["own-agent-tok"], "the environment's token is only the fallback"
+    assert used == "own-agent-tok"
     assert result["status"] == "member"
 
 
 def test_a_fresh_enrollment_token_still_re_homes_the_machine():
-    """The opposite case, and just as real: an operator carried a new token to
-    this box to move it onto another cluster. The stored one is the *old*
-    cluster's and would be refused, so the deliberate one has to go first."""
+    """An operator carried a new token to this box to move it onto another
+    cluster. The held agent token is the *old* cluster's and is refused there,
+    so the environment's token is tried next."""
     presented = []
 
     async def join(url, token, profile, agent_url):
         presented.append(token)
         if token != "ej_fresh_xyz":
             raise JoinRejected("invalid cluster token")
-        return {"status": "member", "cluster_id": "c-new", "cluster_token": "new-perm"}
+        return {"status": "member", "cluster_id": "c-new", "agent_token": "new-own"}
 
-    config = RegistryConfig(token="ej_fresh_xyz", fallback_token="old-cluster-tok")
+    config = RegistryConfig(token="ej_fresh_xyz", agent_token="old-cluster-own")
     result, used = run(
         join_with_held_credentials(
             join, "http://10.0.0.10:8080", config, make_profile(), "http://10.0.0.11:8081"
         )
     )
 
-    assert presented == ["ej_fresh_xyz"], "the fallback must not be tried once one works"
+    assert presented == ["old-cluster-own", "ej_fresh_xyz"]
     assert used == "ej_fresh_xyz"
-    assert result["cluster_token"] == "new-perm"
+    assert result["agent_token"] == "new-own"
 
 
 def test_both_credentials_wrong_still_raises():
     async def join(url, token, profile, agent_url):
         raise JoinRejected("invalid cluster token")
 
-    config = RegistryConfig(token="wrong-a", fallback_token="wrong-b")
+    config = RegistryConfig(token="wrong-a", agent_token="wrong-b")
     with pytest.raises(JoinRejected):
         run(
             join_with_held_credentials(
@@ -3523,22 +3611,164 @@ def test_no_fallback_means_no_retry():
     assert presented == ["only-one"]
 
 
-def test_recovering_credentials_keeps_the_stored_token_as_a_fallback(tmp_path):
-    load_or_create_identity(tmp_path, cluster_id="c-abcd", token="permanent-tok")
+def test_recovering_credentials_reads_the_held_agent_token(tmp_path):
+    from control_plane.registry.identity import save_agent_credential
+
+    save_agent_credential(tmp_path, "c-abcd", "own-agent-tok")
 
     recovered = recover_credentials(
         RegistryConfig(data_dir=tmp_path, token="ej_spent_abc")
     )
 
+    assert recovered.agent_token == "own-agent-tok"
     assert recovered.token == "ej_spent_abc"
-    assert recovered.fallback_token == "permanent-tok"
+    assert recovered.cluster_id == "c-abcd"
 
 
-def test_a_matching_stored_token_is_not_also_a_fallback(tmp_path):
+def test_a_pre_upgrade_worker_recovers_its_cluster_token_for_the_migration(tmp_path):
     load_or_create_identity(tmp_path, cluster_id="c-abcd", token="permanent-tok")
 
-    recovered = recover_credentials(
-        RegistryConfig(data_dir=tmp_path, token="permanent-tok")
-    )
+    recovered = recover_credentials(RegistryConfig(data_dir=tmp_path))
 
-    assert recovered.fallback_token is None
+    assert recovered.token == "permanent-tok"
+    assert recovered.agent_token is None
+
+
+# ----------------------------------------------------------------------
+# Join by proof of possession (the token never crosses the wire)
+# ----------------------------------------------------------------------
+
+URL_02 = "http://10.0.0.12:8081"
+
+
+def test_a_stale_join_proof_is_refused(tmp_path):
+    client = FakeClient()
+    client.serve(URL_02, SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="tok")
+    old = joinproof.make("tok", "spark-02", URL_02, time.time() - joinproof.JOIN_PROOF_SKEW_S - 5)
+    with pytest.raises(JoinRejected, match="invalid cluster token"):
+        run(registry.handle_join(old, SPARK_02, URL_02))
+    assert registry.candidates() == []
+
+
+def test_a_replayed_join_proof_is_refused(tmp_path):
+    client = FakeClient()
+    client.serve(URL_02, SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="tok")
+    proof = join_proof(registry, "tok", SPARK_02, URL_02)
+    assert run(registry.handle_join(proof, SPARK_02, URL_02))["status"] == "candidate"
+    with pytest.raises(JoinRejected, match="invalid cluster token"):
+        run(registry.handle_join(proof, SPARK_02, URL_02))
+
+
+def test_a_proof_bound_to_another_agent_url_is_refused(tmp_path):
+    """A captured proof cannot move a member's agent_url somewhere else."""
+    client = FakeClient()
+    client.serve("http://10.6.6.6:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="tok")
+    proof = join_proof(registry, "tok", SPARK_02, URL_02)
+    with pytest.raises(JoinRejected, match="invalid cluster token"):
+        run(registry.handle_join(proof, SPARK_02, "http://10.6.6.6:8081"))
+    assert registry.candidates() == []
+
+
+def test_an_enrollment_token_proof_is_admitted_and_handed_its_own_token(tmp_path):
+    client = FakeClient()
+    client.serve(URL_02, SPARK_02)
+    registry = make_registry(tmp_path, client=client, token="tok")
+    enrollment = registry.mint_enrollment()
+    result = run(
+        registry.handle_join(join_proof(registry, enrollment.token, SPARK_02, URL_02), SPARK_02, URL_02)
+    )
+    assert result["status"] == "member"
+    assert result["agent_token"] == registry.agent_token("spark-02")
+    assert "tok" not in (result.get("cluster_token"), result["agent_token"])
+
+
+def test_the_join_body_carries_a_proof_and_never_the_token():
+    sent = {}
+
+    class Client:
+        async def post_json(self, url, payload, timeout=None):
+            sent.update(payload)
+            proof = payload["proof"]
+            # A real coordinator acknowledges the proof it verified, over the
+            # answer it sends; without this post_join refuses the answer
+            # (tests/unit/test_join_ack.py).
+            body = {"status": "candidate"}
+            body["ack"] = joinproof.ack(
+                "secret-tok", "spark-02", URL_02, proof["nonce"], proof["ts"], body
+            )
+            return body
+
+    run(post_join("http://c:8080", "secret-tok", SPARK_02, URL_02, client=Client()))
+    assert "secret-tok" not in json.dumps(sent)
+    assert "token" not in sent
+    assert joinproof.matches(joinproof.from_dict(sent["proof"]), "secret-tok", "spark-02", URL_02)
+
+
+def _rogue_and_ours():
+    return [
+        DiscoveredPeer("rogue", "coordinator", "c-evil", "10.6.6.6", 8081),
+        DiscoveredPeer("spark-01", "coordinator", "c-ours", "10.0.0.11", 8081),
+    ]
+
+
+def test_resolve_role_skips_a_coordinator_advertising_another_cluster():
+    dialled = []
+
+    async def browse(*a, **k):
+        return _rogue_and_ours()
+
+    async def join(url, token, profile, agent_url, **k):
+        dialled.append(url)
+        return {"node_id": profile.node_id, "cluster_id": "c-ours", "status": "member"}
+
+    config = RegistryConfig(token="tok", cluster_id="c-ours")
+    decision = run(resolve_role(config, SPARK_02, URL_02, browse=browse, join=join))
+    assert decision.joined
+    assert dialled == ["http://10.0.0.11:8080"]
+
+
+def test_reannounce_skips_a_coordinator_advertising_another_cluster():
+    dialled = []
+
+    async def browse(*a, **k):
+        return _rogue_and_ours()
+
+    async def join(url, token, profile, agent_url, **k):
+        dialled.append(url)
+        return {"node_id": profile.node_id, "cluster_id": "c-ours", "status": "member"}
+
+    config = RegistryConfig(token="tok", cluster_id="c-ours")
+    run(reannounce(config, SPARK_02, URL_02, None, browse=browse, join=join))
+    assert dialled == ["http://10.0.0.11:8080"]
+
+
+def test_a_join_with_an_option_shaped_address_is_refused_before_dialling():
+    from fastapi.testclient import TestClient
+
+    from control_plane.gateway.app import create_app
+    from tests.unit.test_gateway import FakeRegistry, build_deps
+
+    dialled: list[str] = []
+
+    class Reg(FakeRegistry):
+        async def handle_join(self, proof, profile, url):
+            dialled.append(url)
+            return {"node_id": profile.node_id, "status": "candidate"}
+
+    body = profile_to_dict(SPARK_02) | {"address": "-oProxyCommand=x"}
+    with TestClient(create_app(build_deps(registry=Reg()))) as http:
+        res = http.post("/api/nodes/join", json={"profile": body, "agent_url": URL_02})
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "invalid_join_body"
+    assert dialled == []
+
+
+def test_a_probe_back_with_an_option_shaped_address_is_rejected(tmp_path):
+    client = FakeClient()
+    client.serve(URL_02, dataclasses.replace(SPARK_02, address="-oProxyCommand=x"))
+    registry = make_registry(tmp_path, client=client, token="tok")
+    with pytest.raises(JoinRejected, match="invalid address"):
+        run(registry.handle_join(join_proof(registry, "tok", SPARK_02, URL_02), SPARK_02, URL_02))

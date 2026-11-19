@@ -14,13 +14,15 @@ its gates is derived from a credential the network can obtain:
   and refusing -- absent, so it cannot be probed for or enabled by a request.
 * ``DERATE_SHELL_KEY`` is set out of band, by a human, and **no route mints it
   and no route returns it**. That matters specifically here: ``POST
-  /api/enroll`` is unauthenticated and its token buys the permanent cluster
-  token through ``POST /api/nodes/join``, so anything gated on the cluster
-  token is gated on a secret the LAN can mint for itself. This one cannot be.
-* The ``Origin`` header is checked before the handshake completes. WebSocket
-  handshakes are exempt from CORS and are never preflighted, and nothing in
-  this product validates ``Host``, so without this any page the operator visits
-  could open a root shell -- and DNS rebinding would defeat same-origin anyway.
+  /api/enroll`` mints a credential a node trades, once, for membership, so
+  anything gated on what a join hands out is gated on a secret some admitted
+  node holds. This one is not.
+* ``Origin``. WebSocket handshakes are exempt from CORS and never
+  preflighted, so the browser-facing gate is the coordinator's: the
+  ``/api/nodes/{id}/shell`` socket is session-gated and refused (1008) on a
+  cross-site ``Origin`` before the relay dials this agent, and the relay
+  forwards the browser's ``Origin`` here. ``check_origin`` below adds a
+  second, explicit allowlist only when ``DERATE_SHELL_ORIGINS`` is set.
 
 The session lands on the **host**, not in this container: ``nsenter`` into
 PID 1's namespaces. That is what "control the device" means, and it is possible

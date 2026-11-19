@@ -360,6 +360,28 @@ class RuntimeSpec:
     #: here rather than testing device classes at each site is what keeps the
     #: launch path and the node board from drifting apart.
     memory_pool: str = "gpu"
+    #: Where the per-deployment runtime API key goes (H3). The engine listens
+    #: on 0.0.0.0 on the host network, so without a key anyone on the LAN --
+    #: or any other model container, which shares the host netns -- can call
+    #: it with no limits and no record. `api_key_env` is the variable the
+    #: runtime reads it from (vLLM `VLLM_API_KEY`, SGLang `SGLANG_API_KEY`,
+    #: derate's tts `DERATE_TTS_API_KEY`); `api_key_arg` is appended to the
+    #: command for a runtime that also wants it as a flag.
+    api_key_env: str = ""
+    api_key_arg: str | None = None
+    #: Appended with the sha the resolver read (M7), so remote code, when the
+    #: operator opts in to it, runs the code that was approved, not whatever
+    #: `main` is at launch.
+    revision_arg: str | None = None
+    #: Appended only when the deployment sets `trust_remote_code` (R2). Never
+    #: in a command template: a repo's own Python runs inside the container
+    #: (uid 1000, `--pid=host`, the HF cache mounted rw) only when the operator
+    #: ticked the box beside the resolver's "ships Python" warning.
+    trust_remote_code_arg: str | None = "--trust-remote-code"
+    #: Whether `cache_env` is a compile cache to be split per model (M8): one
+    #: shared, writable Inductor/Triton tree is a place one model container
+    #: can plant `.py`/`.so` the next trusted launch loads.
+    cache_per_model: bool = False
 
 
 #: What `--kv-cache-dtype` accepts, read off the pinned image's own
@@ -810,6 +832,24 @@ def kv_cache_dtype_refusal(runtime: str, kv_dtype: str | None) -> str | None:
     return None
 
 
+def cache_env_for(spec: RuntimeSpec, model_id: str) -> tuple[tuple[str, str], ...]:
+    """`spec.cache_env`, scoped to one model when the runtime compiles."""
+    if not spec.cache_per_model:
+        return spec.cache_env
+    out = []
+    for c in model_id.lower():
+        out.append(c if c.isalnum() else "-")
+    slug = "".join(out).strip("-")[:64] or "model"
+    return tuple((name, "%s/%s" % (path, slug)) for name, path in spec.cache_env)
+
+
+# `--enable-prompt-tokens-details` makes vLLM report
+# `usage.prompt_tokens_details.cached_tokens`, which is the only per-request
+# figure for how much of a prompt the prefix cache served -- per-key telemetry
+# reads it into `cache_read_tokens` / `prefix_cache_hit_rate`, and without it
+# every local row says `cache_error: not_reported`. Read off the pinned image
+# (vllm/entrypoints/launchers/cli_args.py, `enable_prompt_tokens_details:
+# bool = False`); it changes the usage block and nothing about generation.
 _VLLM_COMMAND = """\
 vllm serve \\
     {model} \\
@@ -821,7 +861,7 @@ vllm serve \\
     --max-model-len {max_model_len} \\
     --max-num-seqs {max_num_seqs} \\
     --gpu-memory-utilization {gpu_memory_utilization} \\
-    --trust-remote-code"""
+    --enable-prompt-tokens-details"""
 
 # derate's own server, and the only command template here that does not name
 # somebody else's binary. The flags deliberately mirror `vllm serve` where the
@@ -841,8 +881,7 @@ python3 -m control_plane.runtimes.tts \\
     --pipeline-parallel-size {pipeline_parallel} \\
     --max-model-len {max_model_len} \\
     --max-num-seqs {max_num_seqs} \\
-    --gpu-memory-utilization {gpu_memory_utilization} \\
-    --trust-remote-code"""
+    --gpu-memory-utilization {gpu_memory_utilization}"""
 
 _SGLANG_COMMAND = """\
 python3 -m sglang.launch_server \\
@@ -854,8 +893,7 @@ python3 -m sglang.launch_server \\
     --pp-size {pipeline_parallel} \\
     --context-length {max_model_len} \\
     --max-running-requests {max_running_requests} \\
-    --mem-fraction-static {gpu_memory_utilization} \\
-    --trust-remote-code"""
+    --mem-fraction-static {gpu_memory_utilization}"""
 
 # The CPU runtime, and the only template here that names no parallelism flag
 # at all. That is not an omission of the kind the _TTS_COMMAND note above warns
@@ -974,13 +1012,26 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         # "launching" that happens after the download, when a person watching
         # has already been told the slow part is over. One variable moves the
         # whole tree onto the one mount that survives.
+        # One subtree per model (M8): a shared writable compile cache lets
+        # code running in one model's container poison the next launch's.
         cache_env=(("VLLM_CACHE_ROOT", RUNTIME_CACHE_DIR + "/vllm"),),
+        cache_per_model=True,
+        api_key_env="VLLM_API_KEY",
+        revision_arg=(
+            "--revision {revision} --code-revision {revision} "
+            "--tokenizer-revision {revision}"
+        ),
     ),
     "sglang": RuntimeSpec(
         name="sglang",
         sparkrun_runtime="sglang",
         default_image_env="DERATE_SGLANG_IMAGE",
-        default_image="scitrera/dgx-spark-sglang:0.5.9-t5",
+        # Digest-pinned 2026-11-18 (`docker buildx imagetools inspect`): a tag
+        # on Docker Hub can be re-pushed, a digest cannot. Bump both together.
+        default_image=(
+            "scitrera/dgx-spark-sglang:0.5.9-t5"
+            "@sha256:a055011be7feb2e43ad8dbc365e3903f869c63b992864691f7edf83015bb941d"
+        ),
         max_seqs_key="max_running_requests",
         command_template=_SGLANG_COMMAND,
         custom_command_prefix=_SGLANG_CUSTOM_PREFIX,
@@ -1029,6 +1080,10 @@ RUNTIMES: dict[str, RuntimeSpec] = {
             ("TORCHINDUCTOR_CACHE_DIR", RUNTIME_CACHE_DIR + "/sglang/inductor"),
             ("TRITON_CACHE_DIR", RUNTIME_CACHE_DIR + "/sglang/triton"),
         ),
+        cache_per_model=True,
+        api_key_env="SGLANG_API_KEY",
+        api_key_arg="--api-key {api_key}",
+        revision_arg="--revision {revision}",
     ),
     # Text-to-speech. `sparkrun_runtime` is "vllm" and the command is not
     # vLLM's, which needs saying out loud: sparkrun's runtime field selects
@@ -1079,6 +1134,8 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         # would bill a reference clip as weights.
         cache_env=(("DERATE_TTS_VOICE_DIR", RUNTIME_CACHE_DIR + "/voices"),),
         shards=False,
+        api_key_env="DERATE_TTS_API_KEY",
+        revision_arg="--revision {revision}",
     ),
     # The CPU runtime, and the first entry here whose point is the machine
     # rather than the model. vLLM and SGLang need a CUDA device; a Raspberry

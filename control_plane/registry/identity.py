@@ -2,15 +2,25 @@
 
 The token is what stops anything on the subnet from enlisting itself. It is
 generated on the coordinator's first run, written to the data volume at 0600,
-and printed so a human can carry it to the next node.
+and printed so a human can carry it to the next node. It admits a node that is
+not a member yet, and nothing else: a member re-joins only with its own agent
+token, which the coordinator mints at random when the node becomes a member and
+hands over in the acknowledged join answer. A worker's ``cluster.json`` keeps
+that agent token and *not* the cluster token (``save_agent_credential``), so a
+compromised worker holds a credential for itself and no other machine. The
+coordinator's cluster token can be rotated (``POST /api/cluster/token/rotate``)
+because no member depends on it.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
 import secrets
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +37,23 @@ class ClusterIdentity:
     token: str
     persisted: bool = False
     path: Path | None = None
+    # A worker's own credential, delivered by the coordinator in an acked
+    # join answer. Only ever set when read off a worker's cluster.json.
+    agent_token: str | None = None
+
+
+def agent_token(cluster_token: str, node_id: str) -> str:
+    """The agent token of a member that has not re-joined since per-member
+    tokens existed: ``HMAC(cluster_token, "agent\\n" + node_id)``.
+
+    Kept only for that migration window. Every worker held the cluster token,
+    so anyone holding one could derive every other node's value -- which is
+    why a member is handed a random token of its own on its first re-join
+    (``Registry._mint_agent_token``), after which this value opens nothing.
+    """
+    return hmac.new(
+        cluster_token.encode(), b"agent\n" + node_id.encode(), hashlib.sha256
+    ).hexdigest()
 
 
 def new_cluster_id() -> str:
@@ -43,10 +70,11 @@ def read_identity(data_dir: Path) -> ClusterIdentity | None:
     ``load_or_create_identity`` mints and writes when nothing is on disk, which
     is right for a coordinator and wrong for a worker: a worker that minted an
     identity would be inventing a cluster nobody asked for. This is the read a
-    worker needs to recover the permanent token it adopted on an earlier run.
+    worker needs to recover the agent token it adopted on an earlier run (or,
+    on a worker from before per-member tokens, the cluster token it held).
 
     Returns None when there is no file, when it is unreadable, or when it holds
-    no token -- all "we have nothing", none of them worth failing over.
+    neither token -- all "we have nothing", none of them worth failing over.
     """
     path = Path(data_dir) / CLUSTER_FILE
     if not path.exists():
@@ -60,14 +88,56 @@ def read_identity(data_dir: Path) -> ClusterIdentity | None:
         log.warning("%s did not contain a JSON object", path)
         return None
     token = str(stored.get("token") or "")
-    if not token:
+    agent = str(stored.get("agent_token") or "") or None
+    if not token and not agent:
         return None
     return ClusterIdentity(
         cluster_id=str(stored.get("cluster_id") or ""),
         token=token,
         persisted=True,
         path=path,
+        agent_token=agent,
     )
+
+
+def save_agent_credential(data_dir: Path, cluster_id: str, agent_token: str) -> bool:
+    """Rewrite a worker's ``cluster.json`` as ``{cluster_id, agent_token}``.
+
+    The cluster token is dropped from the file on purpose: once this member
+    holds its own credential it has no further use for the cluster token, and
+    a file that kept it would hand a compromised worker every other member's
+    pre-migration token and the power to join new machines. Atomic (mkstemp,
+    fsync, replace) and 0600 from creation, as ``roster.save_roster`` does.
+    Returns False -- with a warning -- when the data volume is unwritable.
+    """
+    path = Path(data_dir) / CLUSTER_FILE
+    payload = {"cluster_id": cluster_id, "agent_token": agent_token}
+    tmp_path: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".cluster-", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        fsutil.harden_path(tmp_path)
+        os.replace(tmp_path, path)
+        return True
+    except OSError as exc:
+        log.warning(
+            "could not persist this node's agent token to %s (%s); it will not "
+            "survive a restart",
+            path,
+            exc,
+        )
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return False
 
 
 def load_or_create_identity(
@@ -144,10 +214,9 @@ def banner(identity: ClusterIdentity, ui_url: str) -> str:
         f"  finds this coordinator. From elsewhere, DERATE_TOKEN={identity.token}\n"
         "  joins as a candidate you then admit by hand.\n"
         "\n"
-        "  Keep that token somewhere. It is what makes this machine\n"
-        "  replaceable: start a coordinator anywhere with DERATE_TOKEN set to\n"
-        "  it and every node presents itself again on its own. Keep this\n"
-        "  machine's /data too if you can -- with the roster the nodes come\n"
-        "  straight back as members; without it they arrive as candidates to\n"
-        "  admit, one click each. Without the token they cannot arrive at all.\n"
+        "  Keep this machine's data directory. Members re-join with their\n"
+        "  own agent tokens, which live in registry.json beside cluster.json:\n"
+        "  a coordinator started anywhere with both files has every node\n"
+        "  present itself again on its own. Without registry.json a member\n"
+        "  cannot re-join by itself; run its install command again.\n"
     )

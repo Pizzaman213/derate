@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import logging
 import random
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -27,7 +28,8 @@ from .config import (
 )
 from .discovery import DiscoveredPeer, browse_async
 from .errors import JoinRejected, ProbeFailed
-from .identity import load_or_create_identity
+from . import joinproof
+from .identity import read_identity, save_agent_credential
 from .net import normalize_agent_url
 from .serde import profile_to_dict
 
@@ -57,10 +59,10 @@ class RoleDecision:
     # (a coordinator answered but the token did not match), or None (nobody
     # to join at all), as the coordinator saw it.
     status: str | None = None
-    # Set only when we were admitted on an enrollment token: the permanent
-    # cluster token, handed over once so this node keeps working after the
-    # enrollment token expires. The caller must persist it.
-    cluster_token: str | None = None
+    # This member's own agent token, from an acked "member" answer. The
+    # caller persists it (``adopt_credentials``); it is what this node
+    # presents on every later join and what its agent accepts.
+    agent_token: str | None = None
     # Which of the credentials this node holds the coordinator actually took.
     # None when no join happened at all.
     token_used: str | None = None
@@ -77,15 +79,27 @@ async def post_join(
     agent_url: str,
     client: AgentClient | None = None,
 ) -> dict:
-    """POST /api/nodes/join. Raises JoinRejected when refused."""
+    """POST /api/nodes/join. Raises JoinRejected when refused.
+
+    Also raises JoinRejected when a proof-bearing join is answered without an
+    ``ack`` that proves knowledge of the token we presented: whoever answered
+    is not a coordinator that holds our credential -- a rogue mDNS advertiser,
+    most likely -- and nothing it said may be adopted. Every caller (boot,
+    rejoin, re-announce) already treats a rejection as "not this one, keep
+    looking", which is the right response to an impostor as well. A tokenless
+    join can prove nothing either way, so its answer is stripped of every
+    credential it carries: a tokenless join adopts nothing, ever.
+    """
     client = client or HttpAgentClient()
-    payload = {
-        "token": token or "",
-        "profile": profile_to_dict(profile),
-        "agent_url": agent_url,
-    }
+    payload: dict = {"profile": profile_to_dict(profile), "agent_url": agent_url}
+    sent: joinproof.JoinProof | None = None
+    if token:
+        # Proof of possession, never the token itself: whoever answers this
+        # POST may be a rogue mDNS advertiser.
+        sent = joinproof.make(token, profile.node_id, agent_url, time.time())
+        payload["proof"] = sent.to_dict()
     try:
-        return await client.post_json(
+        result = await client.post_json(
             f"{coordinator_url.rstrip('/')}/api/nodes/join",
             payload,
             timeout=JOIN_TIMEOUT_S,
@@ -96,6 +110,18 @@ async def post_join(
         if "403" in str(exc):
             raise JoinRejected(f"coordinator rejected our token: {exc}") from exc
         raise
+    if sent is None:
+        if not isinstance(result, dict):
+            return result
+        return {k: v for k, v in result.items() if k not in ("agent_token", "ack")}
+    if not isinstance(result, dict) or not joinproof.ack_matches(
+        result.get("ack"), token, profile.node_id, agent_url, sent, result
+    ):
+        log.warning(
+            "ignoring a join response without a valid ack from %s", coordinator_url
+        )
+        raise JoinRejected("the join response carried no valid ack")
+    return result
 
 
 async def join_with_held_credentials(
@@ -107,65 +133,82 @@ async def join_with_held_credentials(
 ) -> tuple[dict, str | None]:
     """Present what this machine holds, and let the coordinator pick.
 
-    A node can legitimately be holding two credentials at once: the enrollment
-    token it was installed with -- which ``install.sh`` bakes into the container
-    environment permanently, so it is presented on every restart forever -- and
-    the permanent cluster token the coordinator handed it in exchange for that
-    one. After the first hour the enrollment token is spent, and because
-    ``handle_join`` checks the token *before* it checks membership, presenting
-    it 403s the node out of a cluster it is already a member of.
+    A member holds its own agent token (``config.agent_token``, delivered in
+    an acked join answer and kept in ``cluster.json``) and that is the only
+    credential the coordinator accepts from a member's re-join. It is tried
+    first. ``config.token`` -- ``DERATE_TOKEN`` from the environment -- is the
+    fallback, and is right in exactly two cases nothing on this side can tell
+    apart: a *fresh* enrollment token carried here to re-home the machine onto
+    another cluster, and a pre-upgrade cluster token on a worker that has not
+    migrated yet (the coordinator accepts that once and hands a token back).
 
-    Preferring the stored token instead would break the opposite case, which is
-    just as real: a *fresh* enrollment token carried to this machine to re-home
-    it onto a different cluster, where the stored one is the wrong cluster's and
-    will be refused. Nothing on this side can tell those apart -- so try the
-    deliberate one first and fall back to the held one, and let the far end
-    settle it.
-
-    Returns the join response and the token that earned it, so the caller can
-    stop paying for the rejection next time.
+    Returns the join response and the token that earned it.
     """
-    try:
-        return await join(url, config.token, profile, agent_url), config.token
-    except JoinRejected:
-        fallback = config.fallback_token
-        if not fallback or fallback == config.token:
-            raise
-        log.info(
-            "%s rejected the token we were given; retrying with the permanent "
-            "cluster token this node adopted earlier",
-            url,
-        )
-        return await join(url, fallback, profile, agent_url), fallback
+    held = config.agent_token
+    if held:
+        try:
+            return await join(url, held, profile, agent_url), held
+        except JoinRejected:
+            if not config.token or config.token == held:
+                raise
+            log.info(
+                "%s rejected this node's agent token; retrying with the token "
+                "in the environment",
+                url,
+            )
+    return await join(url, config.token, profile, agent_url), config.token
 
 
-def adopt_cluster_token(config: RegistryConfig, result: dict | None) -> RegistryConfig:
-    """Keep the permanent token a coordinator handed back, and use it from now on.
+def adopt_credentials(config: RegistryConfig, result: dict | None) -> RegistryConfig:
+    """Keep the agent token a coordinator handed back, and use it from now on.
 
-    A node admitted on an enrollment token holds a credential that expires
-    within the hour. ``Registry.handle_join`` therefore returns the permanent
-    cluster token with the admission, exactly once. Persisting it here is not
-    housekeeping: ``handle_join`` checks the token *before* it checks
-    membership, so a worker that kept presenting a spent enrollment token
-    would eventually 403 itself out of a cluster it is already a member of.
+    A member's acked answer carries its own ``agent_token``. Persisting it is
+    not housekeeping: a member re-joins only with that token, so a worker that
+    lost it would be locked out of a cluster it belongs to. The cluster token
+    is never in an answer and is never written here; ``cluster.json`` is
+    rewritten as ``{cluster_id, agent_token}``, dropping any cluster token a
+    pre-upgrade worker kept there.
+
+    Only ever handed a response ``post_join`` let through, which means one
+    whose ``ack`` proved the coordinator holds the token this node presented
+    and covers every field of the answer (or a tokenless one, stripped of
+    every credential).
 
     Returns the config to use from here on -- the same object when there was
-    nothing to adopt. Writing goes through ``load_or_create_identity``, which
-    already prefers an explicit token and creates the file at 0600.
+    nothing to adopt.
     """
-    token = (result or {}).get("cluster_token")
-    if not token or token == config.token:
+    result = result or {}
+    token = result.get("agent_token")
+    if not token or not isinstance(token, str):
         return config
-    load_or_create_identity(
-        config.data_dir,
-        cluster_id=(result or {}).get("cluster_id") or config.cluster_id,
-        token=str(token),
+    cluster_id = str(result.get("cluster_id") or config.cluster_id or "")
+    stored = read_identity(config.data_dir)
+    unchanged = (
+        token == config.agent_token
+        and stored is not None
+        and stored.agent_token == token
+        and not stored.token
+        and stored.cluster_id == cluster_id
     )
-    log.info(
-        "adopted the cluster token from the coordinator; the enrollment token "
-        "this node installed with is no longer needed"
-    )
-    return dataclasses.replace(config, token=str(token))
+    if unchanged:
+        return config
+    save_agent_credential(config.data_dir, cluster_id, token)
+    if token != config.agent_token:
+        log.info("adopted this node's agent token from the coordinator")
+    return dataclasses.replace(config, agent_token=token, cluster_id=cluster_id or None)
+
+
+def _foreign_cluster(config: RegistryConfig, peer: DiscoveredPeer) -> bool:
+    """A coordinator advertising a cluster that is not ours is never joined."""
+    if config.cluster_id and peer.cluster_id and peer.cluster_id != config.cluster_id:
+        log.warning(
+            "ignoring coordinator %s advertising cluster %s (ours is %s)",
+            peer.node_id,
+            peer.cluster_id,
+            config.cluster_id,
+        )
+        return True
+    return False
 
 
 async def resolve_role(
@@ -219,7 +262,7 @@ async def resolve_role(
             f"DERATE_JOIN={config.join_address}",
             cluster_id=(result or {}).get("cluster_id"),
             status=(result or {}).get("status"),
-            cluster_token=(result or {}).get("cluster_token"),
+            agent_token=(result or {}).get("agent_token"),
             token_used=token_used,
         )
 
@@ -228,6 +271,8 @@ async def resolve_role(
     rejected_url: str | None = None
 
     for peer in coordinators:
+        if _foreign_cluster(config, peer):
+            continue
         url = f"http://{peer.address}:{config.coordinator_port}"
         try:
             result, token_used = await join_with_held_credentials(
@@ -240,7 +285,7 @@ async def resolve_role(
                 f"joined coordinator {peer.node_id} at {url}",
                 cluster_id=(result or {}).get("cluster_id") or peer.cluster_id,
                 status=(result or {}).get("status"),
-                cluster_token=(result or {}).get("cluster_token"),
+                agent_token=(result or {}).get("agent_token"),
                 token_used=token_used,
             )
         except JoinRejected:
@@ -376,7 +421,7 @@ async def reannounce(
         peers = []
 
     for peer in peers:
-        if not peer.is_coordinator:
+        if not peer.is_coordinator or _foreign_cluster(config, peer):
             continue
         url = f"http://{peer.address}:{config.coordinator_port}"
         if url in tried:
@@ -420,7 +465,7 @@ async def rejoin_until_admitted(
         return None
     while should_continue():
         try:
-            result, token_used = await join_with_held_credentials(
+            result, _ = await join_with_held_credentials(
                 join, url, config, profile, agent_url
             )
         except JoinRejected as exc:
@@ -437,13 +482,9 @@ async def rejoin_until_admitted(
             await sleep(REJOIN_INTERVAL_S + jitter() * REJOIN_JITTER_S)
             continue
 
-        # Before the status check: an admission carries the permanent token
-        # with it, and the next iteration of this loop must present that one.
-        # Same for a credential that only worked as the fallback -- there is no
-        # reason to keep paying for the rejection that got us here.
-        if token_used and token_used != config.token:
-            config = dataclasses.replace(config, token=token_used)
-        config = adopt_cluster_token(config, result)
+        # Before the status check: an admission carries this member's own
+        # agent token, and the next iteration must present that one.
+        config = adopt_credentials(config, result)
 
         if (result or {}).get("status") == "member":
             log.info(

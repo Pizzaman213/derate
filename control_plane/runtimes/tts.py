@@ -48,10 +48,12 @@ WHAT IT DOES NOT DO, stated rather than discovered at request time:
 from __future__ import annotations
 
 import argparse
+import hmac
 import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -77,6 +79,15 @@ log = logging.getLogger("derate.tts")
 #: window leaves room for it. 512 frames at ~21.5 frames/s is about 24 seconds
 #: of speech, which is the checkpoint's own generation_config default.
 DEFAULT_MAX_NEW_TOKENS = 512
+
+#: L16: the longest `input` /v1/audio/speech accepts. One request holds the
+#: GPU lock for its whole generation, so an unbounded input is one caller
+#: holding the deployment. OpenAI's own limit for this route is 4096.
+MAX_INPUT_CHARS = 4096
+
+#: L15: what a default-voice row from the remote dataset may name. The speaker
+#: id becomes a filename and the clip is fetched by URL, so neither is trusted.
+_SPEAKER_SAFE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 #: Printed immediately before this process gives up, and the one line in this
 #: file another module matches on: ``deploy/progress.py::_RUNTIME_FATAL``.
@@ -401,6 +412,8 @@ def _pick_row(rows: list, taken: set[str]) -> tuple[str, str, str] | None:
             source = str(audio[0].get("src") or "")
         if not speaker or not source or speaker in taken:
             continue
+        if not _SPEAKER_SAFE.fullmatch(speaker) or not source.startswith("https://"):
+            continue
         if not DEFAULT_VOICE_MIN_CHARS <= len(transcript) <= DEFAULT_VOICE_MAX_CHARS:
             continue
         return speaker, transcript, source
@@ -589,6 +602,9 @@ class ServerConfig:
     #: ensure_default_voices; off leaves the directory exactly as found.
     default_voices: bool = True
     device: str | None = None
+    #: The commit the launch was pinned to (M7): the weights and the remote
+    #: code are read at exactly this revision. None reads the default branch.
+    revision: str | None = None
 
 
 def _patch_reference_text_tag(processor: Any) -> None:
@@ -686,13 +702,16 @@ class SpeechEngine:
                 )
 
         self.processor = AutoProcessor.from_pretrained(
-            self.config.model, trust_remote_code=self.config.trust_remote_code
+            self.config.model,
+            trust_remote_code=self.config.trust_remote_code,
+            revision=self.config.revision,
         )
         _patch_reference_text_tag(self.processor)
         self.model = (
             AutoModel.from_pretrained(
                 self.config.model,
                 trust_remote_code=self.config.trust_remote_code,
+                revision=self.config.revision,
                 dtype=dtype,
             )
             .eval()
@@ -851,6 +870,11 @@ def parse_speech_request(body: Any, served_name: str) -> SpeechRequest:
     text = body.get("input")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("you must provide a non-empty 'input' to speak")
+    if len(text) > MAX_INPUT_CHARS:
+        raise ValueError(
+            f"'input' is {len(text)} characters; this server speaks at most "
+            f"{MAX_INPUT_CHARS} per request. Split the text and send it in parts"
+        )
 
     speed = body.get("speed")
     if speed is not None and float(speed) != 1.0:
@@ -919,7 +943,7 @@ def error_body(message: str, code: str, status: int) -> dict:
 # ── the app ──────────────────────────────────────────────────────────────────
 
 
-def build_app(engine: SpeechEngine, admission: Admission):
+def build_app(engine: SpeechEngine, admission: Admission, api_key: str | None = None):
     """The HTTP surface: /health, /v1/models, /v1/audio/speech.
 
     ``/health`` and ``/v1/models`` are not decoration -- ``deploy/health.py``
@@ -928,6 +952,28 @@ def build_app(engine: SpeechEngine, admission: Admission):
     """
     app = FastAPI(title="derate tts", docs_url=None, redoc_url=None)
     served = engine.config.served_model_name
+    # H3: the deployment's runtime key, which only the gateway holds. Every
+    # /v1 path requires it; /health stays open for deploy/health.py.
+    key = api_key if api_key is not None else os.environ.get("DERATE_TTS_API_KEY", "")
+    if key:
+        expected = f"Bearer {key}".encode()
+
+        @app.middleware("http")
+        async def require_key(request: Request, call_next):
+            if request.url.path.startswith("/v1"):
+                given = request.headers.get("authorization", "").encode()
+                if not hmac.compare_digest(given, expected):
+                    return JSONResponse(
+                        status_code=401,
+                        content={
+                            "error": {
+                                "message": "invalid api key",
+                                "type": "invalid_request_error",
+                                "code": "invalid_api_key",
+                            }
+                        },
+                    )
+            return await call_next(request)
 
     @app.get("/health")
     async def health() -> Response:
@@ -1105,6 +1151,9 @@ def build_parser() -> argparse.ArgumentParser:
         default_voices=os.environ.get("DERATE_TTS_DEFAULT_VOICES", "1") not in ("0", "false", "no")
     )
     parser.add_argument("--device", default=None, help="cuda, cuda:1, cpu")
+    parser.add_argument(
+        "--revision", default=None, help="commit sha to load weights and code at"
+    )
     return parser
 
 
@@ -1142,6 +1191,7 @@ def config_from_args(args: argparse.Namespace) -> ServerConfig:
         voice_dir=args.voice_dir,
         default_voices=bool(args.default_voices),
         device=args.device,
+        revision=args.revision,
     )
 
 
