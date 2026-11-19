@@ -43,7 +43,7 @@ function toDate(v: unknown): Date | null | undefined {
   return parseDate(v, PARSE_TZ ? { timeZone: PARSE_TZ } : {}) ?? undefined
 }
 
-/** What each field helper accepts; the chooser reads it to bind data columns to fields. */
+/** What each field helper accepts. */
 export type FieldKind = 'number' | 'number?' | 'date' | 'date?' | 'label' | 'label?'
 const KINDS = new WeakMap<z.ZodTypeAny, FieldKind>()
 const tag = <T extends z.ZodTypeAny>(kind: FieldKind, schema: T): T => {

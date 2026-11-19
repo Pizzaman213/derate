@@ -1,1 +1,0 @@
-{"description":"Desktop browser market share (%), from a CSV export mapped by field name.","data":"browser,share_pct\nChrome,65.4\nEdge,13.1\nSafari,9.2\nFirefox,6.6\nOpera,3.1\nOther,2.6\n","options":{"fields":{"label":"browser","value":"share_pct"}}}

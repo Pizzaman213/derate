@@ -7,7 +7,7 @@ import { cartesian, timeTicks } from './cartesian'
 import { prepare } from './validate'
 import { defineChart } from './define'
 import { fields } from './index'
-import { host } from '../tests/harness'
+import { host } from '../tests/host'
 import type { Mark } from './types'
 
 const fmt = makeFormatters()

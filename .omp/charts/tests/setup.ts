@@ -1,7 +1,7 @@
 export {}
 // jsdom gaps, filled honestly: what is stubbed here does not exist in jsdom, and
-// everything that depends on real layout or pixels is tested in Playwright instead
-// (tests/browser). Nothing here changes chart behaviour.
+// everything that depends on real layout or pixels is not tested here.
+// Nothing here changes chart behaviour.
 
 class TrackedResizeObserver {
   static live = new Set<TrackedResizeObserver>()

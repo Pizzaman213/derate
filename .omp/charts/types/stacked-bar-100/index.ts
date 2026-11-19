@@ -8,7 +8,21 @@ import { stackRows } from '../../adapters'
 import { notes } from '../../core/helpers'
 import type { LegendItem, Mark } from '../../core'
 import { barGeom, cell, collapseSeries, type SeriesTable } from '../_shared/ComparisonA'
-import { input, options, type Stacked100Options, type Stacked100Row } from './schema'
+import { z } from 'zod'
+import { orientation, seriesInput } from '../_shared/ComparisonA'
+
+/** Long rows: one segment per (label, series); each bar is that category's mix, summing to 100%. */
+export const input = seriesInput
+
+export const options = z.object({
+  orientation,
+  showValues: z.boolean().default(false).describe('print each share inside its segment when it fits'),
+  xTitle: z.string().optional(),
+  yTitle: z.string().optional(),
+})
+
+export type Stacked100Row = z.output<typeof input>[number]
+export type Stacked100Options = z.output<typeof options>
 
 /** Per-category shares: label -> series -> [y0, y1] in 0..1, plus totals (negatives excluded). */
 export function shares(t: SeriesTable, series: string[]): { layers: Array<{ key: string; spans: Map<string, [number, number]> }>; totals: Map<string, number> } {

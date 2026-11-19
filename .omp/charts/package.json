@@ -2,21 +2,11 @@
   "name": "derate-chart-pack",
   "private": true,
   "type": "module",
-  "description": "The chart types the app mounts, behind one API. TypeScript + D3 -> SVG, canvas above 5k marks. See README.md and RULES.md.",
+  "description": "The chart types the app mounts, one file each, behind one API. TypeScript + D3 -> SVG, canvas above 5k marks. See README.md and RULES.md.",
   "scripts": {
     "theme:build": "node theme/build.mjs",
-    "charts:build": "node scripts/build.mjs",
     "charts:typecheck": "tsc -p tsconfig.json",
-    "charts:test": "vitest run",
-    "charts:visual": "node tests/browser/run.mjs --suite visual,layout",
-    "charts:a11y": "node tests/browser/run.mjs --suite a11y",
-    "charts:perf": "node tests/browser/run.mjs --suite perf",
-    "charts:icons": "node icons/lint.mjs --write && node icons/lint.mjs",
-    "charts:registry": "node scripts/registry.mjs",
-    "charts:gallery": "node scripts/build.mjs && node icons/lint.mjs --write && node scripts/gallery.mjs",
-    "charts:check": "node scripts/check.mjs",
-    "charts:cli": "node scripts/cli.mjs",
-    "charts:gallery:verify": "node tests/browser/gallery.mjs"
+    "charts:test": "vitest run"
   },
   "dependencies": {
     "d3-array": "^3.2.4",
@@ -43,13 +33,7 @@
     "@types/d3-transition": "^3.0.9",
     "@types/d3-zoom": "^3.0.9",
     "@types/node": "^20.19.43",
-    "@types/pngjs": "^6.0.5",
-    "axe-core": "^4.14.1",
-    "esbuild": "^0.25.12",
     "jsdom": "^29.1.1",
-    "pixelmatch": "^8.0.0",
-    "playwright-core": "^1.65.1",
-    "pngjs": "^7.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.12"
   }
