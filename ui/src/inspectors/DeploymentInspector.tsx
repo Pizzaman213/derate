@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Icon } from '../components/Icon'
 import { isAudio } from '../api/types'
 import type {
   DeploymentDTO,
@@ -90,10 +91,10 @@ function Starting({ dep }: { dep: DeploymentDTO }) {
       <ul
         style={{
           listStyle: 'none',
-          margin: '8px 0 0',
+          margin: 'var(--space-8) 0 0',
           padding: 0,
           display: 'grid',
-          gap: 6,
+          gap: 'var(--space-6)',
         }}
       >
         {LAUNCH_PHASES.map((phase, i) => {
@@ -111,11 +112,11 @@ function Starting({ dep }: { dep: DeploymentDTO }) {
                 color: state === 'todo' ? 'var(--ink-muted)' : 'var(--ink)',
                 display: 'grid',
                 gridTemplateColumns: '10px 1fr',
-                gap: 6,
+                gap: 'var(--space-6)',
               }}
             >
-              <span aria-hidden="true" className="mono">
-                {state === 'done' ? '✓' : state === 'now' ? '●' : '○'}
+              <span className="mono">
+                <Icon name={state === 'done' ? 'check-circle' : state === 'now' ? 'circle-dot' : 'circle'} size={12} decorative />
               </span>
               <span>{phaseLabel(phase)}</span>
             </li>
@@ -129,12 +130,12 @@ function Starting({ dep }: { dep: DeploymentDTO }) {
           the only thing on the sheet that distinguishes one four-minute
           silence from another. */}
       {row?.status ? (
-        <div style={{ marginTop: 8 }}>
+        <div style={{ marginTop: 'var(--space-8)' }}>
           <Verbatim text={row.status} size="unit" />
         </div>
       ) : null}
 
-      <div className="unit" style={{ marginTop: 6 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
         {row
           ? // Not "launching for 4m": `since` is when this coordinator first
             // saw it, and after a restart that is when the coordinator came
@@ -259,8 +260,8 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 }}>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 'var(--space-10)' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
           {/* Arriving is amber, not red. A launch drew the fault lamp for the
               whole of its startup because the expression only knew "serving"
               and "not serving" -- so a model doing exactly what it was asked
@@ -270,7 +271,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
             signal={degraded || arriving || dep.state === 'stopping' ? 'warn' : serving ? 'live' : 'fault'}
             label={dep.state}
           />
-          <span className="label mono" style={{ fontSize: 17 }}>
+          <span className="label mono" style={{ fontSize: 'var(--size-title)' }}>
             {dep.served_name}
           </span>
           {dep.origin === 'adopted' ? (
@@ -282,7 +283,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
             </span>
           ) : null}
         </span>
-        <span style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+        <span style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'baseline' }}>
           {/* Offered on the API, or not. Deliberately NOT a stop: the
               container stays up and keeps its GPU memory, which is the whole
               difference between the two and is said out loud below. Only
@@ -294,17 +295,17 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
             </button>
           ) : null}
           {alreadyStopping ? (
-            <button disabled>{dep.state === 'stopped' ? 'Stopped' : 'Stopping…'}</button>
+            <button type="button" disabled>{dep.state === 'stopped' ? 'Stopped' : 'Stopping…'}</button>
           ) : (
-            <button onClick={() => void stop()} disabled={stopping}>
+            <button type="button" onClick={() => void stop()} disabled={stopping}>
               {stopping ? 'Stopping…' : 'Stop'}
             </button>
           )}
-          <button onClick={onClose}>Close</button>
+          <button type="button" onClick={onClose}>Close</button>
         </span>
       </div>
       {stopError ? (
-        <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: '8px 0 0' }}>
+        <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: 'var(--space-8) 0 0' }}>
           {stopError}
         </p>
       ) : null}
@@ -316,7 +317,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
       {!offered && serving ? (
         <p
           className="unit"
-          style={{ color: 'var(--warn)', margin: '8px 0 0', fontWeight: 400 }}
+          style={{ color: 'var(--warn)', margin: 'var(--space-8) 0 0', fontWeight: 400 }}
         >
           Off the API — not in /v1/models, not routed, not in the chat picker.
           The container is still running and still holding
@@ -327,6 +328,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
         </p>
       ) : null}
       <div className="unit" style={{ margin: '5px 0 0' }}>
+      <div className="unit" style={{ margin: 'var(--space-5) 0 0' }}>
         {planShortFromDegrees(dep.plan)} · {dep.runtime}
         {audio ? (
           <> · {dep.modality}</>
@@ -340,7 +342,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
       </div>
 
       {dep.last_error ? (
-        <div style={{ marginTop: 8 }}>
+        <div style={{ marginTop: 'var(--space-8)' }}>
           <Verbatim text={dep.last_error} size="label" />
         </div>
       ) : null}
@@ -349,7 +351,7 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
           was a disclosure under all of this and is now beside it -- during a
           launch the log IS the sheet, and it was the one thing below the fold.
           The column is sticky, so it holds while this one scrolls. */}
-      <div className="depgrid" style={{ marginTop: 12 }}>
+      <div className="depgrid" style={{ marginTop: 'var(--space-12)' }}>
         <div>
         {arriving ? <Starting dep={dep} /> : (
         <>
@@ -437,17 +439,17 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
           <span>Measured all-reduce</span>
           <span className="mono">{dep.node_ids.length >= 2 ? fmtUnit(dep.plan.measured_link_gbps, 1, 'GB/s') : '—'}</span>
         </div>
-        <div className="why on" style={{ marginTop: 8 }}>
+        <div className="why on" style={{ marginTop: 'var(--space-8)' }}>
           <Verbatim text={dep.plan.reason} size="label" />
           {dep.plan.rejected.length > 0 ? (
-            <div style={{ marginTop: 6 }}>
+            <div style={{ marginTop: 'var(--space-6)' }}>
               <div className="mut">Rejected</div>
               <VerbatimList items={dep.plan.rejected} />
             </div>
           ) : null}
         </div>
         {dep.fit.warnings.length > 0 ? (
-          <div className="why on" style={{ marginTop: 8 }}>
+          <div className="why on" style={{ marginTop: 'var(--space-8)' }}>
             <VerbatimList items={dep.fit.warnings} />
           </div>
         ) : null}
@@ -516,7 +518,7 @@ function PhaseBar({ ttftMs, meanDurationS }: { ttftMs: number; meanDurationS: nu
         <span style={{ width: `${pp.toFixed(1)}%`, background: 'var(--fill)', color: 'var(--on-fill)' }}>
           {pp >= 12 ? 'prefill' : ''}
         </span>
-        <span style={{ width: `${(100 - pp).toFixed(1)}%`, background: 'var(--fill)', opacity: 0.45, color: 'var(--on-fill)' }}>
+        <span style={{ width: `${(100 - pp).toFixed(1)}%`, background: 'var(--fill)', opacity: 'var(--opacity-45)', color: 'var(--on-fill)' }}>
           decode
         </span>
       </div>
@@ -531,7 +533,7 @@ function PhaseBar({ ttftMs, meanDurationS }: { ttftMs: number; meanDurationS: nu
           <b>{fmt(tot, 1)} s</b> mean request
         </span>
       </div>
-      <div className="unit" style={{ marginTop: 6 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
         Prefill processes the whole prompt at once and is compute-bound; decode emits one token at a time and
         is memory-bandwidth-bound. The planner and the fit gate reason about decode bandwidth, not this.
       </div>

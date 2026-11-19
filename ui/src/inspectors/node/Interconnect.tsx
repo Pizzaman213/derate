@@ -2,7 +2,7 @@ import { useState } from 'react'
 import type { LinkMeasurement, TopologyEdge } from '../../api/types'
 import { useBackend } from '../../state/backend'
 import { useCluster, useTopology } from '../../state/resources'
-import { edgeMeasured } from '../../tabs/cluster/layout'
+import { linkMeasured } from '../../tabs/models/board'
 import { fmtUnit, relativeTime } from '../../format'
 
 /** This machine's links to every peer.
@@ -52,11 +52,11 @@ export function Interconnect({ nodeId }: { nodeId: string }) {
       {peers.map((peer) => {
         const edge = findEdge(topology.data?.edges ?? [], nodeId, peer)
         const link = findLink(cluster.data?.links ?? [], nodeId, peer)
-        const measured = edgeMeasured(edge)
+        const measured = linkMeasured(edge)
         return (
           <div key={peer} className="row">
             <span className="mono">{peer}</span>
-            <span style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-8)' }}>
               {measured ? (
                 <span className="unit">
                   {fmtUnit(edge?.all_reduce_gbps, 1, 'GB/s all-reduce')}
@@ -67,7 +67,7 @@ export function Interconnect({ nodeId }: { nodeId: string }) {
               ) : (
                 <span className="unit">never measured</span>
               )}
-              <button onClick={() => void measure(peer)} disabled={busy === peer}>
+              <button type="button" onClick={() => void measure(peer)} disabled={busy === peer}>
                 {busy === peer ? 'Measuring…' : measured ? 'Re-measure' : 'Measure'}
               </button>
             </span>
@@ -77,7 +77,7 @@ export function Interconnect({ nodeId }: { nodeId: string }) {
       {error ? (
         <p
           className="label"
-          style={{ color: 'var(--fault)', fontWeight: 400, margin: '8px 0 0' }}
+          style={{ color: 'var(--fault)', fontWeight: 400, margin: 'var(--space-8) 0 0' }}
         >
           {error.message}
         </p>

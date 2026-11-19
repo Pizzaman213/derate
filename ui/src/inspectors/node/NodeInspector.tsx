@@ -13,7 +13,7 @@ import { WindowChips } from './WindowChips'
 import { NodeCharts } from './NodeCharts'
 import { HardwareRows } from './HardwareRows'
 import { Interconnect } from './Interconnect'
-import { runningOrPrevious } from '../../tabs/cluster/layout'
+import { runningOrPrevious } from '../../tabs/models/rows'
 import { ServingBlock } from './ServingBlock'
 import { RequestsTable } from './RequestsTable'
 import { EventsAndLogs } from './EventsAndLogs'
@@ -102,10 +102,10 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
   return (
     <div>
       <div className="nodehead">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 'var(--space-12)' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
             <Lamp signal={signal} hollow={grey && signal !== 'fault'} label={node.state} />
-            <span className="label mono" style={{ fontSize: 17 }}>
+            <span className="label mono" style={{ fontSize: 'var(--size-title)' }}>
               {nodeName(fromState(node))}
             </span>
             {/* The two identities the name may be standing in front of. The id
@@ -118,23 +118,23 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
               {p.hostname} · {node.role}
             </span>
           </span>
-          <span style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <span style={{ display: 'flex', gap: 'var(--space-10)', alignItems: 'center' }}>
             <WindowChips value={window} onChange={setWindow} />
-            <button onClick={onClose}>Close</button>
+            <button type="button" onClick={onClose}>Close</button>
           </span>
         </div>
-        <div className="unit" style={{ marginTop: 4 }}>
+        <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
           {summary.join(' · ')}
         </div>
       </div>
 
       {node.eligible === false && node.ineligible_reason ? (
-        <div style={{ margin: '14px 0 0' }}>
+        <div style={{ margin: 'var(--space-14) 0 0' }}>
           <Verbatim text={node.ineligible_reason} size="label" />
         </div>
       ) : null}
 
-      <div className="nodegrid" style={{ marginTop: 14 }}>
+      <div className="nodegrid" style={{ marginTop: 'var(--space-14)' }}>
         <div>
           <div className="quad">
             <Stat label="power" value={live.power_w} unit="W" stale={grey} />
@@ -142,7 +142,7 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
             <Stat label={utilLabel(p)} value={live.util_pct} unit="%" stale={grey} />
             <Stat label="memory used" value={live.memory_used_pct} unit="%" stale={grey} />
           </div>
-          <div className="unit" style={{ marginTop: 6 }}>
+          <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
             These four are always now, whichever window is selected below: what the machine is
             doing at this second is a different question from what it did over the last hour.
           </div>
@@ -152,7 +152,7 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
 
           <div className="sub">hardware and memory</div>
           <HardwareRows node={node} />
-          <div className="unit" style={{ marginTop: 6 }}>
+          <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
             {unified
               ? 'Unified memory: the model and the operating system share one pool, so the static ceiling overstates what is actually allocatable. Allocatable is the figure the fit gate plans against, read live from the node rather than worked out here.'
               : 'Allocatable is the figure the fit gate plans against, read live from the node rather than worked out here.'}

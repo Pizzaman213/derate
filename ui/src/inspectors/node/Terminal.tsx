@@ -210,7 +210,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
               rendering a figure it did not measure applies to a claim about
               privilege at least as much as to a number. The prompt says which
               once it opens. */}
-          <div className="unit" style={{ marginBottom: 8 }}>
+          <div className="unit" style={{ marginBottom: 'var(--space-8)' }}>
             A shell on {nodeId}, running as whatever user its node agent runs as — on a node
             started with <span className="mono">--pid=host</span> that is root, on the machine
             itself rather than in the container. The connection is not encrypted: the coordinator
@@ -218,7 +218,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
             network in clear. Where the node&apos;s container mounts the operator&apos;s SSH keys,
             a session here also reaches every machine those keys reach.
           </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+          <div style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'center', marginBottom: 'var(--space-10)' }}>
             <label className="sr-only" htmlFor={`shell-key-${nodeId}`}>
               Shell key
             </label>
@@ -234,7 +234,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
               }}
               style={{ width: 240 }}
             />
-            <button onClick={() => void open()} disabled={!key || phase === 'loading'}>
+            <button type="button" onClick={() => void open()} disabled={!key || phase === 'loading'}>
               {phase === 'loading' ? 'Loading…' : 'Open a shell'}
             </button>
             <span className="unit">
@@ -261,9 +261,9 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
             </span>
             <span className="chips">
               {phase === 'open' ? (
-                <button onClick={detach}>Detach</button>
+                <button type="button" onClick={detach}>Detach</button>
               ) : (
-                <button onClick={close}>Close</button>
+                <button type="button" onClick={close}>Close</button>
               )}
             </span>
           </h4>
@@ -272,7 +272,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
       ) : null}
 
       {error ? (
-        <div style={{ marginTop: 6 }}>
+        <div style={{ marginTop: 'var(--space-6)' }}>
           <Verbatim text={error} size="unit" />
         </div>
       ) : null}
@@ -282,7 +282,8 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
 
 /** xterm needs literal colours, and this page is themed with custom properties
  *  that change under `prefers-color-scheme` and the theme switch. Read from the
- *  live computed style so the terminal matches whichever is in force. */
+ *  live computed style so the terminal matches whichever is in force; the
+ *  fallbacks are the light theme's values. */
 function readTheme() {
   const style = getComputedStyle(document.documentElement)
   const token = (name: string, fallback: string) =>

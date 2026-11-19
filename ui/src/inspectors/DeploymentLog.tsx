@@ -100,9 +100,9 @@ export function DeploymentLog({
           {logs ? <span className="unit"> · {lines.length} lines</span> : null}
         </span>
         {!open ? (
-          <button onClick={() => setOpen(true)}>Read it</button>
+          <button type="button" onClick={() => setOpen(true)}>Read it</button>
         ) : logs?.source === 'read' ? (
-          <button onClick={() => setNonce((n) => n + 1)} disabled={pending}>
+          <button type="button" onClick={() => setNonce((n) => n + 1)} disabled={pending}>
             {pending ? 'Reading…' : 'Refresh'}
           </button>
         ) : null}
