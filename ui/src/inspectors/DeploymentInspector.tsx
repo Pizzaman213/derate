@@ -327,7 +327,6 @@ export function DeploymentInspector({ dep, cfg, nodes, frame, stale, settings, o
           . Stop it to get that back.
         </p>
       ) : null}
-      <div className="unit" style={{ margin: '5px 0 0' }}>
       <div className="unit" style={{ margin: 'var(--space-5) 0 0' }}>
         {planShortFromDegrees(dep.plan)} · {dep.runtime}
         {audio ? (
