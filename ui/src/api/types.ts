@@ -1796,7 +1796,7 @@ export interface ChatTurnMeta {
    *  model thought before its first answer token. `null` when this turn
    *  carried no reasoning content at all -- not the same as `0`, which would
    *  claim a model thought for no time rather than not thinking out loud. */
-  reasoningMs: number | null
+  reasoningMs?: number | null
   /** True when `reasoningTokens` counts frames rather than reading usage. */
   reasoningEstimated?: boolean
   /** `null` when no reasoning came back at all. */

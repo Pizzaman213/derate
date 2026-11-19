@@ -926,21 +926,6 @@ export const httpBackend: Backend = {
     let usageCompletion: number | null = null
     let usageReasoning: number | null = null
 
-    // No recipe here passes vLLM `--reasoning-parser`, so a local thinking
-    // model's reasoning arrives as literal `<think>...</think>` inside
-    // `content`, not as its own field. `rawContent` accumulates every content
-    // delta seen so far and is re-split on every frame -- simpler and more
-    // obviously correct than a stateful scan for a tag that can straddle a
-    // chunk boundary, at the cost of a re-scan per frame that a chat-length
-    // transcript never makes expensive. Once a frame carries an explicit
-    // `reasoning_content`/`reasoning` field this is abandoned for the rest of
-    // the stream: trust the field the upstream chose to send, don't also go
-    // looking for tags it has no reason to emit.
-    let rawContent = ''
-    let splitContent = ''
-    let splitReasoning = ''
-    let explicitReasoning = false
-
     const meta = (stopped: boolean): ChatTurnMeta => ({
       model,
       requestId,
