@@ -7,6 +7,7 @@ project's own documented curl workflows) keeps working unchanged.
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
@@ -71,24 +72,54 @@ def _client(settings: GatewaySettings | None = None) -> TestClient:
     return TestClient(app)
 
 
+# The session gate (gateway/authz.py) runs first and the bearer token is a
+# second, optional gate behind it, so these tests sign in themselves -- as
+# raw_http, sending the token on the sign-in too, which is /api like any other
+# route as far as the token is concerned.
+ADMIN = {
+    "username": "token-admin",
+    "email": "token-admin@derate.test",
+    "password": "token-harbor-lamp-123456",
+}
+
+
+def _session(client: TestClient, token: str | None) -> dict[str, str]:
+    headers = {"host": "localhost"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    reply = client.post("/api/setup/admin", json=ADMIN, headers=headers)
+    assert reply.status_code == 200, reply.text
+    cookie = next(
+        part.split(";", 1)[0]
+        for part in reply.headers.get_list("set-cookie")
+        if part.startswith("derate_session")
+    )
+    return {"Cookie": cookie}
+
+
+@pytest.mark.raw_http
 def test_unset_token_reaches_the_route():
     with _client() as client:
-        reply = client.get("/api/providers")
+        reply = client.get("/api/providers", headers=_session(client, None))
     assert reply.status_code == 200
 
 
+@pytest.mark.raw_http
 def test_missing_token_is_refused_before_the_route_runs():
     settings = GatewaySettings(api_token="secret")
     with _client(settings) as client:
-        reply = client.get("/api/providers")
+        session = _session(client, "secret")
+        reply = client.get("/api/providers", headers=session)
     assert reply.status_code == 401
     assert reply.json()["error"]["code"] == "invalid_api_token"
 
 
+@pytest.mark.raw_http
 def test_matching_bearer_token_reaches_the_route():
     settings = GatewaySettings(api_token="secret")
     with _client(settings) as client:
+        session = _session(client, "secret")
         reply = client.get(
-            "/api/providers", headers={"Authorization": "Bearer secret"}
+            "/api/providers", headers={**session, "Authorization": "Bearer secret"}
         )
     assert reply.status_code == 200
