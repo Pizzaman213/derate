@@ -2,7 +2,7 @@
 description: Chart pack rules — read before building or changing any chart
 alwaysApply: true
 ---
-Charts live in `.omp/charts/` (one API: `.omp/charts/index.ts`; registry: `.omp/charts/registry.json`).
-Before building or changing any chart, follow `.omp/charts/RULES.md` (check the registry and
-`recommend()` first, build new types inside the pack, append-only premade inputs, icons, run
-`cd .omp/charts && npm run charts:check` yourself and only report done when it is green).
+Charts live in `.omp/charts/`: one file per chart in `types/<id>/index.ts`, API in
+`.omp/charts/index.ts`. Before building or changing any chart, follow
+`.omp/charts/RULES.md` (check `types/` first, one file per chart, typecheck and test
+yourself and only report done when they are green).

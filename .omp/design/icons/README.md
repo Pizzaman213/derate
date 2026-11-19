@@ -57,7 +57,6 @@ type error, on purpose: the choice is the accessibility decision.
 3. Add the `icons.json` entry: `name`, `category`, `tags`, `usage`, `added`
    (today, `YYYY-MM-DD`), `replaces` (the glyphs or entities it retires).
 4. `cd .omp && npm run icons:build && npm run icons:lint`.
-5. Append a CHANGELOG line. See `.omp/RULES.md`.
 
 Data drawings — charts, the cluster graph, the QR code, the loading band, the
 lamp, the bars — are not icons. They stay as inline `<svg>` with the marker

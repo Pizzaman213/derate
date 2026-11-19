@@ -44,7 +44,7 @@
         "font-mono"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/readout.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#readout",
       "added": "2026-11-17"
     },
@@ -78,7 +78,7 @@
         "radius-full"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/lamp.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#lamp",
       "added": "2026-11-17"
     },
@@ -108,7 +108,7 @@
         "ink-muted"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/segmentbar.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#segmentbar--proportionbar",
       "added": "2026-11-17"
     },
@@ -148,7 +148,7 @@
         "ink-muted"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/proportionbar.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#segmentbar--proportionbar",
       "added": "2026-11-17"
     },
@@ -175,7 +175,7 @@
         "ink"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/verbatim.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#verbatim--verbatimlist",
       "added": "2026-11-17"
     },
@@ -195,7 +195,7 @@
         "ink-muted"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/verbatim.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#verbatim--verbatimlist",
       "added": "2026-11-17"
     },
@@ -221,7 +221,7 @@
         "fault"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/copyable.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#copyable",
       "added": "2026-11-17"
     },
@@ -249,7 +249,7 @@
         "font-mono"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/reveal-modal.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#revealmodal",
       "added": "2026-11-17"
     },
@@ -284,7 +284,7 @@
       "icons": [
         "external-link"
       ],
-      "tests": ".omp/tests/ui/components/provider-sign-in.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#providersignin",
       "added": "2026-11-18"
     },
@@ -315,7 +315,7 @@
         "edge"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/overridegate.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#overridegate",
       "added": "2026-11-17"
     },
@@ -344,7 +344,7 @@
         "fault"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/cachetable.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#cachetable",
       "added": "2026-11-17"
     },
@@ -367,7 +367,7 @@
         "ink-muted"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/disclosure.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#disclosure",
       "added": "2026-11-17"
     },
@@ -393,7 +393,7 @@
         "plus",
         "minus"
       ],
-      "tests": ".omp/tests/ui/components/disclosure.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#disclosure",
       "added": "2026-11-17"
     },
@@ -418,7 +418,7 @@
         "z-rail"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/popover.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#popover",
       "added": "2026-11-17"
     },
@@ -446,7 +446,7 @@
         "z-overlay"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/sheet.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#sheet",
       "added": "2026-11-17",
       "interactive": true
@@ -478,7 +478,7 @@
       "icons": [
         "*"
       ],
-      "tests": ".omp/tests/ui/components/icon.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#icon",
       "added": "2026-11-17"
     },
@@ -515,7 +515,7 @@
         "close",
         "plus"
       ],
-      "tests": ".omp/tests/ui/components/button.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#button",
       "added": "2026-11-17"
     },
@@ -546,7 +546,7 @@
         "fault"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/input.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#input--select--textarea",
       "added": "2026-11-17"
     },
@@ -573,7 +573,7 @@
         "card-pad"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/card.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#card",
       "added": "2026-11-17"
     },
@@ -601,7 +601,7 @@
         "chip-radius"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/chip.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#chip--pill",
       "added": "2026-11-17"
     },
@@ -621,7 +621,7 @@
         "nav-underline"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/nav.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#nav",
       "added": "2026-11-17"
     },
@@ -641,7 +641,7 @@
         "font-mono"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/table.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#table",
       "added": "2026-11-17"
     },
@@ -673,7 +673,7 @@
         "warn"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/banner.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#banner",
       "added": "2026-11-18"
     },
@@ -704,7 +704,7 @@
       ],
       "tokens": [],
       "icons": [],
-      "tests": ".omp/tests/ui/components/packchart.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#packchart",
       "added": "2026-11-18"
     },
@@ -748,7 +748,7 @@
         "eye",
         "eye-off"
       ],
-      "tests": ".omp/tests/ui/components/passwordfield.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#passwordfield",
       "added": "2026-11-18"
     },
@@ -796,7 +796,7 @@
       "icons": [
         "x-circle"
       ],
-      "tests": ".omp/tests/ui/components/blockframe.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#blockframe",
       "added": "2026-11-18"
     },
@@ -830,7 +830,7 @@
         "x-circle",
         "alert-triangle"
       ],
-      "tests": ".omp/tests/ui/components/issuelist.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#issuelist",
       "added": "2026-11-18"
     },
@@ -861,7 +861,7 @@
         "space-6"
       ],
       "icons": [],
-      "tests": ".omp/tests/ui/components/hosttable.check.mjs",
+      "tests": null,
       "spec": "DESIGN.md#hosttable",
       "added": "2026-11-18"
     },

@@ -39,7 +39,7 @@ describe('util', () => {
   })
 
   it('index re-exports every adapter', () => {
-    for (const fn of ['parseCSV', 'toRows', 'mapFields', 'pivot', 'unpivot', 'aggregate', 'groupAggregate', 'normalize', 'topN', 'binValues', 'stackRows', 'stratifyRows', 'pathsToTree', 'treeFromNested', 'sumTree', 'flattenTree', 'toGraph', 'graphFromMatrix', 'matrixFromGraph', 'hasCycle', 'inferFieldTypes', 'columnsToRows', 'rowsToColumns', 'looksLikeCSV', 'toCSV'])
+    for (const fn of ['parseCSV', 'toRows', 'mapFields', 'pivot', 'unpivot', 'aggregate', 'groupAggregate', 'normalize', 'topN', 'stackRows', 'inferFieldTypes', 'columnsToRows', 'rowsToColumns', 'looksLikeCSV', 'toCSV'])
       expect(typeof (adapters as Record<string, unknown>)[fn]).toBe('function')
     expect(adapters.AdapterError).toBe(AdapterError)
   })

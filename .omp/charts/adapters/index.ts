@@ -3,7 +3,4 @@ export { coerceCell, detectDelimiter, looksLikeCSV, parseCSV, toCSV } from './cs
 export { columnsToRows, inferFieldTypes, isDateString, mapFields, rowsToColumns, toRows, type FieldType } from './rows'
 export { distinct, pivot, unpivot } from './reshape'
 export { aggregate, groupAggregate, groupRows, normalize, topN, type Agg } from './aggregate'
-export { binValues, type Bin, type BinOptions } from './bin'
 export { stackRows, type StackOptions, type StackPoint, type Stacked } from './stack'
-export { flattenTree, pathsToTree, stratifyRows, sumTree, treeFromNested, type FlatNode, type TreeNode } from './hierarchy'
-export { graphFromMatrix, hasCycle, matrixFromGraph, toGraph, type Graph } from './graph'
