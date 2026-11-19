@@ -1,1 +1,0 @@
-{"description":"Missing values: null, empty string and an absent key.","data":[{"x":1,"y":52},{"x":null,"y":58},{"x":"","y":55},{"x":4,"y":64},{"x":null,"y":68},{"x":6,"y":66},{"x":7,"y":75},{"x":"","y":79},{"x":9,"y":83},{"y":88}],"options":{"xTitle":"Hours studied","yTitle":"Score"}}

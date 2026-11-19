@@ -1,1 +1,0 @@
-{"description":"Two gauges share a label: kept as distinct dials.","data":[{"label":"Latency","value":30,"unit":"ms","max":200},{"label":"Latency","value":150,"unit":"ms","max":200}]}

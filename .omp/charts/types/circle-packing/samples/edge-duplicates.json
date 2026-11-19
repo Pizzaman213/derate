@@ -1,1 +1,0 @@
-{"description":"Repeated sibling names: kept as separate circles, with a note.","data":{"name":"Menu","children":[{"name":"Drinks","children":[{"name":"Tea","value":17},{"name":"Tea","value":39},{"name":"Coffee","value":36}]},{"name":"Drinks","children":[{"name":"Juice","value":10}]},{"name":"Food","children":[{"name":"Soup","value":25},{"name":"Soup","value":40}]}]}}

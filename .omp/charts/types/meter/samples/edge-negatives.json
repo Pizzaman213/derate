@@ -1,1 +1,0 @@
-{"description":"A range below zero.","data":[{"label":"Freezer","value":-18,"min":-30,"max":0,"low":-22,"high":-15,"optimum":-20,"unit":"°C"},{"label":"Overdraft","value":-40,"min":-100,"max":100,"low":0,"optimum":50}]}

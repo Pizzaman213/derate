@@ -1,1 +1,0 @@
-{"description":"Label/value rows with two negative values, which have no area: omitted and noted.","data":[{"label":"Rent","value":1200},{"label":"Food","value":450},{"label":"Refund","value":-80},{"label":"Transport","value":160},{"label":"Cashback","value":-25},{"label":"Utilities","value":210}]}

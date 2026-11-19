@@ -13,6 +13,6 @@
     "isolatedModules": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "core", "adapters", "time", "chooser", "types", "tests", "datasets/*.ts", "geo/*.ts", "theme/*.ts", "vitest.config.ts"],
+  "include": ["index.ts", "core", "adapters", "time", "chooser", "types", "tests", "datasets/*.ts", "theme/*.ts", "vitest.config.ts"],
   "exclude": ["node_modules", "dist"]
 }

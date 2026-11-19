@@ -1,1 +1,0 @@
-{"description":"The same path appears twice: the values are summed and noted.","data":[{"path":"Fruit/Apples","value":30},{"path":"Fruit/Pears","value":12},{"path":"Fruit/Apples","value":10},{"path":"Veg/Carrots","value":22},{"path":"Veg/Leeks","value":9},{"path":"Veg/Carrots","value":5}]}

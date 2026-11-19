@@ -1,1 +1,0 @@
-{"description":"A whole without its own value is the sum of its parts; a part without a value is left out and noted.","data":{"name":"Survey","value":2000,"children":[{"name":"Answered","children":[{"name":"Satisfied","value":900},{"name":"Unsatisfied","value":300}]},{"name":"Skipped","value":null}]}}

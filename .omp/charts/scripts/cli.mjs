@@ -618,7 +618,7 @@ async function cmdNew({ pos, flags }) {
     lines.push('', `$ ${check.cmd}`, check.summary)
     lines.push('', check.mine.length ? `${check.mine.length} failure(s) in ${id}: fix them before reshaping` : check.ok ? `${id}: all green` : `${id}: no failure names ${id}; ${check.others.length} failure(s) elsewhere in the pack are other work in progress`)
   }
-  lines.push('', `next: reshape types/${id}/index.ts into the real chart (core/CHART_SPEC.md, types/bar as reference), then node tests/browser/shot.mjs ${id} --widths 320,768,1280 --themes light,dark,high-contrast --hover`)
+  lines.push('', `next: reshape types/${id}/index.ts into the real chart (core/CHART_SPEC.md, types/grouped-bar as reference), then node tests/browser/shot.mjs ${id} --widths 320,768,1280 --themes light,dark,high-contrast --hover`)
   emit(flags, lines, { created: true, id, name, category, intents, files: files.map(show), steps: steps.map(({ step: s, ok }) => ({ step: s, ok })), iconFindings: lintMine, check: check && { ok: check.ok, command: check.cmd, steps: check.steps, failuresForId: check.mine, failuresElsewhere: check.others }, ok: !!green })
   if (!green) process.exitCode = 1
 }

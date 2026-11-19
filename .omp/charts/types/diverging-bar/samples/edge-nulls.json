@@ -1,1 +1,0 @@
-{"description":"Missing values: null, empty string and an absent key.","data":[{"label":"Alpha","value":12},{"label":"Bravo","value":null},{"label":"Charlie","value":""},{"label":"Delta","value":-15},{"label":"Echo"}]}

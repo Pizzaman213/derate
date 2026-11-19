@@ -1,1 +1,0 @@
-{"description":"Arabic, Hebrew, CJK and emoji facet titles.","data":[{"region":"الشمال","label":"Q1","value":100},{"region":"الشمال","label":"Q2","value":180},{"region":"דרום","label":"Q1","value":100},{"region":"דרום","label":"Q2","value":180},{"region":"东部 🌏","label":"Q1","value":100},{"region":"东部 🌏","label":"Q2","value":180}],"options":{"chart":"bar","facet":"region"}}

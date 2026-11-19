@@ -1,1 +1,0 @@
-{"description":"Two people with the same name under one manager: separate boxes, noted.","data":[{"id":"1","parent":null,"name":"Alex Kim","title":"Director"},{"id":"2","parent":"1","name":"Sam Lee","title":"Engineer"},{"id":"3","parent":"1","name":"Sam Lee","title":"Designer"},{"id":"4","parent":"1","name":"Jo Ray","title":"PM"}]}

@@ -1,1 +1,0 @@
-{"description":"Global wealth pyramid: adults by net worth band (millions), base first, from CSV.","data":"band,adults_m\nUnder $10k,2818\n$10k-$100k,1791\n$100k-$1M,627\nOver $1M,59\n","options":{"fields":{"label":"band","value":"adults_m"},"order":"base-first"}}

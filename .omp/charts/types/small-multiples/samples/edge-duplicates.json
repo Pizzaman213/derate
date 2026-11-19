@@ -1,1 +1,0 @@
-{"description":"Duplicate labels inside a facet: the child bar chart sums them and its note is prefixed with the facet.","data":[{"region":"North","label":"Q1","value":60},{"region":"North","label":"Q1","value":60},{"region":"South","label":"Q1","value":80}],"options":{"chart":"bar","facet":"region"}}

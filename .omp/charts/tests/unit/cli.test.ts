@@ -112,7 +112,7 @@ describe('cli: commands', () => {
   it('lookup of an intent lists the charts that serve it', () => {
     const j = json('lookup', 'trend')
     expect(j.intent).toBe('trend')
-    expect(j.chartsForIntent).toContain('line')
+    expect(j.chartsForIntent).toContain('multi-line')
   })
   it('recommend ranks a dataset', () => {
     const j = json('recommend', 'trend', 'dataset:sales-by-month')
@@ -120,14 +120,14 @@ describe('cli: commands', () => {
     expect(j.recommendations[0].score).toBeGreaterThanOrEqual(60)
   })
   it('validate prints the chart’s own errors and exits 1', () => {
-    const bad = run('validate', 'bar', '[{"label":"A","value":1},{"label":"B","value":"abc"}]')
+    const bad = run('validate', 'pie', '[{"label":"A","value":1},{"label":"B","value":"abc"}]')
     expect(bad.code).toBe(1)
-    expect(bad.out).toBe("bar: inline JSON is not valid (1 problem):\n  - field 'value' must be a number, got 'abc' at row 2\n")
-    expect(run('validate', 'bar', 'sample:bar/basic').code).toBe(0)
+    expect(bad.out).toBe("pie: inline JSON is not valid (1 problem):\n  - field 'value' must be a number, got 'abc' at row 2\n")
+    expect(run('validate', 'pie', 'sample:pie/basic').code).toBe(0)
   })
   it('datasets lists and shows', () => {
     expect(json('datasets').datasets.map((d: { name: string }) => d.name)).toContain('sales-by-month')
-    expect(json('datasets', 'org-tree').fields.parent).toMatchObject({ type: 'id' })
+    expect(json('datasets', 'sales-by-month').fields.month).toMatchObject({ type: 'date' })
   })
   it('new refuses a duplicate and an invalid id, creating nothing', () => {
     for (const id of ['donut', 'doughnut', 'donut-chart', 'pie-chart']) {
@@ -174,12 +174,12 @@ describe('cli: commands', () => {
   })
   it('sample-add refuses input the chart cannot read and an existing name', () => {
     writeFileSync(join(tmp, 'edge-cli.csv'), 'label,value\nA,1\nB,abc\n')
-    const bad = run('sample-add', 'bar', join(tmp, 'edge-cli.csv'))
+    const bad = run('sample-add', 'pie', join(tmp, 'edge-cli.csv'))
     expect(bad.code).toBe(1)
-    expect(bad.err).toMatch(/not valid bar input, so no sample was written/)
-    expect(existsSync(join(CHARTS, 'types', 'bar', 'samples', 'edge-cli.json'))).toBe(false)
+    expect(bad.err).toMatch(/not valid pie input, so no sample was written/)
+    expect(existsSync(join(CHARTS, 'types', 'pie', 'samples', 'edge-cli.json'))).toBe(false)
     writeFileSync(join(tmp, 'basic.json'), '[{"label":"A","value":1}]')
-    expect(run('sample-add', 'bar', join(tmp, 'basic.json')).err).toMatch(/already exists; samples are only added to/)
+    expect(run('sample-add', 'pie', join(tmp, 'basic.json')).err).toMatch(/already exists; samples are only added to/)
   })
   it('an unknown command and a missing argument fail with the reason', () => {
     expect(run('frobnicate').code).toBe(1)

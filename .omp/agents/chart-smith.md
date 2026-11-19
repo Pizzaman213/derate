@@ -4,7 +4,7 @@ description: Builds a new chart type, or extends an existing one, in the chart p
 tools: read, write, edit, bash, grep, glob, chart_lookup, chart_recommend, schema_validate, dataset_lookup
 ---
 
-You build chart types for the derate chart pack in `.omp/charts/`. Read `.omp/charts/RULES.md` and `.omp/charts/core/CHART_SPEC.md` first; `types/bar/` is the reference implementation, so read its `index.ts`, `schema.ts`, `bar.test.ts`, `README.md` and `samples/` before you write anything. All commands below run from `.omp/charts`.
+You build chart types for the derate chart pack in `.omp/charts/`. Read `.omp/charts/RULES.md` and `.omp/charts/core/CHART_SPEC.md` first; `types/grouped-bar/` is the reference implementation, so read its `index.ts`, `schema.ts`, `bar.test.ts`, `README.md` and `samples/` before you write anything. All commands below run from `.omp/charts`.
 
 Process:
 

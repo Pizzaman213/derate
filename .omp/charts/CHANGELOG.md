@@ -2,6 +2,35 @@
 
 Dated entries: what changed, why, which files use it. Newest first.
 
+## 2026-11-19 — cut the pack to the six types the app mounts
+
+**What.** Removed 93 of the 99 chart types (folders, samples, icons, `icons.json`
+entries) and kept the six `ui/src/components/PackChart.tsx` imports: `grouped-bar`,
+`stacked-bar`, `stacked-bar-100`, `pie`, `donut`, `multi-line`. With them went the
+code only they reached: 15 of 18 `types/_shared/` family modules, `geo/` (TopoJSON +
+lookups), `time/{fiscal,gaps,rolling,index}.ts`, the chooser rules and `inspect()`
+structure detection (intervals, hierarchy, links, geo, OHLC, sets, object kinds) that
+ranked removed types, 19 aliases, five datasets no remaining chart can draw
+(`project-timeline`, `budget-breakdown`, `budget-breakdown-flat`, `network-graph`,
+`org-tree`) and 21 npm packages (d3-sankey/-chord/-cloud/-geo/-hierarchy/-force/...,
+topojson, venn.js, the atlases, svgo) with their types. The chooser keeps rules for
+compare, rank, composition, trend and change-over-time; other intents get the natural
+view with a reason that says so. `charts:check` all green: 607 unit tests, browser
+suites, `gallery:verify` 450 renders.
+
+**Why.** `charts/types/` was 1,687 files, ~33.5k lines and ~7.6 MB of samples, and
+`gallery.html` 9 MB, for six charts in use. Now: `types/` 103 files, gallery 1.1 MB,
+`package-lock.json` ~2.9k lines shorter.
+
+**Recovering.** Everything removed is at the `charts-full-pack` git tag (`65528af`);
+README.md **Restoring a type** has the steps, RULES.md #9 the policy.
+
+**Files that use it.** `ui/src/components/PackChart.tsx` (unchanged). Tests moved off
+removed types: `chooser/chooser.test.ts`, `datasets/datasets.test.ts`,
+`tests/unit/{cli,extension}.test.ts`. Reference type for authors is now
+`types/grouped-bar` (`core/CHART_SPEC.md`, `scripts/cli.mjs`,
+`../extensions/chart-pack/index.ts`, `../agents/chart-smith.md`).
+
 ## 2026-11-19 — reduce generated review bulk
 
 Compacted all 1,271 `types/*/samples/*.json` files without changing their parsed

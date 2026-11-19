@@ -107,43 +107,43 @@ describe('chart-pack extension: tools', () => {
     expect(a.content[0]!.text).toMatch(/^trend — 96 rows/)
     expect(a.content[0]!.text).toMatch(/\n1\. multi-line \d+/)
     const b = await tools.get('chart_recommend')!.execute('1', { intent: 'compare', data: [{ label: 'a', value: 1 }, { label: 'b', value: 2 }] }, undefined, undefined, ctx)
-    expect(b.content[0]!.text).toMatch(/\n1\. bar \d+/)
+    expect(b.content[0]!.text).toMatch(/\n1\. grouped-bar \d+/)
     const c = await tools.get('chart_recommend')!.execute('1', { intent: 'compare' }, undefined, undefined, ctx)
     expect(c.isError).toBe(true)
   })
   it('dataset_lookup lists and shows datasets', async () => {
     const all = await tools.get('dataset_lookup')!.execute('1', {}, undefined, undefined, ctx)
     expect(all.content[0]!.text).toMatch(/^sales-by-month \(rows, 96\)/)
-    const one = await tools.get('dataset_lookup')!.execute('1', { name: 'org-tree' }, undefined, undefined, ctx)
-    expect(one.content[0]!.text).toMatch(/\n {2}parent: id — /)
+    const one = await tools.get('dataset_lookup')!.execute('1', { name: 'sales-by-month' }, undefined, undefined, ctx)
+    expect(one.content[0]!.text).toMatch(/\n {2}month: date — /)
     const none = await tools.get('dataset_lookup')!.execute('1', { name: 'nope' }, undefined, undefined, ctx)
     expect(none.isError).toBe(true)
   })
   it('schema_validate returns the chart’s own messages', async () => {
-    const bad = await tools.get('schema_validate')!.execute('1', { type: 'bar', data: [{ label: 'A', value: 1 }, { label: 'B', value: 'abc' }] }, undefined, undefined, ctx)
-    expect(bad.content[0]!.text).toBe("bar: not valid\n- field 'value' must be a number, got 'abc' at row 2")
+    const bad = await tools.get('schema_validate')!.execute('1', { type: 'pie', data: [{ label: 'A', value: 1 }, { label: 'B', value: 'abc' }] }, undefined, undefined, ctx)
+    expect(bad.content[0]!.text).toBe("pie: not valid\n- field 'value' must be a number, got 'abc' at row 2")
     expect((bad.details as { ok: boolean }).ok).toBe(false)
-    const mapped = await tools.get('schema_validate')!.execute('1', { type: 'bar', data: [{ plan: 'A', mrr: 3 }], options: { fields: { label: 'plan', value: 'mrr' } } }, undefined, undefined, ctx)
-    expect(mapped.content[0]!.text).toBe('ok: valid bar input')
+    const mapped = await tools.get('schema_validate')!.execute('1', { type: 'pie', data: [{ plan: 'A', mrr: 3 }], options: { fields: { label: 'plan', value: 'mrr' } } }, undefined, undefined, ctx)
+    expect(mapped.content[0]!.text).toBe('ok: valid pie input')
   })
 })
 
 describe('chart-pack extension: commands', () => {
   it('/chart renders a type and attaches the PNG', async () => {
-    const out = join(tmp, 'render-bar')
-    await commands.get('chart')!.handler(`bar --out ${out}`, ctx)
+    const out = join(tmp, 'render-pie')
+    await commands.get('chart')!.handler(`pie --out ${out}`, ctx)
     const m = messages[messages.length - 1]!
-    expect(textOf(m)).toMatch(/summary {3}Bar chart, 5 bars, highest Bravo at 340, lowest Delta at 90/)
+    expect(textOf(m)).toMatch(/summary {3}Pie chart, 5 slices totalling 1,035, largest Bravo at 33%, smallest Delta at 8\.7%/)
     expect(Array.isArray(m.content) && m.content.some((c) => c.type === 'image' && c.mimeType === 'image/png' && (c.data?.length ?? 0) > 1000)).toBe(true)
     for (const f of ['chart.html', 'chart.png', 'chart.svg', 'data.csv']) expect(existsSync(join(out, f))).toBe(true)
-    expect(readFileSync(join(out, 'data.csv'), 'utf8')).toBe('Label,Value\nAlpha,120\nBravo,340\nCharlie,210\nDelta,90\nEcho,275')
+    expect(readFileSync(join(out, 'data.csv'), 'utf8')).toMatch(/^Label,Value,Share\nAlpha,120,[\d.]+\nBravo,340,[\d.]+\nCharlie,210,[\d.]+\nDelta,90,[\d.]+\nEcho,275,[\d.]+$/)
   })
   it('/chart-for posts the pick, reason and alternatives, then renders', async () => {
     const before = messages.length
-    await commands.get('chart-for')!.handler(`compare dataset:sales-by-month --out ${join(tmp, 'render-for')}`, ctx)
+    await commands.get('chart-for')!.handler(`compare dataset:survey-results --out ${join(tmp, 'render-for')}`, ctx)
     const posted = messages.slice(before).map(textOf)
-    expect(posted[0]).toMatch(/^\*\*bar\*\* \(\d+\) for 'compare' — .+\ndata: 96 rows.*\nalternatives: horizontal-bar/)
-    expect(posted[1]).toMatch(/type {6}bar {2}\(chosen for intent 'compare'\)/)
+    expect(posted[0]).toMatch(/^\*\*grouped-bar\*\* \(\d+\) for 'compare' — .+\ndata: 60 rows.*\nalternatives: stacked-bar/)
+    expect(posted[1]).toMatch(/type {6}grouped-bar {2}\(chosen for intent 'compare'\)/)
   })
   it('/chart-new reuses an existing chart and creates nothing', async () => {
     await commands.get('chart-new')!.handler('doughnut', ctx)
@@ -167,10 +167,10 @@ describe('chart-pack extension: commands', () => {
   })
   it('/chart-sample add refuses data the chart cannot read', async () => {
     notified.length = 0
-    await commands.get('chart-sample')!.handler(`add bar ${join(tmp, 'bad.csv')} --name edge-ext-probe`, ctx)
-    expect(lastText()).toMatch(/not valid bar input, so no sample was written/)
+    await commands.get('chart-sample')!.handler(`add pie ${join(tmp, 'bad.csv')} --name edge-ext-probe`, ctx)
+    expect(lastText()).toMatch(/not valid pie input, so no sample was written/)
     expect(notified[0]?.[1]).toBe('error')
-    expect(existsSync(join(CHARTS, 'types', 'bar', 'samples', 'edge-ext-probe.json'))).toBe(false)
+    expect(existsSync(join(CHARTS, 'types', 'pie', 'samples', 'edge-ext-probe.json'))).toBe(false)
   })
 })
 
@@ -188,13 +188,13 @@ describe('chart-pack extension: hooks', () => {
   })
   it('records chart edits from edit/write and writing bash commands, ignores reads', async () => {
     timers.length = 0
-    const r = (await hook('tool_result', { toolName: 'write', isError: false, input: { path: '.omp/charts/types/bar/README.md' }, content: [] })) as { additionalContext: string }
-    expect(r.additionalContext).toMatch(/^chart-pack: bar changed — the scoped check/)
+    const r = (await hook('tool_result', { toolName: 'write', isError: false, input: { path: '.omp/charts/types/grouped-bar/README.md' }, content: [] })) as { additionalContext: string }
+    expect(r.additionalContext).toMatch(/^chart-pack: grouped-bar changed — the scoped check/)
     expect(timers).toHaveLength(1)
     const b = (await hook('tool_result', { toolName: 'bash', isError: false, input: { command: 'cd .omp/charts && node scripts/cli.mjs sample-add pie x.json' }, content: [] })) as { additionalContext: string }
     expect(b.additionalContext).toMatch(/chart-pack: pie changed/)
-    expect(await hook('tool_result', { toolName: 'bash', isError: false, input: { command: 'cat .omp/charts/types/bar/index.ts' }, content: [] })).toBeUndefined()
-    expect(await hook('tool_result', { toolName: 'read', isError: false, input: { path: '.omp/charts/types/bar/index.ts' }, content: [] })).toBeUndefined()
+    expect(await hook('tool_result', { toolName: 'bash', isError: false, input: { command: 'cat .omp/charts/types/grouped-bar/index.ts' }, content: [] })).toBeUndefined()
+    expect(await hook('tool_result', { toolName: 'read', isError: false, input: { path: '.omp/charts/types/grouped-bar/index.ts' }, content: [] })).toBeUndefined()
     expect(await hook('tool_result', { toolName: 'write', isError: false, input: { path: 'ui/src/App.tsx' }, content: [] })).toBeUndefined()
   })
   it('the stop gate does not loop', async () => {
@@ -215,8 +215,8 @@ describe.runIf(process.env.CHART_PACK_E2E === '1')('chart-pack extension: slow e
     // the debounced step is fire-and-forget inside the extension (it exposes no promise), so wait for its message
     while (!messages.some((m) => textOf(m).includes('appended a line to .omp/charts/CHANGELOG.md')) && Date.now() - t0 < 240_000) await new Promise((r) => setTimeout(r, 500))
     const report = textOf(messages.find((m) => textOf(m).includes('appended a line')))
-    expect(report).toMatch(/\$ node scripts\/check\.mjs --type bar,pie --skip-browser → (green|FAILED)\n══ charts:check \(bar, pie\)/)
-    expect(readFileSync(changelog, 'utf8')).toMatch(/\n- \d{4}-\d{2}-\d{2}: bar, pie changed \(files: \.omp\/charts\/types\/bar\/README\.md, bash: .*\) — why: <fill in>\n$/)
+    expect(report).toMatch(/\$ node scripts\/check\.mjs --type grouped-bar,pie --skip-browser → (green|FAILED)\n══ charts:check \(grouped-bar, pie\)/)
+    expect(readFileSync(changelog, 'utf8')).toMatch(/\n- \d{4}-\d{2}-\d{2}: grouped-bar, pie changed \(files: \.omp\/charts\/types\/grouped-bar\/README\.md, bash: .*\) — why: <fill in>\n$/)
     const next = (await hook('tool_result', { toolName: 'read', isError: false, input: { path: 'x' }, content: [] })) as { additionalContext: string }
     expect(next.additionalContext).toMatch(/^chart-pack after edits:\n\$ node scripts\/check\.mjs/)
   }, 300_000)
@@ -225,8 +225,8 @@ describe.runIf(process.env.CHART_PACK_E2E === '1')('chart-pack extension: slow e
     if (r) expect(r.additionalContext).toMatch(/did not finish inside the 30 s stop-hook budget|The chart pack is red after this session's edits/)
   }, 60_000)
   it('/chart-check reports steps and scoped failures', async () => {
-    await commands.get('chart-check')!.handler('bar', ctx)
-    expect(lastText()).toMatch(/\$ node scripts\/check\.mjs --type bar\n(pass|FAIL|warn) +theme/)
+    await commands.get('chart-check')!.handler('pie', ctx)
+    expect(lastText()).toMatch(/\$ node scripts\/check\.mjs --type pie\n(pass|FAIL|warn) +theme/)
     expect(lastText()).toMatch(/all green|charts:check FAILED/)
   }, 600_000)
   it('/chart-gallery rebuilds and says when it cannot open a browser', async () => {

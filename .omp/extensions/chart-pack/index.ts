@@ -62,7 +62,7 @@ export default function chartPack(pi: ExtensionAPI) {
     const reg = registry()
     const cats = Object.entries(reg.categories).map(([k, v]) => `${k} ${v.length}`).join(', ')
     return [
-      'derate chart pack (.omp/charts/) — read .omp/charts/RULES.md before building any chart; the authoring contract is .omp/charts/core/CHART_SPEC.md (reference: types/bar).',
+      'derate chart pack (.omp/charts/) — read .omp/charts/RULES.md before building any chart; the authoring contract is .omp/charts/core/CHART_SPEC.md (reference: types/grouped-bar).',
       `Charts: ${reg.count} in .omp/charts/registry.json (${cats || 'registry not built: cd .omp/charts && node scripts/registry.mjs'}). Search it before creating one: reuse beats new.`,
       "API (.omp/charts/index.ts): chart(type, el, data, opts) · chartFor(intent, data, el) · recommend(intent, data) → [{type, score, reason}] · listCharts({category, intent}) · getSample(type, name) · getDataset(name).",
       `Intents: ${INTENTS.join(', ')}.`,

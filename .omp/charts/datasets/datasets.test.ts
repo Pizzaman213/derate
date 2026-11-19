@@ -98,7 +98,8 @@ describe('registry <-> files', () => {
   it('datasetEntry and datasetsFor', () => {
     expect(datasetEntry('ohlc-prices').kind).toBe('rows')
     expect(() => datasetEntry('nope')).toThrow(/unknown dataset "nope"/)
-    expect(datasetsFor('network').map((d) => d.name)).toEqual(['network-graph'])
+    expect(datasetsFor('trend').map((d) => d.name)).toEqual(['sales-by-month', 'server-metrics', 'ohlc-prices'])
+    expect(datasetsFor('network')).toEqual([])
   })
 })
 
@@ -140,56 +141,6 @@ describe('shapes', () => {
     }
   })
 
-  it('budget-breakdown: a 3-level tree with 30 leaves and no cycles, matching the flat rows', () => {
-    const root = file('budget-breakdown').data as TreeNode
-    const nodes = treeNodes(root)
-    const leaves = nodes.filter((n) => !n.children)
-    expect(leaves).toHaveLength(30)
-    const depth = (n: TreeNode): number => (n.children ? 1 + Math.max(...n.children.map(depth)) : 0)
-    expect(depth(root)).toBe(3)
-    const flat = rowsOf('budget-breakdown-flat') as { id: string; parent: string | null; value: number | null }[]
-    expect(flat).toHaveLength(nodes.length)
-    const sum = (rows: { value?: number | null }[]) => rows.reduce((s, r) => s + (r.value ?? 0), 0)
-    expect(sum(flat)).toBe(sum(leaves))
-  })
-
-  it.each(['budget-breakdown-flat', 'org-tree'])('%s: parents exist, one root, no cycles', (name) => {
-    const rows = rowsOf(name) as { id: string; parent: string | null }[]
-    const byId = new Map(rows.map((r) => [r.id, r]))
-    expect(byId.size).toBe(rows.length)
-    expect(rows.filter((r) => r.parent === null)).toHaveLength(1)
-    for (const r of rows) {
-      const seen = new Set<string>()
-      let cur: { id: string; parent: string | null } | undefined = r
-      while (cur && cur.parent !== null) {
-        expect(byId.has(cur.parent), `${cur.id} -> ${cur.parent}`).toBe(true)
-        expect(seen.has(cur.id), `cycle at ${cur.id}`).toBe(false)
-        seen.add(cur.id)
-        cur = byId.get(cur.parent)
-      }
-    }
-  })
-
-  it('org-tree is four levels under one CEO', () => {
-    const rows = rowsOf('org-tree') as { id: string; parent: string | null; title: string }[]
-    const byId = new Map(rows.map((r) => [r.id, r]))
-    const level = (r: { parent: string | null }): number => (r.parent === null ? 1 : 1 + level(byId.get(r.parent)!))
-    expect(Math.max(...rows.map(level))).toBe(4)
-    expect(rows.find((r) => r.parent === null)!.title).toBe('Chief Executive Officer')
-  })
-
-  it('network-graph: links reference existing node ids, 4 groups', () => {
-    const { nodes, links } = file('network-graph').data as { nodes: { id: string; group: string }[]; links: { source: string; target: string }[] }
-    const ids = new Set(nodes.map((n) => n.id))
-    expect(ids.size).toBe(nodes.length)
-    expect(new Set(nodes.map((n) => n.group)).size).toBe(4)
-    expect(links.length).toBeGreaterThanOrEqual(55)
-    for (const l of links) {
-      expect(ids.has(l.source), l.source).toBe(true)
-      expect(ids.has(l.target), l.target).toBe(true)
-    }
-  })
-
   it('server-metrics: timestamps strictly increase per host and the declared gaps are there', () => {
     const rows = rowsOf('server-metrics') as { timestamp: string; host: string; cpu: number | null }[]
     const last = new Map<string, number>()
@@ -207,15 +158,6 @@ describe('shapes', () => {
     expect(rows.filter((r) => r.cpu === null)).toHaveLength(declared)
   })
 
-  it('project-timeline: dependencies resolve and end >= start', () => {
-    const rows = rowsOf('project-timeline') as { id: string; start: string; end: string; dependsOn: string; milestone: boolean }[]
-    const ids = new Set(rows.map((r) => r.id))
-    for (const r of rows) {
-      expect(parseDate(r.end)!.getTime()).toBeGreaterThanOrEqual(parseDate(r.start)!.getTime())
-      if (r.milestone) expect(r.end).toBe(r.start)
-      for (const d of r.dependsOn ? r.dependsOn.split(',') : []) expect(ids.has(d), `${r.id} depends on ${d}`).toBe(true)
-    }
-  })
 })
 
 describe('validate.mjs', () => {

@@ -1,1 +1,0 @@
-{"description":"Seats won per party in a 150-seat parliament, mapped from CSV columns; unsorted to keep the left-right order.","data":"party,seats\nGreen Left,12\nSocial Democrats,41\nLiberals,28\nChristian Democrats,35\nConservatives,26\nNational Front,8\n","options":{"fields":{"label":"party","value":"seats"},"sort":"none","centerLabel":"Seats","maxSlices":8}}

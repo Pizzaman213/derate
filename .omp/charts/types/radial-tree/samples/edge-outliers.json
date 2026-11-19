@@ -1,1 +1,0 @@
-{"description":"Values spanning seven orders of magnitude (they only appear in tooltips).","data":{"name":"Portfolio","children":[{"name":"Index fund","value":1250000},{"name":"Bonds","value":82000},{"name":"Crypto","children":[{"name":"Coin A","value":12},{"name":"Coin B","value":3}]},{"name":"Cash","value":0.5}]}}

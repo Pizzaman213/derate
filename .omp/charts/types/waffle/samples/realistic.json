@@ -1,1 +1,0 @@
-{"description":"How 2,000 survey respondents commute, from a CSV export mapped by field name.","data":"mode,respondents\nCar,812\nPublic transit,486\nBicycle,224\nWalking,198\nWork from home,241\nMotorcycle,27\nOther,12\n","options":{"fields":{"label":"mode","value":"respondents"}}}

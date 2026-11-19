@@ -1,6 +1,6 @@
 # Writing a chart type
 
-The contract every folder in `types/` is written to. `types/bar/` is the reference
+The contract every folder in `types/` is written to. `types/grouped-bar/` is the reference
 implementation: read it first, copy its shape.
 
 ## The folder

@@ -1,7 +1,8 @@
 # derate — chart & data-visualisation audit
 
 Audited 2026-11-17 against the working tree (peer sessions edit concurrently; line
-numbers are as read on that date). Scope: every `<svg>`, `<canvas>`, `uPlot`,
+numbers are as read on that date). Since 2026-11-19 the pack holds only the six types
+`PackChart.tsx` mounts; other pack type ids named below are at the `charts-full-pack` tag. Scope: every `<svg>`, `<canvas>`, `uPlot`,
 `<path d=` / `<rect>` built from data, `getContext(`, and every CSS bar whose
 width is driven by a value, under `ui/src`, plus the design pack in
 `.omp/design/`. Pack type ids are from the chart-pack catalogue.

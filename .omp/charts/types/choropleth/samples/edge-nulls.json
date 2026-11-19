@@ -1,1 +1,0 @@
-{"description":"Missing values: null, empty string and an absent key leave those countries grey, noted.","data":[{"region":"BRA","value":71.2},{"region":"USA","value":null},{"region":"CAN","value":93},{"region":"MEX","value":""},{"region":"DEU","value":91.4},{"region":"FRA"},{"region":"IND","value":46.3}]}

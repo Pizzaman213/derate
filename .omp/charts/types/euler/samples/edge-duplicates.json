@@ -1,1 +1,0 @@
-{"description":"The same overlap twice (B,A and A,B): summed and noted.","data":[{"sets":"A","size":50},{"sets":"B","size":40},{"sets":"C","size":30},{"sets":"A,B","size":10},{"sets":"B,A","size":5},{"sets":"B,C","size":8}]}

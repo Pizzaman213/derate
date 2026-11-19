@@ -23,41 +23,9 @@
         "kpi"
       ],
       "suggested": [
-        "line",
         "multi-line",
         "grouped-bar",
-        "stacked-bar",
-        "stacked-area",
-        "area",
-        "bar",
-        "kpi-tile"
-      ],
-      "added": "2026-11-17"
-    },
-    {
-      "name": "project-timeline",
-      "file": "project-timeline.json",
-      "description": "Fourteen tasks and milestones for a product launch, January to June 2026, with phases, owners, progress and finish-to-start dependencies.",
-      "kind": "rows",
-      "rows": 14,
-      "fields": [
-        "id",
-        "name",
-        "phase",
-        "start",
-        "end",
-        "progress",
-        "dependsOn",
-        "milestone",
-        "owner"
-      ],
-      "intents": [
-        "timeline",
-        "schedule"
-      ],
-      "suggested": [
-        "gantt",
-        "swimlane-timeline"
+        "stacked-bar"
       ],
       "added": "2026-11-17"
     },
@@ -80,11 +48,9 @@
         "deviation"
       ],
       "suggested": [
-        "diverging-bar",
         "stacked-bar-100",
         "stacked-bar",
-        "grouped-bar",
-        "horizontal-bar"
+        "grouped-bar"
       ],
       "added": "2026-11-17"
     },
@@ -111,14 +77,7 @@
         "kpi"
       ],
       "suggested": [
-        "line",
-        "multi-line",
-        "area",
-        "heatmap",
-        "histogram",
-        "box-plot",
-        "scatter",
-        "kpi-tile"
+        "multi-line"
       ],
       "added": "2026-11-17"
     },
@@ -147,106 +106,7 @@
         "distribution"
       ],
       "suggested": [
-        "choropleth",
-        "bubble-map",
-        "bar",
-        "horizontal-bar",
-        "scatter",
-        "bubble",
-        "treemap",
-        "box-plot"
-      ],
-      "added": "2026-11-17"
-    },
-    {
-      "name": "budget-breakdown",
-      "file": "budget-breakdown.json",
-      "description": "Annual operating budget as a tree: five departments, two categories each, three line items per category (30 leaves, USD 18,775,000 total). Values sit on leaves only; parents are their sum.",
-      "kind": "tree",
-      "rows": 46,
-      "fields": [
-        "name",
-        "value"
-      ],
-      "intents": [
-        "hierarchy",
-        "composition",
-        "compare"
-      ],
-      "suggested": [
-        "treemap",
-        "sunburst",
-        "tree"
-      ],
-      "added": "2026-11-17"
-    },
-    {
-      "name": "budget-breakdown-flat",
-      "file": "budget-breakdown-flat.json",
-      "description": "The budget-breakdown tree as flat id/parent rows (stratify-ready). value is set on the 30 line items and null on the root, departments and categories.",
-      "kind": "rows",
-      "rows": 46,
-      "fields": [
-        "id",
-        "parent",
-        "name",
-        "value"
-      ],
-      "intents": [
-        "hierarchy",
-        "composition",
-        "rank"
-      ],
-      "suggested": [
-        "treemap",
-        "sunburst",
-        "tree",
-        "horizontal-bar"
-      ],
-      "added": "2026-11-17"
-    },
-    {
-      "name": "network-graph",
-      "file": "network-graph.json",
-      "description": "A service dependency map for an online store: 30 services in four groups (edge, core, data, infra) and 61 directed calls weighted by requests per second.",
-      "kind": "graph",
-      "rows": 30,
-      "fields": [
-        "id",
-        "label",
-        "group"
-      ],
-      "intents": [
-        "network",
-        "relationship",
-        "flow"
-      ],
-      "suggested": [
-        "force-network",
-        "chord",
-        "sankey"
-      ],
-      "added": "2026-11-17"
-    },
-    {
-      "name": "org-tree",
-      "file": "org-tree.json",
-      "description": "A 35-person company as id/parent rows: a CEO, four executives, ten managers and twenty individual contributors, four levels deep.",
-      "kind": "rows",
-      "rows": 35,
-      "fields": [
-        "id",
-        "parent",
-        "name",
-        "title",
-        "department"
-      ],
-      "intents": [
-        "hierarchy"
-      ],
-      "suggested": [
-        "org-chart",
-        "tree"
+        "grouped-bar"
       ],
       "added": "2026-11-17"
     },
@@ -270,11 +130,7 @@
         "distribution"
       ],
       "suggested": [
-        "candlestick",
-        "ohlc",
-        "line",
-        "area",
-        "bar"
+        "multi-line"
       ],
       "added": "2026-11-17"
     }

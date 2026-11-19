@@ -7,14 +7,9 @@ import registry from './datasets.json'
 
 export const DATASET_NAMES = [
   'sales-by-month',
-  'project-timeline',
   'survey-results',
   'server-metrics',
   'population-by-region',
-  'budget-breakdown',
-  'budget-breakdown-flat',
-  'network-graph',
-  'org-tree',
   'ohlc-prices',
 ] as const
 

@@ -1,1 +1,0 @@
-{"description":"A set and an overlap with no size: left out, noted.","data":[{"sets":"A","size":40},{"sets":"B","size":30},{"sets":"C","size":null},{"sets":"A,B","size":12},{"sets":"A,C","size":null}]}

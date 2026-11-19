@@ -1,1 +1,0 @@
-{"description":"All values at zero.","data":[{"label":"A","value":0,"max":10},{"label":"B","value":0,"max":10,"optimum":10,"low":3,"high":7},{"label":"C","value":0,"max":10,"optimum":0,"low":3,"high":7}]}

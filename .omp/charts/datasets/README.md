@@ -5,16 +5,11 @@ type has at least one dataset here it can render without inventing data.
 
 | name | kind | rows | for |
 | --- | --- | --- | --- |
-| `sales-by-month` | rows | 96 | 24 months x 4 regions: revenue, units, target. Line, grouped/stacked bar, area, KPI. |
-| `project-timeline` | rows | 14 | Launch plan with phases, owners, progress, dependencies, milestones. Gantt, swimlane. |
-| `survey-results` | rows | 60 | 6 Likert questions x 5 levels x 2 segments. Diverging bar, 100% stacked bar. |
-| `server-metrics` | rows | 864 | 3 hosts x 288 five-minute samples on 2026-11-16 UTC, an incident 13:50-14:45, 5 null gaps. |
-| `population-by-region` | rows | 40 | Countries with ISO3, population, area, median age, centroid. Choropleth, bubble map, scatter. |
-| `budget-breakdown` | tree | 46 | Nested `{name, children}` tree, 5 departments > 10 categories > 30 line items. Treemap, sunburst. |
-| `budget-breakdown-flat` | rows | 46 | The same tree as `{id, parent, name, value}` rows (stratify-ready). |
-| `network-graph` | graph | 30 | Service dependency map: 30 nodes in 4 groups, 61 weighted links. Force network, chord, sankey. |
-| `org-tree` | rows | 35 | `{id, parent, ...}` org chart, CEO root, four levels. |
-| `ohlc-prices` | rows | 120 | Weekday OHLC + volume from 2026-06-01, seeded random walk. Candlestick, OHLC. |
+| `sales-by-month` | rows | 96 | 24 months x 4 regions: revenue, units, target. Multi-line, grouped/stacked bar. |
+| `survey-results` | rows | 60 | 6 Likert questions x 5 levels x 2 segments. 100% stacked bar, stacked bar. |
+| `server-metrics` | rows | 864 | 3 hosts x 288 five-minute samples on 2026-11-16 UTC, an incident 13:50-14:45, 5 null gaps. Multi-line. |
+| `population-by-region` | rows | 40 | Countries with ISO3, population, area, median age, centroid. Grouped bar (ranked). |
+| `ohlc-prices` | rows | 120 | Weekday OHLC + volume from 2026-06-01, seeded random walk. Multi-line of the close. |
 
 `datasets.json` is the registry and the source of truth for the table above; `index.ts`
 exposes it typed (`DATASET_NAMES`, `DatasetEntry`, `datasetEntry(name)`,

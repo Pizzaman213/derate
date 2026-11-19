@@ -22,26 +22,7 @@ export { ALL_CHARTS }
 
 /** Chart ids that are spelled differently in conversation. */
 export const ALIASES: Record<string, string> = {
-  column: 'horizontal-bar',
-  'column-bar': 'horizontal-bar',
-  'vertical-bar': 'bar',
   doughnut: 'donut',
-  spider: 'radar',
-  'scatter-matrix': 'splom',
-  'scatterplot-matrix': 'splom',
-  'force-directed': 'force-network',
-  network: 'force-network',
-  'org-tree': 'org-chart',
-  'kpi': 'kpi-tile',
-  'progress-bar': 'linear-progress',
-  'radial-progress': 'progress-ring',
-  'jitter': 'strip',
-  'kde': 'density',
-  'marimekko-chart': 'marimekko',
-  mosaic: 'marimekko',
-  'calendar': 'calendar-heatmap',
-  'tidy-tree': 'tree',
-  'stream': 'streamgraph',
 }
 
 /** Resolve an id or alias to a registered chart id, or undefined. */
@@ -161,7 +142,7 @@ export function recommend(intent: string, data: unknown, options: ChooserOptions
  * draw the data, so the result is a working chart or a clear error.
  */
 export function chartFor(intent: string, data: unknown, container: HTMLElement, options: Record<string, unknown> = {}): { handle: ChartHandle; typeUsed: string; reason: string; alternatives: Recommendation[] } {
-  const recs = recommend(intent, data, { dualAxis: options.dualAxis === true })
+  const recs = recommend(intent, data)
   if (!recs.length) throw new Error(`no chart fits this data for '${intent}' (${describeData(inspect(data))})`)
   let last: { handle: ChartHandle; rec: Recommendation } | null = null
   for (const rec of recs) {
