@@ -152,7 +152,7 @@ describe('shapes', () => {
       last.set(r.host, t)
       perHost.set(r.host, (perHost.get(r.host) ?? 0) + 1)
     }
-    expect([...perHost.values()]).toEqual([288, 288, 288])
+    expect([...perHost.values()]).toEqual([96, 96, 96])
     const declared = file('server-metrics').fields.cpu!.nulls!
     expect(declared).toBeGreaterThan(0)
     expect(rows.filter((r) => r.cpu === null)).toHaveLength(declared)

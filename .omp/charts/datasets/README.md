@@ -7,7 +7,7 @@ type has at least one dataset here it can render without inventing data.
 | --- | --- | --- | --- |
 | `sales-by-month` | rows | 96 | 24 months x 4 regions: revenue, units, target. Multi-line, grouped/stacked bar. |
 | `survey-results` | rows | 60 | 6 Likert questions x 5 levels x 2 segments. 100% stacked bar, stacked bar. |
-| `server-metrics` | rows | 864 | 3 hosts x 288 five-minute samples on 2026-11-16 UTC, an incident 13:50-14:45, 5 null gaps. Multi-line. |
+| `server-metrics` | rows | 288 | 3 hosts x 96 fifteen-minute samples on 2026-11-16 UTC, an incident 13:50-14:45, 5 null gaps. Multi-line. |
 | `population-by-region` | rows | 40 | Countries with ISO3, population, area, median age, centroid. Grouped bar (ranked). |
 | `ohlc-prices` | rows | 120 | Weekday OHLC + volume from 2026-06-01, seeded random walk. Multi-line of the close. |
 

@@ -57,9 +57,9 @@
     {
       "name": "server-metrics",
       "file": "server-metrics.json",
-      "description": "Five-minute samples from three hosts over 16 November 2026 (UTC): a daily load cycle, a 13:50-14:45 incident on web-01 and db-01, and five missed scrapes left as nulls.",
+      "description": "Fifteen-minute samples from three hosts over 16 November 2026 (UTC): a daily load cycle, a 13:50-14:45 incident on web-01 and db-01, and five missed scrapes left as nulls.",
       "kind": "rows",
-      "rows": 864,
+      "rows": 288,
       "fields": [
         "timestamp",
         "host",
