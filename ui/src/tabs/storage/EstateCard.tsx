@@ -39,7 +39,7 @@ function EstateRows({ node, retention }: { node: NodeStorage; retention?: Retent
     <>
       <div
         className="row"
-        style={{ borderBottom: '1px solid var(--rule)', paddingBottom: 4 }}
+        style={{ borderBottom: '1px solid var(--rule)', paddingBottom: 'var(--space-4)' }}
       >
         <span className="mono">{node.node_id}</span>
         <span className="unit">{bytesLabel(total)} total</span>
@@ -48,8 +48,8 @@ function EstateRows({ node, retention }: { node: NodeStorage; retention?: Retent
         const ceiling = cap(e)
         return (
           <div className="row" key={e.key}>
-            <span style={{ opacity: e.exists ? 1 : 0.45 }}>{e.label}</span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ opacity: e.exists ? 1 : 'var(--opacity-45)' }}>{e.label}</span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
               {ceiling != null && e.bytes != null ? (
                 <>
                   <ProportionBar
@@ -113,7 +113,7 @@ export function EstateCard() {
   return (
     <div className="card2">
       <h3>What derate stores</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         Every file this product writes under its data root, measured. Telemetry
         is the only stream that grows on its own; the rest is a record per node,
         deployment and measurement.
@@ -130,8 +130,8 @@ export function EstateCard() {
       )}
 
       {retention ? (
-        <div style={{ marginTop: 12 }}>
-          <div className="label" style={{ marginBottom: 4 }}>
+        <div style={{ marginTop: 'var(--space-12)' }}>
+          <div className="label" style={{ marginBottom: 'var(--space-4)' }}>
             Retention
           </div>
           <div className="unit">
@@ -145,8 +145,8 @@ export function EstateCard() {
         </div>
       ) : null}
 
-      <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <button onClick={clearCache} disabled={busy}>
+      <div style={{ marginTop: 'var(--space-12)', display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
+        <button type="button" onClick={clearCache} disabled={busy}>
           {busy ? 'Clearing…' : 'Clear resolver cache'}
         </button>
         {freed != null ? (
@@ -157,7 +157,7 @@ export function EstateCard() {
       {error ? (
         <div
           className="label"
-          style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}
+          style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}
         >
           {error}
         </div>

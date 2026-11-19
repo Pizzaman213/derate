@@ -74,6 +74,8 @@ export function dominantColor(url: string | null): string | null {
   return null
 }
 
+// design-pack: computed-color — the publisher's own logo colour, sampled from
+// pixels; there is no token for a value that comes from the image.
 function pick(data: Uint8ClampedArray): string | null {
   let r = 0
   let g = 0

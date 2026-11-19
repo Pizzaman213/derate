@@ -27,7 +27,7 @@ is why the dashboard has no plan panel and why `Verdict.tsx` and
 | `DeploymentsStrip.tsx` | 161 | one row per *running* deployment, with a spark cell, a stop and a `↗` to the detail sheet |
 | `LoadSub.tsx` | 142 | requests by Spark, one column per local target |
 | `TelemetrySub.tsx` | 119 | the 60-second live window: cluster, then the selected Spark, then the selected deployment |
-| `AggregateRow.tsx` | 102 | the four overview tiles |
+| `AggregateRow.tsx` | 107 | the Overview's tile row: tok/s and serving, then the usage tiles; `freeGiB` for Telemetry |
 | `chartTheme.ts` | 85 | literal canvas colours, read live off the computed style |
 
 ## `Chart.tsx`
@@ -155,8 +155,8 @@ failed tries at one model are three rows carrying the same served name, the same
 plan and a `0 tok/s` readout the frame never sent. The strip has no vocabulary
 for "over" -- no band, no state column, and the stop button simply vanishes --
 so a stopped deployment drew as an ordinary serving row. `runners()` is
-`tabs/cluster/layout.ts`'s, which filters the same `TERMINAL` set
-`models/rows.ts` uses, because the floor and this strip must not disagree about
+`tabs/models/rows.ts`'s, which filters the `TERMINAL` set defined there,
+because the floor and this strip must not disagree about
 whether a model is running. `stopping` is keyed by deployment id so one row's
 stop never greys another's controls. A stop that throws still invalidates: the
 reason belongs in the sheet, and a strip row has no room for a sentence but must
@@ -204,9 +204,10 @@ the browser, empty on load, and its TTFT and mean duration are moving averages.
 
 ## `AggregateRow.tsx`
 
-Four tiles -- tokens per second, deployments serving, watts drawn, GiB
-addressable free -- and the interesting part of three of them is what they do
-when they have nothing. The second is the exception and the one to read twice:
+Two live tiles -- tokens per second and deployments serving -- that the
+Overview's usage tiles (`UsageCard.tsx`) join on the same line; watts are on
+Telemetry's charts and GiB addressable free is a tile at the top of Telemetry
+(`freeGiB`). "Serving" is the one to read twice:
 it counts `state === 'ready' || state === 'degraded'`, which is stricter than
 the `runners()` the tile beside it uses, so a deployment still loading is
 counted as running by `totalTps` and not by "deployments serving".

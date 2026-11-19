@@ -110,8 +110,8 @@ export function RouteCard({
     facts.models_chosen === false && served && catalogue != null && catalogue.length > 1
 
   return (
-    <div style={{ display: 'grid', gap: 'var(--s-2)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <div style={{ display: 'grid', gap: 'var(--space-8)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
         {facts.healthy == null ? null : (
           <Lamp
             signal={facts.healthy ? 'live' : 'fault'}
@@ -182,6 +182,7 @@ export function RouteCard({
 
       <div>
         <button
+          type="button"
           disabled={busy || !ready}
           onClick={() => void setServed(!served)}
           title={

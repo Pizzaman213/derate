@@ -1,3 +1,4 @@
+// design-pack: data-svg — the dashboard chart is a drawing of measured series, not an icon
 import {
   createContext,
   useContext,

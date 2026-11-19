@@ -1,5 +1,5 @@
 // Verifier for the QR encoder. There is no test runner in this repo (see
-// layout.check.mjs), so this is the whole gate:
+// ui/README.md), so this is the whole gate:
 //
 //   node src/tabs/setup/qr.check.mjs
 //

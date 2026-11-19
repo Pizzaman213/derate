@@ -215,6 +215,12 @@ export function ServePanel({
   // different launch. It is in the plan effect's dependency list for the
   // same reason context and concurrency are.
   const usingCustomCommand = customCommand && customCommandText.trim().length > 0
+  // Opt-in to the repo's own Python (R2). Off by default, except under `tts`:
+  // every architecture that server supports is remote code transformers does
+  // not ship, so it cannot load one checkpoint without it. Reset whenever the
+  // runtime changes so a tick under one runtime never rides into another.
+  const [trustRemoteCode, setTrustRemoteCode] = useState(() => runtime === 'tts')
+  useEffect(() => setTrustRemoteCode(runtime === 'tts'), [runtime])
 
   const seq = useRef(0)
 
@@ -396,6 +402,9 @@ export function ServePanel({
               },
             }
           : {}),
+        // Sent only when the resolver said there is remote code AND the box
+        // is ticked; absent means false on the server.
+        ...(result.remote_code && trustRemoteCode ? { trust_remote_code: true } : {}),
         // One key per gate the backend itself published, sent only where
         // somebody has read that gate's sentence and ticked it. Driven off the
         // published list rather than a fixed set of names, and filtered against
@@ -487,7 +496,7 @@ export function ServePanel({
           changed is that leaving them alone is now a request in its own right
           rather than a silent 8192. */}
       {onCluster ? (
-        <div style={{ marginTop: 'var(--s-3)' }}>
+        <div style={{ marginTop: 'var(--space-12)' }}>
           <Disclosure
             summary={
               route.context === null && route.concurrency === null
@@ -537,6 +546,7 @@ export function ServePanel({
                 <div className="fld">
                   <label htmlFor="sp-auto">&nbsp;</label>
                   <button
+                    type="button"
                     id="sp-auto"
                     onClick={() =>
                       navigate({ context: null, concurrency: null }, { replace: true })
@@ -547,7 +557,7 @@ export function ServePanel({
                 </div>
               ) : null}
             </div>
-            <p className="unit" style={{ margin: '6px 0 0' }}>
+            <p className="unit" style={{ margin: 'var(--space-6) 0 0' }}>
               {route.context === null && route.concurrency === null
                 ? result?.context
                   ? `Judged at ${result.context.toLocaleString()} context and ` +
@@ -576,7 +586,7 @@ export function ServePanel({
             onChoose={onProviderId}
             nodes={cluster?.nodes}
           />
-          <p className="unit" style={{ marginTop: 'var(--s-3)' }}>
+          <p className="unit" style={{ marginTop: 'var(--space-12)' }}>
             This runtime does not launch on the cluster. It tells the provider to
             fetch a GGUF onto itself, and the gateway routes to it once it lands —
             so the quantizations below are the download, and the machine's own free
@@ -651,6 +661,8 @@ export function ServePanel({
             // the ordinary reason: a control nobody opens is a control nobody
             // finds, and this one is the only lever on that figure that does
             // not mean picking a different model.
+            trustRemoteCode={trustRemoteCode}
+            onTrustRemoteCodeChange={setTrustRemoteCode}
             speculativeSection={
               <SpeculativeField
                 options={result.speculative_options ?? []}

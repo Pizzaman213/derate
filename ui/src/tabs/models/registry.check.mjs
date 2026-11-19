@@ -13,6 +13,8 @@
 // Needs a coordinator that serves /api/models: :8088 by default, or whatever
 // DERATE_CHECK_ORIGIN names. Every assertion is about a fact the gateway
 // reports, not a shape this file invented.
+// First, for its side effect: logs in and authenticates every fetch below.
+import '../../check/auth.mjs'
 import { build } from 'esbuild'
 import { fileURLToPath } from 'node:url'
 

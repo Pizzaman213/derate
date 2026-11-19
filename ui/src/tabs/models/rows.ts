@@ -57,6 +57,25 @@ export const TERMINAL: ReadonlySet<DeploymentState> = new Set<DeploymentState>([
   'stopped',
 ])
 
+/** The deployments still holding a machine.
+ *
+ *  `/api/deployments` is a ledger, not a roster -- it keeps every attempt,
+ *  and three tries at one model that all failed are three rows with the same
+ *  served name and the same node. A failed or stopped row holds no machine,
+ *  so anything that counts what is running (the cluster graph, the dashboard,
+ *  the sheets) filters through this rather than spelling the set again.
+ *
+ *  `TERMINAL` is this module's: the Models screen already decides what "over"
+ *  means for a row, and a second list would put two screens at odds about
+ *  whether a model is running.
+ *
+ *  Live duplicates are NOT collapsed. Two deployments of one served name that
+ *  are both up are two runners -- the ledger was the duplication, not the
+ *  cluster. */
+export function runners(deployments: readonly DeploymentDTO[]): DeploymentDTO[] {
+  return deployments.filter((d) => !TERMINAL.has(d.state))
+}
+
 /** The three row shapes now arrive from `GET /api/models` and are declared
  *  with the rest of the wire in `api/types.ts`. Re-exported here so that every
  *  existing `import { type RowProvider } from './rows'` keeps working —

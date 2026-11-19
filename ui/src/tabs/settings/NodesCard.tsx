@@ -3,6 +3,85 @@ import { useCandidates, useCluster } from '../../state/resources'
 import { useBackend } from '../../state/backend'
 import { gbytes, relativeTime, shortGpu } from '../../format'
 import { fromState, nodeName } from '../../state/names'
+import { PasswordField } from '../../components/PasswordField'
+import { Verbatim } from '../../components/Verbatim'
+
+/** Replace the cluster token, behind the signed-in admin's password -- the
+ *  same confirm step an admin key's rotate uses. Nothing is revealed: every
+ *  member holds its own agent token, and new machines join on an enrollment
+ *  token from Add a node. */
+function RotateClusterToken() {
+  const { backend, invalidate } = useBackend()
+  const [open, setOpen] = useState(false)
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [done, setDone] = useState(false)
+
+  const run = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await backend.rotateClusterToken(currentPassword)
+      setOpen(false)
+      setDone(true)
+      setCurrentPassword('')
+      invalidate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 'var(--space-14)' }}>
+      <button
+        type="button"
+        className={open ? undefined : 'ghost'}
+        aria-expanded={open}
+        onClick={() => {
+          setOpen(!open)
+          setError(null)
+          setDone(false)
+        }}
+      >
+        Rotate cluster token
+      </button>
+      {done ? <div className="unit">Cluster token rotated. Every member keeps working.</div> : null}
+      {open ? (
+        <div className="card2" style={{ marginTop: 'var(--space-8)' }}>
+          <div className="unit">
+            The old cluster token stops admitting new machines at once. Members are not affected: each
+            one holds its own agent token. Add machines from now on with an enrollment token.
+          </div>
+          <div className="fld" style={{ marginTop: 'var(--space-8)' }}>
+            <label htmlFor="nc-current-pw">Your password</label>
+            <PasswordField
+              id="nc-current-pw"
+              value={currentPassword}
+              autoComplete="current-password"
+              onChange={setCurrentPassword}
+            />
+          </div>
+          <div style={{ display: 'flex', gap: 'var(--space-8)', marginTop: 'var(--space-8)' }}>
+            <button type="button" disabled={busy || !currentPassword} onClick={() => void run()}>
+              {busy ? 'Rotating…' : 'Rotate cluster token'}
+            </button>
+            <button type="button" className="ghost" disabled={busy} onClick={() => setOpen(false)}>
+              Cancel
+            </button>
+          </div>
+          {error ? (
+            <div style={{ color: 'var(--fault)', marginTop: 'var(--space-8)' }}>
+              <Verbatim text={error} />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
 
 // Ported from mockups-next/js/settings.js `settings()`'s `nodeTable` plus
 // derate.html's "discovered" row. The mockup's own address/kind form is not
@@ -49,7 +128,7 @@ export function NodesCard() {
   return (
     <div className="card2">
       <h3>Nodes</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         Nodes on the local subnet are discovered automatically.
       </div>
       <div style={{ overflowX: 'auto' }}>
@@ -62,6 +141,7 @@ export function NodesCard() {
               <th style={{ textAlign: 'right' }}>Memory</th>
               <th style={{ textAlign: 'right' }}>Bandwidth</th>
               <th>Driver</th>
+              <th>Status</th>
               <th>Seen</th>
               <th></th>
             </tr>
@@ -94,12 +174,16 @@ export function NodesCard() {
                     {p.memory_bandwidth_gbps.toFixed(0)} <span className="unit">GB/s</span>
                   </td>
                   <td className="unit mono">{p.driver_version}</td>
+                  <td className="unit">
+                    {n.healthy ? 'healthy' : <span style={{ color: 'var(--fault)' }}>unreachable</span>}
+                  </td>
                   <td className="unit" style={{ color: stale ? 'var(--warn)' : undefined }}>
                     {relativeTime(n.last_seen)}
                   </td>
                   <td style={{ textAlign: 'right' }}>
                     <button
-                      style={{ padding: '3px 9px' }}
+                      type="button"
+                      style={{ padding: 'var(--space-3) var(--space-9)' }}
                       onClick={() => void remove(p.node_id)}
                       disabled={busy === p.node_id}
                     >
@@ -114,7 +198,7 @@ export function NodesCard() {
       </div>
       <div
         className="unit"
-        style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--rule)' }}
+        style={{ marginTop: 'var(--space-12)', paddingTop: 'var(--space-10)', borderTop: '1px solid var(--rule)' }}
       >
         Addressable is what the fit gate budgets against, at 90% guardrail. On a unified-memory
         node the operating system shares that pool, so the nameplate total overstates what a
@@ -122,11 +206,11 @@ export function NodesCard() {
       </div>
 
       {found.length > 0 ? (
-        <div style={{ marginTop: 14, display: 'grid', gap: 8 }}>
+        <div style={{ marginTop: 'var(--space-14)', display: 'grid', gap: 'var(--space-8)' }}>
           {found.map((c) => (
             <div
               key={c.node_id}
-              style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}
+              style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-8)', flexWrap: 'wrap' }}
             >
               <span className="pill">discovered</span>
               <span className="mono">{c.hostname}</span>
@@ -137,7 +221,8 @@ export function NodesCard() {
                 <span className="unit">{c.ineligible_reason}</span>
               ) : null}
               <button
-                style={{ padding: '3px 8px', marginLeft: 'auto' }}
+                type="button"
+                style={{ padding: 'var(--space-3) var(--space-8)', marginLeft: 'auto' }}
                 onClick={() => void admit(c.node_id)}
                 /* Not gated on c.eligible. The reason above says the device
                    class could not be confirmed, and serialize._eligibility is
@@ -157,8 +242,10 @@ export function NodesCard() {
         </div>
       ) : null}
 
+      <RotateClusterToken />
+
       {error ? (
-        <div className="label" style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}>
+        <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}>
           {error}
         </div>
       ) : null}

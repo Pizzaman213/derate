@@ -20,7 +20,6 @@ export function AppearanceCard() {
 
   return (
     <div className="card2">
-      <h3>Appearance</h3>
       <div className="row">
         {/* No `<label htmlFor>` existed on the old bare `<select>` either --
             `aria-label` here is the first accessible name this control has
