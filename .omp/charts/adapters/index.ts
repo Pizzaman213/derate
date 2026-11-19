@@ -1,0 +1,6 @@
+export { AdapterError, isRecord, toNumber, type Row } from './util'
+export { coerceCell, detectDelimiter, looksLikeCSV, parseCSV, toCSV } from './csv'
+export { columnsToRows, inferFieldTypes, isDateString, mapFields, rowsToColumns, toRows, type FieldType } from './rows'
+export { distinct, pivot, unpivot } from './reshape'
+export { aggregate, groupAggregate, groupRows, normalize, topN, type Agg } from './aggregate'
+export { stackRows, type StackOptions, type StackPoint, type Stacked } from './stack'

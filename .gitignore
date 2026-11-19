@@ -22,6 +22,11 @@ ui/dist/
 ui/.vite/
 *.local
 
+# Design pack (.omp/) -- generated or machine-local
+.omp/node_modules/
+.omp/design/screens/
+.omp/work/auth-keys/LOCK
+
 # Secrets and runtime data
 .env
 .env.*
@@ -39,3 +44,6 @@ logs/
 .idea/
 .vscode/
 *.swp
+.omp/design/tokens/tokens.flat.json
+.omp/package-lock.json
+.omp/charts/package-lock.json
