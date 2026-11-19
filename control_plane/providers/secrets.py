@@ -23,14 +23,37 @@ import logging
 import os
 import stat
 import tempfile
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
 from .config import SECRETS_FILE, data_dir
 
-from control_plane import fsutil
+from control_plane import envspec, fsutil
 
 log = logging.getLogger(__name__)
+
+#: The two shapes of reference the *environment* is consulted for. A reference
+#: is a name an admin types, and before this every variable in the
+#: coordinator's environment was one -- `DERATE_TOKEN`, `DERATE_HF_TOKEN`,
+#: another provider's key -- resolvable and sent as a bearer to whatever
+#: `base_url` the same admin chose. Derate mints `DERATE_<ID>_API_KEY`; an
+#: operator exports `DERATE_SECRET_<NAME>`. Nothing else in the environment is
+#: a provider credential. secrets.json is derate's own file and answers any name.
+MINTED_REF_RE = re.compile(r"DERATE_[A-Z0-9_]+_API_KEY")
+OPERATOR_REF_RE = re.compile(r"DERATE_SECRET_[A-Z0-9_]+")
+
+
+def env_resolvable(ref: str) -> bool:
+    """Whether *ref* may be read from the environment at all.
+
+    A statically declared variable never is, even when it happens to have the
+    minted shape (`DERATE_TTS_API_KEY` is a runtime's key, not a provider's).
+    """
+    if ref in envspec.VARIABLES:
+        return False
+    return bool(MINTED_REF_RE.fullmatch(ref) or OPERATOR_REF_RE.fullmatch(ref))
+
 
 # -- redaction ---------------------------------------------------------------
 #
@@ -122,7 +145,7 @@ class SecretStore:
         write, ``get`` returns the environment's value and the question can no
         longer be asked.
         """
-        if not ref:
+        if not ref or not env_resolvable(ref):
             return None
         value = self._env.get(ref)
         if value is not None:
@@ -133,7 +156,7 @@ class SecretStore:
         """Resolve a reference, or None. Never logs, never raises on a miss."""
         if not ref:
             return None
-        value = self._env.get(ref)
+        value = self._env.get(ref) if env_resolvable(ref) else None
         if value is None:
             value = self._load_file().get(ref)
         if value is not None:

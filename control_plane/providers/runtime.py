@@ -74,16 +74,13 @@ class ProviderRuntime:
     healthy: bool = True
     last_error: str | None = None
     last_refreshed: float = 0.0
-    backoff_until: float = 0.0
-    consecutive_rate_limits: int = 0
-    #: Consecutive failures to reach this provider at all, or 5xx from it. Sizes
-    #: the same exponential backoff `consecutive_rate_limits` does, kept apart
-    #: because "busy" and "broken" should not deepen each other's wait.
+    #: 429 state belongs to the upstream model, never its served-name alias.
+    rate_limit_until: dict[str, float] = field(default_factory=dict)
+    rate_limit_errors: dict[str, str] = field(default_factory=dict)
+    consecutive_rate_limits: Counter[str] = field(default_factory=Counter)
+    #: Consecutive provider-wide transport/5xx failures, independent of 429s.
     consecutive_failures: int = 0
-    #: When a provider we could not reach (or that answered 5xx) may be tried
-    #: again. Deliberately NOT `backoff_until`: that one means "429, come back
-    #: later" and `rate_limited()` reads it, so folding a transport failure into
-    #: it would report an unreachable box as rate limited.
+    #: Provider-wide transport/5xx backoff, separate from model throttling.
     failure_backoff_until: float = 0.0
     #: Set when the upstream rejected our credentials, and the one kind of
     #: unhealthy that does NOT expire. A bad key is not transient: retrying it
@@ -116,6 +113,25 @@ class ProviderRuntime:
     #: one model at a time and must not have to know every other model's pin
     #: on the same provider to avoid erasing it.
     backend_pins: dict[str, str] = field(default_factory=dict)
+    #: Upstream id -> whether OpenRouter may fall back to other hosts when the
+    #: pinned one is down: ``provider: {"order": [pin], "allow_fallbacks":
+    #: true}`` instead of the strict ``{"only": [pin]}``. Only meaningful
+    #: beside a pin; clearing the pin clears it. Merged a key at a time, like
+    #: ``backend_pins`` (`ProviderService._screen_backend_fallbacks`).
+    backend_fallbacks: dict[str, bool] = field(default_factory=dict)
+    #: Upstream id -> ``(input_cost_per_mtok, output_cost_per_mtok)`` of the
+    #: pinned host, captured from the live endpoints call when the pin was set.
+    #: It replaces the catalogue price on the model
+    #: (`ProviderService._apply_pin_prices`), so routing cost and un-metered
+    #: spend follow the host that actually serves the request.
+    backend_pin_prices: dict[str, tuple[float | None, float | None]] = field(
+        default_factory=dict
+    )
+    #: Upstream id -> admin-set USD per minute of audio (``audio_prices`` on
+    #: the provider PATCH). Applied onto ``ProviderModel.price_per_minute_usd``
+    #: by `ProviderService._apply_pin_prices`, on load, every refresh and
+    #: every patch, because discovery rebuilds the model list without it.
+    audio_prices: dict[str, float] = field(default_factory=dict)
 
     # -- the allowlist -----------------------------------------------------
 
@@ -130,13 +146,18 @@ class ProviderRuntime:
 
     # -- health transitions ------------------------------------------------
 
-    def note_success(self, now: float) -> None:
-        """A request got through. Everything transient clears."""
+    def note_success(self, now: float, upstream_id: str | None = None) -> None:
+        """Clear provider failures and only the successful model's 429 state.
+
+        Credential updates have no model and must not erase active cooldowns.
+        """
         self.healthy = True
         self.last_error = None
-        self.backoff_until = 0.0
+        if upstream_id is not None:
+            self.rate_limit_until.pop(upstream_id, None)
+            self.rate_limit_errors.pop(upstream_id, None)
+            self.consecutive_rate_limits.pop(upstream_id, None)
         self.failure_backoff_until = 0.0
-        self.consecutive_rate_limits = 0
         self.consecutive_failures = 0
         self.auth_rejected = False
 
@@ -174,8 +195,10 @@ class ProviderRuntime:
             return
         self.healthy = True
 
-    def note_rate_limit(self, now: float, retry_after: str | None, message: str) -> float:
-        """429. Temporarily not admitting; still healthy.
+    def note_rate_limit(
+        self, now: float, upstream_id: str, retry_after: str | None, message: str
+    ) -> float:
+        """429. Temporarily stop admitting this model; still healthy.
 
         Honours ``Retry-After`` when the provider sends one, up to
         ``RETRY_AFTER_MAX_S`` (a DoS guard, not a real-world expectation —
@@ -187,15 +210,18 @@ class ProviderRuntime:
         if seconds is None:
             seconds = min(
                 BACKOFF_MAX_S,
-                BACKOFF_MIN_S * (2**self.consecutive_rate_limits),
+                BACKOFF_MIN_S * (2**self.consecutive_rate_limits[upstream_id]),
             )
         else:
             seconds = min(seconds, RETRY_AFTER_MAX_S)
-        self.consecutive_rate_limits += 1
-        self.backoff_until = now + seconds
-        self.last_error = f"rate limited, retrying in {seconds:.0f}s: {message}"
+        self.consecutive_rate_limits[upstream_id] += 1
+        self.rate_limit_until[upstream_id] = now + seconds
+        self.rate_limit_errors[upstream_id] = message
         # Health is untouched on purpose. Rate limited is busy, not broken.
-        log.info("provider %s rate limited for %.0fs", self.provider_id, seconds)
+        log.info(
+            "provider %s model %s rate limited for %.0fs: %s",
+            self.provider_id, upstream_id, seconds, message,
+        )
         return seconds
 
     def note_server_error(self, now: float, status: int, message: str) -> None:
@@ -207,14 +233,24 @@ class ProviderRuntime:
             self.provider_id, status, seconds,
         )
 
-    def note_auth_failure(self, now: float, status: int, api_key_ref: str, message: str) -> None:
-        """401 or 403. Unhealthy immediately; retrying a bad key just burns time."""
+    def note_auth_failure(
+        self, now: float, status: int, api_key_ref: str, message: str, *, sign_in: bool = False
+    ) -> None:
+        """401 or 403. Unhealthy immediately; retrying a bad key just burns time.
+
+        ``sign_in`` names a credential that came from signing in, where
+        ``api_key_ref`` is a label rather than a reference and "check the key
+        behind it" would send the operator looking for a key that never existed.
+        """
         self.healthy = False
         self.auth_rejected = True
-        self.last_error = (
-            f"authentication rejected ({status}); check the key behind "
-            f"api_key_ref {api_key_ref!r}: {message}"
-        )
+        if sign_in:
+            self.last_error = f"authentication rejected ({status}) for {api_key_ref}: {message}"
+        else:
+            self.last_error = (
+                f"authentication rejected ({status}); check the key behind "
+                f"api_key_ref {api_key_ref!r}: {message}"
+            )
         log.warning("provider %s auth rejected (%s)", self.provider_id, status)
 
     def note_transport_error(self, now: float, message: str) -> None:
@@ -226,9 +262,15 @@ class ProviderRuntime:
             self.provider_id, message, seconds,
         )
 
-    def note_missing_key(self, api_key_ref: str) -> None:
+    def note_missing_key(self, api_key_ref: str, *, sign_in: bool = False) -> None:
         self.missing_key_ref = api_key_ref
         self.healthy = False
+        if sign_in:
+            self.last_error = (
+                f"{api_key_ref} is missing or expired; sign in again from "
+                "Settings → Providers"
+            )
+            return
         self.last_error = (
             f"api_key_ref {api_key_ref!r} resolves to nothing; set that environment "
             f"variable or add it to secrets.json, then re-enable the provider"
@@ -239,16 +281,15 @@ class ProviderRuntime:
 
     # -- admission ---------------------------------------------------------
 
-    def rate_limited(self, now: float) -> bool:
-        return now < self.backoff_until
+    def rate_limited(self, now: float, upstream_id: str | None = None) -> bool:
+        return now < self.rate_limit_until.get(upstream_id, 0.0)
 
-    def retry_in(self, now: float) -> float:
-        """When this provider may be tried again, whatever is holding it back.
-
-        The max of both waits: a screen asking "how long" wants one number, and
-        the honest one is the later of the 429 backoff and the unreachable one.
-        """
-        return max(0.0, self.backoff_until - now, self.failure_backoff_until - now)
+    def retry_in(self, now: float, upstream_id: str | None = None) -> float:
+        """Wait for this model plus provider failures; no model means global only."""
+        return max(
+            0.0, self.rate_limit_until.get(upstream_id, 0.0) - now,
+            self.failure_backoff_until - now,
+        )
 
     def over_budget(self, now: float) -> bool:
         if self.daily_budget_usd is None:
@@ -272,12 +313,12 @@ class ProviderRuntime:
             f"(${self.spend_today(now):.2f} spent today)"
         )
 
-    def admission_block(self, now: float) -> str | None:
-        """Why this provider is not admitting, or None when it is."""
+    def admission_block(self, now: float, upstream_id: str | None = None) -> str | None:
+        """Provider-wide block, plus this model's cooldown when specified."""
         if self.missing_key_ref is not None:
             return f"api_key_ref {self.missing_key_ref!r} is unresolved"
-        if self.rate_limited(now):
-            return f"rate limited for another {self.retry_in(now):.0f}s"
+        if self.rate_limited(now, upstream_id):
+            return f"rate limited for another {self.retry_in(now, upstream_id):.0f}s"
         budget = self.budget_block(now)
         if budget is not None:
             return budget
@@ -297,8 +338,8 @@ class ProviderRuntime:
             return self.last_error or "unhealthy"
         return None
 
-    def admitting(self, now: float) -> bool:
-        return self.admission_block(now) is None
+    def admitting(self, now: float, upstream_id: str | None = None) -> bool:
+        return self.admission_block(now, upstream_id) is None
 
     # -- spend -------------------------------------------------------------
 

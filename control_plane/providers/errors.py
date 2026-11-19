@@ -67,6 +67,15 @@ class PullRefusedError(ProviderError):
         super().__init__(detail)
 
 
+class SignInError(ProviderError):
+    """A sign-in that could not finish. ``code`` is stable; ``message`` says what to do."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class UpstreamError(ProviderError):
     """An error from the upstream, with its status code and message preserved.
 

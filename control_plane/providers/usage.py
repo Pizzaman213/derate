@@ -123,3 +123,26 @@ class UsageSniffer:
             if usage is not None:
                 found = usage
         return found
+
+    def audio_duration_s(self) -> float | None:
+        """A Whisper-compatible transcription's top-level ``duration``, in
+        seconds, or None. What a per-minute audio price is charged on (K5r)."""
+        return audio_duration_of(bytes(self._buffer)) if not self._stream else None
+
+
+def audio_duration_of(raw: bytes) -> float | None:
+    """The top-level ``duration`` of a JSON body, when it is a finite,
+    non-negative number; None for anything else (audio bytes, no field)."""
+    if not raw or raw.lstrip()[:1] != b"{":
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    value = obj.get("duration") if isinstance(obj, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if value != value or value < 0 or value == float("inf"):
+        return None
+    return value

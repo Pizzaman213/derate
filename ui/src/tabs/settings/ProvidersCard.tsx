@@ -1,8 +1,11 @@
-import { Fragment, useState } from 'react'
+import { Fragment, useState, type MouseEvent } from 'react'
 import type { Provider, ProviderKind } from '../../api/types'
-import { useProviderKinds, useProviderSecretRefs, useProviders } from '../../state/resources'
+import { useProviderKinds, useProviderSecretRefs, useProviders, useRouting } from '../../state/resources'
 import { useBackend } from '../../state/backend'
 import { relativeTime } from '../../format'
+import { Disclosure } from '../../components/Panel'
+import { href, parse } from '../../state/routes'
+import { plainClick, useRouter } from '../../state/router'
 import {
   keyPlaceholder,
   keyStateNote,
@@ -12,6 +15,7 @@ import {
   type KeyMode,
 } from './keyfield'
 import { KeyField } from './KeyField'
+import { ProviderSignIn } from './ProviderSignIn'
 import { ProviderBackupPanel } from './ProviderBackupPanel'
 import { Select, type SelectOption } from '../../components/Select'
 
@@ -38,7 +42,14 @@ function isLocalUrl(url: string): boolean {
 
 export function ProvidersCard() {
   const providers = useProviders()
+  const routing = useRouting()
   const { backend, invalidate } = useBackend()
+  const { navigate } = useRouter()
+  const openHistory = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (!plainClick(event)) return
+    event.preventDefault()
+    navigate(parse(event.currentTarget.getAttribute('href') ?? '/usage/rate-limits'))
+  }
   const kinds = useProviderKinds()
   const secretRefs = useProviderSecretRefs()
   const [kind, setKind] = useState<ProviderKind>('openrouter')
@@ -65,11 +76,15 @@ export function ProvidersCard() {
   // our names it answers to -- so a third piece of row state rather than one
   // mode enum three things fight over.
   const [backupRow, setBackupRow] = useState<string | null>(null)
+  const [modelRows, setModelRows] = useState<Record<string, boolean>>({})
   const [keyRow, setKeyRow] = useState<string | null>(null)
   const [rowMode, setRowMode] = useState<KeyMode>('key')
   const [rowKey, setRowKey] = useState('')
   const [rowRef, setRowRef] = useState('')
   const [rowError, setRowError] = useState<string | null>(null)
+  // Bumped when a first sign-in is acknowledged, so the add form's sign-in
+  // starts over from its first step for the next one.
+  const [signInRun, setSignInRun] = useState(0)
 
   const list = providers.data ?? []
   const specs = kinds.data ?? []
@@ -77,6 +92,10 @@ export function ProvidersCard() {
   const offered = specs.filter((k) => !k.unsupported_reason)
   const knownRefs = secretRefs.data ?? []
   const needsKey = !spec || spec.requires_key
+  // A kind added by signing in: no address to edit, no key, no Add button.
+  const signingIn = spec?.sign_in ?? null
+  // Where Cancel on the sign-in lands: the first kind that takes a key.
+  const firstKeyKind = offered.find((k) => !k.sign_in)?.kind ?? 'openrouter'
   // Where a pasted key will land. The id is predicted the way the coordinator
   // mints it, so the card can name the reference rather than describe it.
   const destination = mintedRef(predictedProviderId(kind, list.map((p) => p.provider_id)))
@@ -89,18 +108,25 @@ export function ProvidersCard() {
     setKind(next)
     const target = specs.find((k) => k.kind === next)
     setBaseUrl(target?.base_url ?? '')
-    if (target && !target.requires_key) {
+    if (target && (!target.requires_key || target.sign_in)) {
       setApiKey('')
       setApiKeyRef('')
     }
   }
 
-  const remove = async (id: string) => {
+  const remove = async (p: Provider) => {
+    const id = p.provider_id
     setBusy(id)
     setError(null)
     try {
-      await backend.removeProvider(id)
+      const result = await backend.removeProvider(id)
       invalidate()
+      if (result?.revoked === false) {
+        setError(p.kind === 'claude_code'
+          ? 'Removed from derate. Remote Claude authorization was not revoked.'
+          : 'Signed out here, but OpenAI did not confirm revocation. Disconnect derate in ChatGPT Settings → Apps.',
+        )
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -180,8 +206,7 @@ export function ProvidersCard() {
 
   return (
     <div className="card2">
-      <h3>Providers</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         A key you paste is written to secrets.json at 0600 and only its reference is kept on the
         provider. Keys are resolved at request time and are never displayed, logged, or included
         in exports. Each row says whether its reference resolves and which of the environment and
@@ -198,19 +223,37 @@ export function ProvidersCard() {
               <th style={{ textAlign: 'right' }}>$/Mtok</th>
               <th style={{ textAlign: 'right' }}>Today</th>
               <th>State</th>
-              <th>Refreshed</th>
+              <th>Catalogue refreshed</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
             {list.map((p) => {
-              const state = p.admission_block ? (
-                <span style={{ color: 'var(--warn)' }}>{p.admission_block}</span>
-              ) : p.healthy ? (
-                'admitting'
-              ) : (
-                <span style={{ color: 'var(--fault)' }}>unhealthy</span>
-              )
+              const modelStatesOpen = modelRows[p.provider_id]
+                ?? p.models.some((m) => m.admitting === false)
+              const state =
+                p.healthy === false ? (
+                  <>
+                    <span style={{ color: 'var(--fault)' }}>unreachable</span>
+                    <div className="unit">
+                      {p.last_error}
+                      {p.retry_in_s != null && p.retry_in_s > 0 ? ` · retrying in ${Math.ceil(p.retry_in_s)} s` : ''}
+                    </div>
+                  </>
+                ) : p.admission_block ? (
+                  <>
+                    <span style={{ color: 'var(--warn)' }}>{p.admission_block}</span>
+                  </>
+                ) : p.last_error ? (
+                  <>
+                    <span style={{ color: 'var(--warn)' }}>retrying</span>
+                    <div className="unit">
+                      {p.last_error}
+                    </div>
+                  </>
+                ) : (
+                  'provider available'
+                )
 
               const today =
                 p.spend_today_usd == null
@@ -226,6 +269,7 @@ export function ProvidersCard() {
                   : '—'
 
               const editing = keyRow === p.provider_id
+              const signIn = specs.find((s) => s.kind === p.kind)?.sign_in ?? null
               const showingBackup = backupRow === p.provider_id
               const served = p.model_count ?? p.models.length
               const rotatesTo = mintedRef(p.provider_id)
@@ -238,7 +282,9 @@ export function ProvidersCard() {
                         a variable and a place -- and between them they are the
                         whole of what may be said about a key here. */}
                     <td className="unit">
-                      <div className="mono">{p.api_key_ref || '—'}</div>
+                      {/* A sign-in kind has no reference: the account it is
+                          signed in as is the name that says whose plan it is. */}
+                      <div className="mono">{signIn ? p.sign_in_account || '—' : p.api_key_ref || '—'}</div>
                       <div
                         style={{
                           color:
@@ -277,11 +323,15 @@ export function ProvidersCard() {
                     </td>
                     <td className="num">{price}</td>
                     <td className="num">{today}</td>
-                    <td className="unit">{state}</td>
+                    <td className="unit">
+                      {state}
+                      <div><a href={href({ ...parse('/usage/rate-limits'), fprovider: p.provider_id, win: '30d' })} onClick={openHistory}>Rate-limit history</a></div>
+                    </td>
                     <td className="unit">{p.last_refreshed ? relativeTime(p.last_refreshed) : '—'}</td>
                     <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                       <button
-                        style={{ padding: '3px 9px', marginRight: 6 }}
+                        type="button"
+                        style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
                         aria-expanded={showingBackup}
                         aria-controls={`pbackuprow-${p.provider_id}`}
                         onClick={() => setBackupRow(showingBackup ? null : p.provider_id)}
@@ -289,29 +339,98 @@ export function ProvidersCard() {
                         Backs up
                       </button>
                       <button
-                        style={{ padding: '3px 9px', marginRight: 6 }}
+                        type="button"
+                        style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
                         aria-expanded={editing}
                         aria-controls={`pkeyrow-${p.provider_id}`}
                         onClick={() => (editing ? closeKeyRow() : openKeyRow(p.provider_id))}
                       >
-                        {editing ? 'Cancel' : p.key_state === 'set' ? 'Replace key' : 'Set key'}
+                        {editing
+                          ? 'Cancel'
+                          : signIn
+                            ? 'Sign in again'
+                            : p.key_state === 'set'
+                              ? 'Replace key'
+                              : 'Set key'}
                       </button>
                       <button
-                        style={{ padding: '3px 9px' }}
-                        onClick={() => void remove(p.provider_id)}
+                        type="button"
+                        style={{ padding: 'var(--space-3) var(--space-9)' }}
+                        onClick={() => void remove(p)}
                         disabled={busy === p.provider_id}
                       >
                         {busy === p.provider_id ? 'Removing…' : 'Remove'}
                       </button>
                     </td>
                   </tr>
+                  {p.models.length > 0 ? (
+                    <tr>
+                      <td colSpan={8}>
+                        <Disclosure
+                          summary={`Model status for ${p.display_name}`}
+                          open={modelStatesOpen}
+                          onToggle={() => setModelRows((rows) => ({
+                            ...rows, [p.provider_id]: !modelStatesOpen,
+                          }))}
+                        >
+                          <table aria-label={`Model status for ${p.display_name}`}>
+                            <thead><tr><th>Model</th><th>State</th><th>Upstream error</th><th>History</th></tr></thead>
+                            <tbody>
+                              {p.models.map((m) => {
+                                const circuit = (routing.data ?? [])
+                                  .flatMap((c) => c.targets)
+                                  .find((t) => t.target_id === `${p.provider_id}:${m.upstream_id}`)?.circuit
+                                return (
+                                  <tr key={m.upstream_id}>
+                                    <td className="mono" style={{ overflowWrap: 'anywhere' }}>
+                                      {m.served_name}
+                                      {m.served_name !== m.upstream_id ? <div className="unit">{m.upstream_id}</div> : null}
+                                    </td>
+                                    <td className="unit" style={{ color: m.admitting === false ? 'var(--warn)' : 'var(--ink-muted)' }}>
+                                      {m.admission_block ?? (m.admitting == null ? 'state unknown' : m.admitting ? 'admitting' : 'not admitting')}
+                                      {circuit && circuit !== 'closed' ? <div>circuit {circuit.replace('_', ' ')}</div> : null}
+                                    </td>
+                                    <td className="unit" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+                                      {m.last_error ?? '—'}
+                                    </td>
+                                    <td><a
+                                      aria-label={`Rate-limit history for ${m.served_name}`}
+                                      onClick={openHistory}
+                                      href={href({
+                                        ...parse('/usage/rate-limits'), dep: m.served_name,
+                                        fprovider: p.provider_id,
+                                        ftarget: `${p.provider_id}:${m.upstream_id}`, win: '30d',
+                                      })}
+                                    >Rate limits</a></td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </Disclosure>
+                      </td>
+                    </tr>
+                  ) : null}
                   {editing ? (
                     <tr id={`pkeyrow-${p.provider_id}`}>
                       <td colSpan={8} style={{ background: 'var(--panel-recessed)' }}>
+                        {signIn ? (
+                          <ProviderSignIn
+                            key={`${signIn}:${p.provider_id}`}
+                            flow={signIn}
+                            providerId={p.provider_id}
+                            onDone={() => {
+                              closeKeyRow()
+                              invalidate()
+                            }}
+                            onCancel={closeKeyRow}
+                          />
+                        ) : (
+                        <>
                         <div
                           style={{
                             display: 'flex',
-                            gap: 8,
+                            gap: 'var(--space-8)',
                             alignItems: 'flex-end',
                             flexWrap: 'wrap',
                           }}
@@ -339,6 +458,7 @@ export function ProvidersCard() {
                             />
                           </div>
                           <button
+                            type="button"
                             onClick={() => void setKey(p)}
                             disabled={
                               busy === `key:${p.provider_id}` ||
@@ -353,13 +473,15 @@ export function ProvidersCard() {
                             className="label"
                             style={{
                               color: 'var(--fault)',
-                              marginTop: 8,
+                              marginTop: 'var(--space-8)',
                               whiteSpace: 'pre-wrap',
                             }}
                           >
                             {rowError}
                           </div>
                         ) : null}
+                        </>
+                        )}
                       </td>
                     </tr>
                   ) : null}
@@ -378,16 +500,18 @@ export function ProvidersCard() {
       </div>
       <div
         className="unit"
-        style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--rule)' }}
+        style={{ marginTop: 'var(--space-12)', paddingTop: 'var(--space-10)', borderTop: '1px solid var(--rule)' }}
       >
-        {spec && !spec.requires_key
+        {signingIn
+          ? `Signing in stores ${signingIn === 'claude' ? 'Claude' : 'ChatGPT'}'s tokens on the coordinator, in oauth.json at 0600, where they are refreshed. They are never displayed, logged, or included in exports. Requests routed to this provider use your ${signingIn === 'claude' ? 'Claude subscription' : 'ChatGPT plan'} allowance, not a key.`
+          : spec && !spec.requires_key
           ? `${spec.display_name} takes no key — it is a server you run, reached over the network. Only the address matters.`
           : keyMode === 'key'
             ? `Paste the key and it is stored on the coordinator, in secrets.json at 0600, under a reference. Only the reference is written to the provider record. Nothing sends the key back — there is no reveal control and adding one would be the bug.`
             : `A reference is the name of an environment variable or of a secrets.json key, never the key itself. It is resolved at request time and the value never leaves the coordinator.`}
       </div>
 
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginTop: 12, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'flex-end', marginTop: 'var(--space-12)', flexWrap: 'wrap' }}>
         <div className="fld">
           <label htmlFor="pkind">Provider</label>
           <Select
@@ -397,7 +521,7 @@ export function ProvidersCard() {
             onChange={chooseKind}
           />
         </div>
-        <div className="fld" style={{ flex: 1, minWidth: 180 }}>
+        <div className="fld" style={{ flex: 1, minWidth: 180, display: signingIn ? 'none' : undefined }}>
           <label htmlFor="pbase">Base URL</label>
           <input
             id="pbase"
@@ -407,7 +531,7 @@ export function ProvidersCard() {
             spellCheck={false}
           />
           {spec && isLocalUrl(baseUrl || spec.base_url) ? (
-            <div className="unit" style={{ marginTop: 4 }}>
+            <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
               This address is dialled from the coordinator, so localhost means the
               coordinator itself. For a server on another machine, use its address.
             </div>
@@ -421,7 +545,7 @@ export function ProvidersCard() {
             which is what they always were on the wire. */}
         <div
           className="fld"
-          style={{ flex: 1, minWidth: 220, display: needsKey ? undefined : 'none' }}
+          style={{ flex: 1, minWidth: 220, display: needsKey && !signingIn ? undefined : 'none' }}
         >
           <KeyField
             idPrefix="padd"
@@ -443,13 +567,29 @@ export function ProvidersCard() {
             destination={destination}
           />
         </div>
-        <button onClick={() => void add()} disabled={busy === '__add__'}>
-          {busy === '__add__' ? 'Adding…' : 'Add provider'}
-        </button>
+        {signingIn ? null : (
+          <button type="button" onClick={() => void add()} disabled={busy === '__add__'}>
+            {busy === '__add__' ? 'Adding…' : 'Add provider'}
+          </button>
+        )}
       </div>
 
+      {signingIn ? (
+        <div style={{ marginTop: 'var(--space-12)' }}>
+          <ProviderSignIn
+            key={`${signingIn}:${signInRun}`}
+            flow={signingIn}
+            onDone={() => {
+              invalidate()
+              setSignInRun((n) => n + 1)
+            }}
+            onCancel={() => chooseKind(firstKeyKind)}
+          />
+        </div>
+      ) : null}
+
       {error ? (
-        <div className="label" style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}>
+        <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}>
           {error}
         </div>
       ) : null}
