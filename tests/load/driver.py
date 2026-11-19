@@ -242,12 +242,17 @@ class Run:
         path = parts.path or "/"
 
         body = json.dumps(job["body"]).encode()
+        # The gateway's key (and cookie), as harness.GATEWAY_HEADERS holds
+        # them. Built into the one pre-encoded request like every other header,
+        # so authenticating costs the driver nothing per request.
+        extra = "".join(f"{k}: {v}\r\n" for k, v in job.get("headers", {}).items())
         self.request = (
             f"POST {path} HTTP/1.1\r\n"
             f"Host: {self.host}:{self.port}\r\n"
             "Content-Type: application/json\r\n"
             "Accept: */*\r\n"
             "Connection: keep-alive\r\n"
+            f"{extra}"
             f"Content-Length: {len(body)}\r\n"
             "\r\n"
         ).encode() + body

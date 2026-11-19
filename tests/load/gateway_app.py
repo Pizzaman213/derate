@@ -10,6 +10,15 @@ path (router, admission, breaker, proxy, parking, stats) is the shipping code.
 ``GET /loadprobe`` is the only addition. The harness cannot see the gateway's
 event loop from outside, and event-loop lag is the difference between "slower"
 and "fell over".
+
+The gateway answers ``/v1`` only to an API key and ``/api`` only to an admin
+session, so before it serves anything this creates the first admin through the
+real ``POST /api/setup/admin`` and writes the session cookie and the default
+key to ``--creds-out`` (mode 0600) for the harness and its drivers. Every
+request the load test sends therefore pays for authentication like a real
+client's does -- which is part of what is being measured. The data directory is
+a fresh temporary one unless ``DERATE_DATA_DIR`` names one, because setup is
+refused (410) on a directory that already has an admin.
 """
 
 from __future__ import annotations
@@ -18,6 +27,7 @@ import argparse
 import asyncio
 import json
 import os
+import tempfile
 import time
 from collections import deque
 
@@ -89,7 +99,8 @@ class LoadDeployments:
 
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
-        modality=Modality.TEXT, extra_args=(),
+        modality=Modality.TEXT, extra_args=(), custom_command=(), revision=None,
+        speculative_tokens=0,
     ) -> Deployment:
         raise NotImplementedError("the load harness does not launch deployments")
 
@@ -282,6 +293,11 @@ def main() -> None:
     parser.add_argument("--max-seqs", type=int, default=4096)
     parser.add_argument("--backlog", type=int, default=4096)
     parser.add_argument(
+        "--creds-out",
+        required=True,
+        help="where to write {authorization, cookie} for the harness (0600)",
+    )
+    parser.add_argument(
         "--settings",
         default="{}",
         help="JSON object of GatewaySettings field overrides",
@@ -294,12 +310,14 @@ def main() -> None:
             raise SystemExit(f"unknown GatewaySettings field: {key}")
         setattr(settings, key, value)
 
+    os.environ.setdefault("DERATE_DATA_DIR", tempfile.mkdtemp(prefix="derate-load-data-"))
     app = build_app(
         [b for b in args.backends.split(",") if b],
         settings=settings,
         context_length=args.context_length,
         max_seqs=args.max_seqs,
     )
+    _write_credentials(app, args.creds_out)
     uvicorn.run(
         app,
         host=args.host,
@@ -308,6 +326,32 @@ def main() -> None:
         access_log=False,
         backlog=args.backlog,
     )
+
+
+def _write_credentials(app, path: str) -> None:
+    """The first admin, through the real setup route, before uvicorn binds.
+
+    No lifespan runs for this one call -- setup touches only the auth and key
+    stores, which open on first use."""
+    from fastapi.testclient import TestClient
+
+    response = TestClient(app).post(
+        "/api/setup/admin",
+        json={"username": "loadtest", "email": "loadtest@derate.test", "password": "loadtest-password-0"},
+    )
+    if response.status_code != 200:
+        raise SystemExit(
+            f"load gateway setup answered {response.status_code}: {response.text} "
+            "(point DERATE_DATA_DIR at an empty directory)"
+        )
+    cookie = response.cookies.get("derate_session")
+    creds = {
+        "authorization": f"Bearer {response.json()['secret_once']}",
+        "cookie": f"derate_session={cookie}",
+    }
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(creds, handle)
 
 
 if __name__ == "__main__":

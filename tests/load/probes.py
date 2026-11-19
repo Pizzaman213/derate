@@ -361,7 +361,7 @@ def control_plane_interference(
     stop = threading.Event()
 
     def hammer() -> None:
-        with httpx.Client(timeout=20.0) as client:
+        with httpx.Client(timeout=20.0, headers=cluster.headers) as client:
             while not stop.is_set():
                 for path in ("/api/topology", "/api/routing", "/api/deployments"):
                     try:

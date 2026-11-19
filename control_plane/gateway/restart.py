@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from functools import partial
 
 from control_plane.contracts import Deployment, Verdict
+from control_plane.contracts.auth import AuditAction
 
 from .deps import GatewayContext
 from .internal_api import (
@@ -156,6 +157,10 @@ async def _attempt_relaunch(
                 modality=out.modality,
                 extra_args=deployment.extra_args,
                 custom_command=deployment.custom_command,
+                # The sha the human approved, not whatever the re-resolve
+                # found on `main` just now (M7).
+                revision=deployment.revision or out.revision,
+                speculative_tokens=getattr(deployment, "speculative_tokens", 0),
             )
         )
     except Exception as exc:
@@ -228,8 +233,8 @@ class RestartCoordinator:
         deployment_id = event.get("deployment_id")
         if not deployment_id:
             return
-        existing = self._state.get(served_name)
-        if existing is not None and existing.in_flight:
+        state = self._state.get(served_name)
+        if state is not None and state.in_flight:
             # A flapping health probe can fire this twice for one deployment;
             # one retry loop per served_name at a time.
             return
@@ -318,6 +323,10 @@ class RestartCoordinator:
         self, served_name, previous_deployment_id, attempt, outcome,
         new_deployment, detail,
     ) -> None:
+        if outcome == "launched":
+            self._audit_relaunch(
+                served_name, previous_deployment_id, attempt, new_deployment
+            )
         events = getattr(self._ctx, "events", None)
         if events is None:
             return
@@ -330,6 +339,32 @@ class RestartCoordinator:
             new_deployment_id=getattr(new_deployment, "deployment_id", None),
             reason=detail,
         )
+
+    def _audit_relaunch(
+        self, served_name, previous_deployment_id, attempt, new_deployment
+    ) -> None:
+        """A launch nobody clicked, in the audit chain beside the ones somebody
+        did (CAP-6). The telemetry event above is retention-trimmed; this row
+        is not, and it names the crashed deployment the relaunch replaced --
+        whose own launch row says who approved its flags in the first place."""
+        stores = getattr(self._ctx, "auth_stores", None)
+        new_id = getattr(new_deployment, "deployment_id", None)
+        if stores is None or not new_id:
+            return
+        try:
+            stores.auth.audit(
+                "system:restart",
+                AuditAction.DEPLOYMENT_LAUNCHED,
+                "deployment",
+                new_id,
+                after={
+                    "previous_deployment_id": previous_deployment_id,
+                    "attempt": attempt,
+                    "served_name": served_name,
+                },
+            )
+        except Exception:
+            log.exception("could not audit the relaunch of %s", served_name)
 
     def _emit_exhausted(
         self, served_name, previous_deployment_id, attempts, last_error
