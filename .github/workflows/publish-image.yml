@@ -240,6 +240,39 @@ jobs:
             type=ref,event=tag
             type=sha,format=long
 
+      # Scan before push. Nothing used to look at what the image contains, and
+      # by 2026-11-19 it was shipping a docker CLI built with a Go carrying 43
+      # stdlib CVEs (one critical), a starlette with three highs on the path
+      # that serves /assets/*, and pip, which nothing at runtime uses.
+      #
+      # amd64 only, loaded locally: it is native here, and the arm64 half has
+      # the same packages from the same Dockerfile. The build below reuses this
+      # one's layers through the gha cache.
+      #
+      # --ignore-unfixed is the gate being usable, not lenient: Debian carries
+      # hundreds of findings with no released fix, and a gate that fails on
+      # those fails every push until somebody deletes it. This fails on what a
+      # rebuild or a bump could actually fix. Trivy runs from its own image,
+      # pinned by digest, reading a saved tarball -- no docker socket handed to
+      # a third-party container, and no third-party action.
+      - name: Build for scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: derate-node:scan
+          cache-from: type=gha
+
+      - name: Scan for fixable CVEs
+        run: |
+          mkdir -p "$RUNNER_TEMP/scan"
+          docker save derate-node:scan -o "$RUNNER_TEMP/scan/node.tar"
+          docker run --rm -v "$RUNNER_TEMP/scan:/img:ro" \
+            aquasec/trivy:0.58.1@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
+            image --input /img/node.tar --scanners vuln \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1
+
       - uses: docker/build-push-action@v6
         with:
           context: .

@@ -51,7 +51,11 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
- && pip install --no-cache-dir "sparkrun==${SPARKRUN_VERSION}"
+ && pip install --no-cache-dir "sparkrun==${SPARKRUN_VERSION}" \
+ && python -m pip uninstall -y pip
+# pip leaves the venv once it has done its job. Nothing at runtime installs a
+# package -- not derate, not sparkrun (its one mention of pip is a help string)
+# -- so shipping it is only shipping pip's own CVEs.
 
 # ---------------------------------------------------------------------------
 # Stage 3: the runtime image.
@@ -68,15 +72,26 @@ FROM python:3.12-slim
 #      the developer's machine has git and the registry is already cloned.
 # iproute2: interface inspection for the host-networking preflight and for
 #           reporting ConnectX-7 topology.
-# curl: the container healthcheck.
+# curl: the container healthcheck, and sparkrun's own model_sync.sh and
+#       nv_monitor_wrapper.sh, which it runs locally rather than over SSH when
+#       the target host is this one.
+#
+# `apt-get upgrade` first: the base image is rebuilt on its own schedule, and
+# a Debian security fix published since then (zlib1g, apt) otherwise waits for
+# it. This layer already resolves to whatever is current, so the upgrade costs
+# no reproducibility it had.
+#
+# The base image's own pip goes too, for the reason given in the deps stage.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
       openssh-client \
       git \
       iproute2 \
       curl \
       ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall -y pip
 
 # The docker CLI -- the client only, never the daemon. sparkrun starts the
 # runtime container by running `docker` itself: containers/registry.py asks
@@ -96,20 +111,32 @@ RUN apt-get update \
 # never start. The upstream static bundle is one binary, extracted alone --
 # 40 MB on disk, ~18 MB in the layer.
 #
-# Pinned, and pinned to what this fleet's daemons run (29.2.1). The CLI
-# negotiates the API version down to whatever daemon answers, so a newer client
-# would work; a pin that matches is one less thing to be surprised by, and an
-# unpinned URL would make the image un-rebuildable.
-ARG DOCKER_CLI_VERSION=29.2.1
+# Pinned, and pinned for its Go toolchain rather than to the fleet's daemons.
+# The binary statically links Go's stdlib, so its crypto/tls, net/http and
+# x509 are whatever Go it was built with: 29.2.1 (go1.25.6) carried 43
+# stdlib CVEs, one critical, into this image. 29.10.0 is built with go1.27.4.
+# The CLI negotiates the API version down to whatever daemon answers, so the
+# fleet's 29.2.1 daemons are unaffected. Re-scan the image when bumping.
+#
+# Checksummed, because the image runs this binary against the host's docker
+# socket. Docker publishes no checksum file for the static bundles; these were
+# taken 2026-11-19 from both docker-29.10.0.tgz downloads. Bump all three
+# together.
+ARG DOCKER_CLI_VERSION=29.10.0
+ARG DOCKER_CLI_SHA256_AMD64=7c1ebadc65c716cdc6d35fc78759ed0e4317debf43c21dd12f066f2006999def
+ARG DOCKER_CLI_SHA256_ARM64=6e5159e8b5615e0c0c2954a2a1a2a12bc65f5d9b603595dba24a10cb367408cd
 ARG TARGETARCH
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) arch=x86_64 ;; \
-      arm64) arch=aarch64 ;; \
+      amd64) arch=x86_64;  sum="$DOCKER_CLI_SHA256_AMD64" ;; \
+      arm64) arch=aarch64; sum="$DOCKER_CLI_SHA256_ARM64" ;; \
       *) echo "no static docker CLI is published for $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://download.docker.com/linux/static/stable/$arch/docker-${DOCKER_CLI_VERSION}.tgz" \
-      | tar -xzf - -C /usr/local/bin --strip-components=1 docker/docker; \
+      -o /tmp/docker-cli.tgz; \
+    echo "$sum  /tmp/docker-cli.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/docker-cli.tgz -C /usr/local/bin --strip-components=1 docker/docker; \
+    rm /tmp/docker-cli.tgz; \
     docker --version
 
 COPY --from=deps /opt/venv /opt/venv
