@@ -1,6 +1,6 @@
 # spend
 
-The Spend screen's arithmetic, kept out of the component so it can be checked
+The Usage overview's arithmetic, kept out of the component so it can be checked
 against a live coordinator rather than only typechecked. Everything here is
 pure.
 
@@ -16,8 +16,33 @@ and the tile said "spent today" over both. `providers/runtime.py` had counted
 
 | File | Lines | What it owns |
 |---|---|---|
-| `rows.ts` | 224 | `SpendBasis`, `cloudSpend`, `fleetSpend`, `cloudTokens`, `publishedRange`, `formatRange`, `money`, `spendCaption`, `spendNotes`, `basisNote` |
-| `rows.check.mjs` | 256 | 35 hermetic checks plus a pass over every provider the live coordinator serves. `// requires: coordinator` |
+| `rows.ts` | 179 | `SpendBasis`, `cloudSpend`, `fleetSpend`, `publishedRange`, `formatRange`, `money`, `basisNote` — the By target rate card |
+| `rows.check.mjs` | 234 | 28 hermetic checks plus a pass over every provider the live coordinator serves. `// requires: coordinator` |
+| `usage.ts` | 213 | The window above By target: `startFor`/`bucketFor`/`windowLabel` for `?win=`, `windowTotals`, `costSeries`, `totalsNotes`, `totalsBasis`, and the table helpers `bySpend`, `capRows`, `share`, `shareTitle`, `floorOf`, `cachedTitle`, `budgetOf`, `budgetText`, `kindByModel` |
+| `usage.check.mjs` | 162 | 41 hermetic checks on literal `/api/usage` rows. No `// requires:` line |
+
+## `usage.ts`
+
+Everything on `/usage` (the overview) above By target reads `GET /api/usage` over the URL's
+window (`?win=24h|7d|30d|all`, default `all`, which asks for `-400d` — the 1d
+rollups' retention in `telemetry/config.py`). Three reads: `group_by=provider` for
+the totals and the two cost charts, `key_id` and `model,provider` for
+the two tables, which fold through `keys/rows.ts::breakdown`.
+
+**A local target's provider is `""` on the wire, not null.** The rollups store
+every group column as `value or ""` (`telemetry/retention.py`), so
+`group.provider` for a local request is the empty string; `isLocal` accepts
+either, and `breakdown` reads a `""` key or model as `—` rather than a
+link to nothing.
+
+`/api/usage` already nulls every measure nothing
+reported and `cost_usd` when nothing in a bucket was priced; every sum here keeps
+that (`addNullable`), so a key that only hit unpriced models reads `—`, and a
+total with priced dollars over unpriced requests reads `≥` (`floor`, `floorOf`).
+
+Local dollars here are what was recorded per request — `PricingStore` price rows
+(Settings → Pricing) — not the electricity-derived `cost_per_mtok` By target
+shows, so the same local model can carry two different figures on one screen.
 
 ## `rows.ts`
 
@@ -38,10 +63,8 @@ traffic sitting under the figure unpriced means `usd` is a lower bound, and
 known, seeds `usd` from `null` rather than `0`, and pushes a provider onto
 `blindProviders` only when its basis is `unpriced` — a non-accounting port may
 have had no traffic at all, which is a different claim and must not be printed as
-missing money. `spendCaption` and `spendNotes` then name both exclusions — an
-unset electricity rate and unpriced cloud models — from the same code, so
-neither can be forgotten alone. The header names its verifier `spend.check.mjs`;
-the file on disk is `rows.check.mjs`.
+missing money. The header names its verifier `spend.check.mjs`; the file on disk
+is `rows.check.mjs`.
 
 ## `rows.check.mjs`
 
@@ -51,7 +74,7 @@ payload *means*. A green `tsc` says `spend_today_usd` is a number. It cannot say
 the number is knowledge, and that distinction is the whole module.
 
 It bundles `rows.ts` with esbuild's JS API — not the launcher under
-`node_modules/.bin`, which is a POSIX script with no `.cmd` twin — then runs 35
+`node_modules/.bin`, which is a POSIX script with no `.cmd` twin — then runs 28
 hermetic checks over four sections: the `$0.00`-that-is-not-a-zero cases,
 metered versus estimated (including a pre-metering record whose
 `metered_requests_today` key is absent rather than zero, which must read as
@@ -66,18 +89,17 @@ its own column, and `--strict` turns that into a failure. And it used to assert
 `provs.length > 0` — turning "the operator has not added a provider yet" into a
 test failure — then read `provs[0]` anyway and crash.
 
-## The seam with `SpendTab.tsx`
+## The seam with `OverviewSub.tsx`
 
-`SpendTab.tsx` is the only consumer, and imports nine names plus the
-`SpendBasis` type:
+`OverviewSub.tsx` is the only consumer of both modules. From `rows.ts` it takes
+what By target needs:
 
 ```tsx
-import type { SpendBasis } from './spend/rows'
-import {
-  basisNote, cloudSpend, cloudTokens, fleetSpend, formatRange,
-  money, publishedRange, spendCaption, spendNotes,
-} from './spend/rows'
+import type { SpendBasis } from './rows'
+import { basisNote, cloudSpend, fleetSpend, formatRange, money, publishedRange } from './rows'
 ```
+
+and everything in `usage.ts` for the window card and the three tables.
 
 The wire side is `useProviders()` from `state/resources.ts` against
 `GET /api/providers`. The verifier reads the same route directly and asserts the
@@ -102,11 +124,6 @@ on the reasoning that decode dominates a serving workload, so the screen quotes
 the number the system acts on rather than a second opinion computed beside it.
 The input rate is a fallback only where a model publishes that and nothing else.
 
-**`cloudTokens` is the output half, never input + output.** A local target's
-`counters.total_tokens` is filled by `gateway/proxy.py` from the completion count
-alone; summing both halves here would make one "tokens generated" tile compare a
-cloud number against a local one measuring something else.
-
 **`$0.000` and `—` are different answers.** A free model publishes a price of
 zero and that is knowledge; an unpriced one publishes nothing. `formatRange`
 returns the em dash only for the second, and the verifier checks both.
@@ -123,11 +140,9 @@ model does not read as an unpriced one.
   `unknown`, `usd` is null, and nothing is added to `blindProviders` — there may
   be no traffic behind it at all.
 - **Every request unpriced.** `usd` is null and basis is `unpriced`. The provider
-  is named in `blindProviders`, the fleet total is marked a floor, and
-  `spendNotes` says how many requests went to models that provider publishes no
-  price for.
+  is named in `blindProviders` and the fleet total is marked a floor.
 - **Some requests unpriced.** The figure is real and `floor` is true, so it
-  renders `≥ $x.xx` and the caption lists the exclusion.
+  renders `≥ $x.xx`.
 - **An empty fleet, or a fresh install with no providers.** `fleetSpend([]).usd`
   is `null`, not `$0.00`. The verifier treats a provider-less coordinator as a
   real state and checks that case rather than demanding it away.
@@ -143,7 +158,7 @@ model does not read as an unpriced one.
 no single rate, and the midpoint is a number nobody is ever charged, so
 `formatRange` prints `$0.120–$6.000` instead.
 
-**A "saved versus all-cloud" tile.** `SpendTab.tsx` records it as one of two
+**A "saved versus all-cloud" tile.** `OverviewSub.tsx` records it as one of two
 inventions from `mockups-next/js/spend.js` that are dead on arrival: it rested on
 a `0.0009 Mtok/request × $0.60` constant that exists nowhere on the real wire.
 "Tokens generated" replaced it with a real sum. The other was a "managed remote"
