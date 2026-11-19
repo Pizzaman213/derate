@@ -2473,6 +2473,7 @@ class ProviderService:
                 "include_usage": True,
             }
 
+        url = join_url(entry.provider.base_url, endpoint)
         return entry, url, headers, payload
 
     def _prepare_responses(
