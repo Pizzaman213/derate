@@ -23,7 +23,7 @@ export function InstalledModelsCard({
   return (
     <div className="card2">
       <h3>Installed models</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         Model weights already downloaded onto this cluster, per node. Freed or
         deleted from Settings → Storage.
       </div>
@@ -39,7 +39,7 @@ export function InstalledModelsCard({
       {error ? (
         <div
           className="label"
-          style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}
+          style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}
         >
           {error.message}
         </div>

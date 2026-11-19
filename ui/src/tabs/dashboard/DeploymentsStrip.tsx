@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { Icon } from '../../components/Icon'
 import { isAudio } from '../../api/types'
 import type { DeploymentDTO, RoutingConfig, TopologyDeployment } from '../../api/types'
 import { useBackend } from '../../state/backend'
@@ -31,8 +32,8 @@ interface Props {
  *  name, the same plan and a 0 tok/s readout the frame never sent. The strip
  *  has no vocabulary for "over" -- there is no band, no state column, and the
  *  stop button simply vanishes -- so a stopped deployment drew as an ordinary
- *  serving row. `runners()` is `cluster/layout.ts`'s, which is
- *  `models/rows.ts`'s `TERMINAL`: the floor and this strip must not disagree
+ *  serving row. `runners()` is `models/rows.ts`'s, which filters
+ *  its own `TERMINAL`: the floor and this strip must not disagree
  *  about whether a model is running. Stopping is kept -- it is winding down
  *  but still holds its machines. */
 export function DeploymentsStrip({
@@ -102,11 +103,23 @@ export function DeploymentsStrip({
           <div
             key={d.deployment_id}
             className={`deprow${sel ? ' sel' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-pressed={sel}
+            aria-label={`${d.served_name}: select; Enter or double-click for detail`}
             onClick={() => selection.selectDep(d.served_name)}
             onDoubleClick={openDetail}
+            // The row holds its own stop/detail buttons, so it cannot itself be
+            // a <button>; role + tabIndex + keys give it the same keyboard
+            // contract: Space selects, Enter opens the detail.
+            onKeyDown={(e) => {
+              if (e.target !== e.currentTarget) return
+              if (e.key === 'Enter') { e.preventDefault(); openDetail() }
+              if (e.key === ' ') { e.preventDefault(); selection.selectDep(d.served_name) }
+            }}
             title="Double-click for detail"
           >
-            <span className="mono" style={{ fontSize: 13 }}>
+            <span className="mono" style={{ fontSize: 'var(--size-label)' }}>
               {d.served_name}
             </span>
             <span className="unit">
@@ -129,8 +142,9 @@ export function DeploymentsStrip({
               {targets == null ? '—' : targets} target{targets === 1 ? '' : 's'}
               {d.state !== 'stopping' && d.state !== 'stopped' ? (
                 <button
+                  type="button"
                   className="ghost dets"
-                  style={{ padding: '1px 5px', marginLeft: 4 }}
+                  style={{ padding: 'var(--space-1) var(--space-5)', marginLeft: 'var(--space-4)' }}
                   disabled={stopping === d.deployment_id}
                   onClick={(e) => {
                     e.stopPropagation()
@@ -142,15 +156,16 @@ export function DeploymentsStrip({
                 </button>
               ) : null}
               <button
+                type="button"
                 className="ghost dets"
-                style={{ padding: '1px 5px', marginLeft: 4 }}
+                style={{ padding: 'var(--space-1) var(--space-5)', marginLeft: 'var(--space-4)' }}
                 onClick={(e) => {
                   e.stopPropagation()
                   openDetail()
                 }}
                 aria-label={`${d.served_name} detail`}
               >
-                ↗
+                <Icon name="external-link" size={12} decorative />
               </button>
             </span>
           </div>

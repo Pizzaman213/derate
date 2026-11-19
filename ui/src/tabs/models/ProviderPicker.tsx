@@ -53,7 +53,7 @@ export function ProviderPicker({
   return (
     <div className="fld">
       <label>Serving on</label>
-      <div style={{ display: 'grid', gap: 4 }}>
+      <div style={{ display: 'grid', gap: 'var(--space-4)' }}>
         {targets.map((p) => {
           const id = `pp-${p.provider_id}`
           return (
@@ -66,7 +66,7 @@ export function ProviderPicker({
                 onChange={() => onChoose(p.provider_id)}
               />
               <label htmlFor={id}>
-                <span style={{ display: 'grid', gap: 2 }}>
+                <span style={{ display: 'grid', gap: 'var(--space-2)' }}>
                   <span>
                     <span className="mono">{p.display_name}</span>{' '}
                     {/* Hollow when the last refresh failed: the box is still a

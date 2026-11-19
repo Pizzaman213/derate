@@ -334,7 +334,7 @@ export function QuantLadder({
 
   return (
     <>
-      <p className="unit" style={{ margin: '0 0 8px' }}>
+      <p className="unit" style={{ margin: '0 0 var(--space-8)' }}>
         {!onCluster ? (
           <>
             Sizes are the measured download. Nothing here is judged by the fit gate:
@@ -545,7 +545,7 @@ export function QuantLadder({
           </p>
         ) : null}
         {recommendedVariant ? null : (
-          <p className="unit" style={{ margin: '4px 0 0' }}>
+          <p className="unit" style={{ margin: 'var(--space-4) 0 0' }}>
             {!onCluster
               ? servable.length
                 ? // Not "the gateway recommended nothing": it recommends for a
@@ -602,7 +602,7 @@ export function QuantLadder({
           somebody may be looking for one, and a list that quietly drops most of
           a repository is lying about the repository. */}
       {reference.length ? (
-        <div style={{ marginTop: 10 }}>
+        <div style={{ marginTop: 'var(--space-10)' }}>
           <Disclosure
             summary={
               onCluster
@@ -612,7 +612,7 @@ export function QuantLadder({
             open={showReference}
             onToggle={() => setShowReference(!showReference)}
           >
-            <p className="unit" style={{ margin: '0 0 8px' }}>
+            <p className="unit" style={{ margin: '0 0 var(--space-8)' }}>
               {/* The group's own note only describes it under the cluster
                   runtimes, where the reference rows are the GGUFs and the note
                   is about GGUF repositories. Under a provider runtime the
@@ -678,7 +678,7 @@ export function QuantLadder({
             fontWeight: 400,
             color: 'var(--fault)',
             whiteSpace: 'pre-wrap',
-            marginTop: 8,
+            marginTop: 'var(--space-8)',
           }}
         >
           {launchError}
@@ -688,7 +688,7 @@ export function QuantLadder({
       {/* Not a footnote anyone should be able to miss: the ladder is built
           from repository and file names, which is the only signal most
           quantizers leave. */}
-      <p className="unit" style={{ marginTop: 8 }}>
+      <p className="unit" style={{ marginTop: 'var(--space-8)' }}>
         {ladder.note}
       </p>
     </>
@@ -701,19 +701,19 @@ export function QuantLadder({
 function Skeleton() {
   return (
     <div aria-busy="true" aria-live="polite">
-      <p className="unit" style={{ margin: '0 0 8px' }}>
+      <p className="unit" style={{ margin: '0 0 var(--space-8)' }}>
         Looking for quantizations…
       </p>
       {[0, 1, 2].map((i) => (
         <div
           key={i}
           className="deprow"
-          style={{ gridTemplateColumns: '1fr 2fr auto', opacity: 0.38 }}
+          style={{ gridTemplateColumns: '1fr 2fr auto', opacity: 'var(--opacity-38)' }}
           aria-hidden
         >
-          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 2 }} />
-          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 2 }} />
-          <span style={{ background: 'var(--panel-sunk)', height: 12, width: 48, borderRadius: 2 }} />
+          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 'var(--radius-sm)' }} />
+          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 'var(--radius-sm)' }} />
+          <span style={{ background: 'var(--panel-sunk)', height: 12, width: 48, borderRadius: 'var(--radius-sm)' }} />
         </div>
       ))}
     </div>
@@ -754,10 +754,15 @@ function Served({
         ? 'fault'
         : 'warn'
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-6)' }}>
       <Lamp signal={signal} label={`${dep.served_name}: ${dep.state}`} />
       <span className="unit">{dep.served_name}</span>
       <span className="unit">{dep.state}</span>
+      {dep.revision ? (
+        <span className="mono unit" title={`pinned to revision ${dep.revision}`}>
+          @{dep.revision.slice(0, 7)}
+        </span>
+      ) : null}
       {dep.last_error ? (
         <span className="unit" style={{ color: 'var(--fault)' }} title={dep.last_error}>
           — {dep.last_error}
@@ -829,13 +834,13 @@ function Consequence({ variant }: { variant: QuantVariant }) {
   return (
     <>
       {bits.length ? (
-        <p className="unit" style={{ margin: '4px 0 0' }}>
+        <p className="unit" style={{ margin: 'var(--space-4) 0 0' }}>
           {bits.join(' · ')}
         </p>
       ) : null}
       {blockedNow ? (
         <>
-          <p className="unit" style={{ margin: '4px 0 0' }}>
+          <p className="unit" style={{ margin: 'var(--space-4) 0 0' }}>
             This hardware holds it. What is resident right now is what blocks it:
           </p>
           <Verbatim text={variant.static_reason ?? ''} size="unit" />
@@ -921,7 +926,7 @@ function Pulled({ reply }: { reply: PullAccepted }) {
     return <span className="unit">already on {reply.checked_against}</span>
   }
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-6)', flexWrap: 'wrap' }}>
       <Lamp signal="warn" label={`pulling ${reply.model}`} />
       <span className="unit">
         pulling {gbytes(reply.download_bytes, 2)} GiB

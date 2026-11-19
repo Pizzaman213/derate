@@ -66,7 +66,7 @@ export function ParamBreakdownTable({ detail }: { detail: ModelDetail }) {
         </tbody>
       </table>
       {mtp > 0 && detail.capabilities.mtp.note ? (
-        <p className="unit" style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>
+        <p className="unit" style={{ marginTop: 'var(--space-6)', whiteSpace: 'pre-wrap' }}>
           {detail.capabilities.mtp.note}
         </p>
       ) : null}

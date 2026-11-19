@@ -1,5 +1,5 @@
 // Verifier for ollamaTarget.ts. There is no UI test runner here, so the rule
-// is the same as rows.check.mjs and layout.check.mjs: esbuild-bundle the module
+// is the same as rows.check.mjs: esbuild-bundle the module
 // and exercise it, because a green tsc says nothing about what the string is.
 //
 //   node ui/src/tabs/models/ollamaTarget.check.mjs

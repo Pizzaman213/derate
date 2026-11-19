@@ -24,6 +24,8 @@
 // covered by chat/rows.check.mjs, which already holds every row (speech
 // included) to its own endpoint heading.
 
+// First, for its side effect: logs in and authenticates every fetch below.
+import '../../check/auth.mjs'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { load, report } from '../../check/harness.mjs'

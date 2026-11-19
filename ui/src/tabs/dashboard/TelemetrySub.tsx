@@ -30,8 +30,8 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
   const selectedNode = nodes.find((n) => n.profile.node_id === selection.selNode)
 
   return (
-    <div style={{ display: 'grid', gap: 'var(--s-4)' }}>
-      <p className="unit" style={{ margin: '0 0 4px' }}>
+    <div style={{ display: 'grid', gap: 'var(--space-16)' }}>
+      <p className="unit" style={{ margin: '0 0 var(--space-4)' }}>
         {NOTE}
       </p>
 
@@ -54,6 +54,7 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
         <div className="chips">
           {nodes.map((n) => (
             <button
+              type="button"
               key={n.profile.node_id}
               aria-pressed={n.profile.node_id === selection.selNode}
               // Picking a Spark here selects it everywhere; it never toggles off.
@@ -95,7 +96,7 @@ export function TelemetrySub({ nodes, telemetry, selection }: Props) {
 
       <section>
         <h2>Per deployment</h2>
-        <p className="unit" style={{ margin: '-4px 0 10px' }}>
+        <p className="unit" style={{ margin: 'calc(-1 * var(--space-4)) 0 var(--space-10)' }}>
           {selection.selDep
             ? `Showing ${selection.selDep}. Selecting a model anywhere — the deployments strip or the cluster graph — changes this.`
             : 'Nothing is being served.'}

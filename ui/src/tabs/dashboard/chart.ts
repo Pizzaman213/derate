@@ -3,7 +3,7 @@ import type { TelemetryPoint } from '../../state/useTelemetry'
 
 // The arithmetic behind every chart, kept out of React and out of uPlot so
 // that `chart.check.mjs` can run it in node. There is no UI test runner here,
-// so the rule is the same as layout.ts and routes.ts: the part that can be
+// so the rule is the same as routes.ts: the part that can be
 // wrong silently is the part that gets verified.
 //
 // Three things in this file are the reason it exists at all:

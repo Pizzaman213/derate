@@ -85,7 +85,7 @@ export function CapabilityChips({ detail }: { detail: ModelDetail }) {
   if (!chips.length) return null
 
   return (
-    <div className="chips" style={{ marginBottom: 4 }}>
+    <div className="chips" style={{ marginBottom: 'var(--space-4)' }}>
       {chips.map((chip) => (
         <span key={chip.key} className="pill" title={chip.title}>
           {chip.text}

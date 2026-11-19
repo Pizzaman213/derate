@@ -23,7 +23,7 @@ export function HeadroomSub({ context, concurrency }: { context: number; concurr
   const cap = capacity.data
 
   return (
-    <div style={{ display: 'grid', gap: 'var(--s-4)' }}>
+    <div style={{ display: 'grid', gap: 'var(--space-16)' }}>
       <p className="unit" style={{ margin: 0 }}>
         The static ceiling is what this hardware could spend with nothing else running.
         Allocatable is what it can hand out at this moment, with the operating system and
@@ -39,7 +39,7 @@ export function HeadroomSub({ context, concurrency }: { context: number; concurr
         ) : nodes.length === 0 ? (
           <p className="unit">{memory.loading ? 'Reading memory…' : 'No node reported memory.'}</p>
         ) : (
-          <div style={{ display: 'grid', gap: 'var(--s-3)' }}>
+          <div style={{ display: 'grid', gap: 'var(--space-12)' }}>
             {nodes.map((n) => (
               <NodeCard key={n.node_id} report={n} />
             ))}
@@ -61,7 +61,7 @@ export function HeadroomSub({ context, concurrency }: { context: number; concurr
                 per model. Each row then carries its own, so the caption stops
                 claiming a single number rather than printing whichever row's
                 happened to be first. */}
-            <p className="unit" style={{ margin: '0 0 8px' }}>
+            <p className="unit" style={{ margin: '0 0 var(--space-8)' }}>
               {cap.context
                 ? `At ${cap.context.toLocaleString()} context and ${cap.concurrency} ` +
                   `${cap.concurrency === 1 ? 'sequence' : 'sequences'}, probed on ${cap.probed_node}.`
@@ -73,7 +73,7 @@ export function HeadroomSub({ context, concurrency }: { context: number; concurr
             <Best label="on idle hardware" side={cap.static ?? null} fallback={null} muted />
             <CapacityTable rows={cap.live?.rows ?? cap.static?.rows ?? []} />
             {cap.unresolved.length > 0 ? (
-              <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
+              <div style={{ marginTop: 'var(--space-10)', display: 'grid', gap: 'var(--space-6)' }}>
                 <div className="unit">not resolved, so not answered for</div>
                 {cap.unresolved.map((u) => (
                   <Verbatim key={u.model_id} text={`${u.model_id} — ${u.reason}`} size="label" />
@@ -81,7 +81,7 @@ export function HeadroomSub({ context, concurrency }: { context: number; concurr
               </div>
             ) : null}
             {cap.excluded.length > 0 ? (
-              <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
+              <div style={{ marginTop: 'var(--space-10)', display: 'grid', gap: 'var(--space-6)' }}>
                 <div className="unit">excluded from the budget</div>
                 {cap.excluded.map((e) => (
                   <Verbatim key={e.node_id} text={`${e.node_id} — ${e.reason}`} size="label" />
@@ -108,7 +108,7 @@ function Best({
 }) {
   if (!side) {
     return (
-      <p className="unit" style={{ margin: '0 0 6px' }}>
+      <p className="unit" style={{ margin: '0 0 var(--space-6)' }}>
         largest {label}: {fallback ? `unavailable — ${fallback}` : 'unavailable'}
       </p>
     )
@@ -120,8 +120,8 @@ function Best({
       style={{
         display: 'flex',
         alignItems: 'baseline',
-        gap: 10,
-        margin: '0 0 6px',
+        gap: 'var(--space-10)',
+        margin: '0 0 var(--space-6)',
         color: muted ? 'var(--ink-muted)' : 'var(--ink)',
       }}
     >
@@ -140,7 +140,7 @@ function Best({
 function CapacityTable({ rows }: { rows: CapacityRow[] }) {
   if (rows.length === 0) return null
   return (
-    <table style={{ width: '100%', marginTop: 8 }}>
+    <table style={{ width: '100%', marginTop: 'var(--space-8)' }}>
       <thead>
         <tr>
           <th style={{ textAlign: 'left' }}>Model</th>
@@ -154,7 +154,7 @@ function CapacityTable({ rows }: { rows: CapacityRow[] }) {
         {rows.map((r) => (
           // Dimmed, not reddened: a model that does not fit is excluded, not
           // faulted, and red here would compete with the real fault lamps.
-          <tr key={r.model_id} style={{ opacity: r.fits ? 1 : 0.62 }}>
+          <tr key={r.model_id} style={{ opacity: r.fits ? 1 : 'var(--opacity-62)' }}>
             <td className="mono">{r.label}</td>
             <td className="mono">
               {r.dtype ?? '—'}
@@ -188,15 +188,15 @@ function NodeCard({ report }: { report: MemoryReport }) {
   const noMemory = !report.addressable
 
   return (
-    <div className="panel" style={{ padding: 'var(--s-3)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <div className="panel" style={{ padding: 'var(--space-12)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
         <Lamp signal={noMemory ? 'idle' : signal} hollow label={noMemory ? 'no memory reported' : sev ?? 'no reading'} />
         <span className="label mono">{report.node_id}</span>
         {report.stale ? <span className="unit">last reading is stale</span> : null}
       </div>
 
       {noMemory ? (
-        <p className="unit" style={{ margin: '6px 0 0' }}>
+        <p className="unit" style={{ margin: 'var(--space-6) 0 0' }}>
           Reports no addressable memory, so nothing can be placed here and it is
           left out of the budget.
         </p>

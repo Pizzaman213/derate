@@ -15,32 +15,35 @@
 .setup-head {
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  padding: var(--s-4) var(--s-5);
+  gap: var(--space-12);
+  padding: var(--space-16) var(--space-24);
   border-bottom: 1px solid var(--rule);
 }
-.setup-wordmark { font-weight: 500; font-size: 18px; letter-spacing: -0.3px; }
+.setup-wordmark { font-weight: 500; font-size: var(--size-wordmark); letter-spacing: var(--tracking-tight); }
 .setup-where { margin-left: auto; }
 /* The monogram's solid stroke sits above its own bounding-box centre (the
    faint echo stroke below it does not carry the same visual weight), so
    centring the box against the wordmark leaves the mark looking high. Nudge
    it down to match derate.css's header, which does the same. */
-.setup-head svg { transform: translateY(2px); }
+.setup-head .brand-mark { width: 30px; height: 30px; margin: calc(-1 * var(--space-3)) 0 calc(-1 * var(--space-4)); transform: translateY(2px); }
 
-.setup-main { max-width: 660px; margin: 0 auto; padding: var(--s-7) var(--s-5) 96px; }
+/* derate.css styles every <main> as the app shell's centre column (a right
+   rule against the roster, overflow hidden). These pages have no roster, so
+   that rule is a stray vertical line beside a centred column: drop it. */
+.setup-main { max-width: 660px; margin: 0 auto; padding: var(--space-48) var(--space-24) var(--space-96); border-right: none; }
 
 /* The ledger: what is true so far, and a way back into any of it. */
 .setup-ledger {
   border-left: 2px solid var(--rule);
-  padding-left: var(--s-4);
-  margin-bottom: var(--s-6);
+  padding-left: var(--space-16);
+  margin-bottom: var(--space-32);
 }
 .setup-ledger:empty { display: none; }
 .setup-done {
   display: flex;
   align-items: baseline;
-  gap: var(--s-2);
-  padding: var(--s-2) 0;
+  gap: var(--space-8);
+  padding: var(--space-8) 0;
   border-bottom: 1px solid var(--rule);
 }
 .setup-done:last-child { border-bottom: 0; }
@@ -49,15 +52,15 @@
 .setup-detail { color: var(--ink-muted); font-size: var(--size-unit); }
 
 .setup h1 {
-  font-size: 26px;
+  font-size: var(--size-h1);
   font-weight: 500;
   line-height: 1.25;
-  letter-spacing: -0.2px;
-  margin: 0 0 var(--s-3);
+  letter-spacing: var(--tracking-snug);
+  margin: 0 0 var(--space-12);
   text-wrap: balance;
 }
-.setup-lede { margin: 0 0 var(--s-5); max-width: 52ch; }
-.setup-step { animation: setup-rise var(--dur) var(--ease, cubic-bezier(0.2, 0.7, 0.3, 1)) both; }
+.setup-lede { margin: 0 0 var(--space-24); max-width: 52ch; }
+.setup-step { animation: setup-rise var(--dur) var(--ease) both; }
 @keyframes setup-rise {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
@@ -69,18 +72,18 @@
   background: var(--fill);
   color: var(--on-fill);
   border-radius: var(--radius-lg);
-  padding: var(--s-5);
-  margin-bottom: var(--s-5);
+  padding: var(--space-24);
+  margin-bottom: var(--space-24);
 }
-.setup-plate-name { font-size: 22px; font-weight: 500; margin-bottom: var(--s-1); }
+.setup-plate-name { font-size: var(--size-plate); font-weight: 500; margin-bottom: var(--space-4); }
 .setup-plate-spec { color: var(--on-fill-dim); font-size: var(--size-label); }
-.setup-plate-caption { color: var(--on-fill-dim); font-size: var(--size-unit); margin-top: var(--s-4); }
+.setup-plate-caption { color: var(--on-fill-dim); font-size: var(--size-unit); margin-top: var(--space-16); }
 
-.setup-row { display: flex; align-items: center; gap: var(--s-3); flex-wrap: wrap; }
+.setup-row { display: flex; align-items: center; gap: var(--space-12); flex-wrap: wrap; }
 .setup-skip {
   background: none;
   border: 0;
-  padding: 6px 0;
+  padding: var(--space-6) 0;
   color: var(--ink-muted);
   font: inherit;
   font-size: var(--size-label);
@@ -92,42 +95,45 @@
 .setup-field {
   font: inherit;
   font-family: var(--font-mono);
-  font-size: 14px;
+  font-size: var(--size-mono-body);
   color: inherit;
   background: var(--panel-raised);
   border: 1px solid var(--edge);
   border-radius: var(--radius);
-  padding: 9px 12px;
+  padding: var(--space-9) var(--space-12);
   width: 100%;
 }
+/* A PasswordField around a setup field: the wrapper is the visible box
+   (base.css), so it takes the setup field's colours. */
+.pwfield:has(> .setup-field) { background: var(--panel-raised); border-color: var(--edge); }
 
 .setup-box {
   border: 1px solid var(--rule);
   border-radius: var(--radius-lg);
-  padding: var(--s-4);
-  margin: var(--s-5) 0;
+  padding: var(--space-16);
+  margin: var(--space-24) 0;
   background: var(--panel-recessed);
 }
-.setup-line { display: flex; align-items: center; gap: var(--s-3); padding: var(--s-2) 0; }
+.setup-line { display: flex; align-items: center; gap: var(--space-12); padding: var(--space-8) 0; }
 .setup-line + .setup-line { border-top: 1px solid var(--rule); }
-.setup-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+.setup-dot { width: 8px; height: 8px; border-radius: var(--radius-full); flex: 0 0 auto; }
 .setup-dot.on { background: var(--live-solid); }
 .setup-dot.off { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-muted); }
 .setup-who { font-weight: 500; font-size: var(--size-label); min-width: 118px; }
 .setup-says { color: var(--ink-muted); font-size: var(--size-unit); }
 
 /* Model picks. */
-.setup-picks { display: grid; gap: var(--s-3); margin-bottom: var(--s-5); }
+.setup-picks { display: grid; gap: var(--space-12); margin-bottom: var(--space-24); }
 .setup-pick {
   display: grid;
   grid-template-columns: 1fr auto;
-  gap: var(--s-4);
+  gap: var(--space-16);
   align-items: center;
   text-align: left;
   width: 100%;
   border: 1px solid var(--rule);
   border-radius: var(--radius-lg);
-  padding: var(--s-4);
+  padding: var(--space-16);
   background: var(--panel-raised);
   font: inherit;
   color: inherit;
@@ -135,7 +141,7 @@
 }
 .setup-pick:hover:not(:disabled) { background: var(--hover); border-color: var(--edge); }
 .setup-pick:disabled { cursor: not-allowed; opacity: 0.72; }
-.setup-pick-title { font-weight: 500; margin-bottom: 2px; }
+.setup-pick-title { font-weight: 500; margin-bottom: var(--space-2); }
 .setup-pick-desc { color: var(--ink-muted); font-size: var(--size-label); line-height: 1.4; max-width: 46ch; }
 .setup-facts {
   font-family: var(--font-mono);
@@ -146,7 +152,7 @@
   line-height: 1.7;
   font-variant-numeric: tabular-nums;
 }
-.setup-facts b { display: block; color: var(--ink); font-weight: 500; font-size: 14px; }
+.setup-facts b { display: block; color: var(--ink); font-weight: 500; font-size: var(--size-body-sm); }
 .setup-facts .no { color: var(--fault); }
 
 /* The one terminal command in the product. */
@@ -154,13 +160,13 @@
   background: var(--fill);
   color: var(--on-fill);
   border-radius: var(--radius-lg);
-  padding: var(--s-4);
-  margin: var(--s-4) 0;
+  padding: var(--space-16);
+  margin: var(--space-16) 0;
   display: flex;
   align-items: center;
-  gap: var(--s-3);
+  gap: var(--space-12);
 }
-.setup-cmd code { font-family: var(--font-mono); font-size: 14px; flex: 1; word-break: break-all; }
+.setup-cmd code { font-family: var(--font-mono); font-size: var(--size-mono-body); flex: 1; word-break: break-all; }
 .setup-cmd button { border-color: var(--on-fill-dim); color: var(--on-fill); }
 /* Derived from --on-fill, not written out: --fill and --on-fill trade places in
    dark mode, and a literal light hover would vanish on the light plate. */
@@ -171,15 +177,15 @@
   background: var(--panel-sunk);
   border: 1px solid var(--edge);
   border-radius: var(--radius-lg);
-  padding: var(--s-4);
+  padding: var(--space-16);
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  margin: var(--s-4) 0;
+  gap: var(--space-12);
+  margin: var(--space-16) 0;
 }
-.setup-endpoint code { font-family: var(--font-mono); font-size: 15px; flex: 1; word-break: break-all; }
+.setup-endpoint code { font-family: var(--font-mono); font-size: var(--size-body); flex: 1; word-break: break-all; }
 
-.setup-handoff { display: flex; gap: var(--s-5); align-items: center; margin: var(--s-4) 0; flex-wrap: wrap; }
+.setup-handoff { display: flex; gap: var(--space-24); align-items: center; margin: var(--space-16) 0; flex-wrap: wrap; }
 .setup-qr {
   width: 132px;
   height: 132px;
@@ -189,25 +195,33 @@
      most phone cameras will not read one, so the tile keeps the light palette's
      paper and ink in both themes. The border stays tokenised so it still sits
      in the page. */
-  background: #f7f4ee;
+  background: var(--qr-tile);
   border: 1px solid var(--rule);
   display: grid;
   place-items: center;
-  padding: 8px;
+  padding: var(--space-8);
 }
 .setup-qr svg { width: 100%; height: 100%; display: block; }
 
 .setup-note { font-size: var(--size-unit); color: var(--ink-muted); line-height: 1.45; }
 .setup-warn {
   border-left: 2px solid var(--warn-solid);
-  padding-left: var(--s-3);
-  margin: var(--s-4) 0;
+  padding-left: var(--space-12);
+  margin: var(--space-16) 0;
   font-size: var(--size-label);
   color: var(--ink-muted);
 }
 .setup-fault { border-left-color: var(--fault); }
+/* A launch failure's launcher dump, folded under derate's own sentence. Off
+   the plate, so the page's muted ink rather than .setup-log's --on-fill-dim,
+   and pre-wrap: the dump is line-structured and verbatim. */
+.setup-details { margin: 0 0 var(--space-16); font-size: var(--size-unit); color: var(--ink-muted); }
+.setup-details summary { cursor: pointer; }
+.setup-details .setup-log { color: var(--ink-muted); white-space: pre-wrap; margin: var(--space-8) 0 0; }
+/* The done screen's test reply: the model's own words, verbatim, as they stream. */
+.setup-reply { margin: var(--space-12) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-.setup-facts .setup-ctx{display:block; font-size:11px; color:var(--ink-muted); opacity:.85}
+.setup-facts .setup-ctx{display: block; font-size: var(--size-micro); color: var(--ink-muted); opacity: .85}
 
 /* ── Starting a model: real progress where there is any ──────────────────────
    Two bars, because there are two honest states and conflating them would mean
@@ -219,16 +233,16 @@
    estimate and plan around it. */
 .setup-bar {
   height: 6px;
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   background: var(--panel-sunk);
   border: 1px solid var(--rule);
   overflow: hidden;
-  margin: var(--s-3) 0 var(--s-2);
+  margin: var(--space-12) 0 var(--space-8);
 }
 .setup-bar span { display: block; height: 100%; }
 .setup-bar .is-known {
   background: var(--flow);
-  transition: width 600ms var(--ease, cubic-bezier(0.2, 0.7, 0.3, 1));
+  transition: width var(--dur-slow) var(--ease);
 }
 .setup-bar .is-open {
   width: 40%;
@@ -239,7 +253,7 @@
     var(--flow) 65%,
     transparent
   );
-  animation: setup-sweep 1.6s ease-in-out infinite;
+  animation: setup-sweep var(--dur-sweep) var(--ease-inout) infinite;
 }
 @keyframes setup-sweep {
   from { transform: translateX(-110%); }
@@ -253,12 +267,12 @@
 .setup-stage {
   display: flex;
   align-items: baseline;
-  gap: var(--s-2);
+  gap: var(--space-8);
   font-size: var(--size-label);
 }
 .setup-stage .dotting::after {
   content: '';
-  animation: setup-dots 1.4s steps(4, end) infinite;
+  animation: setup-dots var(--dur-dots) steps(4, end) infinite;
 }
 @keyframes setup-dots {
   0%   { content: ''; }
@@ -282,15 +296,15 @@
    happening, and what is still ahead. */
 .setup-phases {
   list-style: none;
-  margin: var(--s-3) 0 0;
+  margin: var(--space-12) 0 0;
   padding: 0;
   display: grid;
-  gap: var(--s-1);
+  gap: var(--space-4);
 }
 .setup-phase {
   display: flex;
   align-items: baseline;
-  gap: var(--s-2);
+  gap: var(--space-8);
   font-size: var(--size-label);
   color: var(--on-fill-dim);
 }
@@ -312,7 +326,7 @@
    breaks inside a word, because these lines are mostly paths and ids with no
    spaces to break at. */
 .setup-log {
-  margin-top: var(--s-3);
+  margin-top: var(--space-12);
   /* --on-fill-dim, not --ink-muted: this sits inside .setup-plate, which
      paints --fill and swaps ink for --on-fill. The page's muted ink on the
      plate's ground is the pairing that disappears in one of the two themes. */
