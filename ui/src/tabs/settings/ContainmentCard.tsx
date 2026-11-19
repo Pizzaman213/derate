@@ -114,12 +114,12 @@ export function ContainmentCard() {
         <span>Local only — never route to cloud providers</span>
       </label>
       {data ? (
-        <div className="unit" style={{ marginLeft: 24, marginTop: -3 }}>
+        <div className="unit" style={{ marginLeft: 'var(--space-24)', marginTop: 'calc(-1 * var(--space-3))' }}>
           {SOURCE_LABEL[data.sources.local_only]}
         </div>
       ) : null}
 
-      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginTop: 10, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 'var(--space-10)', alignItems: 'flex-start', marginTop: 'var(--space-10)', flexWrap: 'wrap' }}>
         <div className="fld" style={{ width: 150 }}>
           <label htmlFor="cap">Daily cap</label>
           <input
@@ -156,7 +156,7 @@ export function ContainmentCard() {
       </div>
 
       {error ? (
-        <div className="label" style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}>
+        <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}>
           {error}
         </div>
       ) : null}

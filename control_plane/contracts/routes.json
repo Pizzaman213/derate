@@ -377,6 +377,12 @@
       "methods": [
         "POST"
       ],
+      "path": "/api/setup/admin"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
       "path": "/api/setup/complete"
     },
     {

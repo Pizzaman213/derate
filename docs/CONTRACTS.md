@@ -609,7 +609,7 @@ the canonical value.
 
 ## HTTP surface
 
-### Coordinator gateway (79 routes)
+### Coordinator gateway (80 routes)
 
 | Method | Path |
 |---|---|
@@ -675,6 +675,7 @@ the canonical value.
 | GET | `/api/settings` |
 | PATCH | `/api/settings` |
 | GET | `/api/setup` |
+| POST | `/api/setup/admin` |
 | POST | `/api/setup/complete` |
 | GET | `/api/shell/status` |
 | GET | `/api/storage` |
