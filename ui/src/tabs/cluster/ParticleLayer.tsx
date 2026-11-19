@@ -26,7 +26,29 @@ export function ParticleLayer({ wires, routing }: { wires: Wire[]; routing: Rout
     )
     return (_served: string, t: RouteTarget) => byTarget.get(t.target_id) ?? null
   }, [wires])
-  const flows = useMemo(() => targetFlows(routing, frame?.deployments, stale, keyFor), [routing, frame, stale, keyFor])
+  // The outer legs, per served name: API Input to its split, its merge to
+  // API Output. A block walks them too, so a request is seen leaving the
+  // input and a response is seen reaching the output.
+  const legs = useMemo(() => {
+    const entry = new Map<string, string>()
+    const exit = new Map<string, string>()
+    const servedOf = new Map<string, string>()
+    for (const w of wires) {
+      if (!w.served) continue
+      servedOf.set(w.id, w.served)
+      if (w.kind === 'entry') entry.set(w.served, w.id)
+      if (w.kind === 'exit') exit.set(w.served, w.id)
+    }
+    return { entry, exit, servedOf }
+  }, [wires])
+  const flows = useMemo(
+    () =>
+      targetFlows(routing, frame?.deployments, stale, keyFor).map((f) => ({
+        ...f,
+        leadIn: legs.entry.get(legs.servedOf.get(f.pathKey) ?? '') ?? null,
+      })),
+    [routing, frame, stale, keyFor, legs],
+  )
   const streaming = useMemo(() => mostlyStreaming(streamingRatio(mix.data?.requests ?? [])), [mix.data])
   const streams = useMemo(
     () =>
@@ -40,8 +62,9 @@ export function ParticleLayer({ wires, routing }: { wires: Wire[]; routing: Rout
                 ? frame?.deployments?.find((d) => d.deployment_id === w.target_id)?.tokens_per_sec
                 : frame?.remotes?.find((r) => r.target_id === w.target_id)?.tokens_per_sec) ?? 0),
           streaming: w.served === selDep ? streaming : null,
+          leadOut: w.served ? (legs.exit.get(w.served) ?? null) : null,
         })),
-    [wires, frame, stale, selDep, streaming],
+    [wires, frame, stale, selDep, streaming, legs],
   )
   useParticleField({ layerRef, flows, streams, paths })
   return (

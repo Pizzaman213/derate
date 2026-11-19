@@ -45,12 +45,17 @@
 
 import { useEffect, useRef, type RefObject } from 'react'
 import type { MetricsDeploymentFrame, RouteTarget, RoutingConfig } from '../../api/types'
+import { WIRE_WEIGHT } from './sockets'
 
 /** The geometry a flight walks: an SVG `<path>`, or anything that answers
  *  the same two questions. The wiring editor hands its rendered wires in. */
 export interface PathLike {
   getTotalLength(): number
   getPointAtLength(distance: number): { x: number; y: number }
+  /** The path data, `d` -- an SVGPathElement answers it. A block is drawn on
+   *  a copy of its wire's own geometry, so it bends exactly where the wire
+   *  does. */
+  getAttribute(name: 'd'): string | null
 }
 
 /** A request in flight; output tokens leaving. The wire colours they ride. */
@@ -78,6 +83,9 @@ export interface TargetFlow {
   /** This target's EWMA of real request durations, seconds. Null until it has
    *  completed one. */
   meanDurationS: number | null
+  /** The wire walked BEFORE `pathKey` -- API Input to the split -- so a block
+   *  is seen leaving the input rather than appearing at the split. */
+  leadIn?: string | null
 }
 
 /** Every routing target's live contribution, for EVERY served name.
@@ -211,6 +219,9 @@ export interface StreamFlow {
    *  `streamTone` for why that is not the same clock as the rate above. Null
    *  when nothing on the wire says either way. */
   streaming: boolean | null
+  /** The wire walked AFTER `pathKey` -- the merge to API Output -- so a token
+   *  is seen arriving at the output rather than vanishing at the merge. */
+  leadOut?: string | null
 }
 
 /** Same drop-never-redirect rule as `collapseFlows`: a stream naming a path
@@ -243,56 +254,101 @@ export function mostlyStreaming(ratio: number | null): boolean | null {
  *  difference is carried by shape as well as hue, so it survives a
  *  colour-blind reader and a greyscale screenshot. */
 export function streamBlockWidth(streaming: boolean | null): number {
-  return streaming === true ? 6 : 11
+  return streaming === true ? Math.round(WIRE_WEIGHT * 0.75) : WIRE_WEIGHT * 2
 }
 
-/** One flight: a small rect walked along `path` over `durationMs`, then
- *  removed. `layer` is never touched by React -- this is the only thing that
- *  mutates it, and it does so with plain DOM calls so the flight keeps running
- *  through any number of parent re-renders. `onDone` fires exactly once, when
- *  the block leaves, so the caller's in-flight tally can drop. */
+/** One flight: a bar walked along `path` over `durationMs`, then removed.
+ *
+ *  The bar is a stretch of the wire itself: a copy of the wire's own path,
+ *  stroked at the wire's weight, with one dash `w` long showing. Moving it is
+ *  moving the dash. So at a corner it bends exactly as the wire bends, half on
+ *  each side, and never rotates, flips or sticks out of the wire -- the mark's
+ *  solid stroke sliding along its echo.
+ *
+ *  `layer` is never touched by React -- this is the only thing that mutates
+ *  it, and it does so with plain DOM calls so the flight keeps running through
+ *  any number of parent re-renders. `onDone` fires exactly once, when the bar
+ *  leaves, so the caller's in-flight tally can drop. */
 export function spawnParticle(
   layer: SVGGElement,
   path: PathLike,
   color: string,
   durationMs: number = FLIGHT_MS,
   onDone?: () => void,
-  /** Block size. The defaults are the inbound block; a narrower block is how
-   *  a streamed token reads as a sliver. */
-  w: number = 11,
-  h: number = 9,
+  /** Bar length along the wire, and its thickness across it. Thickness is
+   *  the wire's own weight, so a bar fills its wire exactly; a shorter bar is
+   *  how a streamed token reads as a sliver. */
+  w: number = WIRE_WEIGHT * 2,
+  h: number = WIRE_WEIGHT,
 ): void {
   const total = path.getTotalLength()
-  if (!(total > 0)) {
+  const d = path.getAttribute('d')
+  if (!(total > 0) || !d) {
     onDone?.()
     return
   }
   const NS = 'http://www.w3.org/2000/svg'
-  const box = document.createElementNS(NS, 'rect')
-  box.setAttribute('width', String(w))
-  box.setAttribute('height', String(h))
-  box.setAttribute('rx', '1.5')
-  box.setAttribute('fill', color)
-  layer.appendChild(box)
+  const bar = document.createElementNS(NS, 'path')
+  bar.setAttribute('d', d)
+  bar.setAttribute('fill', 'none')
+  bar.setAttribute('stroke', color)
+  bar.setAttribute('stroke-width', String(h))
+  // Square like the wire: flat ends, mitred where it bends.
+  bar.setAttribute('stroke-linecap', 'butt')
+  bar.setAttribute('stroke-linejoin', 'miter')
+  // One dash, then a gap longer than the whole wire, so only one shows.
+  bar.setAttribute('stroke-dasharray', `${w} ${total + w}`)
+  layer.appendChild(bar)
 
   const t0 = performance.now()
   const span = Math.max(1, durationMs)
 
   const step = (now: number) => {
     const p = Math.min((now - t0) / span, 1)
-    const at = path.getPointAtLength(p * total)
-    box.setAttribute('x', String(at.x - Math.floor(w / 2)))
-    box.setAttribute('y', String(at.y - Math.floor(h / 2)))
+    // The dash's centre sits `p` of the way along the wire.
+    bar.setAttribute('stroke-dashoffset', String(w / 2 - p * total))
     // A parent unmount can detach `layer` before this flight finishes; the
-    // rect just keeps walking off-tree for the rest of its span and is
+    // bar just keeps walking off-tree for the rest of its span and is
     // garbage the moment the callback stops, so there is nothing to guard.
     if (p < 1) requestAnimationFrame(step)
     else {
-      box.remove()
+      bar.remove()
       onDone?.()
     }
   }
   requestAnimationFrame(step)
+}
+
+/** One block across several wires end to end: a request from API Input
+ *  through the split to its target, a response from the target through the
+ *  merge to API Output. `durationMs` is the whole journey and is shared out by
+ *  length, so the block keeps one speed across every leg and never jumps at a
+ *  join. A leg with no path is skipped rather than ending the journey early.
+ *  `onDone` fires once, after the last leg. */
+export function spawnJourney(
+  layer: SVGGElement,
+  legs: (PathLike | null | undefined)[],
+  color: string,
+  durationMs: number,
+  onDone?: () => void,
+  w?: number,
+  h?: number,
+): void {
+  const real = legs.filter((l): l is PathLike => l != null && l.getTotalLength() > 0)
+  if (real.length === 0) {
+    onDone?.()
+    return
+  }
+  const total = real.reduce((sum, l) => sum + l.getTotalLength(), 0)
+  const walk = (i: number) => {
+    const leg = real[i]
+    if (!leg) {
+      onDone?.()
+      return
+    }
+    spawnParticle(layer, leg, color, (durationMs * leg.getTotalLength()) / total, () => walk(i + 1), w, h)
+  }
+  walk(0)
 }
 
 export interface ParticleFieldOptions {
@@ -344,7 +400,8 @@ export function useParticleField(opts: ParticleFieldOptions): void {
         const pts = latest.current.paths[key]
         if (!pts) continue
         active.set(key, running + 1)
-        spawnParticle(layer, pts, REQUEST_COLOUR, flightMs(flow.meanDurationS), () => {
+        const lead = flow.leadIn ? latest.current.paths[flow.leadIn] : null
+        spawnJourney(layer, [lead, pts], REQUEST_COLOUR, flightMs(flow.meanDurationS), () => {
           active.set(key, Math.max(0, (active.get(key) ?? 1) - 1))
         })
       }
@@ -359,14 +416,12 @@ export function useParticleField(opts: ParticleFieldOptions): void {
         // No onDone and no tally: the population is not the measurement here,
         // the rate is, so there is nothing to count back down.
         if (emit) {
-          spawnParticle(
-            layer,
-            pts,
-            RESPONSE_COLOUR,
-            STREAM_FLIGHT_MS,
-            undefined,
-            streamBlockWidth(s.streaming),
-          )
+          // Constant speed: STREAM_FLIGHT_MS is the return leg's own span, so
+          // the leg out to API Output adds time in proportion to its length.
+          const out = s.leadOut ? latest.current.paths[s.leadOut] : null
+          const back = pts.getTotalLength()
+          const span = out && back > 0 ? (STREAM_FLIGHT_MS * (back + out.getTotalLength())) / back : STREAM_FLIGHT_MS
+          spawnJourney(layer, [pts, out], RESPONSE_COLOUR, span, undefined, streamBlockWidth(s.streaming))
         }
       }
     }, TOPUP_MS)
