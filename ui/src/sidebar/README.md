@@ -160,7 +160,7 @@ The selected deployment's shape and the planner's own words for it.
 `cluster.data.deployments` by it and takes `runners(named)[0]`.
 
 **The ledger keeps every attempt, so one served name can match several rows.**
-`runners()` (from `tabs/cluster/layout.ts`) drops the terminal states, so the
+`runners()` (from `tabs/models/rows.ts`) drops the terminal states, so the
 row shown is a live one — a failed attempt's plan is not what the cluster is
 running, and rendering it here attributes machines to nobody.
 
@@ -193,8 +193,7 @@ happening — in the one section whose whole thesis is that the server's own
 sentences are the product.
 
 **A bar means two different things and says which.** `PROPORTIONAL` (from
-`state/policy.ts`, and shared with `tabs/cluster/ClusterGraph.tsx` so the two
-screens cannot disagree) holds `weighted_capacity` and `round_robin` — the only
+`state/policy.ts`) holds `weighted_capacity` and `round_robin` — the only
 policies under which `weight` is a configured share. Under those the fill is
 opaque over a `--panel-sunk` track and the caption reads "Bars are the
 configured share."; under the other five the track has no background at all and

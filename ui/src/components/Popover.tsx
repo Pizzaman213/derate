@@ -54,6 +54,9 @@ export function Popover({ label, trigger, children }: Props) {
     <div
       className="popwrap"
       ref={wrap}
+      // A wrapper that only catches the bubbling keydown: it claims no
+      // semantics of its own (the trigger and the panel carry theirs).
+      role="presentation"
       // Escape is handled here rather than on `document` so an open Sheet's own
       // Escape handler is never shadowed by this one.
       onKeyDown={(e) => {

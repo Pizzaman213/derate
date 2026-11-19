@@ -46,22 +46,26 @@ from . import (
     shell_api,
     ui_api,
 )
+from control_plane.contracts.auth import AuditAction
 from control_plane.deploy.autoadopt import ContainerAutoAdopter
 from control_plane.inventory import api as inventory_api
+from control_plane.paths import data_path
 from control_plane.providers.autoadopt import RuntimeAutoAdopter
 
+from . import auth_api, authz, chainwatch, engine_targets, keys_api
 from .admission import AdmissionController
 from .auth import is_unauthorized
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
-from .csrf import is_cross_site_write
 from .deps import GatewayContext, GatewayDeps
 from .errors import error_response
+from .headers import SecurityHeaders
 from .metrics import MetricsHub
 from .parking import ParkingLot
 from .proxy import UpstreamProxy
 from .restart import RestartCoordinator
 from .router import Router
+from .routing_store import RoutingStore
 from .settings import GatewaySettings
 from .stats import StatsRegistry
 
@@ -215,10 +219,55 @@ async def _consume_deployment_events(ctx: GatewayContext, events) -> None:
                 ctx.admission.block(deployment_id, _EVENT_MEMORY_CRITICAL)
             elif event_type == "memory_cleared":
                 ctx.admission.unblock(deployment_id, _EVENT_MEMORY_CRITICAL)
+            elif event_type == "image_resolved":  # deploy/events.py::IMAGE_RESOLVED
+                await asyncio.to_thread(_audit_image_resolved, ctx, event)
     except asyncio.CancelledError:
         raise
     except Exception:
         log.exception("deployment event stream ended unexpectedly")
+
+
+def _audit_image_resolved(ctx: GatewayContext, event: dict) -> None:
+    """The image a launch actually ran, by id, into the audit chain (SC-05a).
+
+    The 201 launch row names the image reference; its id is only known once
+    the launch has pulled it, and the deployment record that carries it is
+    purged after hours. A second ``deployment_launched`` row for the same
+    deployment, actor ``system:launch``, is the durable copy."""
+    if ctx.auth_stores is None:
+        return
+    try:
+        ctx.auth_stores.auth.audit(
+            "system:launch",
+            AuditAction.DEPLOYMENT_LAUNCHED,
+            "deployment",
+            str(event.get("deployment_id")),
+            after={
+                "image": event.get("image"),
+                "image_id": event.get("image_id"),
+                "node_id": event.get("node_id"),
+            },
+        )
+    except Exception:
+        log.exception("could not audit the image of %s", event.get("deployment_id"))
+
+
+#: How often lapsed keys are marked expired. authenticate() refuses an expired
+#: key on its own; this keeps /api/keys from listing one as active meanwhile.
+KEY_SWEEP_INTERVAL_S = 60.0
+
+
+async def _sweep_expired_keys(ctx: GatewayContext) -> None:
+    while True:
+        await asyncio.sleep(KEY_SWEEP_INTERVAL_S)
+        try:
+            expired = await asyncio.to_thread(ctx.auth_stores.keys.sweep_expired)
+            if expired:
+                log.info("marked %d key(s) expired: %s", len(expired), ", ".join(expired))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("key expiry sweep failed: %s", exc)
 
 
 class _UIStatics(StaticFiles):
@@ -354,6 +403,7 @@ def create_app(
         settings=settings,
         breaker=breaker,
         events=events,
+        store=RoutingStore(data_path("routing.json")),
     )
     proxy = UpstreamProxy(
         settings, client=http_client, breaker=breaker, sink=telemetry.sink
@@ -413,7 +463,6 @@ def create_app(
     # database must still serve, and /api/models says why rather than 500ing.
     try:
         from control_plane.inventory import ModelInventory
-        from control_plane.paths import data_path
 
         ctx.inventory = ModelInventory(data_path("models.db"))
     except Exception:
@@ -443,6 +492,15 @@ def create_app(
         )
     except Exception:
         log.exception("alert book unavailable; /api/alerts will answer empty")
+
+    # Admins, sessions, keys, limits and pricing. Lazy: nothing is opened until
+    # a request needs it, so building an app touches no disk for them, and a
+    # store that cannot be opened makes every gated route answer 503
+    # auth_unavailable (fail closed) rather than failing the startup.
+    ctx.auth_stores = authz.AuthStores(
+        data_path("auth.db"), data_path("keys.db"), data_path("limits.db")
+    )
+    ctx.engine_metrics = engine_targets.build_poller(ctx)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -481,6 +539,18 @@ def create_app(
         await router.start()
         await restart.start()
         await metrics.start()
+        # Spec-decode counters from every local engine, attributed to each
+        # request after it settles; and the sweep that marks lapsed keys
+        # expired without waiting for one to be used.
+        await ctx.engine_metrics.start()
+        key_sweep_task = asyncio.create_task(_sweep_expired_keys(ctx))
+        # The audit store opens here rather than on the first request, so the
+        # remote sink and its heartbeat run from boot; the chain is verified
+        # now and every SINK_HEARTBEAT_S after (gateway/chainwatch.py).
+        chainwatch.warn_if_unanchored()
+        chain_watch = chainwatch.ChainWatch(ctx.auth_stores)
+        await asyncio.to_thread(chain_watch.check)
+        chain_watch_task = asyncio.create_task(chain_watch.run())
         # Started last, and given the registry as its source of agent URLs, so
         # it only ever polls nodes the registry already knows are members.
         await telemetry.start(
@@ -534,6 +604,14 @@ def create_app(
             parking.close()
             await container_autoadopt.stop()
             await autoadopt.stop()
+            for task in (key_sweep_task, chain_watch_task):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            # Before the proxy: the poller scrapes through its clients.
+            await ctx.engine_metrics.stop()
             await metrics.stop()
             await restart.stop()
             await router.stop()
@@ -546,16 +624,20 @@ def create_app(
             await _best_effort_shutdown("registry", deps.registry, "stop")
             # Last, so anything the shutdown path emits is still recorded.
             await telemetry.stop()
+            await asyncio.to_thread(ctx.auth_stores.close)
 
     app = FastAPI(
         title="Derate Gateway",
         version="0.0.1",
         lifespan=lifespan,
-        # The UI and OpenAI clients both talk to this; the surface is the
-        # contract in 00-architecture.md, not a generated schema. /redoc is
-        # undocumented surface the spec never mentions, so it stays off.
-        docs_url="/api/docs",
+        # The UI and OpenAI clients both talk to this; the contract is
+        # docs/CONTRACTS.md, not a generated page. No Swagger UI: it loads its
+        # script from a third-party CDN into the admin's origin, and its
+        # /docs/oauth2-redirect page answered outside /api, ungated. The
+        # schema itself stays, under /api, behind the session.
+        docs_url=None,
         redoc_url=None,
+        swagger_ui_oauth2_redirect_url=None,
         openapi_url="/api/openapi.json",
     )
     app.state.ctx = ctx
@@ -573,41 +655,28 @@ def create_app(
             # default, and the request id is how the UI names the row that
             # recorded a refusal.
             expose_headers=["X-Request-Id"],
-            # Deliberately off. Nothing here is cookie-authenticated, and
-            # allow_credentials forbids the "*" an operator may reasonably use
-            # on a lab network.
+            # Deliberately off. The /api session is a SameSite=Strict cookie a
+            # cross-origin page cannot send whatever CORS says, /v1 takes its
+            # key in a header, and allow_credentials forbids the "*" an
+            # operator may reasonably use on a lab network.
             allow_credentials=False,
         )
         log.info(
             "CORS enabled for %s", ", ".join(settings.allowed_origins)
         )
 
-    # Unconditional, unlike CORS above: this is what protects the default,
-    # same-origin deployment that never sets DERATE_ALLOWED_ORIGINS and so
-    # never installs CORSMiddleware at all -- without it, a page open in any
-    # browser on the LAN could blind-POST to every unauthenticated /api route
-    # the moment its tab happened to be able to reach the coordinator. See
-    # csrf.py for the reasoning.
-    @app.middleware("http")
-    async def _csrf_guard(request, call_next):
-        origin = request.headers.get("origin")
-        if is_cross_site_write(
-            method=request.method,
-            path=request.url.path,
-            origin=origin,
-            request_scheme=request.url.scheme,
-            request_netloc=request.url.netloc,
-            allowed_origins=settings.allowed_origins,
-        ):
-            return error_response(
-                403,
-                f"Cross-origin write refused: {origin!r} does not match this "
-                "gateway. Add it to DERATE_ALLOWED_ORIGINS if it should be "
-                "allowed to change cluster state.",
-                "invalid_request_error",
-                "cross_origin_write_refused",
-            )
-        return await call_next(request)
+    # The credential gate (authz.py): a session on /api, a key on /v1, and the
+    # cross-site write check (csrf.py) ahead of it, so a cross-site write is
+    # refused before anything looks at its cookie and its row carries the
+    # request id. Plain ASGI, not @app.middleware("http") -- see AuthGuard
+    # for the measured reason. It also writes the access record for every
+    # HTTP request and socket.
+    app.add_middleware(authz.AuthGuard)
+
+    # Last, so outermost: every answer carries the headers, including the
+    # refusals AuthGuard sends itself and every static
+    # file. See headers.py for why each one is there.
+    app.add_middleware(SecurityHeaders, settings=settings)
 
     # Opt-in: a no-op unless DERATE_API_TOKEN is set. See auth.py for why
     # /v1 and /api/nodes/join are not covered by this check.
@@ -654,6 +723,10 @@ def create_app(
     # decides whether the socket route exists at all; the status route is
     # always there so the UI can say why it does not.
     app.include_router(shell_api.create_router(ctx))
+    # Above the StaticFiles mount, like every router here: /api/auth/state is
+    # the first call the UI makes, and below the mount it would answer HTML.
+    app.include_router(auth_api.create_router(ctx))
+    app.include_router(keys_api.create_router(ctx))
     # Same rule, and this is the one it would be worst to get wrong: /api/setup
     # is the FIRST call a freshly installed UI makes, so below the mount a new
     # cluster's very first screen would parse index.html as JSON and show
@@ -687,9 +760,8 @@ def create_app(
             # the header-holding bug `upstream_header_hold_s` exists to avoid
             # on a slow-starting chat stream. Bare static files never stream
             # a slow first byte, so the mount is the one place this is free:
-            # the built UI ships a ~570 KB JS bundle, a 42 KB stylesheet and,
-            # with `vite.config.ts`'s `sourcemap: true`, source maps DevTools
-            # fetches whenever it's open -- none of it compressed before this.
+            # the built UI ships a ~570 KB JS bundle and a 42 KB stylesheet,
+            # none of it compressed before this.
             app.router.routes.append(
                 Mount(
                     "/",

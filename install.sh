@@ -44,6 +44,9 @@ PURGE=0
 KEEP_IMAGES=0
 INSTALL_DOCKER=0
 INSTALL_OLLAMA=0
+OLLAMA_BIND=""
+# DERATE_IMAGE_DIGEST / --digest: pull "$IMAGE@<digest>" rather than the tag.
+IMAGE_DIGEST="${DERATE_IMAGE_DIGEST:-}"
 HEALTH_TIMEOUT=60
 
 usage() {
@@ -60,6 +63,9 @@ Options
                       cluster token joins and waits for a click.
   --name NAME         override the node id (default: this machine's hostname)
   --image IMAGE       container image (default: ghcr.io/pizzaman213/derate/node:latest)
+  --digest DIGEST     pull IMAGE by this sha256:... digest, not by its moving
+                      tag. The coordinator's "Add a node" command carries it
+                      when the coordinator knows its own. Also DERATE_IMAGE_DIGEST.
   --port PORT         coordinator/UI port (default: 8080)
   --agent-port PORT   node agent port (default: 8081)
   --install-docker    install Docker with get.docker.com if it is missing.
@@ -71,7 +77,10 @@ Options
                       LAN, so a node with no GPU can serve a small model over
                       the network. Opt-in for the same reason --install-docker
                       is: this script does not install daemons you did not ask
-                      for. The node itself does not need it.
+                      for. The node itself does not need it. It is bound to
+                      the address that reaches the coordinator, not to 0.0.0.0:
+                      Ollama has no authentication.
+  --ollama-bind ADDR  bind Ollama to ADDR instead (0.0.0.0 = every interface)
   --no-gpu            do not pass the GPU into the container. On a machine
                       that has one the node then probes as unidentified
                       hardware; on a machine that has none -- a Pi, a NAS, a
@@ -129,6 +138,10 @@ while [ $# -gt 0 ]; do
         --name=*)       NAME="${1#*=}"; shift ;;
         --image)        need_value "$1" "${2:-}"; IMAGE="$2"; shift 2 ;;
         --image=*)      IMAGE="${1#*=}"; shift ;;
+        --digest)       need_value "$1" "${2:-}"; IMAGE_DIGEST="$2"; shift 2 ;;
+        --digest=*)     IMAGE_DIGEST="${1#*=}"; shift ;;
+        --ollama-bind)  need_value "$1" "${2:-}"; OLLAMA_BIND="$2"; shift 2 ;;
+        --ollama-bind=*) OLLAMA_BIND="${1#*=}"; shift ;;
         --port)         need_value "$1" "${2:-}"; PORT="$2"; shift 2 ;;
         --port=*)       PORT="${1#*=}"; shift ;;
         --agent-port)   need_value "$1" "${2:-}"; AGENT_PORT="$2"; shift 2 ;;
@@ -148,6 +161,18 @@ done
 
 [ -n "$JOIN" ] || [ -z "$TOKEN" ] || die \
     "--token without --join has nothing to present it to. Add --join <coordinator url>."
+
+# A digest names bytes; a tag names whatever was pushed last. With one, the
+# tag is dropped and the pull, the run and the signature check all use it.
+if [ -n "$IMAGE_DIGEST" ]; then
+    case "$IMAGE_DIGEST" in
+        sha256:*) ;;
+        *) die "--digest must look like sha256:<64 hex>, got '$IMAGE_DIGEST'." ;;
+    esac
+    IMAGE="${IMAGE%@*}"
+    case "${IMAGE##*/}" in *:*) IMAGE="${IMAGE%:*}" ;; esac
+    IMAGE="$IMAGE@$IMAGE_DIGEST"
+fi
 
 # ---------------------------------------------------------------------------
 # Docker
@@ -362,6 +387,8 @@ set -- "$@" -e "DERATE_PORT=$PORT" -e "DERATE_AGENT_PORT=$AGENT_PORT"
 [ -n "$JOIN" ]  && set -- "$@" -e "DERATE_JOIN=$JOIN"
 [ -n "$TOKEN" ] && set -- "$@" -e "DERATE_TOKEN=$TOKEN"
 [ -n "$NAME" ]  && set -- "$@" -e "DERATE_NODE_ID=$NAME"
+# So this node, as a coordinator, hands the same digest to the nodes it adds.
+[ -n "$IMAGE_DIGEST" ] && set -- "$@" -e "DERATE_IMAGE_DIGEST=$IMAGE_DIGEST"
 set -- "$@" "$IMAGE"
 
 # The GPU. Held apart from the rest of the run because a Docker that cannot
@@ -542,6 +569,18 @@ if ! $DOCKER pull "$IMAGE" >&2; then
     fi
 fi
 
+# Signature. publish-image.yml signs every pushed digest keylessly with the
+# workflow's own OIDC identity; this is the check that it was that workflow.
+if command -v cosign >/dev/null 2>&1; then
+    info "verifying the signature on $IMAGE"
+    cosign verify "$IMAGE" \
+        --certificate-identity-regexp 'https://github.com/Pizzaman213/derate/' \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        >/dev/null || die "$IMAGE is not signed by derate's publish workflow. Not running it."
+else
+    info "cosign is not installed: the image signature was not verified"
+fi
+
 if [ -n "$OLD_NODES" ]; then
     for id in $OLD_NODES; do
         was="$($DOCKER inspect -f '{{.Name}} ({{.State.Status}})' "$id" 2>/dev/null \
@@ -565,7 +604,9 @@ require_ports 10 || die "the node was not started."
 # it is kept rather than discarded -- but it cannot go straight to the terminal,
 # because the first attempt failing is a normal step on a machine that has a
 # driver and no container toolkit.
-RUN_ERR="${TMPDIR:-/tmp}/derate-run.$$"
+# mktemp, never a name derived from $$: this runs as root, and a guessable path
+# in a world-writable /tmp is one a local user can pre-create as a symlink.
+RUN_ERR=$(mktemp "${TMPDIR:-/tmp}/derate-run.XXXXXX") || die "could not create a temporary file."
 give_up() {
     cat "$RUN_ERR" >&2
     rm -f "$RUN_ERR"
@@ -714,11 +755,26 @@ done
 # to as a provider. That is what this installs; the node does not need it and
 # never calls it.
 #
-# Bound to 0.0.0.0 on purpose. Ollama listens on 127.0.0.1 by default, which is
-# correct for a laptop and useless here: the coordinator is on another machine
-# and would find nothing. This is the one setting that decides whether the
-# runtime is reachable at all, so it is set here rather than left as an
-# instruction somebody has to find.
+# Ollama has no authentication: whoever reaches its port can generate, pull and
+# delete models. So it is bound to the one address the coordinator reaches this
+# machine on -- the source address of the route to the coordinator's host, or
+# loopback when the coordinator is this machine (host networking) -- and to
+# every interface only when --ollama-bind 0.0.0.0 says so.
+ollama_bind_ip() {
+    if [ -n "$OLLAMA_BIND" ]; then
+        say "$OLLAMA_BIND"
+        return 0
+    fi
+    [ -n "$JOIN" ] || { say 127.0.0.1; return 0; }
+    host="${JOIN#*://}"; host="${host%%/*}"; host="${host%:*}"
+    host="${host#[}"; host="${host%]}"
+    addr="$(getent ahosts "$host" 2>/dev/null | awk 'NR==1 {print $1}')"
+    [ -n "$addr" ] || addr="$host"
+    command -v ip >/dev/null 2>&1 || return 1
+    ip route get "$addr" 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+}
+
 install_ollama() {
     if command -v ollama >/dev/null 2>&1; then
         info "ollama is already installed"
@@ -729,13 +785,16 @@ install_ollama() {
             die "the Ollama installer failed. Install it yourself and re-run with --install-ollama."
     fi
 
+    BIND_IP="$(ollama_bind_ip || true)"
+    [ -n "$BIND_IP" ] || die "could not work out which address reaches $JOIN. Re-run with --ollama-bind <this machine's LAN address>."
+
     # systemd is how the vendor script installs it. Without systemd we have no
     # supported way to make the bind address stick across a reboot, and saying
     # so beats writing a unit file for an init system we did not detect.
     if ! command -v systemctl >/dev/null 2>&1; then
         info "ollama is installed, but this machine has no systemctl, so its"
         info "listen address was not changed. It will only answer on localhost"
-        info "and the coordinator will not find it. Set OLLAMA_HOST=0.0.0.0:11434"
+        info "and the coordinator will not find it. Set OLLAMA_HOST=$BIND_IP:11434"
         info "in however this machine starts services."
         return 0
     fi
@@ -743,11 +802,11 @@ install_ollama() {
     SUDO=""
     [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
     OLLAMA_DROPIN=/etc/systemd/system/ollama.service.d
-    info "binding ollama to 0.0.0.0:11434 so the coordinator can reach it"
+    info "binding ollama to $BIND_IP:11434 so the coordinator can reach it"
     $SUDO mkdir -p "$OLLAMA_DROPIN" || die "could not write $OLLAMA_DROPIN"
     # A drop-in rather than an edit of the unit: the vendor's installer owns
     # ollama.service and will overwrite it on upgrade. This survives that.
-    printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0:11434"\n' \
+    printf '[Service]\nEnvironment="OLLAMA_HOST=%s:11434"\n' "$BIND_IP" \
         | $SUDO tee "$OLLAMA_DROPIN/derate.conf" >/dev/null \
         || die "could not write the ollama drop-in"
     $SUDO systemctl daemon-reload || true
@@ -758,7 +817,9 @@ install_ollama() {
     # "installed" and "reachable" are different claims and only the second one
     # is what the coordinator needs.
     waited=0
-    until probe "http://127.0.0.1:11434/api/tags"; do
+    probe_host="$BIND_IP"
+    [ "$probe_host" = "0.0.0.0" ] && probe_host=127.0.0.1
+    until probe "http://$probe_host:11434/api/tags"; do
         if [ "$waited" -ge 30 ]; then
             info "ollama was installed but is not answering on 11434 yet."
             info "check: systemctl status ollama"
@@ -767,7 +828,8 @@ install_ollama() {
         sleep 2
         waited=$((waited + 2))
     done
-    info "ollama is up on 0.0.0.0:11434"
+    info "ollama is up on $BIND_IP:11434"
+    info "ollama answers on $BIND_IP:11434 to anyone who can reach it; it has no authentication"
     info "open this node in the UI and use 'Add as a provider' to route to it"
 }
 
@@ -831,6 +893,11 @@ if [ -z "$JOIN" ]; then
     say ""
     say "  cluster:  ${CLUSTER_ID:-unknown}"
     say "  ui:       http://$ADDR:$PORT"
+    say ""
+    say "  First run: create the admin from this machine (http://127.0.0.1:$PORT/setup),"
+    say "  or from a laptop through a tunnel:"
+    say "    ssh -L $PORT:127.0.0.1:$PORT <this machine>   then http://127.0.0.1:$PORT/setup"
+    say "  Setup refuses any other address until an admin exists."
     say ""
     say "  Add another machine: open the UI, Settings -> Add a node, and run the"
     say "  command it gives you on that machine. It joins and is admitted; there"

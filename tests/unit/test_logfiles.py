@@ -19,7 +19,9 @@ import pathlib
 import pytest
 
 from control_plane import logfiles
-from control_plane.paths import logs_dir, project_root
+import re
+
+from control_plane.paths import logs_dir
 from control_plane.redaction import Redactor
 
 REAL_KEY = "sk-or-v1-0123456789abcdef0123456789abcdef"
@@ -65,13 +67,9 @@ def _read(folder, name):
 
 
 class TestWhereItLands:
-    def test_the_project_root_by_default(self):
-        """Next to the code -- /home/connor/derate here, /opt/derate in the image."""
-        assert logs_dir({}) == project_root() / "logs"
-
-    def test_the_data_root_does_not_decide_it(self, tmp_path):
-        """A regression guard, because it used to and the two look alike."""
-        assert logs_dir({"DERATE_DATA_DIR": str(tmp_path)}) != tmp_path / "logs"
+    def test_the_data_root_by_default(self, tmp_path):
+        """Beside auth.db and the archive, and on the volume in the image."""
+        assert logs_dir({"DERATE_DATA_DIR": str(tmp_path)}) == tmp_path / "logs"
 
     def test_an_operator_who_names_a_folder_gets_it(self, tmp_path):
         named = tmp_path / "var" / "log" / "derate"
@@ -81,19 +79,6 @@ class TestWhereItLands:
     def test_a_container_can_put_them_back_on_the_volume(self, tmp_path):
         """The documented one-liner for a deployment that wants `docker rm` survived."""
         assert logs_dir({"DERATE_LOG_DIR": "/data/logs"}) == pathlib.Path("/data/logs")
-
-    def test_an_unwritable_project_root_falls_through_to_the_data_root(
-        self, tmp_path, monkeypatch
-    ):
-        """A read-only checkout is not a reason to fail, or to pick nowhere."""
-        blocked = tmp_path / "readonly-checkout"
-        blocked.mkdir()
-        blocked.chmod(0o500)
-        monkeypatch.setattr("control_plane.paths.project_root", lambda: blocked)
-        try:
-            assert logs_dir({"DERATE_DATA_DIR": str(tmp_path)}) == tmp_path / "logs"
-        finally:
-            blocked.chmod(0o700)
 
     def test_asking_where_does_not_create_it(self, tmp_path):
         folder = logs_dir({"DERATE_LOG_DIR": str(tmp_path / "nope")})
@@ -344,6 +329,28 @@ class TestTail:
     def test_which_must_be_node_or_proxy(self, tmp_path):
         with pytest.raises(ValueError):
             logfiles.tail("bogus", env={"DERATE_LOG_DIR": str(tmp_path)})
+
+
+class TestPrivateAndUTC:
+    def test_the_folder_is_0700_and_every_file_0600_rotated_ones_too(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DERATE_LOG_MAX_BYTES", "2048")
+        monkeypatch.setenv("DERATE_LOG_BACKUPS", "2")
+        folder = tmp_path / "logs"
+        logfiles.install(directory=folder, level="DEBUG")
+        for _ in range(100):
+            logging.getLogger("gateway.proxy").warning("x" * 200)
+        logfiles.uninstall()
+        assert folder.stat().st_mode & 0o777 == 0o700
+        files = list(folder.iterdir())
+        assert any(p.name.endswith(".1") for p in files)
+        assert {p.name: p.stat().st_mode & 0o777 for p in files} == {p.name: 0o600 for p in files}
+
+    def test_timestamps_are_utc_with_a_z(self, tmp_path):
+        logfiles.install(directory=tmp_path, level="DEBUG")
+        logging.getLogger("gateway.proxy").warning("stamp")
+        logfiles.uninstall()
+        line = next(l for l in _read(tmp_path, logfiles.NODE_LOG).splitlines() if l.endswith("stamp"))
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z WARNING gateway.proxy stamp$", line), line
 
 
 # -- the worker path stays light ---------------------------------------------

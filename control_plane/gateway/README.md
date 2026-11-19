@@ -276,6 +276,39 @@ Without it a benched target reads as `healthy: false` for a deployment that
   frame when it is a LEVEL somebody watches change -- throughput, queue depth,
   acceptance -- and not when it is a sequence of discrete outcomes.
 
+## Inbound auth
+
+Nothing here answers an anonymous caller any more, except the five calls that
+must work before anyone can sign in (`authz.OPEN_ROUTES`). `authz.AuthGuard`
+decides by path: `/api/**` needs a `derate_session` cookie naming a live admin
+session (401 `session_required`); `/v1/**` needs `Authorization: Bearer drt_...`
+(401 `missing_api_key` / `invalid_api_key` / `api_key_disabled` /
+`api_key_expired`, each with `WWW-Authenticate`). `POST /api/setup/admin` is open
+until the first admin exists and 410 `setup_closed` forever after. A store that
+cannot be opened answers 503 `auth_unavailable` on every gated path. The two
+websocket routes check for themselves, closing 1008 before `accept`.
+
+The stores (`auth.db`, `keys.db`, `limits.db`) open on first use, so building an
+app touches no disk for them. The middleware is registered before `_csrf_guard`
+in `app.py`, which makes CSRF the outer of the two checks; `SecurityHeaders`
+(`headers.py`) is registered last of all and so wraps both, which is how their
+refusals carry the headers too.
+
+**Chat from the UI runs as the admin's own key.** Every admin owns an admin key
+(minted with the admin, secret discarded, never expires); `/api/chat/*` run the
+`/v1` handlers with that key as the principal, so a session's requests carry a
+real `key_id`, count against limits and show on the Keys screen, and no key
+ever reaches the browser. `/api/chat/models` and `/api/chat/voices` mirror
+`/v1/models` and `/v1/audio/voices` for the same reason.
+
+`_serve` checks limits before dispatch and settles the reservation exactly
+once: the attempt that answered counts its usage from its telemetry row (in
+`_on_record`, which also prices it and appends to the attempt chain), and
+whatever is still held is released when the response is complete -- at once,
+or at the end of a stream's body. The client's `Authorization` and `Cookie` are
+never forwarded upstream; a REMOTE target gets its provider's key and a LOCAL
+one gets none.
+
 ---
 
 ## Layout
@@ -283,24 +316,29 @@ Without it a benched target reads as `healthy: false` for a deployment that
 Everything above is the request path under failure. The rest of the folder is
 the other two thirds of the surface: the `/api` control plane the UI drives, the
 serializers that decide what may leave the process, and the composition root
-that puts them in the one order that works. 36 modules, 14,811 lines, 75 route
+that puts them in the one order that works. 40 modules, 17,098 lines, 115 route
 decorators.
 
 | File | Lines | What it owns |
 |---|---|---|
 | `internal_api.py` | 3637 | the `/api` control surface -- 45 routes in one closure, plus `_plan_and_fit` |
 | `capacity_api.py` | 1601 | read-only memory truth and "what could run here", with every hub call bounded |
-| `proxy.py` | 1344 | upstream proxying, connection ownership, and per-attempt accounting |
-| `openai_api.py` | 1017 | `/v1`: `_proxy` / `_proxy_multipart` in, `_serve` for everything they share |
+| `proxy.py` | 1508 | upstream proxying, connection ownership, per-attempt accounting and per-token timing |
+| `openai_api.py` | 1438 | `/v1`: `_proxy` / `_proxy_multipart` in, `_serve` (limits, fallback, settle) for everything they share; `/api/chat/*` |
+| `keys_api.py` | 960 | orgs, keys, limits, usage, the audit log, local pricing, and `POST /api/wiring` (provider and routing ops validated whole, then applied in order) -- every mutation audited |
 | `serialize.py` | 689 | contract types to JSON, with provider fields as an explicit allowlist |
-| `app.py` | 604 | `create_app`, the six-step startup, the CSRF middleware, and `_UIStatics` |
+| `app.py` | 677 | `create_app`, the six-step startup, the auth and CSRF middleware, and `_UIStatics` |
 | `stubs.py` | 508 | the day-0 ports that serve the whole surface from fixtures |
-| `router.py` | 421 | the target index, policy resolution, weight refresh, `parkable` |
+| `router.py` | 470 | the target index, policy resolution (and a key's override), per-name route limits, weight refresh, `parkable` |
+| `routing_store.py` | 90 | `routing.json`: policy overrides and route limits, so a restart keeps them; a bad file is an empty state |
+| `authz.py` | 399 | the credential gate: session on `/api`, `drt_` key on `/v1`, lazy auth stores, fail closed |
 | `admission.py` | 350 | the per-request KV commitment, and the three block reasons |
 | `restart.py` | 290 | relaunching a deployment that crashed, three tries, backed off |
 | `policies.py` | 286 | the seven selectors and `hedge_candidate`. Frozen |
 | `enroll_api.py` | 279 | `/install.sh` and the one-line join command, address resolved server-side |
+| `auth_api.py` | 274 | login, logout, password, the admin list |
 | `runtime_api.py` | 270 | finding a runtime already listening on a node, and adopting it |
+| `setup_api.py` | 263 | first run: has anyone set this cluster up yet, and the first admin |
 | `targets.py` | 252 | merging local deployments and remote provider models into one target list |
 | `livefit.py` | 250 | calling the fit gate twice -- static ceiling and live allocatable |
 | `errors.py` | 224 | OpenAI-shaped error bodies, and the redacted exception detail |
@@ -309,17 +347,18 @@ decorators.
 | `realtime.py` | 219 | `/v1/realtime`, a relay and deliberately nothing more |
 | `metrics.py` | 214 | the 1 Hz SSE frame, one producer and many subscribers |
 | `settings.py` | 202 | 52 tunables, every one with a working default |
-| `setup_api.py` | 184 | first run: has anyone set this cluster up yet |
-| `shell_api.py` | 175 | the browser-to-node terminal relay; the credential is never ours |
+| `shell_api.py` | 182 | the browser-to-node terminal relay, behind a session; the shell key is never ours |
 | `breaker.py` | 167 | the per-target circuit. Subtracts from health, never adds |
 | `ui_api.py` | 166 | `GET`/`PATCH /api/settings`, on its own uncontended router |
 | `setup_state.py` | 154 | one fact on disk, outranked by the derived signals |
 | `parking.py` | 151 | the bounded waiting room |
 | `strength.py` | 144 | measured, then predicted, then bandwidth -- and the weight normalization |
-| `deps.py` | 112 | `GatewayDeps` / `GatewayContext`, and `strict=True` |
+| `deps.py` | 119 | `GatewayDeps` / `GatewayContext`, and `strict=True` |
 | `stats.py` | 110 | per-target EWMA counters: decode tok/s, TTFT, outstanding |
 | `gpu_procs.py` | 92 | attributing a resident GPU process to the deployment that launched it |
 | `budget.py` | 92 | the retry budget |
+| `engine_targets.py` | 63 | what the spec-decode poller scrapes, reached through the proxy's clients |
+| `headers.py` | 76 | nosniff, no framing, same-origin referrer on every answer; the CSP on HTML |
 | `csrf.py` | 59 | refusing a cross-site write before it reaches any route |
 | `main.py` | 54 | `python -m control_plane.gateway.main`, the stub surface, banner and all |
 | `states.py` | 40 | which deployment states mean what, spelled without importing `deploy` |
@@ -436,7 +475,24 @@ nothing outside the container could enumerate them. It keeps the model lookup an
 the modality guard, answers from a **local** target only -- a voice library is a
 property of a deployment's filesystem -- and returns the runtime's own envelope
 unaltered, including its `skipped` list, which is the only sentence saying why a
-clip was declined.
+clip was declined. A key still answers to its allowlist and limits there
+(`check_and_reserve` with an empty body, settled unpriced, 403
+`model_not_allowed` off the allowlist) and the call writes a `requests` row
+(finding K2).
+
+`/v1/audio/transcriptions` reads its `model` field out of the raw multipart
+body, and two parsers that disagree about that body are an authorization
+bypass: a content-type with two `boundary=` parameters is a 400 "ambiguous
+multipart boundary", and the `name=` match is case-insensitive and accepts an
+unquoted value, so a second `model` part in any spelling is a duplicate rather
+than invisible (finding K1). A remote transcription goes through the provider's
+`open_upstream` like JSON does (finding K5).
+
+`proxy.forward()` sends the upstream derate's trace id as `x-request-id` (never
+the client's) and `accept-encoding: identity` so an error body can be scrubbed
+before it is relayed; the response headers a client sees are the provider
+allowlist (`content-type`, `cache-control`, `retry-after`) plus
+`content-encoding` and derate's `x-request-id` (findings K4, K6, K10).
 
 ## `serialize.py`
 
@@ -691,6 +747,15 @@ refused with a message saying so rather than accepted into a session that would
 never produce audio. `CLOSE_POLICY` is 1008, the closest thing the WebSocket spec
 has to a 4xx.
 
+A session answers to the same limits as any `/v1` request: `realtime_session`
+calls `check_and_reserve` (as REMOTE) before the relay and refuses with 1008 and
+the limit's code (`model_not_allowed`, `limit_exceeded`), so `max_concurrent`
+counts open sessions and `rpm`/`requests_cycle` count each one. It settles on
+close as one unpriced request -- audio minutes have no price here. The relay
+also asks the provider whether it is admitting (daily budget, rate limit,
+health) before it connects, since nothing can cut a session short once audio
+flows.
+
 ## `metrics.py`
 
 `MetricsHub` produces one frame per `metrics_interval_s` (1.0) and fans it out to
@@ -802,6 +867,15 @@ to sum to 1 and applies `weak_target_floor` (0.15); `strength_spread` is what
 `auto_weighted_spread` (0.25) is compared against when the router picks a policy
 nobody set.
 
+**Operator shares replace the measured weights.** `RoutingConfig.shares`
+(target_id -> a whole number 0..100, stored in `routing.json` beside limits)
+is set with `route.set` / `PUT /api/routing/{name}` and only under
+`weighted_capacity`; any other policy refuses them, and moving to one drops
+them. `Router.config_for` normalizes them over the targets the name has right
+now into each target's `weight` (copies -- the index keeps its measured
+weights), so a share naming a target that has not arrived yet is simply unused
+until it does, and the smooth weighted round robin sends exactly that ratio.
+
 ## `deps.py`
 
 `GatewayDeps` holds the seven ports and defaults every one to its day-0 stub, so
@@ -867,6 +941,26 @@ defense: neither header is settable by a page's own script, so a page cannot for
 agreement between them. A **missing** `Origin` is let through -- every browser
 sends one on a state-changing request, so its absence means curl, an SDK or a
 health check, none of which is what CSRF is about.
+
+## `headers.py`
+
+`SecurityHeaders`, plain ASGI like `AuthGuard` and for the same reason. Every
+response gets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: same-origin`; a `text/html` one also gets `CSP_HTML`. The
+framing pair is not decoration: SameSite=Strict is per *site*, so a page on
+another port of the same host frames the UI with the session attached, and the
+clicks it steals are same-origin writes `csrf.py` correctly lets through. The
+module docstring names the one thing in `ui/src` each CSP allowance is for;
+`script-src` is `'self'` only and must stay that way. `connect-src` is built
+per process from `'self'`, `DERATE_PUBLIC_ORIGIN` and `DERATE_ALLOWED_ORIGINS`
+(each with its `ws`/`wss` form), never a scheme wildcard: a UI pointed at
+another coordinator works only when that coordinator is named in one of them.
+`tests/unit/test_gateway_headers.py` pins the headers on the document, on JSON,
+and on both middleware refusals.
+
+There is no Swagger UI (`docs_url=None`, no `/docs/oauth2-redirect`): it loaded
+a CDN script into the admin's origin. `/api/openapi.json` stays, behind the
+session.
 
 ## `main.py`
 

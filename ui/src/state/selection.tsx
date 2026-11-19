@@ -152,10 +152,9 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
   }, [explicitDep, deployments, remotes])
 
   // The two toggles need to know what is currently selected, and they read it
-  // from a ref rather than from a dependency. Every one of these callbacks is
-  // an identity ClusterGraph keys its pointer and key listeners on: taking
-  // `selNode` as a dependency would hand it a new function on every click and
-  // rebind every listener on the machine floor each time one lands.
+  // from a ref rather than from a dependency, so each keeps one identity:
+  // taking `selNode` as a dependency would hand every consumer (the wiring
+  // canvas's click handlers, the inspectors) a new function on every click.
   const nodeRef = useRef(selNode)
   const linkRef = useRef(selLink)
   nodeRef.current = selNode

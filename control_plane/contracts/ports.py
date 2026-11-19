@@ -74,14 +74,17 @@ class ProviderPort(Protocol):
 
 @runtime_checkable
 class DeploymentPort(Protocol):
-    # `modality`, `extra_args` and `custom_command` are keyword-only and
-    # defaulted: an implementation that predates any of them keeps working.
+    # `modality`, `extra_args`, `custom_command`, `revision` and
+    # `speculative_tokens` are keyword-only and defaulted: an implementation
+    # that predates any of them keeps working.
     # `extra_args` is caller-supplied CLI tokens appended to the generated
     # serve command; `custom_command` replaces it instead of appending, and
-    # the two are mutually exclusive.
+    # the two are mutually exclusive. `speculative_tokens` (0..8, 0 = off)
+    # turns on MTP speculative decoding, vllm only.
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
-        modality=..., extra_args=(), custom_command=(),
+        modality=..., extra_args=(), custom_command=(), revision=None,
+        speculative_tokens=0,
     ) -> Deployment: ...
     def stop(self, deployment_id: str) -> None: ...
     def list(self) -> list[Deployment]: ...

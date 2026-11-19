@@ -4,7 +4,7 @@ import { useCluster } from '../state/resources'
 import { Disclosure } from '../components/Panel'
 import { Verbatim, VerbatimList } from '../components/Verbatim'
 import { fmt, planShortFromDegrees } from '../format'
-import { runners } from '../tabs/cluster/layout'
+import { runners } from '../tabs/models/rows'
 
 // Ported from mockups-next/js/sidebar.js `sidebar()`'s plan block. The
 // mockup's `#whyBox` is hand-written markup keyed on a fixture's `span`/`solo`
@@ -53,7 +53,7 @@ export function PlanSection() {
         <Verbatim text={plan.reason} size="label" />
         {plan.rejected.length > 0 ? (
           <>
-            <div className="unit" style={{ marginTop: 8 }}>Rejected</div>
+            <div className="unit" style={{ marginTop: 'var(--space-8)' }}>Rejected</div>
             <VerbatimList items={plan.rejected} />
           </>
         ) : null}

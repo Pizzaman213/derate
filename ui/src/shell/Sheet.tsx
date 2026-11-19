@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
+import { containTab, focusables } from '../components/focusTrap'
 import { useSelection, type SheetTarget } from '../state/selection'
 import { useCluster, useRouting, useSettings } from '../state/resources'
 import { useMetrics } from '../state/metrics'
@@ -8,7 +9,7 @@ import type { SafeMetricsFrame } from '../state/useMetrics'
 import { NodeInspector } from '../inspectors/node/NodeInspector'
 import { DeploymentInspector } from '../inspectors/DeploymentInspector'
 import { ModelInspector } from '../tabs/models/ModelInspector'
-import { runners } from '../tabs/cluster/layout'
+import { runners } from '../tabs/models/rows'
 
 // The one modal host (mockups-next: a single `#sheet`/`#cardBody` pair reused
 // by both the node inspector and the deployment inspector). Each inspector
@@ -16,9 +17,6 @@ import { runners } from '../tabs/cluster/layout'
 // mechanics every use of the sheet needs regardless of which one is showing:
 // the scrim, the scroll lock, and a focus trap that holds even across a
 // content swap while the sheet stays open.
-
-const FOCUSABLE =
-  'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])'
 
 export function Sheet() {
   const { sheet, closeSheet } = useSelection()
@@ -30,11 +28,6 @@ export function Sheet() {
   const open = sheet !== null
   const cardRef = useRef<HTMLDivElement>(null)
   const restoreFocusRef = useRef<HTMLElement | null>(null)
-
-  const focusable = () => {
-    const card = cardRef.current
-    return card ? Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE)) : []
-  }
 
   // Once per open session: remember what to hand focus back to, and lock the
   // page behind the modal. Reversed only when the sheet actually closes, not
@@ -58,7 +51,7 @@ export function Sheet() {
   // at that DOM position -- a button the new inspector may not even have.
   useEffect(() => {
     if (!open) return
-    ;(focusable()[0] ?? cardRef.current)?.focus()
+    ;(focusables(cardRef.current)[0] ?? cardRef.current)?.focus()
   }, [open, sheet?.kind, sheet?.id])
 
   useEffect(() => {
@@ -70,35 +63,7 @@ export function Sheet() {
         closeSheet()
         return
       }
-      if (e.key !== 'Tab') return
-
-      const items = focusable()
-      const card = cardRef.current
-      if (items.length === 0) {
-        e.preventDefault()
-        card?.focus()
-        return
-      }
-      const first = items[0]!
-      const last = items[items.length - 1]!
-      const active = document.activeElement
-      // Full containment, not just the two ends: if focus is anywhere outside
-      // the card at all -- it escaped via a removed element handing focus
-      // back to <body>, a stray portal, anything -- Tab snaps it back inside
-      // instead of only catching the boundary case. The card itself is also
-      // a valid Shift+Tab boundary: it's focusable (tabIndex={-1}, focused
-      // by a click on its own padding, or as the fallback target when the
-      // card has no focusable children at all), and `card.contains(card)`
-      // is true for it, so without this clause `atBoundary` would be false
-      // and a Shift+Tab from the card would fall through to the browser's
-      // default -- moving focus to whatever is previous in document order
-      // outside the portal, since the card lives under document.body.
-      const inside = active != null && card != null && card.contains(active)
-      const atBoundary = e.shiftKey ? active === first || active === card : active === last
-      if (!inside || atBoundary) {
-        e.preventDefault()
-        ;(e.shiftKey ? last : first).focus()
-      }
+      containTab(e, cardRef.current)
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
@@ -126,6 +91,10 @@ export function Sheet() {
   return createPortal(
     <div
       className="sheet on"
+      // The scrim is not a control: Escape is the keyboard path, so the
+      // click-to-dismiss is a pointer convenience and the element is
+      // presentational to assistive technology.
+      role="presentation"
       onClick={(e) => {
         // Scrim click closes; a click that started inside the card and
         // released here (a drag-selection) still targets the card, not this
@@ -239,9 +208,9 @@ function Gone({ id, onClose }: { id: string; onClose: () => void }) {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
         <span className="label mono">{id}</span>
-        <button onClick={onClose}>Close</button>
+        <button type="button" onClick={onClose}>Close</button>
       </div>
-      <p className="unit" style={{ marginTop: 8 }}>
+      <p className="unit" style={{ marginTop: 'var(--space-8)' }}>
         No longer in the cluster.
       </p>
     </div>

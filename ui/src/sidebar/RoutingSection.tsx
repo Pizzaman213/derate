@@ -100,19 +100,19 @@ export function RoutingSection() {
       </label>
 
       {error ? (
-        <div className="label" style={{ color: 'var(--fault)', marginTop: 6, whiteSpace: 'pre-wrap' }}>
+        <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-6)', whiteSpace: 'pre-wrap' }}>
           {error}
         </div>
       ) : null}
 
       {cfg.auto_selected && cfg.auto_reason ? (
-        <div style={{ marginTop: 6 }}>
+        <div style={{ marginTop: 'var(--space-6)' }}>
           <Verbatim text={cfg.auto_reason} size="label" />
         </div>
       ) : null}
 
       {cfg.policy === 'local_first' && cfg.flow ? (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)', marginTop: 'var(--space-6)' }}>
           <Lamp
             signal={cfg.flow === 'local' ? 'live' : 'warn'}
             label={cfg.flow === 'local' ? 'serving locally' : 'spilled to remote'}
@@ -125,7 +125,7 @@ export function RoutingSection() {
         </div>
       ) : null}
 
-      <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+      <div style={{ marginTop: 'var(--space-10)', display: 'grid', gap: 'var(--space-8)' }}>
         {cfg.targets.map((t) => (
           <TargetWeight
             key={t.target_id}
@@ -136,7 +136,7 @@ export function RoutingSection() {
         ))}
       </div>
 
-      <div className="unit" style={{ marginTop: 4 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
         {cfg.targets.length > 1 ? (
           <>
             {help}
@@ -181,13 +181,13 @@ function TargetWeight({
   const excluded = !t.healthy || !t.admitting || circuitFlagged
 
   return (
-    <div style={{ display: 'grid', gap: 4, opacity: excluded ? 0.62 : 1 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <div style={{ display: 'grid', gap: 'var(--space-4)', opacity: excluded ? 'var(--opacity-62)' : 1 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
         <div
           style={{
             flex: 1,
             height: 15,
-            borderRadius: 2,
+            borderRadius: 'var(--radius-sm)',
             overflow: 'hidden',
             background: proportional ? 'var(--panel-sunk)' : 'none',
             boxShadow: `inset 0 0 0 1px ${proportional ? 'var(--edge)' : 'var(--rule)'}`,
@@ -198,7 +198,7 @@ function TargetWeight({
               height: '100%',
               width: `${pctv}%`,
               background: 'var(--fill)',
-              opacity: proportional ? (t.weight > 0 ? 1 : 0.25) : t.weight > 0 ? 0.55 : 0,
+              opacity: proportional ? (t.weight > 0 ? 1 : 'var(--opacity-25)') : t.weight > 0 ? 'var(--opacity-55)' : 0,
             }}
           />
         </div>
@@ -207,7 +207,7 @@ function TargetWeight({
         </span>
       </div>
 
-      <div className="unit" style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+      <div className="unit" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)', flexWrap: 'wrap' }}>
         {circuitFlagged ? (
           <Lamp
             signal="idle"

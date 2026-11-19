@@ -6,7 +6,7 @@ import { fromState, nodeName } from '../state/names'
 import { Lamp } from '../components/Lamp'
 import { Readout } from '../components/Readout'
 import { ProportionBar } from '../components/Bars'
-import { pct } from '../format'
+import { pct, relativeTime } from '../format'
 
 // Ported from mockups-next/js/sidebar.js `roster()`. The slots model (a fixed
 // array of GPU slots per node, each either free or holding a model) does not
@@ -33,7 +33,7 @@ export function RosterSection() {
   return (
     <section>
       <h2>Nodes</h2>
-      <div style={{ display: 'grid', gap: 12 }}>
+      <div style={{ display: 'grid', gap: 'var(--space-12)' }}>
         {nodes.map((n) => {
           const id = n.profile.node_id
           const live = nodeLive(n, frame, stale)
@@ -47,22 +47,29 @@ export function RosterSection() {
             .filter((x): x is string => Boolean(x))
 
           return (
-            <div
+            <button
+              type="button"
               key={id}
               onDoubleClick={() => openSheet({ kind: 'node', id })}
+              onClick={(e) => { if (e.detail === 0) openSheet({ kind: 'node', id }) }}
+              aria-label={`${nodeName(fromState(n))}: Enter or double-click for detail`}
               title={ineligible ? (n.ineligible_reason ?? undefined) : undefined}
               style={{
+                font: 'inherit',
+                textAlign: 'left',
+                width: '100%',
+                background: 'none',
                 display: 'grid',
-                gap: 4,
+                gap: 'var(--space-4)',
                 cursor: 'pointer',
-                opacity: ineligible ? 0.55 : 1,
+                opacity: ineligible ? 'var(--opacity-55)' : 1,
                 border: ineligible ? '1px dashed var(--rule)' : '1px solid transparent',
                 borderRadius: 'var(--radius)',
-                padding: '4px 6px',
-                margin: '0 -6px',
+                padding: 'var(--space-4) var(--space-6)',
+                margin: '0 calc(-1 * var(--space-6))',
               }}
             >
-              <div className="row" style={{ padding: '0 0 3px' }}>
+              <div className="row" style={{ padding: '0 0 var(--space-3)' }}>
                 <span
                   className="label"
                   style={{
@@ -72,7 +79,7 @@ export function RosterSection() {
                 >
                   {nodeName(fromState(n))}
                 </span>
-                <span className="mono unit" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span className="mono unit" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)' }}>
                   <Lamp
                     signal={signal}
                     hollow={grey && !down}
@@ -84,7 +91,7 @@ export function RosterSection() {
                           : `${id} healthy`
                     }
                   />
-                  <Readout value={live.power_w} width={3} unit="W" stale={grey} />
+                  <Readout value={down ? null : live.power_w} width={3} unit="W" stale={grey} />
                 </span>
               </div>
 
@@ -93,17 +100,19 @@ export function RosterSection() {
               ) : null}
 
               <ProportionBar
-                value={live.memory_used_pct == null ? null : live.memory_used_pct / 100}
+                value={down || live.memory_used_pct == null ? null : live.memory_used_pct / 100}
                 tone={grey ? 'muted' : 'ink'}
                 label={live.memory_used_pct == null ? `no memory reading for ${id}` : `${pct(live.memory_used_pct)} percent of addressable memory in use on ${id}`}
               />
 
               <div className="unit">{names.length > 0 ? names.join(' · ') : 'no deployments'}</div>
 
-              <div className="unit" style={{ marginTop: 2 }}>
-                {utilKind(n.profile)} {pct(live.util_pct)}%{n.profile.device_class === 'gb10' ? ' · shared' : ''}
+              <div className="unit" style={{ marginTop: 'var(--space-2)' }}>
+                {down
+                  ? `unreachable · last seen ${relativeTime(n.last_seen)}`
+                  : `${utilKind(n.profile)} ${pct(live.util_pct)}%${n.profile.device_class === 'gb10' ? ' · shared' : ''}`}
               </div>
-            </div>
+            </button>
           )
         })}
         {nodes.length === 0 ? <p className="unit">No nodes yet.</p> : null}

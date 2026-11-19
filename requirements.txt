@@ -1,10 +1,17 @@
 # Runtime dependencies for the derate node image.
-# sparkrun is installed separately and pinned by build arg; see Dockerfile.
+# sparkrun is pinned here too, so its transitives are hash-locked with the rest.
+#
+# This is the human-edited input. The image and CI install requirements.lock,
+# which pins every transitive with its sha256 and is regenerated from this file:
+#     uv pip compile --generate-hashes --python-version 3.12 --universal \
+#         requirements.txt -o requirements.lock
+# pyproject.toml's [project].dependencies must list exactly these pins;
+# tests/unit/test_single_source.py fails when the two drift.
 fastapi==0.165.0
-# Floors, not pins: fastapi's own range picks the version. starlette < 1.3.1
-# serves /assets/* through a FileResponse whose Range parsing is quadratic
-# (CVE-2025-62727) plus CVE-2026-48818/54283; h11 < 0.16.0 accepts malformed
-# chunked bodies (request smuggling behind a proxy).
+# Floors, not pins: fastapi's own range picks the version and the lock records
+# it. starlette < 1.3.1 serves /assets/* through a FileResponse whose Range
+# parsing is quadratic (CVE-2025-62727) plus the 2026 advisories; h11 < 0.16.0
+# accepts malformed chunked bodies (request smuggling behind a proxy).
 starlette>=1.3.1
 h11>=0.16.0
 uvicorn[standard]==0.34.0
@@ -29,3 +36,14 @@ requests==2.34.2
 # process liveness and process kill. The Linux readers are unchanged and do
 # not go through it -- see control_plane/registry/hostfacts.py.
 psutil==7.2.2
+# Admin passwords are hashed with argon2id (control_plane/auth). There is no
+# fallback hasher on purpose: a weaker one would be the one that ships.
+argon2-cffi==25.1.0
+# The ChatGPT sign-in's ID token is checked against OpenAI's JWKS before it is stored.
+# 2.15.1: CVE-2026-101918/102274.
+PyJWT[crypto]==2.15.1
+# PyJWT's RS256/ES256 verification backend for that same ID-token check.
+cryptography==50.0.0
+# NVIDIA's cluster launcher (control_plane/deploy/sparkrun.py). Bump only after
+# re-checking control_plane/deploy/flags.py against the new version.
+sparkrun==0.2.40

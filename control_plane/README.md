@@ -1,8 +1,8 @@
 # control_plane
 
 One Python package, one process, one entry point: `python3 -m control_plane.node`.
-The twelve subpackages under this directory are what that process composes; the
-ten modules sitting beside them are the leaves any of those twelve may import,
+The fifteen subpackages under this directory are what that process composes; the
+ten modules sitting beside them are the leaves any of those fifteen may import,
 and which import none of them back. That constraint is the design rather than an
 accident of layout -- a module at this level has to be importable by a worker
 *and* by a coordinator, which is why the key scrubber lives here instead of

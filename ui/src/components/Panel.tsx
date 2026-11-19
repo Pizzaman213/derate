@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { Icon } from './Icon'
 
 /** A sidebar section: a printed legend, a hairline, then content. Panels are
  *  separated by rules rather than gaps and shadows. */
@@ -12,19 +13,19 @@ export function Section({
   children: ReactNode
 }) {
   return (
-    <section style={{ padding: 'var(--s1)' }}>
+    <section style={{ padding: 'var(--space-12)' }}>
       <div
         style={{
           display: 'flex',
           alignItems: 'baseline',
           justifyContent: 'space-between',
-          gap: 8,
+          gap: 'var(--space-8)',
         }}
       >
         <h2 className="label">{title}</h2>
         {aside}
       </div>
-      <hr style={{ margin: '6px 0 var(--s1)' }} />
+      <hr style={{ margin: 'var(--space-6) 0 var(--space-12)' }} />
       {children}
     </section>
   )
@@ -46,27 +47,29 @@ export function Disclosure({
   return (
     <div>
       <button
+        type="button"
         onClick={onToggle}
         aria-expanded={open}
         style={{
           border: 0,
-          padding: '2px 0',
+          padding: 'var(--space-2) 0',
+          // WCAG 2.5.8: a pointer target is at least 24px tall. The label
+          // line is 21; the floor is the token, not a magic number.
+          minHeight: 'var(--space-24)',
           width: '100%',
           textAlign: 'left',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          gap: 8,
+          gap: 'var(--space-8)',
           color: 'var(--ink-muted)',
         }}
         className="label"
       >
         <span>{summary}</span>
-        <span aria-hidden className="mono" style={{ fontSize: 11 }}>
-          {open ? '–' : '+'}
-        </span>
+        <Icon name={open ? 'minus' : 'plus'} size={12} decorative />
       </button>
-      {open ? <div style={{ paddingTop: 8 }}>{children}</div> : null}
+      {open ? <div style={{ paddingTop: 'var(--space-8)' }}>{children}</div> : null}
     </div>
   )
 }

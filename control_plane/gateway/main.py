@@ -10,7 +10,7 @@ import uvicorn
 from control_plane import logfiles
 
 from .app import create_app
-from .settings import GatewaySettings
+from .settings import GatewaySettings, uvicorn_proxy_kwargs
 
 
 def main() -> None:
@@ -18,6 +18,8 @@ def main() -> None:
         level=os.environ.get("DERATE_LOG_LEVEL", "INFO"),
         format=logfiles.LOG_FORMAT,
     )
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(logfiles.UTCFormatter(logfiles.LOG_FORMAT))
     # basicConfig sets the root level, but the journal handler is attached
     # during app startup and wants records the root logger would otherwise
     # filter out before any handler sees them.
@@ -39,14 +41,18 @@ def main() -> None:
     # No deps passed: the day-0 stub surface. Integration replaces this with
     # the real ports without touching anything else here.
     # log_config=None so uvicorn does not replace the configuration above
-    # with its own after the fact. Without it two formats share one stream,
-    # and its access logger stops propagating to the root handler the
-    # telemetry journal is attached to.
+    # with its own after the fact; without it two formats share one stream.
+    # access_log=False because authz.on_request_done writes the access line
+    # on logger gateway.access (request id, principal, UTC), which replaces
+    # uvicorn's.
     uvicorn.run(
         create_app(settings=settings),
         host=settings.host,
         port=settings.port,
         log_config=None,
+        access_log=False,
+        server_header=False,
+        **uvicorn_proxy_kwargs(),
     )
 
 

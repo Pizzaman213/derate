@@ -138,18 +138,20 @@ not in the container. This container also mounts the operator's `~/.ssh`
 read-only and ships `openssh-client`, because sparkrun drives the fleet over
 SSH. A shell on one node therefore reaches every machine those keys reach.
 
-Nothing else on this product's HTTP surface is authenticated: `/api` has no
-credential of any kind, the gateway binds `0.0.0.0`, and there is no TLS. Two
-things stand between that and a prompt, and both are load-bearing:
+`/api` needs an admin session and `/v1` a `drt_` key, but the gateway binds
+`0.0.0.0` and speaks plain HTTP unless something terminates TLS in front of it.
+Three things stand between that and a prompt, and all are load-bearing:
 
 - **This flag.** Unset, the route is never registered — an absent path cannot
   be probed for and cannot be switched on by a request.
+- **An admin session.** The coordinator's `/api/nodes/{id}/shell` socket is
+  session-gated, refuses a cross-site `Origin` with close 1008, and writes a
+  `shell_opened`/`shell_closed` audit row for every session.
 - **The key.** Read from `DERATE_SHELL_KEY`, or generated into
   `/data/shell.key` at 0600 and printed once to the node's console on the boot
   that made it. No route mints it and no route returns it, which is the point:
-  `POST /api/enroll` is unauthenticated and its token buys the permanent
-  cluster token through `POST /api/nodes/join`, so anything gated on the
-  *cluster* token is gated on a secret the network can mint for itself.
+  it is a secret read off the machine, never one a session, an enrollment
+  token or the cluster token can be traded for.
 
 Set `DERATE_SHELL_ORIGINS` if you reach the UI from an origin this coordinator
 does not serve. A WebSocket handshake is exempt from CORS and is never
@@ -360,8 +362,8 @@ networking a collision is with something the operator already runs.
 ## `build.sh`
 
 The multi-arch buildx wrapper described above under **Building**. Its knobs are
-`IMAGE`, `TAG`, `PLATFORMS`, `BUILDER` (default `derate`), `SPARKRUN_VERSION`
-(`0.2.40`, the version `deploy/flags.py` was verified against) and `SKIP_UI`; it
+`IMAGE`, `TAG`, `PLATFORMS`, `BUILDER` (default `derate`) and `SKIP_UI`
+(sparkrun's version is a pin in `requirements.txt`, locked with its hashes); it
 creates the buildx builder when `docker buildx inspect` fails, and with no
 `--push` or `--load` it builds both architectures and discards them, which is a
 verification run.
@@ -415,6 +417,14 @@ but the image *that* is one pip layer over. Same base either way, so the pip
 layers below are the only new bytes a node that has served anything has to
 fetch. `audio.Dockerfile` carries the same `ARG BASE` line; bump the two
 Dockerfiles together.
+
+Both Dockerfiles pin the base by digest. The two runtime images `deploy/flags.py`
+names by default, `ghcr.io/pizzaman213/derate/vllm-audio:latest` and
+`ghcr.io/pizzaman213/derate/tts:latest`, are still moving tags: they are not
+published, so no registry digest exists to pin. Each Spark builds them from
+these Dockerfiles over its local `sparkrun-eugr-vllm:latest` and tags the
+result with the ghcr name locally. What a launch actually ran is recorded on
+the deployment as `image` and the resolved `image_id`.
 
 The install is `transformers>=4.57,<6` (pinned to a major because these
 checkpoints ship their architecture as remote code, written against one),
@@ -474,7 +484,7 @@ the placeholder.
 The root `Dockerfile` is what consumes this folder. It does `COPY docker/
 /opt/derate/docker/`, sets `ENTRYPOINT ["/opt/derate/docker/entrypoint.sh"]`,
 and health-checks `/agent/health` on `DERATE_AGENT_PORT` and then `DERATE_PORT`.
-Three build args cross from `build.sh`: `SKIP_UI`, `SPARKRUN_VERSION` and
+Two build args cross from `build.sh`: `SKIP_UI` and
 `DERATE_BUILD`. The UI stage is `FROM --platform=$BUILDPLATFORM node:22-slim`,
 so npm runs once, natively, and only apt and pip go through QEMU;
 `SKIP_UI=1` replaces the built UI with a two-line `index.html` reading "UI not
@@ -521,11 +531,16 @@ actual fix and has not been done.
 
 The only thing that publishes anything here, and nothing else in the repo
 documents it. On a push to `main`, a `v*` tag, or `workflow_dispatch`, two jobs
-run: `verify` installs `requirements.txt` and runs `python -m pytest -q -m "not
-slow"` from the repo root, then `npm ci`, `npm run typecheck`, `npm run build`
-and `npm run check` inside `ui/`; `publish` `needs` it and buildx-pushes
-`linux/amd64,linux/arm64` to `ghcr.io/pizzaman213/derate/node`, tagged `latest`
-on the default branch plus the branch, the tag and the long SHA.
+run: `verify` installs `requirements.lock` with `--require-hashes`, recompiles
+the lock from `requirements.txt` with `uv` and fails on any diff, and runs
+`python -m pytest -q -m "not slow"` from the repo root, then `npm ci`, `npm run
+typecheck`, `npm run build` and `npm run check` inside `ui/`; `publish` `needs`
+it and buildx-pushes `linux/amd64,linux/arm64` to
+`ghcr.io/pizzaman213/derate/node`, tagged `latest` on the default branch plus
+the branch, the tag and the long SHA, with a SLSA provenance attestation and an
+SBOM, then signs the pushed digest with keyless `cosign` and writes the digest
+and `install.sh`'s sha256 to the run summary. Every action is pinned by commit
+SHA, with its tag in a trailing comment; a tag can be moved, a SHA cannot.
 
 **The verify job is the whole point of the file.** Nothing used to run between
 checkout and push, so a broken commit on the default branch became the `:latest`

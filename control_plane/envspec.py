@@ -72,6 +72,8 @@ _DECLARED = (
     _v("DERATE_CLUSTER_ID", None, "control_plane/registry/config.py", ""),
     _v("DERATE_BUILD", None, "control_plane/version.py",
        "stamped into the image; absent means a source checkout"),
+    _v("DERATE_IMAGE_DIGEST", None, "control_plane/gateway/enroll_api.py",
+       "the sha256 digest this node's image was installed by; install.sh --digest sets it, and the join command then pins it"),
     _v("DERATE_ALLOW_BRIDGE", None, "control_plane/registry/config.py",
        "the container refuses bridge networking unless this is set"),
     _v("DERATE_HOST_RESERVE_MIB", None, "control_plane/registry/config.py",
@@ -96,6 +98,9 @@ _DECLARED = (
        "seconds; a pinned commit sha never expires whatever this says"),
     _v("DERATE_OFFLINE", None, "control_plane/resolver/resolver.py",
        "answer from cache and fixtures, never reach the network"),
+    _v("DERATE_MODEL_DIRS", None, "control_plane/resolver/resolver.py",
+       "colon-separated directories a local model path may resolve under, "
+       "beside the HF cache and the data dir; anything else is refused"),
 
     # -- launching -----------------------------------------------------------
     _v("DERATE_VLLM_IMAGE", None, "control_plane/deploy/flags.py", ""),
@@ -154,9 +159,14 @@ _DECLARED = (
        "set by the server into the session it spawns; not operator-facing"),
 
     # -- telemetry -----------------------------------------------------------
-    _v("DERATE_TELEMETRY", "1", "control_plane/telemetry/config.py", ""),
+    _v("DERATE_TELEMETRY", "1", "control_plane/telemetry/config.py",
+       "0 switches metrics, events and log capture off; /v1 request rows and "
+       "access rows are evidence and are still recorded"),
     _v("DERATE_TELEMETRY_SHIP_INTERVAL_S", "5", "control_plane/telemetry/config.py", ""),
     _v("DERATE_TELEMETRY_RETENTION_DAYS", "30", "control_plane/telemetry/config.py", ""),
+    _v("DERATE_REQUESTS_RETENTION_DAYS", "90", "control_plane/telemetry/config.py",
+       "days the archive keeps requests and access rows; not scaled by "
+       "DERATE_TELEMETRY_RETENTION_DAYS"),
     _v("DERATE_TELEMETRY_MAX_BYTES", None, "control_plane/telemetry/config.py", ""),
     _v("DERATE_TELEMETRY_LOG_LEVEL", "LOG_SHIP_LEVEL", "control_plane/telemetry/config.py", ""),
     _v("DERATE_TELEMETRY_QUIET_LOGGERS", None, "control_plane/telemetry/config.py", ""),
@@ -164,8 +174,8 @@ _DECLARED = (
 
     # -- the log folder ------------------------------------------------------
     _v("DERATE_LOG_DIR", None, "control_plane/paths.py",
-       "where node.log and proxy.log are written; unset means <project root>/logs "
-       "-- /opt/derate/logs in the image, which is a layer and not the volume"),
+       "where node.log, proxy.log and audit/ are written; unset means "
+       "<data dir>/logs, which is on the volume and survives docker rm"),
     _v("DERATE_LOG_FILES", "1", "control_plane/logfiles.py",
        "0 to write no files at all -- stderr and the telemetry journal are "
        "unaffected either way"),
@@ -178,6 +188,24 @@ _DECLARED = (
     _v("DERATE_ALLOWED_ORIGINS", "", "control_plane/gateway/settings.py", ""),
     _v("DERATE_API_TOKEN", None, "control_plane/gateway/settings.py",
        "opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op"),
+    _v("DERATE_TRUSTED_PROXIES", "", "control_plane/gateway/settings.py",
+       "comma-separated IPs/CIDRs allowed to set X-Forwarded-For/-Proto; "
+       "empty = proxy headers ignored and the peer address is the client"),
+    _v("DERATE_PUBLIC_ORIGIN", "", "control_plane/gateway/settings.py",
+       "the origin browsers use when a TLS terminator fronts the gateway, "
+       "e.g. https://derate.example; drives the cookie's Secure flag and CSRF"),
+
+    # -- the audit trail -----------------------------------------------------
+    _v("DERATE_AUDIT_SINK", "", "control_plane/auditlog.py",
+       "remote copy of every audit row: udp://host:port or tcp://host:port "
+       "(RFC 5424 syslog), http(s)://... (NDJSON POST); empty = no remote copy"),
+    _v("DERATE_AUDIT_SINK_TOKEN", "", "control_plane/auditlog.py",
+       "bearer token sent to an http(s) audit sink; never rendered"),
+    _v("DERATE_AUDIT_LOG_DAYS", "400", "control_plane/auditlog.py",
+       "days of logs/audit/*.jsonl kept on disk"),
+    _v("DERATE_TTS_API_KEY", None, "control_plane/runtimes/tts.py",
+       "set by the recipe: the bearer the tts runtime requires on /v1; "
+       "unset means the runtime answers unauthenticated"),
     _v("DERATE_ELECTRICITY_RATE", "0", "control_plane/gateway/main.py",
        "currency per kWh; 0 means the spend screen shows no power cost"),
     _v("DERATE_INSTALL_SH", None, "control_plane/gateway/enroll_api.py",
@@ -189,8 +217,6 @@ _DECLARED = (
     _v("DERATE_TEST_NETWORK", None, "tests/unit/test_resolver.py",
        "opt in to tests that reach HuggingFace"),
     _v("DERATE_LOAD_LOGS", None, "tests/load/harness.py", ""),
-    _v("DERATE_STUB_PROVIDER_KEY", None, "control_plane/providers/stub.py",
-       "the key reference the day-0 provider stub hands out"),
     _v("DERATE_API_KEY", "", "tests/load/loadtest.py", ""),
     _v("DERATE_BASE_URL", "http://localhost:8088", "tests/load/loadtest.py", ""),
     _v("DERATE_CHECK_ORIGIN", "http://localhost:8088", "ui/src/**/*.check.mjs",
@@ -201,6 +227,16 @@ _DECLARED = (
     _v("DERATE_CHECK_BROWSER", None, "ui/src/check/browser.mjs",
        "an explicit Chromium path, for a machine whose Playwright cache is "
        "somewhere the finder does not look"),
+    _v("DERATE_CHECK_ADMIN_USER", "", "ui/src/check/auth.mjs",
+       "the admin the live-API verifiers log in as; the gateway answers /api "
+       "only to a session"),
+    _v("DERATE_CHECK_ADMIN_PASSWORD", "", "ui/src/check/auth.mjs",
+       "that admin's password"),
+    _v("DERATE_CHECK_API_KEY", "", "ui/src/check/auth.mjs",
+       "a drt_ key for verifiers that call /v1 directly"),
+    _v("DERATE_GALLERY_ONLY", None, ".omp/tests/ui/layout.check.mjs",
+       "comma-separated component names; run.mjs sets it to scope the gallery "
+       "layout matrix to the components a ui:check path names"),
     _v("DERATE_TTS_DEFAULT_VOICES", "1", "control_plane/runtimes/tts.py",
        "0 leaves an empty voice directory empty instead of fetching a "
        "starter library"),
@@ -231,6 +267,15 @@ DYNAMIC: tuple[DynamicEnv, ...] = (
         suffix="",
         owner="control_plane/links/service.py",
         note="per-node data-plane address override, keyed by node id",
+    ),
+    DynamicEnv(
+        prefix="DERATE_SECRET_",
+        suffix="",
+        owner="control_plane/providers/secrets.py",
+        note=(
+            "an operator-provided provider key a provider's api_key_ref may "
+            "name; no other environment variable is ever resolved as a key"
+        ),
     ),
 )
 

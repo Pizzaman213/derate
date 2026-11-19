@@ -9,7 +9,19 @@ the address the installer printed.
 
 ## Open it
 
-Use the `ui:` line the installer printed — for example `http://192.168.1.10:8080`.
+Use the `ui:` line the installer printed — for example `http://192.168.1.10:8080`
+— but **for the very first visit, open it on the coordinator itself**, as
+`http://127.0.0.1:8080`, or from your laptop through a tunnel:
+
+```
+ssh -L 8080:127.0.0.1:8080 <coordinator>
+```
+
+then `http://127.0.0.1:8080`. The first admin can only be created from the
+coordinator's loopback address (`POST /api/setup/admin` answers `403`
+`setup_local_only` from anywhere else, and the page shows the tunnel command
+instead of the form), so nobody else on the network can claim a fresh install
+before you do. After the admin exists, any address works.
 
 The redirect to the walkthrough happens once, and only if you landed on the
 dashboard. A person who typed a URL, followed a link or clicked a tab has said
@@ -18,7 +30,7 @@ late is worse than never being offered setup at all. `/setup` is a real
 destination with a real URL, so you can open it directly at any time:
 
 ```
-http://192.168.1.10:8080/setup
+http://127.0.0.1:8080/setup
 ```
 
 The walkthrough stops being offered once this cluster is serving a model or has a
@@ -29,6 +41,51 @@ onboarding.
 The walkthrough has no header, no roster and no sidebar. On a fresh install none
 of them have anything in them, and a frame around four empty panels is a worse
 first impression than no frame.
+
+## Before the steps: the admin account
+
+On a coordinator with no admin, every screen sends you to `/setup`, and setup
+opens on one form: **Create the admin account.** Choose a username, an email
+address, and a password of at least 12 characters (`PASSWORD_MIN_LEN`), typed
+twice; the eye beside each password box shows what you typed. No two admins
+may share an email, whatever its case. Until
+this exists, the gateway answers `401` to every `/api` route except
+`GET /api/auth/state` and the one this form posts to, `POST /api/setup/admin`.
+
+That one request makes four things: the admin, the `default` org, the admin's
+own key (used when you chat from the UI; its secret is never shown), and a
+normal API key named `default` that expires in 365 days. It also signs you in.
+
+**The default key's secret is shown once,** in a dialog, and is gone when you
+press **I saved it**. derate keeps only a hash: it cannot show it again, and
+no screen or `/api` response ever will. Copy it now — every request to `/v1`
+needs it (see [the endpoint](the-endpoint.md)). If it is lost, rotate it on the
+**Keys** screen, which reveals a new secret the same once-only way.
+
+**Setup closes for good once an admin exists.** `POST /api/setup/admin` then
+answers `410` `setup_closed`. If another browser got there first, the form says
+`Setup was already finished in another browser.` and sends you to sign in.
+
+### Signing in afterwards
+
+Every later visit without a session lands on `/login`, which takes the
+username *or* the email (any case) of an admin. A session lasts 7 days
+without use and 30 days at most; the cookie is `derate_session`, `HttpOnly`
+and `SameSite=Strict`. More admins are added under Settings, each with their
+own email. Admins created before emails existed show `—` there.
+
+**Five failed sign-ins lock the form — for that name, from that address.**
+Five failures inside 15 minutes for one name as typed, from one IP address,
+lock that pair for 30 seconds; each further failure doubles that, up to an
+hour. Failures for one name spread over several addresses lock the name
+everywhere, but for at most 5 minutes, so somebody typing your username
+elsewhere cannot keep you out. Many failures from one address across different
+names slow its answers (up to 8 seconds) rather than refusing them, because
+behind NAT one address is many people. A locked attempt answers `429`
+`login_locked` with `Retry-After`, the form says how long to wait, and trying
+again while locked does not extend the lock. A wrong password is `401`
+`invalid_credentials` and does not say whether the username exists. Passwords
+may not contain the username or the email's local part.
 
 ## The four steps, and the handover
 
@@ -270,13 +327,21 @@ nothing in the planner or the fit gate filters placement on device class — so 
 reason is printed next to the row and the decision is yours. It is the machines a
 human is most likely to be adding by hand, a Mac or a Pi, that hit that case.
 
-A node admitted either way is handed the permanent cluster token on the way in.
-An enrollment token expiring later cannot lock an established member out of its
-own cluster.
+A node admitted either way is handed its own **agent token** on the way in — a
+random credential for that machine alone, kept in its `cluster.json` — and from
+then on it re-joins with that and nothing else. An enrollment token expiring
+later cannot lock an established member out of its own cluster, and no member
+holds the cluster token: a compromised worker cannot impersonate another node or
+let a new one in. The cluster token can therefore be rotated (Settings → Nodes →
+**Rotate cluster token**, which asks for your password) without disturbing any
+member; it refuses, naming them, while a member from an older build has not
+re-joined yet.
 
-Keep the permanent token somewhere. It is what makes the coordinator
-replaceable: start a coordinator anywhere with `DERATE_TOKEN` set to it and every
-node presents itself again on its own. If you need to read it back:
+Keep the coordinator's data volume. Members re-join on their own agent tokens,
+which the coordinator keeps in `registry.json` beside `cluster.json`; a
+replacement coordinator started with both files (and `DERATE_TOKEN` set to the
+cluster token, if you pinned it) has every node present itself again on its own.
+If you need to read the cluster token back:
 
 ```bash
 docker exec derate cat /data/cluster.json
@@ -328,10 +393,11 @@ Everything you configured is saved; only the reminder to set up is. Check that
 the data directory is writable.
 ```
 
-**Somebody else opened the coordinator and added a node.** The gateway has no
-inbound authentication yet. Anyone who can reach port 8080 can mint an
-enrollment token, admit a candidate, and launch a model. Treat the port as the
-boundary.
+**Somebody else opened the coordinator.** They cannot do anything without an
+admin's password: every `/api` route asks for a session and every `/v1` route
+for a key. What they can do is see the sign-in screen, and use the routes that
+are open by design — `GET /healthz`, `GET /install.sh`, `POST /api/nodes/join`
+(which still needs a valid enrollment token in its body).
 
 ---
 
