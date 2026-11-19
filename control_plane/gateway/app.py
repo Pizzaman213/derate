@@ -58,6 +58,7 @@ from .auth import is_unauthorized
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
 from .deps import GatewayContext, GatewayDeps
+from .errors import error_response
 from .headers import SecurityHeaders
 from .metrics import MetricsHub
 from .parking import ParkingLot
