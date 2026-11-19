@@ -26,7 +26,10 @@ from typing import Any
 from fastapi import APIRouter, Request
 from starlette.responses import JSONResponse, Response
 
+from ..contracts.auth import AuditAction
 from . import errors
+from .body import BodyTooLarge, payload_too_large, read_json_object
+from .authz import audit_request
 from .deps import GatewayContext
 from .settings_store import (
     MUTABLE_FIELDS,
@@ -43,11 +46,10 @@ def _accounts_for_spend(providers: Any) -> bool:
     """Whether any port can tell us what has been spent.
 
     A cap the coordinator cannot measure against is a control that appears to
-    guard money and does not. Better to refuse it and say why.
+    guard money and does not. Better to refuse it and say why. ``spend_today``
+    is what ``Router.rebuild`` sums against the cap, so it is the only proof.
     """
-    return callable(getattr(providers, "public_list", None)) or callable(
-        getattr(providers, "spend_today", None)
-    )
+    return callable(getattr(providers, "spend_today", None))
 
 
 def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> APIRouter:
@@ -96,7 +98,9 @@ def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> AP
     @router.patch("/api/settings")
     async def patch_settings(request: Request) -> Response:
         try:
-            patch = await request.json()
+            patch = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
@@ -131,6 +135,7 @@ def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> AP
                 "not_implemented",
             )
 
+        before_view = _view()
         try:
             store.save(merged)
         except SettingsError as exc:
@@ -161,6 +166,13 @@ def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> AP
             except Exception:
                 log.exception("router rebuild after settings change failed")
 
-        return JSONResponse(_view())
+        after_view = _view()
+        changed = [k for k in MUTABLE_FIELDS if before_view.get(k) != after_view.get(k)]
+        audit_request(
+            request, AuditAction.SETTINGS_CHANGED, "settings", ",".join(changed) or "-",
+            before={k: before_view.get(k) for k in changed},
+            after={k: after_view.get(k) for k in changed},
+        )
+        return JSONResponse(after_view)
 
     return router
