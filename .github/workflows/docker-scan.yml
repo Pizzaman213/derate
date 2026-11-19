@@ -1,0 +1,89 @@
+# Docker image security scan -- the easy check.
+#
+# Builds the node image exactly as the Dockerfile says, scans what would ship
+# with Trivy, and puts the result on the run page as a table: what is fixable
+# now, and what is waiting on upstream. It fails only when a CRITICAL or HIGH
+# finding has a released fix (.github/scripts/trivy_summary.py says why).
+#
+# publish-image.yml runs the same gate before every push. This workflow exists
+# because that one never runs on a pull request, so a PR that adds a
+# vulnerable dependency would only find out after merging. It also runs weekly:
+# a CVE published on Tuesday makes an unchanged image fail, and the only way to
+# hear about it is to look again.
+#
+# Trivy runs from its own image, pinned by digest, against a `docker save`
+# tarball. No third-party action, and no docker socket handed to a container
+# this repository did not build.
+#
+# Run it by hand from the Actions tab (workflow_dispatch), or locally with the
+# same three commands:
+#
+#     docker build --build-arg SKIP_UI=1 -t derate-node:scan .
+#     docker save derate-node:scan -o /tmp/scan/node.tar
+#     docker run --rm -v /tmp/scan:/img aquasec/trivy:0.58.1 image \
+#         --input /img/node.tar --scanners vuln --format json > report.json
+#     python3 .github/scripts/trivy_summary.py report.json
+name: docker security scan
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  schedule:
+    # Mondays 06:17 UTC. Off the hour, so it is not queued behind every other
+    # repository's cron.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # amd64, native on the runner. SKIP_UI=1 because the UI stage ships only
+      # static files into the final image -- no packages for a scanner to find
+      # -- and skipping it saves the npm install.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: derate-node:scan
+          build-args: |
+            SKIP_UI=1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan
+        run: |
+          mkdir -p "$RUNNER_TEMP/scan"
+          docker save derate-node:scan -o "$RUNNER_TEMP/scan/node.tar"
+          docker run --rm -v "$RUNNER_TEMP/scan:/img" "$TRIVY_IMAGE" \
+            image --input /img/node.tar --scanners vuln \
+            --severity CRITICAL,HIGH,MEDIUM --format json --output /img/report.json
+
+      - name: Report
+        run: python3 .github/scripts/trivy_summary.py "$RUNNER_TEMP/scan/report.json" --summary "$GITHUB_STEP_SUMMARY"
+
+      # The full report, for anyone who wants every row rather than the summary.
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: ${{ runner.temp }}/scan/report.json
+          if-no-files-found: ignore

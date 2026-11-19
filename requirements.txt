@@ -1,6 +1,12 @@
 # Runtime dependencies for the derate node image.
 # sparkrun is installed separately and pinned by build arg; see Dockerfile.
-fastapi==0.115.6
+fastapi==0.165.0
+# Floors, not pins: fastapi's own range picks the version. starlette < 1.3.1
+# serves /assets/* through a FileResponse whose Range parsing is quadratic
+# (CVE-2025-62727) plus CVE-2026-48818/54283; h11 < 0.16.0 accepts malformed
+# chunked bodies (request smuggling behind a proxy).
+starlette>=1.3.1
+h11>=0.16.0
 uvicorn[standard]==0.34.0
 # Already pulled in by uvicorn[standard], but /v1/realtime imports it directly
 # as a *client* to dial the upstream, so it is named rather than relied on
@@ -14,7 +20,9 @@ httpx==0.28.1
 # cancelled by then. asyncio.shield does not cover an anyio cancellation.
 anyio==4.14.2
 pydantic==2.10.4
-zeroconf==0.136.2
+# 0.149.16 fixes CVE-2026-47180/47183/47184/48045/48487: LAN-triggerable CPU
+# and memory exhaustion in the browser every node runs in the gateway process.
+zeroconf==0.149.16
 PyYAML==6.0.3
 requests==2.34.2
 # Host facts on the two platforms with no /proc: memory, CPU utilisation,
