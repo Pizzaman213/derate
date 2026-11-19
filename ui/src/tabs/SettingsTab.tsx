@@ -9,12 +9,16 @@ import { ProvidersCard } from './settings/ProvidersCard'
 import { ClusterCard } from './settings/ClusterCard'
 import { ContainmentCard } from './settings/ContainmentCard'
 import { ReliabilityCard } from './settings/ReliabilityCard'
+import { AdminsCard } from './settings/AdminsCard'
+import { SessionsCard } from './settings/SessionsCard'
+import { PricingCard } from './settings/PricingCard'
 import { AppearanceCard } from './settings/AppearanceCard'
 import { ScopeCards } from './settings/ScopeCards'
 import { FilesystemsCard } from './storage/FilesystemsCard'
 import { ModelCacheCard } from './storage/ModelCacheCard'
 import { EstateCard } from './storage/EstateCard'
 import { CollectionCard } from './storage/CollectionCard'
+import { AuditTab } from './audit/AuditTab'
 
 type Sub =
   | 'connection'
@@ -23,6 +27,8 @@ type Sub =
   | 'storage'
   | 'providers'
   | 'policy'
+  | 'admins'
+  | 'audit'
   | 'appearance'
   | 'about'
 
@@ -36,6 +42,8 @@ const SUBS: { id: Sub; label: string }[] = [
   { id: 'storage', label: 'Storage' },
   { id: 'providers', label: 'Providers' },
   { id: 'policy', label: 'Policy' },
+  { id: 'admins', label: 'Admins' },
+  { id: 'audit', label: 'Audit log' },
   { id: 'appearance', label: 'Appearance' },
   { id: 'about', label: 'About' },
 ]
@@ -45,7 +53,7 @@ const SUBS: { id: Sub; label: string }[] = [
  *  are spending their disk on, and what this project has said it will not
  *  build.
  *
- *  Eight sub-tabs (`.subs`, the same bar the Dashboard uses) rather than the
+ *  Ten sub-tabs (`.subs`, the same bar the Dashboard uses) rather than the
  *  one nine-card column this used to be. The column was not merely long: it
  *  ran four unrelated jobs together, and roughly half its height was the
  *  About cards, which are documentation and never change. Splitting on the
@@ -66,6 +74,12 @@ const SUBS: { id: Sub; label: string }[] = [
  *  Add a node holds a minted enrollment token, its countdown, and the list of
  *  machines that have turned up since -- state a tab switch must not throw
  *  away -- and the same is true of a half-typed coordinator address.
+ *
+ *  The audit log joined beside Admins rather than staying its own header
+ *  destination: it is the record of what admins did, read by the same
+ *  people who manage them, and it does not need a top-level slot. It keeps
+ *  its filters across a sub-tab switch for the same mounted-and-hidden
+ *  reason as everything else here.
  *
  *  Appearance joined the same way: the dark-mode select used to sit in the
  *  header, next to the destination tabs, which put a local-only preference
@@ -147,6 +161,19 @@ export function SettingsTab() {
       <div id="st-policy" role="tabpanel" aria-labelledby="st-tab-policy" hidden={sub !== 'policy'}>
         <ContainmentCard />
         <ReliabilityCard />
+        {/* What a local model's tokens cost, for the dollar limits on keys.
+            Policy, because it decides what a request is charged. */}
+        <PricingCard />
+      </div>
+
+      <div id="st-admins" role="tabpanel" aria-labelledby="st-tab-admins" hidden={sub !== 'admins'}>
+        <AdminsCard />
+        {/* Containment: every live session, and sign any admin out everywhere. */}
+        <SessionsCard />
+      </div>
+
+      <div id="st-audit" role="tabpanel" aria-labelledby="st-tab-audit" hidden={sub !== 'audit'}>
+        <AuditTab />
       </div>
 
       <div

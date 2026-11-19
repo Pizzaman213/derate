@@ -4,6 +4,7 @@ import type { Terminal as Xterm } from '@xterm/xterm'
 import { wsUrl } from '../../api/origin'
 import { useShellStatus } from '../../state/history'
 import { Verbatim } from '../../components/Verbatim'
+import { tokens } from '../../../../.omp/design/tokens/tokens.ts'
 
 // The one dependency this UI takes that it could not have written, and it is
 // **loaded on demand**, not bundled. Both halves of that matter.
@@ -283,19 +284,20 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
 /** xterm needs literal colours, and this page is themed with custom properties
  *  that change under `prefers-color-scheme` and the theme switch. Read from the
  *  live computed style so the terminal matches whichever is in force; the
- *  fallbacks are the light theme's values. */
+ *  fallbacks are the light theme's values from the design pack. */
 function readTheme() {
   const style = getComputedStyle(document.documentElement)
   const token = (name: string, fallback: string) =>
     style.getPropertyValue(name).trim() || fallback
+  const light = tokens.light
   return {
-    background: token('--panel', '#EDE9E0'),
-    foreground: token('--ink', '#1A1917'),
-    cursor: token('--ink', '#1A1917'),
-    selectionBackground: token('--panel-sunk', '#D6D0C2'),
-    red: token('--fault', '#9A3327'),
-    green: token('--live', '#2F6E3A'),
-    yellow: token('--warn', '#7F5C14'),
-    blue: token('--flow', '#4A6FA5'),
+    background: token('--panel', light.panel),
+    foreground: token('--ink', light.ink),
+    cursor: token('--ink', light.ink),
+    selectionBackground: token('--panel-sunk', light['panel-sunk']),
+    red: token('--fault', light.fault),
+    green: token('--live', light.live),
+    yellow: token('--warn', light.warn),
+    blue: token('--flow', light.flow),
   }
 }

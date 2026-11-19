@@ -22,6 +22,21 @@ from tests.unit.test_gateway import StubLinks, build_deps
 INJECTION = "-oProxyCommand=touch /tmp/derate-pwned"
 
 
+def test_the_route_refuses_a_node_the_registry_does_not_know():
+    measured: list[tuple[str, str]] = []
+
+    class Recording(StubLinks):
+        def measure(self, a, b):
+            measured.append((a, b))
+            return None
+
+    deps = build_deps()
+    deps.links = Recording()
+    with TestClient(create_app(deps)) as client:
+        reply = client.post("/api/links/measure", json={"a": "spark-01", "b": INJECTION})
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "unknown_node"
+    assert measured == []
 
 
 class _NoAddress:

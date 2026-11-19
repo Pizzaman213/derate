@@ -10,6 +10,7 @@ import { containTab } from '../../components/focusTrap'
 import { Lamp } from '../../components/Lamp'
 import { Verbatim } from '../../components/Verbatim'
 import { fmt, pct } from '../../format'
+import { ROUTING_POLICIES } from '../keys/rows'
 import {
   addLimit,
   BALANCER_SENTENCES,
@@ -31,18 +32,6 @@ import {
   type Doc,
   type ServerSnapshot,
 } from './doc'
-
-/** The seven policies of `RoutingPolicy`, in the wire's order. Stands in for
- *  `keys/rows.ts`'s `ROUTING_POLICIES` until the auth-keys-limits branch lands. */
-const ROUTING_POLICIES: RoutingPolicy[] = [
-  'least_outstanding',
-  'round_robin',
-  'weighted_capacity',
-  'cache_affinity',
-  'failover',
-  'local_first',
-  'cost_aware',
-]
 import { LB_POLICY, wireId } from './sockets'
 
 function whole(value: string): number | undefined {

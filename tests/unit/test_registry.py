@@ -686,6 +686,41 @@ def test_join_is_rejected_when_probe_back_disagrees(tmp_path):
     assert registry.candidates() == []
 
 
+@pytest.mark.parametrize(
+    "agent_url",
+    [
+        "ftp://10.0.0.5",
+        "http://u:p@10.0.0.5",
+        "http://10.0.0.5/x?y=1",
+        "http://10.0.0.5/#f",
+        # A bare trailing `?` turns the appended /agent/profile into a query,
+        # aiming the probe-back at a path of the caller's choosing.
+        "http://127.0.0.1:8088/api/settings?",
+    ],
+)
+def test_the_open_join_route_refuses_an_address_before_dialling_it(agent_url):
+    """POST /api/nodes/join is open, and the registry GETs whatever address it
+    is handed. A shape that is not a peer is a 400 and nothing is dialled."""
+    from fastapi.testclient import TestClient
+
+    from control_plane.gateway.app import create_app
+    from tests.unit.test_gateway import FakeRegistry, build_deps
+
+    dialled: list[str] = []
+
+    class Reg(FakeRegistry):
+        async def handle_join(self, proof, profile, url):
+            dialled.append(url)
+            return {"node_id": profile.node_id, "status": "candidate"}
+
+    with TestClient(create_app(build_deps(registry=Reg()))) as http:
+        res = http.post(
+            "/api/nodes/join",
+            json={"profile": profile_to_dict(SPARK_02), "agent_url": agent_url},
+        )
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "invalid_join_body"
+    assert dialled == []
 
 
 def test_tokenless_join_candidates_are_capped_before_the_probe_back(tmp_path):

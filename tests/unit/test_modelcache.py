@@ -376,6 +376,20 @@ def test_weights_a_live_deployment_is_serving_are_refused(state):
     assert "d-1" in body["error"]["message"]
 
 
+@pytest.mark.parametrize("state", ["stopped", "failed"])
+def test_weights_of_a_terminal_deployment_are_deletable(state, monkeypatch):
+    """The orphan this exists to clear. It must not be protected forever."""
+    import httpx
+
+    client = _gateway_with([_deployment("openai/gpt-oss-120b", state)])
+
+    monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
+    res = client.delete(
+        "/api/storage/nodes/spark-01/models/models--openai--gpt-oss-120b"
+    )
+
+    assert res.status_code == 200
+    assert res.json()["bytes_freed"] == 195758080000
 
 
 def test_a_different_model_is_not_protected_by_an_unrelated_deployment(monkeypatch):

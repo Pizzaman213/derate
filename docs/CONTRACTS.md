@@ -590,6 +590,19 @@ the canonical value.
 - **Why not in `contracts/`**: a judgement about DeploymentState rather than part of it, and it belongs beside the transition table that enforces it. The gateway cannot import it -- the deploy package __init__ pulls the manager, the sparkrun adapter and the event bus into a request module -- so gateway/states.py holds the gateway's one spelling and this holds the two together
 - **Checked copies**: `control_plane.gateway.states:TERMINAL`
 
+### `drt_key_pattern`
+
+- **Canonical**: `control_plane.keys.format:KEY_PATTERN` = `\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}`
+- **Why not in `contracts/`**: the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, copy
+- **Checked copies**: `control_plane.redaction:KEY_PATTERN`
+- **Restated (not checkable)**: `ui/src/api/redact.ts`, `ui/src/shell/screens.check.mjs`
+
+### `login_lock_username_cap`
+
+- **Canonical**: `control_plane.contracts.auth:LOGIN_LOCK_USERNAME_MAX_S` = `300`
+- **Why not in `contracts/`**: a policy about the lockout rather than a shape: anyone can type a username, so the bare-username lock is a denial of service on the real admin and is capped short. auth/service.py enforces it; the auth README and the forensics runbook state the number
+- **Restated (not checkable)**: `control_plane/auth/README.md`, `docs/FORENSICS.md`
+
 ### `node_roles`
 
 - **Canonical**: `control_plane.registry.config:ROLE_COORDINATOR` = `coordinator`
@@ -601,6 +614,12 @@ the canonical value.
 - **Why not in `contracts/`**: it belongs with the scrubber that writes it, and that scrubber is no longer inside the provider package -- logfiles.py redacts on every node, and the worker path may not import providers
 - **Checked copies**: `control_plane.providers.config:REDACTED`, `control_plane.gateway.serialize:REDACTED`
 
+### `request_record_fields`
+
+- **Canonical**: `control_plane.contracts.telemetry:REQUEST_RECORD_FIELDS` = `request_id`, `ts`, `served_name`, `node_id`, `target_id`, `target_kind`, `provider_id`, `deployment_id`, `policy`, `strength_source`, `attempt_no`, `attempts`, `retry_reason`, `status`, `error_code`, `error_class`, `prompt_tokens`, `completion_tokens`, `tokens`, `tokens_estimated`, `cost_usd`, `ttft_ms`, `decode_ms`, `duration_ms`, `parked_ms`, `streaming`, `body_bytes`, `admission_code`, `kv_bytes`, `key_id`, `key_name`, `org_id`, `client_ip`, `user_agent`, `model_requested`, `model_served`, `attempt_chain`, `fallback_used`, `fallback_reason`, `finish_reason`, `cancelled`, `limit_source`, `generation_ms`, `tokens_per_s`, `tpot_mean_ms`, `tpot_p95_ms`, `tail_ms`, `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens`, `max_tokens_requested`, `message_count`, `context_bucket`, `prefix_cache_hit_rate`, `cache_error`, `spec_num_drafts`, `spec_draft_tokens`, `spec_accepted_tokens`, `spec_acceptance_rate`, `spec_mean_accepted_len`, `spec_accepted_per_position`, `spec_decode_error`, `cost_basis`, `client_port`
+- **Why not in `contracts/`**: the record is a dataclass in telemetry/, the column list is a contract the archive schema, the usage API and the UI read
+- **Checked copies**: `control_plane.telemetry.records:REQUEST_RECORD_FIELDS`
+
 ### `runtime_names`
 
 - **Canonical**: `control_plane.deploy.flags:SUPPORTED_RUNTIMES` = `vllm`, `sglang`, `tts`
@@ -609,20 +628,38 @@ the canonical value.
 
 ## HTTP surface
 
-### Coordinator gateway (80 routes)
+### Coordinator gateway (130 routes)
 
 | Method | Path |
 |---|---|
 | GET | `/api/activity` |
+| GET | `/api/admins` |
+| POST | `/api/admins` |
+| DELETE | `/api/admins/{username}` |
+| DELETE | `/api/admins/{username}/sessions` |
+| GET | `/api/audit` |
+| GET | `/api/audit/integrity` |
+| POST | `/api/auth/login` |
+| POST | `/api/auth/logout` |
+| GET | `/api/auth/me` |
+| POST | `/api/auth/password` |
+| DELETE | `/api/auth/sessions` |
+| GET | `/api/auth/sessions` |
+| GET | `/api/auth/state` |
 | GET | `/api/capacity` |
 | GET | `/api/catalog` |
+| POST | `/api/chat/completions` |
+| GET | `/api/chat/models` |
+| POST | `/api/chat/speech` |
+| POST | `/api/chat/transcriptions` |
+| GET | `/api/chat/voices` |
 | GET | `/api/cluster` |
+| POST | `/api/cluster/token/rotate` |
 | GET | `/api/deployments` |
 | POST | `/api/deployments` |
 | DELETE | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}/logs` |
-| GET | `/api/docs` |
 | GET | `/api/enroll` |
 | POST | `/api/enroll` |
 | DELETE | `/api/enroll/{token_id}` |
@@ -631,6 +668,17 @@ the canonical value.
 | GET | `/api/history/nodes` |
 | GET | `/api/history/requests` |
 | GET | `/api/history/status` |
+| GET | `/api/keys` |
+| POST | `/api/keys` |
+| DELETE | `/api/keys/{key_id}` |
+| GET | `/api/keys/{key_id}` |
+| PATCH | `/api/keys/{key_id}` |
+| POST | `/api/keys/{key_id}/disable` |
+| POST | `/api/keys/{key_id}/enable` |
+| POST | `/api/keys/{key_id}/raise` |
+| GET | `/api/keys/{key_id}/requests` |
+| POST | `/api/keys/{key_id}/reset-cycle` |
+| POST | `/api/keys/{key_id}/rotate` |
 | GET | `/api/links` |
 | POST | `/api/links/measure` |
 | POST | `/api/links/reach` |
@@ -655,7 +703,18 @@ the canonical value.
 | POST | `/api/nodes/{node_id}/runtime` |
 | POST | `/api/nodes/{node_id}/runtime/model` |
 | GET | `/api/openapi.json` |
+| GET | `/api/orgs` |
+| POST | `/api/orgs` |
+| DELETE | `/api/orgs/{org_id}` |
+| GET | `/api/orgs/{org_id}` |
+| PATCH | `/api/orgs/{org_id}` |
+| POST | `/api/orgs/{org_id}/keys/disable` |
+| GET | `/api/orgs/{org_id}/limits` |
 | POST | `/api/plan` |
+| GET | `/api/pricing` |
+| DELETE | `/api/pricing/{model:path}` |
+| GET | `/api/pricing/{model:path}` |
+| PUT | `/api/pricing/{model:path}` |
 | GET | `/api/providers` |
 | POST | `/api/providers` |
 | GET | `/api/providers/kinds` |
@@ -669,6 +728,7 @@ the canonical value.
 | POST | `/api/providers/{provider_id}/refresh` |
 | GET | `/api/publishers/avatars` |
 | GET | `/api/publishers/{owner}/avatar` |
+| GET | `/api/requests` |
 | GET | `/api/routing` |
 | DELETE | `/api/routing/{served_name}` |
 | PUT | `/api/routing/{served_name}` |
@@ -678,11 +738,19 @@ the canonical value.
 | POST | `/api/setup/admin` |
 | POST | `/api/setup/complete` |
 | GET | `/api/shell/status` |
+| POST | `/api/sign-in/chatgpt` |
+| GET | `/api/sign-in/chatgpt/{attempt_id}` |
+| POST | `/api/sign-in/chatgpt/{attempt_id}/complete` |
+| POST | `/api/sign-in/claude` |
+| GET | `/api/sign-in/claude/{attempt_id}` |
+| POST | `/api/sign-in/claude/{attempt_id}/complete` |
 | GET | `/api/storage` |
 | DELETE | `/api/storage/cache/resolver` |
 | DELETE | `/api/storage/nodes/{node_id}/models/{folder}` |
 | GET | `/api/topology` |
-| GET | `/docs/oauth2-redirect` |
+| GET | `/api/usage` |
+| POST | `/api/wiring` |
+| GET | `/auth/callback` |
 | GET | `/healthz` |
 | GET | `/install.sh` |
 | POST | `/v1/audio/speech` |
@@ -691,6 +759,7 @@ the canonical value.
 | POST | `/v1/chat/completions` |
 | POST | `/v1/completions` |
 | POST | `/v1/embeddings` |
+| GET | `/v1/key` |
 | GET | `/v1/models` |
 | WEBSOCKET | `/v1/realtime` |
 
@@ -776,7 +845,6 @@ default. A blank default means absence is itself the answer.
 | `DERATE_SHELL_ORIGINS` | `` | `control_plane/registry/shell_config.py` |
 | `DERATE_SHELL_SESSION` |  | `control_plane/registry/shell.py` — set by the server into the session it spawns; not operator-facing |
 | `DERATE_SPARKRUN_BIN` |  | `control_plane/deploy/sparkrun.py` — unset: whatever `sparkrun` resolves to on PATH |
-| `DERATE_STUB_PROVIDER_KEY` |  | `control_plane/providers/stub.py` — the key reference the day-0 provider stub hands out |
 | `DERATE_TELEMETRY` | `1` | `control_plane/telemetry/config.py` — 0 switches metrics, events and log capture off; /v1 request rows and access rows are evidence and are still recorded |
 | `DERATE_TELEMETRY_LOG_LEVEL` | `LOG_SHIP_LEVEL` | `control_plane/telemetry/config.py` |
 | `DERATE_TELEMETRY_MAX_BYTES` |  | `control_plane/telemetry/config.py` |

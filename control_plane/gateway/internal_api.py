@@ -45,9 +45,9 @@ from control_plane.fit.capacity import (
     context_for,
 )
 from control_plane.planner.constants import LATENCY_CONCURRENCY_CEILING
-from control_plane import providers as _providers_pkg
 from control_plane.providers import (
     AdapterUnsupportedError,
+    SignInError,
     UnknownProviderError,
     UpstreamError,
 )
@@ -63,7 +63,7 @@ from control_plane.planner import (
 )
 from control_plane.registry import JoinRejected, NodeNotFound
 from control_plane.version import build_id
-from control_plane.registry import modelcache, reach, storage as registry_storage
+from control_plane.registry import joinproof, modelcache, reach, storage as registry_storage
 from control_plane.registry import net as registry_net
 from control_plane.registry.serde import profile_from_dict
 
@@ -76,31 +76,9 @@ from control_plane.contracts.auth import AuditAction, AuthUnavailable
 from . import errors, gpu_procs, livefit, serialize, states, ui_detail
 from .authz import audit_request, client_ip, is_loopback, request_context, stores_of
 from .body import BodyTooLarge, optional_json_object, payload_too_large, read_json_object
+from .loopback import LoopbackCallback
+from control_plane.providers.config import CHATGPT_REDIRECT_URI, SIGN_IN_ATTEMPT_TTL_S
 from .deps import GatewayContext
-from control_plane.providers import config as _provider_config
-
-# Optional integrations. Each is owned by another branch (providers: sign-in and
-# its loopback listener; registry: signed join proofs). The gateway runs without
-# them and the routes that need one answer 501 rather than the import failing.
-try:  # pragma: no cover - depends on which branches are merged
-    from control_plane.registry import joinproof
-except ImportError:
-    joinproof = None
-try:  # pragma: no cover
-    from .loopback import LoopbackCallback
-except ImportError:
-    LoopbackCallback = None
-
-
-class _NoSignIn(Exception):
-    """Stands in for providers.SignInError when the providers branch lacks it."""
-
-
-SignInError = getattr(_providers_pkg, "SignInError", _NoSignIn)
-CHATGPT_REDIRECT_URI = getattr(
-    _provider_config, "CHATGPT_REDIRECT_URI", "http://localhost:1455/auth/callback"
-)
-SIGN_IN_ATTEMPT_TTL_S = getattr(_provider_config, "SIGN_IN_ATTEMPT_TTL_S", 600)
 
 log = logging.getLogger("gateway.api")
 
@@ -2304,12 +2282,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         try:
             raw_proof = payload.get("proof")
-            if raw_proof is None:
-                proof = None
-            elif joinproof is None:
-                return _not_implemented("Signed node join", "registry")
-            else:
-                proof = joinproof.from_dict(raw_proof)
+            proof = None if raw_proof is None else joinproof.from_dict(raw_proof)
             profile = profile_from_dict(payload["profile"])
             # Validated before the registry dials it: this route is open, and
             # an unchecked address makes the coordinator GET whatever the
@@ -2466,10 +2439,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         """
         from control_plane.registry import MembersNotMigrated
 
-        try:
-            from .auth_api import json_object, reauthenticated
-        except ImportError:  # the auth-keys branch is not merged
-            return _not_implemented("Rotating the cluster token", "auth")
+        from .auth_api import json_object, reauthenticated
 
         rotate = getattr(ctx.deps.registry, "rotate_cluster_token", None)
         if not callable(rotate):
@@ -3407,10 +3377,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
 
     redirect = urlsplit(CHATGPT_REDIRECT_URI)
-    loopback = (
-        None if LoopbackCallback is None else LoopbackCallback(
-            redirect.hostname or "127.0.0.1", redirect.port or 1455, redirect.path, _finish_redirect
-        )
+    loopback = LoopbackCallback(
+        redirect.hostname or "127.0.0.1", redirect.port or 1455, redirect.path, _finish_redirect
     )
 
     @router.post("/api/sign-in/chatgpt")
@@ -3451,9 +3419,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, f"Could not start sign-in. {errors.detail(exc, _redactor())}",
                 "invalid_request_error", "sign_in_failed",
             )
-        if loopback is not None and callable(
-            getattr(ctx.deps.providers, "complete_chatgpt_callback", None)
-        ):
+        if callable(getattr(ctx.deps.providers, "complete_chatgpt_callback", None)):
             # Best effort: a port somebody else holds is logged, and the paste
             # path still finishes the sign-in.
             await loopback.hold(SIGN_IN_ATTEMPT_TTL_S)

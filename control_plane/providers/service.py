@@ -93,6 +93,7 @@ from .secrets import (
 )
 from .serialization import assert_no_key_material, provider_public_dict
 from .store import ProviderStore
+from ..limits.service import estimate_prompt_tokens
 from .usage import Usage, UsageSniffer
 
 log = logging.getLogger(__name__)
@@ -315,39 +316,6 @@ def _oauth_error_code(payload: dict) -> str:
     if isinstance(error, dict):
         return str(error.get("code") or error.get("type") or "")
     return ""
-
-
-def estimate_prompt_tokens(body: dict) -> int:
-    """Character-based prompt estimate (4 chars/token, 4 tokens/message).
-
-    Stand-in for ``limits.service.estimate_prompt_tokens`` so this branch does
-    not depend on the auth-keys-limits branch; the usage fallback only needs a
-    rough figure when an upstream sent no usage block.
-    """
-    chars = 0
-    overhead = 0
-    messages = body.get("messages")
-    if isinstance(messages, list):
-        for message in messages:
-            overhead += 4
-            content = message.get("content") if isinstance(message, dict) else None
-            if isinstance(content, str):
-                chars += len(content)
-            elif isinstance(content, list):
-                chars += sum(
-                    len(part["text"])
-                    for part in content
-                    if isinstance(part, dict) and isinstance(part.get("text"), str)
-                )
-            elif content is not None:
-                chars += len(str(content))
-    for key in ("prompt", "input"):
-        value = body.get(key)
-        if isinstance(value, str):
-            chars += len(value)
-        elif isinstance(value, list):
-            chars += sum(len(i) for i in value if isinstance(i, str))
-    return int(chars / 4.0) + overhead
 
 
 @dataclass

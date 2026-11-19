@@ -474,6 +474,16 @@ def test_the_served_script_carries_no_credential(tmp_path):
     assert "ej_" not in body.replace("ej_...", "")
 
 
+def test_minting_returns_a_command_that_runs_on_another_machine(tmp_path):
+    api = coordinator_client(tmp_path)
+    body = api.post("/api/enroll", json={}).json()
+
+    assert body["command"].startswith('f=$(mktemp) && curl -fsSL http://')
+    assert "--join" in body["command"] and "--token" in body["command"]
+    # Never localhost: the command is meant for a different box.
+    assert "localhost" not in body["command"]
+    assert "127.0.0.1" not in body["command"]
+    assert SPARK_01.address in body["command"]
 
 
 def test_the_minted_token_actually_admits(tmp_path):
@@ -1158,5 +1168,16 @@ def test_the_public_url_names_the_repo_the_ui_will_show():
 _DIGEST = "sha256:" + "ab" * 32
 
 
+def test_the_join_command_pins_the_image_digest_when_given():
+    command = enroll_api.build_command("http://10.0.0.1:8080", "ej_x_y", b"script", image_digest=_DIGEST)
+    assert command.endswith(f"--token ej_x_y --digest {_DIGEST}")
+    assert "--digest" not in enroll_api.build_command("http://10.0.0.1:8080", "ej_x_y", b"script")
 
 
+def test_the_coordinator_reads_its_own_digest_only_when_well_formed(monkeypatch):
+    monkeypatch.setenv("DERATE_IMAGE_DIGEST", _DIGEST)
+    assert enroll_api.own_image_digest() == _DIGEST
+    monkeypatch.setenv("DERATE_IMAGE_DIGEST", "sha256:abc; rm -rf /")
+    assert enroll_api.own_image_digest() is None
+    monkeypatch.delenv("DERATE_IMAGE_DIGEST")
+    assert enroll_api.own_image_digest() is None
