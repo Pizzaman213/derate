@@ -12,7 +12,7 @@ and only `browser.mjs`; `harness.mjs` is imported by verifiers alone.
 | File | Lines | What it owns |
 |---|---|---|
 | `harness.mjs` | 82 | `load()` — esbuild a TS module so node can import it — and `report()`, which prints PASS/FAIL, counts, and sets the exit code |
-| `browser.mjs` | 51 | `findBrowser()`: a Chromium already on this machine, or an honest reason there is none |
+| `browser.mjs` | 84 | `findBrowser()`: a Chromium already on this machine, or an honest reason there is none |
 
 ## `harness.mjs`
 
