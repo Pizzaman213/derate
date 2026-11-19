@@ -401,6 +401,64 @@ def test_a_data_dir_it_cannot_write_answers_500_rather_than_raising(
     assert "data directory is" in body["message"]
 
 
+def test_the_setup_500_does_not_carry_the_os_error_text(data_dir, monkeypatch):
+    """GA-7: the OSError names a path on this machine; it belongs in
+    node.log, never in a response body."""
+
+    def refuse(self):
+        raise OSError(13, "Permission denied", str(data_dir / "setup.json"))
+
+    monkeypatch.setattr(setup_state.SetupStore, "mark_complete", refuse)
+    with TestClient(create_app(build()), raise_server_exceptions=False) as client:
+        r = client.post("/api/setup/complete")
+    assert r.status_code == 500
+    assert str(data_dir) not in r.text
+    assert "Permission denied" not in r.text
+    assert "data directory is writable" in r.json()["error"]["message"]
+
+
+@pytest.mark.raw_http
+def test_two_racing_first_admins_leave_one(data_dir, monkeypatch):
+    """GA-5: both posts pass the guard's admin_exists() before either
+    inserts; the store's own transaction must still let exactly one win."""
+    import threading
+
+    from control_plane.auth.service import AuthService
+
+    barrier = threading.Barrier(2, timeout=5)
+    real = AuthService.admin_exists
+
+    def gated(self):
+        answer = real(self)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return answer
+
+    monkeypatch.setattr(AuthService, "admin_exists", gated)
+    app = create_app(build())
+    statuses: list[int] = []
+
+    def post(n: int) -> None:
+        client = TestClient(app, client=("127.0.0.1", 40000 + n))
+        r = client.post(
+            "/api/setup/admin",
+            json={"username": f"first{n}", "email": f"f{n}@derate.test",
+                  "password": "correct-horse-battery-1"},
+        )
+        statuses.append(r.status_code)
+
+    threads = [threading.Thread(target=post, args=(n,)) for n in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    monkeypatch.setattr(AuthService, "admin_exists", real)
+    assert sorted(statuses) == [200, 410]
+    assert len(app.state.ctx.auth_stores.auth.list_admins()) == 1
+
+
 def test_a_broken_registry_still_answers(data_dir):
     """The one screen where a 500 is unaffordable: nobody has any context yet
     for what a fresh install is supposed to look like."""

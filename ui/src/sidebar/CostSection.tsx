@@ -40,7 +40,7 @@ export function CostSection() {
   return (
     <section>
       <h2>Cost per Mtok · {cfg.served_name}</h2>
-      <div style={{ display: 'grid', gap: 2 }}>
+      <div style={{ display: 'grid', gap: 'var(--space-2)' }}>
         {cfg.targets.map((t) => (
           <CostRow
             key={t.target_id}
@@ -78,7 +78,7 @@ function CostRow({
           <span>{label}</span>
           <span className="mono">{t.cost_per_mtok != null ? `$${t.cost_per_mtok.toFixed(3)}` : '—'}</span>
         </div>
-        <div className="unit" style={{ margin: '-4px 0 6px' }}>published by the provider</div>
+        <div className="unit" style={{ margin: 'calc(-1 * var(--space-4)) 0 var(--space-6)' }}>published by the provider</div>
       </div>
     )
   }
@@ -90,7 +90,7 @@ function CostRow({
           <span>{label}</span>
           <span className="mono">—</span>
         </div>
-        <div className="unit" style={{ margin: '-4px 0 6px' }}>
+        <div className="unit" style={{ margin: 'calc(-1 * var(--space-4)) 0 var(--space-6)' }}>
           set an electricity rate to price local generation
         </div>
       </div>
@@ -129,7 +129,7 @@ function CostRow({
         <span>{label}</span>
         <span className="mono">${usd.toFixed(3)}</span>
       </div>
-      <div className="unit" style={{ margin: '-4px 0 6px' }}>
+      <div className="unit" style={{ margin: 'calc(-1 * var(--space-4)) 0 var(--space-6)' }}>
         from {Math.round(watts)} W at {tps.toFixed(0)} tok/s · ${rate.toFixed(2)}/kWh
       </div>
     </div>

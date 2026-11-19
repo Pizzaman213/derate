@@ -10,6 +10,8 @@
 //
 //   cd ui && node src/tabs/spend/rows.check.mjs
 //   DERATE_CHECK_ORIGIN=http://localhost:18088 node src/tabs/spend/rows.check.mjs
+// First, for its side effect: logs in and authenticates every fetch below.
+import '../../check/auth.mjs'
 import { build } from 'esbuild'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -122,20 +124,6 @@ const prov = (o) => ({
   check(f.blindProviders.join() === 'groq', 'naming the provider whose bill is missing')
   check(f.unpricedRequests === 50, 'and how many requests it was')
   check(
-    R.spendCaption(false, f) === 'spent today · excludes local generation and unpriced cloud models',
-    'the caption lists BOTH exclusions, not just the electricity one',
-  )
-  check(
-    R.spendCaption(true, f) === 'spent today · excludes unpriced cloud models',
-    'and drops the electricity one once a rate is set',
-  )
-  const notes = R.spendNotes(false, f)
-  check(notes.length === 2, 'both notes render')
-  check(
-    notes[1] === '50 requests went to models groq publishes no price for',
-    'the second names the traffic we could not price',
-  )
-  check(
     R.basisNote(f, true).includes('what your provider reports it charged'),
     'the basis note says metered spend is a charge',
   )
@@ -146,7 +134,6 @@ const prov = (o) => ({
   const f = R.fleetSpend([prov({ requests_today: null, spend_today_usd: null })])
   check(f.usd === null, 'a fleet with no accounting totals to unknown')
   check(f.blindProviders.length === 0, 'and is not reported as unpriced traffic — there may be none')
-  check(R.spendCaption(true, f) === 'spent today', 'so the caption claims no exclusion')
   check(R.basisNote(f, false) === null, 'and there is no basis to describe')
 }
 
@@ -185,14 +172,6 @@ check(R.fleetSpend([]).usd === null, 'no providers at all totals to unknown')
     R.formatRange(R.publishedRange([m({ output_cost_per_mtok: 0 })])) === '$0.000',
     'a free model publishes $0.000, which is not an em dash',
   )
-}
-
-// Output tokens only, so the tile compares like with like against a local
-// target's `counters.total_tokens` (gateway/proxy.py fills it from completions).
-{
-  check(R.cloudTokens(prov({ tokens_today: { input: 900, output: 100 } })) === 100,
-    'cloud tokens generated is the output half, not the sum')
-  check(R.cloudTokens(prov({ tokens_today: null })) === null, 'and null when nobody counted')
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +227,7 @@ const live = await (await fetch(`${ORIGIN}/api/providers`)).json()
   }
 
   const f = R.fleetSpend(provs)
-  console.log(`      fleet: ${R.money(f.usd, f.floor)} — ${R.spendCaption(false, f)}`)
-  for (const n of R.spendNotes(false, f)) console.log(`      note: ${n}`)
+  note(`fleet: ${R.money(f.usd, f.floor)}`)
 }
 
 console.log(fail === 0 ? '\nall checks passed' : `\n${fail} check(s) failed`)

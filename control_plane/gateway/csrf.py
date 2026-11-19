@@ -34,6 +34,14 @@ GUARDED_PREFIXES = ("/api", "/v1")
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+def trusted_origins(settings) -> tuple[str, ...]:
+    """``DERATE_ALLOWED_ORIGINS`` plus ``DERATE_PUBLIC_ORIGIN``: behind a TLS
+    terminator the browser's ``Origin`` is the public one, never the scheme
+    and host the gateway itself sees."""
+    public = getattr(settings, "public_origin", "")
+    return tuple(settings.allowed_origins) + ((public,) if public else ())
+
+
 def is_cross_site_write(
     *,
     method: str,
