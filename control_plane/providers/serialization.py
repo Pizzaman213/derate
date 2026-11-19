@@ -21,8 +21,19 @@ from .runtime import ProviderRuntime, utc_day
 from .secrets import Redactor
 
 
-def model_public_dict(model: ProviderModel) -> dict:
-    return asdict(model)
+def model_public_dict(
+    model: ProviderModel, runtime: ProviderRuntime, now: float, *, provider_enabled: bool
+) -> dict:
+    return {
+        **asdict(model),
+        "admitting": provider_enabled and runtime.serves(model.upstream_id)
+        and runtime.admitting(now, model.upstream_id),
+        "admission_block": "provider is disabled" if not provider_enabled
+        else runtime.admission_block(now, model.upstream_id),
+        "last_error": runtime.rate_limit_errors.get(model.upstream_id)
+        if runtime.rate_limited(now, model.upstream_id) else None,
+        "retry_in_s": round(runtime.retry_in(now, model.upstream_id), 3),
+    }
 
 
 def provider_public_dict(
@@ -84,7 +95,9 @@ def provider_public_dict(
         "aliases": dict(runtime.aliases),
     }
     if include_models:
-        payload["models"] = [model_public_dict(m) for m in servable]
+        payload["models"] = [
+            model_public_dict(m, runtime, now, provider_enabled=provider.enabled) for m in servable
+        ]
     return payload
 
 
@@ -105,6 +118,9 @@ def kinds_public() -> list[dict]:
                 "forwardable": spec.forwardable,
                 "unsupported_reason": spec.unsupported_reason or None,
                 "supports_backend_routing": spec.supports_backend_routing,
+                # Added by signing in, never by a key: the UI renders the
+                # sign-in control in place of the key field.
+                "sign_in": spec.sign_in or None,
             }
         )
     return out

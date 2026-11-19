@@ -25,6 +25,7 @@ ever awaited by a request that matters.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -84,6 +85,10 @@ _BRAND: dict[ProviderKind, tuple[str, ...]] = {
         "https://ollama.com/public/apple-touch-icon.png",  # 200 png 5579
     ),
 }
+# The same account's mark: a ChatGPT plan provider is OpenAI's API on a different
+# credential, and its base_url is OpenAI's own.
+_BRAND[ProviderKind.CHATGPT] = _BRAND[ProviderKind.OPENAI]
+_BRAND[ProviderKind.CLAUDE_CODE] = _BRAND[ProviderKind.ANTHROPIC]
 
 #: Probed against an origin the operator configured, where there is no table to
 #: consult. SVG first because it is the only one that stays sharp at the 11
@@ -241,6 +246,27 @@ class LogoCache:
             self._locks[provider_id] = lock
         return lock
 
+    def prune(self, now: float | None = None) -> None:
+        """Drop expired memory entries and idle locks (R7).
+
+        Both maps are keyed by caller-supplied names; without this they grow
+        by one slot per distinct name ever asked, for the process's life. A
+        hit stays on disk and comes back through ``_from_disk`` on demand.
+        """
+        now = time.time() if now is None else now
+        # A transient miss is kept a while past its expiry: its failure count
+        # is what makes the next backoff longer.
+        for key in [
+            k for k, e in self._memory.items()
+            if now >= e.expires_at + (TRANSIENT_MAX_S if e.failures else 0)
+        ]:
+            del self._memory[key]
+        for key in [
+            k for k, lock in self._locks.items()
+            if not lock.locked() and k not in self._memory
+        ]:
+            del self._locks[key]
+
     def get(self, provider_id: str, now: float | None = None) -> tuple[bytes, str] | None:
         """The cached mark, or None for "no answer yet, and do not block"."""
         now = time.time() if now is None else now
@@ -340,8 +366,11 @@ class LogoCache:
 
 
 def _safe(provider_id: str) -> str:
-    """A provider id is operator-chosen; it never becomes a path segment raw."""
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in provider_id)[:64]
+    """A provider id or publisher name is caller-chosen; it never becomes a
+    path segment raw. Hashed rather than filtered and truncated: two names
+    that differ only past the cut or in a dropped character must not share a
+    file (R7)."""
+    return hashlib.sha256(provider_id.encode()).hexdigest()[:16]
 
 
 async def fetch_logo(provider: Provider) -> tuple[bytes, str] | None:
