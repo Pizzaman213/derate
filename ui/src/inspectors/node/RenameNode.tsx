@@ -59,7 +59,7 @@ export function RenameNode({ nodeId, label }: { nodeId: string; label: string | 
   return (
     <div>
       <form
-        style={{ display: 'flex', gap: 6, alignItems: 'center' }}
+        style={{ display: 'flex', gap: 'var(--space-6)', alignItems: 'center' }}
         onSubmit={(e) => {
           e.preventDefault()
           if (dirty && !busy) void commit(trimmed)
@@ -83,7 +83,7 @@ export function RenameNode({ nodeId, label }: { nodeId: string; label: string | 
           </button>
         ) : null}
       </form>
-      <div className="unit" style={{ marginTop: 4 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
         {error ? (
           <span style={{ color: 'var(--fault)' }}>{error}</span>
         ) : (

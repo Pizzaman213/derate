@@ -800,7 +800,7 @@ function VerdictRow({
  *  The default branch matters as much as the named ones. A gateway that adds a
  *  fourth gate tomorrow still gets an honest, blocking control here instead of
  *  this client silently launching past a permission it did not recognise. */
-function claimFor(
+export function claimFor(
   gate: ServeRequirement,
   live: FitResult | null,
   staticCeiling: number | null,

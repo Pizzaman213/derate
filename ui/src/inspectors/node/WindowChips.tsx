@@ -15,9 +15,11 @@ export function WindowChips({
   onChange: (w: HistoryWindow) => void
 }) {
   return (
-    <div className="chips" role="group" aria-label="Telemetry window">
+    // Its one home is the sheet header, centred beside Close: `.chips`' bottom
+    // margin, meant for sitting above a grid, would hang it 5px high there.
+    <div className="chips" role="group" aria-label="Telemetry window" style={{ margin: 0 }}>
       {HISTORY_WINDOWS.map((w) => (
-        <button key={w} aria-pressed={w === value} onClick={() => onChange(w)}>
+        <button type="button" key={w} aria-pressed={w === value} onClick={() => onChange(w)}>
           {windowLabel(w)}
         </button>
       ))}

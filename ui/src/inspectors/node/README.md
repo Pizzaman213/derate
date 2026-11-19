@@ -68,7 +68,7 @@ drew a full serving block, lamp and plan line and four readouts and three
 charts, for a container that does not exist. `runners()` and
 `runningOrPrevious()` (the `here`/`previous` split, including the fallback to
 the last terminal attempt when nothing is running now) are both imported from
-`tabs/cluster/layout`, the floor's and the dashboard strip's own filter,
+`tabs/models/rows`, the cluster graph's and the dashboard strip's own filter,
 deliberately not a fourth spelling of the same set: a machine cannot be
 serving something here and idle there. `tabs/settings/InstanceCard.tsx` calls
 the same `runningOrPrevious()` for the same node, so the two surfaces cannot
@@ -169,7 +169,7 @@ the measurement or the words "never measured", and in both cases a button —
 labelled Measure, or Re-measure once there is something to replace. **An
 unmeasured pair carries no numbers at all** — not an estimate, not a zero, not
 a greyed-out figure from a different pair. That is `SelectionRail`'s rule
-unchanged: `edgeMeasured(edge)` requires `measured === true` *and* a non-null
+unchanged: `linkMeasured(edge)` (`tabs/models/board.ts`) requires `measured === true` *and* a non-null
 `all_reduce_gbps`, and everything else prints "never measured".
 
 Nothing new is fetched. `useCluster()` is already polled every five seconds for
@@ -449,10 +449,10 @@ Everything else crosses outward:
   by calling its own `load()` — a resident model and an accepted pull are on the
   wire nowhere else. `nodeRuntime` is a read, not a write: the probe behind
   `load()`.
-- **`tabs/cluster/layout.ts`** hands over `runners()`, `runningOrPrevious()`
-  and `edgeMeasured()`, so the node page, the Settings instance picker and the
-  cluster floor cannot disagree about what is running, what ran here last, or
-  about what counts as a measured link.
+- **`tabs/models/rows.ts`** hands over `runners()` and `runningOrPrevious()`,
+  and `tabs/models/board.ts` `linkMeasured()`, so the node page, the Settings
+  instance picker and the cluster graph cannot disagree about what is running,
+  what ran here last, or about what counts as a measured link.
 - **`tabs/dashboard/Chart.tsx`** supplies `Chart` and `ChartGrid`; the four
   node traces and the three per-deployment traces are the same component the
   dashboard draws.
