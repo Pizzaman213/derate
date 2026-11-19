@@ -1,1 +1,0 @@
-{"description":"Monthly cloud bill by service (USD), column arrays; nine services fold into six slices.","data":{"label":["Compute","Storage","Database","Networking","Monitoring","CDN","Queues","DNS","Secrets"],"value":[18420.5,6210,9875.25,3120.8,1480,960.4,312,48.2,22]},"options":{"valueFormat":"currency","centerLabel":"This month"}}
