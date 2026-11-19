@@ -1,5 +1,5 @@
 import { Combobox } from '../../components/Combobox'
-import { keyFieldWarning, type KeyMode } from './keyFieldRules'
+import { keyFieldWarning, type KeyMode } from './keyfield'
 
 export interface KeyFieldProps {
   /** Unique per instance. Two of these are on screen at once -- the add form

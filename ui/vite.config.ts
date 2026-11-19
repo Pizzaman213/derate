@@ -22,10 +22,6 @@ export default defineConfig({
       '/api': { target: gateway, changeOrigin: true, ws: true },
       '/v1': { target: gateway, changeOrigin: true },
     },
-    // The design tokens stylesheet lives in ../.omp/design/tokens/, outside
-    // the Vite root; the dev server refuses to read it without this. `vite
-    // build` is unaffected.
-    fs: { allow: ['..'] },
   },
   // No source maps: dist is served as-is from the coordinator, unauthenticated,
   // and a map hands anyone on the LAN the whole commented source.

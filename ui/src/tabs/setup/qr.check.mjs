@@ -3,7 +3,7 @@
 //
 //   node src/tabs/setup/qr.check.mjs
 //
-// What it guards: qrEncode.ts is ~200 lines of transcribed specification -- block
+// What it guards: qr.ts is ~200 lines of transcribed specification -- block
 // tables, alignment centres, two BCH codes, eight mask patterns and four
 // penalty rules. Every one of those is a place a digit can be wrong in a way
 // that types cannot see and a human cannot eyeball, because the output is a
@@ -28,8 +28,8 @@
 //
 // (2) is the independence. The decoder below re-states the placement walk, the
 // mask patterns and the format block from the specification, separately from
-// qrEncode.ts. If it can read symbols produced by an unrelated implementation, then
-// that shared reading of the spec is right; if qrEncode.ts and the decoder were both
+// qr.ts. If it can read symbols produced by an unrelated implementation, then
+// that shared reading of the spec is right; if qr.ts and the decoder were both
 // wrong in the same way, segno's symbols would not read. Neither file can
 // launder a mistake past the other.
 //
@@ -52,7 +52,7 @@ const bundle = join(out, 'qr.mjs')
 // is a POSIX script with no .cmd twin, so spawning it by path fails on Windows.
 // router.check.mjs and rows.check.mjs bundle the same way.
 await bundleWithEsbuild({
-  entryPoints: [join(here, 'qrEncode.ts')],
+  entryPoints: [join(here, 'qr.ts')],
   bundle: true,
   format: 'esm',
   outfile: bundle,
@@ -69,9 +69,9 @@ const check = (label, got, want) => {
   }
 }
 
-// ── A decoder, stated independently of qrEncode.ts ────────────────────────────────
+// ── A decoder, stated independently of qr.ts ────────────────────────────────
 // Deliberately a second copy of the tables rather than an import. If it shared
-// qrEncode.ts's constants, a wrong alignment centre would move the function-pattern
+// qr.ts's constants, a wrong alignment centre would move the function-pattern
 // map in both at once and the walk would still line up with itself. Duplication
 // is the mechanism here, not an oversight.
 

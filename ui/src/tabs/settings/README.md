@@ -25,7 +25,7 @@ reference, and which of the environment and `secrets.json` answered to it.
 | `ContainmentCard.tsx` | 165 | the three mutable cost and locality settings, each showing its `SettingSource` |
 | `allowlist.check.mjs` | 138 | the verifier that proves only switched-on provider models reach a screen |
 | `KeyField.tsx` | 137 | the two-mode credential field, shared by the add form and the per-row editor |
-| `keyFieldRules.ts` | 131 | the pure half: shape warnings, minted names, predicted ids, key-state prose |
+| `keyfield.ts` | 131 | the pure half: shape warnings, minted names, predicted ids, key-state prose |
 | `ScopeCards.tsx` | 101 | three read-only cards — planned, reversed, and never |
 | `InstanceCard.tsx` | — | pick a node and, optionally, a deployment on it; renders NodeInspector's own panels plus `NodeLogFiles` |
 | `ReliabilityCard.tsx` | 61 | one toggle, `auto_restart_crashed_deployments`, with its source |
@@ -115,7 +115,7 @@ edit made here.
 
 ## `keyfield.check.mjs`
 
-`// requires: python`. esbuild-bundles `keyFieldRules.ts` and exercises it, because
+`// requires: python`. esbuild-bundles `keyfield.ts` and exercises it, because
 a green `tsc` says nothing about what a predicate answers.
 
 **The expectations are not restated by hand — they are computed by running the
@@ -251,7 +251,7 @@ a valid paste the field names its `destination` — "Stored as
 which reference stops being what authenticates the provider. What this
 component will never have is a control that shows the current key.
 
-## `keyFieldRules.ts`
+## `keyfield.ts`
 
 The pure half, and a port of the server's own screen.
 
@@ -357,7 +357,7 @@ control.
 ## The seam with `SettingsTab.tsx`
 
 `tabs/SettingsTab.tsx` is the only importer of this folder. It mounts nine of
-the fourteen files directly; `KeyField`, `keyFieldRules.ts` and
+the fourteen files directly; `KeyField`, `keyfield.ts` and
 `ProviderBackupPanel` are reached through `ProvidersCard`, and the two
 `*.check.mjs` files are never imported by the app at all.
 

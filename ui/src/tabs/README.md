@@ -1,26 +1,19 @@
 # tabs
 
 The destination roots. One file per screen the URL can name, each one the whole
-of what `/dashboard`, `/models`, `/cluster`, `/chat`, `/usage`, `/settings`,
-`/login` and `/setup` mean — `state/routes.ts` is the scheme, where `SEGMENT` is the
+of what `/dashboard`, `/models`, `/cluster`, `/chat`, `/spend`, `/settings` and
+`/setup` mean — `state/routes.ts` is the scheme, where `SEGMENT` is the
 `Record<Dest, string>` giving each destination its path segment and
-`DESTINATIONS` is derived from it. The union it keys is eight members wide and
-`shell/AppShell.tsx` is what maps them onto the files here: seven beside this
-README, and `LoginTab`, which lives inside its own folder. `UsageTab` composes
-three panes from folders — `spend/OverviewSub`, `requests/RequestsSub` and
-`keys/KeysSub` — chosen by `Route.sub` (`/usage`, `/usage/requests`, `/usage/keys`).
-`AuditTab` lives in `audit/` too but is not a destination:
-it is the Settings → Audit log sub-tab, mounted by `SettingsTab.tsx`.
+`DESTINATIONS` is derived from it. The union it keys is seven members wide and
+`shell/AppShell.tsx` is what maps those seven onto the seven files here.
 
-Eight of them are mounted together and hidden with `hidden`, never unmounted, so a
+Six of them are mounted together and hidden with `hidden`, never unmounted, so a
 destination keeps its in-flight polls and its scroll position across a visit
-elsewhere. `SetupTab` and `LoginTab` are the exceptions, and both are early
-returns from `shell/AppShell.tsx`, drawn **above** the header, the roster rail
-and the sidebar. Its auth gate (`GET /api/auth/state`) draws `SetupTab` while
-no admin exists (or on `/setup`), and `LoginTab` for any path while an admin
-exists and this browser has no session -- with no session every panel the
-chrome would mount answers 401, and on a fresh install all three are empty and
-a frame around four empty boxes is a worse first impression than no frame.
+elsewhere. `SetupTab` is the exception and it is an early return:
+`shell/AppShell.tsx` renders `if (dest === 'setup') return <SetupTab />` **above**
+the header, the roster rail and the sidebar, because on a fresh install all three
+are empty and a frame around four empty boxes is a worse first impression than no
+frame.
 
 None of these files computes a hardware, memory or fit fact. Verdicts come from
 `GET /api/capacity` and `POST /api/plan`, bytes come from `GET /api/storage`,
@@ -34,26 +27,22 @@ would be a promise the launch path never agreed to.
 | `SetupTab.tsx` | 1269 | first run: five steps, a launch watcher, and the join command |
 | `ModelsTab.tsx` | 711 | one list folded over five sources, banded by the fit gate's verdict |
 | `ChatTab.tsx` | 305 | a client for `/v1/models` and the three endpoints `send` posts to; the transcript is React state and nothing else |
-| `UsageTab.tsx` | — | `/usage`: the Overview · Requests · Keys tablist; the active pane is the URL's `Route.sub`, and all three stay mounted |
+| `SpendTab.tsx` | 280 | where requests went and what they cost, with every unpriced figure declared |
 | `ClusterTab.tsx` | 237 | the machine floor, the link rail beneath it, and the saved arrangement |
 | `SettingsTab.tsx` | 156 | seven sub-tabs; the composition root for `settings/` and `storage/` |
-| `DashboardTab.tsx` | 94 | three sub-tabs; it does the fetching and hands the data down as props |
+| `DashboardTab.tsx` | 87 | four sub-tabs; it does the fetching and hands the data down as props |
 
 Each destination's parts live in a folder beside it:
 
 | Folder | Thesis |
 |---|---|
 | [`chat/`](./chat/README.md) | the picker, transcript, composer and voice fields, sectioned by the endpoint each row answers on |
-| [`cluster/`](./cluster/README.md) | the wiring editor: sockets, the document, blocks, particles and the links rail |
+| [`cluster/`](./cluster/README.md) | the floor drawing: layout, bands, particles, motion and the selection rail |
 | [`dashboard/`](./dashboard/README.md) | the aggregate row, the deployments strip, and the three sub-tabs under it — a headroom table, a charted `TelemetrySub`, and `LoadSub`'s node-by-target matrix |
 | [`models/`](./models/README.md) | rows, cards, the quantization ladder, and `ServePanel` — the one planning surface left |
 | [`settings/`](./settings/README.md) | the cards the settings sub-tabs compose, and the key fields that never render a secret |
-| [`setup/`](./setup/README.md) | the admin step (`AdminStep.tsx`), the QR encoder the last setup step draws, and `setup.css` |
-| [`spend/`](./spend/README.md) | `OverviewSub.tsx`, the Usage overview pane (bare `/usage`), and `rows.ts`: metered against estimated, and every rule for when a figure is a lower bound |
-| [`requests/`](./requests/README.md) | `RequestsSub` and `/usage/requests/<id>`: the request log, its URL filters, and one request's detail |
-| [`keys/`](./keys/README.md) | `KeysSub` and `/usage/keys/<id>`: the key table, create and the one-time reveal, row actions, and `KeyStats` -- every setting a key is governed by is set on the key |
-| [`audit/`](./audit/README.md) | `AuditTab`: the filterable audit log and `diff.ts`, before -> after reduced to the leaves that moved |
-| [`login/`](./login/README.md) | `LoginTab`: sign-in before the frame, and the lockout wording |
+| [`setup/`](./setup/README.md) | the QR encoder the last setup step draws, and `setup.css` |
+| [`spend/`](./spend/README.md) | `rows.ts`: metered against estimated, and every rule for when a figure is a lower bound |
 
 ## `SetupTab.tsx`
 
@@ -256,25 +245,15 @@ always wins. When it names a row the picker does not have, `substituted` says so
 and names both models — on `/chat?dep=Audio8-TTS-Preview-0.6b` the rail once read
 one model while the pane read another and Send went to the second.
 
-## `spend/OverviewSub.tsx`
+## `SpendTab.tsx`
 
-The Usage overview pane (bare `/usage`): who spent what, over one window. The window is the URL's (`/usage?win=24h|7d|30d`,
-no parameter for the default `all`), picked by chips that replace history rather
-than push. Above the fold is a totals card — local/cloud split, spend, requests,
-tokens generated, share of input served from cache, and a cost chart each for
-local and cloud — then **By key** and **By model** tables, each sorted
-by spend, capped at 25 rows behind "show all", with a CSV of its own query. All
-of that reads `GET /api/usage`; the arithmetic is `spend/usage.ts`. A key is the
-unit of attribution (there is no user table); an admin's chat key is marked.
-
-**By target** is the older rate card and reads live sources instead: the
-gateway's per-target counters and each provider's figures for today. Its local
-`$` is electricity-derived `cost_per_mtok`; the window's local `$` is the price
-rows under Settings → Pricing. Two different figures, labelled as such.
-
-No "saved vs all-cloud" tile and no "managed remote" tier: both were inventions
-of the mockup this was ported from, and the first rested on a
-`0.0009 Mtok/request × $0.60` constant that exists nowhere on the real wire.
+Where requests went and what they cost, deliberately two figures shorter than
+the mockup it was ported from. The "managed remote"
+tier is gone — a target is local or a provider, never a third kind — and so is
+the `0.0009 Mtok/request × $0.60` "saved vs all-cloud" tile, because no such
+constant exists anywhere on the real wire and a tile computed from one is exactly
+the invented number this port exists to remove. "Tokens generated" replaces it
+with a real sum.
 
 **A zero is never printed where the figure is unknown.** The cloud half had the
 mirror image of the same bug for longer: `spend_today_usd` is
@@ -288,9 +267,12 @@ back as a real `0.0` from `gateway/targets.py::local_cost_per_mtok` when the
 electricity rate is unset, so every local figure here is forced to null (an em
 dash) unless `settings.electricity_rate_usd_per_kwh > 0`.
 
-In By target, a routing config can alias one physical target under two served
-names; `localTargetsWithModel` keeps the first config to name a `target_id`, so
-its requests and spend are not counted twice.
+`dedupeByTargetId` runs before any aggregation: a routing config can alias one
+physical target under two served names, which would otherwise double-count its
+requests, tokens and spend. The two halves keep different accounting windows on
+purpose — providers report a figure that resets daily, the gateway keeps no
+history at all — which is why the tile is labelled "requests" and not "requests
+today", and why the caption says so.
 
 Each row's Spent cell carries a `basis`, because a metered figure and an estimate
 are not the same claim: metered is what the provider reported it charged,
@@ -299,15 +281,19 @@ a long-context tier.
 
 ## `ClusterTab.tsx`
 
-The wiring editor and the four cards under it (Checks, Pending changes, Links,
-Sockets). It fetches its own data through the same `state/resources` hooks
-every other destination uses rather than taking props, so it drops into
-AppShell's section on its own. It holds the draft (`doc`, `base`, plans, dry
-run) across navigation but renders the canvas only while `active`; the
-document, Save flow and pitfalls are in [`cluster/`](./cluster/README.md).
+The machine floor and the reference desk under it. It fetches its own data
+through the same `state/resources` hooks every other destination uses rather than
+taking props, so it drops into AppShell's section on its own.
 
-Dragged block positions are a preference stored per cluster id
-(`cluster/positions.ts`), which is not known until the first poll answers.
+The arrangement — which slot each machine is dealt (`order`) and how far it has
+been dragged off it (`offsets`) — is one piece of state because it is one
+preference, saved through a single `save` callback so "auto-saves" is a property
+of the state rather than something each caller remembers. It is stored per
+cluster id, which is not known until the first poll answers. `arrangementRef`
+exists so the two writers can read the current arrangement without putting it in
+their dependency arrays: `ClusterGraph` keys its pointer and key listeners on
+those callbacks, and a new identity per drop would tear the listeners down and
+rebuild them on every move.
 
 Measurement and reachability are separate state, deliberately: different
 questions at different prices, and one running must not grey out the other's
@@ -317,11 +303,11 @@ rejection left the rail reading "Never measured" with no explanation; a refused
 check that only re-enabled its button read as "checked, and everything is fine",
 which is the one thing it does not mean.
 
-`nameIndex` is called once for the whole destination so a block and the chip
-naming the same machine cannot disagree. The Sockets card states one meaning
-per channel: colour is socket type, amber is worth a look and red is broken;
-a link's width is measured bandwidth against the 40 GB/s tensor-parallel
-threshold and a dash is never-measured.
+`nameIndex` is called once for the whole destination so a plate and the chip
+naming the same machine cannot disagree. The legend states one meaning per
+channel: width is measured bandwidth against the 40 GB/s tensor-parallel
+threshold, a dash is never-measured and nothing else, colour means something is
+wrong — which is why a healthy plate has none.
 
 ## `SettingsTab.tsx`
 
@@ -353,10 +339,8 @@ stop.
 
 ## `DashboardTab.tsx`
 
-Three sub-tabs — overview (one line of tiles, `AggregateRow` plus `UsageCard`'s
-usage tiles, and the usage charts), headroom, telemetry (free memory,
-`DeploymentsStrip`, `TelemetrySub`, then `LoadSub` under a Load heading; Load was
-its own tab until 2026-11-18) — and this file is the one doing the fetching. `useCluster`,
+Four sub-tabs — overview (`AggregateRow` plus `DeploymentsStrip`), headroom,
+telemetry, load — and this file is the one doing the fetching. `useCluster`,
 `useTopology`, `useRouting`, `useMetrics` and `useTelemetrySeries` are read once
 here and handed down as props, so `TelemetrySub` and `LoadSub` mount no interval
 of their own and cannot disagree with the strip above them about what is
@@ -394,9 +378,9 @@ if (dest === 'setup') return <SetupTab />   // above the chrome, not inside it
 
 Three of this folder's subfolders are imported from outside it, by six files,
 and none of the three can be changed as if it were private to a screen here.
-`models/rows.ts` is the most shared of them: `shell/Sheet.tsx`,
+`cluster/layout.ts` is the most shared of them: `shell/Sheet.tsx`,
 `sidebar/PlanSection.tsx` and `inspectors/node/NodeInspector.tsx` all pull
-`runners` out of it, and `inspectors/node/Interconnect.tsx` pulls `linkMeasured` from `models/board.ts`.
+`runners` out of it and `inspectors/node/Interconnect.tsx` pulls `edgeMeasured`.
 `dashboard/Chart.tsx` is next — `inspectors/node/NodeCharts.tsx` takes `Chart`
 and `ChartGrid`, `inspectors/node/ServingBlock.tsx` takes `Chart`. `Sheet.tsx`
 is the only importer of `models/ModelInspector`. So the model pane, the floor's

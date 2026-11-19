@@ -1,10 +1,10 @@
 // requires: python -- reads looks_like_secret out of the server's own module
-// Verifier for keyFieldRules.ts. There is no UI test runner here, so the rule is
+// Verifier for keyfield.ts. There is no UI test runner here, so the rule is
 // the same as rows.check.mjs and layout.check.mjs: esbuild-bundle the module
 // and exercise it, because a green tsc says nothing about what the predicate
 // answers.
 //
-// What makes this one worth having: keyFieldRules.ts is a port of
+// What makes this one worth having: keyfield.ts is a port of
 // control_plane/providers/secrets.py `looks_like_secret`, and a port drifts.
 // The drift is invisible to types on both sides and shows up as a form that
 // warns about input the server accepts, or stays quiet about input it refuses.
@@ -29,7 +29,7 @@ const out = mkdtempSync(join(tmpdir(), 'keyfield-'))
 const bundle = join(out, 'bundle.mjs')
 execFileSync(
   'npx',
-  ['esbuild', join(here, 'keyFieldRules.ts'), '--bundle', '--format=esm', `--outfile=${bundle}`],
+  ['esbuild', join(here, 'keyfield.ts'), '--bundle', '--format=esm', `--outfile=${bundle}`],
   { stdio: 'pipe', cwd: join(here, '..', '..', '..') },
 )
 const {

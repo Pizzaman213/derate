@@ -1,5 +1,5 @@
 // Checks the chat transcript's per-model colouring: tabs/chat/tags.ts against
-// the tokens it names in the design pack's tokens.css.
+// the tokens it names in styles/tokens.css.
 //
 // Nothing here is visible to `tsc`. `tagsFor` returns a Map<string, number>
 // whether it hands two models the same slot or not, `tagStyle` returns a
@@ -36,7 +36,7 @@ const T = await load(import.meta.url, './tags.ts')
 const { check, note, done } = report()
 
 const css = readFileSync(
-  fileURLToPath(new URL('../../../../.omp/design/tokens/tokens.css', import.meta.url)),
+  fileURLToPath(new URL('../../styles/tokens.css', import.meta.url)),
   'utf8',
 )
 
@@ -132,7 +132,7 @@ check(
 // on an OS setting.
 const BLOCKS = [
   [':root {', 'light'],
-  ["  :root:not([data-theme='light']) {", 'dark, by OS preference'],
+  ["  :root:not([data-theme='light']):not([data-theme='high-contrast']) {", 'dark, by OS preference'],
   [":root[data-theme='dark'] {", 'dark, by explicit choice'],
 ]
 const values = {}

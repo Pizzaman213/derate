@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import { encodeQr, qrPath } from './qrEncode'
+import { encodeQr, qrPath } from './qr'
 
 /** The endpoint as a symbol a phone can read.
  *

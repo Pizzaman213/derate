@@ -1,5 +1,5 @@
 import { createElement } from 'react'
-import { ICONS, ICON_STROKE, ICON_VIEWBOX, type IconName } from '../../../.omp/design/icons/components/icons.ts'
+import { ICONS, ICON_STROKE, ICON_VIEWBOX, type IconName } from './iconData'
 
 export type { IconName }
 
