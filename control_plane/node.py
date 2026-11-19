@@ -153,14 +153,11 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
 def _make_server(app, *, host: str, port: int) -> uvicorn.Server:
     from control_plane.gateway.settings import uvicorn_proxy_kwargs
 
-    # access_log=False: gateway.access (authz.on_request_done) is the access
-    # line now -- request id, principal, UTC -- and uvicorn's would double it.
     config = uvicorn.Config(
         app,
         host=host,
         port=port,
         log_config=None,
-        access_log=False,
         # No "server: uvicorn": the version banner tells a scanner what to try.
         server_header=False,
         **uvicorn_proxy_kwargs(),
