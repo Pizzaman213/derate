@@ -100,7 +100,7 @@ export function ProviderBackupPanel({ providerId }: { providerId: string }) {
 
   return (
     <div>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         A model answering to a name this cluster already serves becomes that name's backup: one
         entry on <span className="mono">/v1/models</span>, two targets behind it. Routing picks{' '}
         <span className="mono">local_first</span> for a name served both ways on its own, and sends
@@ -117,7 +117,7 @@ export function ProviderBackupPanel({ providerId }: { providerId: string }) {
       ) : null}
 
       {aliases.length > 0 ? (
-        <div style={{ overflowX: 'auto', marginBottom: 10 }}>
+        <div style={{ overflowX: 'auto', marginBottom: 'var(--space-10)' }}>
           <table>
             <thead>
               <tr>
@@ -139,7 +139,8 @@ export function ProviderBackupPanel({ providerId }: { providerId: string }) {
                   </td>
                   <td style={{ textAlign: 'right' }}>
                     <button
-                      style={{ padding: '3px 9px' }}
+                      type="button"
+                      style={{ padding: 'var(--space-3) var(--space-9)' }}
                       onClick={() => void drop(a)}
                       disabled={busy === a.upstream}
                     >
@@ -152,12 +153,12 @@ export function ProviderBackupPanel({ providerId }: { providerId: string }) {
           </table>
         </div>
       ) : (
-        <div className="unit" style={{ marginBottom: 10 }}>
+        <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
           Nothing here answers to another name yet.
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div className="fld" style={{ flex: 1, minWidth: 220 }}>
           <label htmlFor={`bk-up-${providerId}`}>Upstream model</label>
           {/* A typeahead field rather than a closed picker: several hundred
@@ -179,7 +180,7 @@ export function ProviderBackupPanel({ providerId }: { providerId: string }) {
             suggestions={localNames}
             placeholder={localNames[0] ?? 'the name clients ask for'}
           />
-          <div className="unit" style={{ marginTop: 4 }}>
+          <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
             {served.trim() && localNames.includes(served.trim())
               ? `Backs up ${served.trim()}, which this cluster is serving.`
               : localNames.length
@@ -187,13 +188,13 @@ export function ProviderBackupPanel({ providerId }: { providerId: string }) {
                 : 'Nothing is deployed here yet, so any name typed is a rename.'}
           </div>
         </div>
-        <button onClick={() => void add()} disabled={busy === '__add__' || !upstream.trim() || !served.trim()}>
+        <button type="button" onClick={() => void add()} disabled={busy === '__add__' || !upstream.trim() || !served.trim()}>
           {busy === '__add__' ? 'Saving…' : 'Point it there'}
         </button>
       </div>
 
       {error ? (
-        <div className="label" style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}>
+        <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}>
           {error}
         </div>
       ) : null}

@@ -42,7 +42,7 @@ async with providers.open_upstream(provider_id, upstream_id, body, True) as up:
 | `ProviderNotAdmittingError` | 503, with `.retry_after_s` when set |
 | `MissingKeyError` | 503; the provider is disabled and `.api_key_ref` names the fix |
 | `UnknownProviderError` | 404 |
-| `AdapterUnsupportedError` | 501; the message says to use OpenRouter instead |
+| `AdapterUnsupportedError` | 502 / `provider_adapter_unsupported`; message names the unsupported wire or endpoint |
 
 `route_targets()` leaves `strength` and `weight` at zero. Strength is a
 normalized score over local hardware and we have not measured a remote; Agent G
@@ -109,6 +109,15 @@ someone fixes a provider whose reference does not resolve.
 `/data/secrets.json` at mode 0600. Environment wins. Values are resolved at
 request time and nowhere else.
 
+Only two names are accepted: the one derate mints for *this* provider
+(`DERATE_<PROVIDER_ID>_API_KEY`) and an operator's `DERATE_SECRET_<NAME>`;
+anything else is a 400 (`service.ref_allowed`), and `SecretStore` will not read
+any other environment variable at all (`secrets.env_resolvable`). Before this, a
+session could name `DERATE_TOKEN` and point `base_url` at itself, and the
+refresh sent the cluster token as a bearer. A stored record still holding an
+old name reports `key_state: missing` and is warned about at startup until it
+is given a key again. The client does not follow redirects, for the same reason.
+
 A key can also be *given*, as `api_key` on an add or update spec. It is a
 request field and nothing more: `_register` reads it, hands it to the redactor
 before any screen below can raise, and — after every other screen has passed,
@@ -134,12 +143,111 @@ Three layers keep them out of everything else:
 across every response shape the package emits. If that test is missing, the
 feature is not done.
 
+## Signed-in credentials: ChatGPT plan
+
+The `chatgpt` kind has no key at all. Its credential comes from OpenAI's
+*Sign in with ChatGPT plan usage* flow (authorization code + PKCE, no client
+secret), and requests routed to it use the operator's ChatGPT Plus/Pro
+allowance. `KindSpec.sign_in` names the flow; `POST /api/providers` refuses
+the kind, and only `complete_chatgpt_sign_in` can register one.
+
+- **Two ways back from the redirect.** OpenAI allows only a loopback redirect,
+  `http://127.0.0.1:1455/auth/callback`, which reaches the machine running the
+  browser. When that is the coordinator (or a browser tunnelled to it with
+  `ssh -L 1455:127.0.0.1:<coordinator port>`), `GET /auth/callback` finishes
+  the attempt by its `state` and the UI's poll
+  (`GET /api/sign-in/chatgpt/{attempt}`) notices. Anywhere else the operator
+  pastes the address (`POST /api/sign-in/chatgpt/{attempt}/complete`) -- from
+  the address bar, or from the Network panel when the tab hangs on the
+  redirect; a URL, a `Location:` line and a copied cURL command all parse.
+  Attempts live in memory for ten minutes; a restart loses them.
+- **Stored in `oauth.json`, not `secrets.json`** (`oauth_store.py`, 0600,
+  written the way `SecretStore.put` writes). A record is several values that
+  change together -- an access token that expires within the hour, a refresh
+  token that rotates on every use, the client id OpenAI issued, the account.
+  Every token is handed to the shared `Redactor` on load and on write.
+- **Refreshed under a per-provider lock** (`_access_token`), 300 s before
+  expiry, and once more on a 401. Refreshing twice in parallel would present a
+  spent refresh token, which OpenAI answers as `refresh_token_reused`. Any of
+  the six "sign in again" error codes blanks both tokens, marks the record
+  `needs_reauth` (`key_state: "reauth"`) and disables the provider until the
+  operator signs in again as the same account (the ID token's `sub` is
+  compared). The 6 h refresh loop also keeps the 30-day refresh token rotating.
+- **Chat Completions only.** The upstream is `/v1/responses`, so
+  `responses_adapter.py` translates the request out and the SSE back. A
+  non-streaming client gets the whole stream read first, which is the only way
+  an in-stream `response.failed` (e.g. `subscription_sharing_usage_limit_exceeded`)
+  becomes a 429 rather than a 200. `resolve_key` raises
+  `AdapterUnsupportedError`, so the raw-key paths (multipart, realtime) refuse.
+- **Reasoning comes back as `delta.reasoning`.** A `reasoning_effort` on the
+  request becomes `reasoning: {effort, summary: "auto"}` (no summary for
+  `"none"`): a summary is the only reasoning text the Responses API hands out,
+  and only when asked. `response.reasoning_summary_text.delta` goes out as a
+  `delta.reasoning` chunk -- the field vLLM and OpenRouter stream on -- with a
+  paragraph break between summary parts, and `output_tokens_details.reasoning_tokens`
+  becomes `usage.completion_tokens_details.reasoning_tokens`.
+- **Removing signs out.** The gateway calls `sign_out_async` first, which
+  revokes the refresh token at OpenAI; `revoked: false` on the answer means the
+  grant may outlive the provider there.
+
+## Signed-in credentials: Anthropic plan (unofficial Claude subscription)
+
+`claude_code` is a separate OAuth kind, not API-key `anthropic`. This is an
+**unofficial connection**: [Anthropic's policy](https://code.claude.com/docs/en/legal-and-compliance)
+does not permit third-party routing with subscription credentials and the account
+may be restricted. Account-level extra usage may still be billed by Anthropic.
+There is no API-key fallback, CLI credential import, or promise of entitlement
+to every model returned by discovery.
+
+In **Settings → Providers**, select **Anthropic plan (unofficial)**,
+continue in the browser, then paste `code#state` or the complete callback URL
+into the masked input. There is no loopback listener. Only `user:profile
+user:inference` scopes are requested; refused consent is not silently broadened.
+Management routes are admin-session gated:
+`POST /api/sign-in/claude`, `GET /api/sign-in/claude/{attempt_id}`, and
+`POST /api/sign-in/claude/{attempt_id}/complete`.
+
+The service verifies the authenticated account and organization before storing
+tokens atomically in `oauth.json` (0600). Reconnect must match both; only email
+is public. Rotating refresh is single-flight, and credential commits check the
+entry and token generation so removal or a newer reconnect cannot be undone by
+a late response. Definitive refresh rejection requires reauthorization;
+transient errors retain the last credential.
+
+Discovery uses the fixed Anthropic model endpoint and commits all pages together.
+A failed page keeps the cached catalogue; a genuinely empty response clears it.
+Connecting enables **no** models. Open the existing Models catalogue and use
+**Serve on the API** for each desired model. Enabled models appear in ordinary
+routing, `/v1/models`, `/api/chat/models` and Chat.
+
+`anthropic_adapter.py` translates `/v1/chat/completions` to a native Messages
+stream, including images, reversible function tool names, tool results,
+reasoning and cached-token usage. The coordinator never executes tools.
+Buffered clients get the equivalent completion, with a non-200 status for
+in-band failure or premature EOF. Unsupported semantic parameters are rejected
+by field name, not ignored. Other inference endpoints refuse.
+Token-limited tool calls preserve partial JSON and finish as `length`; complete
+tool calls still require JSON-object arguments. Streaming failures reach Chat's
+existing error display, including after partial text, rather than producing a
+blank success. Cancellation closes upstream connections in either client mode,
+and a client closing on an error cannot discard provider rate-limit state.
+
+`claude_sign_in.py` adds pinned unofficial compatibility headers and billing/
+agent-identity system prefixes without rewriting caller text; derate is not
+Anthropic's CLI. Tokens never follow a redirect or a user-selected origin.
+Removing deletes the local provider and tokens, **not** remote Claude
+authorization; no remote revocation endpoint is guessed.
+
+Deterministic service, gateway and browser checks use a scripted HTTP boundary.
+Live acceptance additionally requires an operator-created authorization and real
+discovery, streaming/buffered inference, tools and refresh. Fixture success alone
+does not establish that Anthropic accepts this unofficial protocol.
+
 ## Deliberately not built
 
-**Native Anthropic.** The Messages API differs in request shape, system-prompt
-placement and streaming events. Adding an Anthropic provider works for
-discovery and health, and `forward` refuses with an `AdapterUnsupportedError`
-naming OpenRouter as the route. That is a day of work OpenRouter already solves.
+**API-key Anthropic forwarding.** The separate `anthropic` kind remains
+discovery-only and refuses forwarding. The Messages adapter is currently wired
+only to the explicitly unofficial `claude_code` subscription connection.
 
 **Invented pricing.** Only OpenRouter and Together publish costs in their model
 lists. Everyone else leaves `input_cost_per_mtok` and `output_cost_per_mtok`
@@ -151,10 +259,19 @@ is not misread as free.
 - **Missing key reference**: provider is disabled with a `last_error` naming the
   reference. Startup is never blocked. It re-enables itself when the reference
   resolves again.
-- **429**: `Retry-After` when present, honoured up to a 300s DoS guard
-  (`RETRY_AFTER_MAX_S`); otherwise exponential from 1s to a 60s cap
-  (`BACKOFF_MAX_S`). `admitting` goes false for the window; `healthy` stays
-  true, because rate limited is busy, not broken.
+- **429**: cooldowns and exponential counters are scoped to `(provider_id,
+  upstream_id)`, not the whole provider or the model's served-name alias.
+  `Retry-After` is honoured up to a 300s DoS guard (`RETRY_AFTER_MAX_S`);
+  otherwise exponential from 1s to a 60s cap (`BACKOFF_MAX_S`). Only that
+  model's route stops admitting; sibling models remain eligible and a sibling
+  success cannot clear its cooldown. `healthy` stays true. Provider-level
+  `admitting`, `admission_block` and `retry_in_s` describe global failures only.
+  An account-wide upstream quota can still return a separate 429 for each model.
+  Public model rows expose `admitting`, `admission_block`, `retry_in_s` and the
+  active model-specific `last_error`. Expiry removes the error from the public
+  view; a sibling success cannot erase it early. These fields reach both the
+  served-model list and the full catalogue through the gateway's allowlist.
+  Rate limits no longer populate the provider-wide `last_error`.
 - **5xx**: one jittered retry, then unhealthy, with an exponential
   `failure_backoff_until` from 1s to the same 60s cap.
 - **Unreachable** (connect/read/DNS): unhealthy, same exponential backoff.
@@ -177,38 +294,42 @@ while it answered pings in 11 ms.
 So once the backoff expires `_sync` calls `half_open`, which stops *asserting*
 the provider is down and lets one request settle it. `last_error` deliberately
 stays readable while the probe is out: this is the admission that we no longer
-know, not a claim of recovery. A success clears everything; another failure
+know, not a claim of recovery. A success clears provider failures and its own
+model's 429 state, not sibling cooldowns; another failure
 backs off further. The stampede in that window is bounded by the gateway's own
 circuit breaker, which covers remote targets exactly as it covers local ones.
 
-`failure_backoff_until` is kept apart from the 429 `backoff_until` on purpose:
-`rate_limited()` reads the latter, so folding the two together would have an
-unreachable box reporting itself as throttled by an upstream it never reached.
-`retry_in()` returns the later of the two, which is the one honest answer to
-"how long".
+`failure_backoff_until` is kept apart from the model-keyed 429
+`rate_limit_until` map on purpose: unreachable is not throttled.
+`retry_in(now, upstream_id)` returns the later of that model's cooldown and
+the provider failure wait; without a model it reports only the provider wait.
 
 ## Layout
 
 Everything above argues the design. This table and the sections under it are the
-per-file map: what each of the fourteen modules owns, and the failure that
-shaped it.
+per-file map of the provider subsystem and the failures that shaped it.
 
 | File | Lines | What it owns |
 |---|---|---|
-| `service.py` | 1437 | `ProviderService`: registry, discovery, forwarding, health, spend, route targets |
-| `logos.py` | 436 | a provider's own mark, fetched coordinator-side and cached with negative entries |
-| `runtime.py` | 337 | per-provider live state: health, the two backoffs, spend, in-flight, the allowlist |
-| `discovery.py` | 286 | an upstream model list turned into `ProviderModel`, filling in nothing unpublished |
+| `service.py` | — | `ProviderService`: registry, discovery, forwarding, health, spend, route targets, provider-specific OAuth lifecycle |
+| `logos.py` | 439 | a provider's own mark, fetched coordinator-side and cached with negative entries |
+| `responses_adapter.py` | 429 | Chat Completions to the Responses API and its SSE back, for the `chatgpt` kind |
+| `anthropic_adapter.py` | — | native Messages request/SSE translation, tools, reasoning, usage and terminal errors |
+| `claude_sign_in.py` | — | Claude PKCE/callback helpers and pinned unofficial request compatibility |
+| `runtime.py` | 353 | per-provider live state: health, the two backoffs, spend, in-flight, the allowlist |
+| `discovery.py` | 290 | an upstream model list turned into `ProviderModel`, filling in nothing unpublished |
 | `stub.py` | 226 | the day-0 service — the real one, over `httpx.MockTransport` |
 | `store.py` | 224 | `providers.json`: references, never values, redactor-checked before every write |
 | `detect.py` | 223 | probing a node already in the roster for a runtime it is already running |
+| `kinds.py` | 221 | the per-kind table: base URL, auth style, pricing unit, wire, sign-in, what a kind can be asked |
 | `secrets.py` | 191 | `SecretStore`, and the re-export seam onto `control_plane/redaction.py` |
-| `kinds.py` | 189 | the per-kind table: base URL, auth style, pricing unit, what a kind can be asked |
+| `oauth_store.py` | 174 | `oauth.json`: signed-in tokens, rotated together, every one known to the redactor |
+| `chatgpt_sign_in.py` | 151 | the authorize URL, the pasted callback, the ID token's signature and nonce |
 | `usage.py` | 125 | reading a response's `usage` block without ever buffering a stream |
-| `serialization.py` | 114 | the public JSON shapes; `api_key` is present and always `"***"` |
-| `errors.py` | 102 | the exception set the status table above maps from |
-| `config.py` | 83 | timeouts, backoff bounds, the refresh interval, the cost blend weights |
-| `__init__.py` | 74 | the package's export surface, 25 names |
+| `config.py` | 121 | timeouts, backoff bounds, the refresh interval, the cost blend weights, the sign-in endpoints |
+| `serialization.py` | 117 | the public JSON shapes; `api_key` is present and always `"***"` |
+| `errors.py` | 111 | the exception set the status table above maps from |
+| `__init__.py` | 76 | the package's export surface, 26 names |
 
 ## `service.py`
 
@@ -261,21 +382,48 @@ top. Three details in `_prepare`:
   (`_accepts_stream`). `/v1/audio/speech` has no such field, and a strict
   upstream answers 400 for an unknown one — injecting it unconditionally would
   break every audio request that ever reached a provider.
-- `stream_options.include_usage` is asked for only where the kind is known to
-  accept the field and the request can be priced. `meters_cost` counts as
-  priced on its own, because a kind that reports its own cost reports it for
-  models whose published `pricing` reads `-1` for "varies" — gating on the rate
-  card alone would decline to ask for usage on exactly the models that cannot be
-  priced without it.
+- `stream_options.include_usage` is asked for on every stream to a kind known to
+  accept the field, priced or not, and set *over* the client's own
+  `stream_options` (its other options are kept): a client sending
+  `include_usage: false` used to stream without a usage frame and be metered on
+  nothing. Usage is recorded for any body somebody started reading, however it
+  ended -- a client that hung up or a transfer that broke is billed upstream --
+  falling back to the gateway's prompt estimate and one token per SSE frame
+  when no usage frame arrived. A body nobody read (a hedge that lost) is not.
 - `serves()` is re-checked here even though the routing index already picked the
   target. That index is cached for its own TTL, and the difference between a
   dict lookup and skipping it is a billed call to a model nobody switched on.
+- An opaque upload (`/v1/audio/transcriptions`) comes in as `content=` +
+  `content_type=` instead of a body and takes the same gate -- enabled,
+  `serves()`, rate limit, daily budget -- then goes out byte for byte; it is a
+  zero-token request on the provider's day. Before this it took the gateway's
+  raw-key path and no provider budget ever saw it (finding K5). It is priced
+  only when the upstream meters cost itself: `ProviderModel` has no per-minute
+  rate to price audio duration by.
+- A backend pin (`backend_pins`) is set as `provider: {"only": [pin]}` *over*
+  any `provider` field the client sent: the pin is the operator's routing and
+  price decision, not the key holder's (finding K7). With the model's
+  `backend_fallbacks` flag it is `{"order": [pin], "allow_fallbacks": true}`
+  instead: the pinned host first, others when it is down.
 
 `open_upstream` retries a 5xx once with `jittered_delay()`, feeds every chunk
 through a `UsageSniffer` on its way out, calls `note_success` and records spend
 only after the body has been consumed, and decrements `runtime.outstanding` in a
-`finally`. `_safe_headers` drops the hop-by-hop set plus `authorization`,
-`x-api-key` and `set-cookie`, and scrubs what is left.
+`finally`. Given `request_id` (the gateway's trace id) it sends it as
+`X-Request-Id` so the provider's log names the same request as the `requests`
+row, and never relays the client's own id (finding K10). `_safe_headers` is an
+allowlist, `RESPONSE_HEADER_ALLOWLIST` -- `content-type`, `cache-control`,
+`retry-after` -- plus derate's `x-request-id`, scrubbed: an upstream's
+`openai-organization`, `openai-project` and account-wide `x-ratelimit-*` describe
+derate's account and never reach a key holder (finding K6).
+
+`validate_base_url(kind, url)` runs on every add and every `base_url` patch: https
+unless the kind is `ollama` or `custom`; an IP-literal host that is link-local
+(`169.254.0.0/16`, `fe80::/10`), multicast or unspecified is refused without a
+DNS lookup; a kind with a fixed home keeps that home's hostname. Moving the
+`base_url` of a provider whose key derate stored (a minted reference) drops the
+reference and deletes the key unless the same patch brings a new one -- the key
+was pasted for the old host (finding K3).
 
 ## `logos.py`
 
@@ -303,14 +451,16 @@ implementation.
 ## `runtime.py`
 
 `ProviderRuntime` is the mutable half of a provider, and `store.py` persists
-only part of it. It carries `healthy`, `last_error`, the two backoffs, the
+only part of it. It carries `healthy`, `last_error`, model-keyed rate limits,
+the provider failure backoff,
 `auth_rejected` latch, `daily_budget_usd`, `aliases`, `backend_pins`,
-`outstanding` and the day-keyed `spend` map. `serves()` is the only reader of
+`backend_fallbacks`, `backend_pin_prices`, `outstanding` and the day-keyed
+`spend` map. `serves()` is the only reader of
 the `enabled_models` tri-state, so there is one place that decides what `None`
 means. The transitions — `note_success`, `note_rate_limit`, `note_server_error`,
 `note_auth_failure`, `note_transport_error`, `half_open` — are the state machine
-the failure list above describes; `retry_in()` returns the later of the two
-waits because a screen asking "how long" wants one number.
+the failure list above describes. HTTP errors and in-band stream errors use
+the same upstream-model key for rate-limit admission and recovery.
 
 `record_usage` prefers the provider's own `metered_cost_usd` outright: that is
 what the account was charged, where the rate-card arithmetic is a forecast. A
@@ -417,7 +567,7 @@ rather than lookups in the table. Each `KindSpec`
 carries the base URL, the endpoint paths, an `AuthStyle`, a `PricingUnit` and
 the per-kind claims that keep this table honest — `forwardable=False` plus an
 `unsupported_reason` naming OpenRouter, on Anthropic alone; `supports_stream_usage`
-false for Anthropic, Ollama and Custom, because an unknown field is a 400 on a
+false for Anthropic, ChatGPT, Claude subscription, Ollama and Custom, because an unknown field is a 400 on a
 strict server; `meters_cost` true only for OpenRouter; `pull_path` non-empty
 only for a server the operator runs, since "pull" on a hosted API is a control
 that does nothing. `native_base` strips the `/v1` shim segment so one address
@@ -552,6 +702,30 @@ started the process and pasting a replacement does not replace it.
 the control that writes it is per-model on the Models tab and must not have to
 know every other model's pin on the same provider just to avoid erasing it by
 omission. An empty string clears one, since `""` can never be a real backend tag.
+`backend_fallbacks` is merged the same way, booleans only (`"backend_fallbacks
+values must be true or false"` — the string `"false"` is truthy and would
+silently loosen a pin), and clearing a pin clears its fallback flag.
+
+**A backend tag is checked against a live endpoints call.** A new tag goes
+through `list_backends` before it is stored, and one the model's endpoints do
+not list is refused with `"<provider> lists no backend '<tag>' for <model>;
+pick one from its backend list"` — a 400 on PATCH and `ok:false` on a
+`/api/wiring` dry run, which runs the same screen. Taking the tag as given
+turned a typo into a 404 on every request. A failed endpoints call refuses the
+pin with its own sentence; re-sending the tag already pinned is not re-fetched.
+The call goes out on a throwaway loop with its own client, so a PATCH waits on
+it — at most `DISCOVERY_TIMEOUT_S`.
+
+**The pinned host's price is the model's price.** The matching endpoints row's
+two prices are captured into `runtime.backend_pin_prices` when the pin is set,
+and `_apply_pin_prices` writes them onto the `ProviderModel` — on every pin
+change, every alias change, load and every refresh — so `blended_cost`, the
+route target's `cost_per_mtok` (COST_AWARE) and un-metered spend all follow the
+host that actually serves the request. OpenRouter's metered `cost_usd` still
+wins over either when the response carries it. The catalogue's own price is
+kept beside it (`_Entry.catalogue_prices`), is what `providers.json` holds for
+the model, and is what a cleared pin restores. A pin set before prices were
+captured keeps the catalogue price until it is set again.
 
 **The logo path never makes a screen wait.** A cold cache answers 404
 immediately and starts `_warm_logo` behind the already-sent response;
@@ -613,7 +787,20 @@ configured.
 only addresses a human already admitted, and produces a suggestion rather than a
 provider. Discovery proposes; a person accepts.
 
-**Validating a backend tag against a live endpoints call.**
-`_screen_backend_pins` checks the model id against the provider's own catalogue
-and takes the tag as given — the same tradeoff already made for pricing, which
-is accepted as a forecast rather than a fact.
+## Change log
+
+- 2026-11-18: Moved 429 cooldowns and retry counters from provider-wide state
+  to upstream-model state in `runtime.py` and `service.py`. A rate-limited
+  Fable request must not block Opus or Haiku on the same connection. Provider
+  authentication, transport failures and daily budgets remain provider-wide.
+  Regression coverage: `test_providers.py`, `test_chatgpt_sign_in.py` and
+  `test_claude_sign_in.py`.
+- 2026-11-18: Exposed per-model admission, remaining retry delay and upstream
+  rate-limit errors in public provider/model responses. Settings now attributes
+  each error to the affected model instead of labelling the whole connection
+  as retrying. Updated gateway metadata/serialization and settings browser checks.
+- 2026-11-18: Upstream 429s now record sanitized reasons and retry delays in
+  request attempt history, including in-band subscription errors after HTTP
+  headers have been sent. Cooldown logs include provider, model, delay and
+  reason. Usage → Rate limits separates current admission from these retained
+  failures; JSON/CSV request history can be filtered by provider.

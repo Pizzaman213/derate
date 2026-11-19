@@ -15,30 +15,53 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import hmac
+import ipaddress
 import logging
+import math
 import re
 import time
+import threading
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
 from ..contracts.providers import Provider, ProviderKind, ProviderModel
+from ..netliteral import is_numeric_host_literal
 from ..contracts.routing import RouteTarget, TargetKind
+from . import chatgpt_sign_in as siwc
+from . import claude_sign_in as claude
 from .config import (
+    CHATGPT_DISCOVERY_URL,
+    CHATGPT_PLAN_SCOPE,
+    CHATGPT_REDIRECT_URI,
+    CHATGPT_RESOURCE,
+    CHATGPT_TOKEN_URL,
+    CLAUDE_CLIENT_ID,
+    CLAUDE_REDIRECT_URI,
+    CLAUDE_TOKEN_URL,
+    CLAUDE_PROFILE_URL,
+    CLAUDE_SCOPES,
     COST_BLEND_INPUT_WEIGHT,
     COST_BLEND_OUTPUT_WEIGHT,
     CONNECT_TIMEOUT_S,
     DISCOVERY_TIMEOUT_S,
     ERROR_BODY_LIMIT_BYTES,
+    OAUTH_FILE,
     PROVIDER_REFRESH_S,
     READ_TIMEOUT_S,
+    REAUTH_ERROR_CODES,
     SERVER_ERROR_RETRIES,
+    SIGN_IN_ATTEMPT_TTL_S,
     SPEND_PERSIST_INTERVAL_S,
     STREAM_READ_TIMEOUT_S,
+    TOKEN_REFRESH_SKEW_S,
+    SIGN_OUT_RETRIES,
     WRITE_TIMEOUT_S,
     data_dir,
 )
@@ -50,12 +73,18 @@ from .errors import (
     MissingKeyError,
     ProviderError,
     ProviderNotAdmittingError,
+    SignInError,
     UnknownProviderError,
     UpstreamError,
 )
-from .kinds import KindSpec, auth_headers, join_url, native_base, spec_for
+from .kinds import ChatWire, KindSpec, auth_headers, join_url, native_base, spec_for
+from .oauth_store import OAuthStore, SignInRecord
+from .responses_adapter import ResponsesToChat, chat_to_responses
+from .anthropic_adapter import MessagesToChat, chat_to_messages
 from .runtime import ProviderRuntime, jittered_delay, parse_retry_after, utc_day
 from .secrets import (
+    MINTED_REF_RE,
+    OPERATOR_REF_RE,
     Redactor,
     SecretRedactingFilter,
     SecretStore,
@@ -64,9 +93,88 @@ from .secrets import (
 )
 from .serialization import assert_no_key_material, provider_public_dict
 from .store import ProviderStore
-from .usage import UsageSniffer
+from .usage import Usage, UsageSniffer
 
 log = logging.getLogger(__name__)
+
+#: What a sign-in credential is called wherever a key's reference would be named.
+_SIGN_IN_REF = "ChatGPT sign-in"
+
+#: The one endpoint a Responses-wire kind serves; everything else needs a raw key.
+_RESPONSES_ONLY = "ChatGPT plan providers serve /v1/chat/completions only"
+_CLAUDE_ONLY = "Claude subscription providers serve /v1/chat/completions only"
+
+#: Client body fields that choose a different model or backend upstream
+#: (OpenRouter's fallback list and provider routing). Never forwarded (K-2).
+_CLIENT_ROUTING_FIELDS = frozenset({"models", "route", "fallbacks", "provider"})
+
+#: Kinds that name a box the operator chose -- a LAN Ollama, any
+#: OpenAI-compatible server. Plain http and loopback/RFC1918 hosts are theirs
+#: to use; every other kind has one home and speaks https to it.
+_LAN_KINDS = frozenset({ProviderKind.OLLAMA, ProviderKind.CUSTOM})
+
+#: IPv4 link-local, where every cloud metadata service answers.
+_LINK_LOCAL_V4 = ipaddress.ip_network("169.254.0.0/16")
+
+
+def validate_base_url(kind: ProviderKind, url: str) -> str:
+    """Refuse a ``base_url`` the provider's stored credential must not go to.
+
+    The provider's key is sent as a bearer to whatever host this names, and a
+    failed answer's body is echoed into ``last_error`` -- so an unchecked URL
+    is both an SSRF and a way to walk off with the key (finding K3). The
+    rules, each named in the refusal:
+
+    * ``https`` unless the kind is OLLAMA or CUSTOM;
+    * an IP-literal host is never link-local (``169.254.0.0/16``,
+      ``fe80::/10``), multicast or unspecified -- no DNS lookup is made;
+    * a kind with a fixed home (``KindSpec.base_url``, every kind but
+      OLLAMA/CUSTOM) must keep that home's hostname.
+
+    Returns ``url`` unchanged; raises ``ValueError``.
+    """
+    kind = ProviderKind(kind)
+    if kind is ProviderKind.CLAUDE_CODE and url != spec_for(kind).base_url:
+        raise ValueError("claude_code base_url must be https://api.anthropic.com/v1")
+    lan = kind in _LAN_KINDS
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    allowed = ("https", "http") if lan else ("https",)
+    if scheme not in allowed:
+        raise ValueError(
+            f"{kind.value} base_url must use {' or '.join(allowed)}, not {scheme or 'no scheme'!r}"
+        )
+    try:
+        host = parts.hostname
+    except ValueError:
+        host = None
+    if not host:
+        raise ValueError("base_url names no host")
+    if is_numeric_host_literal(host):
+        raise ValueError("base_url host is not a dotted-quad address or a hostname")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        mapped = getattr(address, "ipv4_mapped", None)
+        if mapped is not None:
+            address = mapped
+        if (
+            address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+            or (address.version == 4 and address in _LINK_LOCAL_V4)
+        ):
+            raise ValueError(
+                f"base_url host {host} is a link-local, multicast or unspecified address"
+            )
+    home = spec_for(kind).base_url
+    if home and not lan:
+        home_host = (urlsplit(home).hostname or "").lower()
+        if host.lower() != home_host:
+            raise ValueError(f"{kind.value} base_url must be on {home_host}, not {host}")
+    return url
 
 
 def _screen_free_text(value: str, field: str) -> None:
@@ -139,6 +247,46 @@ def minted_ref(provider_id: str) -> str:
     budget = _MAX_REF_LEN - len(MINTED_REF_PREFIX) - len(MINTED_REF_SUFFIX)
     return f"{MINTED_REF_PREFIX}{stem[:budget]}{MINTED_REF_SUFFIX}"
 
+
+#: The one field ``POST /api/wiring`` will not carry: a pasted key is written
+#: to secrets.json, which neither a dry run nor a batch may do.
+WIRING_NO_API_KEY = "api_key cannot be set through /api/wiring; use PATCH /api/providers/{id}."
+
+REF_NOT_OURS = (
+    "api_key_ref must be a derate-minted reference or DERATE_SECRET_*: "
+    'send the key as "api_key" and derate stores it under this provider\'s '
+    "own reference, or export it as DERATE_SECRET_<NAME> and name that"
+)
+
+
+def ref_allowed(ref: str, provider_id: str) -> bool:
+    """Whether *provider_id* may hold the reference *ref*.
+
+    Exactly its own minted name, or an operator's ``DERATE_SECRET_*``. Any
+    other environment variable -- the cluster token, the HF token, another
+    provider's minted key -- would be sent as a bearer to this provider's
+    ``base_url``, which the same admin chose.
+    """
+    if ref == minted_ref(provider_id):
+        return True
+    return bool(OPERATOR_REF_RE.fullmatch(ref)) and not MINTED_REF_RE.fullmatch(ref)
+
+
+def parse_daily_budget(value) -> float | None:
+    """A daily budget, or None for unlimited. NaN would disable it silently."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"daily_budget_usd must be a number or null, got {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"daily_budget_usd must be a number or null, got {value!r}") from None
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"daily_budget_usd must be a finite number >= 0, got {value!r}")
+    return number
+
+
 #: Endpoints whose request body has a `stream` field. Everything else -- today
 #: that means /v1/audio/speech and /v1/audio/transcriptions -- must not have one
 #: added, because a strict upstream rejects an unknown field outright.
@@ -150,6 +298,58 @@ def _accepts_stream(endpoint: str) -> bool:
     return any(tail.endswith(name) for name in _STREAMING_ENDPOINTS)
 
 
+def _json_object(raw: bytes) -> dict:
+    """A response body as a JSON object, or {} when it is not one."""
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _oauth_error_code(payload: dict) -> str:
+    """RFC 6749's ``error`` string, or the ``code`` of an object-shaped one."""
+    error = payload.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        return str(error.get("code") or error.get("type") or "")
+    return ""
+
+
+def estimate_prompt_tokens(body: dict) -> int:
+    """Character-based prompt estimate (4 chars/token, 4 tokens/message).
+
+    Stand-in for ``limits.service.estimate_prompt_tokens`` so this branch does
+    not depend on the auth-keys-limits branch; the usage fallback only needs a
+    rough figure when an upstream sent no usage block.
+    """
+    chars = 0
+    overhead = 0
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            overhead += 4
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                chars += sum(
+                    len(part["text"])
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                )
+            elif content is not None:
+                chars += len(str(content))
+    for key in ("prompt", "input"):
+        value = body.get(key)
+        if isinstance(value, str):
+            chars += len(value)
+        elif isinstance(value, list):
+            chars += sum(len(i) for i in value if isinstance(i, str))
+    return int(chars / 4.0) + overhead
+
+
 @dataclass
 class UpstreamResponse:
     """A live upstream response, headers known, body not yet read."""
@@ -158,24 +358,17 @@ class UpstreamResponse:
     headers: dict[str, str]
     media_type: str | None
     body: AsyncIterator[bytes]
+    # Logical failure discovered while translating a stream whose HTTP headers
+    # have already been sent. Set before the corresponding error frame yields.
+    error: UpstreamError | None = None
 
 
-# Hop-by-hop and framing headers we must not copy onto our own response.
-_DROP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-    "content-encoding",
-    "authorization",
-    "x-api-key",
-    "set-cookie",
-}
+#: The only upstream response headers a client is ever shown (finding K6).
+#: An allowlist, not a denylist: a provider's ``openai-organization``,
+#: ``openai-project`` and account-wide ``x-ratelimit-*`` describe derate's
+#: account with the provider, never the key holder's. ``x-request-id`` is not
+#: here because it is replaced by derate's own trace id, never relayed.
+RESPONSE_HEADER_ALLOWLIST = frozenset({"content-type", "cache-control", "retry-after"})
 
 
 @dataclass
@@ -187,9 +380,24 @@ class _Entry:
     # we know it is ours to re-enable once the reference resolves.
     auto_disabled: bool = False
     models_by_upstream: dict[str, ProviderModel] = field(default_factory=dict)
+    # upstream_id -> (input, output) as the catalogue publishes it, before a
+    # backend pin's host price replaces it on the model. What a cleared pin
+    # restores, and what is persisted: the file never holds a host's price
+    # in the catalogue's place.
+    catalogue_prices: dict[str, tuple[float | None, float | None]] = field(
+        default_factory=dict
+    )
 
     def reindex(self) -> None:
         self.models_by_upstream = {m.upstream_id: m for m in self.provider.models}
+
+    def capture_catalogue_prices(self) -> None:
+        """Record the models' prices as the catalogue's own. Call only on a
+        model list fresh from the upstream or from disk, never after pinning."""
+        self.catalogue_prices = {
+            m.upstream_id: (m.input_cost_per_mtok, m.output_cost_per_mtok)
+            for m in self.provider.models
+        }
 
 
 def existing_provider_for(providers: list[Provider], base_url: str) -> Provider | None:
@@ -217,6 +425,7 @@ class ProviderService:
         data_path: Path | None = None,
         store: ProviderStore | None = None,
         secrets: SecretStore | None = None,
+        oauth: OAuthStore | None = None,
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
         now: Callable[[], float] = time.time,
         refresh_interval_s: float = PROVIDER_REFRESH_S,
@@ -235,6 +444,21 @@ class ProviderService:
         self.redactor = self.secrets.redactor
         self.store = store or ProviderStore(root / "providers.json", redactor=self.redactor)
         self.store.redactor = self.redactor
+        self.oauth = oauth or OAuthStore(root / OAUTH_FILE, redactor=self.redactor)
+        self.oauth.redactor = self.redactor
+        # Per provider, so two requests finding the same expired token refresh
+        # it once: the refresh token rotates, and the loser would present a
+        # spent one and be told to sign in again.
+        self._token_locks: dict[str, asyncio.Lock] = {}
+        self._sign_ins: dict[str, siwc.SignInAttempt] = {}
+        # Finished attempts, kept for the UI's poll; and the ones in flight past
+        # their state check, so a refusal there is recorded rather than lost.
+        self._sign_in_outcomes: dict[str, dict] = {}
+        self._consumed: set[str] = set()
+        self._siwc_discovery: dict | None = None
+        self._claude_sign_ins: dict[str, claude.ClaudeSignInAttempt] = {}
+        self._claude_outcomes: dict[str, dict] = {}
+        self._claude_credential_lock = threading.RLock()
         self._now = now
         self._refresh_interval_s = refresh_interval_s
         self._client_factory = client_factory or self._default_client_factory
@@ -289,7 +513,8 @@ class ProviderService:
                 write=WRITE_TIMEOUT_S,
                 pool=CONNECT_TIMEOUT_S,
             ),
-            follow_redirects=True,
+            # A redirect would carry the bearer to wherever the upstream points.
+            follow_redirects=False,
         )
 
     def _client(self) -> httpx.AsyncClient:
@@ -304,13 +529,29 @@ class ProviderService:
     def _load(self) -> None:
         for provider, runtime in self.store.load():
             entry = _Entry(provider=provider, runtime=runtime, spec=spec_for(provider.kind))
+            entry.capture_catalogue_prices()
+            self._apply_pin_prices(entry)
             entry.reindex()
             self._entries[provider.provider_id] = entry
+            ref = provider.api_key_ref
+            if ref and not ref_allowed(ref, provider.provider_id):
+                log.warning(
+                    "provider %s: api_key_ref %s is not derate-minted or DERATE_SECRET_*; "
+                    "it will not be resolved until the provider is given a key again",
+                    provider.provider_id,
+                    ref,
+                )
         # A missing key disables a provider. It never fails startup.
         for entry in self._entries.values():
             self._check_key(entry)
         if self._entries:
             log.info("loaded %d provider(s) from disk", len(self._entries))
+
+    @staticmethod
+    def _usable_ref(entry: _Entry) -> str:
+        """The reference to resolve, or "" when the record holds one it may not."""
+        ref = entry.provider.api_key_ref
+        return ref if ref and ref_allowed(ref, entry.provider.provider_id) else ""
 
     def _sync(self, entry: _Entry) -> _Entry:
         """Mirror live runtime state onto the contract record before it is read.
@@ -338,16 +579,52 @@ class ProviderService:
         self._spend_dirty = False
         self._spend_persisted_at = self._now()
         entries = [self._sync(e) for e in self._entries.values()]
-        self.store.save([(e.provider, e.runtime) for e in entries])
+        self.store.save([(self._persisted_view(e), e.runtime) for e in entries])
+
+    @staticmethod
+    def _persisted_view(entry: _Entry) -> Provider:
+        """The record with the catalogue's prices, never a pinned host's.
+
+        The pinned price is runtime state (``backend_pin_prices``) re-applied
+        on load; writing it over the catalogue price would lose the price a
+        cleared pin has to restore.
+        """
+        if not entry.runtime.backend_pin_prices:
+            return entry.provider
+        models = []
+        for m in entry.provider.models:
+            cost_in, cost_out = entry.catalogue_prices.get(
+                m.upstream_id, (m.input_cost_per_mtok, m.output_cost_per_mtok)
+            )
+            models.append(replace(m, input_cost_per_mtok=cost_in, output_cost_per_mtok=cost_out))
+        return replace(entry.provider, models=models)
 
     # -- keys --------------------------------------------------------------
 
+    def _credential_label(self, entry: _Entry) -> str:
+        """The name the runtime's messages give this provider's credential."""
+        if entry.spec.sign_in:
+            return "Claude subscription sign-in" if entry.spec.sign_in == "claude" else _SIGN_IN_REF
+        return entry.provider.api_key_ref
+
+    def _credential_present(self, entry: _Entry) -> bool:
+        if entry.spec.sign_in:
+            record = self.oauth.get(entry.provider.provider_id)
+            return record is not None and bool(record.refresh_token) and not record.needs_reauth
+        ref = self._usable_ref(entry)
+        return bool(ref) and self.secrets.has(ref)
+
     def _check_key(self, entry: _Entry) -> bool:
-        """Resolve the key reference. Disable on a miss, re-enable on a return."""
-        if not entry.spec.requires_key and not entry.provider.api_key_ref:
+        """Resolve the credential. Disable on a miss, re-enable on a return.
+
+        For a sign-in kind the credential is the stored sign-in, present while
+        it holds a refresh token that has not been refused.
+        """
+        if not entry.spec.sign_in and not entry.spec.requires_key and not entry.provider.api_key_ref:
             entry.runtime.clear_missing_key()
             return True
-        if self.secrets.has(entry.provider.api_key_ref):
+        label = self._credential_label(entry)
+        if self._credential_present(entry):
             if entry.runtime.missing_key_ref is not None:
                 entry.runtime.clear_missing_key()
                 entry.runtime.healthy = True
@@ -356,21 +633,21 @@ class ProviderService:
                     entry.provider.enabled = True
                     entry.auto_disabled = False
                     log.info(
-                        "provider %s re-enabled; api_key_ref %s now resolves",
+                        "provider %s re-enabled; %s now resolves",
                         entry.provider.provider_id,
-                        entry.provider.api_key_ref,
+                        label,
                     )
             return True
         if entry.provider.enabled:
             entry.auto_disabled = True
         entry.provider.enabled = False
-        entry.runtime.note_missing_key(entry.provider.api_key_ref)
+        entry.runtime.note_missing_key(label, sign_in=bool(entry.spec.sign_in))
         entry.provider.healthy = False
         entry.provider.last_error = entry.runtime.last_error
         log.warning(
-            "provider %s disabled: api_key_ref %s does not resolve",
+            "provider %s disabled: %s does not resolve",
             entry.provider.provider_id,
-            entry.provider.api_key_ref,
+            label,
         )
         return False
 
@@ -398,9 +675,16 @@ class ProviderService:
     def resolve_key(self, provider_id: str) -> str:
         """Request time only. The one place a value is ever produced."""
         entry = self._entry(provider_id)
+        if entry.spec.sign_in:
+            # The raw-key paths (multipart, realtime) would forward to an
+            # endpoint the plan does not serve, with a token that expires
+            # within the hour and is refreshed only by open_upstream.
+            reason = _CLAUDE_ONLY if entry.spec.sign_in == "claude" else _RESPONSES_ONLY
+            raise AdapterUnsupportedError(f"provider {provider_id!r}: {reason}")
         if not entry.spec.requires_key and not entry.provider.api_key_ref:
             return ""
-        value = self.secrets.get(entry.provider.api_key_ref)
+        ref = self._usable_ref(entry)
+        value = self.secrets.get(ref) if ref else None
         if value is None:
             raise MissingKeyError(provider_id, entry.provider.api_key_ref)
         return value
@@ -422,7 +706,16 @@ class ProviderService:
         before the paste, not after.
         """
         entry = self._entry(provider_id)
+        if entry.spec.sign_in:
+            record = self.oauth.get(provider_id)
+            if record is None:
+                return {"key_state": "missing", "key_source": None}
+            if record.needs_reauth:
+                return {"key_state": "reauth", "key_source": "oauth"}
+            return {"key_state": "set", "key_source": "oauth"}
         ref = entry.provider.api_key_ref
+        if ref and not self._usable_ref(entry):
+            return {"key_state": "missing", "key_source": None}
         if not entry.spec.requires_key and not ref:
             return {"key_state": "not_needed", "key_source": None}
         if not ref:
@@ -433,6 +726,644 @@ class ProviderService:
         if self.secrets.has(ref):
             return {"key_state": "set", "key_source": "secrets.json"}
         return {"key_state": "missing", "key_source": None}
+
+    def sign_in_account(self, provider_id: str) -> str | None:
+        """The account a sign-in provider is signed in as, or None.
+
+        An email address, which the operator needs to see to know whose plan
+        a request is billed to, and which is not a credential.
+        """
+        entry = self._entry(provider_id)
+        if not entry.spec.sign_in:
+            return None
+        record = self.oauth.get(provider_id)
+        return record.email if record is not None else None
+
+    async def _access_token(
+        self, entry: _Entry, *, force: bool = False, client: httpx.AsyncClient | None = None,
+        rejected_token: str | None = None,
+    ) -> str:
+        """A live access token for a sign-in provider, refreshed when near expiry.
+
+        Serialised per provider: the refresh token rotates on every use, so two
+        requests refreshing at once would leave the slower one holding a spent
+        token -- which OpenAI answers as ``refresh_token_reused``, and that
+        means signing in again. Inside the lock the record is re-read, so the
+        second caller finds the first one's fresh token and does not refresh.
+        """
+        if entry.spec.sign_in == "claude":
+            return await self._claude_access_token(
+                entry, force=force, client=client, rejected_token=rejected_token
+            )
+        provider_id = entry.provider.provider_id
+        lock = self._token_locks.setdefault(provider_id, asyncio.Lock())
+        async with lock:
+            record = self.oauth.get(provider_id)
+            if record is None or not record.refresh_token or record.needs_reauth:
+                self._check_key(entry)
+                self._persist()
+                raise self._upstream_error(
+                    provider_id, 401, "ChatGPT sign-in is missing or expired; sign in "
+                    "again from Settings → Providers"
+                )
+            now = self._now()
+            if not force and record.expires_at - now > TOKEN_REFRESH_SKEW_S:
+                return record.access_token
+
+            client = client or self._client()
+            try:
+                response = await client.post(
+                    CHATGPT_TOKEN_URL,
+                    data={
+                        "grant_type": "refresh_token",
+                        "client_id": record.client_id,
+                        "refresh_token": record.refresh_token,
+                        "resource": CHATGPT_RESOURCE,
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=DISCOVERY_TIMEOUT_S,
+                )
+            except httpx.HTTPError as exc:
+                raise self._upstream_error(
+                    provider_id, 502,
+                    f"could not refresh ChatGPT sign-in: {type(exc).__name__}",
+                ) from None
+
+            payload = _json_object(response.content)
+            if response.status_code == 200 and isinstance(payload.get("access_token"), str):
+                record.access_token = payload["access_token"]
+                record.refresh_token = str(payload.get("refresh_token") or record.refresh_token)
+                record.expires_at = now + float(payload.get("expires_in") or 3600)
+                if isinstance(payload.get("scope"), str):
+                    record.scopes = payload["scope"].split()
+                record.saved_at = now
+                self.oauth.put(record)
+                return record.access_token
+
+            if _oauth_error_code(payload) in REAUTH_ERROR_CODES:
+                record.needs_reauth = True
+                record.access_token = ""
+                record.refresh_token = ""
+                record.saved_at = now
+                self.oauth.put(record)
+                message = "ChatGPT sign-in expired; sign in again from Settings → Providers"
+                entry.runtime.note_auth_failure(now, 401, _SIGN_IN_REF, message, sign_in=True)
+                self._check_key(entry)
+                self._persist()
+                log.warning("provider %s: ChatGPT sign-in refused at refresh", provider_id)
+                raise self._upstream_error(provider_id, 401, message)
+
+            detail = self._error_message(response.status_code, response.content)
+            raise self._upstream_error(
+                provider_id, 502, f"could not refresh ChatGPT sign-in: {detail}"
+            )
+
+    @staticmethod
+    def _claude_generation(record: SignInRecord | None) -> tuple | None:
+        return None if record is None else (
+            record.access_token, record.refresh_token, record.saved_at
+        )
+
+    def _claude_current(self, entry: _Entry, generation: tuple | None) -> bool:
+        pid = entry.provider.provider_id
+        return (
+            self._entries.get(pid) is entry
+            and self._claude_generation(self.oauth.get(pid)) == generation
+        )
+
+    @staticmethod
+    def _claude_token_fields(payload: dict, *, refresh: bool = False) -> tuple[str, str, float]:
+        access, rotating = payload.get("access_token"), payload.get("refresh_token")
+        expiry = payload.get("expires_in")
+        if (
+            not isinstance(access, str) or not access.strip()
+            or (not refresh and (not isinstance(rotating, str) or not rotating.strip()))
+            or (refresh and rotating is not None and (
+                not isinstance(rotating, str) or not rotating.strip()
+            ))
+            or isinstance(expiry, bool) or not isinstance(expiry, (int, float))
+            or not math.isfinite(expiry) or expiry <= 0
+        ):
+            raise ValueError("Claude returned malformed access_token, refresh_token or expires_in")
+        if "scope" in payload and (
+            not isinstance(payload["scope"], str)
+            or "user:inference" not in payload["scope"].split()
+        ):
+            raise ValueError("Claude did not grant user:inference; consent was not broadened")
+        return access, rotating or "", float(expiry)
+
+    async def _claude_access_token(
+        self, entry: _Entry, *, force: bool, client: httpx.AsyncClient | None,
+        rejected_token: str | None,
+    ) -> str:
+        pid = entry.provider.provider_id
+        lock = self._token_locks.setdefault(pid, asyncio.Lock())
+        async with lock:
+            with self._claude_credential_lock:
+                record = self.oauth.get(pid)
+                if (
+                    self._entries.get(pid) is not entry or record is None
+                    or record.needs_reauth or not record.refresh_token
+                ):
+                    raise self._upstream_error(pid, 401, "Claude subscription sign-in is missing or expired; sign in again from Settings → Providers")
+                now = self._now()
+                if record.expires_at - now > TOKEN_REFRESH_SKEW_S and (
+                    not force or (rejected_token is not None and record.access_token != rejected_token)
+                ):
+                    return record.access_token
+                generation = self._claude_generation(record)
+            try:
+                response = await (client or self._client()).post(
+                    CLAUDE_TOKEN_URL,
+                    json={"grant_type": "refresh_token", "refresh_token": record.refresh_token,
+                          "client_id": CLAUDE_CLIENT_ID},
+                    headers={"Accept": "application/json"}, timeout=DISCOVERY_TIMEOUT_S,
+                )
+            except httpx.HTTPError as exc:
+                raise self._upstream_error(pid, 502, f"could not refresh Claude subscription sign-in: {type(exc).__name__}") from None
+            payload = _json_object(response.content)
+            for field in ("access_token", "refresh_token"):
+                self.redactor.remember(str(payload.get(field) or ""))
+            with self._claude_credential_lock:
+                if not self._claude_current(entry, generation):
+                    newer = self.oauth.get(pid)
+                    if (
+                        self._entries.get(pid) is entry and newer is not None
+                        and not newer.needs_reauth and newer.access_token
+                        and newer.expires_at > self._now()
+                    ):
+                        return newer.access_token
+                    raise self._upstream_error(pid, 401, "Claude subscription credential was removed or invalidated during refresh")
+                if response.status_code == 200:
+                    try:
+                        access, rotating, expiry = self._claude_token_fields(payload, refresh=True)
+                    except ValueError as exc:
+                        raise self._upstream_error(pid, 502, str(exc)) from None
+                    updated = replace(
+                        record, access_token=access, refresh_token=rotating or record.refresh_token,
+                        expires_at=self._now() + expiry, saved_at=self._now(),
+                        scopes=payload["scope"].split() if "scope" in payload else record.scopes,
+                    )
+                    self.oauth.put(updated)
+                    return access
+                if response.status_code in (401, 403) or _oauth_error_code(payload) in {
+                    "invalid_grant", "invalid_token",
+                }:
+                    self.oauth.put(replace(record, needs_reauth=True, access_token="",
+                                           refresh_token="", saved_at=self._now()))
+                    message = "Claude subscription sign-in expired; sign in again from Settings → Providers"
+                    entry.runtime.note_auth_failure(self._now(), 401, self._credential_label(entry), message, sign_in=True)
+                    self._check_key(entry)
+                    self._persist()
+                    raise self._upstream_error(pid, 401, message)
+                detail = self._error_message(response.status_code, response.content)
+                raise self._upstream_error(pid, 502, f"could not refresh Claude subscription sign-in: {detail}")
+
+    def _prune_claude_sign_ins(self) -> None:
+        now = self._now()
+        for key, attempt in list(self._claude_sign_ins.items()):
+            if now - attempt.created >= SIGN_IN_ATTEMPT_TTL_S:
+                del self._claude_sign_ins[key]
+        for key, outcome in list(self._claude_outcomes.items()):
+            if now - outcome["at"] >= SIGN_IN_ATTEMPT_TTL_S:
+                del self._claude_outcomes[key]
+
+    def start_claude_sign_in(self, provider_id: str | None) -> dict:
+        with self._claude_credential_lock:
+            self._prune_claude_sign_ins()
+            if provider_id is not None:
+                entry = self._entry(provider_id)
+                if entry.spec.sign_in != "claude":
+                    raise ValueError(f"provider {provider_id!r} is not a Claude subscription provider")
+                if self.oauth.get(provider_id) is None:
+                    raise ValueError("This provider has no Claude sign-in to renew; remove it and sign in again")
+            attempt = claude.new_attempt(provider_id=provider_id, now=self._now())
+            self._claude_sign_ins[attempt.attempt_id] = attempt
+            return {
+                "attempt_id": attempt.attempt_id, "authorize_url": claude.authorize_url(attempt),
+                "redirect_uri": CLAUDE_REDIRECT_URI,
+                "expires_at": attempt.created + SIGN_IN_ATTEMPT_TTL_S,
+            }
+
+    def claude_sign_in_status(self, attempt_id: str) -> dict:
+        with self._claude_credential_lock:
+            self._prune_claude_sign_ins()
+            if attempt_id in self._claude_sign_ins:
+                return {"status": "pending"}
+            outcome = self._claude_outcomes.get(attempt_id)
+            if outcome is None:
+                raise SignInError("sign_in_attempt_unknown", claude.ATTEMPT_UNKNOWN)
+            return {k: v for k, v in outcome.items() if k != "at"}
+
+    async def complete_claude_sign_in(self, attempt_id: str, callback_url: str) -> Provider:
+        with self._claude_credential_lock:
+            self._prune_claude_sign_ins()
+            attempt = self._claude_sign_ins.get(attempt_id)
+            if attempt is None:
+                raise SignInError("sign_in_attempt_unknown", claude.ATTEMPT_UNKNOWN)
+            params = claude.parse_callback(callback_url)
+            self.redactor.remember(params["code"])
+            if not hmac.compare_digest(params["state"].encode(), attempt.state.encode()):
+                raise SignInError("sign_in_state_mismatch", "That code belongs to a different Claude sign-in. Use this attempt's code, or start again.")
+            previous_entry = self._entry(attempt.provider_id) if attempt.provider_id else None
+            previous = self.oauth.get(attempt.provider_id) if attempt.provider_id else None
+            generation = self._claude_generation(previous)
+            # Consume before the first await, preventing duplicate exchanges.
+            del self._claude_sign_ins[attempt_id]
+            self._claude_outcomes[attempt_id] = {"status": "pending", "at": self._now()}
+        try:
+            provider = await self._exchange_claude_sign_in(attempt, params, previous_entry, generation)
+        except Exception as exc:
+            self._claude_outcomes[attempt_id] = {
+                "status": "failed", "code": getattr(exc, "code", None) or "sign_in_failed",
+                "message": self.redactor.scrub(getattr(exc, "message", None) or str(exc)),
+                "at": self._now(),
+            }
+            raise
+        self._claude_outcomes[attempt_id] = {
+            "status": "done", "provider_id": provider.provider_id, "at": self._now(),
+        }
+        return provider
+
+    async def _exchange_claude_sign_in(
+        self, attempt: claude.ClaudeSignInAttempt, params: dict,
+        previous_entry: _Entry | None, generation: tuple | None,
+    ) -> Provider:
+        client = self._client()
+        try:
+            response = await client.post(
+                CLAUDE_TOKEN_URL,
+                json={"grant_type": "authorization_code", "client_id": CLAUDE_CLIENT_ID,
+                      "code": params["code"], "state": params["state"],
+                      "redirect_uri": CLAUDE_REDIRECT_URI, "code_verifier": attempt.verifier},
+                headers={"Accept": "application/json"}, timeout=DISCOVERY_TIMEOUT_S,
+            )
+            payload = _json_object(response.content)
+            for field in ("access_token", "refresh_token"):
+                self.redactor.remember(str(payload.get(field) or ""))
+            if response.status_code != 200:
+                raise SignInError("sign_in_exchange_failed", f"Claude refused the sign-in code: {self._error_message(response.status_code, response.content)}")
+            try:
+                access, rotating, expiry = self._claude_token_fields(payload)
+            except ValueError as exc:
+                raise SignInError("sign_in_exchange_failed", str(exc)) from None
+            profile_response = await client.get(
+                CLAUDE_PROFILE_URL, headers=claude.oauth_headers(access), timeout=DISCOVERY_TIMEOUT_S,
+            )
+        except httpx.HTTPError as exc:
+            raise self._upstream_error("claude_code", 502, f"could not reach Claude sign-in service: {type(exc).__name__}") from None
+        profile = _json_object(profile_response.content)
+        account, org = profile.get("account"), profile.get("organization")
+        if (
+            profile_response.status_code != 200 or not isinstance(account, dict)
+            or not isinstance(org, dict)
+            or not all(isinstance(v, str) and v.strip() for v in (
+                account.get("uuid"), org.get("uuid"),
+            ))
+        ):
+            raise SignInError("sign_in_exchange_failed", "Claude profile check failed: " + (
+                self._error_message(profile_response.status_code, profile_response.content)
+                if profile_response.status_code != 200 else "account.uuid and organization.uuid are required"
+            ))
+        subject = org["uuid"] + ":" + account["uuid"]
+        with self._claude_credential_lock:
+            if previous_entry is not None:
+                if not self._claude_current(previous_entry, generation):
+                    raise SignInError("sign_in_attempt_unknown", "The Claude provider or credential changed during sign-in. Start again.")
+                previous = self.oauth.get(previous_entry.provider.provider_id)
+                if previous is None or previous.subject != subject:
+                    raise SignInError("sign_in_wrong_account", "That is a different Claude account or organization from this provider's stored account.")
+            pid = attempt.provider_id or self._mint_id(ProviderKind.CLAUDE_CODE)
+            record = SignInRecord(
+                provider_id=pid, client_id=CLAUDE_CLIENT_ID, subject=subject,
+                email=account.get("email") if isinstance(account.get("email"), str) else "",
+                id_token="", access_token=access, refresh_token=rotating,
+                expires_at=self._now() + expiry, saved_at=self._now(),
+                scopes=payload.get("scope", CLAUDE_SCOPES).split(),
+            )
+            self.oauth.put(record)
+            if previous_entry is None:
+                try:
+                    self._register({"kind": "claude_code", "provider_id": pid}, signed_in=True)
+                except BaseException:
+                    self.oauth.delete(pid)
+                    raise
+            else:
+                previous_entry.runtime.note_success(self._now())
+                self._check_key(previous_entry)
+                self._persist()
+        await self.refresh_async(pid)
+        return self.get(pid)
+
+    def _upstream_error(
+        self, provider_id: str, status: int, message: str, *, code: str | None = None,
+        retry_after_s: float | None = None,
+    ) -> UpstreamError:
+        """An UpstreamError carrying an OpenAI-shaped body.
+
+        The gateway hands ``body`` to the client verbatim, so an error derate
+        writes itself -- rather than relays -- has to bring one, or the client
+        receives the status and nothing to read.
+        """
+        message = self.redactor.scrub(message)
+        exc = UpstreamError(provider_id, status, message, error_code=code,
+                            retry_after_s=retry_after_s)
+        exc.body = json.dumps(exc.to_openai_error())
+        return exc
+
+    # -- Sign in with ChatGPT ----------------------------------------------
+
+    def _prune_sign_ins(self, now: float) -> None:
+        for attempt_id, attempt in list(self._sign_ins.items()):
+            if now - attempt.created > SIGN_IN_ATTEMPT_TTL_S:
+                del self._sign_ins[attempt_id]
+        for attempt_id, outcome in list(self._sign_in_outcomes.items()):
+            if now - outcome["at"] > SIGN_IN_ATTEMPT_TTL_S:
+                del self._sign_in_outcomes[attempt_id]
+
+    def chatgpt_sign_in_status(self, attempt_id: str) -> dict:
+        """Where an attempt stands: ``pending``, ``done`` or ``failed``.
+
+        What the UI polls while the operator is in the ChatGPT tab, so a
+        redirect that reached ``GET /auth/callback`` finishes the screen too
+        without anybody pasting anything.
+        """
+        self._prune_sign_ins(self._now())
+        if attempt_id in self._sign_ins:
+            return {"status": "pending"}
+        outcome = self._sign_in_outcomes.get(attempt_id)
+        if outcome is None:
+            raise SignInError("sign_in_attempt_unknown", siwc.ATTEMPT_UNKNOWN)
+        return {k: v for k, v in outcome.items() if k != "at"}
+
+    async def complete_chatgpt_callback(self, query: str) -> tuple[str, Provider]:
+        """Finish whichever attempt the redirect's ``state`` belongs to.
+
+        ``GET /auth/callback`` has no session and no attempt id -- it is a
+        browser following OpenAI's redirect -- so the state, a 256-bit secret
+        only this attempt's authorize URL carried, is what identifies it.
+        """
+        self._prune_sign_ins(self._now())
+        state = siwc.parse_callback(query).get("state", "").encode()
+        for attempt_id, attempt in list(self._sign_ins.items()):
+            if state and hmac.compare_digest(state, attempt.state.encode()):
+                return attempt_id, await self.complete_chatgpt_sign_in(attempt_id, query)
+        raise SignInError("sign_in_attempt_unknown", siwc.ATTEMPT_UNKNOWN)
+
+    def start_chatgpt_sign_in(self, provider_id: str | None) -> dict:
+        """Begin a sign-in: the authorize URL for the operator's browser.
+
+        With ``provider_id``, a sign-in-again for that provider: the client id
+        OpenAI issued it, and its account as the login hint. Without one, a
+        first registration under the dynamic client id.
+        """
+        now = self._now()
+        self._prune_sign_ins(now)
+        if provider_id:
+            entry = self._entry(provider_id)
+            if entry.spec.sign_in != "chatgpt":
+                raise ValueError(f"provider {provider_id!r} is not a ChatGPT plan provider")
+            record = self.oauth.get(provider_id)
+            if record is None:
+                raise ValueError(
+                    f"provider {provider_id!r} has no ChatGPT sign-in to renew; "
+                    "remove it and sign in again"
+                )
+            attempt = siwc.new_attempt(
+                client_id=record.client_id,
+                provider_id=provider_id,
+                email_hint=record.email or None,
+                now=now,
+            )
+        else:
+            attempt = siwc.new_attempt(
+                client_id=siwc.DYNAMIC_CLIENT_ID, provider_id=None, email_hint=None, now=now
+            )
+        self._sign_ins[attempt.attempt_id] = attempt
+        return {
+            "attempt_id": attempt.attempt_id,
+            "authorize_url": siwc.authorize_url(attempt, host_id=self.oauth.host_id()),
+            "redirect_uri": CHATGPT_REDIRECT_URI,
+            "expires_at": now + SIGN_IN_ATTEMPT_TTL_S,
+        }
+
+    async def complete_chatgpt_sign_in(self, attempt_id: str, callback_url: str) -> Provider:
+        """Finish a sign-in from the callback address, pasted or redirected.
+
+        Every refusal is a :class:`SignInError` naming what to do, and none of
+        them stores anything: the record is written only once the ID token has
+        verified, plan usage was granted, and (on a sign-in-again) the account
+        is the one already on file. Once the attempt is consumed its outcome is
+        kept for :meth:`chatgpt_sign_in_status`.
+        """
+        try:
+            provider = await self._complete_chatgpt_sign_in(attempt_id, callback_url)
+        except Exception as exc:
+            if attempt_id not in self._sign_ins and attempt_id in self._consumed:
+                self._consumed.discard(attempt_id)
+                self._sign_in_outcomes[attempt_id] = {
+                    "status": "failed",
+                    "code": getattr(exc, "code", None) or "sign_in_failed",
+                    "message": self.redactor.scrub(getattr(exc, "message", None) or str(exc)),
+                    "at": self._now(),
+                }
+            raise
+        self._consumed.discard(attempt_id)
+        self._sign_in_outcomes[attempt_id] = {
+            "status": "done",
+            "provider_id": provider.provider_id,
+            "at": self._now(),
+        }
+        return provider
+
+    async def _complete_chatgpt_sign_in(self, attempt_id: str, callback_url: str) -> Provider:
+        now = self._now()
+        self._prune_sign_ins(now)
+        attempt = self._sign_ins.get(attempt_id)
+        if attempt is None:
+            raise SignInError("sign_in_attempt_unknown", siwc.ATTEMPT_UNKNOWN)
+        params = siwc.parse_callback(callback_url)
+        if "code" not in params and "error" not in params:
+            raise SignInError("sign_in_bad_callback", siwc.BAD_CALLBACK)
+        if not hmac.compare_digest(params.get("state", "").encode(), attempt.state.encode()):
+            raise SignInError(
+                "sign_in_state_mismatch",
+                "That address belongs to a different sign-in. Paste the address "
+                "from the tab this sign-in opened, or start again.",
+            )
+        # Past the state check the code is this attempt's, and it is single
+        # use: whatever happens next, the attempt cannot be finished twice.
+        del self._sign_ins[attempt_id]
+        self._consumed.add(attempt_id)
+        if "error" in params:
+            raise SignInError(
+                "sign_in_declined", params.get("error_description") or params["error"]
+            )
+        issued = params.get("client_id", "")
+        if attempt.provider_id is None:
+            if not issued or issued == siwc.DYNAMIC_CLIENT_ID:
+                raise SignInError(
+                    "sign_in_incomplete",
+                    "OpenAI did not issue derate a client id for this sign-in. Start again.",
+                )
+            client_id = issued
+        else:
+            if issued and issued != attempt.client_id:
+                raise SignInError(
+                    "sign_in_client_mismatch",
+                    "OpenAI answered for a different registration of derate than "
+                    "the one this provider uses. Start again.",
+                )
+            client_id = attempt.client_id
+
+        client = self._client()
+        try:
+            response = await client.post(
+                CHATGPT_TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "code": params["code"],
+                    "code_verifier": attempt.verifier,
+                    "redirect_uri": CHATGPT_REDIRECT_URI,
+                    "resource": CHATGPT_RESOURCE,
+                },
+                headers={"Accept": "application/json"},
+                timeout=DISCOVERY_TIMEOUT_S,
+            )
+        except httpx.HTTPError as exc:
+            raise self._upstream_error(
+                "chatgpt", 502, f"could not reach {CHATGPT_TOKEN_URL}: {type(exc).__name__}"
+            ) from None
+        tokens = _json_object(response.content)
+        # Before anything below can format an error: the redactor scrubs only
+        # what it already holds.
+        for name in ("id_token", "access_token", "refresh_token"):
+            self.redactor.remember(str(tokens.get(name) or ""))
+        if response.status_code != 200 or not all(
+            isinstance(tokens.get(name), str) and tokens[name]
+            for name in ("id_token", "access_token", "refresh_token")
+        ):
+            detail = self._error_message(response.status_code, response.content)
+            raise SignInError(
+                "sign_in_exchange_failed", f"OpenAI refused the sign-in code: {detail}"
+            )
+
+        discovery = await self._chatgpt_discovery()
+        jwks = await self._get_json(str(discovery.get("jwks_uri") or ""))
+        claims = siwc.verify_id_token(
+            tokens["id_token"], jwks, client_id=client_id, nonce=attempt.nonce
+        )
+        granted = str(tokens.get("scope") or params.get("scope") or "").split()
+        if CHATGPT_PLAN_SCOPE not in granted:
+            raise SignInError("sign_in_no_plan_usage", siwc.NO_PLAN_USAGE)
+        subject = str(claims.get("sub") or "")
+        if attempt.provider_id is not None:
+            previous = self.oauth.get(attempt.provider_id)
+            if previous is None or previous.subject != subject:
+                raise SignInError("sign_in_wrong_account", siwc.WRONG_ACCOUNT)
+
+        provider_id = attempt.provider_id or self._mint_id(ProviderKind.CHATGPT)
+        self.oauth.put(
+            SignInRecord(
+                provider_id=provider_id,
+                client_id=client_id,
+                subject=subject,
+                email=str(claims.get("email") or ""),
+                id_token=tokens["id_token"],
+                access_token=tokens["access_token"],
+                refresh_token=tokens["refresh_token"],
+                expires_at=now + float(tokens.get("expires_in") or 3600),
+                scopes=granted,
+                saved_at=now,
+            )
+        )
+        if attempt.provider_id is None:
+            self._register({"kind": ProviderKind.CHATGPT.value, "provider_id": provider_id},
+                           signed_in=True)
+        else:
+            entry = self._entry(provider_id)
+            entry.runtime.note_success(now)
+            # Re-enables a provider that was switched off for the lapsed sign-in.
+            self._check_key(entry)
+            self._persist()
+        log.info("provider %s signed in to ChatGPT", provider_id)
+        await self.refresh_async(provider_id)
+        return self.get(provider_id)
+
+    async def _chatgpt_discovery(self) -> dict:
+        """OpenAI's OpenID configuration, fetched once per process."""
+        if self._siwc_discovery is None:
+            self._siwc_discovery = await self._get_json(CHATGPT_DISCOVERY_URL)
+        return self._siwc_discovery
+
+    async def _get_json(self, url: str) -> dict:
+        if not url:
+            raise self._upstream_error("chatgpt", 502, "OpenAI's sign-in configuration names no URL")
+        try:
+            response = await self._client().get(
+                url, headers={"Accept": "application/json"}, timeout=DISCOVERY_TIMEOUT_S
+            )
+        except httpx.HTTPError as exc:
+            raise self._upstream_error(
+                "chatgpt", 502, f"could not reach {url}: {type(exc).__name__}"
+            ) from None
+        payload = _json_object(response.content)
+        if response.status_code != 200 or not payload:
+            raise self._upstream_error(
+                "chatgpt", 502,
+                f"{url} answered {response.status_code}: "
+                f"{self._error_message(response.status_code, response.content)}",
+            )
+        return payload
+
+    async def sign_out_async(self, provider_id: str) -> bool | None:
+        """Revoke a sign-in provider's refresh token at OpenAI. Never raises.
+
+        ``None`` when there is nothing to revoke (not a sign-in kind, or no
+        token held); otherwise whether OpenAI confirmed it. A ``False`` is not
+        a reason to keep the provider -- removing it still deletes the tokens
+        here -- only a reason to tell the operator to disconnect derate from
+        the ChatGPT side as well.
+        """
+        try:
+            entry = self._entry(provider_id)
+            if not entry.spec.sign_in:
+                return None
+            if entry.spec.sign_in == "claude":
+                # No remote revocation endpoint has been verified.
+                return False
+            record = self.oauth.get(provider_id)
+            if record is None or not record.refresh_token:
+                return None
+            endpoint = str((await self._chatgpt_discovery()).get("revocation_endpoint") or "")
+            if not endpoint:
+                return False
+            client = self._client()
+            for attempt in range(SIGN_OUT_RETRIES + 1):
+                try:
+                    response = await client.post(
+                        endpoint,
+                        data={
+                            "token": record.refresh_token,
+                            "token_type_hint": "refresh_token",
+                            "client_id": record.client_id,
+                        },
+                        timeout=DISCOVERY_TIMEOUT_S,
+                    )
+                except httpx.HTTPError:
+                    response = None
+                if response is not None and response.status_code == 200:
+                    return True
+                if response is not None and response.status_code < 500:
+                    break
+                if attempt < SIGN_OUT_RETRIES:
+                    await asyncio.sleep(jittered_delay())
+        except Exception as exc:  # a failed revocation must never block a removal
+            log.warning("provider %s: revocation failed (%s)", provider_id, type(exc).__name__)
+            return False
+        log.warning("provider %s: OpenAI did not confirm revocation", provider_id)
+        return False
 
     # -- registry ----------------------------------------------------------
 
@@ -473,9 +1404,19 @@ class ProviderService:
         await self.refresh_async(provider_id)
         return self.get(provider_id)
 
-    def _register(self, spec: dict) -> str:
+    def _register(self, spec: dict, *, signed_in: bool = False) -> str:
+        """Validate *spec* and add the provider. ``signed_in`` is the sign-in flow only.
+
+        A sign-in kind's credential is created by the sign-in completing, so
+        the add route -- which takes a key or a reference -- can never create
+        one: there is nothing it could store that would authenticate.
+        """
         kind = ProviderKind(spec.get("kind", ProviderKind.CUSTOM))
         kind_spec = spec_for(kind)
+        if kind_spec.sign_in and not signed_in:
+            raise ValueError(
+                f"{kind.value} providers are added by signing in: POST /api/sign-in/{kind_spec.sign_in}"
+            )
 
         base_url = str(spec.get("base_url") or kind_spec.base_url).strip()
         if not base_url:
@@ -493,17 +1434,25 @@ class ProviderService:
         self.redactor.remember(api_key)
 
         api_key_ref = str(spec.get("api_key_ref") or "").strip()
+        if kind_spec.sign_in and (api_key or api_key_ref):
+            raise ValueError(f"{kind.value} credentials must come from sign-in, not api_key or api_key_ref")
         if looks_like_secret(api_key_ref):
             # The whole design rests on this field being a name. A key here
             # would be displayed everywhere a reference safely can be. There
             # is somewhere to put the key now, so the refusal says where.
             raise ValueError(KEY_IN_REF_FIELD)
-        if kind_spec.requires_key and not api_key_ref and not api_key:
+        if kind_spec.requires_key and not signed_in and not api_key_ref and not api_key:
             raise ValueError(f"{kind.value} needs an api_key or an api_key_ref")
 
         provider_id = str(spec.get("provider_id") or "").strip() or self._mint_id(kind)
         if provider_id in self._entries:
             raise ValueError(f"provider {provider_id!r} already exists")
+        if api_key_ref and not ref_allowed(api_key_ref, provider_id):
+            raise ValueError(REF_NOT_OURS)
+        # After the reference screens: a spec wrong on both counts is told
+        # about the key first, which is the costlier mistake.
+        validate_base_url(kind, base_url)
+        budget = parse_daily_budget(spec.get("daily_budget_usd"))
 
         display_name = str(spec.get("display_name") or kind_spec.display_name)
         aliases = {str(k): str(v) for k, v in (spec.get("aliases") or {}).items()}
@@ -521,7 +1470,6 @@ class ProviderService:
             api_key_ref = api_key_ref or minted_ref(provider_id)
             self._store_key(api_key_ref, api_key)
 
-        budget = spec.get("daily_budget_usd")
         provider = Provider(
             provider_id=provider_id,
             kind=kind,
@@ -537,7 +1485,7 @@ class ProviderService:
         )
         runtime = ProviderRuntime(
             provider_id=provider_id,
-            daily_budget_usd=None if budget is None else float(budget),
+            daily_budget_usd=budget,
             aliases=aliases,
             # A new provider serves nothing until somebody says otherwise.
             # Deliberately not settable from the spec: the catalogue is empty
@@ -651,6 +1599,40 @@ class ProviderService:
     def update(self, provider_id: str, patch: dict) -> Provider:
         """Enable, disable, reprioritize, rename, set a budget, set aliases."""
         entry = self._entry(provider_id)
+        held = entry.provider.api_key_ref
+        self._apply_patch(entry, patch)
+        if "base_url" in patch and held == minted_ref(provider_id) and not entry.provider.api_key_ref:
+            # _apply_patch let go of the key because base_url moved: the key
+            # was pasted for the old host and is never sent to the new one.
+            self.secrets.delete(held)
+        # auto_disabled too, not just enabled: a provider switched off *because*
+        # its reference did not resolve is exactly the one a new key should
+        # bring back, and it is disabled by definition. An operator who turned
+        # it off by hand stays off.
+        if entry.provider.enabled or entry.auto_disabled:
+            self._check_key(entry)
+        self._persist()
+        return self.get(provider_id)
+
+    def validate_patch(self, provider_id: str, patch: dict) -> None:
+        """Every check ``update`` makes, against a copy, with nothing written.
+
+        ``POST /api/wiring`` validates a whole batch before applying any of it,
+        so this has to raise exactly what ``update`` would and change nothing.
+        A key is the one field it refuses outright: pasting one stores it in
+        secrets.json, which no dry run may do.
+        """
+        if not isinstance(patch, dict):
+            raise ValueError("patch must be an object")
+        if "api_key" in patch:
+            raise ValueError(WIRING_NO_API_KEY)
+        self._apply_patch(copy.deepcopy(self._entry(provider_id)), patch)
+
+    def _apply_patch(self, entry: _Entry, patch: dict) -> None:
+        provider_id = entry.provider.provider_id
+        if entry.spec.sign_in and ("api_key" in patch or "api_key_ref" in patch):
+            self.redactor.remember(str(patch.get("api_key") or ""))
+            raise ValueError(f"{entry.provider.kind.value} credentials must come from sign-in, not api_key or api_key_ref")
         if "enabled" in patch:
             entry.provider.enabled = bool(patch["enabled"])
             entry.auto_disabled = False
@@ -661,14 +1643,24 @@ class ProviderService:
             _screen_free_text(display_name, "display_name")
             entry.provider.display_name = display_name
         if "daily_budget_usd" in patch:
-            value = patch["daily_budget_usd"]
-            entry.runtime.daily_budget_usd = None if value is None else float(value)
+            entry.runtime.daily_budget_usd = parse_daily_budget(patch["daily_budget_usd"])
             # The other crossing direction: the spend did not move, the cap did.
             self._check_budget(entry)
         if "base_url" in patch:
             base_url = str(patch["base_url"]).strip()
             if looks_like_secret(base_url):
                 raise ValueError("base_url looks like it contains key material")
+            validate_base_url(entry.provider.kind, base_url)
+            if (
+                base_url != entry.provider.base_url
+                and entry.provider.api_key_ref == minted_ref(provider_id)
+                and "api_key" not in patch
+                and "api_key_ref" not in patch
+            ):
+                # A key derate stored was pasted for the old host. Moving the
+                # URL must not carry it to the new one (finding K3): the
+                # provider needs its key again.
+                entry.provider.api_key_ref = ""
             entry.provider.base_url = base_url
         if "api_key_ref" in patch:
             ref = str(patch["api_key_ref"]).strip()
@@ -677,6 +1669,8 @@ class ProviderService:
                 # shorter, different sentence here, which read as a different
                 # rule rather than the same one.
                 raise ValueError(KEY_IN_REF_FIELD)
+            if ref and not ref_allowed(ref, provider_id):
+                raise ValueError(REF_NOT_OURS)
             entry.provider.api_key_ref = ref
         if "api_key" in patch:
             # Rotating a key in place. Reuse the reference the provider already
@@ -703,32 +1697,39 @@ class ProviderService:
         if "enabled_models" in patch:
             entry.runtime.enabled_models = self._screen_allowlist(entry, patch["enabled_models"])
         if "backend_pins" in patch:
-            entry.runtime.backend_pins = self._screen_backend_pins(entry, patch["backend_pins"])
-        # auto_disabled too, not just enabled: a provider switched off *because*
-        # its reference did not resolve is exactly the one a new key should
-        # bring back, and it is disabled by definition. An operator who turned
-        # it off by hand stays off.
-        if entry.provider.enabled or entry.auto_disabled:
-            self._check_key(entry)
-        self._persist()
-        return self.get(provider_id)
+            pins, prices, fallbacks = self._screen_backend_pins(entry, patch["backend_pins"])
+            entry.runtime.backend_pins = pins
+            entry.runtime.backend_pin_prices = prices
+            entry.runtime.backend_fallbacks = fallbacks
+            self._apply_pin_prices(entry)
+        if "backend_fallbacks" in patch:
+            entry.runtime.backend_fallbacks = self._screen_backend_fallbacks(
+                entry, patch["backend_fallbacks"]
+            )
+        if "audio_prices" in patch:
+            entry.runtime.audio_prices = self._screen_audio_prices(entry, patch["audio_prices"])
+            self._apply_pin_prices(entry)
 
     def remove(self, provider_id: str) -> None:
-        entry = self._entry(provider_id)
-        ref = entry.provider.api_key_ref
-        del self._entries[provider_id]
-        # Only a reference derate minted for this provider. An operator's own
-        # name may be an environment variable, or shared with something else,
-        # and deleting it is not what removing a provider asked for.
-        if ref and ref == minted_ref(provider_id):
-            self.secrets.delete(ref)
-        self._persist()
-        log.info("removed provider %s", provider_id)
+        with self._claude_credential_lock:
+            entry = self._entry(provider_id)
+            ref = entry.provider.api_key_ref
+            del self._entries[provider_id]
+            # Only delete keys minted by derate, not operator-owned references.
+            if ref and ref == minted_ref(provider_id):
+                self.secrets.delete(ref)
+            self.oauth.delete(provider_id)
+            for attempt_id, attempt in list(self._claude_sign_ins.items()):
+                if attempt.provider_id == provider_id:
+                    del self._claude_sign_ins[attempt_id]
+            self._persist()
+            log.info("removed provider %s", provider_id)
 
     def _apply_aliases(self, entry: _Entry) -> None:
         for model in entry.provider.models:
             model.served_name = entry.runtime.aliases.get(model.upstream_id, model.upstream_id)
         entry.provider.models.sort(key=lambda m: m.served_name)
+        self._apply_pin_prices(entry)
         entry.reindex()
 
     # -- the allowlist -----------------------------------------------------
@@ -760,7 +1761,32 @@ class ProviderService:
         return frozenset(wanted)
 
     @staticmethod
-    def _screen_backend_pins(entry: _Entry, value: object) -> dict[str, str]:
+    def _screen_backend_models(entry: _Entry, value: object, key: str) -> dict:
+        """The per-model update map for ``backend_pins``/``backend_fallbacks``,
+        refused for a kind with no backend hosts or a model off its catalogue."""
+        if not entry.spec.supports_backend_routing:
+            raise ValueError(
+                f"{entry.provider.provider_id} does not aggregate backend hosts per model; "
+                f"{key} does not apply"
+            )
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(f"{key} must be an object keyed by upstream model id")
+        updates = {str(k): v for k, v in (value or {}).items()}
+        unknown = sorted(set(updates) - {m.upstream_id for m in entry.provider.models})
+        if unknown:
+            shown = ", ".join(unknown[:3])
+            more = f" (and {len(unknown) - 3} more)" if len(unknown) > 3 else ""
+            raise ValueError(
+                f"{entry.provider.provider_id} does not publish {shown}{more}; "
+                "pin a backend only for a model from its own catalogue"
+            )
+        return updates
+
+    def _screen_backend_pins(
+        self, entry: _Entry, value: object
+    ) -> tuple[
+        dict[str, str], dict[str, tuple[float | None, float | None]], dict[str, bool]
+    ]:
         """Merge a requested backend-pin update into what is already pinned.
 
         One model at a time, unlike ``aliases`` and ``enabled_models``: the
@@ -771,32 +1797,112 @@ class ProviderService:
         separate delete form.
 
         Membership is checked against the model list, the same guard
-        ``_screen_allowlist`` uses and for the same reason; the backend *tag*
-        itself is not checked against a live endpoints call, the same
-        tradeoff ``enabled_models`` makes against pricing already accepted as
-        a forecast rather than a fact.
+        ``_screen_allowlist`` uses and for the same reason. A new tag is then
+        checked against the model's live endpoints call (``list_backends``):
+        a tag OpenRouter does not list is refused here rather than accepted
+        and turned into a 404 on every request, and the listed row's prices
+        are captured as the price the model is billed and routed at from now
+        on. A tag equal to the one already pinned is not re-fetched.
+
+        Returns ``(pins, pin_prices, fallbacks)`` and writes nothing: the
+        caller assigns them, so a dry run (``validate_patch``) on a copy
+        changes nothing either. Clearing a pin drops its price and its
+        fallback flag.
         """
-        if not entry.spec.supports_backend_routing:
-            raise ValueError(
-                f"{entry.provider.provider_id} does not aggregate backend hosts per model; "
-                "backend_pins does not apply"
-            )
-        updates = {str(k): str(v) for k, v in (value or {}).items()}
+        provider_id = entry.provider.provider_id
+        updates = {
+            k: str(v or "") for k, v in self._screen_backend_models(
+                entry, value, "backend_pins"
+            ).items()
+        }
+        pins = dict(entry.runtime.backend_pins)
+        prices = dict(entry.runtime.backend_pin_prices)
+        fallbacks = dict(entry.runtime.backend_fallbacks)
+        for upstream_id, tag in updates.items():
+            if not tag:
+                pins.pop(upstream_id, None)
+                prices.pop(upstream_id, None)
+                fallbacks.pop(upstream_id, None)
+                continue
+            if pins.get(upstream_id) == tag and upstream_id in prices:
+                continue
+            try:
+                rows = self.list_backends(provider_id, upstream_id)
+            except (UpstreamError, AdapterUnsupportedError, MissingKeyError) as exc:
+                raise ValueError(str(exc)) from None
+            row = next((r for r in rows if r.get("tag") == tag), None)
+            if row is None:
+                raise ValueError(
+                    f"{provider_id} lists no backend '{tag}' for {upstream_id}; "
+                    "pick one from its backend list"
+                )
+            pins[upstream_id] = tag
+            prices[upstream_id] = (row.get("input_cost_per_mtok"), row.get("output_cost_per_mtok"))
+        return pins, prices, fallbacks
+
+    def _screen_backend_fallbacks(self, entry: _Entry, value: object) -> dict[str, bool]:
+        """Merge a requested fallback-flag update, a key at a time like pins.
+
+        ``True`` lets OpenRouter try other hosts when the pinned one is down;
+        ``False`` (stored as absence) keeps the pin strict. Booleans only: a
+        string "false" is truthy and would silently loosen a pin.
+        """
+        updates = self._screen_backend_models(entry, value, "backend_fallbacks")
+        fallbacks = dict(entry.runtime.backend_fallbacks)
+        for upstream_id, flag in updates.items():
+            if not isinstance(flag, bool):
+                raise ValueError("backend_fallbacks values must be true or false")
+            if flag:
+                fallbacks[upstream_id] = True
+            else:
+                fallbacks.pop(upstream_id, None)
+        return fallbacks
+
+    def _screen_audio_prices(self, entry: _Entry, value: object) -> dict[str, float]:
+        """Merge a per-minute audio rate update a key at a time; ``null`` clears."""
+        if not isinstance(value, dict):
+            raise ValueError("audio_prices must be an object keyed by upstream model id")
+        updates = {str(k): v for k, v in value.items()}
         unknown = sorted(set(updates) - {m.upstream_id for m in entry.provider.models})
         if unknown:
-            shown = ", ".join(unknown[:3])
-            more = f" (and {len(unknown) - 3} more)" if len(unknown) > 3 else ""
             raise ValueError(
-                f"{entry.provider.provider_id} does not publish {shown}{more}; "
-                "pin a backend only for a model from its own catalogue"
+                f"{entry.provider.provider_id} does not publish {', '.join(unknown[:3])}; "
+                "set an audio rate only for a model from its own catalogue"
             )
-        pins = dict(entry.runtime.backend_pins)
-        for upstream_id, tag in updates.items():
-            if tag:
-                pins[upstream_id] = tag
-            else:
-                pins.pop(upstream_id, None)
-        return pins
+        prices = dict(entry.runtime.audio_prices)
+        for upstream_id, rate in updates.items():
+            if rate is None:
+                prices.pop(upstream_id, None)
+                continue
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+                raise ValueError("audio_prices values must be a number of USD per minute, or null")
+            if not math.isfinite(rate) or rate < 0:
+                raise ValueError("audio_prices values must be a finite number >= 0")
+            prices[upstream_id] = float(rate)
+        return prices
+
+    def _apply_pin_prices(self, entry: _Entry) -> None:
+        """A pinned host's price on the model; the catalogue's when unpinned.
+
+        ``blended_cost``, the route target's cost and un-metered spend all
+        read the model's two prices, so setting them here is what makes a pin
+        change what a request is routed and billed at. A model with no pin
+        price gets the catalogue's back, which is how clearing a pin undoes it.
+        """
+        pinned = entry.runtime.backend_pin_prices
+        for model in entry.provider.models:
+            price = pinned.get(model.upstream_id) or entry.catalogue_prices.get(model.upstream_id)
+            if price is not None:
+                model.input_cost_per_mtok, model.output_cost_per_mtok = price
+            model.price_per_minute_usd = entry.runtime.audio_prices.get(model.upstream_id)
+
+    def backend_pin_state(self, provider_id: str) -> dict[str, tuple[str, bool]]:
+        """``{upstream_id: (tag, fallback)}`` for every pinned model, for the read side."""
+        runtime = self._entry(provider_id).runtime
+        return {
+            upstream_id: (tag, bool(runtime.backend_fallbacks.get(upstream_id)))
+            for upstream_id, tag in runtime.backend_pins.items()
+        }
 
     def servable(self) -> list[Provider]:
         """Every provider, carrying only the models it is allowed to serve.
@@ -826,8 +1932,17 @@ class ProviderService:
         from .serialization import model_public_dict
 
         entry = self._entry(provider_id)
+        now = self._now()
         payload = [
-            {**model_public_dict(m), "enabled": entry.runtime.serves(m.upstream_id)}
+            {
+                **model_public_dict(m, entry.runtime, now, provider_enabled=entry.provider.enabled),
+                "enabled": entry.runtime.serves(m.upstream_id),
+                "backend_pin": entry.runtime.backend_pins.get(m.upstream_id),
+                "backend_fallback": bool(
+                    entry.runtime.backend_pins.get(m.upstream_id)
+                    and entry.runtime.backend_fallbacks.get(m.upstream_id)
+                ),
+            }
             for m in entry.provider.models
         ]
         assert_no_key_material(payload, self.redactor, "GET /api/providers/{id}/models")
@@ -854,11 +1969,22 @@ class ProviderService:
             return self.get(provider_id)
 
         client = client or self._client()
+        if entry.spec.sign_in == "claude":
+            return await self._refresh_claude_catalogue(entry, client)
         url = join_url(entry.provider.base_url, entry.spec.models_path)
         try:
-            key = self.resolve_key(provider_id)
+            if entry.spec.sign_in:
+                # Also what keeps an idle sign-in alive: the refresh token
+                # lives 30 days and rotates on use, and this runs every 6 h.
+                key = await self._access_token(entry, client=client)
+            else:
+                key = self.resolve_key(provider_id)
         except MissingKeyError:
             self._check_key(entry)
+            self._persist()
+            return self.get(provider_id)
+        except UpstreamError as exc:
+            self._note_refresh_failure(entry, now, exc.message)
             self._persist()
             return self.get(provider_id)
 
@@ -875,7 +2001,8 @@ class ProviderService:
             message = self._error_message(response.status_code, response.content)
             if response.status_code in (401, 403):
                 entry.runtime.note_auth_failure(
-                    now, response.status_code, entry.provider.api_key_ref, message
+                    now, response.status_code, self._credential_label(entry), message,
+                    sign_in=bool(entry.spec.sign_in),
                 )
             else:
                 self._note_refresh_failure(
@@ -905,6 +2032,7 @@ class ProviderService:
                 # is unchanged and no request can land here. Health is a claim
                 # about the server answering, which it did.
                 entry.provider.models = []
+                entry.capture_catalogue_prices()
                 entry.reindex()
                 entry.runtime.last_refreshed = now
                 entry.runtime.healthy = True
@@ -922,6 +2050,8 @@ class ProviderService:
             return self.get(provider_id)
 
         entry.provider.models = models
+        entry.capture_catalogue_prices()
+        self._apply_pin_prices(entry)
         entry.reindex()
         entry.runtime.last_refreshed = now
         entry.runtime.healthy = True
@@ -929,6 +2059,79 @@ class ProviderService:
         self._persist()
         log.info("provider %s refreshed: %d model(s)", provider_id, len(models))
         return self.get(provider_id)
+
+    async def _refresh_claude_catalogue(self, entry: _Entry, client: httpx.AsyncClient) -> Provider:
+        """Discover all pages atomically; a refused page never empties the cache."""
+        pid = entry.provider.provider_id
+        now = self._now()
+        try:
+            key = await self._access_token(entry, client=client)
+            cursor = None
+            seen_cursors: set[str] = set()
+            rows = []
+            refreshed = False
+            while True:
+                params = {"limit": "1000"}
+                if cursor is not None:
+                    params["after_id"] = cursor
+                response = await client.get(
+                    join_url(entry.spec.base_url, "models"), params=params,
+                    headers={**claude.oauth_headers(key), "Accept": "application/json"},
+                    timeout=DISCOVERY_TIMEOUT_S,
+                )
+                if response.status_code == 401 and not refreshed:
+                    refreshed = True
+                    key = await self._access_token(entry, force=True, client=client, rejected_token=key)
+                    continue
+                if response.status_code != 200:
+                    detail = self._error_message(response.status_code, response.content)
+                    if response.status_code in (401, 403):
+                        entry.runtime.note_auth_failure(
+                            now, response.status_code, self._credential_label(entry),
+                            detail, sign_in=True,
+                        )
+                    raise self._upstream_error(pid, response.status_code, f"Claude model list returned {response.status_code}: {detail}")
+                payload = _json_object(response.content)
+                data = payload.get("data")
+                if (
+                    not isinstance(data, list) or not isinstance(payload.get("has_more"), bool)
+                    or any(not isinstance(r, dict) or not isinstance(r.get("id"), str)
+                           or not r["id"].strip() for r in data)
+                ):
+                    raise self._upstream_error(pid, 502, "Claude model list has a malformed data/has_more envelope")
+                for row in data:
+                    row = dict(row)
+                    context = row.get("max_input_tokens")
+                    if (not isinstance(context, bool) and isinstance(context, (int, float))
+                            and math.isfinite(context) and context > 0):
+                        row["context_length"] = int(context)
+                    row["supports_streaming"] = True
+                    rows.append(row)
+                if not payload["has_more"]:
+                    break
+                following = payload.get("last_id")
+                if not isinstance(following, str) or not following or following in seen_cursors:
+                    raise self._upstream_error(pid, 502, "Claude model list has a missing or nonadvancing last_id cursor")
+                seen_cursors.add(following)
+                cursor = following
+            models = parse_models({"data": rows}, entry.spec, aliases=entry.runtime.aliases)
+        except (httpx.HTTPError, UpstreamError) as exc:
+            if self._entries.get(pid) is not entry:
+                raise UnknownProviderError(pid) from None
+            message = exc.message if isinstance(exc, UpstreamError) else f"could not reach Claude models: {type(exc).__name__}"
+            self._note_refresh_failure(entry, now, message)
+            self._persist()
+            return self.get(pid)
+        if self._entries.get(pid) is not entry:
+            raise UnknownProviderError(pid)
+        entry.provider.models = models
+        entry.capture_catalogue_prices()
+        entry.reindex()
+        entry.runtime.last_refreshed = now
+        entry.runtime.healthy = True
+        entry.runtime.last_error = None
+        self._persist()
+        return self.get(pid)
 
     def _note_refresh_failure(self, entry: _Entry, now: float, message: str) -> None:
         """Keep the cached list. A refresh failure is not an inference failure.
@@ -1000,8 +2203,18 @@ class ProviderService:
         return rows
 
     def list_backends(self, provider_id: str, upstream_id: str) -> list[dict]:
-        """Synchronous wrapper, for a caller with no event loop."""
-        return self._run_sync(lambda: self.list_backends_async(provider_id, upstream_id))
+        """Synchronous wrapper, for a caller with no event loop.
+
+        Its own client, closed on the way out, as ``refresh`` does: the
+        wrapper runs on a throwaway loop, and a client cached under that
+        loop's id would be handed to whichever later loop reuses the id.
+        """
+
+        async def fetch() -> list[dict]:
+            async with self._client_factory() as client:
+                return await self.list_backends_async(provider_id, upstream_id, client=client)
+
+        return self._run_sync(fetch)
 
     # -- models ------------------------------------------------------------
 
@@ -1053,7 +2266,12 @@ class ProviderService:
         """``GET /api/providers/{id}/models``."""
         from .serialization import model_public_dict
 
-        payload = [model_public_dict(m) for m in self._entry(provider_id).provider.models]
+        entry = self._entry(provider_id)
+        now = self._now()
+        payload = [
+            model_public_dict(m, entry.runtime, now, provider_enabled=entry.provider.enabled)
+            for m in entry.provider.models
+        ]
         assert_no_key_material(payload, self.redactor, "GET /api/providers/{id}/models")
         return payload
 
@@ -1066,8 +2284,8 @@ class ProviderService:
     def spend_today(self, provider_id: str) -> float:
         return self._entry(provider_id).runtime.spend_today(self._now())
 
-    def admitting(self, provider_id: str) -> bool:
-        return self._entry(provider_id).runtime.admitting(self._now())
+    def admitting(self, provider_id: str, upstream_id: str | None = None) -> bool:
+        return self._entry(provider_id).runtime.admitting(self._now(), upstream_id)
 
     # -- route targets -----------------------------------------------------
 
@@ -1106,7 +2324,6 @@ class ProviderService:
         for entry in self._sorted():
             if not entry.provider.enabled:
                 continue
-            admitting = entry.runtime.admitting(now)
             for model in entry.provider.models:
                 if not entry.runtime.serves(model.upstream_id):
                     continue
@@ -1118,7 +2335,7 @@ class ProviderService:
                         weight=0.0,
                         outstanding=int(entry.runtime.outstanding.get(model.upstream_id, 0)),
                         healthy=entry.runtime.healthy,
-                        admitting=admitting,
+                        admitting=entry.runtime.admitting(now, model.upstream_id),
                         strength=0.0,
                         cost_per_mtok=self.blended_cost(model),
                     )
@@ -1147,16 +2364,24 @@ class ProviderService:
     # -- forwarding --------------------------------------------------------
 
 
-    def _admit(
-        self, provider_id: str, upstream_id: str, endpoint: str
-    ) -> tuple[_Entry, str, dict[str, str]]:
-        """Every gate a forwarded request passes, and the credentials it needs.
+    def _prepare(
+        self,
+        provider_id: str,
+        upstream_id: str,
+        body: dict | None,
+        stream: bool,
+        endpoint: str,
+        content: bytes | None = None,
+        content_type: str | None = None,
+        tool_names: dict[str, str] | None = None,
+    ) -> tuple[_Entry, str, dict[str, str], dict | bytes]:
+        """Every admission check, then the URL, headers and payload to send.
 
-        Split out of :meth:`_prepare` so the raw-body path runs EXACTLY these
-        checks rather than a second copy of them. Enabled, serves, rate
-        limited, over budget, key resolution and the URL join are all decisions
-        about whether this provider may be called at all -- none of them looks
-        at the body, so none of them belongs to the JSON path alone.
+        ``content`` is an opaque upload (a multipart transcription): it gets
+        the same gate -- enabled, ``serves()``, rate limit, budget -- and is
+        sent byte for byte under ``content_type``, so the payload returned is
+        those bytes rather than a dict (finding K5). The caller has already
+        spliced the upstream's model name into it.
         """
         entry = self._entry(provider_id)
         if not entry.spec.forwardable:
@@ -1176,191 +2401,160 @@ class ProviderService:
             )
         # Rate limit and budget are hard stops. Merely unhealthy is not: a
         # provider recovers on the next request that succeeds.
-        if entry.runtime.rate_limited(now):
+        if entry.runtime.rate_limited(now, upstream_id):
             raise ProviderNotAdmittingError(
                 provider_id,
-                f"rate limited for another {entry.runtime.retry_in(now):.0f}s",
-                retry_after_s=entry.runtime.retry_in(now),
+                f"rate limited for another {entry.runtime.retry_in(now, upstream_id):.0f}s",
+                retry_after_s=entry.runtime.retry_in(now, upstream_id),
             )
         budget_block = entry.runtime.budget_block(now)
         if budget_block is not None:
-            # The same sentence the providers screen shows. This used to be a
-            # second, shorter copy that omitted how much had been spent.
+            # The same sentence the providers screen shows.
             raise ProviderNotAdmittingError(provider_id, budget_block)
+        if entry.spec.chat_wire is ChatWire.RESPONSES:
+            return self._prepare_responses(entry, upstream_id, body, endpoint)
+        if entry.spec.chat_wire is ChatWire.ANTHROPIC_MESSAGES:
+            if endpoint.strip("/") != "chat/completions" or content is not None:
+                raise AdapterUnsupportedError(f"provider {provider_id!r}: {_CLAUDE_ONLY}")
+            clean_body = {k: v for k, v in (body or {}).items() if k not in _CLIENT_ROUTING_FIELDS}
+            try:
+                translated, names = chat_to_messages(clean_body, upstream_id)
+            except ValueError as exc:
+                raise self._upstream_error(provider_id, 400, str(exc)) from None
+            if tool_names is not None:
+                tool_names.update(names)
+            headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+            return (entry, join_url(entry.spec.base_url, "messages") + "?beta=true",
+                    headers, claude.subscription_request(translated))
         key = self.resolve_key(provider_id)
         headers = auth_headers(entry.spec, key)
-        return entry, join_url(entry.provider.base_url, endpoint), headers
-
-    def _prepare(
-        self, provider_id: str, upstream_id: str, body: dict, stream: bool, endpoint: str
-    ) -> tuple[_Entry, str, dict[str, str], dict]:
-        entry, url, headers = self._admit(provider_id, upstream_id, endpoint)
+        if content is not None:
+            headers["Content-Type"] = content_type or "application/octet-stream"
+            headers["Accept"] = "application/json"
+            return entry, join_url(entry.provider.base_url, endpoint), headers, content
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "text/event-stream" if stream else "application/json"
 
-        payload = dict(body)
+        payload = dict(body or {})
         payload["model"] = upstream_id
-        if entry.spec.supports_backend_routing and "provider" not in payload:
+        # OpenRouter's own routing fields name *other* models and backends:
+        # forwarded, a key holder is served a model outside its allowlist at
+        # that model's price (K-2). Routing is the operator's, via the pin.
+        for name in _CLIENT_ROUTING_FIELDS:
+            payload.pop(name, None)
+        if entry.spec.supports_backend_routing:
             pin = entry.runtime.backend_pins.get(upstream_id)
             if pin:
-                # Constrain OpenRouter to exactly the backend host the
-                # operator chose. A caller that already sent its own
-                # `provider` field is left alone -- see the `stream_options`
-                # guard just below for the same deference.
-                payload["provider"] = {"only": [pin]}
+                # Constrain OpenRouter to the backend host the operator chose
+                # -- over anything the caller sent. A client `provider` field
+                # is the key holder overriding the operator's routing, prices
+                # included (finding K7). With the fallback flag the pinned
+                # host is tried first and OpenRouter may move on when it is
+                # down; without it, that host or nothing.
+                if entry.runtime.backend_fallbacks.get(upstream_id):
+                    payload["provider"] = {"order": [pin], "allow_fallbacks": True}
+                else:
+                    payload["provider"] = {"only": [pin]}
         # Only where the endpoint actually has a `stream` field. /v1/audio/speech
         # does not, and a strict upstream answers 400 for an unknown one -- so
         # injecting it unconditionally would break every audio request that ever
         # reached a provider.
         if _accepts_stream(endpoint):
             payload["stream"] = bool(stream)
-        model = entry.models_by_upstream.get(upstream_id)
-        # Either way of pricing counts. A kind that meters its own cost reports
-        # one for every model it serves, including the ones whose published
-        # `pricing` reads -1 for "varies" -- gating on the rate card alone would
-        # decline to ask for usage on exactly the models we cannot price without
-        # it.
-        priced = entry.spec.meters_cost or (
-            model is not None and self.blended_cost(model) is not None
-        )
-        if (
-            stream
-            and priced
-            and entry.spec.supports_stream_usage
-            and "stream_options" not in payload
-        ):
-            # Only asked for where we can price it and the upstream is known to
-            # accept the field. Spend accounting is not worth a 400.
-            payload["stream_options"] = {"include_usage": True}
+        if stream and entry.spec.supports_stream_usage:
+            # Asked wherever the upstream is known to accept the field, priced
+            # or not, and *over* the client's own `stream_options`: a client
+            # that sends `include_usage: false` would otherwise stream without
+            # a usage frame and be metered on an estimate (finding H5). The
+            # client's other options are kept.
+            options = payload.get("stream_options")
+            payload["stream_options"] = {
+                **(options if isinstance(options, dict) else {}),
+                "include_usage": True,
+            }
 
         return entry, url, headers, payload
 
-    def _prepare_raw(
-        self, provider_id: str, upstream_id: str, content_type: str, endpoint: str
-    ) -> tuple[_Entry, str, dict[str, str]]:
-        """:meth:`_admit`, with the caller's own content type carried through.
+    def _prepare_responses(
+        self, entry: _Entry, upstream_id: str, body: dict, endpoint: str
+    ) -> tuple[_Entry, str, dict[str, str], dict]:
+        """A Chat Completions request rewritten for the Responses API.
 
-        The body is opaque here, so two things `_prepare` does cannot be done
-        and the caller owns them instead:
-
-        * **The model name.** `_prepare` forces ``payload["model"] =
-          upstream_id``; in a multipart upload that field is a form part, and
-          ``gateway/openai_api.py::_rewrite_multipart_field`` has already
-          rewritten it before these bytes arrive. This trusts that.
-        * **The backend pin.** OpenRouter's ``provider: {only: [...]}`` is a
-          JSON field with no documented multipart equivalent, so an operator's
-          backend pin does not reach a transcription. Refused to invent a form
-          part for it -- a pin that silently did nothing would be worse than
-          one that visibly does not apply here.
+        No credential yet: the token may need refreshing, which is a network
+        call, and this runs on a worker thread. ``open_upstream`` adds it.
         """
-        entry, url, headers = self._admit(provider_id, upstream_id, endpoint)
-        # Boundary and all: rewriting it would invalidate the body.
-        headers["Content-Type"] = content_type
-        headers["Accept"] = "application/json"
-        return entry, url, headers
+        provider_id = entry.provider.provider_id
+        if endpoint.strip("/") != "chat/completions":
+            raise AdapterUnsupportedError(f"provider {provider_id!r}: {_RESPONSES_ONLY}")
+        try:
+            payload = chat_to_responses(body, upstream_id)
+        except ValueError as exc:
+            raise self._upstream_error(provider_id, 400, str(exc)) from None
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        return entry, join_url(entry.provider.base_url, "responses"), headers, payload
 
     @asynccontextmanager
     async def open_upstream(
         self,
         provider_id: str,
         upstream_id: str,
-        body: dict,
+        body: dict | None,
         stream: bool = False,
         *,
         endpoint: str = "chat/completions",
+        content: bytes | None = None,
+        content_type: str | None = None,
+        request_id: str | None = None,
     ) -> AsyncIterator[UpstreamResponse]:
         """Open a forwarded request. Status and headers are known on entry.
 
         The gateway uses this when it wants to mirror the upstream's status
         code and content type. :meth:`forward` is the plain byte-stream form.
+
+        A Responses-wire kind is always asked for a stream -- the upstream
+        accepts nothing else -- and its events are translated back into Chat
+        Completions as they arrive. A client that did not ask for a stream gets
+        the whole stream read here first and one ``chat.completion`` body,
+        which is also the only way a failure the upstream reports *inside* the
+        stream can become an error status rather than a 200.
+
+        ``content``/``content_type`` forward an opaque upload instead of
+        ``body`` (see :meth:`_prepare`). ``request_id`` is derate's trace id:
+        sent upstream as ``X-Request-Id`` and handed back in the response
+        headers, so a provider's log names the same request the ``requests``
+        row does -- never the client's own id (finding K10).
         """
+        tool_names: dict[str, str] = {}
         entry, url, headers, payload = await asyncio.to_thread(
-            self._prepare, provider_id, upstream_id, body, stream, endpoint
+            self._prepare, provider_id, upstream_id, body, stream, endpoint,
+            content, content_type, tool_names,
         )
-        async with self._open_prepared(
-            entry, url, headers,
-            upstream_id=upstream_id, stream=stream, send={"json": payload},
-        ) as opened:
-            yield opened
-
-    @asynccontextmanager
-    async def open_upstream_raw(
-        self,
-        provider_id: str,
-        upstream_id: str,
-        content: bytes,
-        content_type: str,
-        *,
-        endpoint: str = "audio/transcriptions",
-    ) -> AsyncIterator[UpstreamResponse]:
-        """:meth:`open_upstream` for a body this gateway cannot read.
-
-        A multipart upload has no dict to build a payload from, and that alone
-        is why transcriptions used to bypass this class entirely -- taking a
-        raw forward that carried the provider's key and nothing else. Not the
-        backoff, not the auth-failure latching, not the `outstanding` counter,
-        and above all not the usage accounting: **nothing a transcription
-        spent was ever recorded**, so the daily budget gate it passes on the
-        way in never saw the traffic it was meant to be gating.
-
-        The old comment here said that was acceptable "because transcription is
-        priced per audio-minute and nothing on this path can read that figure
-        anyway". The premise is wrong for the provider that matters. OpenRouter
-        returns a usage block on its transcription responses carrying its own
-        `cost`, and `providers/usage.py` already reads exactly that field --
-        so this path prices itself the same way chat does. Where a provider
-        reports nothing, the request is still counted as unpriced rather than
-        estimated: pricing and accounting are separate, and only one of them
-        needed a figure we do not have.
-
-        Deliberately a separate method rather than a `content=` kwarg on
-        :meth:`open_upstream`. The gateway duck-types that method off the
-        providers port (`getattr(..., "open_upstream", None)`) and the test
-        doubles pin its signature, so a new keyword would raise TypeError at
-        request time against any port that predates it. A new name simply is
-        not found, and the caller falls back to the raw forward it uses today.
-
-        Never streaming: a transcription answers with one JSON document.
-        """
-        entry, url, headers = await asyncio.to_thread(
-            self._prepare_raw, provider_id, upstream_id, content_type, endpoint
-        )
-        async with self._open_prepared(
-            entry, url, headers,
-            upstream_id=upstream_id, stream=False, send={"content": content},
-        ) as opened:
-            yield opened
-
-    @asynccontextmanager
-    async def _open_prepared(
-        self,
-        entry: "_Entry",
-        url: str,
-        headers: dict[str, str],
-        *,
-        upstream_id: str,
-        stream: bool,
-        send: dict,
-    ) -> AsyncIterator[UpstreamResponse]:
-        """The wire half both open_upstream forms share.
-
-        One copy of the retry ladder, the 429/401/5xx handling, every
-        `runtime.note_*` call and the usage sniffer, because two copies is how
-        the raw path would quietly stop matching the JSON one. *send* is the
-        one thing that differs: ``{"json": payload}`` or ``{"content": bytes}``.
-        """
+        if request_id:
+            headers["X-Request-Id"] = request_id
+        send = {"content": payload} if isinstance(payload, bytes) else {"json": payload}
+        responses_wire = entry.spec.chat_wire is ChatWire.RESPONSES
+        messages_wire = entry.spec.chat_wire is ChatWire.ANTHROPIC_MESSAGES
+        adapted_wire = responses_wire or messages_wire
         client = self._client()
         timeout = httpx.Timeout(
             connect=CONNECT_TIMEOUT_S,
-            read=STREAM_READ_TIMEOUT_S if stream else READ_TIMEOUT_S,
+            read=STREAM_READ_TIMEOUT_S if stream or adapted_wire else READ_TIMEOUT_S,
             write=WRITE_TIMEOUT_S,
             pool=CONNECT_TIMEOUT_S,
         )
         runtime = entry.runtime
         runtime.outstanding[upstream_id] += 1
         sniffer = UsageSniffer(stream=stream, metered=entry.spec.meters_cost)
+        converter: ResponsesToChat | MessagesToChat | None = None
         try:
+            if entry.spec.sign_in:
+                token = await self._access_token(entry)
+                if messages_wire:
+                    headers.update(claude.inference_headers(token))
+                else:
+                    headers["Authorization"] = "Bearer " + token
             attempt = 0
+            reauthorized = False
             while True:
                 now = self._now()
                 try:
@@ -1385,15 +2579,34 @@ class ProviderService:
                 status = response.status_code
                 retry_after = response.headers.get("retry-after")
 
+                if status == 401 and adapted_wire and not reauthorized:
+                    # The token can be revoked or rotated out from under its
+                    # expiry time. One forced refresh, then the answer stands.
+                    reauthorized = True
+                    token = await self._access_token(
+                        entry, force=True, rejected_token=headers["Authorization"][7:]
+                    )
+                    headers["Authorization"] = "Bearer " + token
+                    continue
+                if messages_wire:
+                    error = _json_object(raw).get("error")
+                    code = error.get("type") if isinstance(error, dict) else None
+                    raw = self._upstream_error(
+                        provider_id, status, message,
+                        code=self.redactor.scrub(code) if isinstance(code, str) else None,
+                    ).body.encode()
                 if status == 429:
-                    seconds = runtime.note_rate_limit(now, retry_after, message)
+                    seconds = runtime.note_rate_limit(now, upstream_id, retry_after, message)
                     raise UpstreamError(
                         entry.provider.provider_id, status, message,
                         body=self.redactor.scrub(raw.decode("utf-8", "replace")),
                         retry_after_s=seconds,
                     )
                 if status in (401, 403):
-                    runtime.note_auth_failure(now, status, entry.provider.api_key_ref, message)
+                    runtime.note_auth_failure(
+                        now, status, self._credential_label(entry), message,
+                        sign_in=bool(entry.spec.sign_in),
+                    )
                     raise UpstreamError(
                         entry.provider.provider_id, status, message,
                         body=self.redactor.scrub(raw.decode("utf-8", "replace")),
@@ -1412,26 +2625,164 @@ class ProviderService:
                     retry_after_s=parse_retry_after(retry_after, now),
                 )
 
-            async def body_iter() -> AsyncIterator[bytes]:
-                async for chunk in response.aiter_bytes():
-                    sniffer.feed(chunk)
-                    yield chunk
+            if messages_wire:
+                converter = MessagesToChat(
+                    stream=stream, model=upstream_id, now=self._now(),
+                    tool_names=tool_names, scrub=self.redactor.scrub,
+                )
+            elif responses_wire:
+                converter = ResponsesToChat(stream=stream, model=upstream_id, now=self._now())
 
+            # Whether anybody started reading the body, and how many SSE frames
+            # went past: what a stream the client walked away from is billed
+            # on when no usage frame arrived before it went.
+            progress = {"started": False, "frames": 0}
+
+            async def body_iter() -> AsyncIterator[bytes]:
+                progress["started"] = True
+                def note_failure() -> None:
+                    if converter.error is None or upstream.error is not None:
+                        return
+                    status, code, message = converter.error
+                    message = self.redactor.scrub(message)
+                    code = self.redactor.scrub(code)
+                    seconds = self._note_inband_failure(
+                        entry, upstream_id, self._now(), (status, code, message)
+                    )
+                    upstream.error = self._upstream_error(
+                        provider_id, status, message, code=code or None,
+                        retry_after_s=seconds,
+                    )
+                if converter is None:
+                    async for chunk in response.aiter_bytes():
+                        sniffer.feed(chunk)
+                        if stream:
+                            progress["frames"] += chunk.count(b"data:")
+                        yield chunk
+                elif not stream:
+                    whole = converter.finish()
+                    sniffer.feed(whole)
+                    yield whole
+                else:
+                    async for chunk in response.aiter_bytes():
+                        frames = converter.feed(chunk)
+                        note_failure()
+                        for frame in frames:
+                            if upstream.error is not None:
+                                frame = self.redactor.scrub_bytes(frame)
+                            sniffer.feed(frame)
+                            progress["frames"] += frame.count(b"data:")
+                            yield frame
+                    if isinstance(converter, MessagesToChat):
+                        final = converter.finish()
+                        note_failure()
+                        if final:
+                            sniffer.feed(final)
+                            progress["frames"] += final.count(b"data:")
+                            yield final
+
+            if converter is None:
+                out_headers = self._safe_headers(response.headers, request_id)
+                media_type = response.headers.get("content-type")
+            else:
+                out_headers = {
+                    name: value
+                    for name, value in self._safe_headers(response.headers, request_id).items()
+                    if name.lower() not in ("content-type", "content-length")
+                }
+                media_type = "text/event-stream" if stream else "application/json"
+            clean = False
             try:
-                yield UpstreamResponse(
+                if converter is not None and not stream:
+                    await self._drain_adapted_stream(entry, upstream_id, response, converter)
+                upstream = UpstreamResponse(
                     status_code=response.status_code,
-                    headers=self._safe_headers(response.headers),
-                    media_type=response.headers.get("content-type"),
+                    headers=out_headers,
+                    media_type=media_type,
                     body=body_iter(),
                 )
+                yield upstream
+                clean = True
             finally:
                 await context.__aexit__(None, None, None)
-            runtime.note_success(self._now())
-            self._record_usage(entry, upstream_id, sniffer)
+                # Spend is recorded for any body somebody read, however it
+                # ended: a provider bills the prompt and every token it sent
+                # before the client hung up or the transfer broke (finding
+                # H5). A body nobody started -- a hedge that lost -- was
+                # never read and is not ours to bill.
+                if clean or progress["started"]:
+                    try:
+                        self._record_usage(
+                            entry,
+                            upstream_id,
+                            sniffer,
+                            body=body,
+                            frames=progress["frames"],
+                        )
+                    except Exception:
+                        log.exception(
+                            "provider %s: could not record usage", provider_id
+                        )
+            failure = converter.error if converter is not None else None
+            if failure is None:
+                runtime.note_success(self._now(), upstream_id)
         finally:
             runtime.outstanding[upstream_id] -= 1
             if runtime.outstanding[upstream_id] <= 0:
                 del runtime.outstanding[upstream_id]
+
+    async def _drain_adapted_stream(
+        self, entry: _Entry, upstream_id: str, response: httpx.Response,
+        converter: ResponsesToChat | MessagesToChat,
+    ) -> None:
+        """Read a whole translated stream for a client that asked for one body.
+
+        The caller owns connection cleanup, including cancellation while this
+        drains before yielding a response. Errors here become non-200 replies.
+        """
+        provider_id = entry.provider.provider_id
+        try:
+            async for chunk in response.aiter_bytes():
+                converter.feed(chunk)
+        except httpx.HTTPError as exc:
+            entry.runtime.note_transport_error(self._now(), type(exc).__name__)
+            raise UpstreamError(
+                provider_id, 502, f"could not reach upstream: {type(exc).__name__}"
+            ) from None
+        if isinstance(converter, MessagesToChat):
+            converter.finish()
+        failure = converter.error
+        if failure is None and not converter.finished:
+            failure = (502, "", f"the {entry.spec.display_name} stream ended before the response completed")
+        if failure is None:
+            return
+        status, code, message = failure
+        seconds = self._note_inband_failure(entry, upstream_id, self._now(), failure)
+        raise self._upstream_error(
+            provider_id, status, message, code=code or None, retry_after_s=seconds
+        )
+
+    def _note_inband_failure(
+        self, entry: _Entry, upstream_id: str, now: float, failure: tuple[int, str, str]
+    ) -> float | None:
+        """What the matching HTTP status would have done to the provider's state.
+
+        Returns the backoff for a rate limit, which is the one number the
+        client is owed back.
+        """
+        status, _code, message = failure
+        message = self.redactor.scrub(message)
+        runtime = entry.runtime
+        if status == 429:
+            return runtime.note_rate_limit(now, upstream_id, None, message)
+        if status in (401, 403):
+            runtime.note_auth_failure(
+                now, status, self._credential_label(entry), message,
+                sign_in=bool(entry.spec.sign_in),
+            )
+        elif status >= 500:
+            runtime.note_server_error(now, status, message)
+        return None
 
     async def forward(
         self,
@@ -1493,13 +2844,43 @@ class ProviderService:
             message = text[:512] or f"HTTP {status}"
         return self.redactor.scrub(message)
 
-    def _safe_headers(self, headers: httpx.Headers) -> dict[str, str]:
+    def _safe_headers(
+        self, headers: httpx.Headers, request_id: str | None = None
+    ) -> dict[str, str]:
+        """The allowlisted upstream headers, scrubbed, plus derate's own
+        ``x-request-id`` when there is one. Everything else stays here."""
         out: dict[str, str] = {}
         for name, value in headers.items():
-            if name.lower() in _DROP_HEADERS:
-                continue
-            out[name] = self.redactor.scrub(value)
+            if name.lower() in RESPONSE_HEADER_ALLOWLIST:
+                out[name] = self.redactor.scrub(value)
+        if request_id:
+            out["x-request-id"] = request_id
         return out
+
+    @asynccontextmanager
+    async def open_upstream_raw(
+        self,
+        provider_id: str,
+        upstream_id: str,
+        content: bytes,
+        content_type: str,
+        *,
+        endpoint: str = "audio/transcriptions",
+        request_id: str | None = None,
+    ) -> AsyncIterator[UpstreamResponse]:
+        """:meth:`open_upstream` for a body this gateway cannot read (a
+        multipart upload), kept as its own name so a caller that duck-types the
+        providers port finds it or falls back, rather than raising TypeError on
+        a keyword an older port predates. Same gate, same retry ladder, same
+        usage accounting as the JSON path: it is that path, with the bytes
+        forwarded as they came under the caller's own content type. Never
+        streaming: a transcription answers with one JSON document."""
+        async with self.open_upstream(
+            provider_id, upstream_id, None, False,
+            endpoint=endpoint, content=content, content_type=content_type,
+            request_id=request_id,
+        ) as opened:
+            yield opened
 
     def attach_events(self, events: Any) -> None:
         """Point budget crossings at an emitter, after construction.
@@ -1547,33 +2928,47 @@ class ProviderService:
         except Exception:  # pragma: no cover - reporting may not break serving
             log.debug("could not report a budget crossing", exc_info=True)
 
-    def _record_usage(self, entry: _Entry, upstream_id: str, sniffer: UsageSniffer) -> None:
+    def _record_usage(
+        self,
+        entry: _Entry,
+        upstream_id: str,
+        sniffer: UsageSniffer,
+        *,
+        body: dict | None = None,
+        frames: int = 0,
+    ) -> None:
+        """Add one request to the provider's day.
+
+        The upstream's own usage block when it sent one; otherwise -- a stream
+        cut short before its usage frame, or an upstream that never sends one
+        -- the gateway's prompt estimate and one token per SSE frame seen.
+        Recording nothing let a request that was billed upstream leave the
+        daily budget untouched (finding H5).
+        """
         usage = sniffer.result()
         if usage is None:
-            # Served, and could not be priced. Counting nothing here is what
-            # made a day of provider audio traffic render as "$0.00, idle" on
-            # the Spend screen: `rows.ts::cloudSpend` reads `requests == 0` as
-            # "nothing was served today. A real zero." -- so a response with no
-            # usage block (an MP3 from /audio/speech, a Custom box, Ollama)
-            # was a fabricated zero presented as knowledge.
-            #
-            # `unpriced_requests` already means "served but not charged"; this
-            # widens it from "no rate card for that model" to include "the
-            # response said nothing", which is one concept and needs no new
-            # field on the wire.
-            entry.runtime.record_unpriced(self._now())
-            entry.runtime.prune_spend(self._now())
-            self._spend_dirty = True
-            self._check_budget(entry)
-            return
+            # An opaque upload (body None) has no prompt to estimate, but it
+            # is still a request on the provider's day: zero tokens, counted.
+            usage = Usage(
+                input_tokens=estimate_prompt_tokens(body) if body is not None else 0,
+                output_tokens=max(0, frames),
+            )
         model = entry.models_by_upstream.get(upstream_id)
+        metered = usage.cost_usd
+        rate = model.price_per_minute_usd if model else None
+        if metered is None and rate is not None:
+            # Audio carries no tokens; a per-minute rate on the upstream's own
+            # `duration` is the only price it has (K5r). No rate: unpriced.
+            seconds = sniffer.audio_duration_s()
+            if seconds is not None:
+                metered = rate * seconds / 60.0
         cost = entry.runtime.record_usage(
             self._now(),
             usage.input_tokens,
             usage.output_tokens,
             model.input_cost_per_mtok if model else None,
             model.output_cost_per_mtok if model else None,
-            metered_cost_usd=usage.cost_usd,
+            metered_cost_usd=metered,
         )
         entry.runtime.prune_spend(self._now())
         if cost:
