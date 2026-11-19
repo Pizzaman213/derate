@@ -132,7 +132,7 @@ check(
 // on an OS setting.
 const BLOCKS = [
   [':root {', 'light'],
-  ["  :root:not([data-theme='light']) {", 'dark, by OS preference'],
+  ["  :root:not([data-theme='light']):not([data-theme='high-contrast']) {", 'dark, by OS preference'],
   [":root[data-theme='dark'] {", 'dark, by explicit choice'],
 ]
 const values = {}

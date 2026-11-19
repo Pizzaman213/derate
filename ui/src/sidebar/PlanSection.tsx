@@ -53,7 +53,7 @@ export function PlanSection() {
         <Verbatim text={plan.reason} size="label" />
         {plan.rejected.length > 0 ? (
           <>
-            <div className="unit" style={{ marginTop: 8 }}>Rejected</div>
+            <div className="unit" style={{ marginTop: 'var(--space-8)' }}>Rejected</div>
             <VerbatimList items={plan.rejected} />
           </>
         ) : null}

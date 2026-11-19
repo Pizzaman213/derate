@@ -25,6 +25,10 @@ class ProviderKind(str, Enum):
     # reverses that one line deliberately and narrowly.
     OLLAMA = "ollama"
     CUSTOM = "custom"  # any OpenAI-compatible base_url
+    # ChatGPT Plus/Pro allowance via Sign in with ChatGPT; credential is OAuth, never a key
+    CHATGPT = "chatgpt"
+    # Unofficial Claude subscription OAuth; separate from API-key Anthropic.
+    CLAUDE_CODE = "claude_code"
 
 
 @dataclass
@@ -40,6 +44,9 @@ class ProviderModel:
     # heuristic -- so it only ever moves a model off the TEXT default when
     # the id says so plainly.
     modality: Modality = Modality.TEXT
+    # USD per minute of audio, for a transcription model. None = unpriced
+    # (audio settles cost_basis "unpriced", as before this field existed).
+    price_per_minute_usd: float | None = None
 
 
 @dataclass

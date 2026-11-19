@@ -23,5 +23,7 @@ export default defineConfig({
       '/v1': { target: gateway, changeOrigin: true },
     },
   },
-  build: { outDir: 'dist', sourcemap: true },
+  // No source maps: dist is served as-is from the coordinator, unauthenticated,
+  // and a map hands anyone on the LAN the whole commented source.
+  build: { outDir: 'dist', sourcemap: false },
 })

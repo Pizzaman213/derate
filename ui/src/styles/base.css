@@ -82,7 +82,7 @@ button {
   background: transparent;
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: var(--s-half) var(--s1);
+  padding: var(--space-6) var(--space-12);
   cursor: pointer;
 }
 
@@ -106,7 +106,47 @@ input {
   background: var(--panel);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: var(--s-half) var(--s1);
+  padding: var(--space-6) var(--space-12);
+}
+
+/* PasswordField: one box with the show/hide eye inside its right edge.
+   The wrapper draws the box (Input's background, border, radius and focus
+   ring); the input inside it is borderless and transparent, and the toggle
+   sits beside it rather than over it, so the two never overlap and typed
+   text never runs under the eye. `.pwfield .pwfield-input` (0,2,0) outranks
+   `.fld input` and `.setup-field`, which both set border and background;
+   setup.css gives `.setup-field` boxes their own colours. */
+.pwfield {
+  display: flex;
+  align-items: stretch;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+.pwfield:has(.pwfield-input:focus-visible) {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.pwfield .pwfield-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+}
+.pwfield .pwfield-input:focus-visible {
+  outline: none;
+}
+.pwfield .pwfield-toggle {
+  flex: 0 0 auto;
+  margin: var(--space-3);
+  padding: 0 var(--space-6);
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink-muted);
+}
+.pwfield .pwfield-toggle:hover:not(:disabled),
+.pwfield .pwfield-toggle[aria-pressed='true'] {
+  color: var(--ink);
 }
 
 /* Focus is always visible. Not a nicety — this panel is usable by keyboard. */
@@ -135,7 +175,7 @@ input {
   width: 1px;
   height: 1px;
   padding: 0;
-  margin: -1px;
+  margin: calc(-1 * var(--space-1));
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;

@@ -49,8 +49,16 @@ under Docker Desktop, `--gpus` needs the NVIDIA container toolkit, and
    on `:8080`. That alone is a working single-node cluster.
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh | sh
+   f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh -o "$f" \
+     && echo "0ca3bc3d3e86e6e0382b796525c2daa696b2c772fc3394f48646c3de6f0b807c  $f" | sha256sum -c - \
+     && sh "$f"
    ```
+
+   The hash is `install.sh`'s at this commit, so a script altered on the way
+   fails `sha256sum -c` instead of running as root. Every release prints it
+   again in the publish workflow's run summary; a mismatch after an update
+   means this README is older than the script, not that you should skip the
+   check.
 
    Or, if you want the dev branch instead of the release, the same install
    with a different image — `ghcr.io/pizzaman213/derate/node-dev`, published
@@ -66,7 +74,12 @@ under Docker Desktop, `--gpus` needs the NVIDIA container toolkit, and
    dev coordinator whose nodes were installed without it runs two builds at
    once.
 
-2. **Open `http://<machine one>:8080`.** A setup walkthrough runs on the first
+2. **Open `http://127.0.0.1:8080` on machine one** — or from your laptop
+   through a tunnel, `ssh -L 8080:127.0.0.1:8080 <machine one>`, then
+   `http://127.0.0.1:8080`. The first admin can only be created from the
+   coordinator's own loopback, so nobody else on the network can claim it
+   first; from any other address the page shows that tunnel command instead
+   of the form. A setup walkthrough runs on the first
    visit and takes five steps — read the machine, add a cloud provider if you
    want one, pick a first model and check it against the fit gate, add more
    machines, done. It ends by handing you the endpoint, with a QR code so a
@@ -79,9 +92,13 @@ under Docker Desktop, `--gpus` needs the NVIDIA container toolkit, and
    turn up after it runs.
 
    ```bash
-   curl -fsSL http://<coordinator>:8080/install.sh | sh -s -- \
-       --join http://<coordinator>:8080 --token ej_...
+   f=$(mktemp) && curl -fsSL http://<coordinator>:8080/install.sh -o "$f" \
+     && echo "<sha256>  $f" | sha256sum -c - \
+     && sh "$f" --join http://<coordinator>:8080 --token ej_...
    ```
+
+   The hash is the sha256 of the exact script the coordinator serves, so a
+   script swapped in transit fails `sha256sum -c` instead of running as root.
 
 4. **Run that on machine two.** The token lasts an hour and is spent by the
    machine that uses it, so the node is admitted on arrival: no approval step,
@@ -128,8 +145,29 @@ effect on the next request rather than at the next refresh.
 
 `control_plane/providers/` makes OpenRouter, OpenAI, Anthropic, Together,
 Groq, Ollama, and any OpenAI-compatible URL as `custom` into ordinary route
-targets. No API key is ever rendered:
+targets. No provider API key is ever rendered:
 responses are scrubbed on the way to the screen, and there is no inverse.
+
+Settings → Providers also offers ChatGPT plan sign-in and **Anthropic plan
+(unofficial)** for a Claude subscription. Both use the normal model catalogue and explicit **Serve on the
+API** workflow; connecting enables nothing automatically. The Claude connection
+does not use or fall back to an API key, but [Anthropic does not permit this
+third-party subscription routing](https://code.claude.com/docs/en/legal-and-compliance)
+and may restrict the account. Account-level extra usage can still be billed.
+Removing it from derate deletes local tokens, not remote Claude authorization.
+See `control_plane/providers/README.md` for supported requests and live-verification limits.
+
+The endpoint is not open. `/v1` answers only to a derate API key,
+`Authorization: Bearer drt_<id>_<secret>`, minted on the **Keys** screen and
+shown exactly once; the screens and `/api` answer only to a signed-in admin,
+and the first admin is created by the first step of setup, from the
+coordinator itself (loopback, or an `ssh -L` tunnel to it). A key belongs to an
+org, expires (1 to 365 days), can be disabled, rotated or deleted, and carries
+limits — tokens, requests and dollars per 30-day cycle, local and cloud pools,
+rpm, tpm, concurrency, per-request caps, per model — that refuse with a 429
+naming the limit that tripped. Every request row records the key that sent it,
+so each key has its own usage page. `GET /v1/key` tells a client what
+its key may do. See `docs/guide/the-endpoint.md`.
 
 ## The cluster
 
@@ -149,7 +187,7 @@ rather than implying otherwise.
 ## The screen
 
 `ui/` is a React app the gateway serves itself, at the same origin as the API —
-`/dashboard`, `/models`, `/cluster`, `/chat`, `/spend`, `/settings`, and
+`/dashboard`, `/models`, `/cluster`, `/chat`, `/usage`, `/settings`, and
 `/setup`. The path names the screen and its subject
 (`/models/meta-llama/Llama-3.1-8B`); the query names what is selected
 (`?node=`, `?link=`, `?dep=`). Every screen has a real URL, so a link to one
@@ -160,6 +198,33 @@ verifiers, each of which exists because a specific class of bug is invisible to
 types, and `npm run screens` drives a real browser over every destination and
 writes a PNG — the only thing here that sees what shipped rather than inferring
 it from source.
+
+## Operating: investigation-ready
+
+derate records who did what -- every admin action in a hash-chained audit
+table, every `/v1` request in `requests`, every HTTP request in `access` --
+but some of it is only as good as its configuration. Set these on the
+coordinator before you need them (`docs/FORENSICS.md` is how to use them):
+
+```bash
+DERATE_AUDIT_SINK=https://<collector>/...  # with DERATE_AUDIT_SINK_TOKEN; or tcp://<siem>:6514
+DERATE_TRUSTED_PROXIES=<proxy ip/cidr>     # when a proxy fronts the UI or /v1
+DERATE_PUBLIC_ORIGIN=https://...           # likewise
+DERATE_REQUESTS_RETENTION_DAYS=90
+DERATE_AUDIT_LOG_DAYS=400
+DERATE_LOG_BACKUPS=14
+```
+
+The sink is off by default, and without it the audit chain's only copies are
+on the box an intruder would be on. Without `DERATE_TRUSTED_PROXIES` behind a
+proxy every recorded address is the proxy's; it takes addresses and CIDRs
+only, and `*` or a `/0` stops the node at startup.
+
+Prefer an `https://` sink with `DERATE_AUDIT_SINK_TOKEN`. The `udp://` and
+`tcp://` syslog transports are unauthenticated: anyone who can reach the
+receiver can send lines that look like derate's, so a syslog receiver must
+accept only the coordinator's address. Injected rows do not link into the
+chain, so re-verifying it from the receiver's copy exposes them.
 
 ## Where things live
 
@@ -205,6 +270,5 @@ rather than a token rate: none is measured, and a zero would read as stalled.
 MIT — see `LICENSE`. Use it for anything, commercial included, without asking.
 
 If you are running derate in production, please open an issue first and say
-what you are building on. The gateway has no inbound authentication yet, and
-there are things worth knowing about sizing and placement that are cheaper to
-hear before the deploy than after it.
+what you are building on. There are things worth knowing about sizing and
+placement that are cheaper to hear before the deploy than after it.

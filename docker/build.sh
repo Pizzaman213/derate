@@ -10,7 +10,6 @@ IMAGE="${IMAGE:-ghcr.io/pizzaman213/derate/node}"
 TAG="${TAG:-latest}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 BUILDER="${BUILDER:-derate}"
-SPARKRUN_VERSION="${SPARKRUN_VERSION:-0.2.40}"
 # Release builds leave this at 0: a UI that does not compile must fail the image.
 SKIP_UI="${SKIP_UI:-0}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,7 +23,7 @@ usage: docker/build.sh [--push | --load] [--tag TAG]
            local docker daemon. buildx cannot load a multi-arch manifest.
   (neither) build both architectures and discard, i.e. verify the build
 
-env: IMAGE, TAG, PLATFORMS, BUILDER, SPARKRUN_VERSION, SKIP_UI
+env: IMAGE, TAG, PLATFORMS, BUILDER, SKIP_UI
 USAGE
 }
 
@@ -73,7 +72,6 @@ echo "==> building ${IMAGE}:${TAG} for ${PLATFORMS}"
 if ! docker buildx build \
     --builder "$BUILDER" \
     --platform "$PLATFORMS" \
-    --build-arg "SPARKRUN_VERSION=${SPARKRUN_VERSION}" \
     --build-arg "SKIP_UI=${SKIP_UI}" \
     --build-arg "DERATE_BUILD=${DERATE_BUILD}" \
     --tag "${IMAGE}:${TAG}" \

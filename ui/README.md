@@ -44,12 +44,12 @@ DERATE_GATEWAY=http://localhost:8088 npm run dev   # against a real coordinator
 `vite.config.ts` proxies `/api` and `/v1` to `$DERATE_GATEWAY`, defaulting
 to `:8080`. Point it wherever the coordinator actually is.
 
-For the parts of the graph a two-node cluster cannot show — the compact and chip
-density tiers, the ring, a wide unmeasured mesh — run the layout verifier, which
-needs neither a browser nor a cluster:
+The cluster wiring editor's rules -- the socket table, the document's ops, the
+particle emission -- are checked without a browser or a cluster:
 
 ```bash
-node src/tabs/cluster/layout.check.mjs   # assertions, plus layout-preview.svg
+node src/tabs/cluster/sockets.check.mjs   # what can connect, and every refusal sentence
+node src/tabs/cluster/doc.check.mjs       # edits -> /api/wiring ops, against tests/fixtures/wiring_rules.json
 node src/tabs/cluster/particles.check.mjs # what gets drawn, in and out
 ```
 
@@ -169,8 +169,12 @@ for which half of a URL a thing goes in:
 
 ```
 the PATH names the screen         /dashboard  /models  /cluster
-                                  /chat  /spend  /settings
+                                  /chat  /usage  /settings
 ...and the screen's own subject   /models/meta-llama/Llama-3.1-8B
+                                  /usage/requests/<id>  /usage/keys/<id>
+                                  (/usage's panes -- overview, requests, rate-limits, keys --
+                                  is a path segment, Route.sub; the old /spend,
+                                  /keys, /requests paths are parse-only aliases)
 the QUERY names what is selected  ?node=spark-01        a machine
                                   ?link=spark-01~spark-02   a link
                                   ?dep=qwen3-30b-a3b    the deployment in the sidebar
@@ -185,10 +189,22 @@ the QUERY names what is selected  ?node=spark-01        a machine
                                   ?spec=ngram:5         speculative decoding, method
                                                         and drafted tokens; absent
                                                         means one token per step
+                                  ?win=7d               a usage pane's window
+                                                        (overview: 24h, 7d, 30d, absent
+                                                        is all; requests: 24h, 7d, 30d,
+                                                        absent is 24h; rate-limits: the
+                                                        same windows, absent is 30d)
 ```
 
+`/usage?dep=<served model or deployment id>` opens the Rate limits pane for
+that subject, canonicalized to `/usage/rate-limits?dep=…`. Its current model
+state is separate from the durable 429 log. `?provider=` and `?target=` narrow
+history; Requests accepts them too, with `?status=429` for rate-limit failures.
+Request detail preserves the recorded upstream message and retry delay when
+they were captured; older rows are not retroactively inferred.
+
 Selections are query parameters rather than path segments because they are not
-owned by a destination: the same machine is selectable on the cluster floor, in
+owned by a destination: the same machine is selectable on the cluster editor, in
 the dashboard's telemetry strip and in the sidebar roster, and the sheet is a
 modal that sits over whichever screen is showing. A model id is a path, because
 it is the subject of the screen and because `/models/meta-llama/Llama-3.1-8B`
@@ -236,7 +252,7 @@ policy. `state/selection.tsx` reads and writes the four selections through it;
 every caller still just says `selectNode(id)` and does not know a URL was
 involved.
 
-**Selecting replaces, opening pushes.** Clicking across a machine floor is
+**Selecting replaces, opening pushes.** Clicking across the cluster editor is
 scrubbing, not navigating, and a history entry per click would make Back a
 hundred-press undo of something nobody thinks of as an action -- the URL still
 updates, so it is still shareable. Opening the sheet or a model's detail pane
@@ -356,106 +372,30 @@ more precise than any rewrite, and they are the product. They are rendered
 exactly as received — never truncated, re-cased, or summarised. Rendering one
 through anything else is the bug.
 
-**The cluster graph is a machine floor, and it draws every machine.** One card
-per node in `/api/topology`, whether or not it is running anything — an idle
-Spark, a node that just joined and a node that has gone unreachable are all
-things you need to see, and a graph built out of deployments cannot show any of
-them. Cards shrink by tier as the cluster grows (full to 4, compact to 8, chip
-to 12) rather than being sized by dividing the available width, which is how the
-previous layout could compute a negative box.
+**The cluster screen is a wiring editor, and it draws every machine.** One
+block per node in `/api/topology`, whether or not it is running anything — an
+idle Spark, a node that just joined and a node that has gone unreachable are
+all things you need to see. Requests read left to right: API Input, rate
+limits, one load balancer split per served name, machines and providers,
+the matching merge, API Output. Only the wires the server will accept are
+editable (a cloud wire to a provider model, a rate limit into a split, a draft
+model's `deploy to`), and an edit is a `POST /api/wiring` op, dry-run before
+Save. The rules, the document and the React Flow pitfalls are in
+`src/tabs/cluster/README.md`.
 
-**Positions are a pure function of the node set and the arrangement.**
-Coordinator first, then sorted ids, dealt into a row or a grid and a ring past
-twelve. No force simulation: at this node count physics produces drifting,
-unrepeatable positions, and a machine that moves between refreshes is a machine
-you cannot learn the position of. Hand-placement is the opposite of that —
-somebody putting a machine somewhere on purpose — so a machine can be dragged
-anywhere on the floor and stays exactly where it is dropped, saved the moment
-the pointer comes up and restored on the next visit. Nothing snaps, and a plate
-may be dropped over a link or over another plate: where you want a machine is
-not a question the drawing gets a vote on.
-
-What is stored is a *displacement* from the slot the machine is dealt, never an
-absolute x/y — this is the one thing that makes free placement storable.
-Absolute coordinates stop meaning anything the moment the window resizes or the
-cluster crosses a density tier and the card size changes; an offset travels
-with its slot through both, so a floor arranged to match the rack still matches
-it on a narrower window. What it cannot survive is the machine set changing
-shape underneath it, because a node joining re-deals the slots. `Reset layout`
-puts every machine back, and appears only once there is something to put back.
-
-Two things follow a moved plate, because they are drawings *of* it rather than
-decoration near it: its links re-aim (a bracket where the drag left a clear
-channel between two level plates, an arc where it did not) and its band's bar
-re-spans, stretching to the machine's new position and dropping its
-`contiguous` claim once the bar would run across a machine that is not one of
-its own. Both are decided off the final geometry — `layout.ts` asks "are these
-level, with nothing in between?" rather than comparing row and column indices,
-which describe the slot a plate came from and stop describing the drawing the
-moment anybody drags one. `alt` plus an arrow key is the other half: it steps a
-machine through the *default order* rather than nudging it, and clears that
-machine's hand-placement so it lands in the slot the announcement names.
+**Positions are dealt, then the operator's.** Blocks are dealt into fixed
+columns deterministically, so nothing moves between refreshes; a dragged block
+stays where it was dropped, saved per cluster in localStorage, and `Reset
+layout` appears only once there is something to put back.
 
 **The unmeasured mesh is not all drawn at once.** `/api/topology` returns every
 pair, so twelve machines is sixty-six edges of which one or two carry a figure.
-Every measured link is always on the canvas; an unmeasured pair is drawn when a
-deployment is relying on it, when the whole mesh is small enough to show, or
-when its machine is selected. The rail below lists all of them either way.
+A machine-to-machine line is drawn when it is measured, when a deployment spans
+the pair, or when there are four machines or fewer. The Links card lists all of
+them either way.
 
-**A model a provider serves gets the same band as one this cluster runs.**
-`/api/topology` has carried a `remotes[]` row per provider model since the
-target index grew one, and nothing drew it: a model routed to a provider
-reached this screen as a substring inside the bus's sublabel and as nothing
-else — no band, no tap, no mention on any machine. The floor now draws it with
-the same bar, the same served name, the same 1 Hz throughput readout and the
-same selection as a deployment, because it is the same served name in the same
-request flow. The only honest differences are drawn and no others: no plan, no
-machine members unless the provider is one of ours, and its own words — `via
-openrouter`, `off cluster` — saying whose hardware it is. It used to be drawn
-dashed as well; that went with the routing boundary, and words on the band said
-it better than a stroke pattern ever did.
-
-**Which provider models earn a place on the floor is a rule, not a filter.**
-That payload is one row per model of every enabled provider, so an OpenRouter
-key with no allowlist is several hundred rows and a band each would bury the
-machines under a catalogue nobody deployed. `groupRemotes` in `layout.ts` draws
-a name only when somebody here did something to it: a deployment already serves
-it (`backup` — it goes ON that band, named in its sublabel, which is what the
-routing actually does with it), the provider is a machine on this roster
-(`hosted` — it sits with the local bands, machine leads and all, because the
-request never leaves the building), an alias was set (`named`), or the
-providers behind it serve few enough names between them to be a list somebody
-chose rather than a catalogue we fetched. Everything else is counted on the bus
-and not drawn. The rule reads the topology payload and nothing else, so it is
-pure and `layout.check.mjs` holds it — including the case it exists for, that
-forty catalogue models draw zero bands.
-
-**The provider bus lists one line per provider.** It used to carry a single
-aggregate sentence — "2 providers · third party · no telemetry", then every
-routed name in one list — which could say THAT a provider was behind the bus
-and never WHICH provider served WHAT, the question somebody looks at that box
-to answer. Each line now names a provider, the models it serves here, and how
-much of its catalogue it could still reach. The box stays outlined rather than
-filled: it is not a machine you own, and no provider is ever drawn as one.
-
-**One entry plate per endpoint family, not one per floor.** The plate at the
-left used to read `POST /v1/chat/completions` whatever was on the floor. With a
-speech deployment beside a chat one that is not a simplification of the
-routing, it is a drawing of a request the gateway refuses: naming a TTS model
-on the chat endpoint comes back `wrong_modality` with the route that would have
-worked. `layout.ts` now groups bands by modality — `endpointGroups` — and gives
-each group its own entry plate and its own exit plate, the exit too because
-what comes back off a speech band is one audio file and not a token stream. A
-floor with nothing but chat deployments, which is nearly all of them, draws
-exactly what it drew before: one family, one plate, at the same y. The plates
-grow leftward from a fixed right edge so two labels of different lengths still
-line up where the connectors leave, and `separate()` shuffles one down when two
-families' bands interleave and both want the same middle — placed before
-anything is connected to them, so a request block never flies out of thin air
-beside a plate that moved.
-
-**And `/chat` is the screen that makes that plate reachable.** The floor has
-been able to draw a `POST /v1/audio/speech` entry since the audio work landed,
+**And `/chat` is the screen that makes a speech model reachable.** The
+gateway has served `POST /v1/audio/speech` since the audio work landed,
 and for a while nothing in the product could send one: the chat picker filtered
 audio models out, which left a runtime this repository writes audible only
 from curl. A dedicated `/speech` screen closed that gap first; it was then
@@ -484,46 +424,11 @@ stops a row promising a route its request does not take; `rows.check.mjs`
 asserts it. The `?dep=` fallback prefers a text model, and says so when the URL
 named something this picker has no row for rather than silently substituting.
 
-**A provider is connected on the side the request is already going.** The bus
-used to be tapped from a rail in the left-hand gutter at x=156, between the
-entry column at 140 and the floor at 172 — where every tap ran along the same
-y as the entry connector that had just arrived at that band, under a line five
-times its weight, with its junction dot reading as a bead threaded onto the
-entry wire. The connection now leaves each band's bottom-right corner, drops
-down a corridor of its own past the floor, and lands on the provider box's
-right edge. That is also where the flight lands: the two used to disagree, the
-rail stopping at the box's left edge while the block carried on to its centre,
-so a request arrived at a provider by sliding out from under its own line and
-across the label.
-
-**Only a band a provider actually serves is connected to the bus.** Every band
-used to get a 0.22-opacity hairline pointing at it, meaning "reachable through
-the proxy" — true when a provider served its whole catalogue, and false now
-that `enabled_models` means it serves nothing but its allowlist. A line from a
-name no provider offers claimed routing that cannot happen, so there is no
-longer a hairline tier at all: a band is connected or it is not, and the
-predicate reads `band.providers` and the routing targets, both of which come
-off payloads the coordinator has already filtered.
-
-**A block in flight is a request in flight, on every band at once.** The
-emitter used to open with `if (!selDep) return []`, so a graph with nothing
-clicked — which is what it looks like almost all of the time — drew nothing,
-and a cluster whose only traffic went to a provider had never animated. Drawing
-all of it weakens no claim: a block is still one measured request off
-`queue_depth` or `outstanding`, and `collapseFlows` still drops any flow whose
-path this layout did not draw, so several hundred catalogue names cost one map
-and no ink. A provider flight now crosses the band it is served by on its way
-down, which the port had lost — it turned into the gutter sixteen units short
-of the band, so a block for a name was never once seen on that name.
-
-**The return legs run on every band too, but only the selected one is
-coloured.** The rate is per band and measured, off the same 1 Hz frame as the
-tok/s readout beside it. Whether a name was *called* with `stream: true` is not
-on that frame at all — it lives in the request archive, which `useRequestMix`
-queries for one served name — so asking per band would be a query per band for
-a hue. The selected band paints its measured streamed/batched tone and every
-other passes null, which is the same "no reading" grey an empty meter track
-uses. Selecting a band is what answers that question for that band.
+**A block in flight is a request in flight, on every wire at once.** A request
+block is one measured request off `queue_depth` or `outstanding`, riding the
+`requests` wire of the target serving it; a response block rides the
+`responses` wire at a rate off the 1 Hz tok/s figure. Nothing needs to be
+selected for either to draw.
 
 **Measured speculation is on the frame, per deployment, or it is absent.**
 `MetricsDeploymentFrame.speculative` carries what the ENGINE counted about its
@@ -740,12 +645,11 @@ and two mockup trees that are tracked in git, never built and never served.
 | `index.html` | 13 | the Vite entry: `#root`, `color-scheme: light dark`, `/src/main.tsx` |
 | `package.json` | 32 | the six scripts, and the dependency set the image installs |
 | `package-lock.json` | 1809 | tracked, because the image build runs `npm ci` |
-| `vite.config.ts` | 27 | the dev proxy -- `/api` with `ws: true`, `/v1` -- and `dist/` with sourcemaps |
+| `vite.config.ts` | 33 | the dev proxy -- `/api` with `ws: true`, `/v1` -- and `dist/` without sourcemaps |
 | `tsconfig.json` | 4 | a solution file with `"files": []`; the reason a bare `tsc --noEmit` checks nothing |
 | `tsconfig.app.json` | 21 | the only project that covers `src/`: strict, `noUncheckedIndexedAccess` |
 | `tsconfig.node.json` | 15 | covers `vite.config.ts` and nothing else in the folder |
 | `.gitignore` | 11 | which previews and captures are output rather than source |
-| `layout-preview.svg` | 0 | not source: the floor at eight cluster sizes, written by `layout.check.mjs` |
 
 ## `check.mjs`
 
@@ -829,8 +733,9 @@ fails its handshake under `npm run dev` and the terminal simply never connects
 way, which is exactly what makes the bug hard to find from the deployed shape.
 
 `process` is hand-declared at the top rather than pulling in `@types/node` for
-one variable. `build` sets `outDir: 'dist'` and `sourcemap: true`, so `dist/`
-carries a `.map` beside every chunk.
+one variable. `build` sets `outDir: 'dist'` and `sourcemap: false`: `dist/` is
+served unauthenticated by the coordinator, and a map would hand anyone on the
+LAN the whole commented source.
 
 ## `tsconfig.json`
 
@@ -864,27 +769,10 @@ is covered by it -- `check.mjs` and the 24 `*.check.mjs` files are JavaScript,
 ## `.gitignore`
 
 Eleven lines, and it is the file that says which artefacts in this folder are
-output. `node_modules/`, `dist/`, `*.tsbuildinfo`, `layout-preview.svg`,
-`.history-check-*/`, `src/tabs/cluster/loading-preview.svg` and `screens/`. Its
-own comment states the rule for the two preview SVGs and `screens/`:
-generated so a screen can be looked at without a browser (`layout-preview.svg`,
-`src/tabs/cluster/loading-preview.svg`) or with one (`screens/`, written by
-`src/shell/screens.check.mjs`), regenerated on demand, and not reviewable in a
-diff. What is deliberately *not* ignored is `mockups/` and
-`mockups-next/`, which is the whole of the next section.
-
-## `layout-preview.svg`
-
-The one file at this level that is not source and is on disk anyway: 65 KB of
-SVG on a single line, which is why `wc -l` says 0. `layout.check.mjs` writes it
-on every run, stacking the cluster floor at 1, 2, 3, 4, 6, 9, 12 and 16
-machines so the density tiers can be eyeballed with no cluster and no browser.
-It exists because there is nothing else to look at: `api/fixtures.ts` was
-deleted in 7626319 and `VITE_API_MODE` no longer exists, so a shape the live
-cluster is not currently in has no other way of being seen. Rendered at
-`K = 12 / 9` off the authored units, so the preview is the size that ships.
-Delete it freely -- it is in `.gitignore` and the next verifier run puts it
-back.
+output. `node_modules/`, `dist/`, `*.tsbuildinfo`, `.history-check-*/` and
+`screens/` (written by `src/shell/screens.check.mjs`, regenerated on demand,
+and not reviewable in a diff). What is deliberately *not* ignored is `mockups/`
+and `mockups-next/`, which is the whole of the next section.
 
 ## The folder map
 
@@ -913,8 +801,7 @@ reference line.
 
 The rest of the top level is generated or installed, and none of it is in git:
 `dist/` (the bundle, and the deployment), `screens/` (the PNGs plus
-`console.txt`), `layout-preview.svg` (written by
-`src/tabs/cluster/layout.check.mjs`), `node_modules/`, and the
+`console.txt`), `node_modules/`, and the
 `.history-check-*/` scratch directories.
 
 ## The mockups are tracked, and nothing imports them

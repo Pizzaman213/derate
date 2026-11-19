@@ -6,14 +6,26 @@
 import { apiToken } from './apiToken'
 import { apiUrl } from './origin'
 import { scrub } from './redact'
+import { createThinkSplitter } from './think'
+import type { ThinkSplit } from './think'
 import type {
   AlertsReport,
   Activity,
+  AdminRow,
+  AdminSession,
   AdoptedRuntime,
+  ApiKeyRow,
+  AuditPage,
+  AuditQuery,
+  AuthState,
   CacheClearResult,
   Candidate,
   CapacityReport,
+  ProviderSignInFlow,
+  ProviderSignInStart,
+  ProviderSignInStatus,
   ChatMessage,
+  ChatRequestOptions,
   ChatTurnMeta,
   Cluster,
   CuratedModel,
@@ -23,12 +35,20 @@ import type {
   EnrollmentRow,
   EnrollmentSpec,
   EventHistory,
+  KeyCreate,
+  KeyFilter,
+  KeyPatch,
+  RequestsPage,
+  RequestsQuery,
   KillResult,
   LaunchRequest,
+  LimitState,
   LinkMeasurement,
+  LocalPrice,
   LogHistory,
   MemoryReportList,
   MetricsFrame,
+  MintedKey,
   Modality,
   ModelDeleteResult,
   ModelDetail,
@@ -41,6 +61,7 @@ import type {
   NodeProfile,
   NodeRuntime,
   NodeStateDTO,
+  OrgRow,
   PlanRequest,
   PlanResponse,
   Provider,
@@ -53,11 +74,13 @@ import type {
   QuantTable,
   ReachReport,
   RequestHistory,
+  RouteLimits,
   RoutingConfig,
   RoutingPolicy,
   ServedModel,
   Settings,
   SettingsPatch,
+  SetupAdminResult,
   SetupStatus,
   ShellStatus,
   SpeechRequest,
@@ -68,30 +91,36 @@ import type {
   Topology,
   TranscriptionRequest,
   TranscriptionResult,
+  UsageQuery,
+  UsageResult,
   VariantLadder,
   VoiceLibrary,
   SpeculativeHeads,
+  WiringRequest,
+  WiringResponse,
 } from './types'
 
 /** One turn's worth of arguments for `chatStream`.
  *
- *  `onDelta` is called per text fragment as it arrives; `onOpen` fires once the
+ *  `onDelta` is called per answer fragment as it arrives and `onReasoning` per
+ *  reasoning fragment, whether the server separated it or the browser split it
+ *  out of inline `<think>` tags; `onRewrite` replaces both wholesale when the
+ *  browser's split turns out to have been wrong (see `api/think.ts`), and a
+ *  caller without it keeps the text as first routed. `onOpen` fires once the
  *  response headers are in, which is the earliest the request id exists and is
  *  therefore the only way a caller learns it for a turn that goes on to fail.
- *  `onReasoning`, when given, is called per reasoning fragment -- a model's
- *  "thinking" content, kept apart from `onDelta` so a caller can render it
- *  separately (collapsed by default) rather than mixed into the answer.
- *
- *  `temperature`/`max_tokens`/`stop` are omitted from the request body
- *  entirely when left `undefined`, the same convention `speech()` uses for an
- *  unset voice: an omitted key is a real "use the server's default", not a
- *  sent `null`. */
+ *  `options` is spread into the request body as extra top-level fields.
+ *  `thinkOpen`: the chat template is expected to open the `<think>` block in
+ *  the prompt, so the answer starts inside it. */
 export interface ChatStreamRequest {
   model: string
   messages: ChatMessage[]
   onDelta: (text: string) => void
   onReasoning?: (text: string) => void
+  onRewrite?: (reasoning: string, content: string) => void
   onOpen?: (requestId: string | null) => void
+  options?: ChatRequestOptions
+  thinkOpen?: boolean
   signal: AbortSignal
   temperature?: number
   max_tokens?: number
@@ -111,24 +140,40 @@ export interface Backend {
   /** Records that the wizard was finished, so it is not offered again --
    *  including when the person chose to add nothing, which is still an answer. */
   completeSetup(): Promise<void>
-  /** `GET /v1/models`: every model the gateway will accept as `model`, local
-   *  deployments and remote providers alike. */
+  /** The models this session can chat with: `GET /api/chat/models`, the
+   *  session-gated mirror of `/v1/models` (which answers only to an API key).
+   *  Local deployments and remote providers alike. */
   models(): Promise<ServedModel[]>
-  /** `POST /v1/chat/completions` with `stream: true`. Resolves when the stream
-   *  ends -- including when it ended because the caller aborted, which is an
-   *  outcome rather than an error and leaves the partial text standing. */
+  /** `POST /api/chat/completions` with `stream: true` -- the session-gated
+   *  twin of `/v1/chat/completions`, attributed to this admin's own key.
+   *  Resolves when the stream ends -- including when it ended because the
+   *  caller aborted, which is an outcome rather than an error and leaves the
+   *  partial text standing. */
   chatStream(req: ChatStreamRequest): Promise<ChatTurnMeta>
-  /** `POST /v1/audio/speech`. One request, one audio file, no stream. */
+  /** `POST /api/chat/speech` (= `/v1/audio/speech`). One request, one audio
+   *  file, no stream. */
   speech(req: SpeechRequest, signal?: AbortSignal): Promise<SpeechResult>
-  /** `GET /v1/audio/voices?model=`. The reference clips installed beside this
+  /** `GET /api/chat/voices?model=` (= `/v1/audio/voices`). The reference clips installed beside this
    *  deployment, and the ones it declined to offer. */
   voices(model: string): Promise<VoiceLibrary>
-  /** `POST /v1/audio/transcriptions`. An audio file in, its text out. */
+  /** `POST /api/chat/transcriptions` (= `/v1/audio/transcriptions`). An audio file in, its text out. */
   transcribe(req: TranscriptionRequest, signal?: AbortSignal): Promise<TranscriptionResult>
   plan(req: PlanRequest): Promise<PlanResponse>
   /** Refused by the fit gate when the verdict is WONT_FIT. Nothing starts. */
   launch(req: LaunchRequest): Promise<DeploymentDTO>
-  setPolicy(servedName: string, policy: RoutingPolicy): Promise<RoutingConfig>
+  /** `PUT /api/routing/{name}`. `limits` replaces the name's stored limits
+   *  (`{}` deletes them); omitted, they are left as they are. */
+  setPolicy(
+    servedName: string,
+    policy: RoutingPolicy,
+    opts?: { limits?: RouteLimits },
+  ): Promise<RoutingConfig>
+  /** `DELETE /api/routing/{name}`: back to what auto_policy picks. */
+  clearPolicy(servedName: string): Promise<RoutingConfig>
+  /** `POST /api/wiring`: a batch of provider and routing changes, validated
+   *  whole. A refused batch is a 400 `wiring_invalid` thrown as `ApiError`
+   *  whose `body` carries the per-op `results`. */
+  wiring(body: WiringRequest): Promise<WiringResponse>
   admit(nodeId: string): Promise<void>
   /** What model runtime is listening on this node, if any. Cheap enough to
    *  call when a node sheet opens; the probe is bounded and a miss is normal. */
@@ -151,6 +196,10 @@ export interface Backend {
   enrollments(): Promise<EnrollmentRow[]>
   revokeEnrollment(tokenId: string): Promise<void>
   removeNode(nodeId: string): Promise<void>
+  /** Replace the cluster token. Needs the signed-in admin's password; 409
+   *  names any member that still depends on the old token. The new token is
+   *  never returned: members hold their own, new nodes join on enrollment. */
+  rotateClusterToken(currentPassword: string): Promise<{ rotated: boolean }>
   measureLink(a: string, b: string): Promise<LinkMeasurement | void>
   /** Can these two nodes reach each other, and from which side? Four health
    *  checks, seconds not a minute, and safe to run against a cluster that is
@@ -347,7 +396,15 @@ export interface Backend {
   activity(): Promise<Activity>
   alerts(): Promise<AlertsReport>
   addProvider(spec: ProviderSpec): Promise<Provider>
-  removeProvider(providerId: string): Promise<void>
+  /** Whether remote authorization was revoked. Claude returns false (local
+   *  removal only); key-based providers return null. */
+  removeProvider(providerId: string): Promise<{ removed: string; revoked: boolean | null }>
+  /** Start or reconnect using the selected flow; ordinary redacted responses. */
+  startProviderSignIn(flow: ProviderSignInFlow, providerId?: string): Promise<ProviderSignInStart>
+  /** Finish with the displayed code or callback URL. */
+  completeProviderSignIn(flow: ProviderSignInFlow, attemptId: string, callbackUrl: string): Promise<Provider>
+  /** A 404 means the attempt expired or was never started. */
+  providerSignInStatus(flow: ProviderSignInFlow, attemptId: string): Promise<ProviderSignInStatus>
   patchProvider(providerId: string, patch: ProviderPatch): Promise<Provider>
   /** The provider's whole catalogue, each row saying whether it is switched
    *  on. Every other provider read in this client is already filtered to the
@@ -364,6 +421,58 @@ export interface Backend {
     onFrame: (f: MetricsFrame) => void,
     onState: (s: StreamState) => void,
   ): () => void
+
+  // ── Auth: admins and the session ──────────────────────────────────────────
+  /** Open: whether an admin exists and whether this browser has a session. */
+  authState(): Promise<AuthState>
+  login(username: string, password: string): Promise<AuthState>
+  logout(): Promise<void>
+  me(): Promise<AdminRow>
+  changePassword(oldPassword: string, newPassword: string): Promise<void>
+  admins(): Promise<AdminRow[]>
+  /** `currentPassword` is the signed-in admin's own: the server re-checks it
+   *  for every admin-level change (401 `invalid_credentials` otherwise). */
+  addAdmin(username: string, email: string, password: string, currentPassword: string): Promise<AdminRow>
+  removeAdmin(username: string, currentPassword: string): Promise<void>
+  /** Every live session of every admin: where it signed in and was last seen. */
+  sessions(): Promise<AdminSession[]>
+  /** Sign `username` out everywhere. Any admin may do this to any admin. */
+  revokeAdminSessions(username: string): Promise<{ username: string; revoked: number }>
+  /** The first admin. Answers 410 once one exists. Reveals the default key. */
+  setupAdmin(username: string, email: string, password: string): Promise<SetupAdminResult>
+
+  // ── API keys ──────────────────────────────────────────────────────────────
+  keys(filter?: KeyFilter): Promise<ApiKeyRow[]>
+  key(keyId: string): Promise<ApiKeyRow>
+  /** Reveals the new key's secret, once. */
+  createKey(spec: KeyCreate): Promise<MintedKey>
+  patchKey(keyId: string, patch: KeyPatch): Promise<ApiKeyRow>
+  deleteKey(keyId: string): Promise<void>
+  disableKey(keyId: string, reason?: string): Promise<ApiKeyRow>
+  orgs(): Promise<OrgRow[]>
+  /** Disable every active key of the org, admin keys included. */
+  disableOrgKeys(orgId: string, reason?: string): Promise<{ disabled: string[] }>
+  enableKey(keyId: string): Promise<ApiKeyRow>
+  /** Replaces the secret and reveals the new one, once. The old one stops
+   *  working immediately. An admin key also needs the signed-in admin's
+   *  `currentPassword`; other keys ignore it. */
+  rotateKey(keyId: string, currentPassword?: string): Promise<MintedKey>
+  /** This cycle only: the override is gone when the cycle ends. */
+  raiseLimit(keyId: string, limitType: string, value: number): Promise<LimitState>
+  resetCycle(keyId: string): Promise<void>
+  keyRequests(keyId: string, q?: RequestsQuery): Promise<RequestsPage>
+  /** The CSV export of the same query, as a URL a link can point at. */
+  keyRequestsCsvUrl(keyId: string, q?: RequestsQuery): string
+  /** One row per client request, cluster-wide: the final attempt, with
+   *  `attempts` the true count. `retried` keeps only the ones that failed over. */
+  requests(q?: RequestsQuery): Promise<RequestsPage>
+  requestsCsvUrl(q?: RequestsQuery): string
+  usage(q: UsageQuery): Promise<UsageResult>
+  usageCsvUrl(q: UsageQuery): string
+  audit(q?: AuditQuery): Promise<AuditPage>
+  pricing(): Promise<LocalPrice[]>
+  setPricing(model: string, inputUsdPerMtok: number | null, outputUsdPerMtok: number | null): Promise<LocalPrice>
+  clearPricing(model: string): Promise<void>
 }
 
 /** The window every history route shares.
@@ -431,7 +540,18 @@ function numberHeader(res: Response, name: string): number | null {
   return Number.isFinite(n) ? n : null
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+/** Fired on any 401 from the coordinator. AppShell listens and sends the
+ *  browser to /login: a session that expired mid-visit is the common case, and
+ *  a screen of failed panels is a worse answer to it than the login form. */
+export const UNAUTHENTICATED_EVENT = 'derate:unauthenticated'
+
+function noteUnauthenticated(res: Response): void {
+  if (res.status === 401 && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(UNAUTHENTICATED_EVENT))
+  }
+}
+
+async function fetchOk(path: string, init?: RequestInit): Promise<Response> {
   // Every path in this file is written as the contract spells it -- relative,
   // rooted at /api or /v1 -- and `apiUrl` is the one place a configured
   // coordinator base is prepended. Same origin (the deployed shape, and the
@@ -449,14 +569,55 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!res.ok) {
+    noteUnauthenticated(res)
     const body = await res.text().catch(() => '')
     // The resolved URL, not the contract path: when a base is set, which
     // coordinator refused is half the message.
-    throw new ApiError(res.status, body || res.statusText, url)
+    throw new ApiError(res.status, body || res.statusText, url, res.headers)
   }
+  return res
+}
+
+async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetchOk(path, init)
   if (res.status === 204) return undefined as T
   return scrub((await res.json()) as T)
 }
+
+/** `req` without `scrub()`. Used by exactly three calls -- `setupAdmin`,
+ *  `createKey`, `rotateKey` -- because their whole answer is a `drt_` secret
+ *  shown once (redact.ts names the exception). Nothing else may use it. */
+async function reqUnscrubbed<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetchOk(path, init)
+  return (await res.json()) as T
+}
+
+function qs(
+  params: Record<string, string | number | boolean | string[] | null | undefined>,
+): string {
+  const parts: string[] = []
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null) continue
+    const value = Array.isArray(v) ? v.join(',') : String(v)
+    if (value === '') continue
+    parts.push(`${k}=${encodeURIComponent(value)}`)
+  }
+  return parts.length ? `?${parts.join('&')}` : ''
+}
+
+/** `retried` is a flag on the wire: present as 1, or absent. `false` must not
+ *  serialize as the string "false", which the server would read as unset only
+ *  by luck. */
+function requestParams(q: RequestsQuery) {
+  return { ...q, retried: q.retried ? 1 : undefined }
+}
+
+const post = (body?: unknown): RequestInit => ({
+  method: 'POST',
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+})
+
+const seg = encodeURIComponent
 
 /** OpenAI-shaped error bodies (gateway/errors.py): `{error:{message,...}}`.
  *  When the body parses that way, `.message` is the sentence the gateway
@@ -509,6 +670,9 @@ export class ApiError extends Error {
     readonly status: number,
     readonly body: string,
     readonly path: string,
+    /** The refusal's headers -- `Retry-After` on a locked login, the
+     *  `X-RateLimit-*` trio on a 429. Null where the caller had none. */
+    readonly headers: Headers | null = null,
   ) {
     super(errorMessage(status, path, body))
   }
@@ -628,46 +792,29 @@ interface ModelsWire {
 /** One `data:` frame of a streamed chat completion, as much of it as this UI
  *  reads. Everything is optional: the first frame usually carries only a role,
  *  and `usage` appears on the last frame from some upstreams and never from
- *  others.
- *
- *  `reasoning_content` (vLLM's reasoning parsers, DeepSeek's API) and
- *  `reasoning` (OpenRouter) are the two names actually seen for a model's
- *  "thinking" delta -- not a guaranteed set, just the ones with evidence. No
- *  recipe in this repo turns on vLLM's `--reasoning-parser`, so a local
- *  thinking model streams its reasoning as literal `<think>` tags inside
- *  `content` instead; see the inline-tag scan in `chatStream`. */
+ *  others. The reasoning delta is `reasoning` from vLLM since it renamed the
+ *  field and `reasoning_content` from SGLang and the providers, so both. */
 interface ChatChunkWire {
+  error?: { message?: string; type?: string; code?: string | null } | null
   choices?: {
     delta?: {
       content?: string | null
-      reasoning_content?: string | null
       reasoning?: string | null
+      reasoning_content?: string | null
     }
+    finish_reason?: string | null
   }[]
-  usage?: { completion_tokens?: number | null } | null
+  usage?: {
+    prompt_tokens?: number | null
+    completion_tokens?: number | null
+    completion_tokens_details?: { reasoning_tokens?: number | null } | null
+  } | null
 }
 
 /** An aborted fetch or reader. Checked by name rather than by `instanceof
  *  DOMException`, which does not hold across every runtime this can run in. */
 function isAbort(e: unknown): boolean {
   return (e as { name?: string } | null)?.name === 'AbortError'
-}
-
-/** Splits `<think>...</think>` spans out of accumulated content text.
- *
- *  Takes the WHOLE buffer seen so far, not just the newest chunk -- a tag can
- *  straddle a chunk boundary, and re-deriving both halves from scratch every
- *  time is simpler to get right than carrying scan state across frames. The
- *  `(<\/think>|$)` alternation is what makes an unterminated tag (the model
- *  is still "thinking" when the stream ends) fall out as reasoning too,
- *  rather than staying stuck in `content` forever. */
-function splitThink(raw: string): { content: string; reasoning: string } {
-  let reasoning = ''
-  const content = raw.replace(/<think>([\s\S]*?)(<\/think>|$)/g, (_m, inner: string) => {
-    reasoning += inner
-    return ''
-  })
-  return { content, reasoning }
 }
 
 export const httpBackend: Backend = {
@@ -729,7 +876,7 @@ export const httpBackend: Backend = {
   },
   completeSetup: () => req<void>('/api/setup/complete', { method: 'POST' }),
   async models(): Promise<ServedModel[]> {
-    const wire = await req<ModelsWire>('/v1/models')
+    const wire = await req<ModelsWire>('/api/chat/models')
     return (wire.data ?? []).map((m) => ({
       id: m.id,
       // `index.context_length` is a `.get()` on the gateway side and can come
@@ -749,7 +896,10 @@ export const httpBackend: Backend = {
     messages,
     onDelta,
     onReasoning,
+    onRewrite,
     onOpen,
+    options,
+    thinkOpen = false,
     signal,
     temperature,
     max_tokens,
@@ -758,54 +908,96 @@ export const httpBackend: Backend = {
     // The one thing in this file `req<T>` cannot carry: it awaits `res.json()`,
     // and the whole value here is in not waiting for the end of the body.
     // `EventSource` is no help either -- it is GET-only and cannot send one.
-    const path = apiUrl('/v1/chat/completions')
+    const path = apiUrl('/api/chat/completions')
     const startedAt = performance.now()
+    const splitter = createThinkSplitter({ startInside: thinkOpen })
 
     let requestId: string | null = null
     let ttftMs: number | null = null
+    let firstContentMs: number | null = null
+    // When the last reasoning fragment arrived, relative to send: how long the
+    // model thought out loud. null for a turn with no reasoning at all.
     let reasoningMs: number | null = null
-    let sawReasoning = false
     let textFrames = 0
+    let reasoningFrames = 0
+    let reasoningSource: ChatTurnMeta['reasoningSource'] = null
+    let finishReason: string | null = null
+    let usagePrompt: number | null = null
     let usageCompletion: number | null = null
-
-    // No recipe here passes vLLM `--reasoning-parser`, so a local thinking
-    // model's reasoning arrives as literal `<think>...</think>` inside
-    // `content`, not as its own field. `rawContent` accumulates every content
-    // delta seen so far and is re-split on every frame -- simpler and more
-    // obviously correct than a stateful scan for a tag that can straddle a
-    // chunk boundary, at the cost of a re-scan per frame that a chat-length
-    // transcript never makes expensive. Once a frame carries an explicit
-    // `reasoning_content`/`reasoning` field this is abandoned for the rest of
-    // the stream: trust the field the upstream chose to send, don't also go
-    // looking for tags it has no reason to emit.
-    let rawContent = ''
-    let splitContent = ''
-    let splitReasoning = ''
-    let explicitReasoning = false
+    let usageReasoning: number | null = null
 
     const meta = (stopped: boolean): ChatTurnMeta => ({
       model,
       requestId,
       ttftMs,
+      firstContentMs,
       elapsedMs: performance.now() - startedAt,
-      // `textFrames || null`: zero frames means nothing was ever observed, and
-      // that reads as an em dash rather than as a model that emitted 0 tokens.
-      completionTokens: usageCompletion ?? (textFrames || null),
+      promptTokens: usagePrompt,
+      // `|| null`: zero frames means nothing was ever observed, and that reads
+      // as an em dash rather than as a model that emitted 0 tokens.
+      completionTokens: usageCompletion ?? (textFrames + reasoningFrames || null),
+      reasoningTokens: usageReasoning ?? (reasoningFrames || null),
       tokensEstimated: usageCompletion === null,
       reasoningMs,
+      reasoningEstimated: usageReasoning === null,
+      reasoningSource,
+      finishReason,
       stopped,
     })
 
-    const emitContent = (chunk: string) => {
-      const now = performance.now()
-      if (ttftMs === null) ttftMs = now - startedAt
-      if (sawReasoning && reasoningMs === null) reasoningMs = now - startedAt
-      textFrames += 1
-      onDelta(chunk)
+    const mark = (): number => {
+      const now = performance.now() - startedAt
+      if (ttftMs === null) ttftMs = now
+      return now
     }
-    const emitReasoning = (chunk: string) => {
-      sawReasoning = true
-      onReasoning?.(chunk)
+
+    /** Route what the splitter made of one content delta (`frame`) or of its
+     *  end-of-stream flush (not a frame, so nothing is counted). A delta it
+     *  swallowed whole into an open block -- the `<think>` tag itself, the
+     *  closing tag -- is still a token the model emitted, so it counts as a
+     *  reasoning frame; one it is holding undecided counts as text. */
+    const route = (parts: ThinkSplit, frame: boolean): void => {
+      if (parts.rewrite) {
+        const now = mark()
+        if (splitter.inline) {
+          // A bare `</think>`: every frame so far was reasoning after all.
+          reasoningSource ??= 'inline'
+          reasoningFrames += textFrames
+          textFrames = 0
+          firstContentMs = parts.content !== '' ? now : null
+          if (frame) {
+            if (parts.content !== '') textFrames += 1
+            else reasoningFrames += 1
+          }
+        } else {
+          // Expected a block that never closed: it was all the answer.
+          reasoningSource = null
+          textFrames += reasoningFrames
+          reasoningFrames = 0
+          firstContentMs = ttftMs
+        }
+        onRewrite?.(parts.reasoning, parts.content)
+        return
+      }
+      if (parts.content !== '') {
+        const now = mark()
+        if (firstContentMs === null) firstContentMs = now
+        if (frame) textFrames += 1
+        if (parts.reasoning !== '') {
+          reasoningMs = now
+          onReasoning?.(parts.reasoning)
+        }
+        onDelta(parts.content)
+        return
+      }
+      if (!splitter.inline) {
+        if (frame) textFrames += 1
+        return
+      }
+      reasoningSource ??= 'inline'
+      reasoningMs = mark()
+      if (frame) reasoningFrames += 1
+      if (parts.reasoning !== '') onReasoning?.(parts.reasoning)
     }
 
     /** Returns true when the frame was the stream's terminator. */
@@ -824,36 +1016,57 @@ export const httpBackend: Backend = {
           // the same rule `subscribe()` applies to the metrics stream.
           continue
         }
-        const delta = frame.choices?.[0]?.delta
-        const reasoningField = delta?.reasoning_content ?? delta?.reasoning
-        if (typeof reasoningField === 'string' && reasoningField !== '') {
-          explicitReasoning = true
-          emitReasoning(reasoningField)
+        if (frame.error) {
+          // HTTP has already succeeded, but this turn has not. Use the same
+          // redacted error envelope as the JSON API, so Chat's existing catch
+          // displays the upstream sentence and never receives successful meta.
+          throw new ApiError(200, JSON.stringify(scrub(frame)), path)
+        }
+        const choice = frame.choices?.[0]
+        const delta = choice?.delta
+        // Reasoning first, so a frame carrying both keeps
+        // `firstContentMs >= ttftMs`.
+        const reasoning =
+          typeof delta?.reasoning === 'string' && delta.reasoning !== ''
+            ? delta.reasoning
+            : typeof delta?.reasoning_content === 'string' && delta.reasoning_content !== ''
+              ? delta.reasoning_content
+              : null
+        if (reasoning !== null) {
+          reasoningSource = 'server'
+          reasoningMs = mark()
+          reasoningFrames += 1
+          onReasoning?.(reasoning)
         }
         const text = delta?.content
         if (typeof text === 'string' && text !== '') {
-          if (explicitReasoning) {
-            emitContent(text)
-          } else {
-            rawContent += text
-            const split = splitThink(rawContent)
-            if (split.reasoning.length > splitReasoning.length) {
-              emitReasoning(split.reasoning.slice(splitReasoning.length))
-              splitReasoning = split.reasoning
-            }
-            if (split.content.length > splitContent.length) {
-              emitContent(split.content.slice(splitContent.length))
-              splitContent = split.content
-            }
-          }
+          // A server that separates reasoning has already taken the tags out;
+          // splitting again would eat an answer that quotes `<think>`.
+          route(
+            reasoningSource === 'server' ? { reasoning: '', content: text } : splitter.push(text),
+            true,
+          )
         }
+        if (typeof choice?.finish_reason === 'string') finishReason = choice.finish_reason
         // Some upstreams close with a usage block. A real count beats a counted
         // frame whenever one turns up, which is why this is checked every time
         // rather than only on the last frame.
-        const completion = frame.usage?.completion_tokens
-        if (typeof completion === 'number') usageCompletion = completion
+        const usage = frame.usage
+        if (typeof usage?.prompt_tokens === 'number') usagePrompt = usage.prompt_tokens
+        if (typeof usage?.completion_tokens === 'number') usageCompletion = usage.completion_tokens
+        const reasoningTokens = usage?.completion_tokens_details?.reasoning_tokens
+        if (typeof reasoningTokens === 'number') usageReasoning = reasoningTokens
       }
       return false
+    }
+
+    /** Whatever the splitter still holds, routed like any delta. */
+    const flush = (): void => {
+      // The server separated the reasoning, so the splitter never saw the
+      // content and has nothing to hand back -- least of all a rewrite.
+      if (reasoningSource === 'server') return
+      const rest = splitter.flush()
+      if (rest.rewrite || rest.content !== '' || rest.reasoning !== '') route(rest, false)
     }
 
     try {
@@ -871,7 +1084,7 @@ export const httpBackend: Backend = {
         // No `stream_options: {include_usage: true}`. Not every upstream in
         // ProviderKind accepts it, and a request refused for an unknown field
         // is worse than a token count labelled as an estimate.
-        body: JSON.stringify(body),
+        body: JSON.stringify({ ...body, ...(options ?? {}) }),
       })
 
       // Read before anything can throw on the body: a refusal carries the id
@@ -880,6 +1093,7 @@ export const httpBackend: Backend = {
       onOpen?.(requestId)
 
       if (!res.ok) {
+        noteUnauthenticated(res)
         throw new ApiError(res.status, await res.text().catch(() => ''), path)
       }
       if (!res.body) {
@@ -891,35 +1105,40 @@ export const httpBackend: Backend = {
       let buffer = ''
       let done = false
 
-      while (!done) {
-        const chunk = await reader.read()
-        if (chunk.done) break
-        // `stream: true` so a multi-byte character split across two network
-        // chunks is not decoded into two replacement characters.
-        buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, '\n')
-        // Events are separated by a blank line, and a chunk boundary can fall
-        // anywhere -- mid-event, mid-token. Only whole events are parsed; the
-        // tail stays buffered for the next read.
-        for (;;) {
-          const sep = buffer.indexOf('\n\n')
-          if (sep === -1) break
-          const event = buffer.slice(0, sep)
-          buffer = buffer.slice(sep + 2)
-          if (consume(event)) {
-            done = true
-            break
+      try {
+        while (!done) {
+          const chunk = await reader.read()
+          if (chunk.done) break
+          // Decode incrementally and normalize after joining: either a UTF-8
+          // character or a CRLF pair can straddle network chunks.
+          buffer = (buffer + decoder.decode(chunk.value, { stream: true })).replace(/\r\n/g, '\n')
+          // Events are separated by a blank line, and a chunk boundary can fall
+          // anywhere -- mid-event, mid-token. Only whole events are parsed; the
+          // tail stays buffered for the next read.
+          for (;;) {
+            const sep = buffer.indexOf('\n\n')
+            if (sep === -1) break
+            const event = buffer.slice(0, sep)
+            buffer = buffer.slice(sep + 2)
+            if (consume(event)) {
+              done = true
+              break
+            }
           }
         }
+        flush()
+      } finally {
+        // No more reads, including when an error frame throws. Cancel rather
+        // than leave the upstream connection open until the tab closes.
+        await reader.cancel().catch(() => {})
       }
-
-      // Nothing more will be read from it, whether the upstream closed or
-      // `[DONE]` arrived first. Without this the connection stays open until
-      // the tab does.
-      await reader.cancel().catch(() => {})
     } catch (e) {
       // Stop was pressed. Deliberately not rethrown: the caller keeps the
       // partial text and the readout says it was stopped.
-      if (isAbort(e)) return meta(true)
+      if (isAbort(e)) {
+        flush()
+        return meta(true)
+      }
       throw e
     }
 
@@ -935,7 +1154,7 @@ export const httpBackend: Backend = {
     // `res.json()` and the value is in not waiting, this one awaits it and the
     // body is not JSON. It must also stay clear of `scrub()` -- redact.ts
     // walks a decoded object graph, and there is nothing here to walk.
-    const path = apiUrl('/v1/audio/speech')
+    const path = apiUrl('/api/chat/speech')
     const res = await fetch(path, {
       method: 'POST',
       signal,
@@ -955,6 +1174,7 @@ export const httpBackend: Backend = {
     const requestId = res.headers.get('X-Request-Id')
 
     if (!res.ok) {
+      noteUnauthenticated(res)
       // A refusal is still JSON, and ApiError unwraps `{error:{message}}` into
       // `.message` -- which the speech screen renders through Verbatim. The
       // unknown-voice refusal lists what IS installed and the format refusals
@@ -990,7 +1210,7 @@ export const httpBackend: Backend = {
     // full `multipart/form-data; boundary=...` from the FormData itself, and
     // the gateway forwards those bytes verbatim under the client's own
     // content-type (gateway/proxy.py's raw-content path).
-    const path = apiUrl('/v1/audio/transcriptions')
+    const path = apiUrl('/api/chat/transcriptions')
     const form = new FormData()
     form.append('model', model)
     form.append('file', file, file.name)
@@ -999,6 +1219,7 @@ export const httpBackend: Backend = {
     const res = await fetch(path, { method: 'POST', signal, body: form })
     const requestId = res.headers.get('X-Request-Id')
     if (!res.ok) {
+      noteUnauthenticated(res)
       throw new ApiError(res.status, await res.text().catch(() => ''), path)
     }
     // OpenAI's default `response_format` is json: `{"text": "..."}`. Not sent
@@ -1016,7 +1237,7 @@ export const httpBackend: Backend = {
     const wire = await req<{
       data?: { id?: unknown }[]
       skipped?: unknown[]
-    }>(`/v1/audio/voices?model=${encodeURIComponent(model)}`)
+    }>(`/api/chat/voices?model=${encodeURIComponent(model)}`)
     return {
       voices: (wire.data ?? [])
         .map((v) => v.id)
@@ -1033,11 +1254,15 @@ export const httpBackend: Backend = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  setPolicy: (servedName, policy) =>
+  setPolicy: (servedName, policy, opts) =>
     req<RoutingConfig>(`/api/routing/${encodeURIComponent(servedName)}`, {
       method: 'PUT',
-      body: JSON.stringify({ policy }),
+      body: JSON.stringify(opts?.limits ? { policy, limits: opts.limits } : { policy }),
     }),
+  clearPolicy: (servedName) =>
+    req<RoutingConfig>(`/api/routing/${encodeURIComponent(servedName)}`, { method: 'DELETE' }),
+  wiring: (body) =>
+    req<WiringResponse>('/api/wiring', { method: 'POST', body: JSON.stringify(body) }),
   admit: (nodeId) =>
     req<void>(`/api/nodes/${encodeURIComponent(nodeId)}/admit`, { method: 'POST' }),
   nodeRuntime: (nodeId) =>
@@ -1058,6 +1283,11 @@ export const httpBackend: Backend = {
     req<void>(`/api/enroll/${encodeURIComponent(tokenId)}`, { method: 'DELETE' }),
   removeNode: (nodeId) =>
     req<void>(`/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }),
+  rotateClusterToken: (currentPassword) =>
+    req<{ rotated: boolean }>('/api/cluster/token/rotate', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: currentPassword }),
+    }),
   measureLink: (a, b) =>
     req<LinkMeasurement>('/api/links/measure', {
       method: 'POST',
@@ -1201,7 +1431,22 @@ export const httpBackend: Backend = {
   addProvider: (spec) =>
     req<Provider>('/api/providers', { method: 'POST', body: JSON.stringify(spec) }),
   removeProvider: (providerId) =>
-    req<void>(`/api/providers/${encodeURIComponent(providerId)}`, { method: 'DELETE' }),
+    req<{ removed: string; revoked: boolean | null }>(
+      `/api/providers/${encodeURIComponent(providerId)}`,
+      { method: 'DELETE' },
+    ),
+  startProviderSignIn: (flow, providerId) =>
+    req<ProviderSignInStart>(
+      `/api/sign-in/${flow}`,
+      post(providerId ? { provider_id: providerId } : {}),
+    ),
+  completeProviderSignIn: (flow, attemptId, callbackUrl) =>
+    req<Provider>(
+      `/api/sign-in/${flow}/${encodeURIComponent(attemptId)}/complete`,
+      post({ callback_url: callbackUrl }),
+    ),
+  providerSignInStatus: (flow, attemptId) =>
+    req<ProviderSignInStatus>(`/api/sign-in/${flow}/${encodeURIComponent(attemptId)}`),
   providerModels: (providerId) =>
     req<ProviderCatalogueModel[]>(
       `/api/providers/${encodeURIComponent(providerId)}/models`,
@@ -1270,4 +1515,76 @@ export const httpBackend: Backend = {
       if (timer) window.clearTimeout(timer)
     }
   },
+
+  authState: () => req<AuthState>('/api/auth/state'),
+  login: (username, password) =>
+    req<AuthState>('/api/auth/login', post({ username, password })),
+  logout: () => req<void>('/api/auth/logout', post()),
+  me: () => req<AdminRow>('/api/auth/me'),
+  changePassword: (oldPassword, newPassword) =>
+    req<void>('/api/auth/password', post({ old: oldPassword, new: newPassword })),
+  admins: () => req<AdminRow[]>('/api/admins'),
+  addAdmin: (username, email, password, currentPassword) =>
+    req<AdminRow>('/api/admins', post({ username, email, password, current_password: currentPassword })),
+  removeAdmin: (username, currentPassword) =>
+    req<void>(`/api/admins/${seg(username)}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ current_password: currentPassword }),
+    }),
+  sessions: () => req<AdminSession[]>('/api/auth/sessions'),
+  revokeAdminSessions: (username) =>
+    req<{ username: string; revoked: number }>(`/api/admins/${seg(username)}/sessions`, {
+      method: 'DELETE',
+    }),
+  setupAdmin: (username, email, password) =>
+    reqUnscrubbed<SetupAdminResult>('/api/setup/admin', post({ username, email, password })),
+
+  keys: (filter = {}) =>
+    req<ApiKeyRow[]>(
+      `/api/keys${qs({
+        status: filter.status,
+        near_limit: filter.near_limit ? 'true' : undefined,
+        expiring_days: filter.expiring_days,
+        q: filter.q,
+      })}`,
+    ),
+  key: (keyId) => req<ApiKeyRow>(`/api/keys/${seg(keyId)}`),
+  createKey: (spec) => reqUnscrubbed<MintedKey>('/api/keys', post(spec)),
+  patchKey: (keyId, patch) =>
+    req<ApiKeyRow>(`/api/keys/${seg(keyId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  deleteKey: (keyId) => req<void>(`/api/keys/${seg(keyId)}`, { method: 'DELETE' }),
+  disableKey: (keyId, reason) =>
+    req<ApiKeyRow>(`/api/keys/${seg(keyId)}/disable`, post(reason ? { reason } : {})),
+  orgs: () => req<OrgRow[]>('/api/orgs'),
+  disableOrgKeys: (orgId, reason) =>
+    req<{ disabled: string[] }>(`/api/orgs/${seg(orgId)}/keys/disable`, post(reason ? { reason } : {})),
+  enableKey: (keyId) => req<ApiKeyRow>(`/api/keys/${seg(keyId)}/enable`, post()),
+  rotateKey: (keyId, currentPassword) =>
+    reqUnscrubbed<MintedKey>(
+      `/api/keys/${seg(keyId)}/rotate`,
+      post(currentPassword ? { current_password: currentPassword } : undefined),
+    ),
+  raiseLimit: (keyId, limitType, value) =>
+    req<LimitState>(`/api/keys/${seg(keyId)}/raise`, post({ limit_type: limitType, value })),
+  resetCycle: (keyId) => req<void>(`/api/keys/${seg(keyId)}/reset-cycle`, post()),
+  keyRequests: (keyId, q = {}) =>
+    req<RequestsPage>(`/api/keys/${seg(keyId)}/requests${qs(requestParams(q))}`),
+  keyRequestsCsvUrl: (keyId, q = {}) =>
+    apiUrl(`/api/keys/${seg(keyId)}/requests${qs({ ...requestParams(q), format: 'csv' })}`),
+  requests: (q = {}) => req<RequestsPage>(`/api/requests${qs(requestParams(q))}`),
+  requestsCsvUrl: (q = {}) => apiUrl(`/api/requests${qs({ ...requestParams(q), format: 'csv' })}`),
+  usage: (q) => req<UsageResult>(`/api/usage${qs({ ...q })}`),
+  usageCsvUrl: (q) => apiUrl(`/api/usage${qs({ ...q, format: 'csv' })}`),
+  audit: (q = {}) => req<AuditPage>(`/api/audit${qs({ ...q })}`),
+  pricing: () => req<LocalPrice[]>('/api/pricing'),
+  setPricing: (model, inputUsdPerMtok, outputUsdPerMtok) =>
+    req<LocalPrice>(`/api/pricing/${model.split('/').map(seg).join('/')}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        input_usd_per_mtok: inputUsdPerMtok,
+        output_usd_per_mtok: outputUsdPerMtok,
+      }),
+    }),
+  clearPricing: (model) =>
+    req<void>(`/api/pricing/${model.split('/').map(seg).join('/')}`, { method: 'DELETE' }),
 }

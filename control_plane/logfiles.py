@@ -49,6 +49,12 @@ Three properties, in this order:
    the one holding the model cache, where 894 GiB of weights leaves no room for
    a log that grows forever.
 
+4. **Only this user reads them.** The folder is 0700 and every file --
+   rotated ones included -- 0600: a log line names IPs, users and key ids.
+   Timestamps are UTC with a ``Z`` (:class:`UTCFormatter`), so a line lines up
+   with an audit row and with another box's log without knowing either's
+   timezone.
+
 Installed from the two entrypoints -- ``control_plane/node.py`` and
 ``control_plane/gateway/main.py`` -- immediately after ``basicConfig``, so a
 crash during startup is in the file rather than only on a stderr nobody
@@ -60,10 +66,12 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from . import fsutil
 from .paths import logs_dir
 from .redaction import Redactor, SecretRedactingFilter
 
@@ -100,6 +108,16 @@ PROXY_LOGGERS = (
 #: reads the same as the one somebody saw in a terminal. Both entrypoints
 #: import this for their ``basicConfig`` rather than retyping it.
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+
+class UTCFormatter(logging.Formatter):
+    """``2026-11-18T09:14:03.120Z``: UTC, millisecond, explicit zone. Both
+    entrypoints pass it to ``basicConfig`` as well, so stderr matches."""
+
+    converter = time.gmtime
+    default_time_format = "%Y-%m-%dT%H:%M:%S"
+    default_msec_format = "%s.%03dZ"
+
 
 #: Rotation. 32 MiB is roughly a day of a busy coordinator's INFO stream at the
 #: access-log volume measured in ``telemetry/config.py`` (99.6% of records), and
@@ -174,9 +192,28 @@ def _handler(
         path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8", delay=False
     )
     handler.setLevel(level)
-    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    handler.setFormatter(UTCFormatter(LOG_FORMAT))
     for f in filters:
         handler.addFilter(f)
+    if handler.stream is not None:
+        fsutil.harden_fd(handler.stream.fileno(), path)
+
+    def rotator(source: str, dest: str) -> None:
+        if os.path.exists(source):
+            os.replace(source, dest)
+            fsutil.harden_path(dest)
+
+    # The fresh file after a rollover is opened by _open(), mode from umask;
+    # harden it the moment it exists.
+    opener = handler._open
+
+    def _open():
+        stream = opener()
+        fsutil.harden_fd(stream.fileno(), path)
+        return stream
+
+    handler.rotator = rotator
+    handler._open = _open  # type: ignore[method-assign]
     return handler
 
 
@@ -211,10 +248,14 @@ def install(
 
     folder = Path(directory) if directory is not None else logs_dir(env)
     try:
-        folder.mkdir(parents=True, exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
         log.warning("no log folder at %s (%s); logging to stderr only", folder, exc)
         return None
+    try:
+        os.chmod(folder, 0o700)
+    except OSError as exc:
+        log.warning("could not set mode 0700 on %s: %s", folder, exc)
 
     redact = _redacting_filter(redactor)
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 
@@ -46,6 +47,24 @@ class GatewaySettings:
             for origin in os.environ.get("DERATE_ALLOWED_ORIGINS", "").split(",")
             if origin.strip()
         )
+    )
+    # DERATE_TRUSTED_PROXIES, validated (see trusted_proxies below). Empty
+    # means X-Forwarded-For is ignored, and AuthGuard warns once per peer
+    # that sends one. authz.forwarded_client reads it, never uvicorn.
+    trusted_proxies: tuple[str, ...] = field(default_factory=lambda: trusted_proxies())
+
+    @property
+    def trusted_networks(self) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+        """:attr:`trusted_proxies` as networks, parsed once per distinct value."""
+        return _networks(self.trusted_proxies)
+
+    # The origin browsers reach this gateway at when a TLS terminator fronts
+    # it (``https://derate.example``). The gateway itself then sees plaintext
+    # from the proxy, so ``request.url.scheme`` cannot decide the session
+    # cookie's ``Secure`` flag or what a same-origin write looks like; this
+    # does. Empty: the request's own scheme and host are the truth.
+    public_origin: str = field(
+        default_factory=lambda: os.environ.get("DERATE_PUBLIC_ORIGIN", "").strip().rstrip("/")
     )
 
     # Optional bearer token gating every /api request (see auth.py). Empty
@@ -126,6 +145,9 @@ class GatewaySettings:
     local_only: bool = False
     # None means no cap; 0.0 means spend nothing. Two different instructions,
     # and a form whose empty field yields 0.0 would silently swap them.
+    # Enforced at routing (Router.rebuild sums providers' spend_today): once
+    # reached, every remote stops admitting. Spend is measured per rebuild, so
+    # the overshoot is bounded by index_ttl_s / weight_refresh_interval_s.
     daily_spend_cap_usd: float | None = None
     # A deployment that crashes (fatal runtime marker, exited container, a
     # health probe that stops answering) relaunches itself, up to
@@ -240,3 +262,62 @@ class GatewaySettings:
     # figure it produces is a windowed rate -- a shorter window would be a
     # noisier number about the same fact, bought with more requests.
     prefix_cache_interval_s: float = 10.0
+
+
+
+
+def trusted_proxies(env=None) -> tuple[str, ...]:
+    """``DERATE_TRUSTED_PROXIES``, parsed strictly: each entry an IP address
+    or CIDR, never a catch-all.
+
+    ``*`` or ``0.0.0.0/0`` would trust every hop and record a client-chosen
+    ``X-Forwarded-For`` as the address,
+    and a typo would silently match nothing. Either falsifies every ``ip`` in
+    the audit, the sessions and ``requests``; both are a startup error here,
+    naming the variable.
+    """
+    env = os.environ if env is None else env
+    out: list[str] = []
+    for raw in env.get("DERATE_TRUSTED_PROXIES", "").split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        if entry == "*":
+            raise ValueError("DERATE_TRUSTED_PROXIES: a catch-all network is not allowed")
+        try:
+            network = ipaddress.ip_network(entry, strict=True)
+        except ValueError:
+            raise ValueError(
+                f"DERATE_TRUSTED_PROXIES: {entry!r} is not an IP address or CIDR"
+            ) from None
+        if network.prefixlen == 0:
+            raise ValueError("DERATE_TRUSTED_PROXIES: a catch-all network is not allowed")
+        out.append(entry)
+    return tuple(out)
+
+
+def _networks(entries: tuple[str, ...]) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    cached = _NETWORKS.get(entries)
+    if cached is None:
+        cached = tuple(ipaddress.ip_network(e, strict=False) for e in entries)
+        _NETWORKS[entries] = cached
+    return cached
+
+
+_NETWORKS: dict[tuple[str, ...], tuple] = {}
+
+
+def uvicorn_proxy_kwargs(env=None) -> dict:
+    """How uvicorn treats ``X-Forwarded-For``/``-Proto``: never.
+
+    uvicorn's own resolution returns the *leftmost* ``X-Forwarded-For``
+    element when every hop is inside the trusted list and overwrites the
+    socket's peer with it, so a client inside a trusted CIDR chose its own
+    address -- loopback included, which opened first-admin setup to the LAN.
+    derate resolves the address itself (``authz.forwarded_client``: right to
+    left, the first untrusted hop) and keeps the socket peer beside it.
+    Still validates ``DERATE_TRUSTED_PROXIES`` so a bad entry is a startup
+    error: raises ``ValueError`` on an entry :func:`trusted_proxies` refuses.
+    """
+    trusted_proxies(env)
+    return {"proxy_headers": False}

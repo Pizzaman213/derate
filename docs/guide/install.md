@@ -32,8 +32,13 @@ run` and exits before the platform check.
 Run this on the machine you want to be the coordinator.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh | sh
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh -o "$f" \
+  && echo "0ca3bc3d3e86e6e0382b796525c2daa696b2c772fc3394f48646c3de6f0b807c  $f" | sha256sum -c - \
+  && sh "$f"
 ```
+
+The hash is `install.sh`'s at the commit this page ships with; every release
+also prints it in the publish workflow's run summary.
 
 It reports what it is doing on stderr, one line at a time:
 
@@ -129,9 +134,10 @@ The last one is read-write, and it is what lets Settings → Storage show and
 reclaim downloaded weights. Without it the node reports no model cache and
 nothing breaks; it can only no longer see or delete what the runtime downloaded.
 
-One thing to know before you put this on a shared network: **the gateway has no
-inbound authentication yet.** Anyone who can reach port 8080 can call the API,
-admit a node, and launch a model.
+One thing to know before you put this on a shared network: everything on `/api`
+needs an admin session and everything on `/v1` a `drt_` key, but the first
+admin can only be created from the coordinator itself (see
+[the first visit](first-run.md)), so do that before you leave the machine.
 
 ## 3. Machine two
 
@@ -141,9 +147,14 @@ flight would corrupt a script that is about to be piped into `sh`. The script it
 serves never contains a token; the credential is only ever an argument.
 
 ```bash
-curl -fsSL http://<coordinator>:8080/install.sh | sh -s -- \
-    --join http://<coordinator>:8080 --token ej_...
+f=$(mktemp) && curl -fsSL http://<coordinator>:8080/install.sh -o "$f" \
+  && echo "<sha256>  $f" | sha256sum -c - \
+  && sh "$f" --join http://<coordinator>:8080 --token ej_...
 ```
+
+`<sha256>` is the hash of the exact bytes the coordinator serves at that moment,
+filled in by the card below. A script altered on the way fails the check and
+never runs.
 
 Do not type that from memory. Open the coordinator's UI, go to
 **Settings → Nodes → Add a node**, and press **Generate join command**: the
@@ -183,11 +194,14 @@ message above exists.
 | Lives for | one hour by default, one day at most | forever |
 | Spent | after one machine uses it | never |
 | What it gets you | **member** — admitted on arrival, nothing to click | **candidate** — waits for somebody to press Admit |
-| Can be revoked | yes, from the same card | no |
+| Can be revoked | yes, from the same card | rotated, from Settings → Nodes |
 
-A node admitted with an enrollment token is handed the permanent token on the
-way in, so the enrollment token expiring later cannot lock an established member
-out of its own cluster.
+Neither is what a member keeps. A node is handed its own random **agent token**
+when it becomes a member, keeps it in its `cluster.json`, and re-joins with that
+and nothing else — so the enrollment token expiring later cannot lock it out,
+and no member holds the cluster token. Rotating the cluster token disturbs no
+member; it is refused, naming them, while a member from an older build has not
+re-joined since the upgrade.
 
 ## 4. The rest of the options
 
@@ -211,10 +225,20 @@ out of its own cluster.
   looking for a cluster to join.
 - **`--install-docker`** — install Docker from `get.docker.com` if it is
   missing. Opt-in: the script does not install daemons you did not ask for.
-- **`--install-ollama`** — install Ollama on this machine and bind it to
-  `0.0.0.0:11434` through a systemd drop-in, so a node with no GPU can serve a
-  small model over the network. The node itself does not need it and never calls
-  it; you add that machine as a provider afterwards.
+- **`--install-ollama`** — install Ollama on this machine and bind it, through a
+  systemd drop-in, to the address this machine reaches the coordinator from
+  (`ip route get <coordinator>`'s source address; `127.0.0.1` on the
+  coordinator itself), so a node with no GPU can serve a small model over the
+  network. Ollama answers on that address to anyone who can reach it; it has
+  no authentication. `--ollama-bind ADDR` picks the address instead, and
+  `--ollama-bind 0.0.0.0` is every interface. The node itself does not need it
+  and never calls it; you add that machine as a provider afterwards.
+- **`--digest sha256:…`** (or `DERATE_IMAGE_DIGEST`) — pull the image by that
+  digest rather than by its moving tag. The "Add a node" command carries it
+  when the coordinator was itself installed with one. With `cosign` on `PATH`
+  the script verifies the image was signed by derate's publish workflow and
+  refuses to run it otherwise; without `cosign` it says the signature was not
+  verified.
 - **`--name`**, **`--image`**, **`--port`**, **`--agent-port`** — override the
   node id (default: this machine's hostname), the image, `8080` and `8081`.
 - **`--keep-images`** — do not reclaim the derate images this upgrade

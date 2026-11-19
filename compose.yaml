@@ -43,12 +43,8 @@ services:
     volumes:
       # Cluster token, node registry, link measurements, deployment records,
       # resolved-shape cache, synthesized recipes, telemetry journal and
-      # archive.
-      #
-      # NOT the log files: paths.py::logs_dir() puts node.log and proxy.log at
-      # <project root>/logs, which in this image is /opt/derate/logs -- a layer,
-      # so `docker rm` takes them. Set DERATE_LOG_DIR=/data/logs below to keep
-      # them here with everything else.
+      # archive, and the log files (paths.py::logs_dir() defaults to
+      # /data/logs, including the audit JSONL mirror).
       - derate:/data
       # The host's sparkrun config, read-only: registries, saved clusters,
       # container image defaults.
@@ -113,7 +109,7 @@ services:
       DERATE_TELEMETRY_QUIET_LOGGERS: ${DERATE_TELEMETRY_QUIET_LOGGERS-uvicorn.access,httpx}
       # An interactive root shell on this machine, reachable from the node page
       # in the UI. OFF, and it should stay off unless you want it: the /api
-      # surface has no authentication, the gateway binds 0.0.0.0, and this
+      # surface takes one admin session to reach, the gateway binds 0.0.0.0, and this
       # container runs as root with --pid=host and the operator's SSH keys
       # mounted -- so an enabled shell reaches the host, and through those keys
       # the rest of the fleet. Both variables are required; the key is never
@@ -128,6 +124,18 @@ services:
       DERATE_SHELL_ORIGINS: ${DERATE_SHELL_ORIGINS:-}
       # Seconds of inactivity before a shell session closes itself.
       DERATE_SHELL_IDLE_S: ${DERATE_SHELL_IDLE_S:-1800}
+      # Investigation-ready (README "Operating: investigation-ready",
+      # docs/FORENSICS.md). The audit sink is OFF by default; set it so a copy
+      # of every audit row leaves this box as it is written.
+      # DERATE_AUDIT_SINK: tcp://<siem>:6514   # or https://... plus the token
+      # DERATE_AUDIT_SINK_TOKEN: ""
+      # Behind a proxy, name it (IPs/CIDRs only; * or /0 refuses to start).
+      # DERATE_TRUSTED_PROXIES: <proxy ip/cidr>
+      # DERATE_PUBLIC_ORIGIN: https://...
+      # requests + access rows; not scaled by DERATE_TELEMETRY_RETENTION_DAYS.
+      # DERATE_REQUESTS_RETENTION_DAYS: "90"
+      # DERATE_AUDIT_LOG_DAYS: "400"
+      # DERATE_LOG_BACKUPS: "14"
 
     healthcheck:
       # /agent/health exists in both roles. /api/cluster is coordinator-only

@@ -23,7 +23,16 @@
 # torch built against this hardware's CUDA, and reusing it means the layers
 # below are the only new bytes a node has to fetch. Bump this together with
 # DERATE_VLLM_IMAGE in control_plane/deploy/flags.py, or pass --build-arg.
-ARG BASE=ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+# Pinned by digest 2026-11-18. The base the tts image on the Sparks was built
+# from on 2026-09-07 is a local sparkrun-eugr-vllm:latest (vLLM 0.28.1rc1,
+# transformers 5.16.1, image id sha256:d25ccc68...) that was never pulled from
+# a registry and so has no RepoDigest to pin -- `docker image inspect` prints
+# RepoDigests []. The pin is therefore the nightly's registry digest as of
+# that date (built 2026-11-07: vLLM 0.33.0rc1, torch 2.14), which is exactly
+# what `:latest` resolved to, now immutable. It has not been built and
+# launched here yet; re-pin to the next base that is, together with the
+# transformers it resolves, and keep audio.Dockerfile's BASE the same.
+ARG BASE=ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest@sha256:b62b958b2aa7d60ae71c5f30be1d83b855532cd115907f9c8cca7a3881829bed
 FROM ${BASE}
 
 # transformers is the loader: these checkpoints ship their architecture as

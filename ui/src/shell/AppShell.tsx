@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
+import { Icon } from '../components/Icon'
 import { useBackend } from '../state/backend'
+import { MetricsProvider } from '../state/metrics'
 import { SelectionProvider } from '../state/selection'
+import { TelemetryProvider } from '../state/telemetry'
 import { useRouter, type Dest } from '../state/router'
 import { Header } from './Header'
+import { HealthBanner } from './HealthBanner'
 import { Sheet } from './Sheet'
 import { DashboardTab } from '../tabs/DashboardTab'
 import { ModelsTab } from '../tabs/ModelsTab'
@@ -44,8 +48,9 @@ const WIDE: ReadonlySet<Dest> = new Set<Dest>(['models'])
  *  Latches once /api/setup reports complete: setup cannot become incomplete
  *  again mid-session, so there is no reason to keep asking.
  *
- *  A failed request does nothing, same as before -- a coordinator that
- *  cannot answer /api/setup has a bigger problem than onboarding. */
+ *  A failed request does nothing. The dashboard on a fresh install is a thin
+ *  screen, but it is a working one, and a coordinator that cannot answer
+ *  /api/setup has a bigger problem than onboarding. */
 function useFirstRunRedirect(dest: Dest) {
   const { backend } = useBackend()
   const { navigate } = useRouter()
@@ -74,6 +79,24 @@ function useFirstRunRedirect(dest: Dest) {
 export function AppShell() {
   const { route } = useRouter()
   const dest = route.dest
+
+  // Before the frame, and deliberately not one of the sections below. On a
+  // fresh install the header, the roster rail and every panel are empty, and a
+  // chrome around four empty boxes is a worse first impression than no chrome.
+  // It is still a real destination with a real URL, so it can be linked,
+  // reloaded and re-run by typing it.
+  if (dest === 'setup') return <SetupTab />
+
+  return (
+    <MetricsProvider>
+      <TelemetryProvider>
+        <Frame dest={dest} />
+      </TelemetryProvider>
+    </MetricsProvider>
+  )
+}
+
+function Frame({ dest }: { dest: Dest }) {
   useFirstRunRedirect(dest)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   // What the sidebar was before a wide destination collapsed it, so leaving
@@ -103,20 +126,15 @@ export function AppShell() {
     }
   }, [dest])
 
-  // Before the frame, and deliberately not one of the sections below. On a
-  // fresh install the header, the roster rail and every panel are empty, and a
-  // chrome around four empty boxes is a worse first impression than no chrome.
-  // It is still a real destination with a real URL, so it can be linked,
-  // reloaded and re-run by typing it.
-  if (dest === 'setup') return <SetupTab />
-
   return (
     <SelectionProvider>
       <Header dest={dest} />
+      <HealthBanner />
 
       <div className={sidebarOpen ? 'wrap' : 'wrap narrow'}>
         <div className="rail">
           <button
+            type="button"
             className="tab"
             aria-controls="side"
             aria-expanded={sidebarOpen}
@@ -130,18 +148,7 @@ export function AppShell() {
               setSidebar(!openRef.current)
             }}
           >
-            <svg
-              width="7"
-              height="12"
-              viewBox="0 0 7 12"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.5}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M1 1l5 5-5 5" />
-            </svg>
+            <Icon name="chevron-right" size={12} decorative />
           </button>
         </div>
 
@@ -163,7 +170,7 @@ export function AppShell() {
           <section aria-label="Chat" hidden={dest !== 'chat'}>
             <ChatTab />
           </section>
-          <section aria-label="Spend" hidden={dest !== 'spend'}>
+          <section aria-label="Usage" hidden={dest !== 'usage'}>
             <SpendTab />
           </section>
           <section aria-label="Settings" hidden={dest !== 'settings'}>

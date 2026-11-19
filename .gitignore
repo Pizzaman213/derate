@@ -47,3 +47,6 @@ logs/
 .omp/design/tokens/tokens.flat.json
 .omp/package-lock.json
 .omp/charts/package-lock.json
+
+# local git worktrees for the PR split
+.worktrees/
