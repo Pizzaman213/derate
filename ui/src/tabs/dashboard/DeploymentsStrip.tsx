@@ -7,7 +7,7 @@ import type { SafeMetricsFrame } from '../../state/useMetrics'
 import type { TelemetrySeries } from '../../state/useTelemetry'
 import { Readout } from '../../components/Readout'
 import { planShortFromDegrees } from '../../format'
-import { runners } from '../cluster/layout'
+import { runners } from '../models/rows'
 import { ChartCell } from './Chart'
 
 interface Props {

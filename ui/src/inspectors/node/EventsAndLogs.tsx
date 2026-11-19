@@ -84,7 +84,7 @@ export function EventsAndLogs({
         control={
           <span className="chips">
             {LEVELS.map((l) => (
-              <button key={l} aria-pressed={l === level} onClick={() => setLevel(l)}>
+              <button type="button" key={l} aria-pressed={l === level} onClick={() => setLevel(l)}>
                 {l === 'WARNING' ? 'warnings' : 'everything'}
               </button>
             ))}

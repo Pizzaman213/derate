@@ -1,7 +1,7 @@
 import type { Cluster, MetricsNodeFrame } from '../../api/types'
 import { Readout } from '../../components/Readout'
 import { gbNum } from '../../format'
-import { runners } from '../cluster/layout'
+import { runners } from '../models/rows'
 import type { SafeMetricsFrame } from '../../state/useMetrics'
 
 interface Props {

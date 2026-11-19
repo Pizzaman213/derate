@@ -165,7 +165,7 @@ function Frame({ dest }: { dest: Dest }) {
             <ModelsTab />
           </section>
           <section aria-label="Cluster" hidden={dest !== 'cluster'}>
-            <ClusterTab />
+            <ClusterTab active={dest === 'cluster'} />
           </section>
           <section aria-label="Chat" hidden={dest !== 'chat'}>
             <ChatTab />

@@ -105,7 +105,7 @@ export function NodeCharts({
           {...common}
         />
       </ChartGrid>
-      <div style={{ marginTop: 8 }}>
+      <div style={{ marginTop: 'var(--space-8)' }}>
         <Provenance window={window} resource={history} />
       </div>
     </>

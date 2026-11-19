@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Icon } from '../../components/Icon'
 import type { GpuProcessDTO } from '../../api/types'
 import { Verbatim } from '../../components/Verbatim'
 import { useBackend } from '../../state/backend'
@@ -68,25 +69,27 @@ export function ResidentProcesses({ nodeId }: { nodeId: string }) {
             <span className="mono" title={proc.command ?? undefined}>
               {proc.name}
             </span>
-            <span style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-8)' }}>
               <span className="unit">
                 pid {proc.pid} · {gbytes(proc.gpu_memory, 1)} GiB ·{' '}
                 {proc.served_name ?? 'not managed here'}
               </span>
               {proc.killable ? (
-                <button onClick={() => void kill(proc)} disabled={busy[proc.pid]}>
+                <button type="button" onClick={() => void kill(proc)} disabled={busy[proc.pid]}>
                   {busy[proc.pid] ? 'Killing…' : 'Kill'}
                 </button>
               ) : (
                 <button
+                  type="button"
                   className="ghost"
-                  title={proc.not_killable_reason ?? undefined}
+                  aria-label="Open detail"
+                  title={proc.not_killable_reason ?? 'Open detail'}
                   onClick={() =>
                     proc.served_name &&
                     selection.openSheet({ kind: 'dep', id: proc.served_name })
                   }
                 >
-                  ↗
+                  <Icon name="external-link" size={12} decorative />
                 </button>
               )}
             </span>
@@ -94,12 +97,12 @@ export function ResidentProcesses({ nodeId }: { nodeId: string }) {
         ))
       )}
       {note ? (
-        <div style={{ marginTop: 8 }}>
+        <div style={{ marginTop: 'var(--space-8)' }}>
           <Verbatim text={note} size="label" />
         </div>
       ) : null}
       {error ? (
-        <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: '8px 0 0' }}>
+        <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: 'var(--space-8) 0 0' }}>
           {error}
         </p>
       ) : null}

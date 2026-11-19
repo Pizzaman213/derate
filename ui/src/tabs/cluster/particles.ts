@@ -15,14 +15,14 @@
 //
 // and on the return leg, a second claim in a deliberately different shape:
 //
-//     A BLOCK LEAVING A BAND IS OUTPUT TOKENS LEAVING THAT SERVED NAME.
+//     A BLOCK ON A RESPONSES WIRE IS OUTPUT TOKENS LEAVING THAT MODEL.
 //
 // Inbound, the POPULATION is the measurement: N blocks is N requests, and the
 // layer counts them up and down. Outbound, the RATE is the measurement and the
 // population means nothing -- blocks leave at a compressed, CAPPED image of
 // measured tokens/sec, so nobody can count blocks and arrive at a token
-// figure. The token figure is on the band, in tok/s, one number, where it
-// always was. Outbound flights therefore fly at a CONSTANT speed: spacing
+// figure. The token figure is on the model's row, in tok/s, one number. Outbound
+// flights therefore fly at a CONSTANT speed: spacing
 // carries the rate, and encoding one number in two channels means neither of
 // them is readable.
 //
@@ -44,14 +44,18 @@
 //     its presence still does.
 
 import { useEffect, useRef, type RefObject } from 'react'
-import type { MetricsDeploymentFrame, RoutingConfig } from '../../api/types'
-import { localFlightKey, providerFlightKey, type Point } from './layout'
+import type { MetricsDeploymentFrame, RouteTarget, RoutingConfig } from '../../api/types'
 
-/** The block's width across the wire. Deliberately inside the wire's own
- *  range (`edgeWidth` in layout.ts tops out at 5.7 for a saturated link) so
- *  the block reads as a lit-up piece of the wire, the way the header logo's
- *  pulse does, rather than a shape sitting on top of a thinner line. */
-export const PARTICLE_STROKE_WIDTH = 3
+/** The geometry a flight walks: an SVG `<path>`, or anything that answers
+ *  the same two questions. The wiring editor hands its rendered wires in. */
+export interface PathLike {
+  getTotalLength(): number
+  getPointAtLength(distance: number): { x: number; y: number }
+}
+
+/** A request in flight; output tokens leaving. The wire colours they ride. */
+export const REQUEST_COLOUR = 'var(--graph-req)'
+export const RESPONSE_COLOUR = 'var(--graph-resp)'
 
 /** Used only when a target has requests in flight but has never completed one,
  *  so there is no measured duration to fly at yet. */
@@ -66,10 +70,8 @@ export const TOPUP_MS = 200
 
 /** One routing target's live contribution to the animation. */
 export interface TargetFlow {
-  /** The path this target's requests walk, from `localFlightKey` /
-   *  `providerFlightKey`. Targets that share a key (every remote target of a
-   *  served name shares the one drop into the provider box) have their counts
-   *  summed. */
+  /** The path this target's requests walk, from the caller's `keyFor`.
+   *  Targets that share a key have their counts summed. */
   pathKey: string
   /** Requests measured in flight on this target right now. */
   inflight: number
@@ -95,9 +97,13 @@ export function targetFlows(
   routing: RoutingConfig[],
   frames: MetricsDeploymentFrame[] | null | undefined,
   stale: boolean,
+  /** Which drawn path a target's requests walk; `null` = none is drawn. */
+  keyFor: (servedName: string, target: RouteTarget) => string | null,
 ): TargetFlow[] {
   return routing.flatMap((cfg) =>
-    cfg.targets.map((t) => {
+    cfg.targets.flatMap((t) => {
+      const pathKey = keyFor(cfg.served_name, t)
+      if (pathKey == null) return []
       // Two reads of the same counter at two cadences. The 1 Hz stream carries
       // it for local targets as `queue_depth`; the 5s routing poll carries it
       // for every target as `outstanding`. Prefer the fresher one where it
@@ -107,14 +113,13 @@ export function targetFlows(
         t.kind === 'local' && !stale
           ? (frames ?? []).find((d) => d.deployment_id === t.target_id)?.queue_depth
           : null
-      return {
-        pathKey:
-          t.kind === 'remote'
-            ? providerFlightKey(cfg.served_name)
-            : localFlightKey(cfg.served_name, t.target_id),
-        inflight: Math.max(0, live ?? t.outstanding ?? 0),
-        meanDurationS: t.counters?.mean_duration_s ?? null,
-      }
+      return [
+        {
+          pathKey,
+          inflight: Math.max(0, live ?? t.outstanding ?? 0),
+          meanDurationS: t.counters?.mean_duration_s ?? null,
+        },
+      ]
     }),
   )
 }
@@ -131,7 +136,7 @@ export function flightMs(meanDurationS: number | null): number {
  *  request on an undrawn target is better shown nowhere than shown on the
  *  wrong machine. The duration kept for a shared path is the longest of its
  *  contributors', so a slow provider is not drawn at a local target's pace. */
-export function collapseFlows(flows: TargetFlow[], paths: Record<string, Point[]>): Map<string, TargetFlow> {
+export function collapseFlows(flows: TargetFlow[], paths: Record<string, PathLike>): Map<string, TargetFlow> {
   const byPath = new Map<string, TargetFlow>()
   for (const f of flows) {
     if (!paths[f.pathKey]) continue
@@ -213,7 +218,7 @@ export interface StreamFlow {
  *  summing -- one band is one path, so there is nothing to collapse into. */
 export function collapseStreams(
   streams: StreamFlow[],
-  paths: Record<string, Point[]>,
+  paths: Record<string, PathLike>,
 ): StreamFlow[] {
   return streams.filter((s) => paths[s.pathKey] != null && s.tokensPerSec > 0)
 }
@@ -234,29 +239,6 @@ export function mostlyStreaming(ratio: number | null): boolean | null {
   return ratio == null ? null : ratio >= STREAM_MAJORITY
 }
 
-/** The out-stream's colour.
- *
- *  THIS PAINTS A LIVE ANIMATION WITH A HISTORICAL RATIO, and that is a choice
- *  made with its cost known, not an oversight. `GET /api/history/requests` is
- *  the only place that records whether a request asked for `stream: true` --
- *  the 1 Hz frame carries no such flag and `/api/routing` does not split its
- *  `outstanding` by it, so the live wire cannot answer this question at all.
- *
- *  The consequence is real and is not a rounding error: a served name that
- *  streamed all afternoon and is being batch-hammered right now keeps drawing
- *  in the streamed colour until the window rolls past the streamed traffic. So
- *  the two clocks are kept apart everywhere they can be -- a block's PRESENCE
- *  and RATE are live and measured, its COLOUR is how this name has recently
- *  been called -- and the legend names the window so the reader is told the
- *  same thing this comment tells you.
- *
- *  A ratio nobody has rows for is NOT guessed into a default. It paints the
- *  same "no reading" grey the empty meter track uses. */
-export function streamTone(streaming: boolean | null): string {
-  if (streaming == null) return 'var(--ink-muted)'
-  return streaming ? 'var(--stream)' : 'var(--batch)'
-}
-
 /** Streamed tokens arrive as slivers; a buffered response arrives whole. The
  *  difference is carried by shape as well as hue, so it survives a
  *  colour-blind reader and a greyscale screenshot. */
@@ -264,65 +246,49 @@ export function streamBlockWidth(streaming: boolean | null): number {
   return streaming === true ? 6 : 11
 }
 
-/** One flight: a block that slides along `d` over `durationMs`, then removed.
- *  `layer` is never touched by React -- this is the only thing that mutates
- *  it, and it does so with plain DOM calls so the flight keeps running
+/** One flight: a small rect walked along `path` over `durationMs`, then
+ *  removed. `layer` is never touched by React -- this is the only thing that
+ *  mutates it, and it does so with plain DOM calls so the flight keeps running
  *  through any number of parent re-renders. `onDone` fires exactly once, when
- *  the block leaves, so the caller's in-flight tally can drop.
- *
- *  The block is drawn the way the header logo's pulse is: a dashed segment of
- *  the SAME rendered path the wire itself strokes (see `pathsRender` in
- *  layout.ts), animated by sliding `stroke-dashoffset`, rather than a
- *  separate shape whose position is interpolated by hand. That makes it
- *  geometrically impossible for the block to sit off the wire, corners
- *  included, and reads as a lit-up piece of the line rather than a box
- *  riding over it. */
+ *  the block leaves, so the caller's in-flight tally can drop. */
 export function spawnParticle(
   layer: SVGGElement,
-  d: string,
+  path: PathLike,
   color: string,
   durationMs: number = FLIGHT_MS,
   onDone?: () => void,
-  /** Dash length, i.e. the block's size ALONG the path. The default is the
-   *  inbound request block; a shorter one is how a streamed token reads as a
-   *  sliver (`streamBlockWidth`). */
-  blockLen: number = 11,
-  strokeWidth: number = PARTICLE_STROKE_WIDTH,
+  /** Block size. The defaults are the inbound block; a narrower block is how
+   *  a streamed token reads as a sliver. */
+  w: number = 11,
+  h: number = 9,
 ): void {
-  const NS = 'http://www.w3.org/2000/svg'
-  const path = document.createElementNS(NS, 'path')
-  path.setAttribute('d', d)
-  path.setAttribute('fill', 'none')
-  path.setAttribute('stroke', color)
-  path.setAttribute('stroke-width', String(strokeWidth))
-  // Butt, not round: a round cap adds half the stroke width past each end of
-  // the dash, which would elongate the block past `blockLen` -- the same
-  // reason the logo's own pulse (docs/screenshots/brand/build.py) uses it.
-  path.setAttribute('stroke-linecap', 'butt')
-  layer.appendChild(path)
-
   const total = path.getTotalLength()
-  if (!d || total <= 0) {
-    path.remove()
+  if (!(total > 0)) {
     onDone?.()
     return
   }
-  path.setAttribute('stroke-dasharray', `${blockLen} ${total}`)
+  const NS = 'http://www.w3.org/2000/svg'
+  const box = document.createElementNS(NS, 'rect')
+  box.setAttribute('width', String(w))
+  box.setAttribute('height', String(h))
+  box.setAttribute('rx', '1.5')
+  box.setAttribute('fill', color)
+  layer.appendChild(box)
 
   const t0 = performance.now()
   const span = Math.max(1, durationMs)
 
   const step = (now: number) => {
     const p = Math.min((now - t0) / span, 1)
-    // Slides the dash's leading edge from the path's start (p=0) to past its
-    // end (p=1), the same offset technique `pulse_path()` uses.
-    path.setAttribute('stroke-dashoffset', String(blockLen - p * (blockLen + total)))
+    const at = path.getPointAtLength(p * total)
+    box.setAttribute('x', String(at.x - Math.floor(w / 2)))
+    box.setAttribute('y', String(at.y - Math.floor(h / 2)))
     // A parent unmount can detach `layer` before this flight finishes; the
-    // path just keeps walking off-tree for the rest of its span and is
+    // rect just keeps walking off-tree for the rest of its span and is
     // garbage the moment the callback stops, so there is nothing to guard.
     if (p < 1) requestAnimationFrame(step)
     else {
-      path.remove()
+      box.remove()
       onDone?.()
     }
   }
@@ -338,10 +304,7 @@ export interface ParticleFieldOptions {
   /** The return legs. Empty means nothing selected or nothing being produced,
    *  which draw the same thing: nothing. */
   streams: StreamFlow[]
-  paths: Record<string, Point[]>
-  /** The same flights, rendered -- what `spawnParticle` actually walks. See
-   *  `ClusterLayout.pathsRender` in layout.ts. */
-  pathsRender: Record<string, string>
+  paths: Record<string, PathLike>
 }
 
 /** Mount-scoped top-up loop, cancelled on unmount and fully suppressed under
@@ -378,10 +341,10 @@ export function useParticleField(opts: ParticleFieldOptions): void {
       for (const [key, flow] of byPath) {
         const running = active.get(key) ?? 0
         if (running >= flow.inflight) continue
-        const d = latest.current.pathsRender[key]
-        if (!d) continue
+        const pts = latest.current.paths[key]
+        if (!pts) continue
         active.set(key, running + 1)
-        spawnParticle(layer, d, 'var(--flow)', flightMs(flow.meanDurationS), () => {
+        spawnParticle(layer, pts, REQUEST_COLOUR, flightMs(flow.meanDurationS), () => {
           active.set(key, Math.max(0, (active.get(key) ?? 1) - 1))
         })
       }
@@ -389,8 +352,8 @@ export function useParticleField(opts: ParticleFieldOptions): void {
       // The return legs. One loop, one reduced-motion guard, so the output
       // stream is suppressed with the rest of it rather than needing its own.
       for (const s of collapseStreams(latest.current.streams, latest.current.paths)) {
-        const d = latest.current.pathsRender[s.pathKey]
-        if (!d) continue
+        const pts = latest.current.paths[s.pathKey]
+        if (!pts) continue
         const { credit, emit } = streamCredit(credits.get(s.pathKey) ?? 0, s.tokensPerSec, TOPUP_MS)
         credits.set(s.pathKey, credit)
         // No onDone and no tally: the population is not the measurement here,
@@ -398,8 +361,8 @@ export function useParticleField(opts: ParticleFieldOptions): void {
         if (emit) {
           spawnParticle(
             layer,
-            d,
-            streamTone(s.streaming),
+            pts,
+            RESPONSE_COLOUR,
             STREAM_FLIGHT_MS,
             undefined,
             streamBlockWidth(s.streaming),
