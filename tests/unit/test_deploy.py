@@ -612,7 +612,9 @@ def test_sglangs_runtime_spec_fields(tmp_path):
     on the string "sglang" anywhere else in `sparkrun.py`/`recipes.py`, so a
     wrong value here is a wrong launch with no other test to catch it."""
     spec = RUNTIMES["sglang"]
-    assert spec.default_image == "scitrera/dgx-spark-sglang:0.5.9-t5"
+    # Pinned by digest as well as tag (M-series image hardening): a tag can be
+    # repushed, a digest cannot.
+    assert spec.default_image.startswith("scitrera/dgx-spark-sglang:0.5.9-t5@sha256:")
     assert spec.default_image_env == "DERATE_SGLANG_IMAGE"
     # sglang's own name for concurrency, not vLLM's max_num_seqs -- this is
     # what `test_render_command_sglang_uses_its_own_concurrency_key` already
@@ -5342,7 +5344,14 @@ def test_the_sglang_recipe_actually_names_sglangs_own_flags(tmp_path):
         "--mem-fraction-static {gpu_memory_utilization}",
     ):
         assert flag in recipe, "sglang command template drops %r" % flag
-    assert "--trust-remote-code" in recipe
+    # Remote code is opt-in (R2), so the default recipe does not carry the flag.
+    assert "--trust-remote-code" not in recipe
+    opted_in = synthesize(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), "sglang", 8192, 64, "m",
+        port=8100, gpu_memory_utilization=0.25, recipe_dir=tmp_path,
+        trust_remote_code=True,
+    ).content
+    assert "--trust-remote-code" in opted_in
     # And the defaults block actually carries a value for the one key whose
     # name differs from vLLM's (max_running_requests, not max_num_seqs) --
     # the exact mismatch `test_render_command_sglang_uses_its_own_concurrency_key`

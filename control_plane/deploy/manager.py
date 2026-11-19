@@ -500,6 +500,9 @@ class DeploymentManager:
         # that predates this kwarg keeps working unchanged instead of raising
         # a TypeError the first time a launch reaches it.
         self._probe_accepts_health_path = _accepts_kwarg(probe_fn, "health_path")
+        # Same rule for the runtime key (H3): a probe double that predates it
+        # is probed without one rather than raising TypeError on every call.
+        self._probe_accepts_api_key = _accepts_kwarg(probe_fn, "api_key")
         self._port_free = port_free_fn
 
         self._lock = threading.RLock()
@@ -1778,6 +1781,11 @@ class DeploymentManager:
             return None
         return int(value) if value is not None else None
 
+    def _key_kwargs(self, record: "_Record") -> dict[str, str]:
+        """`{"api_key": ...}` to splat into `self._probe`, or `{}` when the
+        probe does not take one (see `_probe_accepts_api_key`)."""
+        return _key_kw(record) if self._probe_accepts_api_key else {}
+
     def _health_kwargs(self, deployment: Any) -> dict[str, str | None]:
         """`{"health_path": ...}` to splat into `self._probe`, or `{}`.
 
@@ -2132,7 +2140,7 @@ class DeploymentManager:
                     timeout=self._ready_probe_timeout(),
                     expect_model=deployment.served_name,
                     **self._health_kwargs(deployment),
-                    **_key_kw(record),
+                    **self._key_kwargs(record),
                 )
                 if healthy:
                     with self._lock:
@@ -2443,7 +2451,7 @@ class DeploymentManager:
                     timeout=probe_timeout,
                     expect_model=record.deployment.served_name,
                     **self._health_kwargs(record.deployment),
-                    **_key_kw(record),
+                    **self._key_kwargs(record),
                 )
             except Exception as exc:  # a probe_fn must never crash the watch thread
                 outcome = (False, "probe raised %s: %s" % (type(exc).__name__, exc))
@@ -2787,7 +2795,7 @@ class DeploymentManager:
                 url,
                 expect_model=deployment.served_name,
                 **self._health_kwargs(deployment),
-                **_key_kw(record),
+                **self._key_kwargs(record),
             )
             if healthy:
                 if deployment.state is S.STOPPING:

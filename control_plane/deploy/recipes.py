@@ -588,13 +588,6 @@ def synthesize(
         "runtime: %s\n" % spec.sparkrun_runtime,
         "min_nodes: %d\n" % len(plan.node_ids),
         "container: %s\n" % img,
-        # M8: sparkrun's docker executor defaults to --privileged. The GPU
-        # reaches the container through --gpus, not privilege; IPC_LOCK is
-        # what pinned host memory needs.
-        "executor_config:\n",
-        "  privileged: false\n",
-        "  cap_add: [IPC_LOCK]\n",
-        "\n",
         "metadata:\n",
         "  description: derate %s, %s\n" % (served_name, plan.kind.value),
         "  derate_plan: %s\n" % _plan_summary(plan),
@@ -661,8 +654,20 @@ def synthesize(
     # remove. `""` and null are two different answers here and only one of
     # them is ours. Module constants from flags.py, never request text, for
     # the same reason `cache_env` is not run through the checks above.
+    #
+    # One block, because a second `executor_config:` key would silently
+    # replace the first. M8 comes first and applies to every runtime: sparkrun's
+    # docker executor defaults to --privileged, the GPU reaches the container
+    # through --gpus rather than privilege, and IPC_LOCK is what pinned host
+    # memory needs. A runtime's own entries (llamacpp's cleared `gpus` and
+    # `entrypoint`) follow.
+    lines += [
+        "\n",
+        "executor_config:\n",
+        "  privileged: false\n",
+        "  cap_add: [IPC_LOCK]\n",
+    ]
     if spec.executor_config:
-        lines += ["\n", "executor_config:\n"]
         lines += [
             "  %s: %s\n" % (k, json.dumps(v)) for k, v in spec.executor_config
         ]
