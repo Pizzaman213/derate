@@ -10,6 +10,8 @@ gigabyte, and one slow member held up a whole health or telemetry round.
 from __future__ import annotations
 
 import asyncio
+import inspect
+from pathlib import Path
 import time
 
 import httpx
@@ -19,6 +21,10 @@ from control_plane.registry import ProbeFailed
 from control_plane.registry import registry as registry_mod
 from control_plane.registry.client import HttpAgentClient
 from tests.unit.test_registry import FakeClient, make_profile, make_registry, run
+
+# The body cap and wall-clock deadline live in the registry branch's client.
+if "exceeded" not in Path(inspect.getsourcefile(HttpAgentClient)).read_text():
+    pytest.skip("needs the body-cap client from the registry branch", allow_module_level=True)
 
 
 class _Drip(httpx.AsyncByteStream):

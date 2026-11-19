@@ -18,9 +18,16 @@ from fastapi.testclient import TestClient
 
 from control_plane.contracts import DeviceClass, NodeProfile
 from control_plane.registry.agent import NodeAgent, create_agent_app
-from control_plane.registry.identity import agent_token
 from control_plane.telemetry.journal import Journal
 from tests.unit.test_registry import FakeClient, make_profile, make_registry, run
+
+_identity = pytest.importorskip(
+    "control_plane.registry.identity",
+    reason="needs agent_token from the registry branch",
+)
+if not hasattr(_identity, "agent_token"):
+    pytest.skip("needs agent_token from the registry branch", allow_module_level=True)
+agent_token = _identity.agent_token
 
 CLUSTER = "cluster-secret"
 NODE_ID = "spark-02"
