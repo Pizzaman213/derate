@@ -233,8 +233,8 @@ class RestartCoordinator:
         deployment_id = event.get("deployment_id")
         if not deployment_id:
             return
-        state = self._state.get(served_name)
-        if state is not None and state.in_flight:
+        existing = self._state.get(served_name)
+        if existing is not None and existing.in_flight:
             # A flapping health probe can fire this twice for one deployment;
             # one retry loop per served_name at a time.
             return
