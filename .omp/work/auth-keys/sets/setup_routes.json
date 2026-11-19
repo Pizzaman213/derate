@@ -1,0 +1,39 @@
+{
+ "derived_by": "hand-written (U0.1) from the plan's 'Open routes' decision",
+ "before_first_admin": [
+  {
+   "route": "POST /api/setup/admin",
+   "why": "creates the first admin, from a loopback peer only (403 setup_local_only otherwise); 410 setup_closed once one exists"
+  }
+ ],
+ "always_open": [
+  {
+   "route": "GET /healthz",
+   "why": "liveness probe for load balancers and install.sh; carries no data"
+  },
+  {
+   "route": "GET /install.sh",
+   "why": "curl | sh on a new node has no session"
+  },
+  {
+   "route": "POST /api/nodes/join",
+   "why": "worker join authenticates with the cluster token in the body"
+  },
+  {
+   "route": "GET /api/auth/state",
+   "why": "the UI must learn whether to show setup or login before it has a session"
+  },
+  {
+   "route": "POST /api/auth/login",
+   "why": "the way a session is obtained"
+  },
+  {
+   "route": "POST /api/auth/logout",
+   "why": "idempotent; an expired cookie must still be clearable"
+  },
+  {
+   "route": "GET /auth/callback",
+   "why": "a browser following OpenAI's redirect carries no session; the attempt's state authorises it"
+  }
+ ]
+}

@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "datasets": [
+    {
+      "name": "sales-by-month",
+      "file": "sales-by-month.json",
+      "description": "Monthly revenue, units and target for four sales regions, January 2025 to December 2026, with Q4 seasonality and steady growth.",
+      "kind": "rows",
+      "rows": 96,
+      "fields": [
+        "month",
+        "region",
+        "revenue",
+        "units",
+        "target"
+      ],
+      "intents": [
+        "compare",
+        "trend",
+        "change-over-time",
+        "composition",
+        "deviation",
+        "kpi"
+      ],
+      "suggested": [
+        "multi-line",
+        "grouped-bar",
+        "stacked-bar"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "survey-results",
+      "file": "survey-results.json",
+      "description": "Five-level Likert responses to six statements, split by Customers (212 respondents) and Staff (94 respondents).",
+      "kind": "rows",
+      "rows": 60,
+      "fields": [
+        "question",
+        "response",
+        "count",
+        "segment"
+      ],
+      "intents": [
+        "compare",
+        "composition",
+        "distribution",
+        "deviation"
+      ],
+      "suggested": [
+        "stacked-bar-100",
+        "stacked-bar",
+        "grouped-bar"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "server-metrics",
+      "file": "server-metrics.json",
+      "description": "Five-minute samples from three hosts over 16 November 2026 (UTC): a daily load cycle, a 13:50-14:45 incident on web-01 and db-01, and five missed scrapes left as nulls.",
+      "kind": "rows",
+      "rows": 864,
+      "fields": [
+        "timestamp",
+        "host",
+        "cpu",
+        "memory",
+        "latency_ms",
+        "requests"
+      ],
+      "intents": [
+        "trend",
+        "change-over-time",
+        "distribution",
+        "correlation",
+        "deviation",
+        "kpi"
+      ],
+      "suggested": [
+        "multi-line"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "population-by-region",
+      "file": "population-by-region.json",
+      "description": "Approximate 2024-25 population, land area and median age for forty countries across six world regions, with ISO 3166-1 alpha-3 codes and centroid coordinates.",
+      "kind": "rows",
+      "rows": 40,
+      "fields": [
+        "region",
+        "country",
+        "iso3",
+        "population",
+        "area_km2",
+        "median_age",
+        "lat",
+        "lon"
+      ],
+      "intents": [
+        "geo",
+        "compare",
+        "rank",
+        "correlation",
+        "composition",
+        "distribution"
+      ],
+      "suggested": [
+        "grouped-bar"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "ohlc-prices",
+      "file": "ohlc-prices.json",
+      "description": "Daily open, high, low, close and volume for one fictional stock over 120 trading days from 1 June 2026 (weekends skipped, no holidays), from a seeded random walk.",
+      "kind": "rows",
+      "rows": 120,
+      "fields": [
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+      ],
+      "intents": [
+        "trend",
+        "change-over-time",
+        "distribution"
+      ],
+      "suggested": [
+        "multi-line"
+      ],
+      "added": "2026-11-17"
+    }
+  ]
+}

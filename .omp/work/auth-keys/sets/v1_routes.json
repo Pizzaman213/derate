@@ -1,0 +1,14 @@
+{
+  "derived_by": "python3 -c \"import json; r=json.load(open('control_plane/contracts/routes.json'))['gateway']; print(json.dumps([m+' '+x['path'] for x in r if x['path'].startswith('/v1') for m in x['methods']]))\"  (after: python3 -m control_plane.contracts.routes --write)",
+  "members": [
+    "POST /v1/audio/speech",
+    "POST /v1/audio/transcriptions",
+    "GET /v1/audio/voices",
+    "POST /v1/chat/completions",
+    "POST /v1/completions",
+    "POST /v1/embeddings",
+    "GET /v1/key",
+    "GET /v1/models",
+    "WEBSOCKET /v1/realtime"
+  ]
+}

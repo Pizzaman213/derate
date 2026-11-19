@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "icons": [
+    {
+      "name": "donut",
+      "chart": "donut",
+      "category": "part-to-whole",
+      "tags": [
+        "donut",
+        "composition"
+      ],
+      "usage": "Donut chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "grouped-bar",
+      "chart": "grouped-bar",
+      "category": "comparison",
+      "tags": [
+        "grouped",
+        "bar",
+        "compare",
+        "rank"
+      ],
+      "usage": "Grouped bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "multi-line",
+      "chart": "multi-line",
+      "category": "trend",
+      "tags": [
+        "multi",
+        "line",
+        "trend",
+        "change-over-time",
+        "compare"
+      ],
+      "usage": "Multi-line chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "pie",
+      "chart": "pie",
+      "category": "part-to-whole",
+      "tags": [
+        "pie",
+        "composition"
+      ],
+      "usage": "Pie chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "stacked-bar",
+      "chart": "stacked-bar",
+      "category": "comparison",
+      "tags": [
+        "stacked",
+        "bar",
+        "compare",
+        "composition"
+      ],
+      "usage": "Stacked bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "stacked-bar-100",
+      "chart": "stacked-bar-100",
+      "category": "comparison",
+      "tags": [
+        "stacked",
+        "bar",
+        "100",
+        "composition",
+        "compare"
+      ],
+      "usage": "100% stacked bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    }
+  ]
+}
