@@ -1,7 +1,7 @@
 # styles
 
 The chrome, in two sheets imported exactly once, on top of a palette that is
-generated. `main.tsx` loads them in order — `styles/tokens.css`,
+generated. `main.tsx` loads them in order — `.omp/design/tokens/tokens.css`,
 `base.css`, `derate.css` — and that order is the cascade: the palette first,
 the element baseline on top of it, the structural chrome on top of that. No
 component in this app carries a literal colour, so dark mode (and high
@@ -17,7 +17,7 @@ decisions below still hold and are now the `$description` of each token.
 
 | File | Lines | What it owns |
 |---|---|---|
-| `tokens.css` | generated | the entire palette, the type scale, the spacing grid (`--space-<px>`), motion, elevation, and the dark and high-contrast blocks |
+| `../../../.omp/design/tokens/tokens.css` | generated | the entire palette, the type scale, the spacing grid (`--space-<px>`), motion, elevation, and the dark and high-contrast blocks |
 | `base.css` | 143 | the reset, `html`/`body`/`#root` sizing, the typographic classes, and the bare control rules |
 | `derate.css` | 1762 | the structural chrome: every screen's layout, ported from the design source |
 

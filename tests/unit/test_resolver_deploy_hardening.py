@@ -199,8 +199,38 @@ def _launched_row(client, dep_id: str) -> dict:
     return rows[0]
 
 
+def test_launch_audit_row_carries_what_the_command_was(tmp_path):
+    deployments = _TrustingDeployments()
+    with TestClient(create_app(build_deps(deployments=deployments))) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={
+                "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+                "extra_args": "--enforce-eager",
+                "trust_remote_code": True,
+            },
+        )
+        assert reply.status_code == 201, reply.text
+        dep = reply.json()
+        assert dep["trust_remote_code"] is True
+        row = _launched_row(client, dep["deployment_id"])
+    after = row["after"]
+    assert after["extra_args"] == ["--enforce-eager"]
+    assert after["custom_command"] == []
+    assert after["speculative_tokens"] == 0
+    assert after["trust_remote_code"] is True
+    assert after["image"].startswith("ghcr.io/example/vllm@sha256:")
 
 
+def test_launch_body_trust_remote_code_must_be_a_bool():
+    deployments = _TrustingDeployments()
+    with TestClient(create_app(build_deps(deployments=deployments))) as client:
+        reply = client.post(
+            "/api/deployments",
+            json={"model_id": "meta-llama/Llama-3.3-70B-Instruct", "trust_remote_code": "yes"},
+        )
+    assert reply.status_code == 400
+    assert deployments.launched == []
 
 
 class _RecordingAdapter(FakeAdapter):
@@ -209,6 +239,39 @@ class _RecordingAdapter(FakeAdapter):
         return super().launch(*args, **kw)
 
 
+def test_manager_records_flag_image_and_id(tmp_path, monkeypatch):
+    from control_plane.deploy import manager as manager_mod
+
+    monkeypatch.setattr(manager_mod.imageprobe, "image_id", lambda image, **kw: "sha256:abc")
+    manager = make_manager(tmp_path)
+    manager.adapter.__class__ = _RecordingAdapter
+    # The gateway in front of it, so the id reaches the audit chain (SC-05a):
+    # the deployment record below is purged after hours, the chain is not.
+    with TestClient(create_app(build_deps(deployments=manager))) as client:
+        assert wait_for(lambda: manager.bus.subscriber_count >= 1)
+        dep = manager.launch(
+            fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 8192, 8, trust_remote_code=True,
+        )
+        assert dep.trust_remote_code is True
+        assert dep.image  # the reference the launch will run
+        assert wait_for(lambda: manager.get(dep.deployment_id).image_id == "sha256:abc")
+        assert manager.adapter.trusted is True
+        stored = json.loads(next(tmp_path.rglob(f"{dep.deployment_id}.json")).read_text())
+        assert stored["deployment"]["trust_remote_code"] is True
+        assert stored["deployment"]["image_id"] == "sha256:abc"
+
+        def image_rows():
+            entries = client.get(
+                "/api/audit", params={"action": "deployment_launched", "page_size": 50}
+            ).json()["entries"]
+            return [e for e in entries if e["target_id"] == dep.deployment_id]
+
+        assert wait_for(lambda: bool(image_rows()))
+        row = image_rows()[0]
+    assert row["actor"] == "system:launch"
+    assert row["after"]["image"] == dep.image
+    assert row["after"]["image_id"] == "sha256:abc"
+    assert row["after"]["node_id"] == fx.pp2_plan().node_ids[0]
 
 
 # -- E4: the failed-log name -----------------------------------------------
@@ -235,17 +298,75 @@ def test_archived_log_name_cannot_leave_its_directory(tmp_path):
 # -- E2: cache-delete folder ------------------------------------------------
 
 
+@pytest.mark.parametrize("folder", ["not-a-folder", "models--a?x", "models--a#b", "models--a b"])
+def test_cache_delete_refuses_anything_but_one_models_folder(folder):
+    from urllib.parse import quote
+
+    with TestClient(create_app(build_deps())) as client:
+        reply = client.delete(f"/api/storage/nodes/spark-01/models/{quote(folder, safe='')}")
+    assert reply.status_code == 400, reply.text
+    assert reply.json()["error"]["code"] == "invalid_folder"
 
 
 # -- R7: avatar fan-out ------------------------------------------------------
 
 
+def test_avatar_batch_is_capped_per_session(monkeypatch):
+    from control_plane.resolver import avatars
+
+    async def resolve_many(owners):
+        return {o: False for o in owners}
+
+    monkeypatch.setattr(avatars, "resolve_many", resolve_many)
+    owners = ",".join(f"o{i}" for i in range(64))
+    with TestClient(create_app(build_deps())) as client:
+        codes = [
+            client.get("/api/publishers/avatars", params={"owners": owners}).status_code
+            for _ in range(4)
+        ]
+    # 3 x 64 = 192 fits in 240; the fourth batch would make 256.
+    assert codes == [200, 200, 200, 429]
 
 
+def test_avatar_answers_from_the_cache_are_not_charged(monkeypatch):
+    """Every screen asks for the same grid; only hub-bound lookups count."""
+    from control_plane.resolver import avatars
+
+    async def resolve_many(owners):
+        return {o: True for o in owners}
+
+    monkeypatch.setattr(avatars, "resolve_many", resolve_many)
+    monkeypatch.setattr(avatars, "uncached", lambda owners: [])
+    owners = ",".join(f"o{i}" for i in range(64))
+    with TestClient(create_app(build_deps())) as client:
+        codes = {
+            client.get("/api/publishers/avatars", params={"owners": owners}).status_code
+            for _ in range(10)
+        }
+    assert codes == {200}
 
 
+def test_logo_file_names_are_hashed_and_distinct():
+    from control_plane.providers.logos import _safe
+
+    a, b = _safe("a" * 64 + "x"), _safe("a" * 64 + "y")
+    assert a != b and len(a) == 16 and all(c in "0123456789abcdef" for c in a)
+    assert _safe("a/b") != _safe("a_b")
 
 
+def test_logo_cache_prune_evicts_expired(tmp_path):
+    import asyncio
+
+    from control_plane.providers.logos import LogoCache
+
+    cache = LogoCache(tmp_path)
+    cache.remember_miss("gone", permanent=True, now=0.0)
+    cache.put("kept", b"<svg/>", "image/svg+xml", now=1e12)
+    cache.lock_for("gone")
+    cache.prune(now=1e9)
+    assert "gone" not in cache._memory and "gone" not in cache._locks
+    assert "kept" in cache._memory
+    assert isinstance(cache.lock_for("again"), asyncio.Lock)
 
 
 # -- E3: shell key -----------------------------------------------------------

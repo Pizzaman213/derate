@@ -59,7 +59,7 @@ pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "slow: minutes, not seconds. Deselect with -m 'not slow'.",
-    "raw_http: no automatic admin session or API key is attached.",
+    "raw_http: no automatic admin session or API key is attached (tests/unit/conftest.py).",
 ]
 
 [tool.ruff]

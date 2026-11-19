@@ -421,10 +421,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         Never the secret or its hash -- ``ApiKey`` has neither -- and never
         the admin's notes about it.
         """
-        try:
-            from .keys_api import usage_totals
-        except ImportError:  # the auth-keys branch is not merged: no cycle usage
-            usage_totals = None
+        from .keys_api import usage_totals
 
         principal: Principal = request.state.principal
         stores = ctx.auth_stores
@@ -434,7 +431,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         cycle_start, resets_at = stores.limits.cycle_bounds(key.created_at, now)
         archive = getattr(getattr(ctx, "telemetry", None), "archive", None)
         usage = None
-        if archive is not None and usage_totals is not None:
+        if archive is not None:
             try:
                 totals = await asyncio.to_thread(
                     usage_totals, archive, "key_id", [key.key_id], cycle_start, now

@@ -496,12 +496,60 @@ def _gateway(agent_url, deployments, handles=None):
     return create_app(build_deps(registry=Reg(), deployments=Deps(deployments)))
 
 
+def test_route_annotates_a_stray_and_leaves_it_killable():
+    procs_wire = [
+        {"pid": 5, "name": "llama-server", "command": "llama-server --port 8080",
+         "user": "connor", "gpu_memory": 72 * GIB}
+    ]
+    with FakeAgent(procs_wire) as agent:
+        with TestClient(_gateway(agent.url, [])) as client:
+            body = client.get("/api/nodes/spark-01/processes").json()
+    assert body["processes"][0]["killable"] is True
+    assert body["processes"][0]["deployment_id"] is None
 
 
+def test_route_refuses_to_kill_a_backend_the_router_is_still_using():
+    from tests.unit.test_gateway import make_deployment
+
+    dep = make_deployment(
+        "d-1",
+        "gpt-oss-120b",
+        backend_url="http://127.0.0.1:8100/v1",
+        state=DeploymentState.READY,
+        node_ids=("spark-01",),
+    )
+    procs_wire = [
+        {"pid": 9, "name": "vllm", "command": "vllm serve --port 8100",
+         "user": "root", "gpu_memory": 60 * GIB}
+    ]
+    with FakeAgent(procs_wire) as agent:
+        app = _gateway(agent.url, [dep], handles={"d-1": {"cluster_id": None, "port": 8100}})
+        with TestClient(app) as client:
+            res = client.delete("/api/nodes/spark-01/processes/9")
+    assert res.status_code == 409
+    assert "gpt-oss-120b" in res.json()["error"]["message"]
+    assert agent.killed == []  # never reached the machine
 
 
+def test_route_kills_a_stray_and_presents_the_agent_token():
+    procs_wire = [
+        {"pid": 5, "name": "llama-server", "command": "llama-server --port 8080",
+         "user": "connor", "gpu_memory": 72 * GIB}
+    ]
+    with FakeAgent(procs_wire) as agent:
+        with TestClient(_gateway(agent.url, [])) as client:
+            res = client.delete("/api/nodes/spark-01/processes/5")
+    assert res.status_code == 200
+    assert res.json()["gpu_memory_reclaimed"] == GIB
+    assert agent.killed == [5]
+    assert agent.tokens == [AGENT_TOKENS["spark-01"]]
 
 
+def test_route_404s_a_pid_that_is_not_holding_gpu_memory():
+    with FakeAgent([]) as agent:
+        with TestClient(_gateway(agent.url, [])) as client:
+            res = client.delete("/api/nodes/spark-01/processes/4242")
+    assert res.status_code == 404
 
 
 def test_a_node_with_no_agent_url_says_so_rather_than_looking_idle():

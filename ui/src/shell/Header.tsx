@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import { Icon } from '../components/Icon'
+import { useAuth } from '../state/auth'
 import { plainClick, useRouter, type Dest } from '../state/router'
 import { useCluster, useRouting, useSettings } from '../state/resources'
 import { useMetrics } from '../state/metrics'
@@ -30,6 +31,7 @@ export function Header({ dest }: Props) {
   const cluster = useCluster()
   const settings = useSettings()
   const { stream } = useMetrics()
+  const { state: auth, logout } = useAuth()
   const stale = stream.status === 'stale'
 
   const nodes = cluster.data?.nodes ?? []
@@ -88,6 +90,20 @@ export function Header({ dest }: Props) {
           </a>
         ))}
       </nav>
+
+      {/* Who is signed in, and the way out. The session is a cookie the page
+          cannot read, so the name comes from /api/auth/state. */}
+      {auth?.username ? (
+        <button
+          type="button"
+          className="ghost"
+          onClick={() => void logout()}
+          title={`Signed in as ${auth.username}`}
+        >
+          <Icon name="log-out" size={14} decorative /> Sign out{' '}
+          <span className="mono">{auth.username}</span>
+        </button>
+      ) : null}
     </header>
   )
 }

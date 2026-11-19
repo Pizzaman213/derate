@@ -53,8 +53,24 @@ def _rows(app, action: AuditAction):
 # ---------------------------------------------------------------------------
 
 
+def test_an_agent_url_naming_a_third_host_is_refused(tmp_path):
+    client = FakeClient()
+    client.serve("http://10.9.9.9:8081", make_profile("spark-02", address="10.9.9.9"))
+    registry = _registry(tmp_path, client)
+    with TestClient(create_app(build_deps(registry=registry)), client=("10.0.0.12", 5000)) as http:
+        res = http.post("/api/nodes/join", json=_body(NODE, "http://10.9.9.9:8081"))
+    assert res.status_code == 403
+    assert "agent_url must name the requesting address" in res.json()["error"]["message"]
+    assert client.gets == [] if hasattr(client, "gets") else True
+    assert registry.candidates() == []
 
 
+def test_a_metadata_agent_url_is_not_a_peer_address(tmp_path):
+    registry = _registry(tmp_path, FakeClient())
+    with TestClient(create_app(build_deps(registry=registry)), client=("10.0.0.12", 5000)) as http:
+        res = http.post("/api/nodes/join", json=_body(NODE, "http://169.254.169.254:80"))
+    assert res.status_code == 403
+    assert "agent_url is not a peer address" in res.json()["error"]["message"]
 
 
 _NUMERIC_METADATA = ("2852039166", "0xa9fea9fe", "0251.0376.0251.0376")
@@ -68,10 +84,37 @@ def test_a_numeric_literal_host_is_not_a_peer_address(host):
     assert is_peer_address(host) is False
 
 
+@pytest.mark.parametrize("host", _NUMERIC_METADATA)
+def test_a_numeric_literal_agent_url_is_refused_at_join(tmp_path, host):
+    registry = _registry(tmp_path, FakeClient())
+    with TestClient(create_app(build_deps(registry=registry)), client=("10.0.0.12", 5000)) as http:
+        res = http.post("/api/nodes/join", json=_body(NODE, f"http://{host}:80"))
+    assert res.status_code == 403
+    assert "agent_url is not a peer address" in res.json()["error"]["message"]
 
 
+def test_loopback_agent_url_from_a_remote_peer_is_not_a_peer_address(tmp_path):
+    registry = _registry(tmp_path, FakeClient())
+    with TestClient(create_app(build_deps(registry=registry)), client=("10.0.0.12", 5000)) as http:
+        res = http.post("/api/nodes/join", json=_body(NODE, "http://127.0.0.1:8081"))
+    assert res.status_code == 403
+    assert "agent_url is not a peer address" in res.json()["error"]["message"]
 
 
+def test_a_loopback_requester_may_only_name_this_machine(tmp_path):
+    """Single-box dev: a worker on the coordinator's machine dials 127.0.0.1.
+    It may name an address this machine holds -- never somebody else's."""
+    local = make_profile("spark-02", address="127.0.0.1")
+    client = FakeClient()
+    client.serve("http://127.0.0.1:8081", local)
+    registry = _registry(tmp_path, client)
+    with TestClient(create_app(build_deps(registry=registry)), client=("127.0.0.1", 5000)) as http:
+        away = http.post("/api/nodes/join", json=_body(NODE, "http://10.9.9.9:8081"))
+        here = http.post("/api/nodes/join", json=_body(local, "http://127.0.0.1:8081", None))
+    assert away.status_code == 403
+    assert "agent_url must name the requesting address" in away.json()["error"]["message"]
+    assert here.status_code == 200, here.text
+    assert here.json()["status"] == "candidate"
 
 
 # ---------------------------------------------------------------------------
@@ -162,10 +205,61 @@ def test_a_profile_that_is_not_a_json_object_is_an_unusable_profile(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_a_member_rejoining_from_a_new_address_writes_node_joined(tmp_path):
+    client = FakeClient()
+    client.serve(URL, NODE)
+    moved = make_profile("spark-02", address="10.0.0.13")
+    client.serve("http://10.0.0.13:8081", moved)
+    registry = _registry(tmp_path, client)
+    run(registry.add_node("10.0.0.12"))
+    own = registry.agent_token("spark-02")
+    app = create_app(build_deps(registry=registry))
+    with TestClient(app, client=("10.0.0.13", 5000)) as http:
+        res = http.post("/api/nodes/join", json=_body(moved, "http://10.0.0.13:8081", own))
+        assert res.status_code == 200, res.text
+        assert res.json()["status"] == "member"
+        rows = _rows(app, AuditAction.NODE_JOINED)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.actor == "spark-02"
+    assert row.target_kind == "node" and row.target_id == "spark-02"
+    assert row.ip == "10.0.0.13"
+    assert row.request_id and row.request_id.startswith("r-")
+    assert row.before == {"agent_url": URL}
+    assert row.after["agent_url"] == "http://10.0.0.13:8081"
+    assert row.after["address"] == "10.0.0.13"
+    assert row.after["status"] == "member"
+    assert row.after["source"] == "agent_token"
+    assert row.after["enrollment_token_id"] is None
 
 
+def test_an_enrollment_admission_names_its_token(tmp_path):
+    client = FakeClient()
+    client.serve(URL, NODE)
+    registry = _registry(tmp_path, client)
+    enrollment = registry.mint_enrollment()
+    app = create_app(build_deps(registry=registry))
+    with TestClient(app, client=("10.0.0.12", 5000)) as http:
+        res = http.post("/api/nodes/join", json=_body(NODE, URL, enrollment.token))
+        assert res.status_code == 200, res.text
+        rows = _rows(app, AuditAction.NODE_JOINED)
+    assert [r.after["source"] for r in rows] == ["enrollment"]
+    assert rows[0].after["enrollment_token_id"] == enrollment.token_id
+    assert rows[0].before is None
 
 
+def test_a_waiting_candidates_routine_repoll_is_not_audited(tmp_path):
+    client = FakeClient()
+    client.serve(URL, NODE)
+    registry = _registry(tmp_path, client)
+    app = create_app(build_deps(registry=registry))
+    with TestClient(app, client=("10.0.0.12", 5000)) as http:
+        for _ in range(3):
+            assert http.post("/api/nodes/join", json=_body(NODE, URL, None)).status_code == 200
+        rows = _rows(app, AuditAction.NODE_JOINED)
+    assert len(rows) == 1
+    assert rows[0].after["source"] == "none"
+    assert rows[0].after["status"] == "candidate"
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +401,53 @@ def _rotate(http, password=None):
     )
 
 
+def test_rotation_waits_for_every_member_to_migrate(tmp_path):
+    client = FakeClient()
+    client.serve(URL, NODE)
+    _unmigrated_member(tmp_path)
+    registry = _registry(tmp_path, client)
+    app = create_app(build_deps(registry=registry))
+    with TestClient(app) as http:
+        res = _rotate(http)
+    assert res.status_code == 409, res.text
+    assert res.json()["error"]["code"] == "members_not_migrated"
+    assert "spark-02" in res.json()["error"]["message"]
+    assert registry.cluster_token() == TOKEN
 
 
+def test_rotation_retires_the_old_cluster_token(tmp_path):
+    client = FakeClient()
+    client.serve(URL, NODE)
+    newcomer = make_profile("spark-03", address="10.0.0.13")
+    client.serve("http://10.0.0.13:8081", newcomer)
+    registry, _ = _migrated(tmp_path, client)
+    app = create_app(build_deps(registry=registry))
+    with TestClient(app) as http:
+        assert _rotate(http, "wrong-password-xx").status_code == 401
+        res = _rotate(http)
+        assert res.status_code == 200, res.text
+        assert res.json() == {"rotated": True}
+        rows = _rows(app, AuditAction.CLUSTER_TOKEN_ROTATED)
+    fresh = registry.cluster_token()
+    assert fresh != TOKEN
+    assert len(rows) == 1 and rows[0].target_id == "cluster"
+    assert rows[0].after == {"members": 2}
+    assert fresh not in str(rows[0].after) and fresh not in res.text
+    import json
+
+    assert json.loads((tmp_path / "cluster.json").read_text())["token"] == fresh
+
+    url3 = "http://10.0.0.13:8081"
+    with TestClient(create_app(build_deps(registry=registry)), client=("10.0.0.13", 5000)) as http:
+        stale = http.post("/api/nodes/join", json=_body(newcomer, url3, TOKEN))
+        current = http.post("/api/nodes/join", json=_body(newcomer, url3, fresh))
+    assert stale.status_code == 403
+    assert current.status_code == 200 and current.json()["status"] == "candidate"
+    # The members keep their own tokens: rotation evicts nobody.
+    own = registry.agent_token("spark-02")
+    assert run(registry.handle_join(
+        joinproof.make(own, "spark-02", URL, time.time()), NODE, URL, peer="10.0.0.12"
+    ))["status"] == "member"
 
 
 def test_a_waiting_candidate_cannot_be_displaced(tmp_path):
@@ -331,3 +470,16 @@ def test_a_waiting_candidate_cannot_be_displaced(tmp_path):
     assert record["agent_url"] == "http://10.0.0.14:8081"
 
 
+def test_joins_are_windowed_per_address(tmp_path):
+    """N-8: the open join route answers one address 30 times a minute."""
+    registry = _registry(tmp_path, FakeClient())
+    app = create_app(build_deps(registry=registry))
+    with TestClient(app, client=("10.0.0.77", 5000)) as http:
+        codes = [http.post("/api/nodes/join", json={}).status_code for _ in range(31)]
+        last = http.post("/api/nodes/join", json={})
+    assert codes[:30] == [400] * 30
+    assert codes[30] == 429
+    assert last.headers["retry-after"] == "60"
+    assert last.json()["error"]["code"] == "rate_limited"
+    with TestClient(app, client=("10.0.0.78", 5000)) as http:
+        assert http.post("/api/nodes/join", json={}).status_code == 400

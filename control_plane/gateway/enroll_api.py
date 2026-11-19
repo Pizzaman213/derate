@@ -29,15 +29,20 @@ and the request's Host header is a fallback used only when it is not loopback.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, Response
 
+from ..contracts.auth import AuditAction
 from . import errors
+from .body import BodyTooLarge, optional_json_object, payload_too_large
+from .authz import audit_request
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.enroll_api")
@@ -105,17 +110,67 @@ def _coordinator_origin(ctx: GatewayContext, request: Request) -> str:
     return f"http://{address or '127.0.0.1'}:{port}"
 
 
-def build_command(origin: str, token: str) -> str:
+def install_script_bytes() -> bytes | None:
+    """The exact bytes ``/install.sh`` serves, or None when there is no script."""
+    path = install_script_path()
+    if path is None:
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+IMAGE_DIGEST_ENV = "DERATE_IMAGE_DIGEST"
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def own_image_digest() -> str | None:
+    """The digest this coordinator's own image was installed by, or None.
+
+    An image cannot carry its own digest (the digest is a hash over it), so
+    the only source is ``DERATE_IMAGE_DIGEST``, which ``install.sh --digest``
+    passes into the container. Anything not shaped like a sha256 digest is
+    ignored rather than pasted into a shell line.
+    """
+    value = (os.environ.get(IMAGE_DIGEST_ENV) or "").strip()
+    return value if _DIGEST.fullmatch(value) else None
+
+
+def build_command(
+    origin: str, token: str, script: bytes | None = None, image_digest: str | None = None
+) -> str:
     """The one line to paste on the new machine. Composed in exactly one place.
 
-    The Docker form, and still the default: it is what a Linux GPU node runs.
-    Kept as its own function and its own response field so nothing that already
-    reads ``command`` has to change.
+    The script is downloaded to a file and checked against the sha256 of the
+    bytes this coordinator serves before ``sh`` sees it, so an on-path
+    substitution fails closed at ``sha256sum -c`` instead of running as root.
+    ``script`` defaults to what ``/install.sh`` serves right now.
+
+    The file is ``mktemp``'s, never a fixed ``/tmp`` name: a fixed path in a
+    world-writable directory lets a local user swap the bytes between
+    ``sha256sum -c`` and ``sh``, or pre-plant a symlink curl writes through.
+
+    ``image_digest``, when given, is appended as ``--digest``: the new node
+    pulls the same image bytes this coordinator runs, not whatever the moving
+    tag points at today.
     """
-    return f"curl -fsSL {origin}/install.sh | sh -s -- --join {origin} --token {token}"
+    if script is None:
+        script = install_script_bytes() or b""
+    digest = hashlib.sha256(script).hexdigest()
+    command = (
+        f'f=$(mktemp) && curl -fsSL {origin}/install.sh -o "$f"'
+        f' && echo "{digest}  $f" | sha256sum -c -'
+        f' && sh "$f" --join {origin} --token {token}'
+    )
+    if image_digest:
+        command += f" --digest {image_digest}"
+    return command
 
 
-def build_commands(origin: str, token: str) -> dict[str, str]:
+def build_commands(
+    origin: str, token: str, script: bytes | None = None, image_digest: str | None = None
+) -> dict[str, str]:
     """The join line. Still composed in exactly one place.
 
     One entry, and that is the claim being made: ``install.sh`` installs a
@@ -131,7 +186,7 @@ def build_commands(origin: str, token: str) -> dict[str, str]:
     survived. Do not put a platform back in this dict without an installer
     that has been run on that platform.
     """
-    return {"docker": build_command(origin, token)}
+    return {"docker": build_command(origin, token, script, image_digest)}
 
 
 def create_router(ctx: GatewayContext) -> APIRouter:
@@ -154,7 +209,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "install_script_missing",
             )
         try:
-            body = path.read_text()
+            body = path.read_bytes()
         except OSError as exc:
             log.exception("could not read the installer script")
             return errors.error_response(
@@ -167,7 +222,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # renders this instead of downloading it is the least of it, but a
         # proxy that decides to rewrite HTML in flight would corrupt a script
         # that is about to be piped into sh.
-        return PlainTextResponse(
+        return Response(
             body,
             media_type="text/x-shellscript; charset=utf-8",
             headers={"cache-control": "no-store"},
@@ -185,12 +240,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "not_implemented",
             )
         try:
-            payload: dict[str, Any] = await request.json()
-        except Exception:
             # An empty body is the common case -- "give me the default token" --
             # so it is not an error, unlike a body that is present and malformed.
-            payload = {}
-        if not isinstance(payload, dict):
+            payload: dict[str, Any] = await optional_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except Exception:
             return errors.error_response(
                 400,
                 "Body must be a JSON object.",
@@ -235,14 +290,26 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # meant to copy, minted for one install and expiring within the hour,
         # not a credential the UI stores or a field it can reach into. No
         # endpoint anywhere returns the permanent cluster token.
-        body["command"] = build_command(origin, token.token)
+        script = install_script_bytes()
+        image_digest = own_image_digest()
+        body["command"] = build_command(origin, token.token, script, image_digest)
         # Additive: the Docker line above is unchanged for every existing
         # reader, and "commands" carries the same token for the two
         # platforms that cannot run it.
-        body["commands"] = build_commands(origin, token.token)
+        body["commands"] = build_commands(origin, token.token, script, image_digest)
         body["join_url"] = origin
         body["install_url"] = f"{origin}/install.sh"
         body["public_install_url"] = PUBLIC_INSTALL_URL
+        # The id and expiry only: the token itself never reaches the audit.
+        audit_request(
+            request, AuditAction.ENROLLMENT_MINTED, "enrollment", token.token_id,
+            after={
+                "token_id": token.token_id,
+                "expires_at": token.expires_at,
+                "uses_remaining": token.uses_remaining,
+                "auto_admit": token.auto_admit,
+            },
+        )
         return JSONResponse(body)
 
     @router.get("/api/enroll")
@@ -257,7 +324,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return JSONResponse([])
 
     @router.delete("/api/enroll/{token_id}")
-    async def revoke_enrollment(token_id: str) -> Response:
+    async def revoke_enrollment(token_id: str, request: Request) -> Response:
         revoke = _registry_call("revoke_enrollment")
         if revoke is None:
             return errors.error_response(
@@ -274,6 +341,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "enrollment_not_found",
             )
+        audit_request(
+            request, AuditAction.ENROLLMENT_REVOKED, "enrollment", token_id,
+        )
         return Response(status_code=204)
 
     return router

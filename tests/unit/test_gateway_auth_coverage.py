@@ -22,16 +22,6 @@ from starlette.websockets import WebSocketDisconnect
 
 from control_plane.contracts.routes import _collect as collect_routes
 from control_plane.gateway import create_app
-from control_plane.gateway.deps import GatewayContext
-
-# The credential gate is registered by gateway/app.py (the gateway branch);
-# without it no route is gated and the walk would only raise AttributeError.
-if "auth_stores" not in getattr(GatewayContext, "__dataclass_fields__", {}) and not hasattr(
-    GatewayContext, "auth_stores"
-):
-    pytest.skip(
-        "needs GatewayContext.auth_stores from the gateway branch", allow_module_level=True
-    )
 
 pytestmark = pytest.mark.raw_http
 
