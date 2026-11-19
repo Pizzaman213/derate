@@ -143,8 +143,25 @@ check(L.decodeLabel({ verdict: null, fits: null, predicted_decode_tps: null }) =
   'an unjudged row shows no throughput')
 // The wire is still expected to carry it -- if that ever stops, the guard above
 // is silently doing nothing and the fit-degraded row loses its number.
-check(derived.variants.some(v => v.predicted_decode_tps != null),
-  'the gateway still sends a decode figure for the screen to decide about')
+//
+// But only from hardware whose memory bandwidth is known. The figure is
+// bandwidth-bound, and `fit/calculator.py` sends None rather than a rate no
+// measurement produced when any machine in the placement reads 0 GB/s -- which
+// is every machine `probe.py` does not recognise, a CI runner included. This
+// used to demand the figure unconditionally, so it failed on every runner and
+// held the image publish behind it. Each side is still asserted: a figure from
+// known hardware, and NO figure from unknown hardware.
+const placed = (await get('/api/cluster')).nodes
+  .filter((n) => (derived.sized_on?.nodes ?? []).includes(n.node_id))
+const bandwidthKnown = placed.length > 0 && placed.every((n) => n.memory_bandwidth_gbps > 0)
+console.log(`  placement bandwidth: ${placed.map((n) => `${n.node_id}=${n.memory_bandwidth_gbps} GB/s`).join(', ') || 'no placed node'}`)
+if (bandwidthKnown) {
+  check(derived.variants.some(v => v.predicted_decode_tps != null),
+    'the gateway still sends a decode figure for the screen to decide about')
+} else {
+  check(derived.variants.every(v => v.predicted_decode_tps == null),
+    'hardware with no known memory bandwidth gets no decode figure, rather than an invented one')
+}
 
 // --- a refusal the hardware could have held does not draw as a flat refusal
 const lamp = (over) => L.fitLamp({ verdict: 'wont_fit', fits: false, ...over }, true)

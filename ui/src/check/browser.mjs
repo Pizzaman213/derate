@@ -32,20 +32,53 @@ export function findBrowser() {
       : { path: null, why: `$DERATE_CHECK_BROWSER=${explicit} does not exist` }
   }
 
-  const cache = process.env.PLAYWRIGHT_BROWSERS_PATH || join(homedir(), '.cache', 'ms-playwright')
+  // Linux's cache, then macOS's. Whichever exists is the evidence; the OS name
+  // is not consulted (see CLAUDE.md, "Platform questions are answered with
+  // evidence").
+  const cache = process.env.PLAYWRIGHT_BROWSERS_PATH
+    || [join(homedir(), '.cache', 'ms-playwright'), join(homedir(), 'Library', 'Caches', 'ms-playwright')]
+      .find((d) => existsSync(d))
+    || join(homedir(), '.cache', 'ms-playwright')
   if (!existsSync(cache)) return { path: null, why: `no browser cache at ${cache}` }
 
   // Full chromium first, headless_shell second: the shell is smaller and
   // faster but cannot do everything, and when both are present the full
   // browser is the one that renders what a person would actually see.
-  for (const [prefix, exe] of [['chromium-', 'chrome'], ['chromium_headless_shell-', 'headless_shell']]) {
+  for (const [prefix, layouts] of LAYOUTS) {
     const dirs = readdirSync(cache)
       .filter((d) => d.startsWith(prefix))
       .sort((a, b) => revision(b) - revision(a))
     for (const d of dirs) {
-      const p = join(cache, d, 'chrome-linux', exe)
-      if (existsSync(p)) return { path: p, why: d }
+      for (const rel of layouts) {
+        const p = join(cache, d, ...rel)
+        if (existsSync(p)) return { path: p, why: d }
+      }
     }
   }
   return { path: null, why: `no chromium under ${cache}` }
 }
+
+/** Where the executable sits inside a revision directory. Playwright has used
+ *  two layouts: `chrome-linux/chrome` (and `chrome-linux/headless_shell`) up to
+ *  about 1.50, then Chrome for Testing's per-platform folders. This used to
+ *  know only the first, so the browser `npx playwright install chromium`
+ *  had just put on a fresh CI runner -- `chrome-linux64/chrome` -- read as no
+ *  browser at all, and the screens verifier failed every publish. Both are
+ *  listed: this box's cache predates the switch. Taken from playwright-core
+ *  1.63's own registry (`executablePaths`). */
+const LAYOUTS = [
+  ['chromium-', [
+    ['chrome-linux', 'chrome'],
+    ['chrome-linux64', 'chrome'],
+    ['chrome-linux-arm64', 'chrome'],
+    ['chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'],
+    ['chrome-mac-x64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'],
+  ]],
+  ['chromium_headless_shell-', [
+    ['chrome-linux', 'headless_shell'],
+    ['chrome-headless-shell-linux64', 'chrome-headless-shell'],
+    ['chrome-headless-shell-linux-arm64', 'chrome-headless-shell'],
+    ['chrome-headless-shell-mac-arm64', 'chrome-headless-shell'],
+    ['chrome-headless-shell-mac-x64', 'chrome-headless-shell'],
+  ]],
+]
