@@ -17,8 +17,7 @@ python3 -m sglang.launch_server \\
     --pp-size {pipeline_parallel} \\
     --context-length {max_model_len} \\
     --max-running-requests {max_running_requests} \\
-    --mem-fraction-static {gpu_memory_utilization} \\
-    --trust-remote-code"""
+    --mem-fraction-static {gpu_memory_utilization}"""
 
 
 # The binary-and-model half of the command above, with none of the
@@ -33,7 +32,7 @@ SPEC = EngineSpec(
     name="sglang",
     sparkrun_runtime="sglang",
     default_image_env="DERATE_SGLANG_IMAGE",
-    default_image="scitrera/dgx-spark-sglang:0.5.9-t5",
+    default_image="scitrera/dgx-spark-sglang:0.5.9-t5@sha256:a055011be7feb2e43ad8dbc365e3903f869c63b992864691f7edf83015bb941d",
     max_seqs_key="max_running_requests",
     command_template=_SGLANG_COMMAND,
     custom_command_prefix=_SGLANG_CUSTOM_PREFIX,
@@ -82,4 +81,8 @@ SPEC = EngineSpec(
         ("TORCHINDUCTOR_CACHE_DIR", RUNTIME_CACHE_DIR + "/sglang/inductor"),
         ("TRITON_CACHE_DIR", RUNTIME_CACHE_DIR + "/sglang/triton"),
     ),
+    api_key_env="SGLANG_API_KEY",
+    api_key_arg="--api-key {api_key}",
+    revision_arg="--revision {revision}",
+    cache_per_model=True,
 )

@@ -25,8 +25,7 @@ python3 -m control_plane.runtimes.tts \\
     --pipeline-parallel-size {pipeline_parallel} \\
     --max-model-len {max_model_len} \\
     --max-num-seqs {max_num_seqs} \\
-    --gpu-memory-utilization {gpu_memory_utilization} \\
-    --trust-remote-code"""
+    --gpu-memory-utilization {gpu_memory_utilization}"""
 
 
 # The binary-and-model half of the command above, with none of the
@@ -86,4 +85,6 @@ SPEC = EngineSpec(
     # would bill a reference clip as weights.
     cache_env=(("DERATE_TTS_VOICE_DIR", RUNTIME_CACHE_DIR + "/voices"),),
     shards=False,
+    api_key_env="DERATE_TTS_API_KEY",
+    revision_arg="--revision {revision}",
 )
