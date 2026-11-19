@@ -1127,22 +1127,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         open_upstream is not None
                         and provider_id is not None
                         and provider_upstream_id is not None
-                        # A multipart upload used to be excluded here, because
-                        # the managed path builds its payload with dict(body)
-                        # and an opaque upload has none. It took the raw
-                        # forward below instead -- which carries the provider's
-                        # key and fails over, but runs none of the provider's
-                        # own accounting, so NOTHING a transcription spent was
-                        # ever recorded. `open_upstream_raw` is that path with
-                        # the body left opaque; a providers port that does not
-                        # have it still falls back exactly as before.
-                        and (
-                            content is None
-                            or (
-                                open_upstream_raw is not None
-                                and content_type is not None
-                            )
-                        )
+                        # An upload goes through the same service as JSON: the
+                        # providers port's `open_upstream` takes the bytes as
+                        # `content=` (or `open_upstream_raw`, the same path
+                        # under its own name, when the port has it), so the
+                        # provider's own gates and accounting run for a
+                        # transcription too. Only a body with no content type
+                        # cannot be forwarded as an upload.
+                        and (content is None or content_type is not None)
                     )
                     if not use_provider_service and selection.provider is not None:
                         try:
