@@ -24,7 +24,7 @@ import {
   type Columns,
   type GapSpan,
   type YKind,
-} from './chart'
+} from './chartModel'
 import { readChartTheme, subscribeChartTheme, type ChartTheme } from './chartTheme'
 
 // Two renderings, deliberately by two different means.

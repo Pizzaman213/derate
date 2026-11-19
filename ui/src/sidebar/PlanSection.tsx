@@ -4,7 +4,7 @@ import { useCluster } from '../state/resources'
 import { Disclosure } from '../components/Panel'
 import { Verbatim, VerbatimList } from '../components/Verbatim'
 import { fmt, planShortFromDegrees } from '../format'
-import { runners } from '../tabs/models/rows'
+import { runners } from '../tabs/cluster/layout'
 
 // Ported from mockups-next/js/sidebar.js `sidebar()`'s plan block. The
 // mockup's `#whyBox` is hand-written markup keyed on a fixture's `span`/`solo`

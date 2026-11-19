@@ -1,5 +1,5 @@
 // Verifier for the chart arithmetic. There is no UI test runner in this repo
-// (see layout.check.mjs), and chart.ts is pure -- points in, columns and a
+// (see layout.check.mjs), and chartModel.ts is pure -- points in, columns and a
 // range out -- so it is checkable without a browser:
 //
 //   node src/tabs/dashboard/chart.check.mjs
@@ -23,7 +23,7 @@
 //   3. THE MEMO KEY NOTICES. `seriesKey` is a heuristic -- it is allowed to be
 //      -- but the cases it must catch are written down rather than assumed.
 //
-// chart.ts is bundled with the esbuild inside vite rather than imported
+// chartModel.ts is bundled with the esbuild inside vite rather than imported
 // directly, for the same reason router.check.mjs does it: node's ESM resolver
 // will not resolve an extensionless specifier.
 
@@ -38,7 +38,7 @@ const out = mkdtempSync(join(tmpdir(), 'chart-check-'))
 const bundle = join(out, 'chart.mjs')
 
 await bundleWithEsbuild({
-  entryPoints: [join(here, 'chart.ts')],
+  entryPoints: [join(here, 'chartModel.ts')],
   bundle: true,
   format: 'esm',
   outfile: bundle,

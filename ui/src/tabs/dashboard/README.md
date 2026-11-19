@@ -23,7 +23,7 @@ is why the dashboard has no plan panel and why `Verdict.tsx` and
 | `Chart.tsx` | 437 | two renderings by two means: `Chart`/`ChartGrid` on uPlot, and `ChartCell`, a hand-drawn 24px SVG |
 | `chart.check.mjs` | 270 | the hermetic verifier that pins "a hole stays a hole" at the renderer boundary |
 | `HeadroomSub.tsx` | 247 | what can run here right now: per-node memory, and the fit gate's capacity table |
-| `chart.ts` | 205 | the chart arithmetic, out of React and out of uPlot so it can be checked in node |
+| `chartModel.ts` | 205 | the chart arithmetic, out of React and out of uPlot so it can be checked in node |
 | `DeploymentsStrip.tsx` | 161 | one row per *running* deployment, with a spark cell, a stop and a `↗` to the detail sheet |
 | `LoadSub.tsx` | 142 | requests by Spark, one column per local target |
 | `TelemetrySub.tsx` | 119 | the 60-second live window: cluster, then the selected Spark, then the selected deployment |
@@ -63,12 +63,12 @@ zero width.
 with no axis, no cursor and no band uses none of what uPlot brings, and the
 deployments strip draws one per row, where a canvas, a DOM subtree and a
 `ResizeObserver` each would be pure overhead. Both renderers take their nulls
-from `chart.ts`, so the two cannot drift about what a hole is.
+from `chartModel.ts`, so the two cannot drift about what a hole is.
 
 ## `chart.check.mjs`
 
 The verifier, and hermetic -- it carries no `// requires:` line, which
-`ui/check.mjs` reads as needing nothing but the checkout. It bundles `chart.ts`
+`ui/check.mjs` reads as needing nothing but the checkout. It bundles `chartModel.ts`
 with the esbuild inside vite, for the same reason `router.check.mjs` does:
 node's ESM resolver will not resolve an extensionless specifier.
 
@@ -113,7 +113,7 @@ model that does not fit is excluded, not faulted, and red here would compete
 with the real fault lamps. Unresolved models and excluded nodes render through
 `Verbatim`, so the gate's own sentence survives intact.
 
-## `chart.ts`
+## `chartModel.ts`
 
 The arithmetic, kept out of React and out of uPlot so `chart.check.mjs` can run
 it in node. `bounds`, `align`, `kindFor`, `yRange`, `gapSpans`, `gapAt` and

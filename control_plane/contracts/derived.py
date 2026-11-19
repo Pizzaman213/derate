@@ -145,41 +145,6 @@ FACTS: tuple[DerivedFact, ...] = (
         why="the role a node takes is the registry's question to answer",
         copies=(),
     ),
-    DerivedFact(
-        name="request_record_fields",
-        canonical="control_plane.contracts.telemetry:REQUEST_RECORD_FIELDS",
-        why=(
-            "the record is a dataclass in telemetry/, the column list is a "
-            "contract the archive schema, the usage API and the UI read"
-        ),
-        copies=("control_plane.telemetry.records:REQUEST_RECORD_FIELDS",),
-        compare="members",
-    ),
-    DerivedFact(
-        name="drt_key_pattern",
-        canonical="control_plane.keys.format:KEY_PATTERN",
-        why=(
-            "the key format belongs to the keys package; redaction.py may "
-            "import nothing from it (every node, including the worker path, "
-            "imports the scrubber), so it holds a copy of the pattern it "
-            "scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, "
-            "copy"
-        ),
-        copies=("control_plane.redaction:KEY_PATTERN",),
-        restated_at=("ui/src/api/redact.ts", "ui/src/shell/screens.check.mjs"),
-    ),
-    DerivedFact(
-        name="login_lock_username_cap",
-        canonical="control_plane.contracts.auth:LOGIN_LOCK_USERNAME_MAX_S",
-        why=(
-            "a policy about the lockout rather than a shape: anyone can type a "
-            "username, so the bare-username lock is a denial of service on the "
-            "real admin and is capped short. auth/service.py enforces it; the "
-            "auth README and the forensics runbook state the number"
-        ),
-        copies=(),
-        restated_at=("control_plane/auth/README.md", "docs/FORENSICS.md"),
-    ),
 )
 
 

@@ -11,84 +11,6 @@
       "methods": [
         "GET"
       ],
-      "path": "/api/admins"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/admins"
-    },
-    {
-      "methods": [
-        "DELETE"
-      ],
-      "path": "/api/admins/{username}"
-    },
-    {
-      "methods": [
-        "DELETE"
-      ],
-      "path": "/api/admins/{username}/sessions"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/audit"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/audit/integrity"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/auth/login"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/auth/logout"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/auth/me"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/auth/password"
-    },
-    {
-      "methods": [
-        "DELETE"
-      ],
-      "path": "/api/auth/sessions"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/auth/sessions"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/auth/state"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
       "path": "/api/capacity"
     },
     {
@@ -99,45 +21,9 @@
     },
     {
       "methods": [
-        "POST"
-      ],
-      "path": "/api/chat/completions"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/chat/models"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/chat/speech"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/chat/transcriptions"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/chat/voices"
-    },
-    {
-      "methods": [
         "GET"
       ],
       "path": "/api/cluster"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/cluster/token/rotate"
     },
     {
       "methods": [
@@ -168,6 +54,12 @@
         "GET"
       ],
       "path": "/api/deployments/{deployment_id}/logs"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/docs"
     },
     {
       "methods": [
@@ -216,72 +108,6 @@
         "GET"
       ],
       "path": "/api/history/status"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/keys"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/keys"
-    },
-    {
-      "methods": [
-        "DELETE"
-      ],
-      "path": "/api/keys/{key_id}"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/keys/{key_id}"
-    },
-    {
-      "methods": [
-        "PATCH"
-      ],
-      "path": "/api/keys/{key_id}"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/keys/{key_id}/disable"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/keys/{key_id}/enable"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/keys/{key_id}/raise"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/keys/{key_id}/requests"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/keys/{key_id}/reset-cycle"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/keys/{key_id}/rotate"
     },
     {
       "methods": [
@@ -429,75 +255,9 @@
     },
     {
       "methods": [
-        "GET"
-      ],
-      "path": "/api/orgs"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/orgs"
-    },
-    {
-      "methods": [
-        "DELETE"
-      ],
-      "path": "/api/orgs/{org_id}"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/orgs/{org_id}"
-    },
-    {
-      "methods": [
-        "PATCH"
-      ],
-      "path": "/api/orgs/{org_id}"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/orgs/{org_id}/keys/disable"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/orgs/{org_id}/limits"
-    },
-    {
-      "methods": [
         "POST"
       ],
       "path": "/api/plan"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/pricing"
-    },
-    {
-      "methods": [
-        "DELETE"
-      ],
-      "path": "/api/pricing/{model:path}"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/pricing/{model:path}"
-    },
-    {
-      "methods": [
-        "PUT"
-      ],
-      "path": "/api/pricing/{model:path}"
     },
     {
       "methods": [
@@ -581,12 +341,6 @@
       "methods": [
         "GET"
       ],
-      "path": "/api/requests"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
       "path": "/api/routing"
     },
     {
@@ -623,12 +377,6 @@
       "methods": [
         "POST"
       ],
-      "path": "/api/setup/admin"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
       "path": "/api/setup/complete"
     },
     {
@@ -636,42 +384,6 @@
         "GET"
       ],
       "path": "/api/shell/status"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/sign-in/chatgpt"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/sign-in/chatgpt/{attempt_id}"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/sign-in/chatgpt/{attempt_id}/complete"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/sign-in/claude"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/api/sign-in/claude/{attempt_id}"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/sign-in/claude/{attempt_id}/complete"
     },
     {
       "methods": [
@@ -701,19 +413,7 @@
       "methods": [
         "GET"
       ],
-      "path": "/api/usage"
-    },
-    {
-      "methods": [
-        "POST"
-      ],
-      "path": "/api/wiring"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/auth/callback"
+      "path": "/docs/oauth2-redirect"
     },
     {
       "methods": [
@@ -762,12 +462,6 @@
         "POST"
       ],
       "path": "/v1/embeddings"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/v1/key"
     },
     {
       "methods": [
@@ -842,6 +536,12 @@
         "GET"
       ],
       "path": "/agent/telemetry"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/openapi.json"
     }
   ]
 }

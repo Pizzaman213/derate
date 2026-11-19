@@ -2528,28 +2528,6 @@
       ],
       "restated_at": []
     },
-    "drt_key_pattern": {
-      "canonical": "control_plane.keys.format:KEY_PATTERN",
-      "value": "\\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\\-]{32,}",
-      "why": "the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, copy",
-      "copies": [
-        "control_plane.redaction:KEY_PATTERN"
-      ],
-      "restated_at": [
-        "ui/src/api/redact.ts",
-        "ui/src/shell/screens.check.mjs"
-      ]
-    },
-    "login_lock_username_cap": {
-      "canonical": "control_plane.contracts.auth:LOGIN_LOCK_USERNAME_MAX_S",
-      "value": 300,
-      "why": "a policy about the lockout rather than a shape: anyone can type a username, so the bare-username lock is a denial of service on the real admin and is capped short. auth/service.py enforces it; the auth README and the forensics runbook state the number",
-      "copies": [],
-      "restated_at": [
-        "control_plane/auth/README.md",
-        "docs/FORENSICS.md"
-      ]
-    },
     "node_roles": {
       "canonical": "control_plane.registry.config:ROLE_COORDINATOR",
       "value": "coordinator",
@@ -2564,80 +2542,6 @@
       "copies": [
         "control_plane.providers.config:REDACTED",
         "control_plane.gateway.serialize:REDACTED"
-      ],
-      "restated_at": []
-    },
-    "request_record_fields": {
-      "canonical": "control_plane.contracts.telemetry:REQUEST_RECORD_FIELDS",
-      "value": [
-        "request_id",
-        "ts",
-        "served_name",
-        "node_id",
-        "target_id",
-        "target_kind",
-        "provider_id",
-        "deployment_id",
-        "policy",
-        "strength_source",
-        "attempt_no",
-        "attempts",
-        "retry_reason",
-        "status",
-        "error_code",
-        "error_class",
-        "prompt_tokens",
-        "completion_tokens",
-        "tokens",
-        "tokens_estimated",
-        "cost_usd",
-        "ttft_ms",
-        "decode_ms",
-        "duration_ms",
-        "parked_ms",
-        "streaming",
-        "body_bytes",
-        "admission_code",
-        "kv_bytes",
-        "key_id",
-        "key_name",
-        "org_id",
-        "client_ip",
-        "user_agent",
-        "model_requested",
-        "model_served",
-        "attempt_chain",
-        "fallback_used",
-        "fallback_reason",
-        "finish_reason",
-        "cancelled",
-        "limit_source",
-        "generation_ms",
-        "tokens_per_s",
-        "tpot_mean_ms",
-        "tpot_p95_ms",
-        "tail_ms",
-        "reasoning_tokens",
-        "cache_read_tokens",
-        "cache_write_tokens",
-        "max_tokens_requested",
-        "message_count",
-        "context_bucket",
-        "prefix_cache_hit_rate",
-        "cache_error",
-        "spec_num_drafts",
-        "spec_draft_tokens",
-        "spec_accepted_tokens",
-        "spec_acceptance_rate",
-        "spec_mean_accepted_len",
-        "spec_accepted_per_position",
-        "spec_decode_error",
-        "cost_basis",
-        "client_port"
-      ],
-      "why": "the record is a dataclass in telemetry/, the column list is a contract the archive schema, the usage API and the UI read",
-      "copies": [
-        "control_plane.telemetry.records:REQUEST_RECORD_FIELDS"
       ],
       "restated_at": []
     },
@@ -2950,6 +2854,11 @@
       "default": null,
       "owner": "control_plane/deploy/sparkrun.py",
       "note": "unset: whatever `sparkrun` resolves to on PATH"
+    },
+    "DERATE_STUB_PROVIDER_KEY": {
+      "default": null,
+      "owner": "control_plane/providers/stub.py",
+      "note": "the key reference the day-0 provider stub hands out"
     },
     "DERATE_TELEMETRY": {
       "default": "1",

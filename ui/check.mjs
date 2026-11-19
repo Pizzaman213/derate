@@ -90,7 +90,12 @@ async function probe(kind, arg) {
     // src/check/auth.mjs as $DERATE_CHECK_ADMIN_USER. A 401 here means the
     // credentials are missing or wrong, and that is the reason printed.
     try {
-      await import('./src/check/auth.mjs')
+      // The login helper arrives with the auth branch; without it the probe
+      // runs unauthenticated, which a gated coordinator answers with a 401
+      // and an ungated one with a 200.
+      await import('./src/check/auth.mjs').catch((e) => {
+        if (e?.code !== 'ERR_MODULE_NOT_FOUND') throw e
+      })
       const r = await fetch(`${ORIGIN}/api/topology`, { signal: AbortSignal.timeout(2000) })
       result = r.ok
         ? { ok: true }

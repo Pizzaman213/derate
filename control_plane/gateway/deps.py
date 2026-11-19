@@ -106,30 +106,10 @@ class GatewayContext:
     # a gateway built without one answers /api/alerts with an empty set.
     alerts: "object" = None
     started_at: float = 0.0
-    # Admins, sessions, keys, limits and pricing (gateway/authz.py). Opened
-    # lazily on first use, so building an app touches no disk for them; None
-    # only on a GatewayContext built by hand, which no middleware guards.
-    auth_stores: "object" = None
-    # Spec-decode counters scraped from local engines, attributed to a request
-    # after it settles. Optional: None means every row says not_reported.
-    engine_metrics: "object" = None
     degraded_startup: list[str] = field(default_factory=list)
-    # Refused keys, sessions, joins and origins, as warnings and rate-limited
-    # audit rows (gateway/secevents.py). Built here, writing through
-    # whatever auth_stores holds at the time of the event.
-    secevents: "object" = None
 
     def __post_init__(self) -> None:
         from control_plane.telemetry import NULL_SINK
 
-        from .secevents import SecurityEvents
-
-        if self.secevents is None:
-            self.secevents = SecurityEvents(self._audit_security_event)
         if self.sink is None:
             self.sink = NULL_SINK
-
-    def _audit_security_event(self, *args, **kwargs) -> None:
-        if self.auth_stores is None:
-            return
-        self.auth_stores.auth.audit(*args, **kwargs)

@@ -6,7 +6,7 @@ header, no sidebar and no roster. `SetupTab.tsx` itself lives one directory up �
 this folder is what it imports.
 
 The encoder exists because every other way of getting a QR code fails on exactly
-the machine this product is for. `qr.ts` says so in its own header: a CDN script
+the machine this product is for. `qrEncode.ts` says so in its own header: a CDN script
 is a network call and a derate cluster is routinely on a LAN with no route out;
 an npm dependency is 50 KB and a supply-chain surface for ~200 lines of finite,
 specified arithmetic; rendering it server-side needs the same arithmetic again in
@@ -16,13 +16,13 @@ Python plus a new entry in `requirements.txt`.
 
 | File | Lines | What it owns |
 |---|---|---|
-| `qr.ts` | 551 | the encoder: byte mode, error correction M, versions 1–10, `encodeQr` and `qrPath` |
+| `qrEncode.ts` | 551 | the encoder: byte mode, error correction M, versions 1–10, `encodeQr` and `qrPath` |
 | `Qr.tsx` | 40 | the `<svg>`, and the decision to render nothing rather than a broken symbol |
 | `qr.fixtures.mjs` | 705 | 16 symbols generated with `segno`, as matrices of `'0'`/`'1'` strings |
 | `qr.check.mjs` | 350 | the whole gate on the encoder. Hermetic — no `// requires:` line |
 | `setup.css` | 323 | the first-run stylesheet, separate from `derate.css` |
 
-## `qr.ts`
+## `qrEncode.ts`
 
 Byte mode, error correction level M, versions 1 to 10. That covers 213 bytes,
 and the longest address this is ever asked for is an IPv6 literal with a port and
@@ -104,7 +104,7 @@ in, checked twice: our encoder through this file's decoder, and *segno's*
 matrices through the same decoder. The second is the independence — the decoder
 re-states the placement walk, the masks and the format block from the spec and
 deliberately keeps its own copy of the tables (`DEC_EC_M`, `DEC_ALIGN`,
-`DEC_MASKS`) rather than importing `qr.ts`'s, because a shared wrong alignment
+`DEC_MASKS`) rather than importing `qrEncode.ts`'s, because a shared wrong alignment
 centre would move the function map in both at once and still line up with
 itself. Reed-Solomon is checked directly instead: every block's syndromes must be
 zero. Then the properties no fixture states — determinism, 21 modules at version
@@ -156,7 +156,7 @@ Until it resolves, `endpoint` is `null`, the `Qr` is not rendered at all, and th
 `qr.check.mjs` is discovered by `ui/check.mjs`, which scans for `*.check.mjs` and
 reads a `// requires:` line off the top of each. This one has none, which means
 hermetic — it needs nothing but the checkout and a `node_modules` with esbuild
-in it. It bundles `qr.ts` through esbuild's JS API rather than the launcher under
+in it. It bundles `qrEncode.ts` through esbuild's JS API rather than the launcher under
 `node_modules/.bin`, because that shim is a POSIX script with no `.cmd` twin and
 spawning it by path fails on Windows.
 
@@ -199,7 +199,7 @@ page.
 
 ## Deliberately not built
 
-**A QR dependency of any kind.** Named and rejected in `qr.ts`'s header: a CDN
+**A QR dependency of any kind.** Named and rejected in `qrEncode.ts`'s header: a CDN
 script (a network call on an air-gapped LAN, failing on exactly the install with
 the least patience for a broken screen), an npm package (50 KB and a
 supply-chain surface), and server-side rendering (the same arithmetic again in

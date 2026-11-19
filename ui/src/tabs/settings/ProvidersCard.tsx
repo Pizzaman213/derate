@@ -10,7 +10,7 @@ import {
   mintedRef,
   predictedProviderId,
   type KeyMode,
-} from './keyfield'
+} from './keyFieldRules'
 import { KeyField } from './KeyField'
 import { ProviderBackupPanel } from './ProviderBackupPanel'
 import { Select, type SelectOption } from '../../components/Select'

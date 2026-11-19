@@ -12,7 +12,6 @@ import '../../.omp/design/tokens/tokens.css'
 import './styles/base.css'
 import './styles/derate.css'
 import { AppShell } from './shell/AppShell'
-import { AuthProvider } from './state/auth'
 import { BackendProvider } from './state/backend'
 import { RouterProvider } from './state/router'
 
@@ -20,13 +19,10 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     {/* Outermost: the URL decides which screen mounts and what is selected on
         it, so everything below is downstream of the address bar. The metrics
-        and telemetry providers live inside AppShell now, under the auth gate:
-        nothing streams or polls before there is a session. */}
+        and telemetry providers live inside AppShell. */}
     <RouterProvider>
       <BackendProvider>
-        <AuthProvider>
-          <AppShell />
-        </AuthProvider>
+        <AppShell />
       </BackendProvider>
     </RouterProvider>
   </StrictMode>,

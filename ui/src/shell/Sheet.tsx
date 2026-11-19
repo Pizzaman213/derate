@@ -9,7 +9,7 @@ import type { SafeMetricsFrame } from '../state/useMetrics'
 import { NodeInspector } from '../inspectors/node/NodeInspector'
 import { DeploymentInspector } from '../inspectors/DeploymentInspector'
 import { ModelInspector } from '../tabs/models/ModelInspector'
-import { runners } from '../tabs/models/rows'
+import { runners } from '../tabs/cluster/layout'
 
 // The one modal host (mockups-next: a single `#sheet`/`#cardBody` pair reused
 // by both the node inspector and the deployment inspector). Each inspector

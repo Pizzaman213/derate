@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../components/Icon'
-import { useAuth } from '../state/auth'
 import { useBackend } from '../state/backend'
 import { MetricsProvider } from '../state/metrics'
 import { SelectionProvider } from '../state/selection'
@@ -13,10 +12,9 @@ import { DashboardTab } from '../tabs/DashboardTab'
 import { ModelsTab } from '../tabs/ModelsTab'
 import { ClusterTab } from '../tabs/ClusterTab'
 import { ChatTab } from '../tabs/ChatTab'
+import { SpendTab } from '../tabs/SpendTab'
 import { SettingsTab } from '../tabs/SettingsTab'
 import { SetupTab } from '../tabs/SetupTab'
-import { LoginTab } from '../tabs/login/LoginTab'
-import { UsageTab } from '../tabs/UsageTab'
 import { Sidebar } from '../sidebar/Sidebar'
 
 // `Dest` is the router's -- the set of destinations and the set of path
@@ -52,10 +50,7 @@ const WIDE: ReadonlySet<Dest> = new Set<Dest>(['models'])
  *
  *  A failed request does nothing. The dashboard on a fresh install is a thin
  *  screen, but it is a working one, and a coordinator that cannot answer
- *  /api/setup has a bigger problem than onboarding.
- *
- *  Runs inside the frame only, so it asks once a session exists: /api/setup
- *  answers nothing to a browser without one. */
+ *  /api/setup has a bigger problem than onboarding. */
 function useFirstRunRedirect(dest: Dest) {
   const { backend } = useBackend()
   const { navigate } = useRouter()
@@ -81,51 +76,17 @@ function useFirstRunRedirect(dest: Dest) {
   }, [backend, navigate, dest])
 }
 
-/** Which screen this browser may see, from `GET /api/auth/state`.
- *
- *  No admin yet -> /setup, whose first step creates one. An admin but no
- *  session -> /login, from anywhere, with `replace` so Back does not return to
- *  a screen that would only bounce again. A session on /login -> the
- *  dashboard. Until the first answer nothing renders: a frame drawn before it
- *  would fire a dozen polls that all 401. */
-function useAuthGate(dest: Dest): 'wait' | 'setup' | 'login' | 'in' {
-  const { state } = useAuth()
-  const { navigate } = useRouter()
-
-  const gate: 'wait' | 'setup' | 'login' | 'in' =
-    state === null
-      ? 'wait'
-      : !state.admin_exists
-        ? 'setup'
-        : !state.authenticated
-          ? 'login'
-          : 'in'
-
-  useEffect(() => {
-    if (gate === 'setup' && dest !== 'setup') navigate({ dest: 'setup' }, { replace: true })
-    if (gate === 'login' && dest !== 'login') navigate({ dest: 'login' }, { replace: true })
-    if (gate === 'in' && dest === 'login') navigate({ dest: 'dash' }, { replace: true })
-  }, [gate, dest, navigate])
-
-  return gate
-}
-
 export function AppShell() {
   const { route } = useRouter()
   const dest = route.dest
-  const gate = useAuthGate(dest)
 
-  if (gate === 'wait') return null
   // Before the frame, and deliberately not one of the sections below. On a
   // fresh install the header, the roster rail and every panel are empty, and a
   // chrome around four empty boxes is a worse first impression than no chrome.
   // It is still a real destination with a real URL, so it can be linked,
-  // reloaded and re-run by typing it. Its first step creates the admin, and
-  // the steps after it run with that admin's session.
-  if (gate === 'setup' || (gate === 'in' && dest === 'setup')) return <SetupTab />
-  if (gate === 'login') return <LoginTab />
+  // reloaded and re-run by typing it.
+  if (dest === 'setup') return <SetupTab />
 
-  // Under the gate, so nothing streams or polls before there is a session.
   return (
     <MetricsProvider>
       <TelemetryProvider>
@@ -204,15 +165,13 @@ function Frame({ dest }: { dest: Dest }) {
             <ModelsTab />
           </section>
           <section aria-label="Cluster" hidden={dest !== 'cluster'}>
-            {/* React Flow measures its viewport; under `hidden` it measures
-                zero, so the canvas mounts only while this is on screen. */}
-            <ClusterTab active={dest === 'cluster'} />
+            <ClusterTab />
           </section>
           <section aria-label="Chat" hidden={dest !== 'chat'}>
             <ChatTab />
           </section>
           <section aria-label="Usage" hidden={dest !== 'usage'}>
-            <UsageTab />
+            <SpendTab />
           </section>
           <section aria-label="Settings" hidden={dest !== 'settings'}>
             <SettingsTab />

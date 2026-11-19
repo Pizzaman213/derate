@@ -217,6 +217,8 @@ _DECLARED = (
     _v("DERATE_TEST_NETWORK", None, "tests/unit/test_resolver.py",
        "opt in to tests that reach HuggingFace"),
     _v("DERATE_LOAD_LOGS", None, "tests/load/harness.py", ""),
+    _v("DERATE_STUB_PROVIDER_KEY", None, "control_plane/providers/stub.py",
+       "the key reference the day-0 provider stub hands out"),
     _v("DERATE_API_KEY", "", "tests/load/loadtest.py", ""),
     _v("DERATE_BASE_URL", "http://localhost:8088", "tests/load/loadtest.py", ""),
     _v("DERATE_CHECK_ORIGIN", "http://localhost:8088", "ui/src/**/*.check.mjs",
