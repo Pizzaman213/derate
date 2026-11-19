@@ -46,7 +46,7 @@ logs/
 *.swp
 .omp/design/tokens/tokens.flat.json
 .omp/package-lock.json
-.omp/charts/package-lock.json
+# .omp/charts/package-lock.json is tracked: the image runs `npm ci` there.
 
 # local git worktrees for the PR split
 .worktrees/
