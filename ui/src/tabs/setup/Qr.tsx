@@ -1,3 +1,4 @@
+// design-pack: data-svg — the QR code is data rendered as paths, not an icon
 import { useMemo } from 'react'
 import { encodeQr, qrPath } from './qr'
 
@@ -30,10 +31,10 @@ export function Qr({ text, label }: { text: string; label: string }) {
         role="img"
         aria-label={label}
       >
-        {/* #1A1917 is --ink's LIGHT value, written out on purpose: the tile it
-            sits on is pinned to the light palette in both themes so the symbol
-            always scans. See .setup-qr in setup.css. */}
-        <path fill="#1A1917" d={drawn.path} />
+        {/* --qr-ink is theme-invariant on purpose: the tile it sits on is
+            pinned to the light palette in both themes so the symbol always
+            scans. See .setup-qr in setup.css. */}
+        <path fill="var(--qr-ink)" d={drawn.path} />
       </svg>
     </div>
   )

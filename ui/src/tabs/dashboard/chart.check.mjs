@@ -1,5 +1,5 @@
 // Verifier for the chart arithmetic. There is no UI test runner in this repo
-// (see layout.check.mjs), and chart.ts is pure -- points in, columns and a
+// (see ui/README.md), and chart.ts is pure -- points in, columns and a
 // range out -- so it is checkable without a browser:
 //
 //   node src/tabs/dashboard/chart.check.mjs

@@ -45,7 +45,7 @@ export function CollectionCard() {
     return (
       <div className="card2">
         <h3>Collection</h3>
-        <div className="unit" style={{ marginBottom: 6 }}>
+        <div className="unit" style={{ marginBottom: 'var(--space-6)' }}>
           Durable telemetry is off, so nothing is being recorded and the graphs
           are whatever this browser has accumulated since it loaded.
         </div>
@@ -61,7 +61,7 @@ export function CollectionCard() {
   return (
     <div className="card2">
       <h3>Collection</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         Every node journals locally and the coordinator drains it. A node that
         is behind has not lost anything yet; a node that has dropped rows has.
       </div>
@@ -110,13 +110,13 @@ export function CollectionCard() {
       {cursors
         .filter((c) => c.last_error)
         .map((c) => (
-          <div key={c.node_id} style={{ marginTop: 6 }}>
+          <div key={c.node_id} style={{ marginTop: 'var(--space-6)' }}>
             <span className="label">{c.node_id}: </span>
             <Verbatim text={c.last_error as string} size="label" />
           </div>
         ))}
 
-      <div className="unit" style={{ marginTop: 10 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-10)' }}>
         Archive {bytesLabel(telemetry.archive?.bytes)}
         {rows
           ? ` · ${rows.samples.toLocaleString()} samples · ${rows.requests.toLocaleString()} requests · ${rows.events.toLocaleString()} events · ${rows.logs.toLocaleString()} logs`

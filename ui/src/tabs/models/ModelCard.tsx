@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { Icon } from '../../components/Icon'
 import type { QuantTable } from '../../api/types'
 import { Lamp } from '../../components/Lamp'
 import { sizeLabel } from '../../format'
@@ -112,8 +113,8 @@ export function ModelCard({
           <span className="mcard-owner" hidden={!owner}>
             <span className="mcard-owner-name">{owner}</span>
             {isFirstParty(owner) ? (
-              <span className="mcard-verified" aria-label="Published by the team that trained it">
-                ✓
+              <span className="mcard-verified">
+                <Icon name="check" size={12} label="Published by the team that trained it" />
               </span>
             ) : null}
           </span>

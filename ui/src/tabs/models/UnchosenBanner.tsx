@@ -69,11 +69,11 @@ export function UnchosenBanner({ providers }: { providers: Provider[] | null | u
           className="unit"
           style={{
             display: 'flex',
-            gap: 'var(--s-2)',
+            gap: 'var(--space-8)',
             alignItems: 'baseline',
             flexWrap: 'wrap',
             color: 'var(--warn)',
-            margin: '0 0 6px',
+            margin: '0 0 var(--space-6)',
           }}
         >
           <span>
@@ -83,6 +83,7 @@ export function UnchosenBanner({ providers }: { providers: Provider[] | null | u
             API.
           </span>
           <button
+            type="button"
             disabled={busy !== null}
             onClick={() => void serveNone(p)}
             title={`Stop serving every model ${p.display_name || p.provider_id} publishes`}
@@ -94,7 +95,7 @@ export function UnchosenBanner({ providers }: { providers: Provider[] | null | u
       {error ? (
         <p
           className="label"
-          style={{ fontWeight: 400, color: 'var(--warn)', whiteSpace: 'pre-wrap', margin: '0 0 6px' }}
+          style={{ fontWeight: 400, color: 'var(--warn)', whiteSpace: 'pre-wrap', margin: '0 0 var(--space-6)' }}
         >
           {error}
         </p>

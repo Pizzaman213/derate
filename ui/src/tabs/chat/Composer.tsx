@@ -1,33 +1,16 @@
-import { useState, type ChangeEvent, type KeyboardEvent } from 'react'
-import type { SpeechFormat, VoiceLibrary } from '../../api/types'
+import { useState, type KeyboardEvent } from 'react'
+import type { SpeechFormat, ThinkingChoice, VoiceLibrary } from '../../api/types'
 import { OWN_VOICE, VoiceFields, resolveVoice } from './VoiceFields'
 import { DEFAULT_LANGUAGE, UploadFields, type Upload } from './UploadFields'
-import { RequestParamsFields, type ChatParams } from './RequestParams'
-
-/** An image read into memory as a data URL -- both the wire payload
- *  (`image_url.url` accepts a data URL directly, same as OpenAI's own API)
- *  and the local preview source, so there is one copy of the bytes rather
- *  than a data URL for the request and a separate object URL for display. */
-export interface ImageAttachment {
-  name: string
-  dataUrl: string
-}
-
-/** The gateway's own reference point for what a request body may carry
- *  (`control_plane/gateway/settings.py`: "25 MiB is what OpenAI accepts").
- *  Rejecting an oversized image here is cheaper than letting the gateway do
- *  it after the whole file has already gone over the wire. */
-const MAX_IMAGE_BYTES = 25 * 1024 * 1024
 
 /** What a send carries beyond the text, when the endpoint takes more than
- *  text.
+ *  text. `null` is a chat completion.
  *
- *  A discriminated union rather than optional fields, because the three
+ *  A discriminated union rather than three optional fields, because the three
  *  endpoints take disjoint inputs and `ChatTab` switches on exactly this: one
  *  value decides which controls are drawn AND which URL the send goes to, so
  *  the composer cannot offer a voice for a request that has no voice field. */
 export type SendExtra =
-  | { kind: 'chat'; images: ImageAttachment[] }
   | { kind: 'speech'; voice: string | undefined; format: SpeechFormat }
   | { kind: 'transcription'; file: File; language: string | undefined }
 
@@ -35,7 +18,7 @@ interface Props {
   /** No model selected, or the one selected cannot serve. */
   disabled: boolean
   busy: boolean
-  onSend: (text: string, extra: SendExtra) => void
+  onSend: (text: string, extra: SendExtra | null) => void
   onStop: () => void
   onClear: () => void
   canClear: boolean
@@ -49,8 +32,9 @@ interface Props {
    *  on this endpoint, and a textarea above a file input would be a control
    *  whose contents are silently discarded. */
   transcribing?: boolean
-  params: ChatParams
-  onParamsChange: (next: ChatParams) => void
+  /** The per-request thinking control, for a text model that has one. The
+   *  choices come from tabs/chat/reasoning.ts; an empty list draws nothing. */
+  thinking?: { choices: readonly ThinkingChoice[]; value: ThinkingChoice; onChange: (c: ThinkingChoice) => void }
 }
 
 export function Composer({
@@ -64,8 +48,7 @@ export function Composer({
   library = null,
   voicesError = null,
   transcribing = false,
-  params,
-  onParamsChange,
+  thinking,
 }: Props) {
   const [text, setText] = useState('')
   // Held across a switch to a text model and back on purpose: picking a voice,
@@ -76,37 +59,12 @@ export function Composer({
   const [voice, setVoice] = useState<string>(OWN_VOICE)
   const [format, setFormat] = useState<SpeechFormat>('mp3')
   const [upload, setUpload] = useState<Upload>({ file: null, language: DEFAULT_LANGUAGE })
-  const [images, setImages] = useState<ImageAttachment[]>([])
-  const [attachError, setAttachError] = useState<string | null>(null)
-
-  const onAttach = (e: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? [])
-    e.target.value = ''
-    if (files.length === 0) return
-    const oversized = files.find((f) => f.size > MAX_IMAGE_BYTES)
-    if (oversized) {
-      setAttachError(`${oversized.name} is over the 25 MiB a request body here accepts.`)
-      return
-    }
-    setAttachError(null)
-    files.forEach((file) => {
-      const reader = new FileReader()
-      reader.onload = () => {
-        if (typeof reader.result === 'string') {
-          setImages((prev) => [...prev, { name: file.name, dataUrl: reader.result as string }])
-        }
-      }
-      reader.readAsDataURL(file)
-    })
-  }
-  const removeImage = (name: string) =>
-    setImages((prev) => prev.filter((img) => img.name !== name))
 
   /** What the button sends, or null when it cannot send yet. One function,
    *  so the disabled state and the payload cannot disagree about whether this
    *  composer is ready -- they were two conditions and the file case made
    *  that a bug waiting to happen. */
-  const ready = (): { text: string; extra: SendExtra } | null => {
+  const ready = (): { text: string; extra: SendExtra | null } | null => {
     if (disabled || busy) return null
     if (transcribing) {
       // The file IS the request. There is no text on this endpoint, so an
@@ -123,35 +81,33 @@ export function Composer({
       }
     }
     const body = text.trim()
-    if (speaking) {
-      if (!body) return null
-      const active = resolveVoice(voice, library)
-      return {
-        text: body,
-        extra: { kind: 'speech', voice: active === OWN_VOICE ? undefined : active, format },
-      }
+    if (!body) return null
+    if (!speaking) return { text: body, extra: null }
+    const active = resolveVoice(voice, library)
+    return {
+      text: body,
+      extra: { kind: 'speech', voice: active === OWN_VOICE ? undefined : active, format },
     }
-    // An image with no caption is still a real request -- "describe this" is
-    // the image talking, not the empty textarea.
-    if (!body && images.length === 0) return null
-    return { text: body, extra: { kind: 'chat', images } }
   }
 
   const send = () => {
     const next = ready()
     if (!next) return
     if (!transcribing) setText('')
-    if (next.extra.kind === 'chat') setImages([])
     onSend(next.text, next.extra)
   }
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter sends, Shift+Enter breaks the line. The composer is the only
     // multi-line input in the product, so it says so under the field rather
-    // than assuming the convention is obvious.
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // than assuming the convention is obvious. Not while an IME is composing:
+    // that Enter commits the candidate, and sending on it eats the message.
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
       send()
+    } else if (e.key === 'Escape' && busy) {
+      e.preventDefault()
+      onStop()
     }
   }
 
@@ -183,50 +139,6 @@ export function Composer({
         />
       ) : (
         <>
-          {/* Sampling controls and an image attach are both only meaningful
-              on the plain chat endpoint -- a speech request has no `messages`
-              array for a system prompt to join and no vision input for an
-              audio model to read, so both are gated on `!speaking` too, not
-              only on `!transcribing`. */}
-          {!speaking ? (
-            <>
-              <RequestParamsFields value={params} onChange={onParamsChange} disabled={disabled} />
-
-              <div className="attachrow">
-                <label className="filepick">
-                  <span className="unit">Attach image</span>
-                  <input type="file" accept="image/*" multiple onChange={onAttach} />
-                </label>
-                <span className="unit">
-                  No model here advertises vision support — this sends anyway
-                  and a model that cannot read it will refuse the request.
-                </span>
-              </div>
-              {attachError ? (
-                <p className="unit" style={{ color: 'var(--warn)' }}>
-                  {attachError}
-                </p>
-              ) : null}
-              {images.length > 0 ? (
-                <div className="attachchips">
-                  {images.map((img) => (
-                    <span key={img.name} className="attachchip">
-                      <img src={img.dataUrl} alt={img.name} />
-                      {img.name}
-                      <button
-                        type="button"
-                        onClick={() => removeImage(img.name)}
-                        aria-label={`Remove ${img.name}`}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-            </>
-          ) : null}
-
           <label className="sr-only" htmlFor="chat-input">
             Message
           </label>
@@ -243,11 +155,30 @@ export function Composer({
           />
         </>
       )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s-2)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
+        {!speaking && !transcribing && thinking && thinking.choices.length > 0 ? (
+          <>
+            <span className="unit">Thinking</span>
+            {/* `margin: 0`: `.chips`' bottom margin is for sitting above a
+                grid, and in this row it would hang the chips off-centre. */}
+            <span className="chips" role="group" aria-label="Thinking" style={{ margin: 0 }}>
+              {thinking.choices.map((c) => (
+                <button
+                  type="button"
+                  key={c}
+                  aria-pressed={c === thinking.value}
+                  onClick={() => thinking.onChange(c)}
+                >
+                  {c}
+                </button>
+              ))}
+            </span>
+          </>
+        ) : null}
         <span className="unit">
           {transcribing
             ? 'The file is the request — there is no message on this endpoint'
-            : `${speaking ? 'Enter speaks' : 'Enter sends'} · Shift+Enter for a new line`}
+            : `${speaking ? 'Enter speaks' : 'Enter sends'} · Shift+Enter for a new line${busy ? ' · Esc stops' : ''}`}
         </span>
         <span style={{ flex: 1 }} />
         <button type="button" onClick={onClear} disabled={!canClear || busy}>

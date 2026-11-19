@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Icon } from '../components/Icon'
 import {
   useCapacity,
   useProviderCatalogues,
@@ -413,23 +414,16 @@ export function ModelsTab() {
   }
 
   return (
-    <div style={{ display: 'grid', gap: 'var(--s-4)' }}>
+    <div style={{ display: 'grid', gap: 'var(--space-16)' }}>
       <div className="card2">
-        <h3>Models</h3>
-        <div className="unit">
-          What could run here, and what each quantization of it would cost. Every
-          verdict comes from the fit gate a launch goes through, so nothing on
-          this screen can promise something the launch would refuse.
-        </div>
-
         {/* The pill toolbar: search, the two filters, the sort, and the view
             toggle on the right. Context and sequences stay as plain fields --
             they are the question every verdict is answered at, not a filter,
             and dressing them as one would hide that. */}
         <div className="mbar">
           <div className="mbar-search">
-            <span className="mbar-icon" aria-hidden>
-              &#8981;
+            <span className="mbar-icon">
+              <Icon name="search" size={14} decorative />
             </span>
             <input
               id="mt-q"
@@ -446,7 +440,7 @@ export function ModelsTab() {
                 aria-label="Clear search"
                 onClick={() => setQuery('')}
               >
-                &#10005;
+                <Icon name="close" size={12} decorative />
               </button>
             ) : null}
           </div>
@@ -478,7 +472,7 @@ export function ModelsTab() {
                   window.localStorage.setItem(VIEW_KEY, v)
                 }}
               >
-                <span aria-hidden>{v === 'cards' ? '\u25a6' : '\u25a4'}</span>
+                <Icon name={v === 'cards' ? 'grid' : 'rows'} size={14} decorative />
                 <span className="sr-only">{v}</span>
                 {v === 'cards' && selected ? (
                   <span className="sr-only"> (browse view; the open model shows rows)</span>
@@ -515,7 +509,7 @@ export function ModelsTab() {
               `context` is null when nobody named one, which is the default
               path. The gate then chose per model -- so the caption says which
               machine and which budget, and each row carries its own number. */}
-          <p className="unit" style={{ margin: '0 0 6px' }}>
+          <p className="unit" style={{ margin: '0 0 var(--space-6)' }}>
             {capacity.data && cap.basis
               ? `Fit on ${machinesPhrase(capacity.data)}, ` +
                 (capacity.data.context
@@ -547,7 +541,7 @@ export function ModelsTab() {
                 fontWeight: 400,
                 color: 'var(--warn)',
                 whiteSpace: 'pre-wrap',
-                margin: '0 0 6px',
+                margin: '0 0 var(--space-6)',
               }}
             >
               {p.name}: {p.message}
@@ -566,14 +560,14 @@ export function ModelsTab() {
                       fontWeight: 400,
                       color: 'var(--warn)',
                       whiteSpace: 'pre-wrap',
-                      margin: '0 0 6px',
+                      margin: '0 0 var(--space-6)',
                     }}
                   >
                     {name}: {v.note}
                   </p>
                 ))}
               {hits.notes.map((n) => (
-                <p key={n} className="unit" style={{ margin: '0 0 6px' }}>
+                <p key={n} className="unit" style={{ margin: '0 0 var(--space-6)' }}>
                   {n}
                 </p>
               ))}
