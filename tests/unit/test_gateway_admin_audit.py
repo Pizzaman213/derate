@@ -12,7 +12,7 @@ import subprocess
 import pytest
 from fastapi.testclient import TestClient
 
-from control_plane.gateway import create_app, internal_api
+from control_plane.gateway import GatewaySettings, create_app, internal_api
 from control_plane.gateway.enroll_api import build_command, install_script_bytes
 from control_plane.providers.logos import LogoCache
 from tests.fixtures import SPARK_01, SPARK_02
@@ -260,7 +260,13 @@ def test_adopting_a_node_runtime_is_audited_as_a_provider_created():
     """CAP-5: the one click that adds a routing target leaves its own row."""
     registry = _runtime_registry()
     node_id = registry.states[0].profile.node_id
-    with TC(create_app(build_deps(registry=registry, providers=_AdoptingProviders()))) as client:
+    # The background scan that adopts a detected runtime on its own would have
+    # created the provider before this click; this test is about the click.
+    app = create_app(
+        build_deps(registry=registry, providers=_AdoptingProviders()),
+        settings=GatewaySettings(auto_adopt_runtimes=False),
+    )
+    with TC(app) as client:
         r = client.post(f"/api/nodes/{node_id}/runtime")
         assert r.status_code == 201, r.text
         row = _one(client, "provider_created", f"{node_id}-ollama")
