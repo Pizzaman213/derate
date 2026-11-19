@@ -693,7 +693,7 @@ the canonical value.
 | GET | `/v1/models` |
 | WEBSOCKET | `/v1/realtime` |
 
-### Node agent (11 routes)
+### Node agent (10 routes)
 
 | Method | Path |
 |---|---|
@@ -707,7 +707,6 @@ the canonical value.
 | POST | `/agent/reach` |
 | GET | `/agent/storage` |
 | GET | `/agent/telemetry` |
-| GET | `/openapi.json` |
 
 ## Environment
 

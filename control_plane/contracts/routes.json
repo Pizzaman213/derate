@@ -536,12 +536,6 @@
         "GET"
       ],
       "path": "/agent/telemetry"
-    },
-    {
-      "methods": [
-        "GET"
-      ],
-      "path": "/openapi.json"
     }
   ]
 }
