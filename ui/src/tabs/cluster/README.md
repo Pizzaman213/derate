@@ -33,7 +33,7 @@ spill-on-saturation, change the one constant `LB_POLICY` in `sockets.ts`.
 | `sockets.ts` | the socket types, every block's sockets, `canConnect`, every sentence the editor says about a socket, `LB_POLICY`. Pure |
 | `doc.ts` | the document: server snapshot in, blocks/wires/ops/launches/issues out. Pure, no React, no `@xyflow` |
 | `WiringCanvas.tsx` | the `<ReactFlow>`: node and edge types, drag state, wire reconnects, double-click, Delete on a balancer, measured sizes, refusals to the `aria-live` region |
-| `edges.tsx` | `WireEdge` (bezier, stroke by socket type, red on fault, label, the × on a selected editable wire) and `PathRegistry` for particles |
+| `edges.tsx` | `WireEdge` and `WireConnectionLine` (square-cornered orthogonal steps via `wirePath`, the same for a placed wire and the drag preview; stroke by socket type, red on fault, label, the × on a selected editable wire) and `PathRegistry` for particles |
 | `ParticleLayer.tsx` | particles in the viewport, fed from routing and the 1 Hz frame |
 | `particles.ts` | what gets emitted, where and how fast; `useParticleField` |
 | `positions.ts` | dragged block positions in localStorage |

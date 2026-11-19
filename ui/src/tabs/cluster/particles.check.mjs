@@ -17,6 +17,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { load } from '../../check/harness.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const uiRoot = join(here, '..', '..', '..')
@@ -84,15 +85,74 @@ function tick(t) {
   for (const fn of due) fn(clock)
 }
 
+/** How long a bar's dash is: the first number of its dasharray. */
+const dashLength = (bar) => Number(String(bar.attrs['stroke-dasharray']).split(' ')[0])
+/** Where a bar's centre sits, as a distance along its wire. */
+const centre = (bar) => dashLength(bar) / 2 - Number(bar.attrs['stroke-dashoffset'])
+
 /** A straight path along x, answering what an SVG <path> answers. */
 function line(length) {
-  return { getTotalLength: () => length, getPointAtLength: (d) => ({ x: d, y: 0 }) }
+  return { getTotalLength: () => length, getPointAtLength: (d) => ({ x: d, y: 0 }), getAttribute: () => `M0 0L${length} 0` }
+}
+
+// ── A journey crosses every wire ────────────────────────────────────────────
+{
+  // A request is seen leaving API Input and a response reaching API Output:
+  // one block walks the outer wire and the inner one end to end, at one speed,
+  // and reports done once, after the last leg. A 300-unit leg then a 100-unit
+  // one over 4000ms is 3000ms then 1000ms.
+  const layer = newLayer()
+  let done = 0
+  clock = 0
+  P.spawnJourney(layer, [line(300), null, line(100)], 'red', 4000, () => done++)
+  tick(0)
+  tick(1500)
+  ok(Math.abs(centre(layer.children[0]) - 150) < 0.001, 'a journey walks its first leg at the shared speed')
+  tick(2999)
+  tick(3000)
+  ok(layer.children.length === 1 && done === 0, 'the block hands over to the next leg instead of ending (a missing leg is skipped)')
+  tick(3000)
+  tick(3500)
+  ok(Math.abs(centre(layer.children[0]) - 50) < 0.001, 'and keeps the same speed on it -- no jump at the join')
+  tick(4000)
+  tick(4000)
+  ok(layer.children.length === 0 && done === 1, 'onDone fires once, after the last leg')
+  let none = 0
+  P.spawnJourney(newLayer(), [null, line(0)], 'red', 1000, () => none++)
+  ok(none === 1, 'a journey with nothing to walk settles at once, so a tally cannot stick')
+}
+
+// ── A block fills its wire ───────────────────────────────────────────────────
+{
+  // Wires are orthogonal steps as thick as WIRE_WEIGHT, and a block is drawn
+  // the same thickness so it reads as the wire filling in. Along a horizontal
+  // run it lies long; along a vertical one it turns -- never wider than the
+  // wire either way.
+  const S = await load(import.meta.url, './sockets.ts')
+  const across = newLayer()
+  clock = 0
+  const wire = line(1000)
+  P.spawnParticle(across, wire, 'red', 1000)
+  tick(0)
+  tick(500)
+  const bar = across.children[0].attrs
+  ok(Number(bar['stroke-width']) === S.WIRE_WEIGHT, `a bar is exactly the wire's weight thick (${bar['stroke-width']})`)
+  ok(dashLength(across.children[0]) > S.WIRE_WEIGHT, 'and longer than it is thick')
+  ok(bar.d === wire.getAttribute('d'), "a bar is drawn on the wire's own geometry, so it bends exactly where the wire bends")
+  ok(bar['stroke-linejoin'] === 'miter' && bar['stroke-linecap'] === 'butt', 'square like the wire: flat ends, mitred bends')
+  ok(Number(String(bar['stroke-dasharray']).split(' ')[1]) > 1000, 'only one dash shows: the gap is longer than the wire')
+  ok(!('transform' in bar), 'it never rotates or flips -- the dash moves, the bar does not turn')
+  let skipped = 0
+  P.spawnParticle(newLayer(), { getTotalLength: () => 10, getPointAtLength: () => ({ x: 0, y: 0 }), getAttribute: () => null }, 'red', 100, () => skipped++)
+  ok(skipped === 1, 'a wire with no geometry to copy settles at once, so a tally cannot stick')
+  ok(P.streamBlockWidth(true) < P.streamBlockWidth(false) && P.streamBlockWidth(false) > S.WIRE_WEIGHT, 'a streamed token is a sliver; a request block is longer than it is thick')
 }
 
 // ── Flight ───────────────────────────────────────────────────────────────────
 {
   // A straight 1000-unit path, so position maps to progress with no geometry
-  // in the way. The -5/-4 is the rect's own half-size, which centres it.
+  // in the way. `centre` takes off the rect's own half-size, whatever the
+  // wire weight makes it.
   const path = line(1000)
   const layer = newLayer()
   let done = 0
@@ -102,9 +162,9 @@ function line(length) {
   const box = layer.children[0]
 
   tick(0)
-  ok(Number(box.attrs.x) === -5, 'a block starts at the head of its path')
+  ok(Math.abs(centre(box) - 0) < 0.001, 'a block starts at the head of its path')
   tick(1000)
-  ok(Math.abs(Number(box.attrs.x) - 495) < 0.001, 'half the span puts the block half way along')
+  ok(Math.abs(centre(box) - 500) < 0.001, 'half the span puts the block half way along')
   ok(done === 0, 'a block in flight has not reported done')
   tick(1999)
   ok(!box.removed, 'a block survives to the end of its span')
@@ -121,7 +181,7 @@ function line(length) {
   P.spawnParticle(slow, path, 'red', 8000)
   tick(0)
   tick(1000)
-  ok(Math.abs(Number(slow.children[0].attrs.x) - 120) < 0.001, 'a longer span walks the same path slower')
+  ok(Math.abs(centre(slow.children[0]) - 125) < 0.001, 'a longer span walks the same path slower')
 
   // A path with no length draws nothing, and must still settle the tally --
   // otherwise the path would be counted as permanently occupied and never

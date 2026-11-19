@@ -64,11 +64,28 @@ export const SOCKET_TYPES: Record<SocketType, SocketTypeInfo> = {
 
 export const SOCKET_TYPE_ORDER: readonly SocketType[] = ['requests', 'responses', 'limit', 'deploy', 'link']
 
-/** Wire strokes: fixed wires recede, the ones you own stand forward. */
+/** One weight for a wire and for the blocks that travel it. A wire is drawn
+ *  the way the derate mark is: a heavy stepped stroke laid down faint, with
+ *  the solid stroke moving through it -- here, the particles. A request block
+ *  is exactly as thick as its wire, so it reads as the wire filling in rather
+ *  than as a dot riding on top of a hairline. */
+export const WIRE_WEIGHT = 8
+
+/** Wire strokes: fixed wires recede, the ones you own stand forward. Both are
+ *  faint enough that a solid block of the same colour shows inside them; the
+ *  mark's own echo stroke is 0.32. */
 export const WIRE_STROKE = {
-  fixed: { width: 1.6, opacity: 0.45 },
-  editable: { width: 2.4, opacity: 1 },
+  fixed: { width: WIRE_WEIGHT, opacity: 0.18 },
+  editable: { width: WIRE_WEIGHT, opacity: 0.34 },
+  /** A selected wire you own: the one Delete or the × will cut. */
+  selected: { width: WIRE_WEIGHT, opacity: 0.62 },
 } as const
+
+/** How far a wire runs straight out of its socket before its first corner.
+ *  Wires are orthogonal steps with square corners (issue #5), never curves:
+ *  the drawn wire and the drag preview both read this, so a wire does not
+ *  change shape the moment it is dropped. */
+export const WIRE_STEP_OFFSET = 20
 
 export const FAULT_COLOUR = 'var(--graph-fault)'
 export const WARN_COLOUR = 'var(--graph-warn)'

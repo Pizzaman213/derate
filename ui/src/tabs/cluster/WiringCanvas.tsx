@@ -23,7 +23,7 @@ import { MergeBlock, SplitBlock } from './blocks/Balancer'
 import { MachineBlock, ProviderBlock } from './blocks/Containers'
 import { ModelBlock } from './blocks/ModelBlock'
 import { InputBlock, LimitBlock, OutputBlock } from './blocks/Terminals'
-import { PathRegistry, WireEdge, type WireEdgeType } from './edges'
+import { PathRegistry, WireConnectionLine, WireEdge, type WireEdgeType } from './edges'
 import { ParticleLayer } from './ParticleLayer'
 import type { PathLike } from './particles'
 import { SENTENCES, canConnect, dropOnBlock, type SocketRef } from './sockets'
@@ -337,6 +337,7 @@ export function WiringCanvas({
             edges={edges}
             nodeTypes={NODE_TYPES}
             edgeTypes={EDGE_TYPES}
+            connectionLineComponent={WireConnectionLine}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onNodeDragStop={(_, node) => onMoved(node.id, node.position)}
