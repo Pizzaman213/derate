@@ -15,7 +15,8 @@ and nothing redacts them today.
 Volume is the risk, and the first three mitigations were not enough. The
 default floor is INFO, DEBUG is opt-in, and a single message is truncated
 rather than allowed to carry a megabyte of traceback into the archive -- but
-access lines ARE INFO, so the floor admitted every one of them, and measurement
+access lines ARE INFO -- ``gateway.access`` now, uvicorn's own ``uvicorn.access``
+before both entrypoints passed ``access_log=False`` -- so the floor admitted every one of them, and measurement
 put them at 99.6% of the stream. The fourth mitigation is a name filter,
 ``config.NOISY_LOGGERS``: a level is the wrong axis for a logger that is
 individually cheap and collectively enormous.
@@ -118,8 +119,9 @@ def install(
 
     Call this *after* uvicorn.run() has installed its own configuration, or
     pass log_config=None: uvicorn's LOGGING_CONFIG lands after basicConfig and
-    sets propagate=False on its access logger, so a handler attached too early
-    never sees an access log line.
+    sets propagate=False on its loggers. Both entrypoints pass log_config=None
+    and access_log=False; the access line is ``gateway.access``, which
+    propagates like any other gateway logger.
     """
     if sink is NULL_SINK or sink is None:
         return None

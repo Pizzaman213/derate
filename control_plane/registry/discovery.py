@@ -181,6 +181,13 @@ if HAVE_ZEROCONF:
                 return
             props = info.properties or {}
             node_id = _txt(props, "node_id") or name.split(".")[0]
+            if node_id in self.peers:
+                # First record wins for the life of one browse. A later
+                # record under the same node_id is either an update nobody
+                # needs inside a five-second window or a second host
+                # claiming that id to displace the first -- the way a rogue
+                # "coordinator" would put itself in front of the real one.
+                return
             self.peers[node_id] = DiscoveredPeer(
                 node_id=node_id,
                 role=_txt(props, "role") or "unknown",

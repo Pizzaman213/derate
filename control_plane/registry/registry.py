@@ -13,10 +13,10 @@ a fault marker tell an operator more than a row that vanished.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 import time
 from typing import Any, AsyncIterator, Callable
+from urllib.parse import urlsplit
 
 from control_plane.contracts import (
     DEFAULT_GUARDRAIL,
@@ -42,10 +42,17 @@ from .enrollment import (
     EnrollmentStore,
     EnrollmentToken,
 )
-from .errors import JoinRejected, NodeNotFound, ProbeFailed
-from .identity import ClusterIdentity, load_or_create_identity
+from . import joinproof
+from .joinproof import JOIN_PROOF_SKEW_S, JoinProof, NonceCache
+from .errors import JoinRejected, MembersNotMigrated, NodeNotFound, ProbeFailed
+from .identity import (
+    ClusterIdentity,
+    agent_token as derived_agent_token,
+    load_or_create_identity,
+    new_token,
+)
 from .labels import normalize_label
-from .net import normalize_agent_url
+from .net import normalize_agent_url, same_host as _same_host
 from .probe import probe_local
 from control_plane.telemetry.events import RegistryEvents
 
@@ -88,6 +95,18 @@ SOURCE_MANUAL = "manual"
 # keeps profile and agent_url only -- so this never reaches disk. It is here
 # so the record is not mislabelled as a plain "join" on the way past.
 SOURCE_ENROLL = "enroll"
+
+# Token-less joins land in the candidate list on nothing but a probe-back that
+# answers, and POST /api/nodes/join is open. A bound, so one machine on the LAN
+# cannot fill the Add-a-node screen and the roster file. mDNS sightings and
+# manual adds are not counted: they are not offered by the caller.
+MAX_JOIN_CANDIDATES = 32
+
+# A join's probe-back dials whatever the open route was handed, so it gets a
+# pool of its own: a burst of joins naming dead addresses waits on these eight
+# connections and never on the 64 the heartbeats and telemetry share.
+JOIN_PROBE_CONNECTIONS = 8
+JOIN_PROBE_TIMEOUT_S = 2.0
 
 
 def _opt_int(value: Any) -> int | None:
@@ -136,6 +155,12 @@ class Registry:
         self._clock = clock
         self._role = role
         self._client = client or HttpAgentClient()
+        # An injected client (tests, mostly) answers probe-backs too; the
+        # production one keeps them off the shared pool. See
+        # JOIN_PROBE_CONNECTIONS.
+        self._probe_client: AgentClient = client or HttpAgentClient(
+            max_connections=JOIN_PROBE_CONNECTIONS
+        )
 
         self._identity = identity or load_or_create_identity(
             self.config.data_dir,
@@ -145,6 +170,7 @@ class Registry:
         # Short-lived credentials the UI mints so a new machine can be
         # installed with one command and be a member when it finishes.
         # Shares the data dir with the identity, and the same 0600 rule.
+        self._nonces = NonceCache()
         self._enrollment = enrollment or EnrollmentStore(
             self.config.data_dir, clock=self._clock
         )
@@ -152,6 +178,15 @@ class Registry:
         self._members: dict[str, NodeState] = {}
         self._candidates: dict[str, dict] = {}
         self._agent_urls: dict[str, str] = {}
+        # node_id -> that member's own agent token, random and minted when it
+        # became a member (``_mint_agent_token``). Persisted in the roster
+        # (0600). What the coordinator presents to that agent, and the only
+        # credential a member's re-join is accepted on.
+        self._agent_tokens: dict[str, str] = {}
+        # Members whose token was minted on a human's admission (or a manual
+        # add) and not yet handed over: their next credentialed join, on the
+        # credential that made them a candidate, collects it -- once.
+        self._undelivered: set[str] = set()
         # node_id -> operator-chosen display name. Sparse on purpose: a node
         # nobody renamed has no entry, not an entry equal to its node_id.
         self._labels: dict[str, str] = {}
@@ -203,6 +238,81 @@ class Registry:
 
     def cluster_token(self) -> str:
         return self._identity.token
+
+    def agent_token(self, node_id: str) -> str | None:
+        """What *node_id*'s agent accepts on its gated routes, or None for a
+        node that is not a member.
+
+        The member's own random token when it has one. A member from before
+        per-member tokens that has not re-joined yet still gets the value
+        derived from the cluster token (``identity.agent_token``), because
+        that is what its agent holds until it migrates. Every call the
+        coordinator makes to an agent presents this, never the cluster token.
+        """
+        token = self._agent_tokens.get(node_id)
+        if token:
+            return token
+        if node_id in self._members:
+            return derived_agent_token(self._identity.token, node_id)
+        return None
+
+    def _agent_headers(self, node_id: str) -> dict[str, str] | None:
+        token = self.agent_token(node_id)
+        return {"X-Derate-Token": token} if token else None
+
+    def _mint_agent_token(
+        self, node_id: str, *, delivered: bool, persist: bool = True
+    ) -> str:
+        """Give a member its own agent token, once. Returns it.
+
+        ``delivered`` says whether the caller is about to hand it over in an
+        acknowledged join answer; when it is not (a human's admission, a
+        manual add) the member's next credentialed join collects it.
+        """
+        token = self._agent_tokens.get(node_id)
+        if token is None:
+            token = new_token()
+            self._agent_tokens[node_id] = token
+            if not delivered:
+                self._undelivered.add(node_id)
+        if delivered:
+            self._undelivered.discard(node_id)
+        if persist:
+            self._persist_roster()
+        return token
+
+    def unmigrated_members(self) -> list[str]:
+        """Members that would still present the cluster token on their next
+        join: never handed a token of their own, or not collected it yet."""
+        return sorted(
+            node_id
+            for node_id in self._members
+            if node_id not in self._agent_tokens or node_id in self._undelivered
+        )
+
+    def rotate_cluster_token(self) -> int:
+        """Replace the cluster token. Returns how many members there are.
+
+        Raises MembersNotMigrated while any member still depends on the old
+        one. Members keep working: none of them holds or is presented the
+        cluster token. Nodes not yet in the cluster join on an enrollment
+        token, or on the new cluster token read off this machine.
+        """
+        waiting = self.unmigrated_members()
+        if waiting:
+            raise MembersNotMigrated(waiting)
+        if self.config.token:
+            log.warning(
+                "DERATE_TOKEN is set in this coordinator's environment; the "
+                "next restart restores that cluster token over the rotated one"
+            )
+        self._identity = load_or_create_identity(
+            self.config.data_dir,
+            cluster_id=self._identity.cluster_id,
+            token=new_token(),
+        )
+        log.warning("cluster token rotated; %d member(s) unaffected", len(self._members))
+        return len(self._members)
 
     def cluster_id(self) -> str:
         return self._identity.cluster_id
@@ -312,6 +422,11 @@ class Registry:
                 utilization_pct=0.0,
             )
             self._agent_urls[node_id] = str(entry.get("agent_url", ""))
+            token = entry.get("agent_token")
+            if isinstance(token, str) and token:
+                self._agent_tokens[node_id] = token
+                if entry.get("agent_token_pending"):
+                    self._undelivered.add(node_id)
             # A bad label on disk loses the name, never the node.
             try:
                 label = normalize_label(entry.get("label"))
@@ -345,6 +460,18 @@ class Registry:
                 **(
                     {"label": self._labels[node_id]}
                     if self._labels.get(node_id)
+                    else {}
+                ),
+                # Same rule: absent, never null, for a member from before
+                # per-member tokens. The file is 0600 (fsutil.harden_path).
+                **(
+                    {"agent_token": self._agent_tokens[node_id]}
+                    if self._agent_tokens.get(node_id)
+                    else {}
+                ),
+                **(
+                    {"agent_token_pending": True}
+                    if node_id in self._undelivered
                     else {}
                 ),
             }
@@ -381,7 +508,13 @@ class Registry:
         }
 
     async def handle_join(
-        self, token: str | None, profile: NodeProfile, agent_url: str
+        self,
+        proof: JoinProof | None,
+        profile: NodeProfile,
+        agent_url: str,
+        *,
+        peer: str | None = None,
+        facts: dict | None = None,
     ) -> dict:
         """Coordinator side of the join protocol. Async: it probes back.
 
@@ -403,57 +536,208 @@ class Registry:
         rewrite where that member's traffic is routed -- node_ids are
         slugified hostnames, advertised in the clear over mDNS, so they are
         not a secret an unauthenticated prober can be assumed not to know.
-        Only a token holder can move the agent_url / profile on file for an
-        existing member; a tokenless "re-join" is a status check, not a
-        write.
+        Only the member's own agent token can move the agent_url / profile on
+        file for an existing member; a tokenless "re-join" is a status check,
+        not a write.
 
         A third credential exists: an *enrollment* token from
         ``enrollment.EnrollmentStore``, minted in the UI for one install and
         expiring within the hour. It is the one thing that admits a new node
         without a click, because a human minted it and carried it to that
         machine deliberately -- the same position ``add_node`` already takes
-        for a human typing an address. The response then carries
-        ``cluster_token`` once, so the node keeps working after the enrollment
-        token expires.
+        for a human typing an address.
+
+        A *member* re-joins on its own agent token and nothing else: the
+        cluster token every worker holds, and any enrollment token, are not
+        tried for an id that is already a member with a token of its own, so
+        one worker cannot move another member's row to itself (N-1). Two
+        one-shot exceptions exist, both bound to the host the member is
+        already recorded at: a member from before per-member tokens migrates
+        on the cluster token, and a member a human admitted collects its
+        freshly minted token on the credential that made it a candidate.
+        No response ever carries the cluster token.
+
+        Every response to a verified proof carries ``ack`` (``joinproof.ack``),
+        keyed by the token that proof verified against and computed over every
+        other field of the response, so the joiner can tell this coordinator
+        from an impostor and an on-path host cannot swap a field (N-3); a
+        member's response also carries its ``agent_token``. ``peer`` is the
+        requester's address as the route established it: a credentialed join
+        must describe the machine that sent it (``profile.address``).
+        ``facts``, when given, is filled with what the caller's audit row needs
+        and the response must not carry.
         """
         expected = self.cluster_token()
-        has_token = bool(token)
-        # Two credentials are accepted here and they mean different things. The
-        # cluster token is permanent and buys candidacy, exactly as before. An
-        # enrollment token is short-lived, was minted by a human in the UI for
-        # this specific install, and buys membership outright -- minting it was
-        # the admission decision. Anything that is neither is still rejected
-        # with the same sentence, so this cannot be used to tell an expired
-        # enrollment token apart from a wrong one.
+        node_id = profile.node_id
+        has_token = proof is not None
+        facts = facts if facts is not None else {}
+        facts.update(
+            source="cluster_token" if has_token else "none",
+            enrollment_token_id=None,
+            previous_agent_url=self._agent_urls.get(node_id),
+        )
+        if self.local_node_id is not None and node_id == self.local_node_id:
+            # Whatever the credential. The coordinator's row is enrolled by
+            # the process itself (enroll_local); a join naming it is somebody
+            # asking to have the coordinator's traffic -- its own kills, its
+            # telemetry, ssh for link measurements -- routed to them.
+            log.warning(
+                "rejected join from %s claiming the coordinator's own id %s",
+                agent_url,
+                node_id,
+            )
+            raise JoinRejected("the coordinator's own row is not joinable")
+
+        is_member = node_id in self._members
+        own_token = self._agent_tokens.get(node_id) if is_member else None
+        # A member that may still present the credential it had before it was
+        # handed a token of its own: never handed one (pre-upgrade), or
+        # admitted by a human and not yet collected it.
+        collecting = is_member and (own_token is None or node_id in self._undelivered)
+        # Credentials, in the order they are tried. The cluster token buys
+        # candidacy. An enrollment token is short-lived, was minted by a human
+        # in the UI for this specific install, and buys membership outright --
+        # minting it was the admission decision. A member's own agent token
+        # is the only thing a member re-joins on. None of them ever crosses
+        # the wire: the joiner proves possession with an HMAC bound to its node
+        # id, agent_url, a nonce and the time (joinproof.py).
         enrollment: EnrollmentToken | None = None
-        if has_token and not hmac.compare_digest(str(token), expected):
-            enrollment = self._enrollment.verify(token)
-            if enrollment is None:
+        matched_token = expected
+        if proof is not None:
+            now = self._clock()
+            ok = abs(now - proof.ts) <= JOIN_PROOF_SKEW_S
+            refused_as_member = False
+            if ok:
+                if own_token is not None and joinproof.matches(
+                    proof, own_token, node_id, agent_url
+                ):
+                    matched_token = own_token
+                    facts["source"] = "agent_token"
+                elif is_member and not collecting:
+                    ok = False
+                    refused_as_member = True
+                elif joinproof.matches(proof, expected, node_id, agent_url):
+                    if is_member:
+                        facts["source"] = "migration"
+                else:
+                    enrollment = next(
+                        (
+                            t
+                            for t in self._enrollment.live_tokens()
+                            if joinproof.matches(proof, t.token, node_id, agent_url)
+                        ),
+                        None,
+                    )
+                    ok = enrollment is not None
+                    if enrollment is not None:
+                        matched_token = enrollment.token
+                        facts.update(
+                            source="enrollment", enrollment_token_id=enrollment.token_id
+                        )
+            if (
+                ok
+                and collecting
+                and matched_token != own_token
+                and not _same_host(
+                    urlsplit(agent_url).hostname,
+                    urlsplit(self._agent_urls.get(node_id, "")).hostname,
+                )
+            ):
+                # The one-shot collection is for the machine already on file;
+                # anyone else holding the cluster token is N-1 again.
+                ok = False
+                refused_as_member = True
+            # The nonce is remembered only once the MAC holds, so a flood of
+            # forged proofs cannot grow the cache; a valid one is accepted once.
+            if ok and self._nonces.seen_or_add(proof.nonce, now):
+                ok = False
+                refused_as_member = False
+            if not ok:
+                if refused_as_member:
+                    log.warning(
+                        "rejected join for member %s from %s: not on its own agent token",
+                        node_id,
+                        agent_url,
+                    )
+                    raise JoinRejected(
+                        "node_id is a member: re-join with its own agent token, "
+                        "or remove it before re-enrolling"
+                    )
                 log.warning(
                     "rejected join from %s (%s): wrong cluster token",
-                    profile.node_id,
+                    node_id,
                     agent_url,
                 )
                 raise JoinRejected("invalid cluster token")
 
+        def acked(result: dict) -> dict:
+            """Answer a verified proof with proof of our own (joinproof.ack),
+            computed last, over the final answer."""
+            if proof is None:
+                return result
+            if result.get("status") == "member":
+                result["agent_token"] = self._agent_tokens[node_id]
+            result["ack"] = joinproof.ack(
+                matched_token, node_id, agent_url, proof.nonce, proof.ts, result
+            )
+            return result
+
+        # Every tokenless probe counts against the cap, not only a new id: a
+        # re-poll from a known candidate is the same probe-back to the same
+        # caller-chosen address. Members are exempt -- that is a status check
+        # a node admitted without a token makes on every poll.
+        if not has_token and not is_member:
+            waiting = sum(
+                1 for c in self._candidates.values() if c.get("source") == SOURCE_JOIN
+            )
+            if waiting >= MAX_JOIN_CANDIDATES:
+                log.warning(
+                    "rejected join from %s (%s): %d unadmitted join candidates",
+                    node_id,
+                    agent_url,
+                    waiting,
+                )
+                raise JoinRejected(
+                    "too many unadmitted candidates; admit or dismiss one in Add a node"
+                )
+
         # Believe the profile only after the far side answers as itself,
         # token or not. A joiner can claim any hardware it likes in the body.
         try:
-            confirmed = await self.probe_remote(agent_url)
+            confirmed = await self.probe_remote(
+                agent_url, client=self._probe_client, timeout=JOIN_PROBE_TIMEOUT_S
+            )
         except ProbeFailed as exc:
             log.warning("rejected join from %s: probe-back failed (%s)", agent_url, exc)
+            if "invalid node address" in str(exc):
+                raise JoinRejected(
+                    "probe-back answered with an invalid address"
+                ) from exc
             raise JoinRejected("probe-back failed") from exc
 
-        if confirmed.node_id != profile.node_id:
+        if confirmed.node_id != node_id:
             log.warning(
                 "rejected join from %s: claimed %s, answered as %s",
                 agent_url,
-                profile.node_id,
+                node_id,
                 confirmed.node_id,
             )
             raise JoinRejected("node_id mismatch on probe-back")
+        facts["address"] = confirmed.address
 
-        if confirmed.node_id in self._members:
+        if has_token and peer is not None and not _same_host(confirmed.address, peer):
+            # The address the cluster will ssh to, hand prompts to and kill
+            # through is the one in the profile, not the one in agent_url --
+            # so a credentialed join may only describe the machine asking.
+            log.warning(
+                "rejected join of %s from %s: profile address %s is not the requester",
+                confirmed.node_id,
+                peer,
+                confirmed.address,
+            )
+            raise JoinRejected("profile address does not match the requester")
+
+        if is_member:
             if not has_token:
                 # Confirming membership is fine -- that is the mechanism a
                 # no-token-admitted worker uses to learn its cluster id --
@@ -465,36 +749,55 @@ class Registry:
                 log.info(
                     "member %s re-confirmed with no token from %s "
                     "(routing state unchanged, valid token required to move it)",
-                    confirmed.node_id,
+                    node_id,
                     agent_url,
                 )
+                facts["unchanged"] = True
                 return {
-                    "node_id": confirmed.node_id,
+                    "node_id": node_id,
                     "cluster_id": self.cluster_id(),
                     "status": "member",
                 }
-            # A restarted member, or a waiting candidate that was just
-            # admitted, re-joining with the real token. Refresh what it
-            # told us, keep it.
-            self._agent_urls[confirmed.node_id] = agent_url
-            state = self._members[confirmed.node_id]
+            # A restarted member re-joining on its own token, or a member
+            # collecting the token it has not been handed yet. Refresh what it
+            # told us, keep it -- and say so when it moved, because a move is
+            # exactly what a stolen credential would be used for.
+            state = self._members[node_id]
+            before_url = self._agent_urls.get(node_id)
+            before_address = state.profile.address
+            if before_url != agent_url or before_address != confirmed.address:
+                log.warning(
+                    "member %s moved: agent_url %s -> %s, address %s -> %s",
+                    node_id,
+                    before_url,
+                    agent_url,
+                    before_address,
+                    confirmed.address,
+                )
+            self._agent_urls[node_id] = agent_url
             state.profile = confirmed
             state.last_seen = self._clock()
             state.healthy = True
-            self._misses[confirmed.node_id] = 0
+            self._misses[node_id] = 0
+            if collecting:
+                # The one-time hand-over. From here on this member re-joins on
+                # the token in this answer and on nothing else.
+                facts["unchanged"] = False
+                self._mint_agent_token(node_id, delivered=True, persist=False)
+                log.info("handed member %s its own agent token", node_id)
             self._persist_roster()
-            result = {
-                "node_id": confirmed.node_id,
-                "cluster_id": self.cluster_id(),
-                "status": "member",
-            }
-            if enrollment is not None:
-                # It is still holding the enrollment token, which means the
-                # cluster token we handed back last time never reached disk.
-                # Hand it over again rather than let this member 403 itself
-                # out of the cluster when the enrollment token expires.
-                result["cluster_token"] = expected
-            return result
+            return acked(
+                {
+                    "node_id": node_id,
+                    "cluster_id": self.cluster_id(),
+                    "status": "member",
+                }
+            )
+
+        prior = self._candidates.get(node_id)
+        # A waiting candidate re-polls every REJOIN_INTERVAL_S; the same
+        # record from the same address is not news worth an audit row.
+        facts["unchanged"] = prior is not None and prior.get("agent_url") == agent_url
 
         if not has_token:
             # No token at all: never a rejection, only a candidate -- and a
@@ -503,46 +806,71 @@ class Registry:
             self.offer_candidate(confirmed, agent_url, source=SOURCE_JOIN)
             log.info(
                 "candidate %s joined from %s with no token, awaiting admission",
-                confirmed.node_id,
+                node_id,
                 agent_url,
             )
-            return {"node_id": confirmed.node_id, "status": "candidate"}
+            return {"node_id": node_id, "status": "candidate"}
 
         if enrollment is not None and enrollment.auto_admit:
             # Straight to member. `admit` is the same promotion the UI button
             # calls, reached through the candidate record so there is exactly
             # one place that builds a NodeState from a profile.
-            self._candidates[confirmed.node_id] = self._candidate_record(
+            facts["unchanged"] = False
+            self._candidates[node_id] = self._candidate_record(
                 confirmed, agent_url, SOURCE_ENROLL
             )
-            self.admit(confirmed.node_id)
+            self.admit(node_id)
+            # Handed over in this very answer.
+            self._mint_agent_token(node_id, delivered=True)
             self._enrollment.consume(enrollment.token_id)
             log.info(
                 "admitted %s from %s on enrollment token %s",
-                confirmed.node_id,
+                node_id,
                 agent_url,
                 enrollment.token_id,
             )
-            return {
-                "node_id": confirmed.node_id,
-                "cluster_id": self.cluster_id(),
-                "status": "member",
-                # The permanent token, handed over once, so this node survives
-                # the enrollment token expiring. It is the only response that
-                # ever carries it, and only to a node we just admitted.
-                "cluster_token": expected,
-            }
+            return acked(
+                {
+                    "node_id": node_id,
+                    "cluster_id": self.cluster_id(),
+                    "status": "member",
+                }
+            )
 
-        self._candidates[confirmed.node_id] = self._candidate_record(
+        self._refuse_displacement(node_id, agent_url)
+        self._candidates[node_id] = self._candidate_record(
             confirmed, agent_url, SOURCE_JOIN
         )
         self._persist_roster()
-        log.info("candidate %s joined from %s, awaiting admission", confirmed.node_id, agent_url)
-        return {
-            "node_id": confirmed.node_id,
-            "cluster_id": self.cluster_id(),
-            "status": "candidate",
-        }
+        log.info("candidate %s joined from %s, awaiting admission", node_id, agent_url)
+        return acked(
+            {
+                "node_id": node_id,
+                "cluster_id": self.cluster_id(),
+                "status": "candidate",
+            }
+        )
+
+    def _refuse_displacement(self, node_id: str, agent_url: str) -> None:
+        """Raise JoinRejected when a candidate of this name already waits from
+        another host (N-7): the admin's Admit click names the machine that
+        asked first, and a second host claiming the same id must not become
+        what that click admits."""
+        existing = self._candidates.get(node_id)
+        if existing is None:
+            return
+        before = urlsplit(str(existing.get("agent_url") or "")).hostname
+        after = urlsplit(agent_url).hostname
+        if before and not _same_host(before, after):
+            log.warning(
+                "candidate %s is already waiting from %s; ignoring the claim from %s",
+                node_id,
+                before,
+                after,
+            )
+            raise JoinRejected(
+                "a candidate with this name is already waiting from another address"
+            )
 
     def enroll_local(
         self, profile: NodeProfile | None = None, *, persist: bool = True
@@ -594,6 +922,9 @@ class Registry:
         self._agent_urls[profile.node_id] = (
             f"http://{profile.address}:{self.config.agent_port}"
         )
+        # The local agent is armed with this by startup.py; nothing is handed
+        # over the network, so it is delivered from the first instant.
+        self._mint_agent_token(profile.node_id, delivered=True, persist=False)
         self._misses[profile.node_id] = 0
         # A machine cannot be its own candidate. If this id was sitting in the
         # candidate list -- a stale record from before it was the coordinator,
@@ -621,6 +952,13 @@ class Registry:
         """
         if profile.node_id in self._members:
             return self._candidates.get(profile.node_id, {})
+        try:
+            self._refuse_displacement(profile.node_id, agent_url)
+        except JoinRejected:
+            # A tokenless join is told why; an mDNS sighting is only ignored.
+            if source == SOURCE_JOIN:
+                raise
+            return self._candidates[profile.node_id]
         record = self._candidate_record(profile, agent_url, source)
         self._candidates[profile.node_id] = record
         self._persist_roster()
@@ -646,6 +984,8 @@ class Registry:
         self._members[node_id] = state
         self._agent_urls[node_id] = record["agent_url"]
         self._misses[node_id] = 0
+        # Its own credential, collected on its next credentialed join.
+        self._mint_agent_token(node_id, delivered=False, persist=False)
         self._persist_roster()
         log.info("admitted %s as a member", node_id)
         # admit() is the single funnel -- the UI button, add_node and
@@ -712,6 +1052,8 @@ class Registry:
         if not was_member and not was_candidate:
             raise NodeNotFound(f"no member or candidate {node_id!r}")
         self._agent_urls.pop(node_id, None)
+        self._agent_tokens.pop(node_id, None)
+        self._undelivered.discard(node_id)
         self._labels.pop(node_id, None)
         self._misses.pop(node_id, None)
         self._last_error.pop(node_id, None)
@@ -737,14 +1079,27 @@ class Registry:
     # Probing
     # ------------------------------------------------------------------
 
-    async def probe_remote(self, agent_url: str) -> NodeProfile:
-        """GET /agent/profile on a peer. Raises ProbeFailed."""
-        payload = await self._client.get_json(
-            f"{agent_url.rstrip('/')}/agent/profile", timeout=HEARTBEAT_TIMEOUT_S
+    async def probe_remote(
+        self,
+        agent_url: str,
+        *,
+        client: AgentClient | None = None,
+        timeout: float = HEARTBEAT_TIMEOUT_S,
+    ) -> NodeProfile:
+        """GET /agent/profile on a peer. Raises ProbeFailed.
+
+        ``client`` is the join route's own pool (``JOIN_PROBE_CONNECTIONS``)
+        when the address came from an open request; everything else shares
+        the registry's.
+        """
+        payload = await (client or self._client).get_json(
+            f"{agent_url.rstrip('/')}/agent/profile", timeout=timeout
         )
         try:
             return profile_from_dict(payload)
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            # AttributeError: a JSON answer that is not an object (a list, a
+            # number) has no .get -- an unusable profile, not a 500.
             raise ProbeFailed(f"{agent_url} returned an unusable profile: {exc}") from exc
 
     # ------------------------------------------------------------------
@@ -774,7 +1129,7 @@ class Registry:
                 f"{source_url.rstrip('/')}/agent/reach",
                 {"url": url},
                 PEER_REACH_TIMEOUT_S,
-                {"X-Derate-Token": self.cluster_token()},
+                self._agent_headers(source),
             )
         except Exception as exc:
             # NOT a failed source -> target leg, and not a coordinator ->
@@ -915,7 +1270,9 @@ class Registry:
             return False
         try:
             body = await self._client.get_json(
-                f"{url.rstrip('/')}/agent/health", timeout=HEARTBEAT_TIMEOUT_S
+                f"{url.rstrip('/')}/agent/health",
+                timeout=HEARTBEAT_TIMEOUT_S,
+                headers=self._agent_headers(node_id),
             )
             self._record_build(node_id, body)
             self._last_error.pop(node_id, None)
@@ -1059,8 +1416,14 @@ class Registry:
         node_ids = list(self._members)
         if not node_ids:
             return
+        # Each node is bounded as a whole, not per read (N-4): one member that
+        # answers a byte at a time must not hold the round for everyone.
         results = await asyncio.gather(
-            *(self.check_health(n) for n in node_ids), return_exceptions=True
+            *(
+                asyncio.wait_for(self.check_health(n), HEARTBEAT_TIMEOUT_S * 2)
+                for n in node_ids
+            ),
+            return_exceptions=True,
         )
         for node_id, ok in zip(node_ids, results):
             self.record_health(node_id, ok is True)
@@ -1112,7 +1475,9 @@ class Registry:
             return
         try:
             payload = await self._client.get_json(
-                f"{url.rstrip('/')}/agent/telemetry", timeout=HEARTBEAT_TIMEOUT_S
+                f"{url.rstrip('/')}/agent/telemetry",
+                timeout=HEARTBEAT_TIMEOUT_S,
+                headers=self._agent_headers(node_id),
             )
         except ProbeFailed:
             return  # health loop owns the verdict; keep the last sample
@@ -1152,7 +1517,11 @@ class Registry:
         if not node_ids:
             return
         await asyncio.gather(
-            *(self._sample_node(n) for n in node_ids), return_exceptions=True
+            *(
+                asyncio.wait_for(self._sample_node(n), HEARTBEAT_TIMEOUT_S * 2)
+                for n in node_ids
+            ),
+            return_exceptions=True,
         )
 
     def available_memory(self, node_id: str, guardrail: float = DEFAULT_GUARDRAIL) -> int:
@@ -1379,6 +1748,9 @@ class Registry:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
+        aclose = getattr(self._probe_client, "aclose", None)
+        if self._probe_client is not self._client and callable(aclose):
+            await aclose()
 
     # ------------------------------------------------------------------
     # Views

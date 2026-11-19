@@ -13,6 +13,7 @@ real figure.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ import socket
 import socketserver
 import threading
 import time
+from typing import Callable, Iterable
 
 log = logging.getLogger(__name__)
 
@@ -28,19 +30,70 @@ MAGIC = b"SPLK0001"
 _CHUNK = 1024 * 1024
 _PAYLOAD = bytes(_CHUNK)  # zeros; we are timing the wire, not compressing
 
+# The sink listens on every interface of every node, unauthenticated, because
+# the measurer on the far side holds no credential for it. So it is bounded
+# instead: a few blasts at once, each one over in a fixed time and a fixed
+# number of bytes, and only from an address that could be a cluster peer.
+SINK_MAX_CONCURRENT = 16
+SINK_DURATION_S = 5.0  # the measurer's default (links.measure)
+SINK_DEADLINE_FACTOR = 4
+# A backstop, not a throttle: the deadline already bounds a blast. One GiB
+# would truncate an honest five-second measurement of anything faster than
+# about 1.7 Gbit/s -- and a truncated sink stops reading, which stalls the
+# sender into a failed probe -- so the cap sits above what 400 Gbit/s line
+# rate delivers in the whole deadline.
+SINK_MAX_BYTES = 1 << 40
+
+
+def _peer_allowed(host: str, extra: Iterable[str]) -> bool:
+    """Private, link-local or loopback -- the networks a cluster lives on --
+    or an address this node has seen present its agent token."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    ip = mapped or ip
+    if ip.is_private or ip.is_link_local or ip.is_loopback:
+        return True
+    return str(ip) in set(extra)
+
 
 class _SinkHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
+        server: _Server = self.server  # type: ignore[assignment]
+        peer = self.client_address[0] if self.client_address else ""
+        if not _peer_allowed(peer, server.allowed()):
+            log.warning("link probe sink refused %s: not a cluster address", peer)
+            return
+        if not server.slots.acquire(blocking=False):
+            log.warning("link probe sink refused %s: %d probes already running",
+                        peer, SINK_MAX_CONCURRENT)
+            return
+        try:
+            self._sink(server.deadline_s)
+        finally:
+            server.slots.release()
+
+    def _sink(self, deadline_s: float) -> None:
         sock: socket.socket = self.request
-        sock.settimeout(30.0)
+        give_up = time.monotonic() + deadline_s
+        sock.settimeout(min(30.0, deadline_s))
         try:
             header = _recv_exactly(sock, len(MAGIC))
             if header != MAGIC:
                 return
             received = 0
             started: float | None = None
-            while True:
-                chunk = sock.recv(_CHUNK)
+            while received < SINK_MAX_BYTES:
+                remaining = give_up - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    chunk = sock.recv(min(_CHUNK, SINK_MAX_BYTES - received))
+                except socket.timeout:
+                    break  # the timeout *is* the deadline: report what came
                 if not chunk:
                     break
                 if started is None:
@@ -50,6 +103,7 @@ class _SinkHandler(socketserver.BaseRequestHandler):
                 received += len(chunk)
             elapsed = (time.monotonic() - started) if started is not None else 0.0
             reply = json.dumps({"bytes": received, "elapsed_s": elapsed}).encode() + b"\n"
+            sock.settimeout(5.0)
             sock.sendall(reply)
         except (OSError, socket.timeout):
             return
@@ -65,6 +119,19 @@ class _Server(socketserver.ThreadingTCPServer):
     # let the second bind fail and the caller report the port as taken.
     allow_reuse_address = os.name != "nt"
     daemon_threads = True
+
+    def __init__(
+        self,
+        address,
+        handler,
+        *,
+        allowed: Callable[[], Iterable[str]] = lambda: (),
+        deadline_s: float = SINK_DEADLINE_FACTOR * SINK_DURATION_S,
+    ) -> None:
+        self.slots = threading.BoundedSemaphore(SINK_MAX_CONCURRENT)
+        self.allowed = allowed
+        self.deadline_s = deadline_s
+        super().__init__(address, handler)
 
 
 class ProbeServer:
@@ -90,9 +157,24 @@ class ProbeServer:
         self.close()
 
 
-def start_probe_server(host: str = "0.0.0.0", port: int = DEFAULT_PROBE_PORT) -> ProbeServer:
-    """Bind the sink and serve it on a daemon thread."""
-    server = _Server((host, port), _SinkHandler)
+def start_probe_server(
+    host: str = "0.0.0.0",
+    port: int = DEFAULT_PROBE_PORT,
+    *,
+    allowed: Callable[[], Iterable[str]] = lambda: (),
+    duration_s: float = SINK_DURATION_S,
+) -> ProbeServer:
+    """Bind the sink and serve it on a daemon thread.
+
+    ``allowed`` names public addresses that may blast too (the coordinator
+    of a cluster on routable addresses); private, link-local and loopback
+    peers always may. Each blast is cut off after ``4 * duration_s`` and
+    ``SINK_MAX_BYTES``, whichever comes first.
+    """
+    server = _Server(
+        (host, port), _SinkHandler, allowed=allowed,
+        deadline_s=SINK_DEADLINE_FACTOR * duration_s,
+    )
     thread = threading.Thread(target=server.serve_forever, name="link-probe-server", daemon=True)
     thread.start()
     return ProbeServer(server, thread)

@@ -89,6 +89,8 @@ class StubDeploymentManager:
         speculative: SpeculativeSpec | None = None,
         kv_dtype: str | None = None,
         quantization: str | None = None,
+        revision: str | None = None,
+        speculative_tokens: int = 0,
     ) -> Deployment:
         name = served_name or default_served_name(shape)
         if fit.verdict is Verdict.WONT_FIT:
@@ -132,6 +134,8 @@ class StubDeploymentManager:
                 # developed against a stub that drops this is developed
                 # against the bug the field closes.
                 quantization=quantization or None,
+                revision=revision,
+                speculative_tokens=speculative_tokens,
             )
             record = _Record(deployment=deployment, handle={"port": port})
             self._records[deployment.deployment_id] = record

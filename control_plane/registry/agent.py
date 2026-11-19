@@ -3,12 +3,20 @@
 Reads and an mDNS advertisement. This is the part of the registry that
 exists on every machine; a worker is a node agent and nothing else.
 
-``POST /agent/processes/{pid}/kill`` is the one exception and the only
-mutating route on this surface. It carries the cluster token because it is
-the only thing here that changes the machine, and because every other node
-runs the same app on the same LAN. What it may touch is bounded in
-``procs.py``, not here: only PIDs nvidia-smi currently reports as holding
-GPU memory, and never our own process tree.
+``POST /agent/processes/{pid}/kill`` and ``DELETE /agent/models/cache/{folder}``
+are the mutating routes on this surface. They carry ``X-Derate-Token`` because
+they change the machine, and because every other node runs the same app on the
+same LAN. ``GET /agent/journal`` and ``GET /agent/processes`` carry it too: one
+is the node's log stream and its read is the trim ack, the other is every GPU
+command line. So do the inventory reads (telemetry, storage, the model cache):
+none of them is anybody else's business on the LAN. The token is this node's
+own agent token (minted at random by the coordinator, ``Registry.agent_token``),
+never the cluster token. What the
+kill may touch is bounded in ``procs.py``, not here: only PIDs nvidia-smi
+currently reports as holding GPU memory, and never our own process tree.
+
+Every gated action and every refusal is journalled as an ``agent`` event, so
+the coordinator's archive holds the agent-side fact beside its own audit row.
 
 FastAPI is imported inside ``create_agent_app`` so that importing this module,
 and unit-testing NodeAgent, works on a machine without a web framework.
@@ -17,9 +25,9 @@ and unit-testing NodeAgent, works on a machine without a web framework.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
-import secrets
 import time
 from pathlib import Path
 
@@ -43,6 +51,7 @@ from control_plane.telemetry.events import RegistryEvents
 
 from .profiles import profile_diff, profile_supersedes
 from .discovery import Advertiser
+from .net import same_host
 from .procs import KillRefused, kill_gpu_process
 from .serde import (
     containers_to_dict,
@@ -58,6 +67,16 @@ from .telemetry import (
     TELEMETRY_TIMEOUT_S,
     read_telemetry,
 )
+
+try:
+    # Only so the route signatures in create_agent_app can name it: with
+    # `from __future__ import annotations` FastAPI resolves an annotation
+    # against this module's globals, and a `Request` imported inside the
+    # factory is invisible there -- the parameter silently becomes a query
+    # field and every route answers 422. Optional, like FastAPI itself.
+    from starlette.requests import Request
+except ImportError:  # pragma: no cover - no web framework installed
+    Request = None  # type: ignore[assignment,misc]
 
 log = logging.getLogger(__name__)
 
@@ -117,11 +136,22 @@ class NodeAgent:
         # Defaults to the no-op sink, so a NodeAgent still constructs and
         # tests on a machine with telemetry switched off.
         self._sink = sink
-        # The cluster token, and the only thing gating the one mutating
-        # endpoint on this agent. None means no token is configured, which
-        # is a refusal rather than a free pass: an agent that cannot check a
-        # credential must not act on an uncredentialed request.
+        # This node's agent token (identity.agent_token), and the only thing
+        # gating the credentialed routes on this agent. None means no token is
+        # configured, which is a refusal rather than a free pass: an agent
+        # that cannot check a credential must not act on an uncredentialed
+        # request.
         self._token = token or None
+        # peer -> (last journalled refusal, refusals since). See note_refused.
+        self._refusals: dict[str, tuple[float, int]] = {}
+        # (peer, path) -> (last journalled read, reads since). See note_read.
+        self._reads: dict[tuple[str, str], tuple[float, int]] = {}
+        # The coordinator's address as this node last joined it. A token-gated
+        # read from it is routine; from anywhere else it is journalled.
+        self._coordinator_host: str | None = None
+        # Addresses that presented this agent's token -- the coordinator, in
+        # practice. The link probe sink admits them even off a private range.
+        self._trusted_peers: set[str] = set()
         # Where this node's data lives, for the storage probe. Defaults to the
         # same env var every other component reads, with the same /data
         # fallback, so an agent constructed without one still reports the real
@@ -142,20 +172,20 @@ class NodeAgent:
     def uptime_s(self) -> float:
         return self._clock() - self._started_at
 
-    def profile_payload(self) -> dict:
-        """This machine's hardware, plus which build is describing it.
+    def profile_payload(self, include_build: bool = False) -> dict:
+        """This machine's hardware, plus -- for a token holder -- its build.
 
         ``build`` is not part of NodeProfile and deliberately never will be:
         the profile is hardware, and the software reading it is a different
-        fact. It rides along here because this is the payload a coordinator
-        probes back, and "what does this node think it is" is not answerable
-        without also knowing what was doing the thinking. A node whose image
-        predates a probe improvement reports hardware its coordinator would
-        have identified, and until this field existed the two were
-        indistinguishable from the outside.
+        fact. It rides along here because "what does this node think it is"
+        is not answerable without also knowing what was doing the thinking.
+        Only for a caller holding this agent's token, though: the route is
+        open (probe-back precedes any token) and a build id is a version
+        fingerprint any LAN host could otherwise match against advisories.
         """
         payload = profile_to_dict(self.profile)
-        payload["build"] = build_id()
+        if include_build:
+            payload["build"] = build_id()
         return payload
 
     def telemetry_payload(self) -> dict:
@@ -268,15 +298,20 @@ class NodeAgent:
     def release_shell(self) -> None:
         self._shell_open = False
 
-    def note_shell_opened(self, *, host: bool) -> None:
-        """Record that a root prompt was opened on this machine.
+    def note_shell_opened(
+        self, *, host: bool, peer: str = "-", origin: str | None = None
+    ) -> None:
+        """Record that a root prompt was opened on this machine, from which
+        address and which page (``peer``, ``origin``).
 
         An event, never the output. Terminal output is unbounded and would
         recreate the access-log problem with a payload that can contain
         anything the operator typed, credentials included. What is worth
         keeping is that a session happened, when, and whether it reached the
-        host or stopped at this container -- and ``events`` is the one raw
-        table the archive's size cap never evicts.
+        host or stopped at this container. ``agent`` and ``shell`` events are
+        evidence in the archive: its size cap evicts them only after every
+        telemetry row and every anonymous access row has gone, and they are
+        journalled even with ``DERATE_TELEMETRY=0``.
         """
         try:
             self._sink.event(
@@ -286,13 +321,49 @@ class NodeAgent:
                     "ts": self._clock(),
                     "node_id": self.profile.node_id,
                     "host": host,
+                    "peer": peer,
+                    "origin": origin,
                 },
             )
         except Exception:
             log.debug("could not record shell event", exc_info=True)
 
+    def set_coordinator(self, host: str | None) -> None:
+        """The address of the coordinator this node joined (N-11)."""
+        self._coordinator_host = host or None
+
+    def note_read(self, peer: str, method: str, path: str) -> None:
+        """A token-gated read answered for somebody other than the coordinator.
+
+        The coordinator reads every member every second; that is not news.
+        The same token presented from another address is somebody holding a
+        credential they should not, and the read itself is otherwise the one
+        thing that leaves no trace. Journalled at most once a minute per peer
+        and path, with the count in between, like ``note_refused``.
+        """
+        if self._coordinator_host and same_host(peer, self._coordinator_host):
+            return
+        now = self._clock()
+        key = (peer, path)
+        last, since = self._reads.get(key, (None, 0))
+        if last is not None and now - last < 60.0:
+            self._reads[key] = (last, since + 1)
+            return
+        if len(self._reads) >= 1024:
+            self._reads.clear()
+        self._reads[key] = (now, 0)
+        self._event(
+            {
+                "type": "agent_read",
+                "peer": peer,
+                "method": method,
+                "path": path,
+                "suppressed": since,
+            }
+        )
+
     def set_token(self, token: str | None) -> None:
-        """Adopt the cluster token, including on a late admission.
+        """Adopt this node's agent token, including on a late admission.
 
         A worker that started as a candidate has no token until a human
         admits it. Without this the agent would keep refusing kills for the
@@ -302,22 +373,92 @@ class NodeAgent:
         self._token = token or None
 
     def token_matches(self, presented: str | None) -> bool:
+        """Constant-time, on bytes: a header is latin-1 text, and comparing a
+        non-ASCII ``str`` raises inside ``compare_digest`` -- a 500 where a
+        refusal belongs."""
         if not self._token or not presented:
             return False
-        return secrets.compare_digest(self._token, presented)
+        return hmac.compare_digest(
+            self._token.encode(), presented.encode("latin-1", "ignore")
+        )
 
-    def health_payload(self) -> dict:
-        return {
+    def _event(self, payload: dict) -> None:
+        try:
+            self._sink.event(
+                "agent", {"ts": self._clock(), "node_id": self.node_id, **payload}
+            )
+        except Exception:
+            log.debug("could not record agent event", exc_info=True)
+
+    def note_action(self, kind: str, peer: str, path: str, **detail) -> None:
+        """Journal a token-gated action this agent performed.
+
+        The coordinator's audit row says which admin asked; this says what the
+        machine itself did and who it did it for, and it is written whether or
+        not the request came through the coordinator -- the cluster-token
+        holder who talks to the agent directly leaves this and nothing else.
+        """
+        self._event({"type": kind, "peer": peer, "path": path, **detail})
+
+    def note_trusted(self, peer: str) -> None:
+        """Remember an address that presented this agent's token."""
+        if peer and peer != "-" and peer not in self._trusted_peers:
+            if len(self._trusted_peers) >= 64:
+                self._trusted_peers.clear()
+            self._trusted_peers.add(peer)
+
+    def trusted_peers(self) -> tuple[str, ...]:
+        """Addresses that presented this agent's token (the probe sink's
+        allow-list beyond the private ranges)."""
+        return tuple(self._trusted_peers)
+
+    def note_refused(self, peer: str, method: str, path: str) -> None:
+        """A credentialed route turned somebody away.
+
+        Logged and journalled at most once a minute per peer, the next one
+        carrying the count in between, so a LAN host hammering the port can
+        fill neither the journal's size cap -- evicting rows the coordinator
+        has not collected yet -- nor node.log (N-12).
+        """
+        now = self._clock()
+        last, since = self._refusals.get(peer, (None, 0))
+        if last is not None and now - last < 60.0:
+            self._refusals[peer] = (last, since + 1)
+            return
+        if since:
+            log.warning(
+                "agent refused %s %s from %s (and %d more in the minute before)",
+                method, path, peer, since,
+            )
+        else:
+            log.warning("agent refused %s %s from %s", method, path, peer)
+        if len(self._refusals) >= 1024:
+            self._refusals.clear()
+        self._refusals[peer] = (now, 0)
+        self._event(
+            {
+                "type": "agent_refused",
+                "peer": peer,
+                "method": method,
+                "path": path,
+                "suppressed": since,
+            }
+        )
+
+    def health_payload(self, include_build: bool = False) -> dict:
+        payload = {
             "status": "ok",
             "node_id": self.node_id,
             "role": self.role,
             "cluster_id": self.cluster_id,
             "uptime_s": round(self.uptime_s, 1),
-            # Rides the heartbeat rather than needing a call of its own: the
-            # coordinator already dials this endpoint every 5s and used to
-            # throw the body away. See Registry.check_health.
-            "build": build_id(),
         }
+        if include_build:
+            # Rides the heartbeat rather than needing a call of its own: the
+            # coordinator already dials this endpoint every 5s, with this
+            # node's agent token. Nobody else learns the version.
+            payload["build"] = build_id()
+        return payload
 
     async def reach_payload(self, url: object, client=None) -> dict:
         """Dial another node's agent from THIS machine and report what happened.
@@ -595,32 +736,93 @@ def create_agent_app(node_agent: NodeAgent):
     """A FastAPI app serving the /agent/* surface."""
     from fastapi import FastAPI, Header, HTTPException
 
-    app = FastAPI(title="derate node agent", docs_url=None, redoc_url=None)
+    # No /openapi.json either: the schema would answer whether /agent/shell is
+    # installed, which is the one thing the conditional registration below hides.
+    app = FastAPI(
+        title="derate node agent", docs_url=None, redoc_url=None, openapi_url=None
+    )
+
+    def _peer(request: Request) -> str:
+        return request.client.host if request.client else "-"
+
+    def _require_token(
+        request: Request, presented: str | None, detail: str = "agent token required"
+    ) -> None:
+        """403 unless *presented* is this node's agent token; every refusal
+        is logged with the peer and journalled (``NodeAgent.note_refused``)."""
+        if node_agent.token_matches(presented):
+            peer = _peer(request)
+            node_agent.note_trusted(peer)
+            # Reads only: the actions record themselves (note_action).
+            if request.method == "GET" or request.url.path == "/agent/reach":
+                node_agent.note_read(peer, request.method, request.url.path)
+            return
+        node_agent.note_refused(_peer(request), request.method, request.url.path)
+        raise HTTPException(status_code=403, detail=detail)
+
+    # Open by design: profile and health, because probe-back
+    # (registry.probe_remote) and reach call them on nodes that hold no token
+    # yet -- and neither says which build is running unless the caller holds
+    # the token. Everything else is token-gated: telemetry, storage and the
+    # model cache are an inventory of this machine that no other host on the
+    # LAN needs, the journal and the process list are worse.
 
     @app.get("/agent/profile")
-    async def get_profile() -> dict:
-        return node_agent.profile_payload()
+    async def get_profile(x_derate_token: str | None = Header(default=None)) -> dict:
+        return node_agent.profile_payload(node_agent.token_matches(x_derate_token))
 
     @app.get("/agent/telemetry")
-    async def get_telemetry() -> dict:
+    async def get_telemetry(
+        request: Request, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
+        _require_token(request, x_derate_token)
         return node_agent.telemetry_payload()
 
     @app.get("/agent/health")
-    async def get_health() -> dict:
+    async def get_health(
+        request: Request, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
         node_agent.note_polled()
-        return node_agent.health_payload()
+        trusted = node_agent.token_matches(x_derate_token)
+        if trusted:
+            node_agent.note_trusted(_peer(request))
+        return node_agent.health_payload(trusted)
 
     @app.get("/agent/journal")
-    async def get_journal(since: int = 0, limit: int = 2000) -> dict:
-        # Asking for rows after `since` is itself the acknowledgement that
-        # everything through `since` reached the coordinator, so the node is
-        # free to trim below it. There is no separate ack.
-        return await asyncio.to_thread(
+    async def get_journal(
+        request: Request,
+        since: int = 0,
+        limit: int = 2000,
+        x_derate_token: str | None = Header(default=None),
+    ) -> dict:
+        # Token-gated, and before anything else: the rows are this node's
+        # whole log stream, and asking for rows after `since` is itself the
+        # acknowledgement that everything through `since` reached the
+        # coordinator, so the node is free to trim below it. There is no
+        # separate ack, which means an uncredentialed read could erase every
+        # row the coordinator has not collected yet.
+        _require_token(request, x_derate_token)
+        payload = await asyncio.to_thread(
             node_agent.journal_payload, since, min(max(limit, 1), 5000)
         )
+        if isinstance(payload, dict) and "clamped_from" in payload:
+            # An acknowledgement of rows this node never wrote. The journal
+            # clamps it (Journal.read) so nothing uncollected is released,
+            # but a cursor from the future is either a coordinator that lost
+            # its archive or somebody trying to make this node drop its log.
+            node_agent.note_action(
+                "journal_cursor_clamped", _peer(request), request.url.path,
+                since=since,
+            )
+        return payload
 
     @app.get("/agent/processes")
-    async def get_processes() -> dict:
+    async def get_processes(
+        request: Request,
+        x_derate_token: str | None = Header(default=None),
+    ) -> dict:
+        # Token-gated: command lines and PIDs of everything on the GPU.
+        _require_token(request, x_derate_token)
         return await node_agent.processes_payload()
 
     @app.get("/agent/containers")
@@ -628,10 +830,10 @@ def create_agent_app(node_agent: NodeAgent):
         return await node_agent.containers_payload()
 
     @app.get("/agent/storage")
-    async def get_storage() -> dict:
-        # Uncredentialed, like /agent/profile and /agent/telemetry. It reads
-        # capacity and the sizes of files this product wrote; the one route on
-        # this surface that changes the machine is the kill below.
+    async def get_storage(
+        request: Request, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
+        _require_token(request, x_derate_token)
         return await node_agent.storage_payload()
 
     @app.get("/agent/logs")
@@ -642,11 +844,15 @@ def create_agent_app(node_agent: NodeAgent):
         return await node_agent.logs_payload(which, max(1, min(tail, 5000)))
 
     @app.get("/agent/models/cache")
-    async def get_model_cache() -> dict:
+    async def get_model_cache(
+        request: Request, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
+        _require_token(request, x_derate_token)
         return await node_agent.model_cache_payload()
 
     @app.delete("/agent/models/cache/{folder}")
     async def delete_model_cache(
+        request: Request,
         folder: str,
         x_derate_token: str | None = Header(default=None),
     ) -> dict:
@@ -654,15 +860,20 @@ def create_agent_app(node_agent: NodeAgent):
         # the machine, and the token is checked before the folder is looked at
         # so an uncredentialled caller cannot learn what is cached by reading
         # which refusal comes back.
-        if not node_agent.token_matches(x_derate_token):
-            raise HTTPException(status_code=403, detail="Bad or missing cluster token.")
+        _require_token(request, x_derate_token, "Bad or missing agent token.")
         try:
-            return await node_agent.delete_cached_model(folder)
+            result = await node_agent.delete_cached_model(folder)
         except modelcache.DeleteRefused as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
+        node_agent.note_action(
+            "cache_deleted", _peer(request), request.url.path, folder=folder,
+            bytes_freed=result.get("bytes_freed") if isinstance(result, dict) else None,
+        )
+        return result
 
     @app.post("/agent/reach")
     async def reach_peer(
+        request: Request,
         payload: dict,
         x_derate_token: str | None = Header(default=None),
     ) -> dict:
@@ -671,8 +882,7 @@ def create_agent_app(node_agent: NodeAgent):
         # uncredentialed one would be a port scanner that runs inside the
         # operator's network and reports its findings. The token is checked
         # before the body is read.
-        if not node_agent.token_matches(x_derate_token):
-            raise HTTPException(status_code=403, detail="cluster token required")
+        _require_token(request, x_derate_token)
         try:
             return await node_agent.reach_payload(payload.get("url"))
         except reach.UnusableTarget as exc:
@@ -680,14 +890,14 @@ def create_agent_app(node_agent: NodeAgent):
 
     @app.post("/agent/processes/{pid}/kill")
     async def kill_process(
+        request: Request,
         pid: int,
         x_derate_token: str | None = Header(default=None),
     ) -> dict:
         # The token is checked before anything else, including the PID
         # guards. An uncredentialed caller must not be able to learn which
         # PIDs exist or are protected by reading which refusal comes back.
-        if not node_agent.token_matches(x_derate_token):
-            raise HTTPException(status_code=403, detail="cluster token required")
+        _require_token(request, x_derate_token)
         try:
             result = await kill_gpu_process(pid)
         except KillRefused as exc:
@@ -699,7 +909,12 @@ def create_agent_app(node_agent: NodeAgent):
             raise HTTPException(
                 status_code=status, detail={"code": exc.code, "message": exc.message}
             ) from exc
-        return result.as_dict()
+        body = result.as_dict()
+        node_agent.note_action(
+            "process_killed", _peer(request), request.url.path, pid=pid,
+            name=body.get("name") or "", signal_sent=body.get("signal_sent"),
+        )
+        return body
 
     # The shell, and only if it was asked for. Registered conditionally rather
     # than registered-and-refusing: an absent route cannot be probed for, and

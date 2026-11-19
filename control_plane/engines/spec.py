@@ -216,3 +216,14 @@ class EngineSpec:
     #: here rather than testing device classes at each site is what keeps the
     #: launch path and the node board from drifting apart.
     memory_pool: str = "gpu"
+    #: The per-deployment runtime API key (H3): the environment variable the
+    #: runtime reads it from, and the flag form for a runtime that also wants
+    #: it on the command line. Mirrors ``deploy/flags.py::RuntimeSpec``.
+    api_key_env: str = ""
+    api_key_arg: str | None = None
+    #: Appended with the resolver's commit sha (M7).
+    revision_arg: str | None = None
+    #: Appended only when the deployment opted in to the repo's own Python (R2).
+    trust_remote_code_arg: str | None = "--trust-remote-code"
+    #: Whether ``cache_env`` is a compile cache split per model (M8).
+    cache_per_model: bool = False

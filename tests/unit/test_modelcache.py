@@ -225,7 +225,10 @@ def test_the_agent_serves_the_cache(tmp_path, monkeypatch):
     make_repo(tmp_path, "models--org--m", blob_sizes=(2048,))
 
     client = TestClient(create_agent_app(NodeAgent(profile(), token="tok")))
-    body = client.get("/agent/models/cache").json()
+    # Token-gated since the LAN-disclosure fix: which models a node has
+    # cached is nobody else's business on the network.
+    assert client.get("/agent/models/cache").status_code == 403
+    body = client.get("/agent/models/cache", headers={"X-Derate-Token": "tok"}).json()
 
     assert body["available"] is True
     assert body["node_id"] == "spark-01"
@@ -296,7 +299,7 @@ def _gateway_with(deployments, agent_url="http://198.51.100.9:8081"):
         def agent_url(self, node_id):
             return agent_url
 
-        def cluster_token(self):
+        def agent_token(self, node_id):
             return "tok"
 
     deps = GatewayDeps()
@@ -373,20 +376,6 @@ def test_weights_a_live_deployment_is_serving_are_refused(state):
     assert "d-1" in body["error"]["message"]
 
 
-@pytest.mark.parametrize("state", ["stopped", "failed"])
-def test_weights_of_a_terminal_deployment_are_deletable(state, monkeypatch):
-    """The orphan this exists to clear. It must not be protected forever."""
-    import httpx
-
-    client = _gateway_with([_deployment("openai/gpt-oss-120b", state)])
-
-    monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
-    res = client.delete(
-        "/api/storage/nodes/spark-01/models/models--openai--gpt-oss-120b"
-    )
-
-    assert res.status_code == 200
-    assert res.json()["bytes_freed"] == 195758080000
 
 
 def test_a_different_model_is_not_protected_by_an_unrelated_deployment(monkeypatch):

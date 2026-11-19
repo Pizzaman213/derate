@@ -196,12 +196,16 @@ def test_unavailable_is_not_an_empty_disk():
 # ---------------------------------------------------------------------------
 
 
+TOKEN = "agent-secret"
+HEADERS = {"X-Derate-Token": TOKEN}
+
+
 def test_the_agent_serves_its_own_data_root(tmp_path):
     (tmp_path / "telemetry").mkdir()
     (tmp_path / "telemetry" / "journal.db").write_bytes(b"x" * 2048)
 
-    client = TestClient(create_agent_app(NodeAgent(profile(), data_root=tmp_path)))
-    res = client.get("/agent/storage")
+    client = TestClient(create_agent_app(NodeAgent(profile(), token=TOKEN, data_root=tmp_path)))
+    res = client.get("/agent/storage", headers=HEADERS)
 
     assert res.status_code == 200
     body = res.json()
@@ -212,12 +216,17 @@ def test_the_agent_serves_its_own_data_root(tmp_path):
     assert journal["bytes"] == 2048
 
 
-def test_the_storage_route_needs_no_token(tmp_path):
-    """A read, like /agent/profile. Only the kill route is credentialed."""
+def test_the_storage_route_needs_the_agent_token(tmp_path):
+    """Disk layout and what is cached is nobody else's business on the LAN:
+    the route answers only the agent token, and an agent with none refuses."""
     client = TestClient(
-        create_agent_app(NodeAgent(profile(), token="secret", data_root=tmp_path))
+        create_agent_app(NodeAgent(profile(), token=TOKEN, data_root=tmp_path))
     )
-    assert client.get("/agent/storage").status_code == 200
+    assert client.get("/agent/storage").status_code == 403
+    assert client.get("/agent/storage", headers={"X-Derate-Token": "wrong"}).status_code == 403
+    assert client.get("/agent/storage", headers=HEADERS).status_code == 200
+    tokenless = TestClient(create_agent_app(NodeAgent(profile(), data_root=tmp_path)))
+    assert tokenless.get("/agent/storage", headers=HEADERS).status_code == 403
 
 
 def test_a_probe_that_raises_degrades_rather_than_500ing(tmp_path, monkeypatch):
@@ -225,8 +234,8 @@ def test_a_probe_that_raises_degrades_rather_than_500ing(tmp_path, monkeypatch):
         raise OSError("disk went away")
 
     monkeypatch.setattr(storage, "storage_payload", boom)
-    client = TestClient(create_agent_app(NodeAgent(profile(), data_root=tmp_path)))
-    res = client.get("/agent/storage")
+    client = TestClient(create_agent_app(NodeAgent(profile(), token=TOKEN, data_root=tmp_path)))
+    res = client.get("/agent/storage", headers=HEADERS)
 
     assert res.status_code == 200
     assert res.json()["available"] is False
@@ -354,7 +363,7 @@ def test_a_node_on_an_older_build_says_so_rather_than_echoing_a_404():
         async def __aexit__(self, *a):
             return False
 
-        async def get(self, url):
+        async def get(self, url, headers=None):
             return _Response()
 
     original = httpx.AsyncClient

@@ -94,7 +94,16 @@ def wrong_model(reason: str | None) -> bool:
     return bool(reason) and _MISMATCH_MARK in reason
 
 
-def _models(origin: str, timeout: float) -> tuple[list[str] | None, str | None]:
+def _get(url: str, api_key: str | None) -> urllib.request.Request:
+    """A GET carrying the deployment's runtime key, when it has one (H3):
+    the engine refuses `/v1/*` without it, and `/health` ignores it."""
+    headers = {"Authorization": "Bearer %s" % api_key} if api_key else {}
+    return urllib.request.Request(url, headers=headers)
+
+
+def _models(
+    origin: str, timeout: float, api_key: str | None = None
+) -> tuple[list[str] | None, str | None]:
     """What the port says it serves, or None when it would not say.
 
     None is "nothing learned", which is not the same as "wrong model": a
@@ -104,7 +113,7 @@ def _models(origin: str, timeout: float) -> tuple[list[str] | None, str | None]:
     """
     url = origin + MODELS_PATH
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with urllib.request.urlopen(_get(url, api_key), timeout=timeout) as response:
             if not 200 <= response.status < 300:
                 return None, "%s returned HTTP %d" % (url, response.status)
             body = response.read(_MAX_BODY)
@@ -127,6 +136,7 @@ def probe(
     timeout: float = 3.0,
     expect_model: str | None = None,
     health_path: str | None = None,
+    api_key: str | None = None,
 ) -> tuple[bool, str | None]:
     """Is the backend answering -- and, when asked, is it ours?
 
@@ -155,7 +165,7 @@ def probe(
     """
     origin = backend_origin(backend_url)
     if expect_model:
-        names, _ = _models(origin, timeout)
+        names, _ = _models(origin, timeout, api_key)
         if names is not None:
             if serves(names, expect_model):
                 return True, None
@@ -181,7 +191,7 @@ def probe(
     for path in paths:
         url = origin + path
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
+            with urllib.request.urlopen(_get(url, api_key), timeout=timeout) as response:
                 if 200 <= response.status < 300:
                     return True, None
                 last = "%s returned HTTP %d" % (url, response.status)

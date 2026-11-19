@@ -8,14 +8,104 @@ the whole point.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import re
 import socket
 from pathlib import Path
 
+from ..netliteral import is_numeric_host_literal
 from .errors import BridgeNetworkError
 
 log = logging.getLogger(__name__)
+
+# A DNS name: labels of letters, digits and inner hyphens. Never starts with
+# "-", so an address can never be read as an ssh option.
+HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+
+def valid_host(value: str) -> bool:
+    """An IP literal or a hostname: the only things safe as an ssh target."""
+    if not value or value.startswith("-"):
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return bool(HOSTNAME_RE.match(value))
+
+
+_LINK_LOCAL = (ipaddress.ip_network("169.254.0.0/16"), ipaddress.ip_network("fe80::/10"))
+
+
+def is_peer_address(host: str) -> bool:
+    """Whether *host* can name another machine on the network.
+
+    An IP literal is refused when it is loopback, link-local (which holds the
+    cloud metadata address), multicast, unspecified or reserved; a hostname
+    passes iff :func:`valid_host`. Loopback is refused because every caller
+    means "a different machine" -- an agent URL that names the coordinator's
+    own loopback is an SSRF into it, not a peer. No DNS resolution: that
+    would make the answer depend on whoever runs the resolver.
+    """
+    if not host or is_numeric_host_literal(host):
+        return False
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        name = host.lower().rstrip(".")
+        if name == "localhost" or name.endswith(".localhost"):
+            return False
+        return valid_host(host)
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+        return False
+    return not any(ip in net for net in _LINK_LOCAL if net.version == ip.version)
+
+
+def _as_ip(value: str):
+    try:
+        ip = ipaddress.ip_address(value.strip("[]"))
+    except ValueError:
+        return None
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return mapped or ip
+
+
+def same_host(a: str | None, b: str | None) -> bool:
+    """Whether two host strings name the same machine, without DNS.
+
+    IP literals compare as addresses (so ``::ffff:10.0.0.5`` is ``10.0.0.5``
+    and IPv6 spellings agree); anything else compares case-insensitively.
+    """
+    if not a or not b:
+        return False
+    ia, ib = _as_ip(a), _as_ip(b)
+    if ia is not None or ib is not None:
+        return ia is not None and ia == ib
+    return a.lower().rstrip(".") == b.lower().rstrip(".")
+
+
+def is_local_address(host: str | None) -> bool:
+    """Whether *host* is an address of this machine: loopback, or an IP
+    literal one of our interfaces holds (binding to it succeeds). No DNS and
+    no packets -- a bind to port 0 asks the kernel and nothing else."""
+    ip = _as_ip(host or "")
+    if ip is None:
+        return False
+    if ip.is_loopback:
+        return True
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.bind((str(ip), 0))
+        return True
+    except OSError:
+        return False
+
 
 BRIDGE_MESSAGE = (
     "Bridge networking detected. mDNS discovery cannot cross a Docker bridge, "

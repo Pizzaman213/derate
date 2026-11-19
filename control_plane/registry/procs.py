@@ -15,7 +15,7 @@ Three rules keep this a narrow verb rather than a remote-exec hole:
 2. **Never PID 1, never ourselves, never an ancestor of ourselves.** Killing our
    own process tree would take the agent down with the workload and leave the
    node unreachable to say what happened.
-3. **The caller must hold the cluster token.** Enforced in ``agent.py``, because
+3. **The caller must hold this node's agent token.** Enforced in ``agent.py``, because
    that is where the request and its headers are.
 
 Success means the memory came back, not that the signal was delivered. A
