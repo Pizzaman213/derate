@@ -35,8 +35,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
+from ..contracts.auth import AuditAction
 from ..providers.detect import detect_runtime, set_resident
-from . import errors
+from . import errors, serialize
+from .authz import audit_request
+from .body import BodyTooLarge, payload_too_large, read_json_object
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +123,7 @@ def create_router(ctx) -> APIRouter:
         )
 
     @router.post("/api/nodes/{node_id}/runtime")
-    async def adopt_runtime(node_id: str) -> Response:
+    async def adopt_runtime(node_id: str, request: Request) -> Response:
         """Adopt the runtime on this node as a provider. The one click.
 
         Takes no body on purpose. Every field a provider needs here is already
@@ -184,6 +187,17 @@ def create_router(ctx) -> APIRouter:
                 "invalid_request_error",
                 "provider_rejected",
             )
+        # A routing target nobody typed: its own row, never the generic
+        # api_write one, so the record says what was added (CAP-5).
+        audit_request(
+            request,
+            AuditAction.PROVIDER_CREATED,
+            "provider",
+            getattr(provider, "provider_id", provider_id),
+            after=serialize.provider_audit(
+                provider, getattr(ctx.deps.providers, "redactor", None)
+            ),
+        )
         return JSONResponse(
             {
                 "node_id": node_id,
@@ -221,7 +235,9 @@ def create_router(ctx) -> APIRouter:
                 "probe_unavailable",
             )
         try:
-            body = await request.json()
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
@@ -254,6 +270,13 @@ def create_router(ctx) -> APIRouter:
                 "server_error",
                 "runtime_refused",
             )
+        audit_request(
+            request,
+            AuditAction.NODE_RUNTIME_MODEL_CHANGED,
+            "node",
+            node_id,
+            after={"model": model, "resident": resident},
+        )
         return JSONResponse(
             {
                 "node_id": node_id,

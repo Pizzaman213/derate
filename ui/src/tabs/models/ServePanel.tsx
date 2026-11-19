@@ -133,6 +133,12 @@ export function ServePanel({
   // them rather than making somebody retype. Starts ticked when a custom
   // serve seeded a value, since that field arrived non-empty on purpose.
   const [customCommand, setCustomCommand] = useState(() => !!initialCustomCommand)
+  // Opt-in to the repo's own Python (R2). Off by default, except under `tts`:
+  // every architecture that server supports is remote code transformers does
+  // not ship, so it cannot load one checkpoint without it. Reset whenever the
+  // runtime changes so a tick under one runtime never rides into another.
+  const [trustRemoteCode, setTrustRemoteCode] = useState(() => runtime === 'tts')
+  useEffect(() => setTrustRemoteCode(runtime === 'tts'), [runtime])
 
   const seq = useRef(0)
 
@@ -257,6 +263,9 @@ export function ServePanel({
         ...(customCommand && customCommandText.trim()
           ? { custom_command: customCommandText.trim() }
           : {}),
+        // Sent only when the resolver said there is remote code AND the box
+        // is ticked; absent means false on the server.
+        ...(result.remote_code && trustRemoteCode ? { trust_remote_code: true } : {}),
         // One key per gate the backend itself published, sent only where
         // somebody has read that gate's sentence and ticked it. Driven off the
         // published list rather than a fixed set of names, and filtered against
@@ -355,7 +364,7 @@ export function ServePanel({
           changed is that leaving them alone is now a request in its own right
           rather than a silent 8192. */}
       {onCluster ? (
-        <div style={{ marginTop: 'var(--s-3)' }}>
+        <div style={{ marginTop: 'var(--space-12)' }}>
           <Disclosure
             summary={
               route.context === null && route.concurrency === null
@@ -405,6 +414,7 @@ export function ServePanel({
                 <div className="fld">
                   <label htmlFor="sp-auto">&nbsp;</label>
                   <button
+                    type="button"
                     id="sp-auto"
                     onClick={() =>
                       navigate({ context: null, concurrency: null }, { replace: true })
@@ -415,7 +425,7 @@ export function ServePanel({
                 </div>
               ) : null}
             </div>
-            <p className="unit" style={{ margin: '6px 0 0' }}>
+            <p className="unit" style={{ margin: 'var(--space-6) 0 0' }}>
               {route.context === null && route.concurrency === null
                 ? result?.context
                   ? `Judged at ${result.context.toLocaleString()} context and ` +
@@ -444,7 +454,7 @@ export function ServePanel({
             onChoose={onProviderId}
             nodes={cluster?.nodes}
           />
-          <p className="unit" style={{ marginTop: 'var(--s-3)' }}>
+          <p className="unit" style={{ marginTop: 'var(--space-12)' }}>
             This runtime does not launch on the cluster. It tells the provider to
             fetch a GGUF onto itself, and the gateway routes to it once it lands —
             so the quantizations below are the download, and the machine's own free
@@ -456,7 +466,7 @@ export function ServePanel({
       )}
 
       {!onCluster ? null : result ? (
-        <div style={{ marginTop: 'var(--s-3)' }}>
+        <div style={{ marginTop: 'var(--space-12)' }}>
           <Verdict
             result={result}
             checking={checking}
@@ -479,6 +489,8 @@ export function ServePanel({
             onCustomCommandTextChange={setCustomCommandText}
             customCommand={customCommand}
             onCustomCommandChange={setCustomCommand}
+            trustRemoteCode={trustRemoteCode}
+            onTrustRemoteCodeChange={setTrustRemoteCode}
           />
         </div>
       ) : error ? (
@@ -488,13 +500,13 @@ export function ServePanel({
             color: 'var(--fault)',
             fontWeight: 400,
             whiteSpace: 'pre-wrap',
-            margin: 'var(--s-3) 0 0',
+            margin: 'var(--space-12) 0 0',
           }}
         >
           {error}
         </p>
       ) : (
-        <p className="unit" style={{ margin: 'var(--s-3) 0 0' }}>
+        <p className="unit" style={{ margin: 'var(--space-12) 0 0' }}>
           Checking where this fits…
         </p>
       )}

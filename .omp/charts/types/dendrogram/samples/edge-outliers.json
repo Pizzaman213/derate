@@ -1,0 +1,1 @@
+{"description":"Merge heights spanning four orders of magnitude.","data":{"name":"","height":5000,"children":[{"name":"","height":0.4,"children":[{"name":"a"},{"name":"b"}]},{"name":"","height":12,"children":[{"name":"c"},{"name":"","height":0.9,"children":[{"name":"d"},{"name":"e"}]}]}]}}

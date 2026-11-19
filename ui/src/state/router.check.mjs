@@ -1,5 +1,5 @@
 // Verifier for the URL scheme. There is no test runner in this repo (see
-// layout.check.mjs), and routes.ts is pure -- a string in, a route out, a
+// ui/README.md), and routes.ts is pure -- a string in, a route out, a
 // string back -- so it is checkable without a browser:
 //
 //   node src/state/router.check.mjs
@@ -13,7 +13,7 @@
 //   href(parse(u)) is stable    a URL has one canonical spelling
 //
 // routes.ts is bundled with the esbuild inside vite rather than imported
-// directly, for the same reason layout.check.mjs does it: node's ESM resolver
+// directly, for the same reason every other verifier does: node's ESM resolver
 // will not resolve an extensionless specifier.
 
 import { build as bundleWithEsbuild } from 'esbuild'
@@ -56,18 +56,34 @@ check('root is the dashboard', parse('/').dest, 'dash')
 check('root canonicalises', href(parse('/')), '/dashboard')
 check('unknown path is the dashboard', parse('/nonsense/deeper').dest, 'dash')
 check('unknown path canonicalises', href(parse('/nonsense')), '/dashboard')
+// A malformed escape makes decodeURIComponent throw URIError; uncaught, that
+// was a blank app on `/models/%E0`.
+check('malformed escape is the dashboard', (() => {
+  try {
+    return parse('/models/%E0').dest
+  } catch (e) {
+    return `threw ${e}`
+  }
+})(), 'dash')
+check('malformed escape canonicalises', href(parse('/models/%E0?node=a')), '/dashboard')
 
 for (const [path, dest] of [
   ['/dashboard', 'dash'],
   ['/models', 'models'],
   ['/cluster', 'cluster'],
   ['/chat', 'chat'],
-  ['/spend', 'spend'],
+  ['/usage', 'usage'],
   ['/settings', 'settings'],
   // Not in the header's nav, and still a destination like any other. The
   // first-run screen has to survive being reloaded and typed, so it has to
   // round trip through the scheme like the rest.
   ['/setup', 'setup'],
+  // Off the nav as well, and the one screen without a session.
+  ['/login', 'login'],
+  ['/usage/requests', 'usage'],
+  ['/usage/requests/r-abc123', 'usage'],
+  ['/usage/keys', 'usage'],
+  ['/usage/keys/k1', 'usage'],
 ]) {
   check(`${path} -> ${dest}`, parse(path).dest, dest)
   check(`${path} round trips`, href(parse(path)), path)
@@ -107,6 +123,73 @@ check('model id only on /models', href({ ...parse('/cluster'), model: HF }), '/c
 // in, character for character, not one that merely re-encodes to the same URL.
 const ODD = 'someone/model with spaces+and%20stuff'
 check('odd id round trips', parse(href({ ...parse('/models'), model: ODD })).model, ODD)
+
+// ── /usage: one destination, three panes in the path ─────────────────────────
+
+check('the bare path is the overview', parse('/usage').sub, 'overview')
+check('no pane off /usage', parse('/cluster').sub, null)
+check('/usage/overview is spelled /usage', href(parse('/usage/overview')), '/usage')
+check('an unknown pane is the overview, tail dropped', href(parse('/usage/bogus/x')), '/usage')
+check('a pane with no sub is the overview', href({ ...parse('/cluster'), dest: 'usage' }), '/usage')
+
+// The three destinations it replaced still land, and are re-spelled.
+check('/spend is the overview', [parse('/spend').dest, parse('/spend').sub], ['usage', 'overview'])
+check('/spend?win=7d -> /usage?win=7d', href(parse('/spend?win=7d')), '/usage?win=7d')
+check('/keys/k1 -> /usage/keys/k1', href(parse('/keys/k1')), '/usage/keys/k1')
+check(
+  '/requests/r-1 with filters -> /usage/requests/r-1',
+  href(parse('/requests/r-1?win=7d&key=k1&status=failed&retried=1')),
+  '/usage/requests/r-1?win=7d&key=k1&status=failed&retried=1',
+)
+
+// ── Key ids: one slug, owned by /usage/keys ──────────────────────────────────
+
+check('key id', parse('/usage/keys/abc123defg').key, 'abc123defg')
+check('no key id', parse('/usage/keys').key, null)
+check('only the first segment is the subject', href(parse('/usage/keys/k1/extra')), '/usage/keys/k1')
+// The same canonicalising rule as a model id: a subject is meaningless off
+// its own pane, so it does not follow the route anywhere else.
+check('a key id is dropped off the keys pane', href({ ...parse('/usage/keys/k1'), sub: 'overview' }), '/usage')
+check('a key id is dropped off /usage', href({ ...parse('/usage/keys/k1'), dest: 'cluster' }), '/cluster')
+// The audit log is a Settings sub-tab now, not a destination: its old path
+// reads as the dashboard like any other unknown segment.
+check('/audit is not a destination', parse('/audit').dest, 'dash')
+// Orgs are not in the UI any more: every setting is on the key.
+check('/orgs is not a destination', parse('/orgs/o1').dest, 'dash')
+check('a key id never lands on /models', href({ ...parse('/models'), key: 'k1' }), '/models')
+
+// ── The spend window: a selection owned by the overview ──────────────────────
+
+check('a window parses', parse('/usage?win=7d').win, '7d')
+check('a window round trips', href(parse('/usage?win=7d')), '/usage?win=7d')
+check('an unknown window is the default', parse('/usage?win=fortnight').win, null)
+check('a window is dropped off /usage', href({ ...parse('/usage?win=7d'), dest: 'dash' }), '/dashboard')
+check('no window on the keys pane', href({ ...parse('/usage?win=7d'), sub: 'keys' }), '/usage/keys')
+
+// ── The requests pane: a request id in the path, its filters in the query ────
+
+check('a request id', parse('/usage/requests/r-abc123').request, 'r-abc123')
+check(
+  'request filters round trip',
+  href(parse('/usage/requests/r-1?retried=1&status=failed&key=k1&win=7d')),
+  '/usage/requests/r-1?win=7d&key=k1&status=failed&retried=1',
+)
+check('a request id is dropped off the requests pane', href({ ...parse('/usage/requests/r-1?retried=1'), sub: 'keys' }), '/usage/keys')
+check('a key id is dropped onto the requests pane', href({ ...parse('/usage/keys/k1'), sub: 'requests' }), '/usage/requests')
+check('an unknown status filter is none', parse('/usage/requests?status=teapot').fstatus, null)
+check('`all` is not a requests window', href({ ...parse('/usage?win=all'), sub: 'requests' }), '/usage/requests')
+check('requests filters never leak to the overview', href({ ...parse('/usage/requests?win=7d&key=k1'), sub: 'overview' }), '/usage?win=7d')
+check('a model Usage link opens rate limits', href(parse('/usage?dep=claude-opus-5-5')), '/usage/rate-limits?dep=claude-opus-5-5')
+check('rate limit provider and target survive reload',
+  href(parse('/usage/rate-limits?dep=claude-opus-5-5&win=30d&provider=claude_code&target=claude_code:claude-opus-5-5')),
+  '/usage/rate-limits?dep=claude-opus-5-5&win=30d&target=claude_code:claude-opus-5-5&provider=claude_code')
+check('429 request filter survives reload', parse('/usage/requests?status=429&provider=claude_code').fstatus, '429')
+check('provider scope survives request detail navigation',
+  href({ ...parse('/usage/requests?status=429&provider=claude_code'), request: 'r-limited' }),
+  '/usage/requests/r-limited?status=429&provider=claude_code')
+check('request-only filters do not leak into rate limits',
+  href({ ...parse('/usage/requests?key=k&status=429&retried=1'), sub: 'rate-limits' }),
+  '/usage/rate-limits')
 
 // ── Selections ───────────────────────────────────────────────────────────────
 
@@ -166,11 +249,11 @@ check('negative sequences defer to the coordinator', parse('/models?seq=-3').con
 check('fractional context rounds', parse('/models?ctx=4096.4').context, 4096)
 // The numbers belong to the fit question, so they ride along wherever that
 // question is being asked -- the models tab, or a model sheet over any screen.
-check('numbers are dropped off the models tab', href({ ...parse('/spend'), context: 32768 }), '/spend')
+check('numbers are dropped off the models tab', href({ ...parse('/usage'), context: 32768 }), '/usage')
 check(
   'a model sheet keeps them',
-  href({ ...parse(`/spend?open=model:${HF}`), context: 32768 }),
-  `/spend?open=model:${HF}&ctx=32768`,
+  href({ ...parse(`/usage?open=model:${HF}`), context: 32768 }),
+  `/usage?open=model:${HF}&ctx=32768`,
 )
 
 // ── The deployment shape: which machines, at which degrees ───────────────────
@@ -195,7 +278,7 @@ check('blank entries are dropped', parse('/models?on=spark-01,,%20').on, ['spark
 check('no machines is the planner', parse('/models').on, null)
 check('an empty list is the planner', parse('/models?on=').on, null)
 check('an empty list is not written', href(parse('/models?on=')), '/models')
-check('machines are dropped off the models tab', href({ ...parse('/spend'), on: ['spark-01'] }), '/spend')
+check('machines are dropped off the models tab', href({ ...parse('/usage'), on: ['spark-01'] }), '/usage')
 
 check('degrees parse', [parse('/models?tp=2&pp=1').tp, parse('/models?tp=2&pp=1').pp], [2, 1])
 check('degrees round trip', href(parse('/models?tp=2&pp=1')), '/models?tp=2&pp=1')
@@ -212,7 +295,7 @@ check('one axis adopts the pair', [parse('/models?tp=4').tp, parse('/models?tp=4
 check('one axis writes the pair', href(parse('/models?tp=4')), '/models?tp=4&pp=1')
 check('garbage degrees are the planner', parse('/models?tp=abc&pp=x').tp, null)
 check('zero degrees are the planner', parse('/models?tp=0&pp=0').tp, null)
-check('degrees are dropped off the models tab', href({ ...parse('/spend'), tp: 2, pp: 1 }), '/spend')
+check('degrees are dropped off the models tab', href({ ...parse('/usage'), tp: 2, pp: 1 }), '/usage')
 
 // ── The properties themselves, over every URL above ──────────────────────────
 
@@ -226,7 +309,7 @@ const URLS = [
   '/cluster?node=spark-01',
   '/cluster?link=spark-01~spark-02',
   '/cluster?node=spark-01&open=node:spark-02',
-  `/spend?open=model:${HF}&ctx=131072`,
+  `/usage?open=model:${HF}&ctx=131072`,
   '/settings?node=spark-01&dep=qwen3-30b-a3b&open=dep:qwen3-30b-a3b',
   '/nonsense?ctx=99',
   `/models/${HF}?ctx=32768&seq=8&on=spark-4d38`,
@@ -235,7 +318,12 @@ const URLS = [
   // to survive the round trip like any other, or a shared link quietly becomes
   // "let the coordinator choose".
   `/models/${HF}?ctx=8192&seq=1`,
-  `/spend?open=model:${HF}&on=spark-01&tp=1&pp=2`,
+  `/usage?open=model:${HF}&on=spark-01&tp=1&pp=2`,
+  '/usage?win=all',
+  '/usage/requests/r-1?win=30d&model=m&target=t',
+  '/usage?dep=claude-opus-5-5',
+  '/usage/rate-limits?dep=claude-opus-5-5&win=7d&provider=claude_code',
+  '/usage/requests?status=429&provider=claude_code',
 ]
 
 for (const url of URLS) {

@@ -237,9 +237,69 @@ cannot start a different model than the one the verdict card judged.
 
 **`cache_env` -> the `env:` block is the only channel there is.** sparkrun's
 recipe format has no `volumes:` key, so anything a runtime must keep between
-launches is pointed at `RUNTIME_CACHE_DIR` through an environment variable, and
-that block is deliberately not run through the safety checks above because its
-values are module constants from `flags.py` that never touch a request.
+launches is pointed at `RUNTIME_CACHE_DIR` through an environment variable. Its
+values are module constants from `flags.py` plus, for a runtime with
+`cache_per_model` (vLLM, SGLang), a slug of the already-checked `model_id`
+(`flags.cache_env_for`): one compile cache per model, because a shared writable
+Inductor/Triton tree is somewhere code in one model's container can plant a
+`.py`/`.so` the next trusted launch loads. The tts voice library stays shared.
+
+**Every engine requires a per-deployment key.** The engine listens on `0.0.0.0`
+on the host network, so `DeploymentManager.launch` mints `secrets.token_hex(32)`,
+keeps it in the record's persisted handle (never on `Deployment`, so no
+serializer can reach it) and `synthesize(..., runtime_api_key=)` puts it in the
+recipe's `env:` as `VLLM_API_KEY` / `SGLANG_API_KEY` (plus `--api-key`) /
+`DERATE_TTS_API_KEY`. The recipe file is written 0600. The gateway is the only
+holder: `gateway/targets.py` puts it on the LOCAL `RouteTarget`, `proxy.py` and
+the voices listing send it, and `health.probe(api_key=)` sends it to
+`/v1/models`. vLLM's middleware guards `/v1`, `/v2`, `/inference` and `/cohere`
+only (`vllm/entrypoints/serve/middleware/authenticate.py::GUARDED_PREFIX`, read
+out of the pinned image), so `/health` and `/metrics` stay open. A deployment
+launched before keys existed has none and is called without a header. Launch
+output is scrubbed of the key before it is kept, because sparkrun echoes
+`--api-key`.
+
+**The approved revision is the one that runs.** `synthesize(..., revision=)`
+appends `--revision --code-revision --tokenizer-revision` (vLLM) or `--revision`
+(SGLang, tts) for a 40-hex sha and nothing otherwise (logged as unpinned), so
+remote code, when it is trusted, is the code the resolver read, not whatever
+`main` is at launch. The value is YAML-quoted: an all-digit sha is an integer to YAML.
+
+**Remote code is opt-in.** No command template carries `--trust-remote-code`.
+`launch(..., trust_remote_code=True)` (the launch body's `trust_remote_code`,
+default false) makes `_append_pins` add `RuntimeSpec.trust_remote_code_arg`,
+on the generated and the custom command alike; `check_extra_args_safe` refuses
+the flag as an `extra_args`/`custom_command` token, so the only way to set it is
+the field the `deployment_launched` audit row records. The resolver says which
+repos need it: `Resolution.remote_code` and a warning naming `auto_map` or the
+repo's `.py` files. A model that needs it and was launched without it fails at
+load. The Serve panel's "Trust remote code" box defaults to unchecked, except on
+the `tts` runtime, where it defaults to checked: every architecture in
+`TTS_ARCHITECTURES` (`ArkttsModel`) is remote code that transformers does not
+ship, so that server cannot load a single supported checkpoint without it.
+Every launch also records `image` (the reference run, env override included)
+and `image_id` (`docker image inspect {{.Id}}` on the coordinator after the
+launch, `""` when the image is not local there).
+
+**Speculative decoding is one generated flag.** `launch(..., speculative_tokens=N)`
+(0..8, vllm only, refused otherwise before any record exists) makes
+`_serve_command` append `--speculative-config '{"method": "mtp",
+"num_speculative_tokens": N}'` after the KV argument and before `extra_args`,
+plus a `derate_speculative_tokens` metadata line. It is generated, so it never
+meets `check_extra_args_safe`; the braces survive sparkrun because vpd's
+`arg_substitute` puts back any `{...}` it has no value for. `custom_command`
+replaces the generated flags, this one included. The plan charges the MTP
+module (`param_breakdown["mtp"]`) that the resolver otherwise excludes.
+
+**Containers are not privileged.** Every recipe carries `executor_config:
+privileged: false, cap_add: [IPC_LOCK]`, which sparkrun 0.2.40 reads from the
+recipe (`core/recipe.py` `executor_config`, chained in `core/launcher.py` above
+its own `EXECUTOR_DEFAULTS` of `privileged: True`). If a GPU launch cannot see
+the device without privilege, that is the line to revisit, with the measured
+failure recorded here.
+
+**sparkrun inherits an allowlisted environment** (`sparkrun.sparkrun_env`), not
+the coordinator's: no `DERATE_TOKEN`, provider key or `DERATE_SECRET_*`.
 
 ## `flags.py`
 

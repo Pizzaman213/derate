@@ -1,0 +1,1 @@
+{"description":"SaaS trial funnel for one quarter, column arrays with a field mapping.","data":{"stage":["Signed up","Verified email","Created project","Invited a teammate","Started trial","Converted to paid"],"users":[48210,39876,21530,9120,6044,1712]},"options":{"fields":{"label":"stage","value":"users"}}}

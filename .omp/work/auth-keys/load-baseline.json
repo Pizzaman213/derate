@@ -1,0 +1,77 @@
+{
+  "config": {
+    "command": "rps",
+    "backends": 4,
+    "tokens": 64,
+    "ttft": 0.01,
+    "itl": 0.02,
+    "duration": 10.0,
+    "cooldown": 5.0,
+    "max_rps": 200000.0,
+    "max_streams": 8192,
+    "no_ab": false,
+    "settings": "{}",
+    "json": "/home/connor/derate/.omp/work/auth-keys/load-baseline.json",
+    "rungs": "25,50,100,250",
+    "policy": "least_outstanding"
+  },
+  "rps": {
+    "axis": "rps",
+    "rungs": [
+      {
+        "rate": 25.0,
+        "achieved_rps": 25.0,
+        "error_rate": 0.0,
+        "p50_ms": 3.31,
+        "p99_ms": 4.728,
+        "loop_lag_p99_ms": 2.162,
+        "cpu_pct": 7.5,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": []
+      },
+      {
+        "rate": 50.0,
+        "achieved_rps": 50.0,
+        "error_rate": 0.0,
+        "p50_ms": 3.245,
+        "p99_ms": 5.431,
+        "loop_lag_p99_ms": 1.03,
+        "cpu_pct": 13.5,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": []
+      },
+      {
+        "rate": 100.0,
+        "achieved_rps": 100.0,
+        "error_rate": 0.0,
+        "p50_ms": 3.182,
+        "p99_ms": 5.431,
+        "loop_lag_p99_ms": 0.957,
+        "cpu_pct": 24.8,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": []
+      },
+      {
+        "rate": 250.0,
+        "achieved_rps": 250.0,
+        "error_rate": 0.0,
+        "p50_ms": 2.61,
+        "p99_ms": 112.378,
+        "loop_lag_p99_ms": 1.945,
+        "cpu_pct": 54.6,
+        "drop_rate": 0.0,
+        "outstanding_leaked": 0,
+        "reasons": [
+          "p99 112.4 ms is 34x the idle p50 of 3.3 ms"
+        ]
+      }
+    ],
+    "derated": 100.0,
+    "stopped_by": [
+      "p99 112.4 ms is 34x the idle p50 of 3.3 ms"
+    ]
+  }
+}

@@ -387,15 +387,19 @@ def test_the_recipes_own_command_line_parses():
     machines were committed."""
     from control_plane.deploy.flags import runtime_spec
 
-    template = runtime_spec("tts").command_template
+    spec = runtime_spec("tts")
     argv: list[str] = []
-    for token in template.replace("\\\n", " ").split():
+    for token in spec.command_template.replace("\\\n", " ").split():
         if token in ("python3", "-m", "control_plane.runtimes.tts"):
             continue
         argv.append("1" if token.startswith("{") else token)
     config = tts.config_from_args(tts.build_parser().parse_args(argv))
-    assert config.trust_remote_code is True
+    # Opt-in since the audit: the template never trusts remote code by itself,
+    # and the arg the launch appends when the operator ticks the box parses.
+    assert config.trust_remote_code is False
     assert config.max_num_seqs == 1
+    trusted = tts.config_from_args(tts.build_parser().parse_args([*argv, spec.trust_remote_code_arg]))
+    assert trusted.trust_remote_code is True
 
 
 # ── admission ────────────────────────────────────────────────────────────────
@@ -469,3 +473,63 @@ def test_the_voice_listing_says_what_was_skipped():
     reply = _client().get("/v1/audio/voices")
     assert reply.status_code == 200
     assert reply.json() == {"object": "list", "data": [], "skipped": []}
+
+
+# ── security: runtime key, input cap, untrusted default-voice rows ──────────
+
+
+def test_v1_requires_the_runtime_key_and_health_stays_open():
+    """H3: the engine listens on 0.0.0.0 on the host network. With a key set,
+    every /v1 path refuses a caller without the bearer; /health is what
+    deploy/health.py polls and stays open."""
+    from starlette.testclient import TestClient
+
+    client = TestClient(tts.build_app(_StubEngine(), tts.Admission(1), api_key="k" * 64))
+    assert client.get("/health").status_code == 200
+    refused = client.get("/v1/models")
+    assert refused.status_code == 401
+    assert refused.json()["error"]["code"] == "invalid_api_key"
+    assert client.get("/v1/models", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.post("/v1/audio/speech", json={}).status_code == 401
+    ok = client.get("/v1/models", headers={"Authorization": "Bearer " + "k" * 64})
+    assert ok.status_code == 200
+
+
+def test_the_key_is_read_from_the_environment(monkeypatch):
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("DERATE_TTS_API_KEY", "envkey123")
+    client = TestClient(tts.build_app(_StubEngine(), tts.Admission(1)))
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer envkey123"}).status_code == 200
+
+
+def test_an_input_past_the_cap_is_refused_with_a_400():
+    """L16: one request holds the GPU lock for its whole generation."""
+    body = {"model": "audio8-tts", "input": "a" * (tts.MAX_INPUT_CHARS + 1)}
+    with pytest.raises(ValueError):
+        tts.parse_speech_request(body, "audio8-tts")
+    reply = _client().post("/v1/audio/speech", json=body)
+    assert reply.status_code == 400
+    body["input"] = "a" * tts.MAX_INPUT_CHARS
+    assert tts.parse_speech_request(body, "audio8-tts").input == body["input"]
+
+
+@pytest.mark.parametrize(
+    "speaker, src",
+    [
+        ("../../etc/x", "https://example.invalid/clip.wav"),
+        ("a b", "https://example.invalid/clip.wav"),
+        ("2902", "http://example.invalid/clip.wav"),
+        ("2902", "file:///etc/passwd"),
+    ],
+)
+def test_a_default_voice_row_with_an_unsafe_name_or_url_is_skipped(speaker, src):
+    """L15: the speaker id becomes a filename and the clip is fetched by URL."""
+    rows = fake_rows(speaker, "x" * 80, src=src)["rows"]
+    assert tts._pick_row(rows, set()) is None
+
+
+def test_the_revision_flag_reaches_the_config():
+    args = tts.build_parser().parse_args(["--model", "x/y", "--revision", "a" * 40])
+    assert tts.config_from_args(args).revision == "a" * 40

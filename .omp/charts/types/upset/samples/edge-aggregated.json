@@ -1,0 +1,1 @@
+{"description":"Inclusive sizes in venn.js's { sets: [...] } form, converted to exclusive intersections.","data":{"sets":[{"sets":["A"],"size":12},{"sets":["B"],"size":12},{"sets":["C"],"size":12},{"sets":["A","B"],"size":4},{"sets":["A","C"],"size":4},{"sets":["B","C"],"size":4},{"sets":["A","B","C"],"size":2}]}}

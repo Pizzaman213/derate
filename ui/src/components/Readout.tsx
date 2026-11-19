@@ -50,7 +50,7 @@ export function Readout({
       <span className={cls} style={style}>
         {fmt(value, decimals)}
       </span>
-      {unit ? <span className="unit" style={{ marginLeft: 4 }}>{unit}</span> : null}
+      {unit ? <span className="unit" style={{ marginLeft: 'var(--space-4)' }}>{unit}</span> : null}
     </span>
   )
 }

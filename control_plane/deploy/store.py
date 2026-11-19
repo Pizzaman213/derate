@@ -178,10 +178,24 @@ class DeploymentStore:
         return out
 
     def _path(self, deployment_id: str) -> Path:
-        safe = "".join(c for c in deployment_id if c.isalnum() or c in "-_")
-        if not safe:
-            raise ValueError("unusable deployment_id %r" % deployment_id)
-        return self.root / ("%s.json" % safe)
+        return self.root / ("%s.json" % safe_deployment_id(deployment_id))
+
+
+_SAFE_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def safe_deployment_id(deployment_id: str) -> str:
+    """*deployment_id* reduced to ``[A-Za-z0-9_-]``, for use as a file name.
+
+    The one sanitiser for every per-deployment file (the record here, the
+    failed-launch log in manager.py), so none of them can be steered out of
+    its directory by an id. Raises ``ValueError`` when nothing is left."""
+    safe = "".join(c for c in deployment_id if c in _SAFE_ID_CHARS)
+    if not safe:
+        raise ValueError("unusable deployment_id %r" % deployment_id)
+    return safe
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -224,6 +238,11 @@ def encode(d: Deployment) -> dict[str, Any]:
         "modality": d.modality.value,
         "extra_args": list(d.extra_args),
         "custom_command": list(d.custom_command),
+        "revision": d.revision,
+        "speculative_tokens": d.speculative_tokens,
+        "trust_remote_code": d.trust_remote_code,
+        "image": d.image,
+        "image_id": d.image_id,
     }
 
 
@@ -263,4 +282,9 @@ def decode(raw: dict[str, Any]) -> Deployment:
         # necessarily launched with none.
         extra_args=tuple(raw.get("extra_args", ())),
         custom_command=tuple(raw.get("custom_command", ())),
+        revision=raw.get("revision"),
+        speculative_tokens=int(raw.get("speculative_tokens", 0)),
+        trust_remote_code=bool(raw.get("trust_remote_code", False)),
+        image=str(raw.get("image", "")),
+        image_id=str(raw.get("image_id", "")),
     )

@@ -1,0 +1,1 @@
+{"description":"Long names truncate with the full text on hover.","data":[{"label":"Interconnect bandwidth utilisation between spark-01 and spark-02 over RoCE","value":0.66,"low":0.2,"high":0.9},{"label":"Resident model weights as a share of unified memory on the coordinator","value":0.93,"low":0.5,"high":0.85,"optimum":0.3}]}

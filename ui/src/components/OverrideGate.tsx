@@ -43,19 +43,19 @@ export function OverrideGate({
   launchLabel?: string
 }) {
   return (
-    <div style={{ display: 'grid', gap: 8 }}>
+    <div style={{ display: 'grid', gap: 'var(--space-8)' }}>
       <p
         className="label"
         style={{ margin: 0, fontWeight: 400, color: 'var(--fault)', whiteSpace: 'pre-wrap' }}
       >
         {reason}
       </p>
-      <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
+      <label style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'flex-start', cursor: 'pointer' }}>
         <input
           type="checkbox"
           checked={checked}
           onChange={(e) => onChange(e.target.checked)}
-          style={{ marginTop: 3 }}
+          style={{ marginTop: 'var(--space-3)' }}
         />
         <span className="label" style={{ fontWeight: 400 }}>
           {sentence}
@@ -63,7 +63,7 @@ export function OverrideGate({
       </label>
       {checked && onLaunch ? (
         <div>
-          <button onClick={onLaunch} disabled={launching}>
+          <button type="button" onClick={onLaunch} disabled={launching}>
             {launching ? 'Launching…' : launchLabel}
           </button>
         </div>

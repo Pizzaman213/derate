@@ -117,16 +117,13 @@ class RegistryConfig:
 
     role: str = ROLE_AUTO
     token: str | None = None
-    # A second credential this machine holds, tried only when the first is
-    # rejected. It exists because a node can legitimately be holding two: the
-    # enrollment token it was installed with, which install.sh bakes into the
-    # container environment permanently, and the permanent cluster token the
-    # coordinator handed it in exchange. The enrollment one is single-use and
-    # expires within the hour, so on every restart after the first it is the
-    # wrong one -- but it is also the right one when an operator is deliberately
-    # re-homing this machine onto a different cluster. Which of those is
-    # happening cannot be known from here; the coordinator settles it.
-    fallback_token: str | None = None
+    # This member's own agent token, handed over by the coordinator in an
+    # acked join answer and kept in cluster.json (identity.save_agent_credential).
+    # Presented first on every join; ``token`` -- the environment's
+    # DERATE_TOKEN, an enrollment token for re-homing or a pre-upgrade
+    # cluster token for the one-time migration -- is the fallback. Which of
+    # those the coordinator takes is its call, never this side's.
+    agent_token: str | None = None
     join_address: str | None = None
     agent_port: int = DEFAULT_AGENT_PORT
     coordinator_port: int = DEFAULT_COORDINATOR_PORT

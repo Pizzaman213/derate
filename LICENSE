@@ -29,6 +29,6 @@ That said, if you are putting derate in front of real users -- a production
 deployment, a shared cluster, anything where a bad launch costs somebody
 their afternoon -- please get in touch first. Open an issue or a discussion
 at https://github.com/Pizzaman213/derate and say what you are building on.
-There are recommendations worth having about sizing, placement and the
-gateway's current lack of inbound authentication, and I would rather hand
-them to you up front than read about them afterwards.
+There are recommendations worth having about sizing, placement and how
+to hand out API keys and limits, and I would rather hand them to you up
+front than read about them afterwards.

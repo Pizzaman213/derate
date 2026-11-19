@@ -1,0 +1,1 @@
+{"description":"Every value is zero: no area to draw, so the empty state says so.","data":{"name":"Root","value":0,"children":[{"name":"A","value":0,"children":[{"name":"A1","value":0},{"name":"A2","value":0}]},{"name":"B","value":0},{"name":"C","value":0}]}}

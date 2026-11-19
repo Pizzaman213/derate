@@ -199,12 +199,15 @@ third shipped. `deploy/flags.py::SUPPORTED_RUNTIMES` is the list that decides
 (`vllm`, `sglang`, `tts`), and `tests/unit/test_single_source.py` holds
 `resolver/support.py`'s table to the same names.
 
-Three fields are trailing and defaulted so every record written before they
-existed still decodes: `modality`, `extra_args` and `custom_command`.
+Five fields are trailing and defaulted so every record written before they
+existed still decodes: `modality`, `extra_args`, `custom_command`, `revision`
+and `speculative_tokens`.
 `extra_args` appends caller-supplied CLI tokens to the generated serve command;
 `custom_command` replaces the plan-derived flags instead of appending, and the
 two are mutually exclusive — `deploy/recipes.py::synthesize` refuses both at
-once, and both go through `check_extra_args_safe` first.
+once, and both go through `check_extra_args_safe` first. `speculative_tokens`
+(0..8, `MAX_SPECULATIVE_TOKENS`, checked by `check_speculative_tokens`) turns on
+MTP speculative decoding on the vllm runtime; 0 is off.
 
 ## `providers.py`
 
@@ -268,7 +271,8 @@ and `settings`.
 Two signatures carry their own history. `LinkPort.measure` returns
 `LinkMeasurement | None`, and `None` means every measurement rung failed — an
 honest absence, never a fabricated figure. `DeploymentPort.launch` takes
-`modality`, `extra_args` and `custom_command` keyword-only and defaulted,
+`modality`, `extra_args`, `custom_command`, `revision` and `speculative_tokens`
+keyword-only and defaulted,
 precisely so an implementation predating any of them keeps satisfying the
 protocol.
 
@@ -448,7 +452,7 @@ from control_plane.contracts import FitRequest, ModelShape, NodeProfile, Verdict
 ## Things that look like details and are not
 
 **A default on a contract field is a compatibility promise, not a convenience.**
-`FitResult.budget_basis`, `Deployment.modality`/`extra_args`/`custom_command`,
+`FitResult.budget_basis`, `Deployment.modality`/`extra_args`/`custom_command`/`speculative_tokens`,
 `NodeState.memory_total`/`sample_ts`/`is_local`/`build` and
 `ProviderModel.modality` are all trailing and defaulted for the same reason:
 `Deployment` and `NodeState` are persisted, and a record written before the

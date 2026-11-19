@@ -1,0 +1,1 @@
+{"description":"Missing values: gaps in the panels, noted per facet; a missing facet value becomes “(blank)”.","data":[{"region":"North","label":"Q1","value":120},{"region":"North","label":"Q2","value":null},{"region":"South","label":"Q1","value":80},{"region":null,"label":"Q1","value":50}],"options":{"chart":"bar","facet":"region"}}

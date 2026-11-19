@@ -1,0 +1,1 @@
+{"description":"Three teams and who belongs to more than one.","data":[{"sets":"Design","size":60},{"sets":"Engineering","size":80},{"sets":"Research","size":50},{"sets":"Design,Engineering","size":20},{"sets":"Design,Research","size":15},{"sets":"Engineering,Research","size":18},{"sets":"Design,Engineering,Research","size":8}]}

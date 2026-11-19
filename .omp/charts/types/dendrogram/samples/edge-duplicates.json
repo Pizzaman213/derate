@@ -1,0 +1,1 @@
+{"description":"Sibling names repeat: kept as separate nodes, with a note.","data":{"name":"Menu","children":[{"name":"Drinks","children":[{"name":"Tea"},{"name":"Tea"},{"name":"Coffee"}]},{"name":"Drinks","children":[{"name":"Juice"}]},{"name":"Food","children":[{"name":"Soup"},{"name":"Soup"}]}]}}

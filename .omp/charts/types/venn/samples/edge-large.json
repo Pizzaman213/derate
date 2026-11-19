@@ -1,0 +1,1 @@
+{"description":"Very large counts (tens of millions).","data":[{"sets":"Mobile","size":48200000},{"sets":"Desktop","size":31700000},{"sets":"Tablet","size":9100000},{"sets":"Mobile,Desktop","size":17400000},{"sets":"Mobile,Tablet","size":6200000},{"sets":"Desktop,Tablet","size":4100000},{"sets":"Mobile,Desktop,Tablet","size":3300000}]}

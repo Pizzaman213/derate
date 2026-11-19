@@ -71,6 +71,12 @@ ESTATE: tuple[tuple[str, str, str, str], ...] = (
     ("models", "Model registry", "models.db", "file"),
     ("providers", "Provider config", "providers.json", "file"),
     ("secrets", "Provider keys", "secrets.json", "file"),
+    # Admins, sessions and the audit log; orgs and API keys; usage-cycle
+    # counters and local model pricing. Losing these is losing who may call
+    # this gateway, so they are listed where the storage card can show them.
+    ("auth", "Admins, sessions, audit", "auth.db", "file"),
+    ("keys", "Orgs and API keys", "keys.db", "file"),
+    ("limits", "Usage limits and pricing", "limits.db", "file"),
 )
 
 

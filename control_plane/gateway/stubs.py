@@ -97,7 +97,7 @@ class StubRegistry:
     def candidates(self) -> list[dict]:
         return []
 
-    async def handle_join(self, token, profile, agent_url) -> dict:
+    async def handle_join(self, proof, profile, agent_url, *, peer=None, facts=None) -> dict:
         raise NotImplementedError("stub registry does not accept joins")
 
 
@@ -273,7 +273,8 @@ class StubDeployments:
 
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
-        modality=Modality.TEXT, extra_args=(), custom_command=(),
+        modality=Modality.TEXT, extra_args=(), custom_command=(), revision=None,
+        speculative_tokens=0,
     ) -> Deployment:
         dep = _deployment(
             f"d-{len(self._deployments) + 1}",
@@ -286,6 +287,11 @@ class StubDeployments:
             context_length=ctx,
             max_concurrent_seqs=max_seqs,
         )
+        dep.speculative_tokens = speculative_tokens
+        # Kept as the real manager keeps them, so a deployment's flags read
+        # back -- the cluster editor's flag chips and relaunch need them.
+        dep.extra_args = tuple(extra_args)
+        dep.custom_command = tuple(custom_command)
         self._deployments.append(dep)
         return dep
 
@@ -303,6 +309,23 @@ class StubDeployments:
         )
 
 
+#: upstream_id -> the hosts OpenRouter would list for it:
+#: (tag, provider_name, context_length, input $/Mtok, output $/Mtok, quantization).
+#: Enough rows for the host picker to have a choice, a cheapest and a dearest.
+_STUB_BACKENDS: dict[str, tuple[tuple, ...]] = {
+    "qwen/qwen3-30b-a3b": (
+        ("deepinfra", "DeepInfra", 40960, 0.08, 0.29, "fp8"),
+        ("nebius", "Nebius AI Studio", 131072, 0.10, 0.30, None),
+        ("together", "Together", 131072, 0.15, 0.60, "fp8"),
+    ),
+    "anthropic/claude-sonnet-4.5": (
+        ("anthropic", "Anthropic", 200000, 3.0, 15.0, None),
+        ("google-vertex", "Google Vertex", 200000, 3.5, 17.5, None),
+        ("amazon-bedrock", "Amazon Bedrock", 200000, 3.0, 15.0, None),
+    ),
+}
+
+
 class StubProviders:
     """One remote provider. One of its models shares a served_name with a local
     deployment, which is the case worth demonstrating: one entry in /v1/models
@@ -316,7 +339,7 @@ class StubProviders:
                 kind=ProviderKind.OPENROUTER,
                 display_name="OpenRouter",
                 base_url="https://openrouter.ai/api/v1",
-                api_key_ref="OPENROUTER_API_KEY",
+                api_key_ref="DERATE_OPENROUTER_API_KEY",
                 enabled=True,
                 priority=10,
                 models=[
@@ -349,6 +372,12 @@ class StubProviders:
         #: the records rather than on them: `Provider` is a frozen contract and
         #: the real service keeps this on `ProviderRuntime` for the same reason.
         self._enabled_models: dict[str, frozenset[str]] = {}
+        #: provider_id -> upstream_id -> pinned host tag / fallback flag, and
+        #: (provider_id, upstream_id) -> the catalogue price a cleared pin
+        #: restores. Beside the records for the same reason as the allowlist.
+        self._pins: dict[str, dict[str, str]] = {}
+        self._fallbacks: dict[str, dict[str, bool]] = {}
+        self._catalogue_prices: dict[tuple[str, str], tuple[float | None, float | None]] = {}
 
     def list(self) -> list[Provider]:
         return list(self._providers)
@@ -359,7 +388,13 @@ class StubProviders:
         # refuses is not a rehearsal of it: the add form learns what the key
         # fields mean from the 400 it gets back, and against this surface it
         # would learn the opposite.
-        from control_plane.providers.service import KEY_IN_REF_FIELD, minted_ref
+        from control_plane.providers.service import (
+            KEY_IN_REF_FIELD,
+            REF_NOT_OURS,
+            parse_daily_budget,
+            minted_ref,
+            ref_allowed,
+        )
 
         kind = ProviderKind(spec.get("kind", "custom"))
         api_key = str(spec.get("api_key") or "").strip()
@@ -367,6 +402,9 @@ class StubProviders:
         if looks_like_secret(api_key_ref):
             raise ValueError(KEY_IN_REF_FIELD)
         provider_id = spec.get("provider_id") or f"p-{len(self._providers) + 1}"
+        if api_key_ref and not ref_allowed(api_key_ref, provider_id):
+            raise ValueError(REF_NOT_OURS)
+        parse_daily_budget(spec.get("daily_budget_usd"))
         # A stub has no secrets file to write to, so it does the visible half:
         # the reference the real service would have stored the key under. Off
         # this provider's own id, not the kind, because that is the name the
@@ -409,8 +447,80 @@ class StubProviders:
         provider.last_refreshed = time.time()
         return provider
 
-    def update(self, provider_id: str, patch: dict) -> Provider:
+    def _screen(self, provider_id: str, patch: dict) -> Provider:
+        """Every refusal ``update`` can make, before anything is written."""
+        from control_plane.providers.service import (
+            KEY_IN_REF_FIELD,
+            REF_NOT_OURS,
+            parse_daily_budget,
+            ref_allowed,
+        )
+
         provider = self._find(provider_id)
+        if "daily_budget_usd" in patch:
+            parse_daily_budget(patch["daily_budget_usd"])
+        if "api_key_ref" in patch:
+            ref = str(patch["api_key_ref"]).strip()
+            if looks_like_secret(ref):
+                raise ValueError(KEY_IN_REF_FIELD)
+            if ref and not ref_allowed(ref, provider_id):
+                raise ValueError(REF_NOT_OURS)
+        if "priority" in patch:
+            int(patch["priority"])
+        if "enabled_models" in patch:
+            wanted = {str(m) for m in (patch["enabled_models"] or [])}
+            unknown = sorted(wanted - {m.upstream_id for m in provider.models})
+            if unknown:
+                raise ValueError(
+                    f"{provider_id} does not publish {', '.join(unknown[:3])}"
+                )
+        if "backend_pins" in patch:
+            self._screen_pins(provider, patch["backend_pins"])
+        if "backend_fallbacks" in patch:
+            self._screen_fallbacks(provider, patch["backend_fallbacks"])
+        return provider
+
+    def validate_patch(self, provider_id: str, patch: dict) -> None:
+        """The real service's dry run: the same refusals, nothing written."""
+        from control_plane.providers.service import WIRING_NO_API_KEY
+
+        if not isinstance(patch, dict):
+            raise ValueError("patch must be an object")
+        if "api_key" in patch:
+            raise ValueError(WIRING_NO_API_KEY)
+        self._screen(provider_id, patch)
+
+    def update(self, provider_id: str, patch: dict) -> Provider:
+        provider = self._screen(provider_id, patch)
+        if "backend_pins" in patch:
+            # Merged a key at a time, and the pinned host's price becomes the
+            # model's, as ProviderService._apply_pin_prices does; clearing
+            # restores the catalogue price and drops the fallback flag.
+            pins = self._pins.setdefault(provider_id, {})
+            fallbacks = self._fallbacks.setdefault(provider_id, {})
+            for upstream_id, row in self._screen_pins(provider, patch["backend_pins"]).items():
+                model = next(m for m in provider.models if m.upstream_id == upstream_id)
+                catalogue = self._catalogue_prices.setdefault(
+                    (provider_id, upstream_id),
+                    (model.input_cost_per_mtok, model.output_cost_per_mtok),
+                )
+                if row is None:
+                    pins.pop(upstream_id, None)
+                    fallbacks.pop(upstream_id, None)
+                    model.input_cost_per_mtok, model.output_cost_per_mtok = catalogue
+                else:
+                    pins[upstream_id] = row["tag"]
+                    model.input_cost_per_mtok = row["input_cost_per_mtok"]
+                    model.output_cost_per_mtok = row["output_cost_per_mtok"]
+        if "backend_fallbacks" in patch:
+            fallbacks = self._fallbacks.setdefault(provider_id, {})
+            for upstream_id, flag in self._screen_fallbacks(
+                provider, patch["backend_fallbacks"]
+            ).items():
+                if flag:
+                    fallbacks[upstream_id] = True
+                else:
+                    fallbacks.pop(upstream_id, None)
         if "enabled" in patch:
             provider.enabled = bool(patch["enabled"])
         if "priority" in patch:
@@ -431,13 +541,15 @@ class StubProviders:
             if "api_key_ref" not in patch:
                 provider.api_key_ref = minted_ref(provider_id)
         if "enabled_models" in patch:
-            wanted = {str(m) for m in (patch["enabled_models"] or [])}
-            unknown = sorted(wanted - {m.upstream_id for m in provider.models})
-            if unknown:
-                raise ValueError(
-                    f"{provider_id} does not publish {', '.join(unknown[:3])}"
-                )
-            self._enabled_models[provider_id] = frozenset(wanted)
+            self._enabled_models[provider_id] = frozenset(
+                str(m) for m in (patch["enabled_models"] or [])
+            )
+        if "aliases" in patch:
+            # The whole map, replaced, as ProviderService._apply_aliases does:
+            # a model the map does not name serves under its upstream id.
+            aliases = {str(k): str(v) for k, v in (patch["aliases"] or {}).items()}
+            for model in provider.models:
+                model.served_name = aliases.get(model.upstream_id, model.upstream_id)
         return provider
 
     def servable(self) -> list[Provider]:
@@ -469,11 +581,94 @@ class StubProviders:
         allowed = self._enabled_models.get(provider_id)
         return [
             {
-                **serialize.provider_model_payload(m),
+                **serialize.provider_model_payload(
+                    m,
+                    pin=self._pins.get(provider_id, {}).get(m.upstream_id),
+                    fallback=self._fallbacks.get(provider_id, {}).get(m.upstream_id, False),
+                ),
                 "enabled": allowed is None or m.upstream_id in allowed,
             }
             for m in provider.models
         ]
+
+    def list_backends(self, provider_id: str, upstream_id: str) -> list[dict]:
+        """A few hosts per model with their prices, the real call's row shape."""
+        from control_plane.providers import AdapterUnsupportedError
+
+        provider = self._find(provider_id)
+        if not spec_for(provider.kind).supports_backend_routing:
+            raise AdapterUnsupportedError(
+                f"provider {provider_id!r} does not aggregate backend hosts per model"
+            )
+        pin = self._pins.get(provider_id, {}).get(upstream_id)
+        return [
+            {
+                "tag": tag,
+                "provider_name": name,
+                "context_length": context,
+                "input_cost_per_mtok": cost_in,
+                "output_cost_per_mtok": cost_out,
+                "quantization": quant,
+                "pinned": tag == pin,
+            }
+            for tag, name, context, cost_in, cost_out, quant in _STUB_BACKENDS.get(upstream_id, ())
+        ]
+
+    def backend_pin_state(self, provider_id: str) -> dict[str, tuple[str, bool]]:
+        self._find(provider_id)
+        fallbacks = self._fallbacks.get(provider_id, {})
+        return {
+            upstream_id: (tag, bool(fallbacks.get(upstream_id)))
+            for upstream_id, tag in self._pins.get(provider_id, {}).items()
+        }
+
+    def _screen_backend(self, provider: Provider, value: object, key: str) -> dict:
+        """The real service's per-model screen, sentence for sentence."""
+        if not spec_for(provider.kind).supports_backend_routing:
+            raise ValueError(
+                f"{provider.provider_id} does not aggregate backend hosts per model; "
+                f"{key} does not apply"
+            )
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(f"{key} must be an object keyed by upstream model id")
+        updates = {str(k): v for k, v in (value or {}).items()}
+        unknown = sorted(set(updates) - {m.upstream_id for m in provider.models})
+        if unknown:
+            shown = ", ".join(unknown[:3])
+            more = f" (and {len(unknown) - 3} more)" if len(unknown) > 3 else ""
+            raise ValueError(
+                f"{provider.provider_id} does not publish {shown}{more}; "
+                "pin a backend only for a model from its own catalogue"
+            )
+        return updates
+
+    def _screen_pins(self, provider: Provider, value: object) -> dict[str, dict | None]:
+        """upstream_id -> the listed host row to pin to, or None to clear."""
+        out: dict[str, dict | None] = {}
+        for upstream_id, tag in self._screen_backend(provider, value, "backend_pins").items():
+            tag = str(tag or "")
+            if not tag:
+                out[upstream_id] = None
+                continue
+            row = next(
+                (r for r in self.list_backends(provider.provider_id, upstream_id)
+                 if r["tag"] == tag),
+                None,
+            )
+            if row is None:
+                raise ValueError(
+                    f"{provider.provider_id} lists no backend '{tag}' for {upstream_id}; "
+                    "pick one from its backend list"
+                )
+            out[upstream_id] = row
+        return out
+
+    def _screen_fallbacks(self, provider: Provider, value: object) -> dict[str, bool]:
+        updates = self._screen_backend(provider, value, "backend_fallbacks")
+        for flag in updates.values():
+            if not isinstance(flag, bool):
+                raise ValueError("backend_fallbacks values must be true or false")
+        return updates
 
     def key_status(self, provider_id: str) -> dict:
         """Whether the credential resolves. A stub's always does.

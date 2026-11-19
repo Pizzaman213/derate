@@ -26,10 +26,20 @@ onboarding/model-surface/cluster item; this file is the flat checklist.
       blocked on native support below)
 - [ ] Run natively on macOS and Windows (Linux-only today; `derate` is taken
       on PyPI, needs a distribution name/channel)
-- [ ] Inbound authentication on the gateway — currently none; biggest gap,
-      blocks guest sharing below
+- [x] Inbound authentication on the gateway — admins + sessions on `/api`,
+      `drt_` API keys with per-key/org limits on `/v1`, an audit log, and the
+      `/login`, `/keys`, `/orgs`, `/audit` screens (2026-11-17; see
+      `.omp/work/auth-keys/PROGRESS.md`)
 - [ ] Shareable guest access via QR code (person-scoped, revocable token
-      variant of the existing node-enrollment model)
+      variant of the existing node-enrollment model) — now buildable on a
+      short-expiry key in its own org
+- [ ] TOTP second factor for admin logins
+- [ ] Encrypted per-node backups of the telemetry archive and the auth, keys
+      and limits databases (`auth.db`, `keys.db`, `limits.db`): today losing
+      the coordinator's data dir loses every admin, key and usage counter
+- [ ] Keep spec decode one click: a deployment toggle that turns on a
+      draft/EAGLE speculator, now that per-key telemetry reports acceptance
+      rate per position (`vllm:spec_decode_*`) and says `not_enabled` when off
 - [ ] Auto-discovery on the local network / `derate.local` hostname (mDNS
       advertises nodes only today; needs `_http._tcp` too)
 - [ ] Household framing in the product copy (gated on the four items above)

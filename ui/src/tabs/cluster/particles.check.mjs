@@ -6,8 +6,8 @@
 //
 //   node src/tabs/cluster/particles.check.mjs
 //
-// Bundled with the esbuild inside vite for the same reason layout.check.mjs
-// does it: node's ESM resolver will not take the extensionless specifiers.
+// Bundled with the esbuild inside vite (src/check/harness.mjs): node's ESM
+// resolver will not take the extensionless specifiers.
 // `useParticleField` itself needs a React tree and is not exercised here; its
 // two decisions -- which paths to draw on, and how long a flight lasts -- are
 // `collapseFlows` and `flightMs`, which are.
@@ -84,18 +84,20 @@ function tick(t) {
   for (const fn of due) fn(clock)
 }
 
+/** A straight path along x, answering what an SVG <path> answers. */
+function line(length) {
+  return { getTotalLength: () => length, getPointAtLength: (d) => ({ x: d, y: 0 }) }
+}
+
 // ── Flight ───────────────────────────────────────────────────────────────────
 {
   // A straight 1000-unit path, so position maps to progress with no geometry
   // in the way. The -5/-4 is the rect's own half-size, which centres it.
-  const pts = [
-    { x: 0, y: 0 },
-    { x: 1000, y: 0 },
-  ]
+  const path = line(1000)
   const layer = newLayer()
   let done = 0
   clock = 0
-  P.spawnParticle(layer, pts, 'red', 2000, () => done++)
+  P.spawnParticle(layer, path, 'red', 2000, () => done++)
   ok(layer.children.length === 1, 'a flight puts exactly one block on the layer')
   const box = layer.children[0]
 
@@ -116,17 +118,17 @@ function tick(t) {
   // the block at a different speed over the same geometry.
   const slow = newLayer()
   clock = 0
-  P.spawnParticle(slow, pts, 'red', 8000)
+  P.spawnParticle(slow, path, 'red', 8000)
   tick(0)
   tick(1000)
   ok(Math.abs(Number(slow.children[0].attrs.x) - 120) < 0.001, 'a longer span walks the same path slower')
 
-  // A degenerate path draws nothing, and must still settle the tally --
+  // A path with no length draws nothing, and must still settle the tally --
   // otherwise the path would be counted as permanently occupied and never
   // draw again.
   const empty = newLayer()
   let settled = 0
-  P.spawnParticle(empty, [{ x: 0, y: 0 }], 'red', 1000, () => settled++)
+  P.spawnParticle(empty, line(0), 'red', 1000, () => settled++)
   ok(empty.children.length === 0 && settled === 1, 'a path with no length draws nothing and settles')
 }
 
@@ -143,7 +145,7 @@ function tick(t) {
 
 // ── Which path a block flies ─────────────────────────────────────────────────
 {
-  const paths = { 'm#L:d-a': [], 'm#L:d-b': [], 'm#P': [] }
+  const paths = { 'm#L:d-a': line(10), 'm#L:d-b': line(10), 'm#P': line(10) }
   const flow = (pathKey, inflight, meanDurationS = null) => ({ pathKey, inflight, meanDurationS })
 
   const idle = P.collapseFlows([flow('m#L:d-a', 0), flow('m#P', 0)], paths)
@@ -200,30 +202,33 @@ function tick(t) {
     { served_name: 'remote-name', targets: [target('openrouter:x', 'remote', 2)] },
   ]
 
-  const all = P.targetFlows(routing, [], false)
+  // The canvas decides which drawn wire a target rides; null is "none drawn".
+  const keyFor = (served, t) => (t.kind === 'remote' ? `${served}#P` : `${served}#L:${t.target_id}`)
+  const all = P.targetFlows(routing, [], false, keyFor)
   ok(all.length === 2, 'every served name contributes a flow, not just one')
   ok(
     all.some((f) => f.pathKey === 'local-name#L:d-a'),
-    'a local target flies its own deployment path',
+    'a local target flies the path keyFor names',
   )
   ok(
     all.some((f) => f.pathKey === 'remote-name#P'),
-    'a remote target flies the drop into the provider box',
+    'a remote target flies the path keyFor names',
   )
+  ok(P.targetFlows(routing, [], false, () => null).length === 0, 'a target with no drawn wire contributes nothing')
 
   // Nothing here filters by what was drawn -- collapseFlows does that, and the
   // two together are what let a 312-model provider cost one map and no ink.
-  const undrawn = P.collapseFlows(all, { 'local-name#L:d-a': [] })
+  const undrawn = P.collapseFlows(all, { 'local-name#L:d-a': line(10) })
   ok(undrawn.size === 1, 'a flow for a name with no band is dropped downstream, not upstream')
 
   // The 1 Hz frame wins over the 5s poll for a local target...
-  const fresh = P.targetFlows(routing, [{ deployment_id: 'd-a', queue_depth: 9 }], false)
+  const fresh = P.targetFlows(routing, [{ deployment_id: 'd-a', queue_depth: 9 }], false, keyFor)
   ok(fresh[0].inflight === 9, 'a live queue_depth beats the slower outstanding count')
   // ...and stops winning the moment it stops arriving.
-  const gone = P.targetFlows(routing, [{ deployment_id: 'd-a', queue_depth: 9 }], true)
+  const gone = P.targetFlows(routing, [{ deployment_id: 'd-a', queue_depth: 9 }], true, keyFor)
   ok(gone[0].inflight === 4, 'a stale frame falls back to outstanding rather than freezing')
   // A remote target has no deployment frame to read, so it never takes one.
-  const remoteFresh = P.targetFlows(routing, [{ deployment_id: 'openrouter:x', queue_depth: 9 }], false)
+  const remoteFresh = P.targetFlows(routing, [{ deployment_id: 'openrouter:x', queue_depth: 9 }], false, keyFor)
   ok(remoteFresh[1].inflight === 2, 'a remote target reads outstanding, never a deployment frame')
 
   // A coordinator too old to carry counters is not a zero.
@@ -299,19 +304,17 @@ function tick(t) {
   ok(P.mostlyStreaming(null) === null, 'no ratio is not a verdict')
   ok(P.mostlyStreaming(0.6) === true && P.mostlyStreaming(0.2) === false, 'a majority decides it')
 
-  const tones = [P.streamTone(true), P.streamTone(false), P.streamTone(null)]
-  ok(new Set(tones).size === 3, 'streamed, batched and unknown are three different colours')
-  ok(!tones.includes('var(--flow)'), 'none of them is the request-in-flight blue')
-  ok(P.streamTone(null) === 'var(--ink-muted)', 'unknown paints the no-reading grey, never a default')
+  ok(P.REQUEST_COLOUR === 'var(--graph-req)', 'request blocks ride in the request wire colour')
+  ok(P.RESPONSE_COLOUR === 'var(--graph-resp)', 'response blocks ride in the response wire colour')
   ok(
     P.streamBlockWidth(true) !== P.streamBlockWidth(false),
-    'and the difference survives a greyscale screenshot',
+    'streamed and buffered answers differ in shape, which survives a greyscale screenshot',
   )
 }
 
 // ── Which path an out-block flies ───────────────────────────────────────────
 {
-  const paths = { 'd-a#OUT': [{ x: 0, y: 0 }], 'remote:x#OUT': [{ x: 0, y: 0 }] }
+  const paths = { 'd-a#OUT': line(10), 'remote:x#OUT': line(10) }
   const s = (pathKey, tokensPerSec) => ({ pathKey, tokensPerSec, streaming: true })
   const kept = P.collapseStreams([s('d-a#OUT', 10), s('nope#OUT', 999)], paths)
   ok(

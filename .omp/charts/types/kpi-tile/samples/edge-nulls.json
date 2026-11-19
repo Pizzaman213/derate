@@ -1,0 +1,1 @@
+{"description":"A missing value shows a dash; gaps in the history break the sparkline.","data":[{"label":"Uptime","value":null,"previous":0.999,"format":"percent"},{"label":"Requests","value":9120,"previous":8800,"series":[7000,7400,null,null,8800,9120]}]}

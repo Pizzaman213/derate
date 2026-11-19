@@ -105,9 +105,9 @@ purpose: what is selectable and what is selected by default are different
 questions.
 
 `selNode` and `selLink` are read from refs inside the toggles rather than taken
-as dependencies, because `ClusterGraph` keys its pointer and key listeners on
-those callback identities and would rebind every listener on the machine floor
-on each click.
+as dependencies, so the toggles keep one identity and their consumers (the
+wiring canvas's click handlers, the inspectors) are not handed a new function
+on every click.
 
 ## `placement.ts`
 

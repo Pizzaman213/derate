@@ -1,0 +1,1 @@
+{"description":"GPU memory in use on one node, against good/warning/bad bands and a target.","data":{"value":72,"min":0,"max":100,"target":80,"bands":[{"to":60,"status":"good"},{"to":85,"status":"warning"},{"to":100,"status":"bad"}],"label":"GPU memory","unit":"%"}}

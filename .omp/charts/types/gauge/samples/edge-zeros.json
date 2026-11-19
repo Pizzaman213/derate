@@ -1,0 +1,1 @@
+{"description":"A value of zero: a sliver at the start, still hoverable, readout 0.","data":{"value":0,"target":50,"bands":[{"to":60,"status":"good"},{"to":85,"status":"warning"},{"to":100,"status":"bad"}],"label":"Error rate","unit":"%"}}

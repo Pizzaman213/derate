@@ -2143,7 +2143,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--drain", type=float, default=15.0,
                    help="seconds to let in-flight requests finish after the run stops")
     p.add_argument("--api-key", default=os.environ.get("DERATE_API_KEY", ""),
-                   help="sent as a bearer token if the gateway wants one")
+                   help="the drt_ key /v1 requires (Keys screen); sent as a bearer token")
+    p.add_argument("--admin-user", default="",
+                   help="an admin to sign in as, for the /api calls the policy pin makes")
+    p.add_argument("--admin-password", default="")
     p.add_argument("--stall-after", type=float, default=5.0,
                    help="call a model stalled once it has held requests in flight this "
                         "long with nothing coming back (default 5s)")
@@ -2170,6 +2173,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args.headers = {}
     if args.api_key:
         args.headers["authorization"] = f"Bearer {args.api_key}"
+    # /api answers only to an admin session, and pinning the routing policy is
+    # an /api call. Signed in once, through the real login route; the cookie
+    # rides on every request beside the key, and each half is ignored by the
+    # surface it is not for.
+    if args.admin_user:
+        login = httpx.post(
+            f"{args.base.rstrip('/')}/api/auth/login",
+            json={"username": args.admin_user, "password": args.admin_password},
+            timeout=args.timeout,
+        )
+        if login.status_code != 200:
+            p.error(f"--admin-user: login answered {login.status_code}: {login.text[:300]}")
+        args.headers["cookie"] = f"derate_session={login.cookies.get('derate_session')}"
 
     # The clip, read once. A run sends it thousands of times and re-reading it
     # per request would measure this process's disk.

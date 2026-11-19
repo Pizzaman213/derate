@@ -1,0 +1,1 @@
+{"description":"A scale that spans zero: temperature from −40 to 40 °C. Drawn with a needle.","data":{"value":-12.5,"min":-40,"max":40,"target":4,"bands":[{"to":-20,"status":"bad"},{"to":0,"status":"warning"},{"to":40,"status":"good"}],"label":"Freezer","unit":"°C"},"options":{"display":"needle"}}

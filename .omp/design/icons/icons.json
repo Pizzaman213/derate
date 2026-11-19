@@ -1,0 +1,761 @@
+{
+  "stroke": 1.5,
+  "viewBox": "0 0 24 24",
+  "icons": [
+    {
+      "name": "close",
+      "category": "action",
+      "tags": [
+        "x",
+        "dismiss",
+        "remove",
+        "cancel"
+      ],
+      "usage": "<Icon name=\"close\" label=\"Dismiss\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "✕",
+        "&#10005;",
+        "×"
+      ]
+    },
+    {
+      "name": "search",
+      "category": "action",
+      "tags": [
+        "find",
+        "magnifier",
+        "filter"
+      ],
+      "usage": "<Icon name=\"search\" label=\"Find\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "⌕",
+        "&#8981;"
+      ]
+    },
+    {
+      "name": "copy",
+      "category": "action",
+      "tags": [
+        "clipboard",
+        "duplicate"
+      ],
+      "usage": "<Icon name=\"copy\" label=\"Clipboard\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "check",
+      "category": "action",
+      "tags": [
+        "tick",
+        "done",
+        "verified",
+        "ok"
+      ],
+      "usage": "<Icon name=\"check\" label=\"Tick\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "✓"
+      ]
+    },
+    {
+      "name": "plus",
+      "category": "action",
+      "tags": [
+        "add",
+        "expand",
+        "new"
+      ],
+      "usage": "<Icon name=\"plus\" label=\"Add\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "+"
+      ]
+    },
+    {
+      "name": "minus",
+      "category": "action",
+      "tags": [
+        "remove",
+        "collapse",
+        "subtract"
+      ],
+      "usage": "<Icon name=\"minus\" label=\"Remove\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "–",
+        "−"
+      ]
+    },
+    {
+      "name": "external-link",
+      "category": "action",
+      "tags": [
+        "open",
+        "detail",
+        "new window",
+        "arrow"
+      ],
+      "usage": "<Icon name=\"external-link\" label=\"Open\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "↗"
+      ]
+    },
+    {
+      "name": "trash",
+      "category": "action",
+      "tags": [
+        "delete",
+        "bin",
+        "remove"
+      ],
+      "usage": "<Icon name=\"trash\" label=\"Delete\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "refresh",
+      "category": "action",
+      "tags": [
+        "reload",
+        "retry",
+        "sync"
+      ],
+      "usage": "<Icon name=\"refresh\" label=\"Reload\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "play",
+      "category": "action",
+      "tags": [
+        "start",
+        "run",
+        "launch"
+      ],
+      "usage": "<Icon name=\"play\" label=\"Start\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "stop",
+      "category": "action",
+      "tags": [
+        "halt",
+        "end",
+        "kill"
+      ],
+      "usage": "<Icon name=\"stop\" label=\"Halt\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "upload",
+      "category": "action",
+      "tags": [
+        "send",
+        "attach",
+        "import"
+      ],
+      "usage": "<Icon name=\"upload\" label=\"Send\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "download",
+      "category": "action",
+      "tags": [
+        "save",
+        "export",
+        "fetch"
+      ],
+      "usage": "<Icon name=\"download\" label=\"Save\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "menu",
+      "category": "action",
+      "tags": [
+        "hamburger",
+        "more",
+        "sidebar"
+      ],
+      "usage": "<Icon name=\"menu\" label=\"Hamburger\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "circle",
+      "category": "status",
+      "tags": [
+        "pending",
+        "empty",
+        "idle",
+        "hollow"
+      ],
+      "usage": "<Icon name=\"circle\" label=\"Pending\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "○"
+      ]
+    },
+    {
+      "name": "circle-dot",
+      "category": "status",
+      "tags": [
+        "current",
+        "active",
+        "now",
+        "filled"
+      ],
+      "usage": "<Icon name=\"circle-dot\" label=\"Current\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "●"
+      ]
+    },
+    {
+      "name": "check-circle",
+      "category": "status",
+      "tags": [
+        "done",
+        "complete",
+        "success",
+        "healthy"
+      ],
+      "usage": "<Icon name=\"check-circle\" label=\"Done\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "✓"
+      ]
+    },
+    {
+      "name": "alert-triangle",
+      "category": "status",
+      "tags": [
+        "warning",
+        "caution",
+        "degraded"
+      ],
+      "usage": "<Icon name=\"alert-triangle\" label=\"Warning\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "⚠"
+      ]
+    },
+    {
+      "name": "info-circle",
+      "category": "status",
+      "tags": [
+        "information",
+        "hint",
+        "about"
+      ],
+      "usage": "<Icon name=\"info-circle\" label=\"Information\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "chevron-right",
+      "category": "arrow",
+      "tags": [
+        "expand",
+        "collapsed",
+        "next",
+        "disclosure"
+      ],
+      "usage": "<Icon name=\"chevron-right\" label=\"Expand\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "▸",
+        "›"
+      ]
+    },
+    {
+      "name": "chevron-down",
+      "category": "arrow",
+      "tags": [
+        "expanded",
+        "open",
+        "dropdown",
+        "disclosure"
+      ],
+      "usage": "<Icon name=\"chevron-down\" label=\"Expanded\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "▾",
+        "▼"
+      ]
+    },
+    {
+      "name": "chevron-left",
+      "category": "arrow",
+      "tags": [
+        "back",
+        "previous"
+      ],
+      "usage": "<Icon name=\"chevron-left\" label=\"Back\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "‹"
+      ]
+    },
+    {
+      "name": "chevron-up",
+      "category": "arrow",
+      "tags": [
+        "collapse",
+        "up"
+      ],
+      "usage": "<Icon name=\"chevron-up\" label=\"Collapse\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "▴"
+      ]
+    },
+    {
+      "name": "arrow-right",
+      "category": "arrow",
+      "tags": [
+        "forward",
+        "to",
+        "then"
+      ],
+      "usage": "<Icon name=\"arrow-right\" label=\"Forward\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "→"
+      ]
+    },
+    {
+      "name": "arrow-left-right",
+      "category": "arrow",
+      "tags": [
+        "bidirectional",
+        "link",
+        "interconnect",
+        "swap"
+      ],
+      "usage": "<Icon name=\"arrow-left-right\" label=\"Bidirectional\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "↔"
+      ]
+    },
+    {
+      "name": "grid",
+      "category": "view",
+      "tags": [
+        "cards",
+        "tiles",
+        "gallery"
+      ],
+      "usage": "<Icon name=\"grid\" label=\"Cards\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "▦"
+      ]
+    },
+    {
+      "name": "rows",
+      "category": "view",
+      "tags": [
+        "list",
+        "table",
+        "compact"
+      ],
+      "usage": "<Icon name=\"rows\" label=\"List\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": [
+        "▤"
+      ]
+    },
+    {
+      "name": "file",
+      "category": "file",
+      "tags": [
+        "document",
+        "blob",
+        "generic"
+      ],
+      "usage": "<Icon name=\"file\" label=\"Document\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "file-text",
+      "category": "file",
+      "tags": [
+        "document",
+        "log",
+        "readme",
+        "markdown"
+      ],
+      "usage": "<Icon name=\"file-text\" label=\"Document\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "file-json",
+      "category": "file",
+      "tags": [
+        "config",
+        "manifest",
+        "braces"
+      ],
+      "usage": "<Icon name=\"file-json\" label=\"Config\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "file-audio",
+      "category": "file",
+      "tags": [
+        "speech",
+        "sound",
+        "wav",
+        "tts"
+      ],
+      "usage": "<Icon name=\"file-audio\" label=\"Speech\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "file-image",
+      "category": "file",
+      "tags": [
+        "picture",
+        "png",
+        "vision"
+      ],
+      "usage": "<Icon name=\"file-image\" label=\"Picture\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "folder",
+      "category": "file",
+      "tags": [
+        "directory",
+        "cache",
+        "storage"
+      ],
+      "usage": "<Icon name=\"folder\" label=\"Directory\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "dashboard",
+      "category": "nav",
+      "tags": [
+        "home",
+        "overview"
+      ],
+      "usage": "<Icon name=\"dashboard\" label=\"Home\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "cluster",
+      "category": "nav",
+      "tags": [
+        "nodes",
+        "topology",
+        "graph"
+      ],
+      "usage": "<Icon name=\"cluster\" label=\"Nodes\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "chat",
+      "category": "nav",
+      "tags": [
+        "conversation",
+        "message",
+        "transcript"
+      ],
+      "usage": "<Icon name=\"chat\" label=\"Conversation\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "spend",
+      "category": "nav",
+      "tags": [
+        "cost",
+        "money",
+        "billing"
+      ],
+      "usage": "<Icon name=\"spend\" label=\"Cost\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "settings",
+      "category": "nav",
+      "tags": [
+        "preferences",
+        "gear",
+        "configuration"
+      ],
+      "usage": "<Icon name=\"settings\" label=\"Preferences\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "models",
+      "category": "nav",
+      "tags": [
+        "catalogue",
+        "weights",
+        "cube"
+      ],
+      "usage": "<Icon name=\"models\" label=\"Catalogue\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "setup",
+      "category": "nav",
+      "tags": [
+        "install",
+        "wrench",
+        "onboarding"
+      ],
+      "usage": "<Icon name=\"setup\" label=\"Install\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "bell",
+      "category": "status",
+      "tags": [
+        "notification",
+        "notify",
+        "alert",
+        "alarm",
+        "reminder",
+        "subscribe"
+      ],
+      "usage": "<Icon name=\"bell\" label=\"Notifications\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "key",
+      "category": "nav",
+      "tags": [
+        "api key",
+        "credential",
+        "token",
+        "secret",
+        "access",
+        "keys"
+      ],
+      "usage": "<Icon name=\"key\" label=\"API key\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "scroll",
+      "category": "nav",
+      "tags": [
+        "audit",
+        "audit log",
+        "history",
+        "record",
+        "trail",
+        "ledger"
+      ],
+      "usage": "<Icon name=\"scroll\" label=\"Audit log\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "log-out",
+      "category": "action",
+      "tags": [
+        "logout",
+        "sign out",
+        "signout",
+        "exit",
+        "leave",
+        "session"
+      ],
+      "usage": "<Icon name=\"log-out\" label=\"Sign out\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "lock",
+      "category": "status",
+      "tags": [
+        "padlock",
+        "locked",
+        "login",
+        "sign in",
+        "secure",
+        "private",
+        "auth"
+      ],
+      "usage": "<Icon name=\"lock\" label=\"Locked\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "user",
+      "category": "status",
+      "tags": [
+        "person",
+        "admin",
+        "account",
+        "profile",
+        "signed in",
+        "people"
+      ],
+      "usage": "<Icon name=\"user\" label=\"Signed in as\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "derate-mark",
+      "category": "brand",
+      "tags": [
+        "logo",
+        "monogram",
+        "wordmark"
+      ],
+      "usage": "<Icon name=\"derate-mark\" label=\"derate\" size={24} />",
+      "added": "2026-11-17",
+      "replaces": []
+    },
+    {
+      "name": "eye",
+      "category": "action",
+      "tags": [
+        "show",
+        "reveal",
+        "visible",
+        "password"
+      ],
+      "usage": "<Icon name=\"eye\" label=\"Show\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "eye-off",
+      "category": "action",
+      "tags": [
+        "hide",
+        "conceal",
+        "hidden",
+        "password"
+      ],
+      "usage": "<Icon name=\"eye-off\" label=\"Hide\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "route",
+      "category": "view",
+      "tags": [
+        "load balancer",
+        "split",
+        "fork"
+      ],
+      "usage": "<Icon name=\"route\" label=\"Load balancer\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "server",
+      "category": "view",
+      "tags": [
+        "machine",
+        "node",
+        "rack"
+      ],
+      "usage": "<Icon name=\"server\" label=\"Machine\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "cloud",
+      "category": "view",
+      "tags": [
+        "provider",
+        "remote",
+        "upstream"
+      ],
+      "usage": "<Icon name=\"cloud\" label=\"Cloud provider\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "gauge",
+      "category": "view",
+      "tags": [
+        "rate limit",
+        "rpm",
+        "tpm",
+        "dial"
+      ],
+      "usage": "<Icon name=\"gauge\" label=\"Rate limit\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "zoom-in",
+      "category": "action",
+      "tags": [
+        "magnifier",
+        "plus",
+        "enlarge"
+      ],
+      "usage": "<Icon name=\"zoom-in\" label=\"Zoom in\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "zoom-out",
+      "category": "action",
+      "tags": [
+        "magnifier",
+        "minus",
+        "shrink"
+      ],
+      "usage": "<Icon name=\"zoom-out\" label=\"Zoom out\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "fit-view",
+      "category": "view",
+      "tags": [
+        "fit",
+        "frame",
+        "corners"
+      ],
+      "usage": "<Icon name=\"fit-view\" label=\"Fit view\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "x-circle",
+      "category": "status",
+      "tags": [
+        "error",
+        "failed",
+        "fault"
+      ],
+      "usage": "<Icon name=\"x-circle\" label=\"Failed\" />  (or `decorative` inside a control that already has a label)",
+      "added": "2026-11-18",
+      "replaces": []
+    }
+  ]
+}

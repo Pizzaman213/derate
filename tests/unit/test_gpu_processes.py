@@ -29,9 +29,14 @@ from control_plane.procmatch import matches_deployment, port_in
 from control_plane.registry import procs
 from control_plane.registry.agent import NodeAgent, create_agent_app
 from control_plane.registry.serde import processes_to_dict
+from control_plane.registry.identity import agent_token
 from control_plane.registry.telemetry import read_gpu_processes
 
 GIB = 1024**3
+# The coordinator never shows an agent the cluster token: each node gets its
+# own derived agent token (identity.agent_token).
+CLUSTER = "cluster-secret"
+AGENT_TOKENS = {n: agent_token(CLUSTER, n) for n in ("spark-01", "spark-02")}
 
 
 def profile(node_id="spark-01"):
@@ -273,9 +278,59 @@ def test_processes_route_serves_the_annotated_shape(monkeypatch):
 
     monkeypatch.setattr("control_plane.registry.agent.read_gpu_processes", one)
     client = TestClient(create_agent_app(NodeAgent(profile(), token="t")))
-    body = client.get("/agent/processes").json()
+    body = client.get("/agent/processes", headers={"X-Derate-Token": "t"}).json()
     assert body["available"] is True
     assert body["processes"][0]["name"] == "llama-server"
+
+
+@pytest.mark.parametrize("path", ["/agent/processes", "/agent/journal?since=0"])
+def test_the_read_routes_that_leak_or_ack_need_the_agent_token(monkeypatch, path):
+    """Command lines of everything on the GPU, and the node's whole log stream:
+    neither may be read by anyone on the LAN who can reach the agent port."""
+
+    async def none(*a, **k):
+        return []
+
+    monkeypatch.setattr("control_plane.registry.agent.read_gpu_processes", none)
+    client = TestClient(create_agent_app(NodeAgent(profile(), token="right")))
+    assert client.get(path).status_code == 403
+    assert client.get(path, headers={"X-Derate-Token": "wrong"}).status_code == 403
+    assert client.get(path, headers={"X-Derate-Token": "right"}).status_code == 200
+
+
+def test_probe_back_routes_stay_open_for_nodes_without_a_token():
+    """registry.probe_remote and reach call these on nodes that hold no token."""
+    client = TestClient(create_agent_app(NodeAgent(profile(), token="right")))
+    assert client.get("/agent/profile").status_code == 200
+    assert client.get("/agent/health").status_code == 200
+    assert client.get("/openapi.json").status_code == 404
+
+
+def test_an_uncredentialed_read_cannot_ack_the_journal_away(tmp_path):
+    """Reading after `since` is the ack that lets the node trim below it. A
+    bare caller asking past the head must not advance that mark, or the next
+    trim erases every row the coordinator has not collected yet."""
+    from control_plane.telemetry.journal import Journal
+
+    journal = Journal(tmp_path / "j.db", node_id="spark-01")
+    journal.start()
+    try:
+        for i in range(5):
+            journal.append("sample", {"ts": 1000.0 + i})
+        assert journal.sync(5.0)
+        client = TestClient(
+            create_agent_app(NodeAgent(profile(), sink=journal, token="right"))
+        )
+        head = journal.stats()["head"]
+        bare = client.get("/agent/journal", params={"since": head + 1})
+        assert bare.status_code == 403
+        assert journal.stats()["shipped_hwm"] == 0
+        kept = client.get(
+            "/agent/journal", params={"since": 0}, headers={"X-Derate-Token": "right"}
+        )
+        assert len(kept.json()["rows"]) == 5
+    finally:
+        journal.close()
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +421,10 @@ class FakeAgent:
                 self.wfile.write(raw)
 
             def do_GET(self):
-                if self.path == "/agent/processes":
+                if self.headers.get("X-Derate-Token") not in AGENT_TOKENS.values():
+                    # The real agent gates its process list on its token.
+                    self._send(403, {"detail": "agent token required"})
+                elif self.path == "/agent/processes":
                     self._send(
                         200,
                         {
@@ -428,8 +486,8 @@ def _gateway(agent_url, deployments, handles=None):
         def agent_url(self, node_id):
             return agent_url if node_id == "spark-01" else None
 
-        def cluster_token(self):
-            return "cluster-secret"
+        def agent_token(self, node_id):
+            return agent_token(CLUSTER, node_id)
 
     class Deps(FakeDeployments):
         def handles(self):
@@ -473,7 +531,7 @@ def test_route_refuses_to_kill_a_backend_the_router_is_still_using():
     assert agent.killed == []  # never reached the machine
 
 
-def test_route_kills_a_stray_and_presents_the_cluster_token():
+def test_route_kills_a_stray_and_presents_the_agent_token():
     procs_wire = [
         {"pid": 5, "name": "llama-server", "command": "llama-server --port 8080",
          "user": "connor", "gpu_memory": 72 * GIB}
@@ -484,7 +542,7 @@ def test_route_kills_a_stray_and_presents_the_cluster_token():
     assert res.status_code == 200
     assert res.json()["gpu_memory_reclaimed"] == GIB
     assert agent.killed == [5]
-    assert agent.tokens == ["cluster-secret"]
+    assert agent.tokens == [AGENT_TOKENS["spark-01"]]
 
 
 def test_route_404s_a_pid_that_is_not_holding_gpu_memory():
@@ -529,8 +587,8 @@ def _agent_backed_manager(tmp_path, agent):
         def agent_urls(self, include_local=False):
             return {"spark-01": agent.url, "spark-02": agent.url}
 
-        def cluster_token(self):
-            return "cluster-secret"
+        def agent_token(self, node_id):
+            return agent_token(CLUSTER, node_id)
 
     registry = Reg(td.fx.SPARK_01, td.fx.SPARK_02)
 
@@ -580,7 +638,7 @@ def test_a_stop_sparkrun_will_not_confirm_is_killed_on_its_nodes(tmp_path):
             manager.stop(dep.deployment_id)
 
             assert agent.killed == [31337]
-            assert agent.tokens == ["cluster-secret"]
+            assert agent.tokens == [AGENT_TOKENS["spark-01"]]
             live = manager.get(dep.deployment_id)
             assert live.state is DeploymentState.STOPPED
             assert "killed on its nodes" in live.last_error

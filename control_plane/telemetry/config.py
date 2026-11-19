@@ -6,10 +6,13 @@ Every horizon below is a default that a deployment can move, but the defaults
 are chosen against real arithmetic rather than round numbers. At 1 Hz a node
 sample is roughly 96 bytes on disk, so thirty days of raw samples is about
 250 MB per node -- nothing on a Spark's NVMe. A request row is roughly 260
-bytes, which is also nothing at demo rates and 2.2 GB/day at a sustained 100
-requests per second. That asymmetry is why ``REQUESTS_RAW_RETENTION_S`` is
-shorter than ``SAMPLES_RAW_RETENTION_S``: the rollups carry the long story for
-the stream that can actually run away, and the cheap stream keeps everything.
+bytes with the per-key columns, which is nothing at demo rates and ~9.4 GB
+over thirty days at a sustained 100 requests per second -- under
+``ARCHIVE_MAX_BYTES`` only at demo rates. Raw request rows are kept ninety
+days anyway, because a key's detail page reads its stats off them and an
+investigation reads who called from where off them; the size
+cap, which drops the oldest raw day and records a gap, is what protects the
+disk, and the rollups carry the long story.
 """
 
 from __future__ import annotations
@@ -81,16 +84,25 @@ SHIP_PAGE_PAUSE_S = 0.005
 # -- L3, the coordinator's archive -------------------------------------------
 
 SAMPLES_RAW_RETENTION_S = 30 * DAY_S
-REQUESTS_RAW_RETENTION_S = 7 * DAY_S
+#: Raw /v1 request rows are evidence (who, from where, which key, which
+#: request id): an investigation usually starts weeks after the fact.
+REQUESTS_RAW_RETENTION_S = 90 * DAY_S
 EVENTS_RETENTION_S = 30 * DAY_S
 LOGS_RETENTION_S = 7 * DAY_S
 
 ROLLUP_1M_RETENTION_S = 90 * DAY_S
 ROLLUP_1H_RETENTION_S = 400 * DAY_S
+ROLLUP_1D_RETENTION_S = 400 * DAY_S
 
 #: Ceiling on the archive. Enforced by dropping the oldest raw day and
 #: recording it in ``gaps``.
 ARCHIVE_MAX_BYTES = 16 * 1024 * 1024 * 1024
+
+#: Raw ``logs`` + ``events`` bytes one node may ship into the archive per UTC
+#: day (the coordinator's clock). Past it that node's raw rows are dropped and
+#: one ``node_quota`` gap is recorded, so a single rogue member cannot drive the
+#: archive into its size cap and evict every other node's record (N-5).
+NODE_RAW_BYTES_PER_DAY = 256 << 20
 
 #: How often rollups run and expired rows go. On a timer, deliberately:
 #: deploy/store.py's purge_expired is called only from reconcile(), so a
@@ -99,6 +111,7 @@ COMPACT_INTERVAL_S = 60.0
 
 BUCKET_1M_S = 60.0
 BUCKET_1H_S = 3600.0
+BUCKET_1D_S = 86400.0
 
 #: Below this span a query answers from raw rows; below the next, from
 #: 1-minute rollups; beyond it, from hourly ones. This is what stops a UI
@@ -144,6 +157,9 @@ LOG_MESSAGE_MAX_CHARS = 8192
 #: ``DERATE_TELEMETRY_QUIET_LOGGERS`` to a comma-separated list to change it,
 #: or to the empty string to record everything again.
 NOISY_LOGGERS = (
+    # The gateway's own access line (authz.on_request_done) since uvicorn's
+    # was switched off; same volume, same reason. It stays in node.log.
+    "gateway.access",
     "uvicorn.access",
     "httpx",
 )
@@ -207,8 +223,20 @@ def enabled() -> bool:
 
 
 def retention_days() -> float:
-    """Raw-sample horizon, in days. Scales the other raw horizons with it."""
+    """Raw-sample horizon, in days. Scales the other raw telemetry horizons
+    with it -- never the evidence tables, see requests_retention_days."""
     return _env_float("DERATE_TELEMETRY_RETENTION_DAYS", SAMPLES_RAW_RETENTION_S / DAY_S)
+
+
+def requests_retention_days() -> float:
+    """How long ``requests`` and ``access`` rows are kept, in days.
+
+    Its own knob, deliberately not scaled by DERATE_TELEMETRY_RETENTION_DAYS:
+    these rows are the attribution record (which key, from which address,
+    asked for what), and shortening the metrics window to save disk must not
+    shorten an investigation's window with it.
+    """
+    return _env_float("DERATE_REQUESTS_RETENTION_DAYS", REQUESTS_RAW_RETENTION_S / DAY_S)
 
 
 def log_ship_level() -> str:

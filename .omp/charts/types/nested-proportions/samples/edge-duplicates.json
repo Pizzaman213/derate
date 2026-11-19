@@ -1,0 +1,1 @@
+{"description":"The same stage appears twice: the values are summed and noted.","data":[{"label":"Visitors","value":800},{"label":"Trial","value":120,"parent":"Visitors"},{"label":"Trial","value":30,"parent":"Visitors"},{"label":"Paid","value":40,"parent":"Trial"}]}

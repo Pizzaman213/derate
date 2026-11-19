@@ -11,15 +11,20 @@ Everything here is entered through `../ChatTab.tsx`, which owns the turns, the
 abort controller and the send. This folder owns the picker, the composer, the
 transcript, and three verifiers: `rows.check.mjs` and `voices.check.mjs` hold
 the picker and the voice controls to a live gateway, and `tags.check.mjs` is
-hermetic -- it holds the transcript's colours to `styles/tokens.css`.
+hermetic -- it holds the transcript's colours to `.omp/design/tokens/tokens.flat.json`.
 
 ## Layout
 
 | File | Lines | What it owns |
 |---|---|---|
 | `ModelList.tsx` | 228 | `buildRows`, `sections`, `emptyNote` -- every served name, cut into one section per endpoint family |
-| `Transcript.tsx` | 205 | the `Turn` type, the turn list, the meta line, scroll anchoring |
-| `Composer.tsx` | 172 | the send box and `SendExtra` -- one value picks the controls drawn and the URL posted to |
+| `Transcript.tsx` | 270 | the turn list, the Thinking disclosure, the meta block (`TurnMeta`), scroll anchoring |
+| `turn.ts` | 36 | the `Turn` type: both halves of an exchange, with `reasoning`, `requested` and `setup` beside `content` |
+| `Composer.tsx` | 199 | the send box, the thinking chips, and `SendExtra` -- one value picks the controls drawn and the URL posted to |
+| `reasoning.ts` | 151 | how the picked model thinks: family table, `--reasoning-parser` off the launch flags, the chips it gets and what each sends |
+| `stats.ts` | 133 | `turnFigures`, `sessionFigures`, `reasoningVerdict`: every derived figure and the verdict sentence under an answer |
+| `SessionStats.tsx` | 59 | the session strip above the transcript, absent until an answer has finished |
+| `Markdown.tsx` | 178 | `parseMarkdown` and `Markdown`: an answer rendered as React elements only, links http(s) only |
 | `tags.ts` | 114 | `tagsFor`, `tagStyle`, `tagInk`: which model a turn went to, drawn as a colour |
 | `VoiceFields.tsx` | 104 | voice and container format for a speech model; `OWN_VOICE`, `resolveVoice` |
 | `UploadFields.tsx` | 87 | file and language for `/v1/audio/transcriptions`; `DEFAULT_LANGUAGE` |
@@ -28,6 +33,10 @@ hermetic -- it holds the transcript's colours to `styles/tokens.css`.
 | `tags.check.mjs` | 296 | hermetic: no two models drawn the same, no colour that moves, no hue nobody can separate |
 | `rows.check.mjs` | 241 | requires a coordinator: `buildRows` against the live `/v1/models` |
 | `voices.check.mjs` | 110 | requires a coordinator: `SPEECH_FORMATS` against the runtime's own table, and the voices route's refusals |
+| `reasoning.check.mjs` | 58 | hermetic: family rows, parser read from both flag forms, the options each chip sends, never a template switch to a provider |
+| `stats.check.mjs` | 75 | hermetic: think/gen time, tok/s over decode time, session sums, every verdict sentence |
+| `markdown.check.mjs` | 100 | hermetic: block shapes, a streaming fence, and that raw HTML, `javascript:` links and images stay text |
+| `chat.check.mjs` | 182 | requires browser + coordinator: the tab with the model side scripted by `page.route`; writes `screens/chat-thinking.png` |
 
 ## `ModelList.tsx`
 
@@ -43,8 +52,8 @@ saying why. `target_kinds` still decides, read server-side off the same index
 the router dispatches from, but it now decides what a row *says* rather than
 whether it exists. Locally-served names sort first, then alphabetically.
 `sections()` cuts the rows on `SECTION_ORDER` -- text, embedding, speech,
-transcription, the same order and reasoning as `MODALITY_ORDER` in
-`tabs/cluster/layout.ts`. Headings name the route, not the category:
+transcription: text is what nearly every cluster serves, so it goes first, and
+the unusual one is found by scanning down. Headings name the route, not the category:
 `POST /v1/audio/speech` is the thing a person can act on. `emptyNote` names
 what is pending from `NOTABLE` (`launching`, `planned`, `stopping`, `failed`),
 because "nothing is running" and "something is launching" read very
@@ -52,21 +61,83 @@ differently.
 
 ## `Transcript.tsx`
 
-The turn list, and the `Turn` type both halves of an exchange are stored as.
-`model` is recorded at send time on the question and the answer alike;
-`meta.model` -- what actually served -- wins where both exist, which is
-`destination()`. `audio` is a separate field rather than a tagged union,
-because a turn's identity is the request and not the media type of what came
-back. `metaLine` is the line that makes this a control-plane surface: what
-served, the request id, ttft, elapsed, tokens. When `ttftMs`, `elapsedMs` and
-`completionTokens` are all null it prints the model and the id alone -- both
-audio endpoints land there, and `ttft — ms · — s · — tok` would read as three
-failed measurements rather than as a request that never had them. The test is
-on the figures, not on the modality, so it survives a fourth endpoint. The
-in-flight caption follows `mode`: "generating audio", "transcribing", or
-"waiting for the first token", because naming the wrong one makes a working
-request look stalled. `followRef` anchors the scroll to the tail unless the
-reader has scrolled up, the same pattern `DeploymentLog` uses.
+The turn list. `Turn` itself lives in `turn.ts`; `model` is recorded at send
+time on the question and the answer alike; `meta.model` -- what actually
+served -- wins where both exist, which is `destination()`. `audio` is a
+separate field rather than a tagged union, because a turn's identity is the
+request and not the media type of what came back. `reasoning` is a separate
+field from `content` for the same reason and one more: `ChatTab` builds history
+from `content` alone, so a model's reasoning is never sent back to it.
+
+An answer renders through `Markdown`; a question stays pre-wrap text. When a
+turn has reasoning, a `Disclosure` above the answer holds it as plain text
+(`.think`), summarised as `Thinking · N tok · S s` once the turn finishes. It
+follows the stream -- open while the model is still thinking, closed once the
+answer starts -- until somebody clicks it, and then it stays where they put it
+(`pinned`).
+
+`TurnMeta` is the block that makes this a control-plane surface, three lines:
+what served, the request id and why it stopped (`finish stop`, `stopped`);
+`ttft`, `think` time, `gen` time, `tok/s`, `in`/`out` tokens and `think` tokens,
+each estimate labelled `(est.)`; and `reasoningVerdict` -- whether reasoning
+came back, and whether the server separated it or the browser had to, naming
+the `--reasoning-parser` to add when it did. When `ttftMs`, `elapsedMs` and
+`completionTokens` are all null it prints the first line alone -- both audio
+endpoints land there, and `ttft — ms · — s · — tok` would read as three failed
+measurements rather than as a request that never had them. The test is on the
+figures, not on the modality, so it survives a fourth endpoint. The in-flight
+caption follows `mode`: "generating audio", "transcribing", or "waiting for
+the first token" -- and "thinking…" once reasoning is arriving -- because
+naming the wrong one makes a working request look stalled. `followRef` anchors
+the scroll to the tail unless the reader has scrolled up, the same pattern
+`DeploymentLog` uses.
+
+## `reasoning.ts` and `stats.ts`
+
+`profileFor(id)` matches the HF id (the served name for a provider row) against
+an ordered family table: a `toggle` reads `chat_template_kwargs.enable_thinking`
+or `.thinking` (Qwen3, Gemma 4, GLM, Granite, DeepSeek-V3.1/3.2), an `effort`
+ladder sends `reasoning_effort` (gpt-oss, OpenAI o-series), `always` thinks with
+no switch (R1, QwQ, the Thinking checkpoints). `launchedParser` reads
+`--reasoning-parser` out of the deployment's `extra_args`/`custom_command`.
+
+Every text model -- local or a provider's -- gets the same six chips,
+`THINKING_CHOICES`: default · off · on · low · medium · high. Which of them a
+model honours cannot be known up front, so the control is offered everywhere
+and the verdict under each answer says what happened. On a local deployment, on
+and off send **both** template keys with one value -- vLLM ORs them and each
+template reads its own; a level turns thinking on, sends `reasoning_effort`
+(vLLM hands it to the template and most ignore it), and -- only when the
+deployment runs a `--reasoning-parser` -- a hard cap, `thinking_token_budget`
+from `THINKING_BUDGET` (minimal 256 · low 1k · medium 4k · high 16k · xhigh 32k;
+`max` is uncapped), which vLLM refuses without one. The levels are exactly the
+values vLLM's `reasoning_effort` accepts. An
+effort-ladder family (gpt-oss) reads the level natively, on is its `medium`,
+and it gets no cap. A provider row never gets a template field (OpenAI and
+strict servers refuse unknown ones): off is `reasoning_effort: "none"`, on is
+`"medium"`, a level is itself. OpenRouter, OpenAI, Groq, Ollama and vLLM read
+that field as sent; the ChatGPT kind's `responses_adapter.py` turns it into
+`reasoning: {effort, summary: "auto"}` and streams the summary back as
+`delta.reasoning`, which is the only reasoning text that API hands out. The
+family table is vLLM's documented behaviour; the verdict line is what shows
+when it is wrong for a checkpoint, and the fix is the table row.
+
+Nothing is asked of the runtime: the gateway forwards the body untouched and
+relays the stream byte for byte, so `api/client.ts` reads `delta.reasoning`
+(vLLM since it renamed the field) and `delta.reasoning_content` (SGLang,
+providers), splits inline `<think>` blocks with `api/think.ts` when neither
+arrives, and takes `usage.completion_tokens_details.reasoning_tokens` when the
+last frame carries it. Many current templates (Qwen3 Thinking and 3.5+,
+DeepSeek-R1-0528, QwQ) open `<think>` *in the prompt*, so the output carries
+only `</think>`: when `expectsInlineThinking` says the model should be thinking
+and no server parser will take the block out, the stream starts inside the
+block (`thinkOpen`) so the reasoning streams into its own disclosure; a bare
+`</think>` that arrives anyway moves everything before it into reasoning, and an
+expected block that never closes is handed back as the answer at the end --
+both through `onRewrite`, which replaces the two fields at once. `stats.ts` derives everything printed from that:
+`thinkMs` is first reasoning token to first answer token, `genMs` is first
+token to end of stream, and the session's `tok/s` is Σtokens / Σdecode seconds,
+not a mean of per-turn rates.
 
 ## `Composer.tsx`
 
@@ -82,8 +153,12 @@ happen. On the transcription path the file *is* the request: an empty message
 box must not block it, so the textarea is replaced rather than stacked above
 the chooser, and the turn is labelled with the file's name. `voice` and
 `format` are held across a switch to a text model and back, and only ever read
-when `speaking`. Enter sends, Shift+Enter breaks the line, and the caption
-under the field says so.
+when `speaking`. Enter sends (not while an IME is composing), Shift+Enter
+breaks the line, Esc stops a stream in flight, and the caption under the field
+says so. For a text model with controls, `Thinking` chips (`off · on · low ·
+medium · high`, whichever apply) sit on the button
+row; the choice is held per model in `ChatTab`, so switching away and back
+keeps it.
 
 ## `tags.ts`
 
@@ -227,12 +302,15 @@ name is a 404 `model_not_found`. It absorbed the useful half of the deleted
 
 ## The seam with `ChatTab.tsx`
 
-`../ChatTab.tsx` (305 lines) is the only importer:
+`../ChatTab.tsx` (343 lines) is the only importer:
 
 ```tsx
 import { ModelList, buildRows, emptyNote } from './chat/ModelList'
-import { Transcript, type Turn } from './chat/Transcript'
+import { Transcript } from './chat/Transcript'
+import type { Turn } from './chat/turn'
 import { Composer, type SendExtra } from './chat/Composer'
+import { SessionStats } from './chat/SessionStats'
+import { choicesFor, describeSetup, reasoningSetup, requestOptions } from './chat/reasoning'
 import { useVoices } from './chat/useVoices'
 ```
 
@@ -258,10 +336,10 @@ Outside the tab, this folder reaches `api/types.ts` for `Modality`,
 `components/Verbatim` for anything the server wrote -- `Verbatim` for a
 sentence, `VerbatimList` for `library.skipped` -- `format` for `fmt`, which is
 what puts an em dash rather than a zero in every figure `metaLine` prints,
-`state/backend` for the client, and `styles/tokens.css` for `--tag-1`..`--tag-4`
+`state/backend` for the client, and `.omp/design/tokens/tokens.json` for `--tag-1`..`--tag-4`
 and `--ink-muted`. `styles/derate.css` owns `.chatlist`, `.chatgroup`,
-`.chatgrouphead`, `.chatlog`, `.turn`, `.composer`, `.speechrow`, `.clip` and
-`.cliprow`.
+`.chatgrouphead`, `.chattop`, `.chathead`, `.chatstats`, `.chatlog`, `.turn`,
+`.think`, `.turnmeta`, `.md`, `.composer`, `.speechrow`, `.clip` and `.cliprow`.
 
 ## Things that look like details and are not
 
@@ -281,7 +359,7 @@ fifth modality is ever added, the honest failure is a section with no controls
 under it, which is why `sections()` files by modality rather than by "is it
 audio".
 
-**The `--tag-*` ramp is ordered by use, not by spectrum.** `tokens.css` runs
+**The `--tag-*` ramp is ordered by use, not by spectrum.** `tokens.json` runs
 blue, magenta, teal, violet. A first draft ran blue-teal-violet-magenta, which
 is how a ramp is normally written and put the two closest hues on the two
 commonest slots: a two-model transcript came out 29 degrees apart, correctly

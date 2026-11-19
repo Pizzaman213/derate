@@ -8,6 +8,11 @@ memory, and fronts every model behind one OpenAI endpoint.
 every type, enum, constant, derived fact, route and environment variable -- and
 a test fails when it goes stale, so it cannot be wrong in a way the code is not.
 
+**Charts: read `.omp/charts/RULES.md` before building or changing any chart.** Every
+chart type lives in the chart pack (`.omp/charts/`, one API in `index.ts`, the list in
+`registry.json`); check it and `recommend()` before writing a chart, and run
+`cd .omp/charts && npm run charts:check` yourself after any change.
+
 **There is no separate architecture journal any more.** `00-architecture.md`,
 `ROADMAP.md`, `agents/*.md` and `research/*.md` were the scope, the reasoning,
 the file-ownership map and the per-workstream briefs for the initial parallel-
@@ -26,6 +31,9 @@ cd ui && npm run build                 # tsc -b && vite build -> ui/dist
 cd ui && npm run check                 # the whole UI suite. See below.
 cd ui && npm run check -- --strict     # ...and a skip counts as a failure
 cd ui && npm run screens               # capture ui/screens/<dest>.png, no assertions
+# Every coordinator verifier logs in (ui/src/check/auth.mjs): export
+# DERATE_CHECK_ADMIN_USER / DERATE_CHECK_ADMIN_PASSWORD (and DERATE_CHECK_API_KEY
+# for /v1) or the coordinator probe answers 401 and they are skipped.
 python3 -m tests.model_sweep           # resolve every config in tests/resolver_data/
 python3 -m tests.model_sweep --live    # ...or every local model the coordinator knows
 python3 -m tests.model_sweep --arch    # VLLM_ARCHITECTURES against the image's registry
@@ -110,7 +118,11 @@ can run on its own, and that is still the inner loop.
 drives the Chromium already in the Playwright cache -- nothing is downloaded --
 over every destination in `state/routes.ts` and writes `ui/screens/<dest>.png`.
 Under `npm run check` it also asserts: no console error, no uncaught rejection,
-nothing non-2xx from the coordinator, a `#root` with height, and, against the
+nothing non-2xx from the coordinator, a `#root` with height, that everything
+laid out in a row sits on one line (`src/check/alignment.mjs`: controls in a
+flex row share a centre, a table row's cells a baseline, measured at 1440, 1024
+and 390 because wrapping is what breaks it -- a `.chips` group's bottom margin
+in a centred row is the usual offender), and, against the
 server's own `Redactor` primed with the real stored values, that no key is on
 screen. Open the PNGs -- that is the only thing here that sees what shipped
 rather than inferring it from source. Off-site failures are recorded in
@@ -129,7 +141,13 @@ control_plane/resolver/    HuggingFace id -> ModelShape, quantization table
 control_plane/fit/         the blocking out-of-memory gate
 control_plane/planner/     TP/PP/EP from measured facts
 control_plane/deploy/      sparkrun adapter, lifecycle
-control_plane/gateway/     the one HTTP surface: /v1, /api, and the built UI
+control_plane/gateway/     the one HTTP surface: /v1, /api, and the built UI.
+                           authz.py is the credential gate: a session on /api,
+                           a drt_ key on /v1, everything else open by name.
+control_plane/auth/        admins (argon2id), sessions, login lockout, audit log
+control_plane/keys/        orgs and drt_ API keys; keys/format.py is the key shape
+control_plane/limits/      30-day cycle counters, rpm/tpm/concurrency windows,
+                           per-request caps, local model pricing (limits.db)
 control_plane/providers/   remote upstreams as route targets
 control_plane/runtimes/    the inference servers derate ships itself. Runs
                            INSIDE a model container (docker/tts.Dockerfile),
@@ -146,6 +164,10 @@ ui/                        the screen. See ui/README.md, which is thorough.
 tests/                     the suite is tests/unit/; everything beside it is not
                            collected -- the sweeps, fixtures/, resolver_data/, and
                            load/, which is a harness rather than a suite.
+                           tests/unit/conftest.py signs every TestClient in as a
+                           real admin and attaches a real key: the auth path runs
+                           on every request. @pytest.mark.raw_http opts out, for
+                           the tests that assert a 401.
 docs/screenshots/          every image the README shows, and one README over
                            both halves of it. The eight PNGs are promoted by hand
                            out of ui/screens/ after `npm run screens`.
@@ -175,8 +197,23 @@ renders as a blank page with nothing in the network log to explain it.
 exactly as received: never truncated, re-cased or summarised. A refusal names
 what to change, and rewriting it destroys the thing that made it useful.
 
-**No API key is ever rendered.** `ui/src/api/redact.ts` scrubs responses on the
-way in. Do not add an inverse.
+**No API key is ever rendered -- with one exception.** `ui/src/api/redact.ts`
+scrubs responses on the way in, by field name for provider keys and by value
+(`drt_<id>_<secret>`) for derate's own. Do not add an inverse. The exception,
+added 2026-11-17: a `drt_` secret is shown exactly once, in
+`components/RevealModal.tsx`, from the `secret_once` field of exactly three
+responses -- `POST /api/setup/admin`, `POST /api/keys`,
+`POST /api/keys/{id}/rotate` -- which `client.ts` fetches through
+`reqUnscrubbed()`. Nothing else may use it. The server keeps only a sha256 of
+the secret, so there is no second reveal to build.
+
+**Every gated route is gated by `gateway/authz.py`, not per handler.** The open
+list (`/healthz`, `/install.sh`, `POST /api/nodes/join`, `GET /api/auth/state`,
+`POST /api/auth/login`, and `POST /api/setup/admin` until an admin exists) is
+hardcoded there and read from `.omp/work/auth-keys/sets/setup_routes.json` by
+`tests/unit/test_gateway_auth_coverage.py`, which walks every route in
+routes.json and fails on one that answers without credentials. A new route is
+gated by default; opening one is an edit to that list and that set.
 
 **Live memory is an optional kwarg that degrades.** The fit gate prefers what a
 node can actually hand out now and falls back to the static ceiling when there
@@ -288,14 +325,22 @@ an explicit `command:` verbatim.
 ## The UI's URL scheme
 
 Added 2026-09-07. The path names the screen (`/dashboard`, `/models`,
-`/cluster`, `/chat`, `/spend`, `/settings`, plus `/setup`, which is
+`/cluster`, `/chat`, `/usage`, `/settings`, plus `/setup`, which is
 a real destination and off the nav) and that screen's own subject
-(`/models/<model id>`); the query names what is selected (`?node=`, `?link=`,
-`?dep=`, `?open=node:spark-01`, `?ctx=`/`?seq=`). `ui/src/state/
+(`/models/<model id>`, `/usage/requests/<id>`, `/usage/keys/<id>`); the query names what is selected (`?node=`, `?link=`,
+`?dep=`, `?open=node:spark-01`, `?ctx=`/`?seq=`, and `/usage`'s own `?win=`). `/usage`'s pane
+(Overview, Requests, Rate limits, Keys) is a path segment, `Route.sub`; the old `/spend`, `/keys` and
+`/requests` paths are parse-only aliases since 2026-11-18, rewritten to `/usage...`. `ui/src/state/
 routes.ts` is the scheme -- pure, verified by `router.check.mjs` --
 `router.tsx` is the provider, and `selection.tsx` reads and writes it so no
 call site knows a URL is involved. Selecting replaces, opening pushes. Details
 and the reasoning are in `ui/README.md` under **URLs**.
+`/usage?dep=<served model or deployment id>` opens Rate limits and canonicalizes
+to `/usage/rate-limits?dep=…`. That pane separates live cooldowns from the
+durable 429 request log. `?provider=` and `?target=` narrow attribution;
+Requests also accepts them and `?status=429`. New upstream failures retain
+sanitized reasons and retry delays in `attempt_chain`, including logical
+429s received after a translated stream's HTTP 200 headers were sent.
 
 This list said `/storage` and did not say `/setup`. Storage has never been a
 destination -- `tabs/storage/*` is four cards composed inside `SettingsTab`
@@ -315,15 +360,26 @@ already do.
 
 ## This box
 
-- The live coordinator is on **:8088** (`DERATE_UI_DIR=/home/connor/derate/ui/dist`,
-  data in `/tmp/derate-live`). `:8080` is somebody else's. Boot test instances
-  on **18xxx**.
+- The live coordinator is **one** process on **:8088** (agent :18081,
+  `DERATE_UI_DIR=/home/connor/derate/ui/dist`, data in `/home/connor/derate-data`,
+  logs in `/home/connor/derate-data/logs`). Never start a second process on the
+  same data dir: each keeps its own audit row count, so `logs/audit/HEAD` names
+  whichever wrote last and the chain stops verifying. `/tmp/derate-live` is the
+  retired copy and `/home/connor/derate-evidence-20261118T222901Z` the
+  pre-move evidence snapshot (checksummed in `SHA256SUMS`); start nothing on
+  either. `:8080` is somebody else's. Boot test instances on **18xxx**.
 - `npx vite build` is live on :8088 with no restart, *if* `DERATE_UI_DIR` still
   points at `ui/dist` -- read it off `/proc/<pid>/environ` and confirm with
   `curl -s localhost:8088/ | grep -o 'assets/index-[^"]*\.js'`. Equal hashes is
   the only proof.
 - Server-side changes do need a restart, and the process **does not exit on
-  SIGTERM**: `kill PID`, wait for the port to free, then `kill -9`. Never
+  SIGTERM**: `kill PID`, wait for the port to free, then `kill -9` -- always,
+  even when the port frees. SIGTERM closes the listening socket and leaves the
+  process alive on its established connections, and the browser here comes in
+  through VS Code Remote-SSH port forwarding, which keeps its keep-alive
+  connections open: on 2026-11-18 the old process answered the operator's
+  browser for 40 minutes after a "restart", running the old code, while the
+  new one served nothing. `[ -d /proc/PID ]` is the check, not `ss -ltn`. Never
   `pkill -f control_plane.node` -- the pattern matches the agent's own shell.
 - **The tts image is not published, and is faked by a local tag.**
   `deploy/flags.py` defaults the `tts` runtime to
@@ -349,3 +405,12 @@ already do.
 
 
 Dont commit to git or ask unless I ask`s
+
+## Design pack
+
+The design pack -- tokens, icons, component registry, specs, UI guardrail
+checks, the code graph and the omp tooling -- lives in `.omp/` and nowhere
+else. `.omp/RULES.md` is sticky and binding in every session: check the pack
+before creating, add to the pack first, register and test what you add.
+`cd .omp && npm run check` is the UI design gate (`ui:check` alone skips the
+pack's typecheck); `.omp/README.md` is the index of every file and script.

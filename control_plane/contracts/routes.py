@@ -30,9 +30,14 @@ from pathlib import Path
 
 ROUTES_PATH = Path(__file__).with_name("routes.json")
 
-#: Starlette mounts and the catch-all UI handler answer paths that are not
-#: endpoints, and listing them would be listing the filesystem.
-_SKIP_KINDS = {"Mount", "WebSocketRoute"}
+#: Starlette mounts answer paths that are not endpoints, and listing them
+#: would be listing the filesystem.
+_SKIP_KINDS = {"Mount"}
+
+#: Both spellings of a websocket route. FastAPI's ``APIWebSocketRoute`` has no
+#: ``.methods``, so before it was named here ``/v1/realtime`` was silently
+#: absent from routes.json -- and so from anything that iterates it.
+_WEBSOCKET_KINDS = {"WebSocketRoute", "APIWebSocketRoute"}
 
 #: Methods every route reports whether or not it implements them.
 _IMPLICIT = {"HEAD"}
@@ -91,7 +96,7 @@ def _walk(routes, prefix: str, out: list[dict]) -> None:
         if path is None:
             continue
         kind = type(route).__name__
-        if kind == "WebSocketRoute":
+        if kind in _WEBSOCKET_KINDS:
             out.append({"methods": ["WEBSOCKET"], "path": prefix + path})
             continue
         if kind in _SKIP_KINDS:

@@ -22,6 +22,8 @@ Four rules this file exists to enforce:
 from __future__ import annotations
 
 import logging
+import re
+import secrets
 import socket
 import threading
 import time
@@ -31,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
 
+from control_plane.contracts.deployment import check_speculative_tokens
 from control_plane.contracts import (
     Deployment,
     DeploymentState as S,
@@ -48,13 +51,42 @@ from . import events as ev
 from .events import EventBus
 from .fsm import SERVING, TERMINAL, check as fsm_check
 from .health import HEALTH_PATHS, probe, wrong_model
-from .progress import LaunchProgress, advance as advance_progress, from_launcher, from_runtime_log
-from .recipes import check_extra_args_safe, check_recipe_identifiers
+from .progress import MAX_LINE_CHARS, LaunchProgress, advance as advance_progress, explain_failure, from_launcher, from_runtime_log
+from .flags import runtime_spec
+from .recipes import check_extra_args_safe, check_recipe_identifiers, container_image
 from .sparkrun import LaunchError, SparkrunAdapter, default_served_name, is_oom
 from .utilization import utilization_for
-from .store import DeploymentStore
+from .store import DeploymentStore, safe_deployment_id
 
 from control_plane.paths import data_dir
+from control_plane.resolver import imageprobe
+
+from control_plane.redaction import REDACTED
+
+_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _image_for(runtime: str) -> str:
+    """The image reference a launch on *runtime* will run, or "" for a
+    runtime this build has no spec for (the adapter refuses those itself)."""
+    try:
+        return container_image(runtime_spec(runtime))
+    except ValueError:
+        return ""
+
+
+def _scrub_key(record: "_Record", text: str) -> str:
+    """The record's runtime API key, replaced wherever sparkrun or the
+    runtime prints it, before the text is kept, shown or archived."""
+    key = (getattr(record, "handle", None) or {}).get("runtime_api_key")
+    return text.replace(key, REDACTED) if key and text else text
+
+
+def _key_kw(record: "_Record") -> dict[str, str]:
+    """The probe's `api_key` kwarg, only when this deployment has a key: a
+    pre-key engine answers `/v1/models` without one."""
+    key = (getattr(record, "handle", None) or {}).get("runtime_api_key")
+    return {"api_key": key} if key else {}
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +427,9 @@ class DeploymentManager:
         modality: Modality = Modality.TEXT,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        revision: str | None = None,
+        speculative_tokens: int = 0,
+        trust_remote_code: bool = False,
     ) -> Deployment:
         """Refuse, render, run, then watch for readiness.
 
@@ -418,6 +453,10 @@ class DeploymentManager:
             raise LaunchRefused(fit)
 
         self.adapter.require()
+        # Duck-typed like router.rebuild: test adapters need not grow one.
+        preflight = getattr(self.adapter, "preflight", None)
+        if callable(preflight):
+            preflight()
         name = served_name or default_served_name(shape)
         # M-22: run the same model_id/served_name safety check synthesize()
         # runs, but here -- synchronously, before any record or launch
@@ -438,6 +477,11 @@ class DeploymentManager:
                 "extra_args and custom_command are mutually exclusive: extra_args "
                 "appends to the generated serve command, custom_command replaces "
                 "it, and a request cannot mean both at once"
+            )
+        check_speculative_tokens(speculative_tokens)
+        if speculative_tokens > 0 and runtime != "vllm":
+            raise ValueError(
+                "speculative decoding is only supported on the vllm runtime here."
             )
 
         with self._lock:
@@ -462,9 +506,23 @@ class DeploymentManager:
                 modality=modality,
                 extra_args=tuple(extra_args),
                 custom_command=tuple(custom_command),
+                # Only a commit sha is a pin; "main", "local", "inline" are not.
+                revision=revision if revision and _SHA.fullmatch(revision) else None,
+                speculative_tokens=speculative_tokens,
+                trust_remote_code=bool(trust_remote_code),
+                # The reference this launch will run (env override included);
+                # its local id is filled in once the launch has pulled it.
+                image=_image_for(runtime),
             )
             port = self._allocate_port()
-            record = _Record(deployment=deployment, handle={"port": port})
+            # H3: the engine listens on 0.0.0.0 on the host network; this key
+            # is the only thing that lets a caller in, and the gateway is the
+            # only holder. Kept in the persisted handle -- never on the
+            # Deployment contract, so no serializer can reach it.
+            record = _Record(
+                deployment=deployment,
+                handle={"port": port, "runtime_api_key": secrets.token_hex(32)},
+            )
             self._records[deployment.deployment_id] = record
             self._transition(record, S.LAUNCHING)
 
@@ -611,7 +669,7 @@ class DeploymentManager:
             return False, None
 
         urls_fn = getattr(self.registry, "agent_urls", None)
-        token_fn = getattr(self.registry, "cluster_token", None)
+        token_fn = getattr(self.registry, "agent_token", None)
         if not callable(urls_fn) or not callable(token_fn):
             return False, None
         try:
@@ -619,11 +677,12 @@ class DeploymentManager:
             # on the coordinator's own node, and excluding it would make this
             # tier a no-op in the most common topology there is.
             urls = urls_fn(include_local=True)
-            token = token_fn()
+            # Each agent is shown only its own credential (identity.agent_token).
+            tokens = {node_id: token_fn(node_id) for node_id in node_ids}
         except Exception:
             logger.exception("could not reach the registry for a force kill")
             return False, None
-        if not token:
+        if not all(tokens.values()):
             return False, "no cluster token is available, so the node agents could not be asked"
 
         port = record.handle.get("port")
@@ -638,8 +697,12 @@ class DeploymentManager:
                     notes.append("%s: no agent URL" % node_id)
                     continue
                 base = url.rstrip("/")
+                token = tokens[node_id]
                 try:
-                    res = client.get("%s/agent/processes" % base)
+                    res = client.get(
+                        "%s/agent/processes" % base,
+                        headers={"X-Derate-Token": token},
+                    )
                     res.raise_for_status()
                     processes = res.json().get("processes") or []
                 except Exception as exc:
@@ -707,6 +770,14 @@ class DeploymentManager:
                 for deployment_id, record in self._records.items()
             }
 
+    def runtime_api_key(self, deployment_id: str) -> str | None:
+        """The bearer this deployment's engine requires, or None when it was
+        launched before keys existed (H3). Reached through a ``getattr`` from
+        gateway/targets.py and nowhere else; never on the Deployment."""
+        with self._lock:
+            record = self._records.get(deployment_id)
+            return record.handle.get("runtime_api_key") if record else None
+
     def progress(self) -> dict[str, dict[str, object]]:
         """What each still-launching deployment is doing, by deployment id.
 
@@ -742,7 +813,7 @@ class DeploymentManager:
         deployment = record.deployment
         with self._lock:
             lines = list(record.log_lines)
-            last_error = deployment.last_error or ""
+            last_error = _scrub_key(record, deployment.last_error or "")
         if not lines and not last_error:
             return
         header = [
@@ -759,7 +830,9 @@ class DeploymentManager:
         ]
         try:
             self.failed_log_dir.mkdir(parents=True, exist_ok=True)
-            path = self.failed_log_dir / ("%s.log" % deployment.deployment_id)
+            path = self.failed_log_dir / (
+                "%s.log" % safe_deployment_id(deployment.deployment_id)
+            )
             path.write_text("\n".join(header + lines) + "\n")
             self._prune_failed_logs()
         except Exception:
@@ -777,7 +850,10 @@ class DeploymentManager:
 
     def _archived_log(self, deployment_id: str, *, limit: int) -> list[str]:
         """The kept lines for *deployment_id*, or none. Never raises."""
-        path = self.failed_log_dir / ("%s.log" % deployment_id)
+        try:
+            path = self.failed_log_dir / ("%s.log" % safe_deployment_id(deployment_id))
+        except ValueError:
+            return []
         try:
             return path.read_text().splitlines()[-limit:]
         except FileNotFoundError:
@@ -847,9 +923,9 @@ class DeploymentManager:
         if not cluster_id:
             return {"lines": [], "source": "none", "cluster_id": None}
         try:
-            tail = self.adapter.logs(
+            tail = _scrub_key(record, self.adapter.logs(
                 cluster_id, hosts=hosts, tail=limit, timeout=POST_MORTEM_READ_S
-            )
+            ) or "")
         except Exception:
             logger.debug("could not read the log for %s", deployment_id, exc_info=True)
             return {"lines": [], "source": "none", "cluster_id": cluster_id}
@@ -981,6 +1057,9 @@ class DeploymentManager:
         that say what happened; keeping the newest frame is both what a reader
         wants and what stops a log from being nothing but a bar.
         """
+        # sparkrun echoes its `docker run -e ...` line; the runtime key is in it.
+        # Capped first: a runtime can print one unbounded line (R-4).
+        line = _scrub_key(record, line[:MAX_LINE_CHARS])
         with self._lock:
             buffer = record.log_lines
             bar = _bar_desc(line)
@@ -1225,6 +1304,12 @@ class DeploymentManager:
                 on_output=lambda line: self._note_line(record, line, from_launcher),
                 extra_args=deployment.extra_args,
                 custom_command=deployment.custom_command,
+                runtime_api_key=record.handle.get("runtime_api_key"),
+                revision=deployment.revision,
+                speculative_tokens=deployment.speculative_tokens,
+                # Only when opted in, so an adapter that predates the field
+                # (and every launch that never asked) is called as before.
+                **({"trust_remote_code": True} if deployment.trust_remote_code else {}),
             )
         except LaunchError as exc:
             self._fail_launch(record, exc)
@@ -1246,6 +1331,27 @@ class DeploymentManager:
             )
             deployment.backend_url = result.backend_url
             self.store.save(deployment, record.handle)
+
+        # What the image name resolved to on this box, now that the launch has
+        # pulled it (SC-05): "" when it is not local here. After the handle is
+        # recorded, so a stop arriving meanwhile can still find the container,
+        # and outside the lock, because it shells out to docker.
+        if deployment.image:
+            image_id = imageprobe.image_id(deployment.image, timeout=10.0) or ""
+            with self._lock:
+                deployment.image_id = image_id
+                self.store.save(deployment, record.handle)
+            # The record above is purged after hours; the gateway writes this
+            # into the audit chain, beside the launch row (SC-05a).
+            node_ids = list(getattr(deployment.plan, "node_ids", None) or [])
+            self.bus.emit(
+                ev.IMAGE_RESOLVED,
+                deployment_id=deployment.deployment_id,
+                served_name=deployment.served_name,
+                image=deployment.image,
+                image_id=image_id,
+                node_id=node_ids[0] if node_ids else None,
+            )
 
         self._wait_for_ready(record, deadline=deadline)
 
@@ -1363,6 +1469,7 @@ class DeploymentManager:
                     url,
                     timeout=self._ready_probe_timeout(),
                     expect_model=deployment.served_name,
+                    **_key_kw(record),
                 )
                 if healthy:
                     with self._lock:
@@ -1444,7 +1551,12 @@ class DeploymentManager:
         deployment = record.deployment
         detail = str(exc)
         if exc.raw:
-            detail = "%s\n--- sparkrun output ---\n%s" % (detail, exc.raw.strip())
+            detail = "%s\n--- sparkrun output ---\n%s" % (
+                detail, _scrub_key(record, exc.raw.strip())
+            )
+        why = explain_failure(exc.raw or "")
+        if why:
+            detail = f"{why}\n{detail}"
         with self._lock:
             deployment.last_error = detail
             if deployment.state in (S.LAUNCHING, S.READY, S.DEGRADED):
@@ -1479,9 +1591,10 @@ class DeploymentManager:
         cluster_id = record.cluster_id
         if not cluster_id:
             return
-        tail = self.adapter.logs(
+        # SGLang prints its ServerArgs, api_key included (R-2).
+        tail = _scrub_key(record, self.adapter.logs(
             cluster_id, hosts=record.hosts, tail=200, timeout=POST_MORTEM_READ_S
-        )
+        ) or "")
         if not tail:
             return
         with self._lock:
@@ -1659,6 +1772,7 @@ class DeploymentManager:
                     record.deployment.backend_url,
                     timeout=probe_timeout,
                     expect_model=record.deployment.served_name,
+                    **_key_kw(record),
                 )
             except Exception as exc:  # a probe_fn must never crash the watch thread
                 outcome = (False, "probe raised %s: %s" % (type(exc).__name__, exc))
@@ -1992,7 +2106,9 @@ class DeploymentManager:
             # this call handed the record straight to READY. The reason is
             # kept now instead of discarded, because "a stranger is on your
             # port" is the one thing here worth reporting.
-            healthy, why = self._probe(url, expect_model=deployment.served_name)
+            healthy, why = self._probe(
+                url, expect_model=deployment.served_name, **_key_kw(record)
+            )
             if healthy:
                 if deployment.state is S.STOPPING:
                     # A stop we never finished. Finish it.

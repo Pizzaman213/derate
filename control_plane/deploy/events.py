@@ -33,6 +33,10 @@ BACKEND_LOST = "backend_lost"
 FIT_MISS = "fit_miss"
 STOP_ESCALATED = "stop_escalated"
 RECONCILED = "reconciled"
+#: The image reference a launch ran, resolved to its local image id once the
+#: launch pulled it. The gateway writes it into the audit chain (SC-05a): the
+#: deployment record that also carries it is purged after hours.
+IMAGE_RESOLVED = "image_resolved"
 
 #: Memory fraction at which we warn and mark DEGRADED.
 MEMORY_WARN_FRACTION = 0.90

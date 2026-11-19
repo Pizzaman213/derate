@@ -127,14 +127,14 @@ export function PullCard({
   return (
     <div className="card2">
       <h3>Run on a provider</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         A machine with no GPU cannot run vLLM or SGLang, so it is reached as a provider
         rather than launched onto. Name the model the way that server names it — to send
         a quantization from a HuggingFace repository instead, open the model and pick the
         ollama runtime.
       </div>
 
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div className="fld">
           <label htmlFor="pullprov">Provider</label>
           <select
@@ -159,17 +159,17 @@ export function PullCard({
             spellCheck={false}
           />
         </div>
-        <button onClick={() => void pull()} disabled={busy || !model.trim()}>
+        <button type="button" onClick={() => void pull()} disabled={busy || !model.trim()}>
           {busy ? 'Pulling…' : 'Pull and serve'}
         </button>
       </div>
 
       {refusal ? (
-        <div style={{ marginTop: 10 }}>
+        <div style={{ marginTop: 'var(--space-10)' }}>
           {/* The server's sentence, which names both figures and the way past
               it. Rewriting it here would be a second answer. */}
           <Verbatim text={refusal} size="label" />
-          <label style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 }}>
+          <label style={{ display: 'flex', gap: 'var(--space-6)', alignItems: 'center', marginTop: 'var(--space-6)' }}>
             <input
               type="checkbox"
               checked={override}
@@ -178,7 +178,8 @@ export function PullCard({
             <span className="unit">Pull it anyway</span>
           </label>
           <button
-            style={{ marginTop: 6 }}
+            type="button"
+            style={{ marginTop: 'var(--space-6)' }}
             disabled={!override || busy}
             onClick={() => void pull(true)}
           >
@@ -188,14 +189,14 @@ export function PullCard({
       ) : null}
 
       {done ? (
-        <div className="label" style={{ marginTop: 8 }}>
+        <div className="label" style={{ marginTop: 'var(--space-8)' }}>
           {done}
         </div>
       ) : null}
       {error ? (
         <div
           className="label"
-          style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}
+          style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}
         >
           {error}
         </div>

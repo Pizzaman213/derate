@@ -7,8 +7,11 @@ tool people screenshot. A field can only reach a response if it is named below.
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import fields, is_dataclass
 from enum import Enum
+from collections.abc import Mapping
 from typing import Any
 
 from control_plane.contracts.quant import quant_info
@@ -457,6 +460,9 @@ def resolution_payload(res: Any) -> dict:
         "param_breakdown": breakdown,
         "mtp": _mtp_payload(breakdown, warnings),
         "warnings": warnings,
+        # True when the repo ships Python --trust-remote-code would run; the
+        # Serve panel offers that flag (default off) only beside this warning.
+        "remote_code": bool(getattr(res, "remote_code", False)),
         "from_cache": getattr(res, "from_cache", False),
         "resolved_at": getattr(res, "resolved_at", 0.0),
         "elapsed_ms": getattr(res, "elapsed_ms", 0.0),
@@ -593,10 +599,24 @@ def deployment_payload(deployment: Deployment, *, error_chars: int | None = None
         "fit": fit_payload(deployment.fit) if deployment.fit else None,
         "extra_args": list(deployment.extra_args),
         "custom_command": list(deployment.custom_command),
+        # The commit the launch was pinned to (M7), or None when unpinned.
+        "revision": getattr(deployment, "revision", None),
+        "speculative_tokens": getattr(deployment, "speculative_tokens", 0),
+        # Whether the operator opted in to the repo's own Python (R2), and
+        # the image reference and local id the launch ran (SC-05).
+        "trust_remote_code": bool(getattr(deployment, "trust_remote_code", False)),
+        "image": getattr(deployment, "image", "") or "",
+        "image_id": getattr(deployment, "image_id", "") or "",
     }
 
 
-def provider_model_payload(model: ProviderModel) -> dict:
+def provider_model_payload(
+    model: ProviderModel, *, pin: str | None = None, fallback: bool = False,
+    status: dict[str, Any] | None = None,
+) -> dict:
+    """One model. *pin* is the backend host it is pinned to (OpenRouter's
+    ``backend_pins``), and when set the two prices are that host's; *fallback*
+    is whether OpenRouter may move off it, and is never true without a pin."""
     return {
         "served_name": model.served_name,
         "upstream_id": model.upstream_id,
@@ -606,6 +626,13 @@ def provider_model_payload(model: ProviderModel) -> dict:
         "modality": model.modality.value,
         "input_cost_per_mtok": model.input_cost_per_mtok,
         "output_cost_per_mtok": model.output_cost_per_mtok,
+        "price_per_minute_usd": model.price_per_minute_usd,
+        "backend_pin": pin or None,
+        "backend_fallback": bool(pin and fallback),
+        "admitting": (status or {}).get("admitting"),
+        "admission_block": (status or {}).get("admission_block"),
+        "last_error": (status or {}).get("last_error"),
+        "retry_in_s": (status or {}).get("retry_in_s"),
     }
 
 
@@ -613,6 +640,9 @@ def provider_payload(
     provider: Provider,
     spend: dict[str, Any] | None = None,
     key: dict[str, Any] | None = None,
+    *,
+    sign_in_account: str | None = None,
+    pins: Mapping[str, tuple[str, bool]] | None = None,
 ) -> dict:
     """Allowlist. ``api_key_ref`` is a reference -- an env var name or secret
     key -- and is safe to show; it is what the UI needs to tell the user which
@@ -630,7 +660,15 @@ def provider_payload(
     provenance only; it carries no key material and could not, since neither
     field is ever a value. Absent leaves both ``None``, which reads as "this
     port cannot say", not as "there is no key".
+
+    *sign_in_account* is the account a sign-in provider is signed in as -- an
+    email address, not a credential -- and ``None`` for every key-based kind.
+
+    *pins* is ``{upstream_id: (tag, fallback)}`` from the port's
+    ``backend_pin_state`` -- runtime state the ``Provider`` record does not
+    carry. Absent means no model is pinned.
     """
+    pins = pins or {}
     payload = {
         "provider_id": provider.provider_id,
         "kind": provider.kind.value,
@@ -643,7 +681,14 @@ def provider_payload(
         "healthy": provider.healthy,
         "last_error": provider.last_error,
         "last_refreshed": provider.last_refreshed,
-        "models": [provider_model_payload(m) for m in provider.models],
+        "models": [
+            provider_model_payload(
+                m, pin=pin, fallback=fallback,
+                status=(spend or {}).get("model_status", {}).get(m.upstream_id),
+            )
+            for m in provider.models
+            for pin, fallback in [pins.get(m.upstream_id, (None, False))]
+        ],
     }
     payload.update(ui_detail.spend_fields(spend))
     # Always both keys, so the shape does not change under a port that has no
@@ -651,6 +696,7 @@ def provider_payload(
     # only one of them survives a round trip through JSON.
     payload["key_state"] = (key or {}).get("key_state")
     payload["key_source"] = (key or {}).get("key_source")
+    payload["sign_in_account"] = sign_in_account
     return payload
 
 
@@ -679,6 +725,11 @@ def routing_payload(
         "served_name": config.served_name,
         "policy": config.policy.value,
         "sticky_ttl_s": config.sticky_ttl_s,
+        # The operator's per-name rate limits: {"rpm"?: int, "tpm"?: int}.
+        "limits": dict(config.limits),
+        # The operator's traffic split, target_id -> 0..100; {} when the
+        # measured weights apply. Each target's `weight` below already reflects it.
+        "shares": dict(config.shares),
         # "local" | "spilled" | null; null unless this config is LOCAL_FIRST
         # and at least one real selection has been made (the caller derives
         # this from the router's own dispatch-time tracker, never recomputed
@@ -724,3 +775,22 @@ def routing_payload(
             for t in config.targets
         ],
     }
+
+
+def provider_audit(provider: Provider, redactor=None) -> dict | None:
+    """The provider as an audit row keeps it: its public payload, run through
+    the provider redactor so no key value can land in a row. Shared by
+    ``PATCH /api/providers/{id}`` and ``POST /api/wiring``."""
+    try:
+        payload = json.dumps(provider_payload(provider), default=str)
+    except Exception:
+        logging.getLogger("gateway.api").exception(
+            "could not serialise provider for the audit row"
+        )
+        return None
+    if redactor is not None:
+        payload = redactor.scrub(payload)
+    try:
+        return json.loads(payload)
+    except ValueError:
+        return {"provider_id": getattr(provider, "provider_id", None)}

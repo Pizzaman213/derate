@@ -17,22 +17,27 @@
 # --platform=$BUILDPLATFORM: the bundle is static files, identical for every
 # target arch, so it is built once natively instead of once per platform --
 # and the emulated half of a multi-arch build never runs npm at all.
-FROM --platform=$BUILDPLATFORM node:22-slim AS ui
+#
+# Bases are pinned by digest (the multi-arch index, so both platforms resolve
+# from it), resolved 2026-11-18 with `docker buildx imagetools inspect`. The
+# tag stays for the reader; the digest is what is pulled. Bump both together.
+FROM --platform=$BUILDPLATFORM node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS ui
 # SKIP_UI=1 builds the image without the UI. For iterating on the container
 # itself while Agent H's tree is mid-edit; a release build never sets it,
 # because a UI that does not compile should fail the image, loudly.
 ARG SKIP_UI=0
 WORKDIR /src
-# The whole context, because `COPY ui/ .` fails outright when ui/ does not
-# exist yet and this image has to build before Agent H lands.
-COPY . /src
+# Only what the UI build reads: ui/ and the design/chart pack it imports from.
+COPY ui/ /src/ui/
+COPY .omp/ /src/.omp/
 RUN mkdir -p /ui-dist \
  && if [ "$SKIP_UI" = "1" ] || [ ! -f ui/package.json ]; then \
         echo '<!doctype html><meta charset=utf-8><title>derate</title>' > /ui-dist/index.html ; \
         echo '<p>UI not built into this image.' >> /ui-dist/index.html ; \
     else \
-        cd ui \
-     && (npm ci --no-audit --no-fund || npm install --no-audit --no-fund) \
+        (cd .omp/charts && npm ci --no-audit --no-fund) \
+     && cd ui \
+     && npm ci --no-audit --no-fund \
      && npm run build \
      && cp -r dist/. /ui-dist/ ; \
     fi
@@ -40,23 +45,23 @@ RUN mkdir -p /ui-dist \
 # ---------------------------------------------------------------------------
 # Stage 2: python dependencies, into a venv we copy wholesale.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS deps
-
-# Pinned to the version this adapter's flags were verified against. Bump with
-# --build-arg SPARKRUN_VERSION=... after re-checking control_plane/deploy/flags.py.
-ARG SPARKRUN_VERSION=0.2.40
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS deps
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
- && pip install --no-cache-dir "sparkrun==${SPARKRUN_VERSION}"
+# requirements.lock, not requirements.txt: every transitive pinned with its
+# sha256, so two builds of one commit install the same bytes and a swapped
+# wheel on the index fails the install. sparkrun is in the lock like everything
+# else (pinned in requirements.txt), so this is the only install: a second,
+# unlocked one could upgrade a locked package to satisfy its own ranges.
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock
 
 # ---------------------------------------------------------------------------
 # Stage 3: the runtime image.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 # openssh-client: sparkrun drives the cluster over SSH.
 # git: sparkrun's recipe registry is a git clone and its RegistryManager shells
@@ -100,16 +105,24 @@ RUN apt-get update \
 # negotiates the API version down to whatever daemon answers, so a newer client
 # would work; a pin that matches is one less thing to be surprised by, and an
 # unpinned URL would make the image un-rebuildable.
+# The sha256 of each tarball is checked before tar sees a byte: measured
+# 2026-11-18 by downloading both docker-29.2.1.tgz files. Bump them together
+# with the version.
 ARG DOCKER_CLI_VERSION=29.2.1
+ARG DOCKER_CLI_SHA256_AMD64=995b1d0b51e96d551a3b49c552c0170bc6ce9f8b9e0866b8c15bbc67d1cf93a3
+ARG DOCKER_CLI_SHA256_ARM64=236c5064473295320d4bf732fbbfc5b11b6b2dc446e8bc7ebb9222015fb36857
 ARG TARGETARCH
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) arch=x86_64 ;; \
-      arm64) arch=aarch64 ;; \
+      amd64) arch=x86_64;  sum="$DOCKER_CLI_SHA256_AMD64" ;; \
+      arm64) arch=aarch64; sum="$DOCKER_CLI_SHA256_ARM64" ;; \
       *) echo "no static docker CLI is published for $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://download.docker.com/linux/static/stable/$arch/docker-${DOCKER_CLI_VERSION}.tgz" \
-      | tar -xzf - -C /usr/local/bin --strip-components=1 docker/docker; \
+      -o /tmp/docker-cli.tgz; \
+    echo "$sum  /tmp/docker-cli.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/docker-cli.tgz -C /usr/local/bin --strip-components=1 docker/docker; \
+    rm /tmp/docker-cli.tgz; \
     docker --version
 
 COPY --from=deps /opt/venv /opt/venv

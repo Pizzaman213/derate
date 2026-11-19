@@ -14,13 +14,14 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from control_plane.contracts import NodeProfile
 
 from .agent import NodeAgent, create_agent_app
 from .bootstrap import (
     RoleDecision,
-    adopt_cluster_token,
+    adopt_credentials,
     reannounce,
     rejoin_until_admitted,
     resolve_role,
@@ -34,7 +35,13 @@ from .config import (
     RegistryConfig,
 )
 from .discovery import Advertiser
-from .identity import ClusterIdentity, banner, load_or_create_identity, read_identity
+from .identity import (
+    ClusterIdentity,
+    agent_token,
+    banner,
+    load_or_create_identity,
+    read_identity,
+)
 from .net import require_host_networking
 from .nodeident import load_or_create_node_id
 from .probe import probe_local
@@ -60,6 +67,9 @@ class NodeRuntime:
     _stopped: bool = field(default=False, repr=False)
     _rejoin_task: "asyncio.Task | None" = field(default=None, repr=False)
     _announce_task: "asyncio.Task | None" = field(default=None, repr=False)
+    # Set by the first landed re-announcement: a member from before per-member
+    # tokens has asked for its own once in this process life.
+    _migration_asked: bool = field(default=False, repr=False)
 
     @property
     def role(self) -> str:
@@ -75,6 +85,20 @@ class NodeRuntime:
     def agent_app(self):
         return create_agent_app(self.node_agent)
 
+    def _agent_credential(self, payload: dict | None = None) -> str | None:
+        """What this node's agent accepts on its gated routes.
+
+        See ``worker_agent_credential``.
+        """
+        return worker_agent_credential(self.config, self.profile.node_id, payload)
+
+    def _note_coordinator(self, url: str | None) -> None:
+        """Tell the agent which address is the coordinator's (N-11): a read
+        presenting this agent's token from anywhere else leaves a row."""
+        host = urlsplit(url).hostname if url else None
+        if host:
+            self.node_agent.set_coordinator(host)
+
     def _apply_admission(self, result: dict) -> None:
         """Learn our cluster identity once a coordinator finally says member.
 
@@ -83,13 +107,14 @@ class NodeRuntime:
         a worker-in-waiting.
         """
         cluster_id = result.get("cluster_id") or ""
-        # An admission on an enrollment token carries the permanent cluster
-        # token with it. Take it before building the identity, or this node
-        # keeps the credential that is about to expire.
-        self.config = adopt_cluster_token(self.config, result)
+        # An admission carries this member's own agent token. Take it before
+        # anything else, or the next join presents a credential the
+        # coordinator no longer accepts from a member.
+        self.config = adopt_credentials(self.config, result)
         self.identity = ClusterIdentity(cluster_id=cluster_id, token=self.config.token or "")
         self.node_agent.cluster_id = cluster_id
-        self.node_agent.set_token(self.config.token)
+        self.node_agent.set_token(self._agent_credential(result))
+        self._note_coordinator(self.decision.coordinator_url)
         self.decision = dataclasses.replace(
             self.decision, joined=True, status="member", cluster_id=cluster_id
         )
@@ -149,6 +174,18 @@ class NodeRuntime:
             return None
         if moved:
             return f"our profile changed (address {self.profile.address})"
+        if (
+            self.decision.status == "member"
+            and not self.config.agent_token
+            and self.config.token
+            and not self._migration_asked
+        ):
+            # A member from before per-member tokens. The coordinator keeps
+            # polling it with the derived token, so silence never comes; one
+            # re-join collects its own token, after which the cluster token
+            # can be rotated. Once per process life: an older coordinator
+            # hands nothing back, and asking again changes nothing.
+            return "this member holds no agent token of its own yet"
         # Silence from the coordinator is the signal. It polls every member
         # every heartbeat, so nobody asking means nobody is holding a usable
         # record of us. `None` -- never polled at all -- is measured from boot
@@ -228,12 +265,12 @@ class NodeRuntime:
         self.decision = dataclasses.replace(
             self.decision, coordinator_url=result.coordinator_url, joined=True
         )
-        if result.token_used and result.token_used != self.config.token:
-            self.config = dataclasses.replace(self.config, token=result.token_used)
-        # An admission carries the permanent token, and a coordinator we have
-        # just met for the first time may be handing it to us now.
-        self.config = adopt_cluster_token(self.config, payload)
-        self.node_agent.set_token(self.config.token)
+        # A member's answer carries its own agent token -- the first one, on
+        # the one-time migration, or the same one again.
+        self._migration_asked = True
+        self.config = adopt_credentials(self.config, payload)
+        self.node_agent.set_token(self._agent_credential(payload))
+        self._note_coordinator(result.coordinator_url)
         status = payload.get("status")
         cluster_id = payload.get("cluster_id") or ""
         if status == "member" and (
@@ -271,42 +308,29 @@ class NodeRuntime:
 
 
 def recover_credentials(config: RegistryConfig) -> RegistryConfig:
-    """Fill in the cluster credential this machine already holds.
+    """Fill in the credential this machine already holds.
 
-    A worker admitted on an enrollment token is handed the permanent cluster
-    token once and persists it (``bootstrap.adopt_cluster_token``) -- and
-    nothing ever read it back. A worker's token came from ``DERATE_TOKEN`` and
-    nowhere else, which made that write dead and its docstring untrue.
+    A member's ``cluster.json`` holds its own agent token
+    (``identity.save_agent_credential``), handed over by the coordinator. That
+    is the only credential a member's re-join is accepted on, so a restarted
+    worker that did not read it back would lock itself out of its cluster. A
+    worker from before per-member tokens still has the cluster token there
+    instead; it is used as ``token`` when the environment names none, which is
+    what the coordinator's one-time migration accepts.
 
-    What that cost, concretely: ``handle_join`` checks the token *before* it
-    checks membership, so a container restarted with a spent ``ej_`` enrollment
-    token still in its environment presented the spent one and was rejected --
-    the node 403'ing itself out of a cluster it was already a member of, which
-    is the exact failure ``adopt_cluster_token`` exists to prevent. A native
-    install restarted without the variable was worse in a quieter way: it
-    joined tokenless, got "member" back with its routing state frozen, and its
-    agent refused every credentialed request because it held no token at all.
-
-    An environment token still wins. It is the deployment's deliberate
-    instruction and it is how a machine is re-homed onto another cluster.
-    Reading is all this does: a worker must never *mint* a cluster identity,
-    which is why it goes through ``read_identity`` and not
-    ``load_or_create_identity``.
+    The environment's ``DERATE_TOKEN`` stays ``token`` and is the fallback
+    ``join_with_held_credentials`` tries when the agent token is refused -- a
+    fresh enrollment token carried to this machine to re-home it. Reading is
+    all this does: a worker must never *mint* a cluster identity, which is why
+    it goes through ``read_identity`` and not ``load_or_create_identity``.
     """
     stored = read_identity(config.data_dir)
     if stored is None:
         return config
-    if not config.token:
+    if stored.agent_token and not config.agent_token:
+        config = dataclasses.replace(config, agent_token=stored.agent_token)
+    if not config.token and stored.token:
         config = dataclasses.replace(config, token=stored.token)
-    elif config.token != stored.token:
-        # Two credentials, and from here there is no way to tell which one the
-        # coordinator will accept. The environment's is tried first because it
-        # is the deliberate instruction -- a fresh enrollment token carried to
-        # this machine to re-home it -- and the stored one is the fallback,
-        # because the common case is the opposite: the container is simply
-        # restarting with the spent enrollment token install.sh baked into its
-        # environment, and the permanent token it adopted is the one that works.
-        config = dataclasses.replace(config, fallback_token=stored.token)
     if not config.cluster_id and stored.cluster_id:
         # So a worker that restarts while the coordinator is down still
         # advertises the cluster it belongs to instead of an empty string.
@@ -314,7 +338,29 @@ def recover_credentials(config: RegistryConfig) -> RegistryConfig:
     return config
 
 
-def _open_probe_sink():
+def worker_agent_credential(
+    config: RegistryConfig, node_id: str, payload: dict | None = None
+) -> str | None:
+    """What a worker's agent accepts on its gated routes.
+
+    The coordinator presents each member its own token and no other: the one
+    an acknowledged join just delivered, else the one this node holds in
+    ``cluster.json``. Only a member that has never been handed one -- a worker
+    from before per-member tokens, not yet re-joined -- falls back to the value
+    derived from the cluster token, which is what the coordinator still
+    presents to it until it migrates.
+    """
+    delivered = (payload or {}).get("agent_token")
+    if delivered:
+        return str(delivered)
+    if config.agent_token:
+        return config.agent_token
+    if not config.token:
+        return None
+    return agent_token(config.token, node_id)
+
+
+def _open_probe_sink(node_agent: NodeAgent | None = None):
     """The TCP sink the link ladder's last rung measures against.
 
     ``links/measure.py``'s ladder degrades nccl-tests -> ib_write_bw -> a plain
@@ -336,7 +382,9 @@ def _open_probe_sink():
     try:
         from control_plane.links.probe_server import start_probe_server
 
-        return start_probe_server()
+        return start_probe_server(
+            allowed=node_agent.trusted_peers if node_agent is not None else (lambda: ())
+        )
     except OSError as exc:
         log.warning(
             "link probe sink not listening (%s); links to this node fall back "
@@ -366,12 +414,18 @@ def _journal_only(config: RegistryConfig, profile: NodeProfile):
     from control_plane.telemetry import config as tconfig
     from control_plane.telemetry.service import Telemetry
 
-    if not tconfig.enabled():
-        return Telemetry.disabled("DERATE_TELEMETRY is off")
     root = Path(config.data_dir)
     if not root.is_dir():
         return Telemetry.disabled(f"{root} does not exist")
-    return Telemetry.open(root, node_id=profile.node_id, coordinator=False)
+    # DERATE_TELEMETRY=0 switches metrics off, not this agent's record of what
+    # it did and refused: that still journals, for the coordinator to collect
+    # (RecordsOnlySink, EV-2).
+    return Telemetry.open(
+        root,
+        node_id=profile.node_id,
+        coordinator=False,
+        records_only=not tconfig.enabled(),
+    )
 
 
 async def start_node(
@@ -418,18 +472,6 @@ async def start_node(
     config = recover_credentials(config)
 
     decision = await resolve_role(config, profile, agent_url)
-    # If the coordinator took the fallback rather than the credential we led
-    # with, lead with that one from now on: there is no reason to keep paying
-    # for the rejection on every later join.
-    if decision.token_used and decision.token_used != config.token:
-        config = dataclasses.replace(config, token=decision.token_used)
-    # A node admitted on an enrollment token was handed the permanent cluster
-    # token in the join response. Persist it now, before anything derives an
-    # identity from `config.token`.
-    config = adopt_cluster_token(
-        config,
-        {"cluster_token": decision.cluster_token, "cluster_id": decision.cluster_id},
-    )
 
     if decision.role == ROLE_COORDINATOR:
         identity = load_or_create_identity(
@@ -441,6 +483,13 @@ async def start_node(
         # then the copy it adopted on an earlier run) and its cluster id comes
         # from the coordinator's join response, falling back to the one on disk
         # when there was nobody to ask.
+        #
+        # A member's acked answer carried its own agent token: persist it now,
+        # before the agent is armed with it.
+        config = adopt_credentials(
+            config,
+            {"agent_token": decision.agent_token, "cluster_id": decision.cluster_id},
+        )
         identity = ClusterIdentity(
             cluster_id=decision.cluster_id or config.cluster_id or "",
             token=config.token or "",
@@ -463,12 +512,22 @@ async def start_node(
         port=config.agent_port,
         advertiser=advertiser,
         sink=telemetry.sink,
-        token=identity.token,
+        # A worker's own credential. The coordinator's agent is armed below,
+        # once its registry exists and has minted the local node's token.
+        token=(
+            None
+            if decision.role == ROLE_COORDINATOR
+            else worker_agent_credential(config, profile.node_id)
+        ),
         data_root=config.data_dir,
     )
+    if decision.role != ROLE_COORDINATOR and decision.coordinator_url:
+        host = urlsplit(decision.coordinator_url).hostname
+        if host:
+            node_agent.set_coordinator(host)
     await node_agent.start()
     await telemetry.start(node_id=profile.node_id)
-    probe_server = _open_probe_sink()
+    probe_server = _open_probe_sink(node_agent)
 
     registry: Registry | None = None
     if decision.role == ROLE_COORDINATOR:
@@ -478,6 +537,10 @@ async def start_node(
             role=ROLE_COORDINATOR,
             identity=identity,
         )
+        # The coordinator presents the local node its own minted token, like
+        # every other member; and it is the only reader its own agent has.
+        node_agent.set_token(registry.agent_token(profile.node_id))
+        node_agent.set_coordinator(profile.address)
         await registry.start()
         print(banner(identity, f"http://{profile.address}:{config.coordinator_port}"))
     else:

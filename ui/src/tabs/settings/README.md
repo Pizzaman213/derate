@@ -2,7 +2,7 @@
 
 The cards behind the Settings destination: which coordinator this browser talks
 to, the machines and providers behind it, what they are allowed to cost, and
-what this project has said it will not build. Fourteen files: twelve modules
+what this project has said it will not build. Fifteen files: thirteen modules
 `tabs/SettingsTab.tsx` composes into seven sub-tabs, and two `*.check.mjs`
 verifiers nothing in the app imports.
 
@@ -10,13 +10,17 @@ One rule governs the folder and it is a negative: **no API key is ever
 rendered.** `api/redact.ts` scrubs every response on the way in, there is no
 inverse of it, and there is no endpoint that returns a key for a reveal control
 to call. Everything this folder shows about a credential is two names — a
-reference, and which of the environment and `secrets.json` answered to it.
+reference, and which of the environment and `secrets.json` answered to it. A
+ChatGPT plan provider has no key at all: its credential is a sign-in, its
+tokens stay in `oauth.json` on the coordinator, and the row shows the account
+email it is signed in as.
 
 ## Layout
 
 | File | Lines | What it owns |
 |---|---|---|
-| `ProvidersCard.tsx` | 462 | one row per provider: key state and source, spend, the served/published count, Set key |
+| `ProvidersCard.tsx` | 552 | one row per provider: key state and source, spend, the served/published count, Set key / Sign in again |
+| `ProviderSignIn.tsx` | — | shared ChatGPT / unofficial Claude subscription start, paste and done controller/view |
 | `AddNodeCard.tsx` | 332 | where a node's join token comes from, and there is nowhere else to look |
 | `ProviderBackupPanel.tsx` | 213 | the alias map — which local name a provider's model answers to |
 | `keyfield.check.mjs` | 203 | the verifier that computes its expectations by running the server's own Python |
@@ -39,6 +43,50 @@ budget, admission state, when the catalogue was last refreshed, and three
 buttons — Backs up, Set key, Remove. The middle one reads Replace key once
 `key_state` is `set`, because a provider that already authenticates is not
 being given a first key.
+
+**Model cooldowns are not provider failures.** A read-only “Model status”
+disclosure under each provider lists only its served models, with each model's
+admission reason, remaining cooldown and full upstream error. It opens by
+default when a model is blocked; other models keep their own admitting states.
+Served aliases retain the upstream ID so the source of a limit is unambiguous.
+Provider-wide auth, transport and budget failures stay on the provider row;
+circuit state is matched to the exact model target. The 15-second provider poll
+refreshes the server's remaining-time reason and removes expired errors.
+`providers-status.check.mjs` in `.omp/tests/ui/` checks the production card's
+attribution, recovery, keyboard disclosure, axe and responsive overflow.
+Provider and model rows link to Usage → Rate limits, where historical 429s
+remain visible after cooldown expiry. “Catalogue refreshed” labels model-list
+freshness explicitly; it is not the time of the last request or rate limit.
+
+**A kind with a non-null `sign_in` is added by signing in, never by a key.**
+Choosing it hides Base URL, `KeyField` and Add and renders `ProviderSignIn`
+with the actual `flow` discriminator. Its row shows `sign_in_account` in place
+of a reference, and Sign in again opens the same control with `providerId`.
+Both flows keep tokens in the coordinator's 0600 `oauth.json`; no browser
+response exposes a token. Newly discovered models remain disabled until the
+operator chooses Serve in the existing Models catalogue.
+
+ChatGPT keeps OpenAI's `127.0.0.1:1455` redirect. While pending the coordinator
+listens there itself (`gateway/loopback.py`); a browser on the coordinator or
+with that port forwarded completes automatically through a two-second status
+poll. Otherwise the operator pastes the address the tab could not load.
+Removal asks OpenAI to revoke authorization; unconfirmed revocation still
+directs the operator to ChatGPT Settings → Apps.
+
+Claude uses its hosted callback, not a loopback listener. The labelled masked
+input accepts the displayed `code#state` or full callback URL, with autocomplete
+and spellcheck disabled. Start/done explicitly warn that this is unofficial,
+Anthropic does not permit third-party subscription routing and may restrict
+the account, linking to the official policy. They disclose the compatibility
+identity, no API-key fallback and possible Anthropic account-level extra-usage
+billing; this is not a free/unlimited guarantee. Removal says
+`Removed from derate. Remote Claude authorization was not revoked.`
+
+Both flows retain a safe external-link fallback for blocked popups and Start
+again for expired/consumed attempts. Callbacks clear on success, cancel and
+restart. Flow/provider keys and operation-generation guards prevent late
+responses from touching another form; cancel does not remotely undo an
+exchange already submitted. Success invalidates shared resources immediately.
 
 **The kind list is the server's, fetched from `/api/providers/kinds` rather
 than restated here.** A local copy went stale in both directions: it offered
@@ -360,6 +408,9 @@ Outward, the cards call `state/backend` and `state/resources`:
 - `addProvider`, `removeProvider`, `patchProvider`, `providerModels` →
   POST / DELETE / PATCH `/api/providers[/{id}]` and
   `GET /api/providers/{id}/models`
+- `startProviderSignIn`, `completeProviderSignIn`, `providerSignInStatus` →
+  POST `/api/sign-in/{flow}`, POST `/api/sign-in/{flow}/{attempt_id}/complete`,
+  GET `/api/sign-in/{flow}/{attempt_id}` (from `ProviderSignIn`)
 - `useCluster`, `useCandidates`, `useEnrollments`, `useTopology` →
   `/api/cluster`, `/api/nodes/candidates`, `/api/enroll`, `/api/topology`
 - `mintEnrollment`, `revokeEnrollment` → `POST /api/enroll`,

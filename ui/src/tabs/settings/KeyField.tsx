@@ -62,7 +62,7 @@ export function KeyField(props: KeyFieldProps) {
   return (
     <>
       <label htmlFor={mode === 'key' ? keyId : refId}>{label}</label>
-      <div style={{ display: 'flex', gap: 12, marginBottom: 2 }}>
+      <div style={{ display: 'flex', gap: 'var(--space-12)', marginBottom: 'var(--space-2)' }}>
         {(
           [
             ['key', 'Paste a key'],
@@ -71,7 +71,7 @@ export function KeyField(props: KeyFieldProps) {
         ).map(([option, text]) => (
           <label
             key={option}
-            style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}
+            style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-4)', cursor: 'pointer' }}
           >
             <input
               type="radio"
@@ -116,12 +116,12 @@ export function KeyField(props: KeyFieldProps) {
         </>
       )}
       {warning ? (
-        <div className="unit" style={{ marginTop: 4, color: 'var(--warn)' }}>
+        <div className="unit" style={{ marginTop: 'var(--space-4)', color: 'var(--warn)' }}>
           {warning}
         </div>
       ) : null}
       {mode === 'key' && apiKey.trim() && !warning ? (
-        <div className="unit" style={{ marginTop: 4 }}>
+        <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
           Stored as <span className="mono">{destination}</span> in secrets.json.
           {displaced ? (
             <>

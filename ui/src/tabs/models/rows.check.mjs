@@ -1,7 +1,7 @@
 // requires: coordinator -- every assertion is about a fact the gateway reports
 // Checks `rows.ts` against the live coordinator on :8088.
 //
-// The sibling of `tabs/cluster/layout.check.mjs`, and for the same reason:
+// The sibling of the other `*.check.mjs` verifiers, and for the same reason:
 // there is no test runner in `ui/`, typecheck is the only other gate, and the
 // interesting part of this module is what it does to real payloads rather than
 // whether it compiles. It esbuild-bundles the module and imports the bundle,
@@ -13,6 +13,8 @@
 //
 // Needs a coordinator: :8088 by default, or whatever DERATE_CHECK_ORIGIN names. Every assertion below is about a fact the
 // gateway reports, not a shape this file invented.
+// First, for its side effect: logs in and authenticates every fetch below.
+import '../../check/auth.mjs'
 import { build } from 'esbuild'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'

@@ -1,0 +1,1 @@
+{"description":"Region keys that match nothing are listed in the note; points off the US projection are noted too.","data":[{"region":"CA","value":39},{"region":"TX","value":30},{"region":"Atlantis","value":5},{"label":"Paris","lon":2.35,"lat":48.86,"value":11}],"options":{"map":"us-states"}}

@@ -24,18 +24,39 @@ somebody pastes into an issue.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from urllib.parse import quote
 
 #: What a scrubbed value is replaced with. The canonical spelling -- see
 #: ``control_plane/contracts/derived.py``, which fails a test if a copy of it
 #: anywhere else stops matching.
 REDACTED = "***"
 
+#: derate's own API keys, ``drt_<key_id>_<secret>``, anywhere in a string. A
+#: copy of ``control_plane.keys.format.KEY_PATTERN`` -- this module may import
+#: nothing from the keys package (see the module docstring) -- held equal to it
+#: by a row in ``control_plane/contracts/derived.py``.
+KEY_PATTERN = r"\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}"
+
+
+#: Field / variable names whose VALUE is always a secret, whatever it looks
+#: like: a runtime's per-deployment API key (hex, so no vendor prefix gives it
+#: away) and the audit sink's bearer. Scrubbed by name below wherever they
+#: appear as `NAME=value` or `"name": "value"`.
+SECRET_FIELDS = frozenset({
+    "runtime_api_key",
+    "VLLM_API_KEY",
+    "SGLANG_API_KEY",
+    "DERATE_TTS_API_KEY",
+    "DERATE_AUDIT_SINK_TOKEN",
+})
 
 # Token shapes common enough to be worth catching even when we never resolved
 # them ourselves. Conservative: a known vendor prefix plus a long opaque tail.
 _KEY_PATTERNS = [
+    re.compile(KEY_PATTERN),
     re.compile(r"\bsk-or-v1-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"\bsk-proj-[A-Za-z0-9_\-]{16,}"),
@@ -44,8 +65,17 @@ _KEY_PATTERNS = [
     re.compile(r"\bhf_[A-Za-z0-9]{20,}"),
     re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{20,}"),
+    re.compile(r"(?i)\bbasic\s+[A-Za-z0-9+/=]{16,}"),
     re.compile(r"(?i)\b(api[-_]?key|access[-_]?token)\s*[=:]\s*[\"']?[A-Za-z0-9._\-]{20,}"),
+    # SECRET_FIELDS by name -- the shape sparkrun's echoed `docker run -e
+    # VLLM_API_KEY=...` and a stray dict repr take. The pattern above misses
+    # them: `_` is a word character, so `\bapi` never matches inside
+    # `VLLM_API_KEY`.
+    re.compile(
+        r"\b(?:%s)[\"']?\s*[=:]\s*[\"']?[^\s\"',}]{8,}" % "|".join(sorted(SECRET_FIELDS))
+    ),
 ]
+
 
 # Minimum length before we bother scrubbing a literal. Below this a "secret"
 # is more likely to be a substring of ordinary prose than a credential.
@@ -105,8 +135,13 @@ class Redactor:
         self._values: set[str] = set()
 
     def remember(self, value: str | None) -> None:
+        """Remember ``value`` and the spellings it takes in a URL or a JSON
+        string, so a key echoed back percent-encoded or escaped is caught too."""
         if value and len(value) >= _MIN_SCRUB_LEN:
             self._values.add(value)
+            for variant in (quote(value, safe=""), json.dumps(value)[1:-1]):
+                if variant != value:
+                    self._values.add(variant)
 
     def scrub(self, text: str) -> str:
         if not text:
@@ -158,3 +193,26 @@ class SecretRedactingFilter(logging.Filter):
             record.args = ()
         return True
 
+
+def printable(s: str, limit: int = 512) -> str:
+    """*s* safe to put on one line a human reads: every character that is not
+    printable becomes ``\\xNN`` (``\\uNNNN`` above 0xFF), and the result is cut
+    at *limit* characters with a trailing ``…``.
+
+    For log lines and text reports only -- a stored row keeps the raw value.
+    A path decoded from ``%0A``, a typed username or an ESC sequence would
+    otherwise start a forged line in ``node.log`` or reach the investigator's
+    terminal as a control sequence.
+    """
+    out: list[str] = []
+    for c in str(s):
+        if c.isprintable():
+            out.append(c)
+        elif ord(c) <= 0xFF:
+            out.append(f"\\x{ord(c):02x}")
+        else:
+            out.append(f"\\u{ord(c):04x}")
+    text = "".join(out)
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return text

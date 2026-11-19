@@ -1,0 +1,1 @@
+{"description":"Values far outside the range clamp to the ends, with a note.","data":[{"label":"Spike","value":900,"max":100,"low":20,"high":80},{"label":"Dip","value":-500,"max":100,"low":20,"high":80},{"label":"Normal","value":50,"max":100,"low":20,"high":80}]}

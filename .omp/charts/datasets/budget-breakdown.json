@@ -1,0 +1,217 @@
+{
+  "name": "budget-breakdown",
+  "description": "Annual operating budget as a tree: five departments, two categories each, three line items per category (30 leaves, USD 18,775,000 total). Values sit on leaves only; parents are their sum.",
+  "source": "synthetic, deterministic",
+  "data": {
+    "name": "Total budget",
+    "children": [
+      {
+        "name": "Engineering",
+        "children": [
+          {
+            "name": "People",
+            "children": [
+              {
+                "name": "Salaries",
+                "value": 4850000
+              },
+              {
+                "name": "Contractors",
+                "value": 620000
+              },
+              {
+                "name": "Training",
+                "value": 95000
+              }
+            ]
+          },
+          {
+            "name": "Infrastructure",
+            "children": [
+              {
+                "name": "Cloud compute",
+                "value": 1340000
+              },
+              {
+                "name": "GPU cluster",
+                "value": 880000
+              },
+              {
+                "name": "Developer tools",
+                "value": 210000
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Sales",
+        "children": [
+          {
+            "name": "People",
+            "children": [
+              {
+                "name": "Salaries",
+                "value": 2150000
+              },
+              {
+                "name": "Commissions",
+                "value": 940000
+              },
+              {
+                "name": "Travel",
+                "value": 310000
+              }
+            ]
+          },
+          {
+            "name": "Programs",
+            "children": [
+              {
+                "name": "Partner incentives",
+                "value": 420000
+              },
+              {
+                "name": "CRM licences",
+                "value": 185000
+              },
+              {
+                "name": "Sales enablement",
+                "value": 120000
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Marketing",
+        "children": [
+          {
+            "name": "Campaigns",
+            "children": [
+              {
+                "name": "Paid search",
+                "value": 760000
+              },
+              {
+                "name": "Events",
+                "value": 540000
+              },
+              {
+                "name": "Content",
+                "value": 260000
+              }
+            ]
+          },
+          {
+            "name": "Brand",
+            "children": [
+              {
+                "name": "Agency fees",
+                "value": 380000
+              },
+              {
+                "name": "Website",
+                "value": 145000
+              },
+              {
+                "name": "Research",
+                "value": 90000
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Operations",
+        "children": [
+          {
+            "name": "Facilities",
+            "children": [
+              {
+                "name": "Office lease",
+                "value": 1120000
+              },
+              {
+                "name": "Utilities",
+                "value": 165000
+              },
+              {
+                "name": "Maintenance",
+                "value": 88000
+              }
+            ]
+          },
+          {
+            "name": "Support",
+            "children": [
+              {
+                "name": "Support staff",
+                "value": 980000
+              },
+              {
+                "name": "Help desk software",
+                "value": 72000
+              },
+              {
+                "name": "Quality assurance",
+                "value": 140000
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "General & Administrative",
+        "children": [
+          {
+            "name": "Finance",
+            "children": [
+              {
+                "name": "Accounting staff",
+                "value": 610000
+              },
+              {
+                "name": "Audit",
+                "value": 180000
+              },
+              {
+                "name": "Insurance",
+                "value": 230000
+              }
+            ]
+          },
+          {
+            "name": "Legal & HR",
+            "children": [
+              {
+                "name": "Legal counsel",
+                "value": 420000
+              },
+              {
+                "name": "Recruiting",
+                "value": 350000
+              },
+              {
+                "name": "Benefits admin",
+                "value": 125000
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "fields": {
+    "name": {
+      "type": "text",
+      "description": "Node name."
+    },
+    "value": {
+      "type": "number",
+      "description": "Line-item amount; present on leaves only.",
+      "unit": "USD",
+      "on": "leaf"
+    }
+  }
+}

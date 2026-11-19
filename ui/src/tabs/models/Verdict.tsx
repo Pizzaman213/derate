@@ -4,6 +4,7 @@ import type {
   ServeRequirement,
   Verdict as VerdictWord,
 } from '../../api/types'
+import { Icon } from '../../components/Icon'
 import { Lamp } from '../../components/Lamp'
 import { Readout } from '../../components/Readout'
 import { SegmentBar, type Segment } from '../../components/Bars'
@@ -36,6 +37,11 @@ interface Props {
   onCustomCommandTextChange: (value: string) => void
   customCommand: boolean
   onCustomCommandChange: (value: boolean) => void
+  /** Whether this launch opts in to the repository's own Python
+   *  (`trust_remote_code`). Owned by `ServePanel`, which sends it; offered
+   *  here only when the resolver says the repo ships any. */
+  trustRemoteCode: boolean
+  onTrustRemoteCodeChange: (value: boolean) => void
 }
 
 const VERDICT_COPY: Record<VerdictWord, { word: string; signal: 'live' | 'warn' | 'fault' }> = {
@@ -52,6 +58,7 @@ const VERDICT_COPY: Record<VerdictWord, { word: string; signal: 'live' | 'warn' 
 export function Verdict({
   result, checking, error, context, onUseMaxContext, onLaunch, launching, gates, granted, onGrant,
   customCommandText, onCustomCommandTextChange, customCommand, onCustomCommandChange,
+  trustRemoteCode, onTrustRemoteCodeChange,
 }: Props) {
   const p = result.plan
   const fit = result.fit
@@ -96,7 +103,7 @@ export function Verdict({
   const canAdjust = maxCtx != null && maxCtx > 0 && maxCtx !== context
 
   return (
-    <div className={`verdict on${canServe ? '' : ' bad'}`} style={{ opacity: checking ? 0.6 : 1 }}>
+    <div className={`verdict on${canServe ? '' : ' bad'}`} style={{ opacity: checking ? 'var(--opacity-60)' : 1 }}>
       {/* A custom launch command, drawn onto the card's own top edge rather
           than as a control floating above it -- a filing-cabinet tab fused
           into the card, not a settings toggle sitting on it. Two-way switch
@@ -127,12 +134,12 @@ export function Verdict({
         </button>
       </div>
       {customCommand ? (
-        <div style={{ display: 'grid', gap: 6, margin: '10px 0' }}>
+        <div style={{ display: 'grid', gap: 'var(--space-6)', margin: 'var(--space-10) 0' }}>
           <input
             id="verdict-custom-command"
             className="mono"
             type="text"
-            placeholder="--tensor-parallel-size 2 --gpu-memory-utilization 0.85 --max-model-len 32768 --trust-remote-code"
+            placeholder="--tensor-parallel-size 2 --gpu-memory-utilization 0.85 --max-model-len 32768"
             value={customCommandText}
             onChange={(e) => onCustomCommandTextChange(e.target.value)}
           />
@@ -148,7 +155,7 @@ export function Verdict({
         </div>
       ) : null}
 
-      <div className="vhead" style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+      <div className="vhead" style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 'var(--space-8)' }}>
         <span>{planShortFromDegrees(p)}</span>
         <Readout value={p.measured_link_gbps} decimals={1} width={5} unit="GB/s link" />
       </div>
@@ -161,10 +168,10 @@ export function Verdict({
           frame is the mockup's and the words are the planner's. */}
       {result.degrees?.rejection ? (
         <div className="swapbar on" style={{ alignItems: 'flex-start' }}>
-          <span aria-hidden className="mono" style={{ color: 'var(--warn)' }}>
-            ⚠
+          <span className="mono" style={{ color: 'var(--warn)' }}>
+            <Icon name="alert-triangle" size={14} label="Warning" />
           </span>
-          <span style={{ display: 'grid', gap: 4 }}>
+          <span style={{ display: 'grid', gap: 'var(--space-4)' }}>
             <Verbatim text={result.degrees.rejection} size="label" />
             <span className="label" style={{ fontWeight: 500, color: 'var(--warn)' }}>
               Overruling.
@@ -176,7 +183,7 @@ export function Verdict({
       {/* Two verdicts, each with its own lamp. The static row never says a
           bare "fits": an unqualified "fits" is the claim that let a launch
           through onto a machine that had no room for it. */}
-      <div style={{ display: 'grid', gap: 4, margin: '6px 0 10px' }}>
+      <div style={{ display: 'grid', gap: 'var(--space-4)', margin: 'var(--space-6) 0 var(--space-10)' }}>
         {fit ? (
           <VerdictRow
             label="fits on idle hardware"
@@ -201,13 +208,13 @@ export function Verdict({
       <Verbatim text={p.reason} size="label" />
 
       {p.rejected.length > 0 ? (
-        <div style={{ display: 'grid', gap: 6, paddingTop: 6 }}>
+        <div style={{ display: 'grid', gap: 'var(--space-6)', paddingTop: 'var(--space-6)' }}>
           <div className="unit">rejected</div>
           <VerbatimList items={p.rejected} />
         </div>
       ) : null}
 
-      <div className="unit" style={{ margin: '6px 0 10px' }}>
+      <div className="unit" style={{ margin: 'var(--space-6) 0 var(--space-10)' }}>
         {p.node_ids.length} {p.node_ids.length === 1 ? 'machine' : 'machines'}: {p.node_ids.join(', ')}
         {/* The line already names the machines; whose choice they were is the
             other half of the fact. */}
@@ -218,16 +225,35 @@ export function Verdict({
       </div>
 
       {result.resolver_warnings.length > 0 ? (
-        <div style={{ display: 'grid', gap: 6, margin: '6px 0 10px' }}>
+        <div style={{ display: 'grid', gap: 'var(--space-6)', margin: 'var(--space-6) 0 var(--space-10)' }}>
           <div className="unit">resolver</div>
           <VerbatimList items={result.resolver_warnings} />
         </div>
       ) : null}
 
+      {/* Opt-in, beside the warning that names what it would run: no launch
+          executes a repository's own Python unless this is ticked. */}
+      {result.remote_code ? (
+        <label style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'flex-start', cursor: 'pointer', margin: '0 0 var(--space-10)' }}>
+          <input
+            type="checkbox"
+            checked={trustRemoteCode}
+            onChange={(e) => onTrustRemoteCodeChange(e.target.checked)}
+            style={{ marginTop: 'var(--space-3)' }}
+          />
+          <span className="label" style={{ fontWeight: 400 }}>
+            Trust remote code — run this repository’s own Python inside the
+            model container (--trust-remote-code). Leave it off unless you
+            trust the repository named above. The launch is not given your
+            HuggingFace token unless the repository is gated.
+          </span>
+        </label>
+      ) : null}
+
       {/* Both reasons, each under its own legend, neither merged into the
           other. They are describing different budgets. */}
       {fit && live && fit.reason !== live.reason ? (
-        <div style={{ display: 'grid', gap: 8 }}>
+        <div style={{ display: 'grid', gap: 'var(--space-8)' }}>
           <div>
             <div className="unit">on idle hardware</div>
             <Verbatim text={fit.reason} size="label" />
@@ -243,13 +269,13 @@ export function Verdict({
 
       {/* One bar, both lines: the live allocatable line is what the verdict
           used, the static ceiling sits behind it. */}
-      <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+      <div style={{ display: 'grid', gap: 'var(--space-8)', marginTop: 'var(--space-8)' }}>
         <SegmentBar
           segments={segments}
           usable={(live ?? fit)?.usable_per_node ?? null}
           ceiling={live ? fit?.usable_per_node ?? null : null}
         />
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--space-8)' }}>
           <span className="unit">per node</span>
           <span className="unit">
             {live
@@ -261,18 +287,18 @@ export function Verdict({
 
       <dl
         style={{
-          margin: '8px 0 0',
+          margin: 'var(--space-8) 0 0',
           display: 'grid',
           gridTemplateColumns: 'max-content max-content max-content',
-          columnGap: 16,
-          rowGap: 4,
+          columnGap: 'var(--space-16)',
+          rowGap: 'var(--space-4)',
           alignItems: 'baseline',
         }}
       >
         {segments.map((s) => (
           <BreakdownRow key={s.key} label={s.label} bytes={s.bytes} limiting={s.limiting === true} />
         ))}
-        <div style={{ gridColumn: '1 / -1', borderTop: '1px solid var(--rule)', margin: '4px 0' }} />
+        <div style={{ gridColumn: '1 / -1', borderTop: '1px solid var(--rule)', margin: 'var(--space-4) 0' }} />
         <BreakdownRow label="total" bytes={shown.breakdown.total} strong />
         {fit ? (
           <BreakdownRow label="ceiling on idle hardware" bytes={fit.usable_per_node} muted={live != null} />
@@ -296,7 +322,7 @@ export function Verdict({
       </dl>
 
       {shown.predicted_decode_tps != null ? (
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-8)', marginTop: 'var(--space-8)' }}>
           <span className="unit">predicted decode</span>
           <Readout
             value={shown.predicted_decode_tps}
@@ -309,7 +335,7 @@ export function Verdict({
       ) : null}
 
       {shown.warnings.length > 0 ? (
-        <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+        <div style={{ display: 'grid', gap: 'var(--space-6)', marginTop: 'var(--space-8)' }}>
           {shown.warnings.map((w) => (
             <p key={w} className="label" style={{ margin: 0, fontWeight: 400, color: 'var(--warn)', whiteSpace: 'pre-wrap' }}>
               {w}
@@ -318,10 +344,10 @@ export function Verdict({
         </div>
       ) : null}
 
-      <div style={{ display: 'grid', gap: 10, marginTop: 10 }}>
+      <div style={{ display: 'grid', gap: 'var(--space-10)', marginTop: 'var(--space-10)' }}>
         {canServe ? (
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <button onClick={onLaunch} disabled={launching}>
+          <div style={{ display: 'flex', gap: 'var(--space-10)', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button type="button" onClick={onLaunch} disabled={launching}>
               {launching
                 ? 'Launching…'
                 : gates.length > 0
@@ -335,7 +361,7 @@ export function Verdict({
             ) : null}
           </div>
         ) : needsOverride ? (
-          <div style={{ display: 'grid', gap: 12 }}>
+          <div style={{ display: 'grid', gap: 'var(--space-12)' }}>
             {gates.map((g) => (
               <OverrideGate
                 key={g.param}
@@ -364,10 +390,10 @@ export function Verdict({
           </p>
         )}
 
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 'var(--space-10)', alignItems: 'center', flexWrap: 'wrap' }}>
           {/* The gate said what to change; this is that change, already applied. */}
           {canAdjust ? (
-            <button onClick={() => onUseMaxContext(maxCtx!)}>
+            <button type="button" onClick={() => onUseMaxContext(maxCtx!)}>
               Use {maxCtx} context{live ? ' — the most that fits right now' : ''}
             </button>
           ) : null}
@@ -383,7 +409,7 @@ export function Verdict({
       {/* The refusal, verbatim, when Serve itself was rejected rather than
           the dry run. */}
       {error ? (
-        <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: '10px 0 0' }}>
+        <p className="label" style={{ color: 'var(--fault)', fontWeight: 400, margin: 'var(--space-10) 0 0' }}>
           {error}
         </p>
       ) : null}
@@ -409,17 +435,17 @@ function VerdictRow({
         display: 'flex',
         alignItems: 'baseline',
         justifyContent: 'space-between',
-        gap: 8,
+        gap: 'var(--space-8)',
         color: muted ? 'var(--ink-muted)' : 'var(--ink)',
       }}
     >
-      <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
         <Lamp signal={v.signal} hollow={muted} label={`${label}: ${v.word}`} />
         <span className="label" style={{ fontWeight: 400 }}>
           {label}
         </span>
       </span>
-      <span style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+      <span style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-10)' }}>
         <span className="label" style={{ fontWeight: muted ? 400 : 500 }}>
           {v.word}
         </span>
@@ -447,7 +473,7 @@ function VerdictRow({
  *  The default branch matters as much as the named ones. A gateway that adds a
  *  fourth gate tomorrow still gets an honest, blocking control here instead of
  *  this client silently launching past a permission it did not recognise. */
-function claimFor(
+export function claimFor(
   gate: ServeRequirement,
   live: FitResult | null,
   staticCeiling: number | null,
@@ -483,12 +509,12 @@ function NoVerdict({ result }: { result: PlanResponse }) {
         <Lamp signal="fault" label="no verdict" /> {planShortFromDegrees(p)}
       </div>
       <Verbatim text={p.reason} size="label" />
-      <p className="label" style={{ fontWeight: 400, margin: '10px 0 0' }}>
+      <p className="label" style={{ fontWeight: 400, margin: 'var(--space-10) 0 0' }}>
         The fit gate did not answer, so nothing here says whether this fits.
         Serve is withheld.
       </p>
       {result.serve?.unavailable_reason ? (
-        <p className="unit" style={{ margin: '6px 0 0' }}>{result.serve.unavailable_reason}</p>
+        <p className="unit" style={{ margin: 'var(--space-6) 0 0' }}>{result.serve.unavailable_reason}</p>
       ) : null}
     </div>
   )
@@ -516,12 +542,12 @@ function BreakdownRow({
         style={{
           fontWeight: strong ? 500 : 400,
           color: strong ? 'var(--ink)' : 'var(--ink-muted)',
-          opacity: muted ? 0.72 : 1,
+          opacity: muted ? 'var(--opacity-72)' : 1,
         }}
       >
         {label}
       </dt>
-      <dd style={{ margin: 0, opacity: muted ? 0.72 : 1 }}>
+      <dd style={{ margin: 0, opacity: muted ? 'var(--opacity-72)' : 1 }}>
         <Readout value={gbNum(bytes)} decimals={1} width={7} unit="GB" tone={tone ?? 'ink'} />
       </dd>
       <dd style={{ margin: 0 }}>

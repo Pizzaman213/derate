@@ -126,7 +126,13 @@ class LaunchProgress:
 #: `Loading safetensors checkpoint shards:  45% Completed | 5/11 [00:12<...]`
 #: The pair is the runtime counting its own shards. The percentage beside it
 #: is derived from the same pair and rounded, so the pair is what we read.
-_SHARDS_RE = re.compile(r"checkpoint shards.*?(\d+)\s*/\s*(\d+)")
+# The count may only start at the beginning of a digit run: without the
+# lookbehind every position inside a long run is retried and backtracked, which
+# is quadratic, under the GIL, on the coordinator's loop (R-4).
+_SHARDS_RE = re.compile(r"checkpoint shards.*?(?<!\d)(\d+)\s*/\s*(\d+)")
+
+#: Longest line read for a phase; a runtime can print anything.
+MAX_LINE_CHARS = 4096
 
 #: `Fetching 16 files:  19%|█▉        | 3/16 [00:45<03:15, 15.0s/it]`
 #:
@@ -270,6 +276,31 @@ _RUNTIME_FATAL: tuple[str, ...] = (
     "fatal: the speech server failed to start.",
 )
 
+#: One sentence naming the cause of a launch failure and the fix, chosen by a
+#: literal marker in the launcher's output -- same stance as _RUNTIME_FATAL:
+#: markers, never inference. The raw output is kept beneath it, verbatim.
+DOCKER_UNREACHABLE = (
+    "Docker is not reachable from this node, so sparkrun cannot start the runtime "
+    "container. In a container, mount the host's socket and restart: "
+    "-v /var/run/docker.sock:/var/run/docker.sock (install.sh does this).")
+IMAGE_MISSING = (
+    "The runtime image is not in any registry this node can reach (manifest unknown). "
+    "Pull or build it on this node, or point DERATE_VLLM_IMAGE / DERATE_SGLANG_IMAGE / "
+    "DERATE_TTS_IMAGE at one that exists.")
+_FAILURE_EXPLANATIONS: tuple[tuple[str, str], ...] = (
+    ("dial unix /var/run/docker.sock", DOCKER_UNREACHABLE),
+    ("failed to connect to the docker API", DOCKER_UNREACHABLE),
+    ("manifest unknown", IMAGE_MISSING),
+)
+
+
+def explain_failure(raw: str) -> str | None:
+    """First explanation whose marker appears anywhere in *raw*; None when none does."""
+    for marker, why in _FAILURE_EXPLANATIONS:
+        if marker in raw:
+            return why
+    return None
+
 
 
 def _lines(text: str) -> list[str]:
@@ -281,7 +312,7 @@ def _lines(text: str) -> list[str]:
     """
     out: list[str] = []
     for chunk in text.replace("\r", "\n").split("\n"):
-        stripped = chunk.strip()
+        stripped = chunk.strip()[:MAX_LINE_CHARS]
         if stripped:
             out.append(stripped)
     return out

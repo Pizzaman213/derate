@@ -1,0 +1,1 @@
+{"description":"A negative size is meaningless: left out with a note.","data":[{"sets":"A","size":40},{"sets":"B","size":30},{"sets":"C","size":20},{"sets":"A,B","size":10},{"sets":"B,C","size":-4}]}

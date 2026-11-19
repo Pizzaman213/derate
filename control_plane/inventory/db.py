@@ -23,6 +23,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from control_plane.fsutil import private_sqlite
+
 log = logging.getLogger(__name__)
 
 #: 1 is the first. A bump discards the file and rebuilds from the live
@@ -184,7 +186,7 @@ def connect(path: Path | str) -> sqlite3.Connection:
     so the connection is still only used by one thread at a time.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    private_sqlite(path)
     conn = sqlite3.connect(
         str(path), timeout=30.0, isolation_level=None, check_same_thread=False
     )

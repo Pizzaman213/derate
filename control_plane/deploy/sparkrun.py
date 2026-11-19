@@ -25,7 +25,7 @@ import subprocess
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from control_plane.contracts import (
     DEFAULT_GUARDRAIL,
@@ -36,8 +36,10 @@ from control_plane.contracts import (
 
 from .flags import KNOBS_BY_NAME, SPARKRUN_BIN, RuntimeSpec, runtime_spec
 from .recipes import RecipeSpec, materialize, synthesize
+from . import progress
 
 from control_plane.paths import data_dir
+from control_plane.registry.net import valid_host
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,14 @@ NOT_INSTALLED = (
 
 class SparkrunNotInstalled(RuntimeError):
     pass
+
+
+class DockerUnreachable(RuntimeError):
+    pass
+
+
+_DOCKERENV = Path("/.dockerenv")
+_DOCKER_SOCK = Path("/var/run/docker.sock")
 
 
 class LogStream:
@@ -179,6 +189,56 @@ def is_oom(text: str) -> bool:
     return any(sig in low for sig in OOM_SIGNATURES)
 
 
+#: What a sparkrun subprocess inherits from the coordinator (L18): what
+#: sparkrun itself reads (USER, SHELL, HF_TOKEN/HUGGING_FACE_HUB_TOKEN,
+#: SPARKRUN_*), what the ssh and docker it runs need to find keys, config and
+#: the daemon, and the image overrides. Nothing else -- in particular no
+#: DERATE_TOKEN, provider key or DERATE_SECRET_*.
+SPARKRUN_ENV_NAMES = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "TZ", "SSH_AUTH_SOCK", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+    "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "DOCKER_HOST", "DOCKER_CONFIG",
+    "HF_HOME", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "DERATE_HF_TOKEN",
+    "DERATE_SPARKRUN_BIN",
+})
+_SPARKRUN_ENV_PATTERN = re.compile(r"\A(SPARKRUN_[A-Z0-9_]+|DERATE_[A-Z0-9_]+_IMAGE)\Z")
+
+
+#: The hub credentials in that allowlist. Withheld from a launch that runs a
+#: repository's own code unless the repository is gated and so needs them (R-6).
+HUB_TOKEN_NAMES = frozenset({"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "DERATE_HF_TOKEN"})
+
+
+def sparkrun_env(
+    environ: Mapping[str, str] | None = None, *, hub_token: bool = True
+) -> dict[str, str]:
+    """The allowlisted slice of *environ* (default: this process's).
+
+    ``hub_token=False`` drops the HuggingFace credentials as well.
+    """
+    source = os.environ if environ is None else environ
+    return {
+        k: v
+        for k, v in source.items()
+        if (k in SPARKRUN_ENV_NAMES or _SPARKRUN_ENV_PATTERN.match(k))
+        and (hub_token or k not in HUB_TOKEN_NAMES)
+    }
+
+
+def _hub_gated(model_id: str) -> bool:
+    """Ask the hub whether *model_id* is gated. Any failure answers False, so
+    an unreachable hub withholds the token rather than handing it over."""
+    from control_plane.resolver.hf import HubClient, is_hub_id
+
+    if not is_hub_id(model_id):
+        return False
+    try:
+        return HubClient().is_gated(model_id)
+    except Exception:
+        logger.debug("could not ask the hub whether %s is gated", model_id, exc_info=True)
+        return False
+
+
 class SparkrunAdapter:
     """Renders, runs, inspects and tears down sparkrun workloads.
 
@@ -198,6 +258,7 @@ class SparkrunAdapter:
         launch_timeout_s: float = 1800.0,
         stop_timeout_s: float = 30.0,
         env: dict[str, str] | None = None,
+        gated_probe: Callable[[str], bool] = _hub_gated,
     ) -> None:
         self.registry = registry
         self.recipe_dir = (
@@ -208,7 +269,24 @@ class SparkrunAdapter:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.launch_timeout_s = launch_timeout_s
         self.stop_timeout_s = stop_timeout_s
+        # L18: an allowlist, not the coordinator's whole environment. The
+        # coordinator holds DERATE_TOKEN, provider keys and DERATE_SECRET_*;
+        # sparkrun, ssh and docker need none of them. Read at each call, not
+        # here: a token the settings screen sets later must still reach it.
         self.env = env
+        self.gated_probe = gated_probe
+
+    def _subprocess_env(self) -> dict[str, str]:
+        return dict(self.env) if self.env is not None else sparkrun_env()
+
+    def _launch_env(self, model_id: str, *, trust_remote_code: bool) -> dict[str, str]:
+        """The launch's environment. A repository whose own code runs gets no
+        hub token unless it is gated, because that code runs with whatever
+        the container was handed (R-6)."""
+        env = self._subprocess_env()
+        if trust_remote_code and not self.gated_probe(model_id):
+            env = {k: v for k, v in env.items() if k not in HUB_TOKEN_NAMES}
+        return env
 
     # -- availability -----------------------------------------------------
 
@@ -218,6 +296,13 @@ class SparkrunAdapter:
     def require(self) -> None:
         if not self.available():
             raise SparkrunNotInstalled(NOT_INSTALLED)
+
+    def preflight(self) -> None:
+        """Refuse a launch this node cannot carry out. Only the certain case: inside a
+        container (/.dockerenv) with no /var/run/docker.sock, sparkrun's `docker` has no
+        daemon. Anything less certain is left to run and explained afterwards."""
+        if _DOCKERENV.exists() and not _DOCKER_SOCK.exists():
+            raise DockerUnreachable(progress.DOCKER_UNREACHABLE)
 
     def version(self) -> str | None:
         if not self.available():
@@ -240,7 +325,12 @@ class SparkrunAdapter:
             # A node_id that the registry does not know is used verbatim.
             # In practice node ids are hostnames, so this is the useful
             # fallback rather than an error that blocks the demo.
-            hosts.append(state.profile.address if state else node_id)
+            host = state.profile.address if state else node_id
+            if not valid_host(host):
+                raise ValueError(
+                    f"node {node_id} has no usable address ({host!r}); refusing to launch"
+                )
+            hosts.append(host)
         return hosts
 
     # -- rendering (pure) -------------------------------------------------
@@ -259,6 +349,10 @@ class SparkrunAdapter:
         kv_cache_memory_bytes: int | None = None,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        runtime_api_key: str | None = None,
+        revision: str | None = None,
+        speculative_tokens: int = 0,
+        trust_remote_code: bool = False,
     ) -> RecipeSpec:
         return synthesize(
             shape,
@@ -286,6 +380,10 @@ class SparkrunAdapter:
             recipe_dir=self.recipe_dir,
             extra_args=extra_args,
             custom_command=custom_command,
+            runtime_api_key=runtime_api_key,
+            revision=revision,
+            speculative_tokens=speculative_tokens,
+            trust_remote_code=trust_remote_code,
         )
 
     def render_command(
@@ -302,6 +400,8 @@ class SparkrunAdapter:
         gpu_memory_utilization: float | None = None,
         kv_cache_memory_bytes: int | None = None,
         extra_args: tuple[str, ...] = (),
+        speculative_tokens: int = 0,
+        trust_remote_code: bool = False,
     ) -> list[str]:
         """The exact argv that will run. Pure: no subprocess, no filesystem.
 
@@ -316,6 +416,8 @@ class SparkrunAdapter:
             plan, shape, runtime, ctx, max_seqs, served_name=name, port=chosen_port,
             gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
+            speculative_tokens=speculative_tokens,
+            trust_remote_code=trust_remote_code,
         )
 
         values: dict[str, Any] = {
@@ -373,6 +475,10 @@ class SparkrunAdapter:
         on_output: Callable[[str], None] | None = None,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        runtime_api_key: str | None = None,
+        revision: str | None = None,
+        speculative_tokens: int = 0,
+        trust_remote_code: bool = False,
     ) -> LaunchResult:
         """Run the invocation and parse the handle back out.
 
@@ -395,6 +501,10 @@ class SparkrunAdapter:
             gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=kv_cache_memory_bytes, extra_args=extra_args,
             custom_command=custom_command,
+            runtime_api_key=runtime_api_key,
+            revision=revision,
+            speculative_tokens=speculative_tokens,
+            trust_remote_code=trust_remote_code,
         )
         materialize(recipe)
         argv = self.render_command(
@@ -406,12 +516,13 @@ class SparkrunAdapter:
         hosts = self.hosts_for(plan.node_ids)
 
         logger.info("launching %s: %s", name, " ".join(argv))
+        launch_env = self._launch_env(shape.model_id, trust_remote_code=trust_remote_code)
         try:
             if on_output is None:
-                proc = self._run(argv, timeout=self.launch_timeout_s)
+                proc = self._run(argv, timeout=self.launch_timeout_s, env=launch_env)
             else:
                 proc = self._run_streamed(
-                    argv, timeout=self.launch_timeout_s, on_line=on_output
+                    argv, timeout=self.launch_timeout_s, on_line=on_output, env=launch_env
                 )
         except subprocess.TimeoutExpired as exc:
             raw = _decode(exc.stdout) + _decode(exc.stderr)
@@ -586,7 +697,7 @@ class SparkrunAdapter:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                env=self.env,
+                env=self._subprocess_env(),
                 # Its own process group, so closing this kills the `docker
                 # exec` underneath rather than only the CLI in front of it --
                 # an orphaned `tail -f` holds an exec session open on the node
@@ -616,13 +727,15 @@ class SparkrunAdapter:
 
     # -- plumbing ---------------------------------------------------------
 
-    def _run(self, argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self, argv: list[str], *, timeout: float, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=self.env,
+            env=env if env is not None else self._subprocess_env(),
             check=False,
         )
 
@@ -632,6 +745,7 @@ class SparkrunAdapter:
         *,
         timeout: float,
         on_line: Callable[[str], None],
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """`_run`, but the caller sees each line as it arrives.
 
@@ -661,7 +775,7 @@ class SparkrunAdapter:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,  # line buffered: progress that arrives late is not progress
-            env=self.env,
+            env=env if env is not None else self._subprocess_env(),
         )
         collected: list[str] = []
 

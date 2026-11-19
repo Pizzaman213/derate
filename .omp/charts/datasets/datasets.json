@@ -1,0 +1,282 @@
+{
+  "version": 1,
+  "datasets": [
+    {
+      "name": "sales-by-month",
+      "file": "sales-by-month.json",
+      "description": "Monthly revenue, units and target for four sales regions, January 2025 to December 2026, with Q4 seasonality and steady growth.",
+      "kind": "rows",
+      "rows": 96,
+      "fields": [
+        "month",
+        "region",
+        "revenue",
+        "units",
+        "target"
+      ],
+      "intents": [
+        "compare",
+        "trend",
+        "change-over-time",
+        "composition",
+        "deviation",
+        "kpi"
+      ],
+      "suggested": [
+        "line",
+        "multi-line",
+        "grouped-bar",
+        "stacked-bar",
+        "stacked-area",
+        "area",
+        "bar",
+        "kpi-tile"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "project-timeline",
+      "file": "project-timeline.json",
+      "description": "Fourteen tasks and milestones for a product launch, January to June 2026, with phases, owners, progress and finish-to-start dependencies.",
+      "kind": "rows",
+      "rows": 14,
+      "fields": [
+        "id",
+        "name",
+        "phase",
+        "start",
+        "end",
+        "progress",
+        "dependsOn",
+        "milestone",
+        "owner"
+      ],
+      "intents": [
+        "timeline",
+        "schedule"
+      ],
+      "suggested": [
+        "gantt",
+        "swimlane-timeline"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "survey-results",
+      "file": "survey-results.json",
+      "description": "Five-level Likert responses to six statements, split by Customers (212 respondents) and Staff (94 respondents).",
+      "kind": "rows",
+      "rows": 60,
+      "fields": [
+        "question",
+        "response",
+        "count",
+        "segment"
+      ],
+      "intents": [
+        "compare",
+        "composition",
+        "distribution",
+        "deviation"
+      ],
+      "suggested": [
+        "diverging-bar",
+        "stacked-bar-100",
+        "stacked-bar",
+        "grouped-bar",
+        "horizontal-bar"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "server-metrics",
+      "file": "server-metrics.json",
+      "description": "Five-minute samples from three hosts over 16 November 2026 (UTC): a daily load cycle, a 13:50-14:45 incident on web-01 and db-01, and five missed scrapes left as nulls.",
+      "kind": "rows",
+      "rows": 864,
+      "fields": [
+        "timestamp",
+        "host",
+        "cpu",
+        "memory",
+        "latency_ms",
+        "requests"
+      ],
+      "intents": [
+        "trend",
+        "change-over-time",
+        "distribution",
+        "correlation",
+        "deviation",
+        "kpi"
+      ],
+      "suggested": [
+        "line",
+        "multi-line",
+        "area",
+        "heatmap",
+        "histogram",
+        "box-plot",
+        "scatter",
+        "kpi-tile"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "population-by-region",
+      "file": "population-by-region.json",
+      "description": "Approximate 2024-25 population, land area and median age for forty countries across six world regions, with ISO 3166-1 alpha-3 codes and centroid coordinates.",
+      "kind": "rows",
+      "rows": 40,
+      "fields": [
+        "region",
+        "country",
+        "iso3",
+        "population",
+        "area_km2",
+        "median_age",
+        "lat",
+        "lon"
+      ],
+      "intents": [
+        "geo",
+        "compare",
+        "rank",
+        "correlation",
+        "composition",
+        "distribution"
+      ],
+      "suggested": [
+        "choropleth",
+        "bubble-map",
+        "bar",
+        "horizontal-bar",
+        "scatter",
+        "bubble",
+        "treemap",
+        "box-plot"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "budget-breakdown",
+      "file": "budget-breakdown.json",
+      "description": "Annual operating budget as a tree: five departments, two categories each, three line items per category (30 leaves, USD 18,775,000 total). Values sit on leaves only; parents are their sum.",
+      "kind": "tree",
+      "rows": 46,
+      "fields": [
+        "name",
+        "value"
+      ],
+      "intents": [
+        "hierarchy",
+        "composition",
+        "compare"
+      ],
+      "suggested": [
+        "treemap",
+        "sunburst",
+        "tree"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "budget-breakdown-flat",
+      "file": "budget-breakdown-flat.json",
+      "description": "The budget-breakdown tree as flat id/parent rows (stratify-ready). value is set on the 30 line items and null on the root, departments and categories.",
+      "kind": "rows",
+      "rows": 46,
+      "fields": [
+        "id",
+        "parent",
+        "name",
+        "value"
+      ],
+      "intents": [
+        "hierarchy",
+        "composition",
+        "rank"
+      ],
+      "suggested": [
+        "treemap",
+        "sunburst",
+        "tree",
+        "horizontal-bar"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "network-graph",
+      "file": "network-graph.json",
+      "description": "A service dependency map for an online store: 30 services in four groups (edge, core, data, infra) and 61 directed calls weighted by requests per second.",
+      "kind": "graph",
+      "rows": 30,
+      "fields": [
+        "id",
+        "label",
+        "group"
+      ],
+      "intents": [
+        "network",
+        "relationship",
+        "flow"
+      ],
+      "suggested": [
+        "force-network",
+        "chord",
+        "sankey"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "org-tree",
+      "file": "org-tree.json",
+      "description": "A 35-person company as id/parent rows: a CEO, four executives, ten managers and twenty individual contributors, four levels deep.",
+      "kind": "rows",
+      "rows": 35,
+      "fields": [
+        "id",
+        "parent",
+        "name",
+        "title",
+        "department"
+      ],
+      "intents": [
+        "hierarchy"
+      ],
+      "suggested": [
+        "org-chart",
+        "tree"
+      ],
+      "added": "2026-11-17"
+    },
+    {
+      "name": "ohlc-prices",
+      "file": "ohlc-prices.json",
+      "description": "Daily open, high, low, close and volume for one fictional stock over 120 trading days from 1 June 2026 (weekends skipped, no holidays), from a seeded random walk.",
+      "kind": "rows",
+      "rows": 120,
+      "fields": [
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+      ],
+      "intents": [
+        "trend",
+        "change-over-time",
+        "distribution"
+      ],
+      "suggested": [
+        "candlestick",
+        "ohlc",
+        "line",
+        "area",
+        "bar"
+      ],
+      "added": "2026-11-17"
+    }
+  ]
+}

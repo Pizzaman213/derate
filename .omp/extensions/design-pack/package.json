@@ -1,0 +1,10 @@
+{
+  "name": "derate-design-pack-extension",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "omp extension for the derate design pack: token/icon/component/graph tools, /tokens /icon /ui-check /graph /impact /design-audit /pack-sync, and the hooks that lint edits, rebuild generated outputs and gate the session on ui:check.",
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

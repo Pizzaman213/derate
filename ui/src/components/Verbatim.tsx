@@ -43,7 +43,7 @@ export function VerbatimList({ items }: { items: string[] }) {
         margin: 0,
         padding: 0,
         display: 'grid',
-        gap: 6,
+        gap: 'var(--space-6)',
       }}
     >
       {items.map((line) => (
@@ -55,7 +55,7 @@ export function VerbatimList({ items }: { items: string[] }) {
             color: 'var(--ink-muted)',
             display: 'grid',
             gridTemplateColumns: '10px 1fr',
-            gap: 6,
+            gap: 'var(--space-6)',
             whiteSpace: 'pre-wrap',
           }}
         >

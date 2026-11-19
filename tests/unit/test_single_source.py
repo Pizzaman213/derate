@@ -225,3 +225,86 @@ def test_declared_defaults_match_what_the_code_actually_falls_back_to():
         )
         + "\n\nThe code is right and the declaration is the copy. Fix envspec.py.\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dependency pins: requirements.txt is what the image installs (via the lock),
+# pyproject.toml is what `pip install .` installs. Same list, or two builds.
+# ---------------------------------------------------------------------------
+
+
+def _requirement_lines(lines) -> set[str]:
+    out = set()
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.add(re.sub(r"\s+", "", line).lower())
+    return out
+
+
+def test_login_lock_max_is_the_window_it_can_actually_reach():
+    """A pair hold is measured from the last failure, and failures older than
+    the window are pruned, so no hold outlasts LOGIN_LOCK_WINDOW_S; a larger
+    LOGIN_LOCK_MAX_S (it was 3600) documents a hold that never happens."""
+    from control_plane.contracts.auth import LOGIN_LOCK_MAX_S, LOGIN_LOCK_WINDOW_S
+
+    assert LOGIN_LOCK_MAX_S == LOGIN_LOCK_WINDOW_S
+
+
+def test_pyproject_pins_exactly_what_requirements_txt_pins():
+    import tomllib
+
+    reqs = _requirement_lines((REPO / "requirements.txt").read_text().splitlines())
+    project = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]
+    deps = _requirement_lines(project["dependencies"])
+    assert reqs == deps, (
+        "\n\nrequirements.txt and pyproject.toml disagree:\n"
+        f"  only in requirements.txt: {sorted(reqs - deps)}\n"
+        f"  only in pyproject.toml:   {sorted(deps - reqs)}\n"
+    )
+
+
+def test_requirements_lock_pins_every_requirement_with_hashes():
+    """The image installs requirements.lock with --require-hashes; a pin bumped
+    in requirements.txt and not recompiled would ship the old version."""
+    from packaging.requirements import Requirement
+
+    lock = (REPO / "requirements.lock").read_text()
+    locked = {
+        m.group(1).lower().replace("_", "-"): m.group(2)
+        for m in re.finditer(r"^([A-Za-z0-9._-]+)(?:\[[^\]]*\])?==(\S+)", lock, re.M)
+    }
+    wrong = []
+    for line in _requirement_lines((REPO / "requirements.txt").read_text().splitlines()):
+        req = Requirement(line)
+        name = req.name.lower().replace("_", "-")
+        if name not in locked or not req.specifier.contains(locked[name]):
+            wrong.append(f"{line} -> lock has {locked.get(name)!r}")
+    assert not wrong, "\n\nrequirements.lock is stale; recompile it:\n  " + "\n  ".join(wrong)
+    assert "--hash=sha256:" in lock
+
+
+@pytest.mark.parametrize("doc", ["README.md", "docs/guide/install.md"])
+def test_the_first_node_install_line_verifies_the_script_in_this_tree(doc):
+    """The first-node line checks install.sh against a literal sha256.
+    Edit install.sh and this fails until the docs carry the new hash."""
+    import hashlib
+
+    text = (REPO / doc).read_text()
+    match = re.search(
+        r'raw\.githubusercontent\.com/\S+/main/install\.sh[^`]*?echo "([0-9a-f]{64})  ', text
+    )
+    assert match, f"{doc}'s first-node install line no longer verifies a sha256"
+    actual = hashlib.sha256((REPO / "install.sh").read_bytes()).hexdigest()
+    assert match.group(1) == actual, f"{doc} pins {match.group(1)}, install.sh is {actual}"
+
+
+def test_sparkrun_is_locked_and_the_image_has_one_pip_install():
+    """sparkrun used to be a second, unlocked `pip install` after the
+    hash-locked one, free to upgrade a locked package to suit its own ranges."""
+    lock = (REPO / "requirements.lock").read_text()
+    assert re.search(r"^sparkrun==\S+ \\$", lock, re.M), "sparkrun is not in requirements.lock"
+    dockerfile = (REPO / "Dockerfile").read_text()
+    installs = re.findall(r"\bpip install\b", dockerfile)
+    assert len(installs) == 1, f"Dockerfile runs pip install {len(installs)} times"
+    assert "--require-hashes" in dockerfile

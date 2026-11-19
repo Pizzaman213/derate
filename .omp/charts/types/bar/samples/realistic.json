@@ -1,0 +1,1 @@
+{"description":"Monthly recurring revenue by plan tier (USD), mapped from a CSV export with a field mapping.","data":"plan,mrr_usd\nFree,0\nStarter,18450\nTeam,64210\nBusiness,121980\nEnterprise,287400\nEducation,9320\nNonprofit,4110\nLegacy Pro,22760\n","options":{"fields":{"label":"plan","value":"mrr_usd"},"valueFormat":"currency","sort":"descending","yTitle":"MRR (USD)"}}

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Icon } from '../../components/Icon'
 import { useBackend } from '../../state/backend'
 import {
   describeBase,
@@ -82,7 +83,7 @@ export function CoordinatorCard() {
   return (
     <div className="card2">
       <h3>Coordinator</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         Where this browser sends <span className="mono">/api</span> and{' '}
         <span className="mono">/v1</span>. Leave it blank in a normal install — the
         coordinator serves this page, so its own origin is the right answer. Set it to
@@ -97,9 +98,9 @@ export function CoordinatorCard() {
       <div
         style={{
           display: 'flex',
-          gap: 8,
+          gap: 'var(--space-8)',
           alignItems: 'flex-end',
-          marginTop: 12,
+          marginTop: 'var(--space-12)',
           flexWrap: 'wrap',
         }}
       >
@@ -121,21 +122,21 @@ export function CoordinatorCard() {
             autoComplete="off"
           />
         </div>
-        <button onClick={() => void test()} disabled={testing || malformed}>
+        <button type="button" onClick={() => void test()} disabled={testing || malformed}>
           {testing ? 'Testing…' : 'Test connection'}
         </button>
-        <button onClick={apply} disabled={!dirty}>
+        <button type="button" onClick={apply} disabled={!dirty}>
           {saved && normalized === '' ? 'Use this page' : 'Save'}
         </button>
         {saved ? (
-          <button onClick={useThisPage} style={{ padding: '5px 9px' }}>
+          <button type="button" onClick={useThisPage} style={{ padding: 'var(--space-5) var(--space-9)' }}>
             Reset
           </button>
         ) : null}
       </div>
 
       {malformed ? (
-        <div className="label" style={{ color: 'var(--fault)', marginTop: 8 }}>
+        <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-8)' }}>
           That is not an address. Expected something like{' '}
           <span className="mono">192.168.1.20:8080</span> or{' '}
           <span className="mono">https://coordinator.lan</span>.
@@ -146,24 +147,24 @@ export function CoordinatorCard() {
         <div
           className="label"
           style={{
-            marginTop: 8,
+            marginTop: 'var(--space-8)',
             color: result.ok ? 'var(--live)' : 'var(--fault)',
             whiteSpace: 'pre-wrap',
           }}
         >
-          {result.ok ? '✓ ' : '✕ '}
+          <Icon name={result.ok ? 'check' : 'close'} size={12} label={result.ok ? 'reachable' : 'unreachable'} className="icon-inline" />{' '}
           {describeBase(result.base)} — {result.detail}
           {result.ok && result.base !== saved ? ' Press Save to use it.' : ''}
         </div>
       ) : null}
 
       {savedNote ? (
-        <div className="label" style={{ marginTop: 8 }}>
+        <div className="label" style={{ marginTop: 'var(--space-8)' }}>
           {savedNote}
         </div>
       ) : null}
 
-      <div className="unit" style={{ marginTop: 10 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-10)' }}>
         A coordinator on another origin has to allow this page before a browser will
         let the requests through. Start it with{' '}
         <span className="mono">DERATE_ALLOWED_ORIGINS={window.location.origin}</span>;

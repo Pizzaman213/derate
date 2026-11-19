@@ -258,11 +258,21 @@ class AdmissionController:
 
     @staticmethod
     def explicit_max_tokens(body: dict) -> int | None:
-        for key in ("max_tokens", "max_completion_tokens"):
+        """The largest explicit output ceiling, or None. ``ValueError`` for a
+        ceiling that is not an integer: the engine coerces ``"100000"``, so
+        skipping it would admit a generation the KV budget never counted."""
+        best: int | None = None
+        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
             value = body.get(key)
-            if isinstance(value, int) and value > 0:
-                return value
-        return None
+            if value is None:
+                continue
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{key} must be an integer, not {value!r}")
+            if value > 0 and (best is None or value > best):
+                best = value
+        return best
 
     def kv_budget(self, deployment: Deployment) -> int:
         breakdown = getattr(deployment.fit, "breakdown", None)
@@ -285,7 +295,12 @@ class AdmissionController:
 
     def check(self, deployment: Deployment, body: dict) -> AdmissionDecision:
         prompt_tokens = self.estimate_prompt_tokens(body)
-        explicit_max = self.explicit_max_tokens(body)
+        try:
+            explicit_max = self.explicit_max_tokens(body)
+        except ValueError as exc:
+            return AdmissionDecision(
+                ok=False, status=400, code="invalid_request", message=str(exc),
+            )
         context_limit = deployment.context_length
 
         # 400: a single request that cannot fit the context, whatever the load.

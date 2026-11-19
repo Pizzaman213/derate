@@ -37,7 +37,7 @@ export function CacheTable({
 
   if (!cache.available) {
     return (
-      <div style={{ marginBottom: 12 }}>
+      <div style={{ marginBottom: 'var(--space-12)' }}>
         <div className="row">
           <span className="mono">{node.node_id}</span>
           <span className="unit">not measured</span>
@@ -49,7 +49,7 @@ export function CacheTable({
 
   if (!cache.repos.length) {
     return (
-      <div className="row" style={{ marginBottom: 12 }}>
+      <div className="row" style={{ marginBottom: 'var(--space-12)' }}>
         <span className="mono">{node.node_id}</span>
         <span className="unit">nothing downloaded · {cache.path}</span>
       </div>
@@ -62,10 +62,10 @@ export function CacheTable({
   const largest = cache.repos[0]?.bytes ?? 1
 
   return (
-    <div style={{ marginBottom: 14 }}>
+    <div style={{ marginBottom: 'var(--space-14)' }}>
       <div
         className="row"
-        style={{ borderBottom: '1px solid var(--rule)', paddingBottom: 4 }}
+        style={{ borderBottom: '1px solid var(--rule)', paddingBottom: 'var(--space-4)' }}
       >
         <span className="mono">{node.node_id}</span>
         <span className="unit">
@@ -119,6 +119,7 @@ export function CacheTable({
                         </span>
                       ) : (
                         <button
+                          type="button"
                           onClick={() => onDelete(node.node_id, m)}
                           disabled={busy != null}
                         >

@@ -1,0 +1,1 @@
+{"description":"Items listed on several rows: their sets are united into one item (long format); a row repeating a membership already seen is ignored and noted.","data":[{"item":"x1","sets":"A"},{"item":"x1","sets":"B"},{"item":"x2","sets":"A"},{"item":"x2","sets":"A"},{"item":"x3","sets":"B,C"},{"item":"x4","sets":"C"},{"item":"x3","sets":"A"}]}

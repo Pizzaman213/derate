@@ -1,0 +1,1 @@
+{"description":"Quarterly recurring revenue walk: an opening total, four changes and the closing total appended.","data":[{"label":"Opening","value":500,"kind":"total"},{"label":"New customers","value":180},{"label":"Expansion","value":95},{"label":"Churn","value":-120},{"label":"Discounts","value":-40}]}

@@ -44,7 +44,7 @@
 .ghost {
   border: none;
   background: none;
-  padding: 5px 7px;
+  padding: var(--space-5) var(--space-7);
 }
 .ghost:hover {
   background: var(--panel-sunk);
@@ -53,9 +53,24 @@
 header {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 12px 20px;
+  gap: var(--space-14);
+  padding: var(--space-12) var(--space-20);
   border-bottom: 1px solid var(--rule);
+}
+/* The monogram is the pack's `derate-mark` icon, a 24-box whose ink spans 20
+   of it. Drawn at 32 the ink is the 27px the old 32x24 drawing painted; the
+   negative margins keep the row at the 24px it always occupied, and the nudge
+   is the one Header.tsx explains. */
+header .brand-mark {
+  width: 32px;
+  height: 32px;
+  margin: calc(-1 * var(--space-4)) 0;
+  transform: translateY(2px);
+}
+/* An icon in running text: drop it to the x-height line so it reads as part
+   of the word, not a superscript. */
+.icon-inline {
+  vertical-align: -0.15em;
 }
 /* Metrics stream dropped (shell/Header.tsx: `stale` from useMetrics) --
    the lamp already turns into a hollow --fault ring, but that is easy to
@@ -65,7 +80,7 @@ header.stream-fault {
 }
 .dest {
   display: flex;
-  gap: 2px;
+  gap: var(--space-2);
   margin-left: auto;
 }
 /* The destinations are anchors (shell/Header.tsx: each one has a real URL, so
@@ -75,7 +90,7 @@ header.stream-fault {
   display: inline-flex;
   align-items: center;
   border-bottom: 2px solid transparent;
-  padding: 6px 13px;
+  padding: var(--space-6) var(--space-13);
   color: var(--ink-muted);
   text-decoration: none;
 }
@@ -92,7 +107,7 @@ header.stream-fault {
   position: relative;
   display: grid;
   grid-template-columns: 1fr var(--rail);
-  transition: grid-template-columns 0.18s ease;
+  transition: grid-template-columns var(--dur) var(--ease-default);
 }
 .wrap.narrow {
   --rail: 0px;
@@ -145,7 +160,7 @@ header.stream-fault {
 }
 
 main {
-  padding: 20px 22px;
+  padding: var(--space-20) var(--space-22);
   border-right: 1px solid var(--rule);
   overflow: hidden;
   min-height: calc(100vh - 55px);
@@ -156,17 +171,17 @@ aside {
   max-height: calc(100vh - 55px);
 }
 aside .inner {
-  padding: 18px;
+  padding: var(--space-18);
   display: flex;
   flex-direction: column;
-  gap: 15px;
+  gap: var(--space-15);
   width: var(--sidebar-w);
   overflow-y: auto;
   max-height: calc(100vh - 55px);
 }
 aside section {
   border-bottom: 1px solid var(--rule);
-  padding-bottom: 13px;
+  padding-bottom: var(--space-13);
 }
 aside section:last-child {
   border: none;
@@ -179,35 +194,35 @@ aside section:last-child {
   right: var(--rail);
   height: 168px;
   width: 24px;
-  z-index: 5;
+  z-index: var(--z-rail);
   display: flex;
   align-items: center;
   justify-content: flex-end;
   transform: translateY(-50%);
-  transition: right 0.18s ease;
+  transition: right var(--dur) var(--ease-default);
 }
 .rail .tab {
   width: 6px;
   height: 46px;
   padding: 0;
   border: none;
-  border-radius: 3px 0 0 3px;
+  border-radius: var(--radius) 0 0 var(--radius);
   background: var(--rule);
   color: var(--ink-muted);
   display: flex;
   align-items: center;
   justify-content: center;
   transition:
-    width 0.16s ease,
-    height 0.16s ease,
-    background 0.16s ease,
-    color 0.16s ease;
+    width var(--dur-mid) var(--ease-default),
+    height var(--dur-mid) var(--ease-default),
+    background var(--dur-mid) var(--ease-default),
+    color var(--dur-mid) var(--ease-default);
 }
 .rail .tab svg {
   opacity: 0;
   transition:
-    opacity 0.16s ease,
-    transform 0.18s ease;
+    opacity var(--dur-mid) var(--ease-default),
+    transform var(--dur) var(--ease-default);
 }
 .rail:hover .tab,
 .rail .tab:focus-visible {
@@ -242,19 +257,19 @@ h2 {
   font-size: var(--size-label);
   font-weight: 500;
   color: var(--ink-muted);
-  margin-bottom: 9px;
+  margin-bottom: var(--space-9);
 }
 h3 {
   font-size: var(--size-body);
   font-weight: 500;
-  margin-bottom: 4px;
+  margin-bottom: var(--space-4);
 }
 
 .stage {
   background: var(--panel-recessed);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 16px 18px;
+  padding: var(--space-16) var(--space-18);
 }
 .stage.bare {
   background: none;
@@ -264,17 +279,17 @@ h3 {
 }
 .bararea {
   display: flex;
-  gap: 7px;
+  gap: var(--space-7);
   align-items: flex-end;
   flex-wrap: wrap;
-  padding-bottom: 13px;
-  margin-bottom: 13px;
+  padding-bottom: var(--space-13);
+  margin-bottom: var(--space-13);
   border-bottom: 1px solid var(--rule);
 }
 .fld {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: var(--space-3);
 }
 .fld label {
   font-size: var(--size-unit);
@@ -282,13 +297,13 @@ h3 {
 }
 .fld input,
 .fld select {
-  padding: 5px 8px;
+  padding: var(--space-5) var(--space-8);
 }
 
 .big {
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 42px;
+  font-size: var(--size-hero);
   font-weight: 500;
   line-height: 1;
 }
@@ -296,7 +311,7 @@ h3 {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  padding: 4px 0;
+  padding: var(--space-4) 0;
 }
 .row .mono {
   font-size: var(--size-mono-body);
@@ -305,15 +320,15 @@ h3 {
 .slot {
   display: flex;
   align-items: center;
-  gap: var(--s-2);
+  gap: var(--space-8);
   font-size: var(--size-unit);
-  padding: 2px 0;
+  padding: var(--space-2) 0;
 }
 .bar {
   flex: 1;
   height: 15px;
   background: var(--panel-sunk);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   box-shadow: inset 0 0 0 1px var(--edge);
 }
@@ -330,13 +345,13 @@ h3 {
 .dot {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--radius-full);
   display: inline-block;
 }
 .pill {
   display: inline-block;
   font-size: var(--size-unit);
-  padding: 2px 8px;
+  padding: var(--space-2) var(--space-8);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   color: var(--ink-muted);
@@ -345,8 +360,8 @@ h3 {
 .why {
   font-size: var(--size-unit);
   color: var(--ink-muted);
-  margin-top: var(--s-2);
-  padding-left: 10px;
+  margin-top: var(--space-8);
+  padding-left: var(--space-10);
   border-left: 2px solid var(--rule);
   display: none;
 }
@@ -354,14 +369,14 @@ h3 {
   display: block;
 }
 .why div {
-  padding: 3px 0;
+  padding: var(--space-3) 0;
 }
 
 .verdict {
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: var(--s-3);
-  margin-bottom: 13px;
+  padding: var(--space-12);
+  margin-bottom: var(--space-13);
   font-size: var(--size-label);
   display: none;
   background: var(--panel);
@@ -374,7 +389,7 @@ h3 {
 }
 .vhead {
   font-weight: 500;
-  margin-bottom: 7px;
+  margin-bottom: var(--space-7);
 }
 /* The Verdict card's mode tabs, drawn onto its own top edge rather than as a
  * control floating above it -- a filing-cabinet tab, not a settings toggle.
@@ -384,14 +399,14 @@ h3 {
  * so it reads as fused with the card rather than resting on top of it. */
 .verdict-modetabs {
   display: flex;
-  gap: 4px;
-  margin: calc(-1 * var(--s-3) - 1px) calc(-1 * var(--s-3)) 0;
-  padding: 0 var(--s-3);
+  gap: var(--space-4);
+  margin: calc(-1 * var(--space-12) - var(--space-1)) calc(-1 * var(--space-12)) 0;
+  padding: 0 var(--space-12);
 }
 .verdict-modetabs button {
   border: 1px solid var(--rule);
   border-radius: var(--radius) var(--radius) 0 0;
-  padding: 5px 12px;
+  padding: var(--space-5) var(--space-12);
   background: var(--panel-recessed);
   color: var(--ink-muted);
   font-size: var(--size-label);
@@ -405,9 +420,9 @@ h3 {
 .budget {
   display: flex;
   height: 20px;
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
-  margin: var(--s-2) 0;
+  margin: var(--space-8) 0;
   background: var(--panel-sunk);
   box-shadow: inset 0 0 0 1px var(--edge);
 }
@@ -415,50 +430,49 @@ h3 {
   display: block;
   height: 100%;
 }
-/* The cluster floor fills the panel it is in, so the legend and the selection
-   rail sit on the BOTTOM edge of the destination rather than trailing the
-   drawing up into the top half of a tall window, and the drawing gets the room
-   between the toolbar and them. Same arithmetic as .chat below: the 55px
-   header, plus main's own 20px padding top and bottom. */
+/* The cluster editor fills the panel it is in, so the reference cards sit on
+   the BOTTOM edge of the destination rather than trailing the drawing up into
+   the top half of a tall window, and the canvas gets the room between the
+   toolbar and them. Same arithmetic as .chat below: the 55px header, plus
+   main's own 20px padding top and bottom. */
 .clusterstage {
   display: flex;
   flex-direction: column;
   min-height: calc(100vh - 95px);
 }
-/* The graph's block is the flex item that grows, so the drawing still takes
-   whatever is left between the toolbar and the two reference blocks below it.
-   Without this the card sizes to its own content and the floor's `flex: 1`
-   has no free space to resolve against, which collapses the drawing.
-
-   `flex: 1` with `min-height: 0` at EVERY level between .clusterstage and the
-   graph's own element, this one included, is what keeps ClusterGraph's
-   ResizeObserver from feeding back into its own size: a flex-basis of 0 means
-   the height comes from the container's free space and never from the
-   content, so measuring the box cannot change the box. Wrapping the floor in
-   a block added a level to that chain, and a level that sizes to its content
-   would reintroduce the loop. */
-.clusterstage .floorcard {
+/* React Flow sizes itself to its parent and needs a definite height to do
+   it, so the card grows into the free space (`flex: 1` with `min-height: 0`
+   at every level, which is what keeps the canvas's own measurement from
+   feeding back into its size) and the canvas has a floor below which a
+   wiring is not readable. */
+.clusterstage .graphcard {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  padding: 0;
+  overflow: hidden;
 }
-.clusterstage .floor {
+.clusterstage .graph {
   flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  /* A flex item's floor is its content; without this a wide drawing would
-     refuse to shrink and push the legend back off the bottom. It is also what
-     lets the graph read its own height back: with a definite height here, the
-     graph's `flex: 1` resolves against free space rather than against its own
-     content, so measuring it cannot feed back into sizing it. */
-  min-height: 0;
+  min-height: calc(var(--space-16) * 36);
+  position: relative;
+}
+.clusterstage .graph-box {
+  position: absolute;
+  inset: 0;
+}
+.wtri-chip {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: var(--space-4);
+  white-space: nowrap;
 }
 
 .legend {
   display: flex;
-  gap: 13px;
+  gap: var(--space-13);
   font-size: var(--size-unit);
   color: var(--ink-muted);
   flex-wrap: wrap;
@@ -474,22 +488,34 @@ table {
   border-collapse: collapse;
   font-size: var(--size-label);
 }
+/* Baseline, not the UA's middle. A cell that wraps -- "Tokens out" at 1024px,
+   a long repo id at 390px, a status with its error class under it -- would
+   otherwise be centred and lift its neighbours' text off the row's line.
+   Enforced by ui/src/check/alignment.mjs. */
+th,
+td {
+  vertical-align: baseline;
+}
 th {
   text-align: left;
   font-weight: 500;
   font-size: var(--size-unit);
   color: var(--ink-muted);
-  padding: 6px 8px;
+  padding: var(--space-6) var(--space-8);
   border-bottom: 1px solid var(--rule);
 }
 td {
-  padding: var(--s-2);
+  padding: var(--space-8);
   border-bottom: 1px solid var(--rule);
 }
 td.num {
   text-align: right;
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+/* A figure's header sits over its figure: numeric columns are right-aligned. */
+th.num {
+  text-align: right;
 }
 tr:last-child td {
   border: none;
@@ -498,9 +524,9 @@ tr:last-child td {
 .deprow {
   display: grid;
   grid-template-columns: 150px 78px 1fr 74px 62px;
-  gap: var(--s-3);
+  gap: var(--space-12);
   align-items: center;
-  padding: 9px 0;
+  padding: var(--space-9) 0;
   border-bottom: 1px solid var(--rule);
   cursor: pointer;
 }
@@ -518,30 +544,30 @@ tr:last-child td {
   background: var(--panel-recessed);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 15px 17px;
-  margin-bottom: 14px;
+  padding: var(--space-15) var(--space-17);
+  margin-bottom: var(--space-14);
 }
 .split {
   display: flex;
   height: 26px;
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   background: var(--panel-sunk);
-  margin: 10px 0;
+  margin: var(--space-10) 0;
   box-shadow: inset 0 0 0 1px var(--edge);
 }
 .split span {
   display: flex;
   align-items: center;
-  padding-left: var(--s-2);
+  padding-left: var(--space-8);
   font-size: var(--size-unit);
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
 }
 .sw {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 7px 0;
+  gap: var(--space-9);
+  padding: var(--space-7) 0;
 }
 .sw input {
   width: auto;
@@ -555,156 +581,12 @@ tr:last-child td {
 }
 
 svg text {
-  font-family: 'IBM Plex Sans', sans-serif;
+  font-family: var(--font-sans);
 }
 svg text.m {
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
-.machine,
-.band,
-.edge {
-  cursor: pointer;
-}
-/* The floor moves rather than teleports. `useFloorMotion` renders a plate
-   where it has arrived and pushes it back to where it was with an inline
-   transform; dropping the push is what this transition then carries. Both the
-   token and the easing are the panel's, so a wire tweened in JavaScript to the
-   same two arrives with the plates instead of racing them.
-
-   Reduced motion needs no rule here: base.css clamps every transition in the
-   document, so the push is simply gone on the next frame. */
-.machine,
-.band {
-  transition: transform var(--dur) var(--ease);
-}
-/* The card's own border carries the node's signal colour, so hover cannot
-   restyle it without overwriting state with decoration. It gets its own ring
-   OUTSIDE the card instead -- the same trick --select-on-panel uses. */
-.machine > rect.ring,
-.band > rect.ring {
-  stroke: none;
-}
-.machine:hover > rect.ring,
-.machine:focus-visible > rect.ring,
-.band:hover > rect.ring,
-.band:focus-visible > rect.ring {
-  stroke: var(--edge);
-  stroke-width: 1.5;
-}
-.edge:hover > path:last-of-type {
-  stroke: var(--ink);
-}
-/* An edge is role=button and tabbable, but a bracket has no path to restyle
-   and the UA outline on an SVG <g> is inconsistent across browsers. Give it
-   the same ring the plates get. */
-.edge:focus-visible {
-  outline: 2px solid var(--select-on-panel);
-  outline-offset: 2px;
-}
-.edge:focus-visible > path:last-of-type {
-  stroke: var(--ink);
-}
-/* A plate under the pointer is not going anywhere it has to be shown getting
-   to: the drag writes a transform on the ghost every frame, and a transition
-   on top of that is a plate that lags the cursor. Bands are hand-placed the
-   same way now, so they get the same rule. */
-.machine[data-dragging='true'],
-.band[data-dragging='true'] {
-  cursor: grabbing;
-  transition: none;
-}
-
-/* A band that is still arriving.
- *
- * The bar sweeps and never fills, which is the same claim -- and the same
- * refusal -- as the setup screen's `.setup-bar .is-open`: nothing downstream
- * reports how big a launch's download will be, so there is no position to
- * draw and this does not draw one. `transform-box: fill-box` puts the
- * percentages on the rect's own box; without it an SVG element measures them
- * against the whole viewport and the highlight leaves the floor entirely. */
-.bandsweep-move {
-  transform-box: fill-box;
-  animation: band-sweep 1.6s ease-in-out infinite;
-}
-.bandsweep-still {
-  display: none;
-}
-@keyframes band-sweep {
-  from {
-    transform: translateX(-110%);
-  }
-  to {
-    transform: translateX(360%);
-  }
-}
-/* The waiting dots on the step in progress. Three real glyphs rather than the
-   animated `content` the setup screen uses, because SVG text has no
-   pseudo-elements -- but the same sequence: nothing, then one, two, three. A
-   keyframe each rather than one keyframe under three delays, which rolls the
-   dots instead of counting them up. */
-.banddot1,
-.banddot2,
-.banddot3 {
-  animation-duration: 1.4s;
-  animation-timing-function: steps(1, end);
-  animation-iteration-count: infinite;
-}
-.banddot1 {
-  animation-name: band-dot1;
-}
-.banddot2 {
-  animation-name: band-dot2;
-}
-.banddot3 {
-  animation-name: band-dot3;
-}
-@keyframes band-dot1 {
-  0%,
-  24% {
-    opacity: 0;
-  }
-  25%,
-  100% {
-    opacity: 1;
-  }
-}
-@keyframes band-dot2 {
-  0%,
-  49% {
-    opacity: 0;
-  }
-  50%,
-  100% {
-    opacity: 1;
-  }
-}
-@keyframes band-dot3 {
-  0%,
-  74% {
-    opacity: 0;
-  }
-  75%,
-  100% {
-    opacity: 1;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  /* Still visibly in progress, without the movement. */
-  .bandsweep-move {
-    display: none;
-  }
-  .bandsweep-still {
-    display: inline;
-  }
-  .banddot1,
-  .banddot2,
-  .banddot3 {
-    animation: none;
-    opacity: 1;
-  }
-}
-
 .sheet {
   position: fixed;
   inset: 0;
@@ -712,7 +594,7 @@ svg text.m {
   display: none;
   align-items: center;
   justify-content: center;
-  z-index: 9;
+  z-index: var(--z-overlay);
 }
 .sheet.on {
   display: flex;
@@ -722,7 +604,7 @@ svg text.m {
   box-shadow: var(--shadow-raised);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 20px;
+  padding: var(--space-20);
   width: 440px;
   max-width: 92vw;
 }
@@ -746,7 +628,7 @@ svg text.m {
 .nodegrid {
   display: grid;
   grid-template-columns: 1.15fr 1fr;
-  gap: var(--s-5);
+  gap: var(--space-24);
   align-items: start;
 }
 /* Same breakpoint as .chartgrid, and for the same reason: below it two charts
@@ -771,7 +653,7 @@ svg text.m {
 .depgrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: var(--s-5);
+  gap: var(--space-24);
   align-items: start;
 }
 .depgrid > .deplogcol {
@@ -796,7 +678,7 @@ svg text.m {
   margin: 0;
   max-height: min(62vh, 720px);
   background: var(--panel-recessed);
-  font-size: 12px;
+  font-size: var(--size-unit);
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -817,7 +699,7 @@ svg text.m {
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   background: var(--panel);
-  margin-bottom: var(--s-3);
+  margin-bottom: var(--space-12);
 }
 /* Same grammar as `.chart h4`: a title on the left, the control on the right,
    both on one baseline. */
@@ -826,12 +708,12 @@ svg text.m {
   font-weight: 500;
   color: var(--ink-muted);
   margin: 0;
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   border-bottom: 1px solid var(--rule);
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  gap: var(--s-3);
+  gap: var(--space-12);
 }
 /* `.chips` carries a 10px bottom margin for its usual home above a grid. In a
    baseline-aligned header that margin hangs the buttons high. */
@@ -843,14 +725,14 @@ svg text.m {
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
-  padding: 4px 12px 8px;
+  padding: var(--space-4) var(--space-12) var(--space-8);
 }
 .logbox .foot {
   border-top: 1px solid var(--rule);
-  padding: 6px 12px;
+  padding: var(--space-6) var(--space-12);
 }
 .logline {
-  padding: 5px 0;
+  padding: var(--space-5) 0;
 }
 .logline + .logline {
   border-top: 1px solid var(--rule);
@@ -863,7 +745,7 @@ svg text.m {
    Same 320px as the log beside it, so the column keeps its rhythm. */
 .termbody {
   height: 320px;
-  padding: 6px 8px;
+  padding: var(--space-6) var(--space-8);
 }
 .termbody .xterm-viewport {
   overscroll-behavior: contain;
@@ -875,11 +757,11 @@ svg text.m {
    control you have to scroll back up to reach reads as a one-time choice. */
 .nodehead {
   position: sticky;
-  top: -20px;
-  z-index: 1;
+  top: calc(-1 * var(--space-20));
+  z-index: var(--z-sticky);
   background: var(--panel-raised);
-  margin: -20px -20px 0;
-  padding: 20px 20px 10px;
+  margin: calc(-1 * var(--space-20)) calc(-1 * var(--space-20)) 0;
+  padding: var(--space-20) var(--space-20) var(--space-10);
   border-bottom: 1px solid var(--rule);
 }
 .sub {
@@ -887,21 +769,21 @@ svg text.m {
   font-weight: 500;
   color: var(--ink-muted);
   letter-spacing: 0.04em;
-  margin: var(--s-4) 0 var(--s-2);
-  padding-top: 11px;
+  margin: var(--space-16) 0 var(--space-8);
+  padding-top: var(--space-11);
   border-top: 1px solid var(--rule);
 }
 .quad {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
-  gap: 14px;
+  gap: var(--space-14);
 }
 .quad .readout {
-  font-size: 21px;
+  font-size: var(--size-readout-sm);
 }
 .dets {
   opacity: 0;
-  transition: opacity 0.12s;
+  transition: opacity var(--dur-fast);
 }
 .deprow:hover .dets,
 .deprow.sel .dets {
@@ -909,52 +791,59 @@ svg text.m {
 }
 .throttle {
   width: 100%;
-  margin: 6px 0 2px;
+  margin: var(--space-6) 0 var(--space-2);
 }
 .cmd {
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   font-size: var(--size-unit);
   line-height: 1.55;
   white-space: pre;
   background: var(--panel);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 10px 12px;
+  padding: var(--space-10) var(--space-12);
   overflow-x: auto;
-  margin-top: var(--s-2);
+  margin-top: var(--space-8);
+}
+/* RevealModal: the secret must be wholly visible to be written down, so it
+   wraps (anywhere: a token_urlsafe secret has no spaces) instead of scrolling. */
+.reveal .cmd {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: visible;
 }
 .cmd .ovr {
   background: var(--panel-sunk);
-  border-radius: 2px;
-  padding: 0 2px;
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-2);
 }
 .phase {
   display: flex;
   height: 22px;
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   background: var(--panel-sunk);
   box-shadow: inset 0 0 0 1px var(--edge);
-  margin: var(--s-2) 0 var(--s-1);
+  margin: var(--space-8) 0 var(--space-4);
 }
 .phase span {
   display: flex;
   align-items: center;
-  padding-left: 7px;
+  padding-left: var(--space-7);
   font-size: var(--size-micro);
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   white-space: nowrap;
   overflow: hidden;
 }
 .chips {
   display: flex;
-  gap: var(--s-half);
+  gap: var(--space-6);
   flex-wrap: wrap;
-  margin: 0 0 10px;
+  margin: 0 0 var(--space-10);
 }
 .chips button {
   font-size: var(--size-unit);
-  padding: 4px 10px;
+  padding: var(--space-4) var(--space-10);
   border-radius: var(--radius);
 }
 .chips button[aria-pressed='true'] {
@@ -965,9 +854,9 @@ svg text.m {
 .swapbar {
   display: none;
   align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  margin-bottom: var(--s-3);
+  gap: var(--space-10);
+  padding: var(--space-9) var(--space-12);
+  margin-bottom: var(--space-12);
   font-size: var(--size-label);
   border: 1px solid var(--warn);
   border-radius: var(--radius);
@@ -978,15 +867,15 @@ svg text.m {
 }
 .subs {
   display: flex;
-  gap: 2px;
-  margin: 0 0 14px;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-14);
   border-bottom: 1px solid var(--rule);
 }
 .subs button {
   border: none;
   background: none;
   border-radius: 0;
-  padding: 6px 12px;
+  padding: var(--space-6) var(--space-12);
   color: var(--ink-muted);
   border-bottom: 2px solid transparent;
   font-size: var(--size-label);
@@ -1006,7 +895,7 @@ svg text.m {
 .settingsgrid {
   display: grid;
   grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr);
-  gap: var(--s-4);
+  gap: var(--space-16);
   align-items: start;
 }
 .settingsgrid > .card2 {
@@ -1017,14 +906,14 @@ svg text.m {
     grid-template-columns: 1fr;
   }
   .settingsgrid > .card2 {
-    margin-bottom: 14px;
+    margin-bottom: var(--space-14);
   }
 }
 
 .chartgrid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: var(--s-4);
+  gap: var(--space-16);
 }
 @media (max-width: 900px) {
   .chartgrid {
@@ -1034,19 +923,19 @@ svg text.m {
 .chart {
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 10px 12px;
+  padding: var(--space-10) var(--space-12);
   background: var(--panel);
 }
 .chart h4 {
   font-size: var(--size-unit);
   font-weight: 500;
-  margin: 0 0 2px;
+  margin: 0 0 var(--space-2);
   display: flex;
   justify-content: space-between;
   align-items: baseline;
 }
 .chart h4 .now {
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: var(--size-body);
 }
@@ -1055,7 +944,7 @@ svg text.m {
   color: var(--ink-muted);
   display: flex;
   justify-content: space-between;
-  margin-top: 2px;
+  margin-top: var(--space-2);
 }
 
 /* uPlot's own stylesheet is imported by Chart.tsx and is entirely scoped to
@@ -1103,14 +992,14 @@ svg text.m {
      transcript's true content height instead of `.chat`'s own height below --
      the same `min-height: 0`/fr rule .clusterstage documents applies here. */
   grid-template-rows: minmax(0, 1fr);
-  gap: var(--s-4);
+  gap: var(--space-16);
   /* the 55px header, plus main's own 20px padding top and bottom */
   height: calc(100vh - 95px);
   min-height: 420px;
 }
 .chatlist {
   overflow-y: auto;
-  padding-right: var(--s-3);
+  padding-right: var(--space-12);
   border-right: 1px solid var(--rule);
 }
 .chatlist button {
@@ -1120,7 +1009,7 @@ svg text.m {
   border: none;
   border-bottom: 1px solid var(--rule);
   border-radius: 0;
-  padding: var(--s-2) var(--s-1);
+  padding: var(--space-8) var(--space-4);
 }
 .chatlist button[aria-pressed='true'] {
   background: var(--panel-sunk);
@@ -1133,14 +1022,14 @@ svg text.m {
 .chatgrouphead {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: var(--z-sticky);
   background: var(--panel);
-  padding: var(--s-2) var(--s-1) var(--s-half);
+  padding: var(--space-8) var(--space-4) var(--space-6);
   border-bottom: 1px solid var(--rule);
   color: var(--ink-muted);
 }
 .chatgroup + .chatgroup .chatgrouphead {
-  margin-top: var(--s-3);
+  margin-top: var(--space-12);
 }
 
 .chatpane {
@@ -1154,17 +1043,28 @@ svg text.m {
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
 }
+/* Everything above the transcript: the model and endpoint, the thinking setup
+   sentence, the substitution warning, and the session's figures. One rule
+   under the whole block rather than one per row. */
+.chattop {
+  display: grid;
+  gap: var(--space-8);
+  padding-bottom: var(--space-8);
+  border-bottom: 1px solid var(--rule);
+}
 .chathead {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: var(--s-3);
-  padding-bottom: var(--s-2);
-  border-bottom: 1px solid var(--rule);
+  gap: var(--space-12);
+}
+.chatstats {
+  padding-top: var(--space-8);
+  border-top: 1px solid var(--rule);
 }
 .chatlog {
   overflow-y: auto;
-  padding: var(--s-3) var(--s-3) 0 0;
+  padding: var(--space-12) var(--space-12) 0 0;
 }
 /* The rule down the left is WHICH MODEL this turn went to. Transparent by
    default so a plain block and a coloured one sit on the same left edge, and
@@ -1173,7 +1073,7 @@ svg text.m {
    a colour. Style and tint arrive together with it, so nothing here needs a
    per-slot class. */
 .turn {
-  padding: var(--s-3) var(--s-3) var(--s-3) var(--s-2);
+  padding: var(--space-12) var(--space-12) var(--space-12) var(--space-8);
   border-left: 3px solid transparent;
 }
 .turn + .turn {
@@ -1183,11 +1083,61 @@ svg text.m {
   color: var(--ink-muted);
 }
 
+/* A turn's reasoning, under its Thinking disclosure. Plain text, muted, and
+   capped so a long chain of thought does not push the answer off screen. */
+.think {
+  white-space: pre-wrap;
+  color: var(--ink-muted);
+  border-left: 2px solid var(--rule);
+  padding-left: var(--space-10);
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.turnmeta {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-6);
+}
+
+/* An answer rendered from markdown (tabs/chat/Markdown.tsx). Only the blocks
+   that parser makes; every heading level renders as `.label`. */
+.md p,
+.md ul,
+.md ol,
+.md blockquote,
+.md pre {
+  margin: var(--space-4) 0 0;
+}
+.md p {
+  white-space: pre-wrap;
+}
+.md pre {
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
+  background: var(--panel-sunk);
+  padding: var(--space-8) var(--space-10);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+.md code {
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
+}
+.md ul,
+.md ol {
+  padding-left: var(--space-20);
+}
+.md blockquote {
+  padding-left: var(--space-10);
+  border-left: 2px solid var(--rule);
+  color: var(--ink-muted);
+}
+
 .composer {
   border-top: 1px solid var(--rule);
-  padding-top: var(--s-3);
+  padding-top: var(--space-12);
   display: grid;
-  gap: var(--s-2);
+  gap: var(--space-8);
 }
 .composer textarea {
   font: inherit;
@@ -1195,7 +1145,7 @@ svg text.m {
   background: var(--panel);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: var(--s-half) var(--s1);
+  padding: var(--space-6) var(--space-12);
   resize: vertical;
   min-height: 62px;
 }
@@ -1207,7 +1157,7 @@ svg text.m {
 .speechrow {
   display: flex;
   align-items: flex-end;
-  gap: var(--s-3);
+  gap: var(--space-12);
   flex-wrap: wrap;
 }
 /* The native file control, only brought as far as the surrounding fields.
@@ -1227,23 +1177,23 @@ svg text.m {
   background: var(--panel);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  padding: 4px 8px;
-  margin-right: var(--s-2);
+  padding: var(--space-4) var(--space-8);
+  margin-right: var(--space-8);
   cursor: pointer;
 }
 .speechrow input[type='text'] {
-  padding: 5px 8px;
+  padding: var(--space-5) var(--space-8);
   width: 5ch;
 }
 .clip {
   display: grid;
-  gap: var(--s-2);
-  padding: var(--s-3) 0;
+  gap: var(--space-8);
+  padding: var(--space-12) 0;
 }
 .cliprow {
   display: flex;
   align-items: baseline;
-  gap: var(--s-3);
+  gap: var(--space-12);
   flex-wrap: wrap;
 }
 @media (max-width: 760px) {
@@ -1268,24 +1218,24 @@ svg text.m {
 }
 .pop {
   position: absolute;
-  top: calc(100% + 4px);
+  top: calc(100% + var(--space-4));
   left: 0;
-  z-index: 5;
+  z-index: var(--z-rail);
   min-width: 260px;
-  /* `main` is overflow:hidden, so an unbounded panel on a wide cluster would
+  /* `main` is overflow: hidden, so an unbounded panel on a wide cluster would
      be clipped at the bottom of the viewport rather than scrolling. */
   max-height: 320px;
   overflow-y: auto;
   background: var(--panel-raised);
   border: 1px solid var(--rule);
   box-shadow: var(--shadow-raised);
-  padding: 8px;
+  padding: var(--space-8);
 }
 .pop .poprow {
   display: flex;
-  gap: 8px;
+  gap: var(--space-8);
   align-items: flex-start;
-  padding: 5px 4px;
+  padding: var(--space-5) var(--space-4);
   cursor: pointer;
 }
 .pop .poprow.off {
@@ -1296,10 +1246,10 @@ svg text.m {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-8);
   border-top: 1px solid var(--rule);
-  margin-top: 6px;
-  padding-top: 6px;
+  margin-top: var(--space-6);
+  padding-top: var(--space-6);
 }
 
 /* ── Model cards ────────────────────────────────────────────────────────────
@@ -1320,8 +1270,8 @@ svg text.m {
 .mgrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(204px, 1fr));
-  gap: var(--s-3);
-  padding: var(--s-3) 0 var(--s-4);
+  gap: var(--space-12);
+  padding: var(--space-12) 0 var(--space-16);
 }
 
 .mcard {
@@ -1329,7 +1279,7 @@ svg text.m {
   display: flex;
   flex-direction: column;
   height: 128px;
-  padding: 12px 12px 11px;
+  padding: var(--space-12) var(--space-12) var(--space-11);
   text-align: left;
   overflow: hidden;
   border: 1px solid var(--rule);
@@ -1356,7 +1306,7 @@ svg text.m {
      the same at either length. The dots are the exception -- they belong on
      the title's own line, so they opt out below. */
   align-items: center;
-  gap: 10px;
+  gap: var(--space-10);
   min-width: 0;
 }
 
@@ -1383,8 +1333,8 @@ svg text.m {
   content: '';
   position: absolute;
   /* The mark is 44x44, so this is a 236x176 field centred on it. */
-  inset: -66px -96px;
-  z-index: -1;
+  inset: calc(-1 * var(--space-66)) calc(-1 * var(--space-96));
+  z-index: var(--z-below);
   pointer-events: none;
   background:
     radial-gradient(
@@ -1426,12 +1376,12 @@ svg text.m {
 }
 .mcard-initials {
   font-family: var(--font-sans);
-  font-size: 15px;
+  font-size: var(--size-body);
   font-weight: 600;
   letter-spacing: 0.01em;
   /* The tile is the accent at full strength, so the monogram is the light
    * side of the pair regardless of which hue landed here. */
-  color: rgb(255 255 255 / 0.94);
+  color: var(--on-accent);
 }
 
 .mcard-id {
@@ -1444,7 +1394,7 @@ svg text.m {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  font-size: 13.5px;
+  font-size: var(--size-title-sm);
   line-height: 16px;
   font-weight: 600;
   color: var(--ink);
@@ -1453,10 +1403,10 @@ svg text.m {
 .mcard-owner {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-4);
   min-width: 0;
-  margin-top: 2px;
-  font-size: 11.5px;
+  margin-top: var(--space-2);
+  font-size: var(--size-caption);
   line-height: 15px;
   color: var(--ink-muted);
 }
@@ -1467,7 +1417,7 @@ svg text.m {
 }
 .mcard-verified {
   flex: 0 0 auto;
-  font-size: 10px;
+  font-size: var(--size-badge);
   line-height: 1;
   color: var(--accent);
 }
@@ -1475,15 +1425,15 @@ svg text.m {
 .mcard-dots {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-4);
   flex: 0 0 auto;
   /* Not centred with the rest of the row: a signal lamp belongs beside the
      name it is about, which is the row's first line. */
   align-self: flex-start;
-  margin-top: 3px;
+  margin-top: var(--space-3);
 }
 .mcard-glyph {
-  font-size: 11px;
+  font-size: var(--size-micro);
   line-height: 1;
   color: var(--warn);
 }
@@ -1492,25 +1442,25 @@ svg text.m {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-8);
   margin-top: auto;
-  padding-top: 10px;
+  padding-top: var(--space-10);
   min-width: 0;
 }
 .mcard-stats {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--space-9);
   min-width: 0;
   font-family: var(--font-mono);
-  font-size: var(--size-mono-unit, 11px);
+  font-size: var(--size-mono-unit);
   font-variant-numeric: tabular-nums;
   color: var(--ink-muted);
 }
 .mcard-stat {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: var(--space-3);
   white-space: nowrap;
 }
 
@@ -1522,8 +1472,8 @@ svg text.m {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-3) 0 var(--s-2);
+  gap: var(--space-8);
+  padding: var(--space-12) 0 var(--space-8);
 }
 .mbar-search {
   position: relative;
@@ -1533,34 +1483,34 @@ svg text.m {
 .mbar-search input {
   width: 100%;
   height: 34px;
-  padding: 0 34px 0 30px;
+  padding: 0 var(--space-34) 0 var(--space-30);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   background: var(--panel-recessed);
 }
 .mbar-search .mbar-icon {
   position: absolute;
-  left: 12px;
+  left: var(--space-12);
   top: 50%;
   transform: translateY(-50%);
   color: var(--ink-muted);
-  font-size: 13px;
+  font-size: var(--size-label);
   pointer-events: none;
 }
 .mbar-search .mbar-clear {
   position: absolute;
-  right: 6px;
+  right: var(--space-6);
   top: 50%;
   transform: translateY(-50%);
   border: 0;
   border-radius: var(--radius);
-  padding: 2px 7px;
+  padding: var(--space-2) var(--space-7);
   color: var(--ink-muted);
 }
 .mbar select {
   height: 34px;
   border-radius: var(--radius);
-  padding: 0 var(--s-2);
+  padding: 0 var(--space-8);
   background: var(--panel-recessed);
 }
 
@@ -1571,16 +1521,16 @@ svg text.m {
  * would be a difference that means nothing. The scroll lives here rather than
  * on the row so the search box stays put while the list moves under it. */
 .pmodels {
-  padding: var(--s-2) 0;
+  padding: var(--space-8) 0;
 }
 .pmodels-list {
   max-height: 320px;
   overflow-y: auto;
-  margin-top: var(--s-2);
-  padding-right: var(--s-2);
+  margin-top: var(--space-8);
+  padding-right: var(--space-8);
 }
 .pmodels-list .sw {
-  padding: 4px 0;
+  padding: var(--space-4) 0;
 }
 
 /* Cards-or-rows, the same two-position toggle Studio uses for models-or-datasets. */
@@ -1588,7 +1538,7 @@ svg text.m {
   display: inline-flex;
   align-items: center;
   height: 34px;
-  padding: 3px;
+  padding: var(--space-3);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   background: var(--panel-recessed);
@@ -1598,7 +1548,7 @@ svg text.m {
   border: 0;
   border-radius: var(--radius);
   height: 26px;
-  padding: 0 11px;
+  padding: 0 var(--space-11);
   color: var(--ink-muted);
   background: transparent;
 }
@@ -1626,7 +1576,7 @@ svg text.m {
 .msplit {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: var(--s-3);
+  gap: var(--space-12);
   align-items: start;
 }
 .msplit.detail {
@@ -1637,7 +1587,7 @@ svg text.m {
  * both rather than sitting between them. */
 .msplit.detail .deprow {
   align-items: start;
-  padding: 8px 0;
+  padding: var(--space-8) 0;
 }
 
 .msplit-list,
@@ -1661,7 +1611,7 @@ svg text.m {
  * one anyway, but saying so keeps the card from stretching oddly at 360px. */
 .mgrid.split {
   grid-template-columns: 1fr;
-  gap: var(--s-2);
+  gap: var(--space-8);
 }
 .mgrid.split .mcard {
   height: auto;
@@ -1710,7 +1660,7 @@ svg text.m {
   grid-template-columns:
     18px minmax(148px, 1.6fr) minmax(150px, 168px) minmax(96px, 116px)
     minmax(78px, 92px) minmax(92px, 1fr);
-  gap: var(--s-3);
+  gap: var(--space-12);
   align-items: start;
   min-width: 640px;
 }
@@ -1719,11 +1669,11 @@ svg text.m {
   font-weight: 500;
   color: var(--ink-muted);
   letter-spacing: 0.04em;
-  padding-bottom: 6px;
+  padding-bottom: var(--space-6);
   border-bottom: 1px solid var(--rule);
 }
 .nboard-row {
-  padding: 9px 0;
+  padding: var(--space-9) 0;
   border-bottom: 1px solid var(--rule);
 }
 .nboard-row:last-child {
@@ -1736,7 +1686,7 @@ svg text.m {
   background: var(--panel-sunk);
 }
 .nboard-row > input[type='checkbox'] {
-  margin-top: 3px;
+  margin-top: var(--space-3);
 }
 .nboard-row > label {
   cursor: pointer;
@@ -1747,7 +1697,7 @@ svg text.m {
 /* Indented under the machine it is about, clear of the tick column. */
 .nboard-note {
   grid-column: 2 / -1;
-  margin: 5px 0 0;
+  margin: var(--space-5) 0 0;
 }
 
 /* ── The node terminal ───────────────────────────────────────────────────────
@@ -1758,5 +1708,427 @@ svg text.m {
  * did not connect" rather than as a missing CSS rule. */
 .termbody {
   height: 340px;
-  padding: 6px 8px;
+  padding: var(--space-6) var(--space-8);
+}
+
+/* Wiring editor (React Flow) theme: React Flow's variables onto pack tokens. */
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-background-pattern-color: var(--graph-dots);
+  --xy-edge-stroke: var(--graph-link);
+  --xy-edge-stroke-selected: var(--graph-block-selected);
+  --xy-connectionline-stroke: var(--graph-req);
+  --xy-node-background-color: var(--graph-block-bg);
+  --xy-node-border: 1px solid var(--graph-block-border);
+  --xy-node-color: var(--ink);
+  --xy-node-border-radius: var(--radius);
+  --xy-handle-background-color: var(--graph-block-bg);
+  --xy-handle-border-color: var(--graph-block-border);
+  --xy-attribution-background-color: transparent;
+  --xy-selection-background-color: var(--hover);
+  --xy-selection-border: 1px dashed var(--graph-block-selected);
+}
+
+/* ── The wiring editor's blocks, sockets and wires ──────────────────────────
+ * Colour here encodes socket type and nothing else (--sock is set per socket
+ * from tabs/cluster/sockets.ts); red and amber are faults and warnings. */
+.wtoolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+  margin-bottom: var(--space-8);
+  flex-wrap: wrap;
+}
+.wtoolbar-gap {
+  flex: 1;
+}
+.wtoolbar .wzoom {
+  min-width: calc(var(--space-16) * 3);
+  text-align: center;
+}
+/* aria-disabled rather than disabled, so the title naming the error count
+   still shows on hover and the button stays in the tab order. */
+.wtoolbar button[aria-disabled='true'] {
+  opacity: var(--opacity-45);
+  cursor: not-allowed;
+}
+.wlive {
+  margin: 0 0 var(--space-6);
+  min-height: 1.4em;
+}
+.whint {
+  display: inline-block;
+  padding: var(--space-4) var(--space-10);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--panel-raised);
+  font-size: var(--size-unit);
+}
+.wcards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(calc(var(--space-16) * 22), 1fr));
+  gap: var(--space-12);
+  margin-top: var(--space-12);
+}
+.wcards .card2 {
+  margin: 0;
+}
+.wops {
+  max-height: calc(var(--space-16) * 16);
+  overflow: auto;
+  margin: 0 0 var(--space-8);
+  font-size: var(--size-unit);
+  white-space: pre;
+}
+.wlaunches,
+.wsaved {
+  margin: 0;
+  padding-left: var(--space-16);
+  display: grid;
+  gap: var(--space-4);
+}
+.wsaved li[data-status='failed'] b,
+.wsaved li[data-status='not applied'] b {
+  color: var(--fault);
+}
+.wsaved-msg {
+  display: block;
+  white-space: pre-wrap;
+  color: var(--fault);
+}
+
+/* A block on the canvas. Rows bleed to the frame's edges so their sockets sit
+   on the border, where the wires meet them. */
+.wnode {
+  position: relative;
+  width: calc(var(--space-16) * 16);
+  font-size: var(--size-label);
+}
+.wnode.wmachine,
+.wnode.wprovider {
+  width: calc(var(--space-16) * 19);
+}
+.wnode.wmodel {
+  width: calc(var(--space-16) * 18);
+}
+.wport,
+.wrow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  margin: 0 calc(var(--space-12) * -1);
+  padding: var(--space-2) var(--space-12);
+  min-height: var(--space-24);
+}
+.wport-right {
+  justify-content: flex-end;
+}
+.wrow {
+  border-top: 1px solid var(--rule);
+  padding-top: var(--space-6);
+  padding-bottom: var(--space-6);
+}
+.wrow[data-rank='true'] {
+  opacity: var(--opacity-72);
+}
+.wrow-main {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+}
+.wrow-title {
+  all: unset;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+}
+button.wrow-title:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.wchips {
+  display: flex;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+.wchips:empty {
+  display: none;
+}
+.wfields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-6) var(--space-10);
+}
+.wfields label {
+  display: grid;
+  gap: var(--space-2);
+}
+.wfields input[type='number'] {
+  width: calc(var(--space-16) * 5);
+}
+.wfield-wide,
+.wfield-wide input {
+  width: 100%;
+}
+.wprovider-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+.wlogo,
+.wmonogram {
+  width: var(--space-16);
+  height: var(--space-16);
+  border-radius: var(--radius-sm);
+}
+.wmonogram {
+  display: inline-grid;
+  place-items: center;
+  background: var(--fill);
+  color: var(--on-fill);
+  font-size: var(--size-micro);
+}
+.waddmodel {
+  display: grid;
+  gap: var(--space-4);
+}
+.waddmodel ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: calc(var(--space-16) * 10);
+  overflow: auto;
+}
+.waddmodel li button {
+  width: 100%;
+  text-align: left;
+}
+
+/* The load balancer's triangles. */
+.wtri {
+  width: calc(var(--space-16) * 12.5);
+  height: calc(var(--space-16) * 7.5);
+}
+.wtri-shape {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.wtri-text {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  gap: var(--space-2);
+  max-width: 55%;
+  font-size: var(--size-unit);
+}
+.wtri-text .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wtri-text-split {
+  right: var(--space-12);
+  text-align: right;
+}
+.wtri-text-merge {
+  left: var(--space-12);
+}
+/* Port labels sit inside the triangle, beside their socket, so nothing hangs
+   into the next column. The merge's out label stays outside its point,
+   where the triangle is too thin to hold it. */
+.wtri-port {
+  position: absolute;
+  transform: translateY(-50%);
+}
+.wtri-port-local {
+  right: var(--space-12);
+  top: 25%;
+}
+.wtri-port-cloud {
+  right: var(--space-12);
+  top: 75%;
+}
+.wtri-port-in-local {
+  left: var(--space-12);
+  top: 25%;
+}
+.wtri-port-in-cloud {
+  left: var(--space-12);
+  top: 75%;
+}
+.wtri-port-out {
+  right: calc(var(--space-10) * -1);
+  top: 50%;
+  transform: translate(100%, -100%);
+}
+.wtri-limit-label {
+  position: absolute;
+  left: 50%;
+  top: 74%;
+  transform: translate(var(--space-10), var(--space-4));
+}
+/* The × on a selected wire you own. */
+.wcut {
+  position: absolute;
+  pointer-events: all;
+  padding: var(--space-2);
+  border-radius: 50%;
+  background: var(--panel-raised);
+  line-height: 0;
+}
+.wcut-below {
+  margin-top: var(--space-20);
+}
+/* A deployment's launch flags on its machine row. */
+.wflag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* One flag, one line: `--enforce-eager` never breaks at its hyphen. */
+  white-space: nowrap;
+  max-width: 100%;
+}
+.wflag button {
+  padding: 0 var(--space-2);
+  line-height: 1;
+}
+.wflag-removed {
+  text-decoration: line-through;
+  opacity: var(--opacity-45);
+}
+/* What Save will do to a row: relaunch it, or stop it. */
+.pill.wpending {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+/* An OpenRouter row's host table inside a provider block: the block is
+   narrower than the table, so it scrolls sideways rather than clipping. */
+.whosts {
+  max-width: 100%;
+  overflow-x: auto;
+  font-size: var(--size-unit);
+}
+/* The balancer dialog (double-click a split or merge). */
+.wbalancer h3 {
+  margin: var(--space-16) 0 var(--space-6);
+}
+.wbalancer-field select {
+  max-width: 100%;
+}
+.wbalancer-note {
+  color: var(--warn);
+}
+/* The balancer dialog takes the whole screen, so every target's slider has
+   room and they line up in one column of equal width. */
+.card.full.wbalancer {
+  width: 96vw;
+  height: 92vh;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+}
+.wbalancer-targets {
+  width: 100%;
+  table-layout: fixed;
+  font-size: var(--size-unit);
+}
+.wbalancer-targets th:nth-child(1) {
+  width: 24%;
+}
+.wbalancer-targets th:nth-child(4) {
+  width: 34%;
+}
+.wbalancer-targets td {
+  overflow-wrap: anywhere;
+  vertical-align: middle;
+}
+/* A target's share of the split: a slider and its whole-number percent. */
+.wshare {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  white-space: nowrap;
+}
+.wshare input[type='range'] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--ink);
+}
+.wshare .mono {
+  width: 4ch;
+  text-align: right;
+}
+.wbalancer-actions {
+  display: flex;
+  gap: var(--space-8);
+  margin-top: auto;
+  padding-top: var(--space-20);
+}
+.socklabel {
+  font-size: var(--size-unit);
+  white-space: nowrap;
+}
+
+/* Sockets: filled = yours to wire, hollow = fixed by the server. */
+.react-flow__handle.sock {
+  width: var(--space-10);
+  height: var(--space-10);
+  min-width: 0;
+  min-height: 0;
+  border: 2px solid var(--sock);
+  transition: transform var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+.react-flow__handle.sock-edit {
+  background: var(--sock);
+  cursor: crosshair;
+}
+.react-flow__handle.sock-fixed {
+  background: var(--graph-block-bg);
+  cursor: help;
+  /* React Flow turns pointer events off on a handle that cannot connect; a
+     fixed socket still answers a press with the sentence saying why. */
+  pointer-events: all;
+}
+.react-flow__handle.sock-valid {
+  transform: translate(-50%, -50%) scale(1.6);
+  box-shadow: 0 0 0 var(--space-4) color-mix(in srgb, var(--sock) 35%, transparent);
+}
+.react-flow__handle-bottom.sock-valid,
+.react-flow__handle-top.sock-valid {
+  transform: translate(-50%, -50%) scale(1.6);
+}
+.react-flow__handle.sock-dim {
+  opacity: 0.18;
+}
+.react-flow__edge-path {
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+/* Wire labels and the particle layer. */
+.wlabel {
+  position: absolute;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  font-size: var(--size-micro);
+  font-family: var(--font-mono);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.wlabel-link {
+  color: var(--ink-secondary);
+}
+.wparticles {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
 }

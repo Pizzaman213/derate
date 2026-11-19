@@ -1,0 +1,1 @@
+{"description":"Missing values and missing locations: skipped and noted.","data":[{"region":"CHN","value":1410},{"region":"IND","value":null},{"region":"USA","value":335},{"lon":null,"lat":null,"value":12,"label":"Nowhere"},{"region":"BRA","value":""},{"label":"Lagos","lon":3.38,"lat":6.52,"value":16},{"region":"NGA"}]}

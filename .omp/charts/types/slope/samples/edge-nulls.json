@@ -1,0 +1,1 @@
+{"description":"Missing values: null, empty string and an absent key.","data":[{"label":"Alpha","start":120,"end":150},{"label":"Bravo","start":null,"end":240},{"label":"Charlie","start":"","end":160},{"label":"Delta","start":90,"end":75},{"label":"Echo","end":190}],"options":{"startLabel":"2024","endLabel":"2025"}}

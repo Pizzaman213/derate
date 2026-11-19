@@ -1,0 +1,10 @@
+{
+  "name": "derate-chart-pack-extension",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "omp extension for the derate chart pack: chart_recommend/chart_lookup/dataset_lookup/schema_validate tools, /chart /chart-for /chart-new /chart-data /chart-sample /chart-check /chart-gallery, and the hooks that check edited charts, rebuild registry.json and gallery.html, log CHANGELOG.md and gate the session on the scoped check. Everything runs .omp/charts/scripts/cli.mjs.",
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

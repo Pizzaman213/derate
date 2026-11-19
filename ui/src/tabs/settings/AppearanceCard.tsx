@@ -8,7 +8,6 @@ export function AppearanceCard() {
 
   return (
     <div className="card2">
-      <h3>Appearance</h3>
       <div className="row">
         <span>Colour scheme</span>
         <select
@@ -22,6 +21,7 @@ export function AppearanceCard() {
           <option value="system">System</option>
           <option value="light">Light</option>
           <option value="dark">Dark</option>
+          <option value="high-contrast">High contrast</option>
         </select>
       </div>
     </div>

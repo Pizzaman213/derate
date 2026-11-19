@@ -195,6 +195,9 @@ class Resolution:
     param_breakdown: dict[str, int] = field(default_factory=dict)
     resolved_at: float = 0.0
     from_cache: bool = False
+    #: The repository ships Python (``auto_map`` in config.json, or a ``.py``
+    #: file) that ``--trust-remote-code`` would execute inside the container.
+    remote_code: bool = False
     elapsed_ms: float = 0.0
 
     @property

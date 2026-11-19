@@ -13,19 +13,9 @@
 
 /** Ten hues, hashed by owner, so the same publisher is the same colour on every
  *  card and across reloads. Deliberately not `--live`/`--warn`/`--fault`: an
- *  accent that landed on signal green would read as a verdict. */
-const PALETTE = [
-  'hsl(214 66% 52%)',
-  'hsl(172 54% 44%)',
-  'hsl(30 70% 52%)',
-  'hsl(348 62% 56%)',
-  'hsl(198 64% 50%)',
-  'hsl(140 48% 46%)',
-  'hsl(222 50% 56%)',
-  'hsl(16 64% 54%)',
-  'hsl(260 46% 58%)',
-  'hsl(44 72% 50%)',
-]
+ *  accent that landed on signal green would read as a verdict. The values are
+ *  `color.avatar.*` in the design pack, theme-invariant. */
+const PALETTE = Array.from({ length: 10 }, (_, i) => `var(--avatar-${i + 1})`)
 
 export function hashString(value: string): number {
   let h = 0

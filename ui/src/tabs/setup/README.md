@@ -20,7 +20,11 @@ Python plus a new entry in `requirements.txt`.
 | `Qr.tsx` | 40 | the `<svg>`, and the decision to render nothing rather than a broken symbol |
 | `qr.fixtures.mjs` | 705 | 16 symbols generated with `segno`, as matrices of `'0'`/`'1'` strings |
 | `qr.check.mjs` | 350 | the whole gate on the encoder. Hermetic — no `// requires:` line |
-| `setup.css` | 323 | the first-run stylesheet, separate from `derate.css` |
+| `setup.css` | 331 | the first-run stylesheet, separate from `derate.css` |
+| `AdminStep.tsx` | 175 | the first step: create the first admin, reveal the default key once (`RevealModal`), or say setup was closed by another browser (410 `setup_closed`) and send the person to `/login` |
+| `admin.ts` | 17 | `adminFormProblem`: the only refusals the browser can know for certain (empty name, under `PASSWORD_MIN_LEN`, passwords differ). Gated by `../login/login.check.mjs` |
+| `done.ts` | 66 | `doneReading`: what the done screen says is running, from the deployment records and `/api/chat/models` -- the pick's record wins (best of ready > launching > failed, since relaunches leave dead records listed), else anything served. `splitLaunchFailure`: derate's sentence vs. the launcher dump after `--- sparkrun output ---`, both verbatim |
+| `done.check.mjs` | 70 | gate on `done.ts`: every reading, "pick failed but a provider serves → failed", and `why` is the first line only. Hermetic |
 
 ## `qr.ts`
 
@@ -131,6 +135,18 @@ swaps ink for `--on-fill`; the page's muted ink on the plate's ground is the
 pairing that disappears in one of the two themes. Both animations have a
 `prefers-reduced-motion` branch that keeps the state visible without the
 movement.
+
+## The admin step, and why the wizard mounts after it
+
+Before the first admin exists the gateway answers 401 to every `/api` route
+except `GET /api/auth/state` and `POST /api/setup/admin`. The wizard prefetches
+`/api/setup` and `/api/capacity` on mount, so `SetupTab` is two components:
+`SetupTab` renders `AdminStep` while `useAuth().state` says no admin or no
+session (or while the key is being revealed), and mounts `SetupWizard` -- and
+with it every one of those requests -- only after "I saved it" has re-read the
+auth state with the new session cookie. A re-run with a session skips straight
+to the wizard. The secret lives in `AdminStep`'s state until "I saved it" and is
+set to null before anything else happens.
 
 ## The seam with `SetupTab.tsx`
 

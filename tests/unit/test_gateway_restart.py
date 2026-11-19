@@ -169,6 +169,42 @@ def test_a_crash_schedules_and_fires_a_restart_with_a_reconstructed_payload(monk
     run(_run_coordinator(ctx, body))
 
 
+def test_a_relaunch_that_dies_spends_the_same_budget(monkeypatch):
+    monkeypatch.setattr(restart_module, "RESTART_BACKOFF_S", FAST_BACKOFF)
+    ctx, deployments = build_ctx()
+    deployment = crashed_deployment()
+    deployments.deployments.append(deployment)
+    served_name = deployment.served_name
+
+    async def wait_for(cond):
+        for _ in range(300):
+            if cond():
+                return
+            await asyncio.sleep(0.01)
+
+    async def body(coordinator):
+        latest = deployment
+        while True:
+            n = len(attempted_events(ctx))
+            deployments.bus.emit(**crash_event(latest))
+            await wait_for(lambda: len(attempted_events(ctx)) > n
+                           and not coordinator._state[served_name].in_flight)
+            assert len(attempted_events(ctx)) == n + 1
+            latest = deployments.launched[-1]
+            if len(attempted_events(ctx)) == restart_module.MAX_RESTART_ATTEMPTS:
+                break
+        deployments.bus.emit(**crash_event(latest))
+        await asyncio.sleep(0.3)
+        assert len(deployments.launched) == restart_module.MAX_RESTART_ATTEMPTS
+        assert len(exhausted_events(ctx)) == 1
+        assert coordinator._state[served_name].attempts == 3
+        deployments.bus.emit(**ready_event(served_name, latest.deployment_id))
+        await wait_for(lambda: served_name not in coordinator._state)
+        assert served_name not in coordinator._state
+
+    run(_run_coordinator(ctx, body))
+
+
 def test_stopped_during_launch_does_not_trigger_a_restart(monkeypatch):
     monkeypatch.setattr(restart_module, "RESTART_BACKOFF_S", FAST_BACKOFF)
     ctx, deployments = build_ctx()
@@ -334,3 +370,41 @@ def test_two_overlapping_crash_events_do_not_double_schedule(monkeypatch):
         assert len(attempted_events(ctx)) == 1
 
     run(_run_coordinator(ctx, body))
+
+
+def test_an_auto_relaunch_leaves_an_audit_row(monkeypatch, tmp_path):
+    """CAP-6: a relaunch nobody clicked is still in the audit chain, naming the
+    deployment it replaced -- the telemetry event alone is retention-trimmed."""
+    from control_plane.gateway.authz import AuthStores
+
+    monkeypatch.setattr(restart_module, "RESTART_BACKOFF_S", FAST_BACKOFF)
+    ctx, deployments = build_ctx()
+    ctx.auth_stores = AuthStores(
+        tmp_path / "auth.db", tmp_path / "keys.db", tmp_path / "limits.db",
+        audit_mirror=False, audit_sink=False,
+    )
+    deployment = crashed_deployment()
+    deployments.deployments.append(deployment)
+
+    async def body(coordinator):
+        deployments.bus.emit(**crash_event(deployment))
+        for _ in range(200):
+            if deployments.launched:
+                break
+            await asyncio.sleep(0.01)
+        assert deployments.launched, "no relaunch was attempted"
+        for _ in range(50):
+            if attempted_events(ctx):
+                break
+            await asyncio.sleep(0.01)
+
+    run(_run_coordinator(ctx, body))
+    new = deployments.launched[0]
+    rows, total = ctx.auth_stores.auth.audit_page(action="deployment_launched")
+    assert total == 1
+    row = rows[0]
+    assert row.actor == "system:restart"
+    assert row.target_kind == "deployment" and row.target_id == new.deployment_id
+    assert row.after["previous_deployment_id"] == deployment.deployment_id
+    assert row.after["attempt"] == 1
+    assert row.after["served_name"] == deployment.served_name

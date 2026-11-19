@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Icon } from '../../components/Icon'
 import type {
   ModelDetail,
   Provider,
@@ -338,14 +339,14 @@ export function ModelInspector({
         style={{
           display: 'flex',
           alignItems: 'baseline',
-          gap: 10,
-          marginBottom: 4,
+          gap: 'var(--space-10)',
+          marginBottom: 'var(--space-4)',
         }}
       >
         <h3 className="mono" style={{ flex: 1, wordBreak: 'break-all' }}>
           {modelId}
         </h3>
-        <button className="ghost" onClick={onClose} aria-label="Close">
+        <button type="button" className="ghost" onClick={onClose} aria-label="Close">
           Close
         </button>
       </div>
@@ -353,7 +354,7 @@ export function ModelInspector({
       {/* What it is, in one line. Kept above the tabs because it is the
           caption for both of them. */}
       {detail ? (
-        <div className="unit" style={{ marginBottom: 10 }}>
+        <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
           {detail.architectures.join(', ') || detail.model_type || 'architecture unknown'}
           {/* The route, and only when it is not the one everything else
               answers on. A text model saying `POST /v1/chat/completions`
@@ -380,6 +381,7 @@ export function ModelInspector({
       <div className="subs" role="tablist" aria-label="Model sections">
         {PANES.map((p) => (
           <button
+            type="button"
             key={p.id}
             role="tab"
             aria-selected={pane === p.id}
@@ -399,7 +401,7 @@ export function ModelInspector({
             className="chips"
             role="group"
             aria-label="Where to serve this model"
-            style={{ marginBottom: 10 }}
+            style={{ marginBottom: 'var(--space-10)' }}
           >
             <button
               type="button"
@@ -416,7 +418,7 @@ export function ModelInspector({
                 onClick={() => setDestination(t.provider_id)}
               >
                 Route to {t.display_name}
-                {t.served ? ' ✓' : ''}
+                {t.served ? <Icon name="check" size={12} label="served" className="icon-inline" /> : null}
               </button>
             ))}
           </div>
@@ -440,7 +442,15 @@ export function ModelInspector({
             {/* Self-hiding: a provider kind that does not aggregate backend
                 hosts per model answers 400, and this renders nothing rather
                 than a control that would fail on every click. */}
-            <BackendPicker providerId={routing.provider_id} upstreamId={routing.upstream_id} />
+            <BackendPicker
+              providerId={routing.provider_id}
+              upstreamId={routing.upstream_id}
+              fallback={
+                catalogues?.[routing.provider_id]?.find(
+                  (m) => m.upstream_id === routing.upstream_id,
+                )?.backend_fallback ?? false
+              }
+            />
           </>
         ) : (
         <>
@@ -526,7 +536,7 @@ export function ModelInspector({
             {(detail.support?.runtimes ?? []).map((r) => (
               <div
                 key={r.runtime}
-                style={{ display: 'flex', gap: 8, alignItems: 'baseline', padding: '3px 0' }}
+                style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'baseline', padding: 'var(--space-3) 0' }}
               >
                 <Lamp
                   signal={
@@ -559,7 +569,7 @@ export function ModelInspector({
                 {skippedLines(detail.nodes.skipped).map((line) => (
                   // Muted, and deliberately not a VerbatimList row: these
                   // machines were not asked, which is not the same as objecting.
-                  <div key={line} className="unit" style={{ marginTop: 6 }}>
+                  <div key={line} className="unit" style={{ marginTop: 'var(--space-6)' }}>
                     {line}
                   </div>
                 ))}
@@ -609,8 +619,8 @@ function ProviderFacts({ rows }: { rows: RowProvider[] }) {
         const inp = price(p.input_cost_per_mtok)
         const out = price(p.output_cost_per_mtok)
         return (
-          <div key={`${p.provider_id}::${p.served_name}`} style={{ padding: '4px 0' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div key={`${p.provider_id}::${p.served_name}`} style={{ padding: 'var(--space-4) 0' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
               <Lamp
                 signal={p.healthy ? 'live' : 'fault'}
                 label={p.healthy ? 'healthy' : 'unhealthy'}
@@ -620,7 +630,7 @@ function ProviderFacts({ rows }: { rows: RowProvider[] }) {
                   operationally useful fact on the panel. */}
               <span className="mono unit">{p.served_name}</span>
             </div>
-            <div className="unit" style={{ paddingLeft: 20 }}>
+            <div className="unit" style={{ paddingLeft: 'var(--space-20)' }}>
               {[
                 p.context_length ? `${p.context_length.toLocaleString()} context` : null,
                 inp && out ? `${inp} / Mtok in · ${out} / Mtok out` : 'not priced',
@@ -631,12 +641,12 @@ function ProviderFacts({ rows }: { rows: RowProvider[] }) {
                 .join(' · ')}
             </div>
             {p.last_error ? (
-              <div style={{ paddingLeft: 20 }}>
+              <div style={{ paddingLeft: 'var(--space-20)' }}>
                 <Verbatim text={p.last_error} size="unit" />
               </div>
             ) : null}
             {p.admitting === false && p.admission_block ? (
-              <div style={{ paddingLeft: 20 }}>
+              <div style={{ paddingLeft: 'var(--space-20)' }}>
                 <Verbatim text={p.admission_block} size="unit" />
               </div>
             ) : null}

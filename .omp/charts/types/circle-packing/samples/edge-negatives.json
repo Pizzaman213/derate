@@ -1,0 +1,1 @@
+{"description":"Negative leaves cannot have an area: omitted with a note.","data":{"name":"P&L","children":[{"name":"Sales","value":120},{"name":"Refunds","value":-15},{"name":"Services","value":45},{"name":"Write-off","value":-8},{"name":"Licensing","value":30}]}}

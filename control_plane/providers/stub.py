@@ -20,11 +20,13 @@ import httpx
 
 from ..contracts.providers import ProviderKind
 from .secrets import SecretStore
-from .service import ProviderService
+from .service import ProviderService, minted_ref
 
-STUB_KEY_REF = "DERATE_STUB_PROVIDER_KEY"
 STUB_KEY_VALUE = "sk-or-v1-stub00000000000000000000000000000000000000"
 STUB_PROVIDER_ID = "openrouter-stub"
+# The name derate itself mints for this id: the only kind of reference, beside
+# DERATE_SECRET_*, a provider may hold.
+STUB_KEY_REF = minted_ref(STUB_PROVIDER_ID)
 
 # Plausible published pricing, in USD per single token, which is the unit
 # OpenRouter uses. Discovery multiplies to per-million.

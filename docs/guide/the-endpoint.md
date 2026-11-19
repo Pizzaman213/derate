@@ -6,24 +6,112 @@ shape. This page is derate from a client's side: what is on `/v1`, what a
 refusal looks like, and how the gateway decides which machine answers. You need
 a coordinator you can reach and at least one model serving.
 
-## Before anything else: there is no inbound authentication
+## Every request carries a key
 
-The gateway does not check a credential on the way in. Anyone who can open
-`http://<coordinator>:8080` can list your models, send requests through them,
-spend your provider credit, and reach `/api` — which adds and removes
-providers and stops deployments.
+`/v1` answers only to an API key, sent as a bearer token:
 
-One thing is checked, and it is narrower than it sounds: a write to `/api` or
-`/v1` carrying an `Origin` header that disagrees with the coordinator's own
-address is refused. That stops a web page you happen to have open in another
-tab from rewriting your cluster. It does nothing about a client that is not a
-browser — `curl` and the OpenAI SDK send no `Origin` and are let straight
-through, which is the point.
+```
+Authorization: Bearer drt_<key_id>_<secret>
+```
 
-So put the coordinator on a network you trust, or behind something that does
-authenticate. The [project README](../../README.md) says the same thing in its
-last paragraph, and it is the reason it asks you to open an issue before
-running derate in production.
+The header is the only place a key is read, the `/v1/realtime` websocket
+included. There is no query-string form: a key in a URL lands in access logs.
+
+**Minting one.** Setup's first step makes a key named `default`, with a
+365-day expiry, and shows its secret once — see
+[Your first visit](first-run.md). After that, open **Keys**, press create,
+choose a name, an org and an expiry (1, 10, 20, 30, 50, 100 or 365 days), and
+copy the secret from the dialog before pressing **I saved it**. Signed in, the
+same thing is `POST /api/keys`:
+
+```bash
+curl -s -b cookies.txt http://<coordinator>:8080/api/keys \
+  -H 'content-type: application/json' \
+  -d '{"name": "laptop", "expiry_days": 30}'
+```
+
+The secret comes back as `secret_once` in that response and nowhere else, ever:
+derate stores a hash of it. `POST /api/keys/{key_id}/rotate` issues a new
+secret the same way and kills the old one on its next use. Lost a secret?
+Rotate; there is nothing to look up.
+
+**A missing or refused key is a `401`** with
+`WWW-Authenticate: Bearer realm="derate"` and one of four codes:
+
+| `code` | Means |
+|---|---|
+| `missing_api_key` | no `Authorization: Bearer` header |
+| `invalid_api_key` | does not parse, unknown id, wrong secret, or the key or its org was deleted |
+| `api_key_disabled` | an admin disabled it (re-enable on **Keys**) |
+| `api_key_expired` | past `expires_at`; expiry is not editable, so create or rotate |
+
+If the key store itself cannot be opened, every gated route answers `503`
+`auth_unavailable` rather than letting anything through.
+
+`/api` — the screens' own surface — takes an admin session cookie instead of a
+key, and answers `401` `session_required` without one. A write carrying an
+`Origin` header that disagrees with the coordinator's own address is still
+refused on both surfaces; `curl` and the SDK send no `Origin`.
+
+### `GET /v1/key`
+
+What the calling key is and how much it has left:
+
+- **`key`** — its id, name, org, status, expiry, limits and allowlist. Never
+  the secret or its hash, and not the admin's notes.
+- **`org`** — `org_id` and `name`.
+- **`expires_at`** — epoch seconds, or `null` for a key that never expires.
+- **`allowed_models`** — the effective allowlist: the key's own list, else
+  the org's, else everything `/v1/models` exposes now.
+- **`limit_states`** — `key` and `org`, one entry per configured limit:
+  `limit_type`, `limit`, `effective_limit`, `used`, `remaining`, `resets_at`,
+  `fraction`, `near` (≥ 80 %), `at`.
+- **`cycle`** — this 30-day cycle's `start`, `resets_at`, and its `usage`
+  (`null` when there is no telemetry archive).
+
+### Limits
+
+A key, and the org it belongs to, can each carry limits; a key's value may not
+exceed its org's. Cycles are 30 days, anchored at the key's (or org's)
+creation. The check runs before dispatch and stops at the first refusal:
+
+**`403` `model_not_allowed`** — the model is outside the key's effective
+allowlist.
+
+**`400` `max_output_tokens_exceeded`** — `max_tokens` is above
+`max_output_tokens_per_request` (the tighter of the key's and the org's); the message names the cap. A request with no
+`max_tokens` at all is sent with the cap filled in instead.
+
+**`413` `max_prompt_tokens_exceeded`** — the prompt estimate is above
+`max_prompt_tokens_per_request`.
+
+**`429` `limit_exceeded`** — a rate (`rpm`, `tpm`, `max_concurrent`) or a cycle
+limit (`requests_cycle`, `tokens_total_cycle`, `budget_usd_cycle`, …) is used
+up:
+
+```json
+{
+  "error": {
+    "message": "…",
+    "type": "rate_limit_error",
+    "code": "limit_exceeded",
+    "limit_source": "key:requests_cycle",
+    "used": 5,
+    "limit": 5,
+    "resets_at": 1765929600.0
+  }
+}
+```
+
+`limit_source` is `<scope>:<limit_type>` — `key:` or `org:`, then the limit's
+name, per-model ones included (`org:model:gpt-4o:rpm`). The headers say the
+same: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` in
+epoch seconds — the window's end for `rpm`/`tpm`, now for `max_concurrent`, the
+cycle's end for a cycle limit.
+
+A key with `cloud_fallback_local_model` set does not get that 429 when a
+provider-served request hits `cloud_tokens_cycle`, `cloud_usd_cycle` or
+`budget_usd_cycle`: the request is answered by that local model instead.
 
 ## What is on `/v1`
 
@@ -35,6 +123,7 @@ POST /v1/embeddings
 POST /v1/audio/speech
 POST /v1/audio/transcriptions
 GET  /v1/audio/voices
+GET  /v1/key
 GET  /v1/realtime               websocket
 ```
 
@@ -44,7 +133,8 @@ URL you give a client.
 ## 1. Ask what is being served
 
 ```bash
-curl -s http://<coordinator>:8080/v1/models
+curl -s http://<coordinator>:8080/v1/models \
+  -H "Authorization: Bearer $DERATE_API_KEY"
 ```
 
 ```json
@@ -93,6 +183,7 @@ error you get if you send to it anyway says which.
 
 ```bash
 curl http://<coordinator>:8080/v1/chat/completions \
+  -H "Authorization: Bearer $DERATE_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"model": "Llama-3.1-8B-Instruct",
        "messages": [{"role": "user", "content": "Name the measured link speed."}]}'
@@ -102,12 +193,12 @@ Add `"stream": true` for server-sent events. Streaming is honoured on
 `/v1/chat/completions` and `/v1/completions`; the other routes answer in one
 piece.
 
-The same thing through the OpenAI SDK — only `base_url` changes:
+The same thing through the OpenAI SDK — `base_url` and `api_key` change:
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://<coordinator>:8080/v1", api_key="derate")
+client = OpenAI(base_url="http://<coordinator>:8080/v1", api_key="drt_<key_id>_<secret>")
 
 for model in client.models.list():
     print(model.id)
@@ -119,9 +210,9 @@ answer = client.chat.completions.create(
 print(answer.choices[0].message.content)
 ```
 
-The SDK requires `api_key` to be a non-empty string and derate never looks at
-it. Put anything there. That is the same fact as the warning at the top of this
-page, arriving as an argument you have to fill in.
+`api_key` is the `drt_` key itself; the SDK sends it as the bearer token. An
+SDK that reads `OPENAI_API_KEY` from the environment works with the key put
+there.
 
 **Every answer carries `X-Request-Id`**, shaped `r-4f2a9c8d1e77`. It is minted
 before the first thing that can refuse, so a 404 has one as readily as a 200,
@@ -132,6 +223,7 @@ something answered oddly.
 
 ```bash
 curl http://<coordinator>:8080/v1/embeddings \
+  -H "Authorization: Bearer $DERATE_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"model": "Llama-3.1-8B-Instruct", "input": "the measured link"}'
 ```
@@ -145,6 +237,7 @@ that is genuinely a different endpoint — see below.
 
 ```bash
 curl http://<coordinator>:8080/v1/audio/speech \
+  -H "Authorization: Bearer $DERATE_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"model": "audio8-tts", "input": "The link is measured, not assumed.",
        "response_format": "mp3"}' --output line.mp3
@@ -152,6 +245,7 @@ curl http://<coordinator>:8080/v1/audio/speech \
 
 ```bash
 curl http://<coordinator>:8080/v1/audio/transcriptions \
+  -H "Authorization: Bearer $DERATE_API_KEY" \
   -F model=whisper-1 \
   -F file=@meeting.m4a
 ```
@@ -173,11 +267,15 @@ a provider:
 
 ### `/v1/realtime`
 
-A websocket, opened with the model in the query string:
+A websocket, opened with the model in the query string and the key in the
+`Authorization` header:
 
 ```
 ws://<coordinator>:8080/v1/realtime?model=gpt-4o-realtime-preview
 ```
+
+A missing or refused key closes the handshake with `1008` and the 401 code as
+the reason.
 
 Frames are relayed both ways without being parsed, to a provider that already
 speaks the realtime protocol. This is the one route with no failover in it: a

@@ -35,10 +35,17 @@ import { load, report } from '../../check/harness.mjs'
 const T = await load(import.meta.url, './tags.ts')
 const { check, note, done } = report()
 
-const css = readFileSync(
-  fileURLToPath(new URL('../../styles/tokens.css', import.meta.url)),
-  'utf8',
+// The resolved palette, per theme, from the design pack. tokens.flat.json is
+// generated from tokens.json and byte-checked for staleness by tokens:check,
+// so reading it here is reading the CSS that ships.
+const flat = JSON.parse(
+  readFileSync(fileURLToPath(new URL('../../../../.omp/design/tokens/tokens.flat.json', import.meta.url)), 'utf8'),
 )
+const THEMES = ['light', 'dark', 'high-contrast']
+const tokenIn = (name, theme) => {
+  const v = flat[name]
+  return v === undefined ? undefined : typeof v === 'object' ? v[theme] : v
+}
 
 // ── 1. two models are never drawn the same ───────────────────────────────────
 
@@ -126,27 +133,23 @@ check(
 
 // ── 3+4. the tokens exist everywhere, and are separable from each other ──────
 
-// Every theme block, by name. `:root` is light; the media query and the
-// attribute selector are the two ways dark is reached, and a token defined in
-// one of them and forgotten in the other is a screen that loses its colours
-// on an OS setting.
-const BLOCKS = [
-  [':root {', 'light'],
-  ["  :root:not([data-theme='light']) {", 'dark, by OS preference'],
-  [":root[data-theme='dark'] {", 'dark, by explicit choice'],
-]
+// Every theme, by name. A token defined in one theme and forgotten in another
+// is a screen that loses its colours on an OS setting; the build refuses a
+// themed value with a missing key, and this is the check that the four tag
+// names are themed at all.
 const values = {}
-for (const [open, label] of BLOCKS) {
-  const at = css.indexOf(open)
-  const body = at === -1 ? '' : css.slice(at + open.length, css.indexOf('\n}', at))
+for (const label of THEMES) {
   const found = {}
-  for (const m of body.matchAll(/--(tag-\d+):\s*(#[0-9A-Fa-f]{6})/g)) found[m[1]] = m[2]
+  for (let i = 1; i <= T.TAG_HUES; i++) {
+    const v = tokenIn(`tag-${i}`, label)
+    if (typeof v === 'string' && /^#[0-9A-Fa-f]{6}$/.test(v)) found[`tag-${i}`] = v
+  }
   values[label] = found
   const wanted = Array.from({ length: T.TAG_HUES }, (_, i) => `tag-${i + 1}`)
   const missing = wanted.filter((n) => !(n in found))
   check(
-    at !== -1 && missing.length === 0,
-    `tokens.css defines every hue in the ${label} theme (${missing.length} missing${
+    missing.length === 0,
+    `tokens.json defines every hue in the ${label} theme (${missing.length} missing${
       missing.length ? ': ' + missing.join(', ') : ''
     })`,
   )
@@ -180,11 +183,8 @@ check(
 // broken, and this is the assertion that keeps the two ramps apart by value
 // and not only by intention.
 const statusOf = (label) => {
-  const at = css.indexOf(BLOCKS.find(([, l]) => l === label)[0])
-  const body = css.slice(at, css.indexOf('\n}', at))
   const out = {}
-  for (const m of body.matchAll(/--(live|warn|fault|live-solid|warn-solid|fault-solid):\s*(#[0-9A-Fa-f]{6})/g))
-    out[m[1]] = m[2].toUpperCase()
+  for (const n of ['live', 'warn', 'fault', 'live-solid', 'warn-solid', 'fault-solid']) out[n] = tokenIn(n, label).toUpperCase()
   return out
 }
 
@@ -197,12 +197,9 @@ const ratio = (a, b) => {
   const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p)
   return (x + 0.05) / (y + 0.05)
 }
-const panelOf = (label) => {
-  const at = css.indexOf(BLOCKS.find(([, l]) => l === label)[0])
-  return /--panel:\s*(#[0-9A-Fa-f]{6})/.exec(css.slice(at, css.indexOf('\n}', at)))[1]
-}
+const panelOf = (label) => tokenIn('panel', label)
 
-for (const label of ['light', 'dark, by explicit choice']) {
+for (const label of THEMES) {
   const tags = Object.entries(values[label])
   const status = statusOf(label)
   const clash = tags.filter(([, v]) =>
@@ -258,7 +255,7 @@ const apart = (a, b) => {
 // new colour will not fit.
 const APART = 40
 
-for (const label of ['light', 'dark, by explicit choice']) {
+for (const label of THEMES) {
   const tags = Object.entries(values[label])
   let worst = null
   for (let i = 0; i < tags.length; i++) {

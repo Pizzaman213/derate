@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from 'react'
-import type { SpeechFormat, VoiceLibrary } from '../../api/types'
+import type { SpeechFormat, ThinkingChoice, VoiceLibrary } from '../../api/types'
 import { OWN_VOICE, VoiceFields, resolveVoice } from './VoiceFields'
 import { DEFAULT_LANGUAGE, UploadFields, type Upload } from './UploadFields'
 
@@ -32,6 +32,9 @@ interface Props {
    *  on this endpoint, and a textarea above a file input would be a control
    *  whose contents are silently discarded. */
   transcribing?: boolean
+  /** The per-request thinking control, for a text model that has one. The
+   *  choices come from tabs/chat/reasoning.ts; an empty list draws nothing. */
+  thinking?: { choices: readonly ThinkingChoice[]; value: ThinkingChoice; onChange: (c: ThinkingChoice) => void }
 }
 
 export function Composer({
@@ -45,6 +48,7 @@ export function Composer({
   library = null,
   voicesError = null,
   transcribing = false,
+  thinking,
 }: Props) {
   const [text, setText] = useState('')
   // Held across a switch to a text model and back on purpose: picking a voice,
@@ -96,10 +100,14 @@ export function Composer({
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter sends, Shift+Enter breaks the line. The composer is the only
     // multi-line input in the product, so it says so under the field rather
-    // than assuming the convention is obvious.
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // than assuming the convention is obvious. Not while an IME is composing:
+    // that Enter commits the candidate, and sending on it eats the message.
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
       send()
+    } else if (e.key === 'Escape' && busy) {
+      e.preventDefault()
+      onStop()
     }
   }
 
@@ -147,11 +155,30 @@ export function Composer({
           />
         </>
       )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s-2)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
+        {!speaking && !transcribing && thinking && thinking.choices.length > 0 ? (
+          <>
+            <span className="unit">Thinking</span>
+            {/* `margin: 0`: `.chips`' bottom margin is for sitting above a
+                grid, and in this row it would hang the chips off-centre. */}
+            <span className="chips" role="group" aria-label="Thinking" style={{ margin: 0 }}>
+              {thinking.choices.map((c) => (
+                <button
+                  type="button"
+                  key={c}
+                  aria-pressed={c === thinking.value}
+                  onClick={() => thinking.onChange(c)}
+                >
+                  {c}
+                </button>
+              ))}
+            </span>
+          </>
+        ) : null}
         <span className="unit">
           {transcribing
             ? 'The file is the request — there is no message on this endpoint'
-            : `${speaking ? 'Enter speaks' : 'Enter sends'} · Shift+Enter for a new line`}
+            : `${speaking ? 'Enter speaks' : 'Enter sends'} · Shift+Enter for a new line${busy ? ' · Esc stops' : ''}`}
         </span>
         <span style={{ flex: 1 }} />
         <button type="button" onClick={onClear} disabled={!canClear || busy}>

@@ -23,6 +23,7 @@ from .record import AnnotatedLink, LinkAnnotation, annotate, pair_key
 from .store import LinkStore
 
 from control_plane.paths import CONTAINER_DATA_DIR, data_dir
+from control_plane.registry.net import valid_host
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +219,11 @@ class LinkService:
             # than to refuse to measure over a naming detail.
             log.debug("no address known for %s; dialling the node id directly", node_id)
             host = node_id
+        # The host becomes an ssh target. A node's hostname arrives unvalidated
+        # from its own profile, and the id from a request body: anything that is
+        # not an address or a DNS name (a leading "-" is an ssh option) stops here.
+        if not valid_host(host):
+            raise ValueError(f"no usable address for {node_id!r}")
         return Endpoint(node_id=node_id, host=host, is_local=self._is_local(node_id, host))
 
     def _is_local(self, node_id: str, host: str) -> bool:

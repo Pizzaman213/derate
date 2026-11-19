@@ -32,7 +32,7 @@ curated, cached and serving rather than three rows each saying a third of it.
 | `dominant.ts` | 101 | the accent taken from the avatar's own pixels |
 | `support.ts` | 131 | the red dot: whether any runtime here loads the format at all |
 | `RouteCard.tsx` | 211 | serving by routing to somebody else's hardware |
-| `BackendPicker.tsx` | 131 | pinning OpenRouter's backend host for one model |
+| `BackendPicker.tsx` | 121 | pinning OpenRouter's backend host (and its fallback) for one model |
 | `PullCard.tsx` | 205 | putting a model on a server derate does not launch |
 | `pullTargets.ts` | 42 | which providers can be told to fetch weights, from the server's kind table |
 | `ProviderPicker.tsx` | 94 | which machine a pull lands on |
@@ -255,8 +255,8 @@ figure.
 
 ## `board.ts`
 
-The machine board's arithmetic with no DOM and no React in it, split for the same
-reason `tabs/cluster/layout.ts` is: it is the part that can be wrong in a way
+The machine board's arithmetic with no DOM and no React in it: it is the part
+that can be wrong in a way
 types cannot catch, so it is the part the verifier bundles.
 
 Nothing here scores a machine or ranks a set of them, and nothing server-side
@@ -273,7 +273,7 @@ that answers 409. `unmeasuredPairs` exists because `LinkService.worst_all_reduce
 answers for the whole set or not at all: one unprobed pair makes the planner treat
 every link as unknown and fall back to a conservative pipeline, which is invisible
 otherwise and changes the plan. `linkMeasured` requires the wire's flag **and** a
-figure, matching `tabs/cluster/layout.ts`. `toggle` sorts before handback so two
+figure, and is the one definition the Links rail and the wiring editor use too. `toggle` sorts before handback so two
 tick orders produce one request body, one answer and one server-side memo key.
 
 ## `NodeBoard.tsx`
@@ -445,18 +445,25 @@ no health and a guess would draw red beside a healthy provider.
 
 OpenRouter multiplexes one model id over several backend hosts (Anthropic direct,
 Bedrock, Vertex…) and picks one per request unless told otherwise. This is that
-"unless told otherwise": a live list from the provider's own endpoints, and a pin
-that rides along on every request thereafter — `ProviderService._prepare` injects
-`provider: {only: [tag]}`.
+"unless told otherwise": a live list from the provider's own endpoints drawn as
+the shared `HostTable` (`components/HostTable.tsx`: Automatic row, each host with
+its $/Mtok in and out, context, quantization, a `cheapest` pill), and a pin that
+rides along on every request thereafter — `ProviderService._prepare` injects
+`provider: {only: [tag]}`, or `{order: [tag], allow_fallbacks: true}` when the
+"Fall back to other hosts" box is ticked. The pinned host's price becomes the
+model's price, and the line `host: <provider_name> · $in / $out` sits directly
+under the `RouteCard` while a pin is in force.
 
 Self-hiding rather than error-prone. A kind with no `supports_backend_routing`
 answers 400 for every model it serves, which is the ordinary answer on a pane
 mostly full of OpenAI, Together and Ollama providers, so
 `backend_routing_unsupported` sets `unsupported` and the component renders
-nothing. It also renders nothing at one row or fewer — there is no choice to
-make. The pin is a single-key patch: `backend_pins` merges, so this never has to
-know or resend the provider's other pins.
-
+nothing. Any other kind shows the table even at zero or one host — zero says
+`OpenRouter lists no hosts for this model yet.` Both writes are single-key
+patches (`backend_pins: {[upstream]: tag | ''}`, `backend_fallbacks:
+{[upstream]: bool}`), which merge, so this never has to know or resend the
+provider's other pins; the rows are refetched after each. The fallback flag's
+current value comes in as a prop, from the catalogue row's `backend_fallback`.
 ## `PullCard.tsx`
 
 Putting a model on a server derate does not launch. A box with no GPU cannot run

@@ -1,0 +1,1 @@
+{"description":"Aggregated sizes with missing values: those rows are left out, noted.","data":[{"sets":"A","size":40},{"sets":"B","size":null},{"sets":"C","size":25},{"sets":"A,C","size":10},{"sets":"A,B","size":""}]}

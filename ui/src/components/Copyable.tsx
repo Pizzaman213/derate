@@ -49,8 +49,8 @@ export function Copyable({ text, label = 'Copy' }: { text: string; label?: strin
   return (
     <div>
       <div className="cmd">{text}</div>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 6 }}>
-        <button style={{ padding: '3px 9px' }} onClick={() => void copy()}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-8)', marginTop: 'var(--space-6)' }}>
+        <button type="button" style={{ padding: 'var(--space-3) var(--space-9)' }} onClick={() => void copy()}>
           {state === 'copied' ? 'Copied' : label}
         </button>
         {state === 'failed' ? (

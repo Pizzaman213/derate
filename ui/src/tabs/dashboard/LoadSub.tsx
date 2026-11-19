@@ -107,7 +107,7 @@ export function LoadSub({ routing, nodes }: Props) {
           </tbody>
         </table>
       </div>
-      <p className="unit" style={{ marginTop: 8 }}>
+      <p className="unit" style={{ marginTop: 'var(--space-8)' }}>
         {/* Counters run since the gateway started, not since midnight -- "today"
             would claim a reset that never happens. And this total is local-only
             (this table has no rows for what spilled to a remote provider), so

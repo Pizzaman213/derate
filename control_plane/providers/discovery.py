@@ -99,7 +99,7 @@ def recognized_envelope(payload: Any) -> bool:
 
 
 def _upstream_id(entry: dict) -> str | None:
-    for key in ("id", "model", "name", "model_name"):
+    for key in ("id", "model", "name", "model_name", "slug"):
         value = entry.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -220,6 +220,10 @@ def parse_models(
     models: list[ProviderModel] = []
     seen: set[str] = set()
     for entry in _entries(payload):
+        # ChatGPT's /models marks entries it does not want listed. No other
+        # kind sends the field, so this is a no-op everywhere else.
+        if "visibility" in entry and entry["visibility"] != "list":
+            continue
         upstream_id = _upstream_id(entry)
         if upstream_id is None or upstream_id in seen:
             continue

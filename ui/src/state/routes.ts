@@ -10,8 +10,9 @@
 // The scheme, and the rule that decides which half of a URL a thing goes in:
 //
 //   the PATH names the screen           /dashboard /models /cluster
-//                                       /chat /spend /settings
+//                                       /chat /usage /settings
 //   ...and the screen's own subject     /models/<model id>
+//                                       /usage/requests/<id>  /usage/keys/<id>
 //   the QUERY names what is selected    ?node= ?link= ?dep= ?open= ?ctx= ?seq=
 //   ...and, on a model, the shape it is    ?on= ?tp= ?pp=
 //   being planned at
@@ -36,7 +37,13 @@ export type Dest =
   | 'models'
   | 'cluster'
   | 'chat'
-  | 'spend'
+  // Who used what, what it cost, and under which key: one destination with
+  // three panes (USAGE_SUBS) in the path -- `/usage` (the overview),
+  // `/usage/requests`, `/usage/keys`. A request id and a key id are subjects
+  // under their pane -- `/usage/requests/r-abc123`, `/usage/keys/<key id>` --
+  // the way `/models/<id>` is, so a chat turn, a key page or a health banner
+  // can link straight to the one thing it is about.
+  | 'usage'
   | 'settings'
   // Not in the header's nav, and deliberately still a real destination. First
   // run is a screen with a subject of its own, so by the rule at the top of
@@ -44,6 +51,10 @@ export type Dest =
   // reloadable, and re-runnable by typing it, rather than a mode you can only
   // reach by having installed the product ten seconds ago.
   | 'setup'
+  // Off the nav too, and before the frame like setup: the one screen a
+  // browser without a session can reach. Every other destination redirects
+  // here (shell/AppShell.tsx `useAuthGate`).
+  | 'login'
 
 /** What the sheet (shell/Sheet.tsx) is showing. The model kind takes its two
  *  numbers from `ctx`/`seq`, so it is fully described by a kind and an id. */
@@ -67,10 +78,27 @@ export interface SheetRef {
 export const DEFAULT_CONTEXT = 8192
 export const DEFAULT_CONCURRENCY = 1
 
+/** The window the spend screen is drawn over. `all` is the archive's 1d-rollup
+ *  horizon (400 days). */
+export const SPEND_WINDOWS = ['24h', '7d', '30d', 'all'] as const
+export type SpendWindow = (typeof SPEND_WINDOWS)[number]
+
+/** The windows the requests screen offers: the raw request table's horizon is
+ *  30 days, so `all` would claim a reach it does not have. */
+export const REQUEST_WINDOWS = ['24h', '7d', '30d'] as const
+
+/** The panes of /usage, in nav order. `overview` is the bare `/usage`. */
+export const USAGE_SUBS = ['overview', 'requests', 'rate-limits', 'keys'] as const
+export type UsageSub = (typeof USAGE_SUBS)[number]
+
 export interface Route {
   dest: Dest
+  /** Which pane of `/usage`: `overview` on the bare path, null off `/usage`. */
+  sub: UsageSub | null
   /** The model open in the models tab's detail pane. Only on `/models`. */
   model: string | null
+  /** The key whose detail page is open. Only on `/usage/keys`. */
+  key: string | null
   node: string | null
   /** `"a~b"`, node ids sorted -- `linkKey` in state/selection.ts. */
   link: string | null
@@ -93,6 +121,20 @@ export interface Route {
    *  expressed at all, so either both are here or neither is. */
   tp: number | null
   pp: number | null
+  /** The window a screen is drawn over. On `/usage` (overview) any of
+   *  SPEND_WINDOWS, null meaning `all`; on `/usage/requests` only 24h/7d/30d,
+   *  null meaning 24h. */
+  win: SpendWindow | null
+  /** The request open in the requests pane's detail. Only on `/usage/requests`. */
+  request: string | null
+  /** Filters for requests and rate-limit history. `dep` selects a model on
+   *  rate limits; provider/target narrow upstream attribution. */
+  fkey: string | null
+  fmodel: string | null
+  fstatus: 'ok' | 'failed' | '429' | null
+  ftarget: string | null
+  fprovider: string | null
+  fretried: boolean
 }
 
 const SEGMENT: Record<Dest, string> = {
@@ -100,9 +142,10 @@ const SEGMENT: Record<Dest, string> = {
   models: 'models',
   cluster: 'cluster',
   chat: 'chat',
-  spend: 'spend',
+  usage: 'usage',
   settings: 'settings',
   setup: 'setup',
+  login: 'login',
 }
 
 /** Every destination, at runtime.
@@ -123,6 +166,11 @@ export const DESTINATIONS = Object.keys(SEGMENT) as Dest[]
 const BY_SEGMENT = new Map<string, Dest>(
   (Object.entries(SEGMENT) as [Dest, string][]).map(([dest, seg]) => [seg, dest]),
 )
+
+/** The three destinations /usage replaced on 2026-11-18. Read by parse() so
+ *  a link somebody shared or bookmarked still lands; never written by href(),
+ *  so the address bar is rewritten to the one spelling on arrival. */
+const LEGACY_USAGE: Record<string, UsageSub> = { spend: 'overview', keys: 'keys', requests: 'requests' }
 
 const SHEET_KINDS = new Set<SheetRef['kind']>(['node', 'dep', 'model'])
 
@@ -192,12 +240,34 @@ export function parse(url: string): Route {
   const cut = url.indexOf('?')
   const pathname = cut === -1 ? url : url.slice(0, cut)
   const search = cut === -1 ? '' : url.slice(cut)
-  const segments = pathname.split('/').filter(Boolean).map(decodeURIComponent)
+  let segments: string[]
+  try {
+    segments = pathname.split('/').filter(Boolean).map(decodeURIComponent)
+  } catch {
+    // A malformed escape (`/models/%E0`) throws URIError, and a throw here is
+    // a blank app. It is a URL nobody can mean, so it reads as the dashboard
+    // like any other unrecognised path.
+    return parse('/')
+  }
+  const legacy = LEGACY_USAGE[segments[0] ?? '']
+  if (legacy) segments = ['usage', legacy, ...segments.slice(1)]
   const dest = BY_SEGMENT.get(segments[0] ?? '') ?? 'dash'
   const params = new URLSearchParams(search)
 
   const model =
     dest === 'models' && segments.length > 1 ? segments.slice(1).join('/') : null
+  const sub: UsageSub | null =
+    dest === 'usage'
+      ? (USAGE_SUBS as readonly string[]).includes(segments[1] ?? '')
+        ? (segments[1] as UsageSub)
+        : params.get('dep') ? 'rate-limits' : 'overview'
+      : null
+  // Single slugs, unlike a model id: only the segment after the pane is the
+  // subject, and anything past it is a typo to drop.
+  const key = sub === 'keys' ? (segments[2] ?? null) : null
+  const request = sub === 'requests' ? (segments[2] ?? null) : null
+  const onRequests = sub === 'requests'
+  const onHistory = onRequests || sub === 'rate-limits'
 
   let sheet: SheetRef | null = null
   const open = params.get('open')
@@ -214,10 +284,22 @@ export function parse(url: string): Route {
   // Either axis present adopts the pair, filling the other with 1 -- the same
   // first-touch-adopts gesture the field itself makes.
   const degrees = wantsNumbers ? degreePair(params) : { tp: null, pp: null }
+  // A window the overview draws, or null -- which reads as the default,
+  // like every other unrecognised parameter.
+  const rawWin = params.get('win') ?? ''
+  const win =
+    sub === 'overview' && (SPEND_WINDOWS as readonly string[]).includes(rawWin)
+      ? (rawWin as SpendWindow)
+      : onHistory && (REQUEST_WINDOWS as readonly string[]).includes(rawWin)
+        ? (rawWin as SpendWindow)
+        : null
+  const rawStatus = params.get('status')
 
   return {
     dest,
+    sub,
     model,
+    key,
     node: params.get('node') || null,
     link: params.get('link') || null,
     dep: params.get('dep') || null,
@@ -227,17 +309,33 @@ export function parse(url: string): Route {
     on: wantsNumbers ? nodeList(params.get('on')) : null,
     tp: degrees.tp,
     pp: degrees.pp,
+    win,
+    request,
+    fkey: onRequests ? params.get('key') || null : null,
+    fmodel: onHistory ? params.get('model') || null : null,
+    fstatus: onRequests && (rawStatus === 'ok' || rawStatus === 'failed' || rawStatus === '429') ? rawStatus : null,
+    ftarget: onHistory ? params.get('target') || null : null,
+    fprovider: onHistory ? params.get('provider') || null : null,
+    fretried: onRequests && params.get('retried') === '1',
   }
 }
 
 /** The one canonical spelling of a route. Everything that writes to history
  *  goes through here, so a route that carries a field its destination has no
- *  use for (a model id on `/cluster`, a context on `/spend`) drops it on the
+ *  use for (a model id on `/cluster`, a context on `/usage`) drops it on the
  *  way out rather than accumulating in the address bar. */
 export function href(route: Route): string {
   const path = [SEGMENT[route.dest]]
   if (route.dest === 'models' && route.model) {
     path.push(...route.model.split('/').filter(Boolean).map(encodeURIComponent))
+  }
+  // A `usage` route without a pane is the overview, so the header's
+  // `linkTo({dest:'usage'})` works from a screen whose `sub` is null.
+  const sub = route.dest === 'usage' ? (route.sub ?? 'overview') : null
+  if (sub && sub !== 'overview') {
+    path.push(sub)
+    if (sub === 'keys' && route.key) path.push(encodeURIComponent(route.key))
+    if (sub === 'requests' && route.request) path.push(encodeURIComponent(route.request))
   }
 
   const query: string[] = []
@@ -267,6 +365,16 @@ export function href(route: Route): string {
       put('tp', String(route.tp ?? 1))
       put('pp', String(route.pp ?? 1))
     }
+  }
+  if (sub === 'overview') put('win', route.win)
+  if (sub === 'requests' || sub === 'rate-limits') {
+    put('win', route.win && (REQUEST_WINDOWS as readonly string[]).includes(route.win) ? route.win : null)
+    if (sub === 'requests') put('key', route.fkey)
+    put('model', route.fmodel)
+    if (sub === 'requests') put('status', route.fstatus)
+    put('target', route.ftarget)
+    put('provider', route.fprovider)
+    if (sub === 'requests' && route.fretried) put('retried', '1')
   }
 
   return `/${path.join('/')}${query.length ? `?${query.join('&')}` : ''}`

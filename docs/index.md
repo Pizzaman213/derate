@@ -30,7 +30,7 @@ The guide, in reading order. Each page names what you need before you open it.
    gateway decides which machine answers.
 5. [**Put somebody else's API behind the same endpoint**](guide/providers.md) — a
    remote API turned into an ordinary target on your own coordinator, routed by
-   the same policies as your own hardware and priced on the Spend screen.
+   the same policies as your own hardware and priced on the Usage overview.
 6. [**Diagnosing a failure**](guide/troubleshooting.md) — matches the message you
    are looking at to the thing that has to change. Two of the errors in it are
    near-identical sentences about completely different machines, so match the
@@ -40,7 +40,7 @@ The guide, in reading order. Each page names what you need before you open it.
 
 [`../control_plane/README.md`](../control_plane/README.md) is the package as a
 whole: one process, one entry point, `python3 -m control_plane.node`, composing
-the twelve subpackages below out of the ten leaf modules beside them.
+the fifteen subpackages below out of the ten leaf modules beside them.
 
 The order here is the dependency order, not the alphabet — each row may import
 the rows above it.
@@ -54,6 +54,9 @@ the rows above it.
 | [`fit/`](../control_plane/fit/README.md) | The blocking pre-launch out-of-memory gate. It refuses, and it names the term that blew the budget and the change that would work. |
 | [`planner/`](../control_plane/planner/README.md) | Picks tensor, pipeline, expert and data parallel degrees from measured hardware facts, and hands back a sentence naming what the decision turned on. |
 | [`deploy/`](../control_plane/deploy/README.md) | Turns an approved plan into a running sparkrun backend, watches it, and tears it down. Every phase a person sees is a line one of two programs actually printed. |
+| [`auth/`](../control_plane/auth/README.md) | Admin accounts, browser sessions, the login lockout and the append-only audit log, in `auth.db`. Fails closed: a store it cannot open is a 503, never an open door. |
+| [`keys/`](../control_plane/keys/README.md) | Orgs and the `drt_` API keys every `/v1` request carries, in `keys.db`. A secret is stored as its hash and shown once. |
+| [`limits/`](../control_plane/limits/README.md) | Per-key and per-org limits checked before dispatch, 30-day cycle counters, and local model pricing, in `limits.db`. A refusal names the limit that stopped it. |
 | [`gateway/`](../control_plane/gateway/README.md) | One OpenAI endpoint, seven routing policies, admission control, and the request path's answer to a node dying under it. |
 | [`providers/`](../control_plane/providers/README.md) | Remote OpenAI-compatible upstreams as first-class route targets, alongside local deployments. The cluster is the default; a paid API is the overflow valve. |
 | [`inventory/`](../control_plane/inventory/README.md) | One record per model, folded on the server from five sources. A materialized view that owns nothing and that nothing routes off. |
@@ -108,7 +111,7 @@ one file per screen the URL can name.
   function of the node set, never of a simulation.
 - [`tabs/chat/`](../ui/src/tabs/chat/README.md) — the console for talking to what
   the cluster is actually running. It filters nothing out of the picker.
-- [`tabs/spend/`](../ui/src/tabs/spend/README.md) — the Spend screen's
+- [`tabs/spend/`](../ui/src/tabs/spend/README.md) — the Usage overview's
   arithmetic, kept out of the component so it can be checked against a live
   coordinator. A number we do not know is `null`, never `0`.
 - [`tabs/settings/`](../ui/src/tabs/settings/README.md) — which coordinator this
@@ -117,6 +120,13 @@ one file per screen the URL can name.
 - [`tabs/setup/`](../ui/src/tabs/setup/README.md) — the two things the first-run
   screen needs that nothing else does: a QR encoder written from scratch, and a
   stylesheet for the one screen with no header and no rail.
+- [`tabs/login/`](../ui/src/tabs/login/README.md) — the sign-in screen, drawn
+  before the frame; it words the server's lockout and keeps no count of its own.
+- [`tabs/keys/`](../ui/src/tabs/keys/README.md) — the `drt_` API keys, one page
+  per key with thirty days of what it did. A secret is drawn once, in
+  `RevealModal`, and nowhere else.
+- [`tabs/audit/`](../ui/src/tabs/audit/README.md) — every admin action, newest
+  first, reduced to the fields that changed.
 
 ## Everything else
 

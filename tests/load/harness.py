@@ -46,6 +46,13 @@ BACKEND_PORT_BASE = 9101
 # this rate are split across more of them.
 RATE_PER_DRIVER = 2000.0
 
+# The gateway's credentials, read off the file gateway_app.py writes once it has
+# created its first admin: the session cookie for /api and the default key for
+# /v1. Module state rather than a Cluster field because the job builders below
+# are plain functions their callers already use everywhere; there is one
+# gateway per harness process.
+GATEWAY_HEADERS: dict[str, str] = {}
+
 
 def _taskset(cores: str) -> list[str]:
     exe = shutil.which("taskset")
@@ -129,6 +136,8 @@ class Cluster:
         # Control-plane calls get their own short timeout so a saturated
         # component fails fast and visibly instead of hanging the harness.
         self._control = httpx.Client(timeout=8.0)
+        self._creds_dir = tempfile.mkdtemp(prefix="derate-load-creds-")
+        self._creds = os.path.join(self._creds_dir, "creds.json")
 
     @property
     def backend_ports(self) -> list[int]:
@@ -166,6 +175,7 @@ class Cluster:
                 "--backends", ",".join(self.backend_urls),
                 "--max-seqs", str(self.max_seqs),
                 "--settings", json.dumps(self.settings),
+                "--creds-out", self._creds,
             ],
             GATEWAY_CORE,
         )
@@ -175,6 +185,15 @@ class Cluster:
             [f"http://127.0.0.1:{p}/health" for p in self.backend_ports]
             + [f"{self.gateway_url}/healthz"]
         )
+        with open(self._creds) as handle:
+            GATEWAY_HEADERS.update(json.load(handle))
+        self.client.headers.update(GATEWAY_HEADERS)
+        self._control.headers.update(GATEWAY_HEADERS)
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """The cookie and the key, for a caller with its own client."""
+        return dict(GATEWAY_HEADERS)
 
     def _await(self, urls: list[str], timeout: float = 30.0) -> None:
         deadline = time.time() + timeout
@@ -208,6 +227,8 @@ class Cluster:
         self.backend_procs.clear()
         self.client.close()
         self._control.close()
+        shutil.rmtree(self._creds_dir, ignore_errors=True)
+        GATEWAY_HEADERS.clear()
 
     # -- runtime control ---------------------------------------------------
 
@@ -367,6 +388,7 @@ def rps_jobs(url: str, rate: float, duration: float, k: int, **extra) -> list[di
             # hiding the very backlog it is looking for.
             "inflight_cap": conns,
             "timeout_s": 30.0,
+            "headers": dict(GATEWAY_HEADERS),
             **extra,
         }
         for _ in range(k)
@@ -384,6 +406,7 @@ def stream_jobs(url: str, concurrency: int, duration: float, k: int, **extra) ->
             "duration_s": duration,
             "max_conns": per + 16,
             "timeout_s": 60.0,
+            "headers": dict(GATEWAY_HEADERS),
             **extra,
         }
         for _ in range(k)

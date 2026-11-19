@@ -1,6 +1,7 @@
 # check
 
-Shared machinery for the verifier suite. Neither file here is a verifier:
+Shared machinery for the verifier suite. The one verifier here is
+`alignment.check.mjs`, which proves `alignment.mjs`; the rest is machinery:
 `harness.mjs` is the prelude a new `*.check.mjs` starts from, so writing one
 begins at its first assertion rather than at thirty lines of bundling and
 counting, and `browser.mjs` answers "where is the Chromium" without ever
@@ -13,6 +14,7 @@ and only `browser.mjs`; `harness.mjs` is imported by verifiers alone.
 |---|---|---|
 | `harness.mjs` | 82 | `load()` — esbuild a TS module so node can import it — and `report()`, which prints PASS/FAIL, counts, and sets the exit code |
 | `browser.mjs` | 51 | `findBrowser()`: a Chromium already on this machine, or an honest reason there is none |
+| `alignment.mjs` | 163 | `alignmentAudit()`, run inside every page by `shell/screens.check.mjs`: controls on one line of a flex row share a centre line, and a table row's cells share a first-line baseline (1px tolerance). Its own verifier, `alignment.check.mjs` (`requires: browser`), proves it on hand-built pages: the margin-hung `.chips` group that made `/usage/requests` bounce, a centred two-line status cell, and the wrapped-line, stacked-item and checkbox cases it must leave alone |
 
 ## `harness.mjs`
 

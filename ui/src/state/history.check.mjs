@@ -1,6 +1,6 @@
 // requires: fixtures HISTORY_FIXTURES -- real payloads, captured; it prints the curl lines
 // Verifier for the pure history adapters, in the same shape and for the same
-// reason as tabs/cluster/layout.check.mjs: there is no test runner in this
+// reason as the other *.check.mjs verifiers: there is no test runner in this
 // repo (AUDIT-2026-09-06.md:197, "No UI test suite exists (typecheck is the
 // only gate)"), and these functions are checkable without a browser.
 //
@@ -32,7 +32,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const uiRoot = join(here, '..', '..')
 // Bundled inside the ui root, not in /tmp: history.ts reaches React through
 // state/backend, and a bundle in /tmp has no node_modules above it to resolve
-// it from. (layout.check.mjs can use /tmp because layout.ts imports nothing.)
+// it from.
 const out = mkdtempSync(join(uiRoot, '.history-check-'))
 const bundle = join(out, 'history.mjs')
 

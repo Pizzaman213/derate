@@ -60,10 +60,10 @@ def shell_on(monkeypatch, tmp_path):
 def test_the_default_is_off(monkeypatch):
     """Pinned, because it drifted once.
 
-    This is not a preference. The `/api` surface has no authentication, the
+    This is not a preference. The `/api` surface is one admin password away, the
     gateway binds 0.0.0.0, and the container runs as root with --pid=host and
-    the operator's SSH keys mounted -- so the env flag and the out-of-band key
-    are two gates on a root prompt, and the argument for collapsing them to one
+    the operator's SSH keys mounted -- so the env flag, the out-of-band key and
+    the session are three gates on a root prompt, and the argument for collapsing them
     ("the key is the real gate anyway") is exactly the argument that makes
     defence in depth not survive a mistake. If this needs to change, it is the
     cluster operator's call and not a refactor's.
@@ -106,14 +106,48 @@ def test_no_key_presented_is_refused(shell_on):
                 pass
 
 
+class _Sink:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def event(self, source, body):
+        self.events.append((source, body))
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
 def test_the_wrong_key_is_refused(shell_on):
-    app = create_agent_app(NodeAgent(profile()))
-    with TestClient(app) as client:
+    """R-3: and the refusal is recorded with the peer, like every other
+    credentialed route on the agent."""
+    sink = _Sink()
+    app = create_agent_app(NodeAgent(profile(), sink=sink))
+    with TestClient(app, client=("10.0.0.66", 4242)) as client:
         with pytest.raises(Exception):
             with client.websocket_connect(
                 "/agent/shell", subprotocols=["derate-shell", "wrong"]
             ):
                 pass
+    refused = [b for s, b in sink.events if b.get("type") == "agent_refused"]
+    assert len(refused) == 1
+    assert refused[0]["path"] == "/agent/shell"
+    assert refused[0]["method"] == "WS"
+    assert refused[0]["peer"] == "10.0.0.66"
+
+
+def test_an_opened_shell_records_who_opened_it(shell_on):
+    sink = _Sink()
+    app = create_agent_app(NodeAgent(profile(), sink=sink))
+    with TestClient(app, client=("10.0.0.11", 4242)) as client:
+        with client.websocket_connect(
+            "/agent/shell", subprotocols=["derate-shell", "s3cret"],
+            headers={"origin": "http://10.0.0.11:8080"},
+        ):
+            pass
+    opened = [b for s, b in sink.events if b.get("type") == "shell_opened"]
+    assert len(opened) == 1
+    assert opened[0]["peer"] == "10.0.0.11"
+    assert opened[0]["origin"] == "http://10.0.0.11:8080"
 
 
 def test_the_right_key_opens_a_session(shell_on):

@@ -28,8 +28,18 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from control_plane.fsutil import private_sqlite
+
 from . import config
-from .records import KIND_EVENT, KIND_LOG, KIND_REQUEST, KIND_SAMPLE, RequestRecord
+from .records import (
+    KIND_ACCESS,
+    KIND_EVENT,
+    KIND_LOG,
+    KIND_REQUEST,
+    KIND_SAMPLE,
+    AccessRecord,
+    RequestRecord,
+)
 
 log = logging.getLogger(__name__)
 
@@ -189,7 +199,9 @@ class Journal:
         self._last_trim = 0.0
         self._migrated = False
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Here, once, rather than in _connect, which runs per read: the
+        # journal holds every log line this node emits.
+        private_sqlite(self.path)
         conn = _connect(self.path)
         try:
             conn.executescript(_SCHEMA)
@@ -249,6 +261,10 @@ class Journal:
 
     def log(self, entry: dict[str, Any]) -> None:
         self.append(KIND_LOG, entry, ts=entry.get("ts"))
+
+    def access(self, record: AccessRecord) -> None:
+        body = record.as_dict() if isinstance(record, AccessRecord) else dict(record)
+        self.append(KIND_ACCESS, body, ts=body.get("ts"))
 
     # -- writer thread ---------------------------------------------------
 
@@ -561,6 +577,18 @@ class Journal:
         """
         conn = _connect(self.path)
         try:
+            # Never acknowledge rows that were not written yet. A cursor past
+            # the last sequence number ever handed out would otherwise raise
+            # the trim mark over rows appended after it, and they would be
+            # evicted uncollected with no telemetry_gap to say so. The
+            # ceiling is sqlite_sequence, not MAX(seq): a fully trimmed
+            # journal has no rows yet a perfectly honest cursor at its end.
+            requested = since
+            written = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='journal'"
+            ).fetchone()
+            ceiling = int(written[0]) if written and written[0] is not None else 0
+            since = min(since, ceiling)
             if since > 0:
                 conn.execute(
                     "INSERT INTO meta(k, v) VALUES('shipped_hwm', ?) "
@@ -583,7 +611,7 @@ class Journal:
                 rows.append({"seq": seq, "ts": ts, "kind": kind, "body": body})
                 next_seq = seq
             head = conn.execute("SELECT MAX(seq) FROM journal").fetchone()[0] or 0
-            return {
+            payload = {
                 "node_id": self.node_id,
                 "rows": rows,
                 "next": next_seq,
@@ -591,6 +619,9 @@ class Journal:
                 "dropped": self._dropped,
                 "schema_version": SCHEMA_VERSION,
             }
+            if requested != since:
+                payload["clamped_from"] = requested
+            return payload
         finally:
             conn.close()
 

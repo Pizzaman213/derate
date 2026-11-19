@@ -17,3 +17,8 @@ DEFAULT_GUARDRAIL = 0.90  # fraction of addressable memory we will spend
 COMM_BUFFER_BYTES = int(1.5 * 1024**3)
 EP_EXTRA_BUFFER_BYTES = int(2.0 * 1024**3)
 FRAMEWORK_OVERHEAD = int(1.0 * 1024**3)
+
+# The open join route (POST /api/nodes/join) answers one client address at
+# most this many times a minute; past it, 429 with Retry-After: 60. Every join
+# makes the coordinator dial the caller back, so this bounds that too.
+JOIN_PER_ADDRESS_PER_MIN = 30

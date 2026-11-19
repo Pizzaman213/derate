@@ -1,33 +1,14 @@
-import { useEffect, useRef, type UIEvent } from 'react'
-import type { ChatRole, ChatTurnMeta, Modality, SpeechResult } from '../../api/types'
+import { Fragment, useEffect, useRef, useState, type UIEvent } from 'react'
+import { plainClick, useRouter } from '../../state/router'
+import type { Modality } from '../../api/types'
+import { Disclosure } from '../../components/Panel'
 import { Verbatim } from '../../components/Verbatim'
 import { fmt } from '../../format'
 import { Clip } from './Clip'
+import { Markdown } from './Markdown'
+import { reasoningVerdict, turnFigures } from './stats'
 import { tagInk, tagStyle, tagsFor } from './tags'
-
-export interface Turn {
-  key: number
-  role: ChatRole
-  content: string
-  /** Set when the turn finished normally, or was stopped. */
-  meta: ChatTurnMeta | null
-  /** The gateway's own sentence when it refused. Rendered verbatim. */
-  error: string | null
-  /** Known from the response headers, so an errored turn still names the row
-   *  that recorded it. */
-  requestId: string | null
-  /** The answer, when the model this turn went to answers in audio rather
-   *  than in text. Mutually exclusive with `content` in practice -- a speech
-   *  reply has no tokens and a chat reply has no clip -- but kept as a
-   *  separate field rather than a tagged union, because the turn's identity
-   *  is the request and not the media type of what came back. */
-  audio: SpeechResult | null
-  /** The model this turn was SENT to, recorded at send time on both halves of
-   *  the exchange. The answer also carries `meta.model` -- what actually
-   *  served -- and that one wins where both exist; this is what a question has
-   *  instead, and what an answer has before the first byte comes back. */
-  model: string | null
-}
+import type { Turn } from './turn'
 
 /** The model a block is about: what served it, else what it was sent to. The
  *  two are the same string in every case seen so far, and the order matters
@@ -37,17 +18,48 @@ function destination(turn: Turn): string | null {
   return turn.meta?.model ?? turn.model
 }
 
-/** The one line under an answer that makes this a control-plane surface rather
- *  than a chat window: what served it, the id of the row that recorded it, and
- *  what it cost in time.
+/** The block under an answer that makes this a control-plane surface rather
+ *  than a chat window: what served it, the id of the row that recorded it, why
+ *  it stopped, what it cost in time and tokens, and whether reasoning came
+ *  back and how.
  *
  *  Missing figures print as an em dash, never as zero, and a token count that
  *  came from counting delta frames says so — the gateway makes the same
  *  distinction on its own records and it is not ours to quietly drop. */
-function metaLine(turn: Turn): string {
+function TurnMeta({ turn }: { turn: Turn }) {
+  const { navigate, linkTo } = useRouter()
   const m = turn.meta
   const id = turn.requestId ?? m?.requestId ?? '—'
-  if (!m) return id
+  const idNode =
+    id === '—' ? (
+      id
+    ) : (
+      <a
+        href={linkTo({ dest: 'usage', sub: 'requests', request: id })}
+        onClick={(e) => {
+          if (!plainClick(e)) return
+          e.preventDefault()
+          navigate({ dest: 'usage', sub: 'requests', request: id })
+        }}
+      >
+        {id}
+      </a>
+    )
+  const join = (parts: (string | null | undefined | typeof ID)[]) =>
+    parts
+      .filter((p) => p)
+      .map((p, i) => (
+        <Fragment key={i}>
+          {i > 0 ? ' · ' : null}
+          {p === ID ? idNode : p}
+        </Fragment>
+      ))
+  if (!m) return <div className="turnmeta unit mono">{idNode}</div>
+  const head = join([
+    m.model,
+    ID,
+    m.stopped ? 'stopped' : m.finishReason ? `finish ${m.finishReason}` : null,
+  ])
   // Nothing token-denominated exists on this turn, so none of it is printed.
   //
   // Both audio endpoints land here: a speech turn's real figures are duration
@@ -61,23 +73,33 @@ function metaLine(turn: Turn): string {
   // row at all. `ttft — ms · — s · — tok` reads as three failed measurements
   // rather than as a request that was never going to have them.
   if (m.ttftMs === null && m.elapsedMs === null && m.completionTokens === null) {
-    const line = [m.model, id].filter(Boolean).join(' · ')
-    return m.stopped ? `${line} · stopped` : line
+    return <div className="turnmeta unit mono"><div>{head}</div></div>
   }
-  const tokens =
-    m.completionTokens == null
-      ? '—'
-      : `${m.completionTokens}${m.tokensEstimated ? ' (est.)' : ''}`
-  const parts = [
-    m.model,
-    id,
-    `ttft ${fmt(m.ttftMs)} ms`,
-    `${fmt(m.elapsedMs == null ? null : m.elapsedMs / 1000, 1)} s`,
-    `${tokens} tok`,
-  ]
-  if (m.stopped) parts.push('stopped')
-  return parts.join(' · ')
+  const f = turnFigures(m)
+  const reasoned = m.reasoningSource !== null
+  const figures = join([
+    `ttft ${fmt(f.ttftMs)} ms`,
+    reasoned ? `think ${fmt(f.thinkMs == null ? null : f.thinkMs / 1000, 1)} s` : null,
+    `gen ${fmt(f.genMs == null ? null : f.genMs / 1000, 1)} s`,
+    `${fmt(f.tokPerS, 1)} tok/s`,
+    `in ${fmt(f.promptTokens)}`,
+    `out ${fmt(f.completionTokens)}${f.estimated && f.completionTokens !== null ? ' (est.)' : ''}`,
+    reasoned
+      ? `think ${fmt(f.reasoningTokens)}${f.reasoningEstimated && f.reasoningTokens !== null ? ' (est.)' : ''} tok`
+      : null,
+  ])
+  const verdict = turn.setup ? reasoningVerdict(turn, turn.setup) : null
+  return (
+    <div className="turnmeta unit mono">
+      <div>{head}</div>
+      <div>{figures}</div>
+      {verdict ? <div>{verdict}</div> : null}
+    </div>
+  )
 }
+
+/** Where the request id sits in a meta line; rendered as a link to it. */
+const ID = Symbol('request id')
 
 interface Props {
   turns: Turn[]
@@ -92,6 +114,10 @@ interface Props {
 }
 
 export function Transcript({ turns, streamingKey, model, mode = 'text' }: Props) {
+  // A thinking block someone has opened or closed stays that way; until then
+  // it follows the stream -- open while the model is still thinking, closed
+  // once the answer starts, so the answer is what is on screen.
+  const [pinned, setPinned] = useState<Map<number, boolean>>(() => new Map())
   // Only one of the three streams, and only one of the three is waiting for a
   // token. Naming the wrong thing is not cosmetic here: "waiting for the
   // first token" in front of a request that produces no tokens reads as a
@@ -166,40 +192,79 @@ export function Transcript({ turns, streamingKey, model, mode = 'text' }: Props)
                 : (dest ?? model ?? 'assistant')}
             </div>
 
+            {turn.reasoning !== '' ? (
+              <ThinkingBlock
+                turn={turn}
+                streaming={streaming}
+                open={pinned.get(turn.key) ?? (streaming && turn.content === '')}
+                onToggle={(open) => setPinned((prev) => new Map(prev).set(turn.key, open))}
+              />
+            ) : null}
+
             {turn.content ? (
-              <p
-                style={{ margin: '4px 0 0', whiteSpace: 'pre-wrap' }}
-                aria-live={streaming ? 'polite' : undefined}
-              >
-                {turn.content}
-              </p>
+              turn.role === 'user' ? (
+                <p style={{ margin: 'var(--space-4) 0 0', whiteSpace: 'pre-wrap' }}>{turn.content}</p>
+              ) : (
+                <div className="md" aria-live={streaming ? 'polite' : undefined}>
+                  <Markdown text={turn.content} />
+                </div>
+              )
             ) : null}
 
             {streaming && !turn.content && !turn.audio ? (
-              <p className="unit" style={{ margin: '4px 0 0' }} aria-live="polite">
+              <p className="unit" style={{ margin: 'var(--space-4) 0 0' }} aria-live="polite">
                 {/* A speech model does not stream, so "the first token" is
                     not the thing being waited for and never arrives. It is
                     one whole file at the end. */}
-                {waiting}
+                {turn.reasoning !== '' ? 'thinking…' : waiting}
               </p>
             ) : null}
 
             {turn.audio ? <Clip clip={turn.audio} /> : null}
 
             {turn.error ? (
-              <div style={{ marginTop: 6, color: 'var(--fault)' }}>
+              <div style={{ marginTop: 'var(--space-6)', color: 'var(--fault)' }}>
                 <Verbatim text={turn.error} />
               </div>
             ) : null}
 
             {turn.role === 'assistant' && (turn.meta || turn.error || turn.audio) ? (
-              <div className="unit mono" style={{ marginTop: 6 }}>
-                {metaLine(turn)}
-              </div>
+              <TurnMeta turn={turn} />
             ) : null}
           </div>
         )
       })}
+    </div>
+  )
+}
+
+/** The model's reasoning, collapsed under one line that says how much of it
+ *  there was. Plain text: it is a working, not an answer, and rendering it as
+ *  markdown would dress it as one. */
+function ThinkingBlock({
+  turn,
+  streaming,
+  open,
+  onToggle,
+}: {
+  turn: Turn
+  streaming: boolean
+  open: boolean
+  onToggle: (open: boolean) => void
+}) {
+  const m = turn.meta
+  let summary = streaming && turn.content === '' ? 'Thinking…' : 'Thinking'
+  if (m) {
+    const f = turnFigures(m)
+    summary = `Thinking · ${fmt(f.reasoningTokens)} tok${
+      f.reasoningEstimated && f.reasoningTokens !== null ? ' (est.)' : ''
+    } · ${fmt(f.thinkMs == null ? null : f.thinkMs / 1000, 1)} s`
+  }
+  return (
+    <div style={{ marginTop: 'var(--space-4)' }}>
+      <Disclosure summary={summary} open={open} onToggle={() => onToggle(!open)}>
+        <div className="think">{turn.reasoning.trimEnd()}</div>
+      </Disclosure>
     </div>
   )
 }

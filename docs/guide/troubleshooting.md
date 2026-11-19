@@ -391,9 +391,10 @@ capture is the longest of the four steps and the one with no bar.
 ## Errors from the endpoint itself
 
 These come from the gateway rather than from a backend. An error a backend
-produced is passed through untouched, so a `401` on a `/v1` call is a provider
-rejecting your key for *that* provider — derate has no inbound authentication of
-its own to fail.
+produced is passed through untouched. A `401` on a `/v1` call is derate's own
+when its `code` is `missing_api_key`, `invalid_api_key`, `api_key_disabled` or
+`api_key_expired` (see [the endpoint](the-endpoint.md#every-request-carries-a-key));
+any other `401` is a provider rejecting your key for *that* provider.
 
 Every body below is OpenAI-shaped: `error.message`, `error.type`, `error.code`.
 The `code` is the field to match on.

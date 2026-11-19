@@ -4,6 +4,7 @@ import type { Terminal as Xterm } from '@xterm/xterm'
 import { wsUrl } from '../../api/origin'
 import { useShellStatus } from '../../state/history'
 import { Verbatim } from '../../components/Verbatim'
+import { tokens } from '../../../../.omp/design/tokens/tokens.ts'
 
 // The one dependency this UI takes that it could not have written, and it is
 // **loaded on demand**, not bundled. Both halves of that matter.
@@ -210,7 +211,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
               rendering a figure it did not measure applies to a claim about
               privilege at least as much as to a number. The prompt says which
               once it opens. */}
-          <div className="unit" style={{ marginBottom: 8 }}>
+          <div className="unit" style={{ marginBottom: 'var(--space-8)' }}>
             A shell on {nodeId}, running as whatever user its node agent runs as — on a node
             started with <span className="mono">--pid=host</span> that is root, on the machine
             itself rather than in the container. The connection is not encrypted: the coordinator
@@ -218,7 +219,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
             network in clear. Where the node&apos;s container mounts the operator&apos;s SSH keys,
             a session here also reaches every machine those keys reach.
           </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+          <div style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'center', marginBottom: 'var(--space-10)' }}>
             <label className="sr-only" htmlFor={`shell-key-${nodeId}`}>
               Shell key
             </label>
@@ -234,7 +235,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
               }}
               style={{ width: 240 }}
             />
-            <button onClick={() => void open()} disabled={!key || phase === 'loading'}>
+            <button type="button" onClick={() => void open()} disabled={!key || phase === 'loading'}>
               {phase === 'loading' ? 'Loading…' : 'Open a shell'}
             </button>
             <span className="unit">
@@ -261,9 +262,9 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
             </span>
             <span className="chips">
               {phase === 'open' ? (
-                <button onClick={detach}>Detach</button>
+                <button type="button" onClick={detach}>Detach</button>
               ) : (
-                <button onClick={close}>Close</button>
+                <button type="button" onClick={close}>Close</button>
               )}
             </span>
           </h4>
@@ -272,7 +273,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
       ) : null}
 
       {error ? (
-        <div style={{ marginTop: 6 }}>
+        <div style={{ marginTop: 'var(--space-6)' }}>
           <Verbatim text={error} size="unit" />
         </div>
       ) : null}
@@ -282,19 +283,21 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
 
 /** xterm needs literal colours, and this page is themed with custom properties
  *  that change under `prefers-color-scheme` and the theme switch. Read from the
- *  live computed style so the terminal matches whichever is in force. */
+ *  live computed style so the terminal matches whichever is in force; the
+ *  fallbacks are the light theme's values from the design pack. */
 function readTheme() {
   const style = getComputedStyle(document.documentElement)
   const token = (name: string, fallback: string) =>
     style.getPropertyValue(name).trim() || fallback
+  const light = tokens.light
   return {
-    background: token('--panel', '#EDE9E0'),
-    foreground: token('--ink', '#1A1917'),
-    cursor: token('--ink', '#1A1917'),
-    selectionBackground: token('--panel-sunk', '#D6D0C2'),
-    red: token('--fault', '#9A3327'),
-    green: token('--live', '#2F6E3A'),
-    yellow: token('--warn', '#7F5C14'),
-    blue: token('--flow', '#4A6FA5'),
+    background: token('--panel', light.panel),
+    foreground: token('--ink', light.ink),
+    cursor: token('--ink', light.ink),
+    selectionBackground: token('--panel-sunk', light['panel-sunk']),
+    red: token('--fault', light.fault),
+    green: token('--live', light.live),
+    yellow: token('--warn', light.warn),
+    blue: token('--flow', light.flow),
   }
 }

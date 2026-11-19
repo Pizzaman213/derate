@@ -28,7 +28,7 @@ export function Lamp({ signal, hollow = false, label, size = 8 }: Props) {
         display: 'inline-block',
         width: size,
         height: size,
-        borderRadius: '50%',
+        borderRadius: 'var(--radius-full)',
         background: hollow ? 'transparent' : c,
         boxShadow: hollow ? `inset 0 0 0 1.5px ${c}` : 'none',
         flex: '0 0 auto',

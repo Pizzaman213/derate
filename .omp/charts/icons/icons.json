@@ -1,0 +1,1252 @@
+{
+  "version": 1,
+  "icons": [
+    {
+      "name": "adjacency-matrix",
+      "chart": "adjacency-matrix",
+      "category": "matrix",
+      "tags": [
+        "adjacency",
+        "matrix",
+        "relationship",
+        "correlation",
+        "compare",
+        "network"
+      ],
+      "usage": "Adjacency matrix: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "alluvial",
+      "chart": "alluvial",
+      "category": "flow-hierarchy",
+      "tags": [
+        "alluvial",
+        "flow",
+        "composition"
+      ],
+      "usage": "Alluvial diagram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "arc-diagram",
+      "chart": "arc-diagram",
+      "category": "flow-hierarchy",
+      "tags": [
+        "arc",
+        "diagram",
+        "network",
+        "relationship"
+      ],
+      "usage": "Arc diagram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "area",
+      "chart": "area",
+      "category": "trend",
+      "tags": [
+        "area",
+        "trend",
+        "change-over-time"
+      ],
+      "usage": "Area chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "bar",
+      "chart": "bar",
+      "category": "comparison",
+      "tags": [
+        "bar",
+        "compare",
+        "rank"
+      ],
+      "usage": "Bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "beeswarm",
+      "chart": "beeswarm",
+      "category": "distribution",
+      "tags": [
+        "beeswarm",
+        "distribution"
+      ],
+      "usage": "Beeswarm chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "box-plot",
+      "chart": "box-plot",
+      "category": "distribution",
+      "tags": [
+        "box",
+        "plot",
+        "distribution",
+        "compare"
+      ],
+      "usage": "Box plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "bubble",
+      "chart": "bubble",
+      "category": "relationship",
+      "tags": [
+        "bubble",
+        "relationship",
+        "correlation"
+      ],
+      "usage": "Bubble chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "bubble-map",
+      "chart": "bubble-map",
+      "category": "geo",
+      "tags": [
+        "bubble",
+        "map",
+        "geo"
+      ],
+      "usage": "Bubble map: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "bullet",
+      "chart": "bullet",
+      "category": "comparison",
+      "tags": [
+        "bullet",
+        "compare",
+        "kpi"
+      ],
+      "usage": "Bullet chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "bump",
+      "chart": "bump",
+      "category": "trend",
+      "tags": [
+        "bump",
+        "trend",
+        "change-over-time",
+        "rank",
+        "compare"
+      ],
+      "usage": "Bump chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "burndown",
+      "chart": "burndown",
+      "category": "timeline",
+      "tags": [
+        "burndown",
+        "timeline",
+        "schedule",
+        "trend",
+        "kpi"
+      ],
+      "usage": "Burndown chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "burnup",
+      "chart": "burnup",
+      "category": "timeline",
+      "tags": [
+        "burnup",
+        "timeline",
+        "schedule",
+        "trend",
+        "kpi"
+      ],
+      "usage": "Burnup chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "calendar-heatmap",
+      "chart": "calendar-heatmap",
+      "category": "trend",
+      "tags": [
+        "calendar",
+        "heatmap",
+        "trend",
+        "change-over-time"
+      ],
+      "usage": "Calendar heatmap: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "candlestick",
+      "chart": "candlestick",
+      "category": "trend",
+      "tags": [
+        "candlestick",
+        "trend",
+        "change-over-time"
+      ],
+      "usage": "Candlestick chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "chord",
+      "chart": "chord",
+      "category": "flow-hierarchy",
+      "tags": [
+        "chord",
+        "flow",
+        "relationship"
+      ],
+      "usage": "Chord diagram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "choropleth",
+      "chart": "choropleth",
+      "category": "geo",
+      "tags": [
+        "choropleth",
+        "geo",
+        "compare"
+      ],
+      "usage": "Choropleth map: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "circle-packing",
+      "chart": "circle-packing",
+      "category": "flow-hierarchy",
+      "tags": [
+        "circle",
+        "packing",
+        "hierarchy",
+        "composition"
+      ],
+      "usage": "Circle packing: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "connected-scatter",
+      "chart": "connected-scatter",
+      "category": "relationship",
+      "tags": [
+        "connected",
+        "scatter",
+        "relationship",
+        "correlation",
+        "change-over-time"
+      ],
+      "usage": "Connected scatter plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "contour-density",
+      "chart": "contour-density",
+      "category": "relationship",
+      "tags": [
+        "contour",
+        "density",
+        "relationship",
+        "correlation",
+        "distribution"
+      ],
+      "usage": "Contour density plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "control-chart",
+      "chart": "control-chart",
+      "category": "timeline",
+      "tags": [
+        "control",
+        "chart",
+        "timeline",
+        "schedule",
+        "trend",
+        "deviation"
+      ],
+      "usage": "Control chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "correlation-matrix",
+      "chart": "correlation-matrix",
+      "category": "relationship",
+      "tags": [
+        "correlation",
+        "matrix",
+        "relationship"
+      ],
+      "usage": "Correlation matrix: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "cumulative-flow",
+      "chart": "cumulative-flow",
+      "category": "timeline",
+      "tags": [
+        "cumulative",
+        "flow",
+        "timeline",
+        "schedule",
+        "trend"
+      ],
+      "usage": "Cumulative flow diagram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "cycle-plot",
+      "chart": "cycle-plot",
+      "category": "trend",
+      "tags": [
+        "cycle",
+        "plot",
+        "trend",
+        "change-over-time"
+      ],
+      "usage": "Cycle plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "dendrogram",
+      "chart": "dendrogram",
+      "category": "flow-hierarchy",
+      "tags": [
+        "dendrogram",
+        "hierarchy",
+        "network"
+      ],
+      "usage": "Dendrogram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "density",
+      "chart": "density",
+      "category": "distribution",
+      "tags": [
+        "density",
+        "distribution"
+      ],
+      "usage": "Density plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "diverging-bar",
+      "chart": "diverging-bar",
+      "category": "comparison",
+      "tags": [
+        "diverging",
+        "bar",
+        "deviation",
+        "compare"
+      ],
+      "usage": "Diverging bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "donut",
+      "chart": "donut",
+      "category": "part-to-whole",
+      "tags": [
+        "donut",
+        "composition"
+      ],
+      "usage": "Donut chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "dot-map",
+      "chart": "dot-map",
+      "category": "geo",
+      "tags": [
+        "dot",
+        "map",
+        "geo",
+        "distribution"
+      ],
+      "usage": "Dot map: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "dot-plot",
+      "chart": "dot-plot",
+      "category": "comparison",
+      "tags": [
+        "dot",
+        "plot",
+        "compare",
+        "rank"
+      ],
+      "usage": "Dot plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "dumbbell",
+      "chart": "dumbbell",
+      "category": "comparison",
+      "tags": [
+        "dumbbell",
+        "compare",
+        "rank",
+        "deviation",
+        "change-over-time"
+      ],
+      "usage": "Dumbbell chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "ecdf",
+      "chart": "ecdf",
+      "category": "distribution",
+      "tags": [
+        "ecdf",
+        "distribution"
+      ],
+      "usage": "Empirical CDF: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "euler",
+      "chart": "euler",
+      "category": "sets",
+      "tags": [
+        "euler",
+        "sets",
+        "compare"
+      ],
+      "usage": "Euler diagram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "event-timeline",
+      "chart": "event-timeline",
+      "category": "timeline",
+      "tags": [
+        "event",
+        "timeline",
+        "schedule"
+      ],
+      "usage": "Event timeline: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "flow-map",
+      "chart": "flow-map",
+      "category": "geo",
+      "tags": [
+        "flow",
+        "map",
+        "geo"
+      ],
+      "usage": "Flow map: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "force-network",
+      "chart": "force-network",
+      "category": "flow-hierarchy",
+      "tags": [
+        "force",
+        "network",
+        "relationship"
+      ],
+      "usage": "Network graph: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "funnel",
+      "chart": "funnel",
+      "category": "part-to-whole",
+      "tags": [
+        "funnel",
+        "composition",
+        "flow"
+      ],
+      "usage": "Funnel chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "gantt",
+      "chart": "gantt",
+      "category": "timeline",
+      "tags": [
+        "gantt",
+        "schedule",
+        "timeline"
+      ],
+      "usage": "Gantt chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "gauge",
+      "chart": "gauge",
+      "category": "kpi",
+      "tags": [
+        "gauge",
+        "kpi"
+      ],
+      "usage": "Gauge: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "grouped-bar",
+      "chart": "grouped-bar",
+      "category": "comparison",
+      "tags": [
+        "grouped",
+        "bar",
+        "compare",
+        "rank"
+      ],
+      "usage": "Grouped bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "heatmap",
+      "chart": "heatmap",
+      "category": "matrix",
+      "tags": [
+        "heatmap",
+        "correlation",
+        "compare",
+        "relationship",
+        "trend",
+        "distribution"
+      ],
+      "usage": "Heatmap: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "hex-tile-map",
+      "chart": "hex-tile-map",
+      "category": "geo",
+      "tags": [
+        "hex",
+        "tile",
+        "map",
+        "geo"
+      ],
+      "usage": "Hex-tile map: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "hexbin",
+      "chart": "hexbin",
+      "category": "relationship",
+      "tags": [
+        "hexbin",
+        "relationship",
+        "correlation",
+        "distribution"
+      ],
+      "usage": "Hexbin plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "histogram",
+      "chart": "histogram",
+      "category": "distribution",
+      "tags": [
+        "histogram",
+        "distribution"
+      ],
+      "usage": "Histogram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "horizon",
+      "chart": "horizon",
+      "category": "trend",
+      "tags": [
+        "horizon",
+        "trend",
+        "change-over-time",
+        "compare"
+      ],
+      "usage": "Horizon chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "horizontal-bar",
+      "chart": "horizontal-bar",
+      "category": "comparison",
+      "tags": [
+        "horizontal",
+        "bar",
+        "compare",
+        "rank"
+      ],
+      "usage": "Horizontal bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "icicle",
+      "chart": "icicle",
+      "category": "part-to-whole",
+      "tags": [
+        "icicle",
+        "composition",
+        "hierarchy"
+      ],
+      "usage": "Icicle chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "kpi-tile",
+      "chart": "kpi-tile",
+      "category": "kpi",
+      "tags": [
+        "kpi",
+        "tile",
+        "trend"
+      ],
+      "usage": "KPI tile: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "line",
+      "chart": "line",
+      "category": "trend",
+      "tags": [
+        "line",
+        "trend",
+        "change-over-time"
+      ],
+      "usage": "Line chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "linear-progress",
+      "chart": "linear-progress",
+      "category": "kpi",
+      "tags": [
+        "linear",
+        "progress",
+        "kpi"
+      ],
+      "usage": "Progress bar: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "lollipop",
+      "chart": "lollipop",
+      "category": "comparison",
+      "tags": [
+        "lollipop",
+        "compare",
+        "rank"
+      ],
+      "usage": "Lollipop chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "marimekko",
+      "chart": "marimekko",
+      "category": "part-to-whole",
+      "tags": [
+        "marimekko",
+        "composition",
+        "compare"
+      ],
+      "usage": "Marimekko chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "meter",
+      "chart": "meter",
+      "category": "kpi",
+      "tags": [
+        "meter",
+        "kpi"
+      ],
+      "usage": "Meter: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "milestone-timeline",
+      "chart": "milestone-timeline",
+      "category": "timeline",
+      "tags": [
+        "milestone",
+        "timeline",
+        "schedule"
+      ],
+      "usage": "Milestone timeline: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "multi-line",
+      "chart": "multi-line",
+      "category": "trend",
+      "tags": [
+        "multi",
+        "line",
+        "trend",
+        "change-over-time",
+        "compare"
+      ],
+      "usage": "Multi-line chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "nested-proportions",
+      "chart": "nested-proportions",
+      "category": "part-to-whole",
+      "tags": [
+        "nested",
+        "proportions",
+        "composition",
+        "hierarchy"
+      ],
+      "usage": "Nested proportions: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "ohlc",
+      "chart": "ohlc",
+      "category": "trend",
+      "tags": [
+        "ohlc",
+        "trend",
+        "change-over-time"
+      ],
+      "usage": "OHLC chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "org-chart",
+      "chart": "org-chart",
+      "category": "flow-hierarchy",
+      "tags": [
+        "org",
+        "chart",
+        "hierarchy",
+        "network"
+      ],
+      "usage": "Org chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "parallel-coordinates",
+      "chart": "parallel-coordinates",
+      "category": "relationship",
+      "tags": [
+        "parallel",
+        "coordinates",
+        "relationship",
+        "correlation"
+      ],
+      "usage": "Parallel coordinates: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "pareto",
+      "chart": "pareto",
+      "category": "comparison",
+      "tags": [
+        "pareto",
+        "rank",
+        "compare"
+      ],
+      "usage": "Pareto chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "pie",
+      "chart": "pie",
+      "category": "part-to-whole",
+      "tags": [
+        "pie",
+        "composition"
+      ],
+      "usage": "Pie chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "population-pyramid",
+      "chart": "population-pyramid",
+      "category": "distribution",
+      "tags": [
+        "population",
+        "pyramid",
+        "distribution",
+        "compare"
+      ],
+      "usage": "Population pyramid: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "progress-ring",
+      "chart": "progress-ring",
+      "category": "kpi",
+      "tags": [
+        "progress",
+        "ring",
+        "kpi"
+      ],
+      "usage": "Progress ring: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "punch-card",
+      "chart": "punch-card",
+      "category": "matrix",
+      "tags": [
+        "punch",
+        "card",
+        "trend",
+        "distribution",
+        "compare",
+        "relationship",
+        "correlation"
+      ],
+      "usage": "Punch card: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "pyramid",
+      "chart": "pyramid",
+      "category": "part-to-whole",
+      "tags": [
+        "pyramid",
+        "composition"
+      ],
+      "usage": "Pyramid chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "qq-plot",
+      "chart": "qq-plot",
+      "category": "distribution",
+      "tags": [
+        "qq",
+        "plot",
+        "distribution"
+      ],
+      "usage": "Q-Q plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "quadrant",
+      "chart": "quadrant",
+      "category": "relationship",
+      "tags": [
+        "quadrant",
+        "relationship",
+        "correlation",
+        "rank"
+      ],
+      "usage": "Quadrant chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "radar",
+      "chart": "radar",
+      "category": "relationship",
+      "tags": [
+        "radar",
+        "relationship",
+        "correlation",
+        "compare"
+      ],
+      "usage": "Radar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "radial-bar",
+      "chart": "radial-bar",
+      "category": "comparison",
+      "tags": [
+        "radial",
+        "bar",
+        "compare",
+        "rank"
+      ],
+      "usage": "Radial bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "radial-tree",
+      "chart": "radial-tree",
+      "category": "flow-hierarchy",
+      "tags": [
+        "radial",
+        "tree",
+        "hierarchy",
+        "network"
+      ],
+      "usage": "Radial tree: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "range-area",
+      "chart": "range-area",
+      "category": "trend",
+      "tags": [
+        "range",
+        "area",
+        "trend",
+        "change-over-time",
+        "distribution"
+      ],
+      "usage": "Range area chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "regression-scatter",
+      "chart": "regression-scatter",
+      "category": "relationship",
+      "tags": [
+        "regression",
+        "scatter",
+        "relationship",
+        "correlation"
+      ],
+      "usage": "Regression scatter plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "ridgeline",
+      "chart": "ridgeline",
+      "category": "distribution",
+      "tags": [
+        "ridgeline",
+        "distribution",
+        "compare"
+      ],
+      "usage": "Ridgeline plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "roadmap",
+      "chart": "roadmap",
+      "category": "timeline",
+      "tags": [
+        "roadmap",
+        "schedule",
+        "timeline"
+      ],
+      "usage": "Roadmap: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "sankey",
+      "chart": "sankey",
+      "category": "flow-hierarchy",
+      "tags": [
+        "sankey",
+        "flow"
+      ],
+      "usage": "Sankey diagram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "scatter",
+      "chart": "scatter",
+      "category": "relationship",
+      "tags": [
+        "scatter",
+        "relationship",
+        "correlation"
+      ],
+      "usage": "Scatter plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "semi-donut",
+      "chart": "semi-donut",
+      "category": "part-to-whole",
+      "tags": [
+        "semi",
+        "donut",
+        "composition"
+      ],
+      "usage": "Semi-donut chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "slope",
+      "chart": "slope",
+      "category": "trend",
+      "tags": [
+        "slope",
+        "trend",
+        "change-over-time",
+        "compare",
+        "rank"
+      ],
+      "usage": "Slope chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "small-multiples",
+      "chart": "small-multiples",
+      "category": "kpi",
+      "tags": [
+        "small",
+        "multiples",
+        "kpi",
+        "compare"
+      ],
+      "usage": "Small multiples: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "sparkline",
+      "chart": "sparkline",
+      "category": "trend",
+      "tags": [
+        "sparkline",
+        "trend",
+        "change-over-time",
+        "kpi"
+      ],
+      "usage": "Sparkline: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "splom",
+      "chart": "splom",
+      "category": "relationship",
+      "tags": [
+        "splom",
+        "relationship",
+        "correlation"
+      ],
+      "usage": "Scatter-plot matrix: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "stacked-area",
+      "chart": "stacked-area",
+      "category": "trend",
+      "tags": [
+        "stacked",
+        "area",
+        "trend",
+        "change-over-time",
+        "composition"
+      ],
+      "usage": "Stacked area chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "stacked-area-100",
+      "chart": "stacked-area-100",
+      "category": "trend",
+      "tags": [
+        "stacked",
+        "area",
+        "100",
+        "trend",
+        "change-over-time",
+        "composition"
+      ],
+      "usage": "100% stacked area chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "stacked-bar",
+      "chart": "stacked-bar",
+      "category": "comparison",
+      "tags": [
+        "stacked",
+        "bar",
+        "compare",
+        "composition"
+      ],
+      "usage": "Stacked bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "stacked-bar-100",
+      "chart": "stacked-bar-100",
+      "category": "comparison",
+      "tags": [
+        "stacked",
+        "bar",
+        "100",
+        "composition",
+        "compare"
+      ],
+      "usage": "100% stacked bar chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "step-line",
+      "chart": "step-line",
+      "category": "trend",
+      "tags": [
+        "step",
+        "line",
+        "trend",
+        "change-over-time"
+      ],
+      "usage": "Step line chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "streamgraph",
+      "chart": "streamgraph",
+      "category": "trend",
+      "tags": [
+        "streamgraph",
+        "trend",
+        "change-over-time",
+        "composition"
+      ],
+      "usage": "Streamgraph: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "strip",
+      "chart": "strip",
+      "category": "distribution",
+      "tags": [
+        "strip",
+        "distribution"
+      ],
+      "usage": "Strip plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "sunburst",
+      "chart": "sunburst",
+      "category": "part-to-whole",
+      "tags": [
+        "sunburst",
+        "composition",
+        "hierarchy"
+      ],
+      "usage": "Sunburst: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "swimlane-timeline",
+      "chart": "swimlane-timeline",
+      "category": "timeline",
+      "tags": [
+        "swimlane",
+        "timeline",
+        "schedule"
+      ],
+      "usage": "Swimlane timeline: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "table-heatmap",
+      "chart": "table-heatmap",
+      "category": "matrix",
+      "tags": [
+        "table",
+        "heatmap",
+        "compare",
+        "correlation",
+        "relationship"
+      ],
+      "usage": "Table heatmap: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "tree",
+      "chart": "tree",
+      "category": "flow-hierarchy",
+      "tags": [
+        "tree",
+        "hierarchy",
+        "network"
+      ],
+      "usage": "Tree: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "treemap",
+      "chart": "treemap",
+      "category": "part-to-whole",
+      "tags": [
+        "treemap",
+        "composition",
+        "hierarchy"
+      ],
+      "usage": "Treemap: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "upset",
+      "chart": "upset",
+      "category": "sets",
+      "tags": [
+        "upset",
+        "sets",
+        "compare",
+        "rank"
+      ],
+      "usage": "UpSet plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "venn",
+      "chart": "venn",
+      "category": "sets",
+      "tags": [
+        "venn",
+        "sets",
+        "compare"
+      ],
+      "usage": "Venn diagram: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "violin",
+      "chart": "violin",
+      "category": "distribution",
+      "tags": [
+        "violin",
+        "distribution",
+        "compare"
+      ],
+      "usage": "Violin plot: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "waffle",
+      "chart": "waffle",
+      "category": "part-to-whole",
+      "tags": [
+        "waffle",
+        "composition"
+      ],
+      "usage": "Waffle chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "waterfall",
+      "chart": "waterfall",
+      "category": "comparison",
+      "tags": [
+        "waterfall",
+        "compare",
+        "change-over-time"
+      ],
+      "usage": "Waterfall chart: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    },
+    {
+      "name": "word-cloud",
+      "chart": "word-cloud",
+      "category": "sets",
+      "tags": [
+        "word",
+        "cloud",
+        "compare",
+        "distribution"
+      ],
+      "usage": "Word cloud: gallery, registry, chart pickers",
+      "added": "2026-11-17"
+    }
+  ]
+}

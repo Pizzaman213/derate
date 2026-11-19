@@ -79,6 +79,8 @@ class StubDeploymentManager:
         modality: Modality = Modality.TEXT,
         extra_args: tuple[str, ...] = (),
         custom_command: tuple[str, ...] = (),
+        revision: str | None = None,
+        speculative_tokens: int = 0,
     ) -> Deployment:
         name = served_name or default_served_name(shape)
         if fit.verdict is Verdict.WONT_FIT:
@@ -112,6 +114,8 @@ class StubDeploymentManager:
                 modality=modality,
                 extra_args=tuple(extra_args),
                 custom_command=tuple(custom_command),
+                revision=revision,
+                speculative_tokens=speculative_tokens,
             )
             record = _Record(deployment=deployment, handle={"port": port})
             self._records[deployment.deployment_id] = record

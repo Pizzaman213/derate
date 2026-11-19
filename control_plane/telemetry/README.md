@@ -7,8 +7,9 @@ the machine that produced them, before anything is averaged.
 
 Three layers, and the boundary between them is a cursor rather than a message.
 Every node appends to its own SQLite journal (`journal.py`). The coordinator
-drains each journal over the node agent's `GET /agent/journal` (`collector.py`)
-into a typed archive (`archive.py`). A pass on a timer rolls raw rows into
+drains each journal over the node agent's `GET /agent/journal` (`collector.py`),
+presenting the cluster token because the read is also the trim ack and the rows
+are the node's whole log stream, into a typed archive (`archive.py`). A pass on a timer rolls raw rows into
 1-minute and 1-hour buckets and enforces every retention horizon
 (`retention.py`), and `query.py` reads it back at whatever resolution the
 window can afford.
@@ -25,16 +26,47 @@ opting out.
 |---|---|---|
 | `journal.py` | 627 | L1: the per-node append-only journal, its writer thread, and drop-oldest overflow |
 | `collector.py` | 220 | L2: draining journals into the archive, pull not push, idempotent, no ack |
-| `archive.py` | 539 | L3: the coordinator's typed archive, and transactional ingest |
-| `retention.py` | 371 | the 1-minute and 1-hour rollups, and every retention horizon, on a timer |
-| `query.py` | 372 | reading it back: resolution chosen for you, gaps reported |
+| `archive.py` | 729 | L3: the coordinator's typed archive, transactional ingest, and the in-place v1→v2 migration |
+| `retention.py` | 601 | the 1-minute, 1-hour and 1-day rollups (per key, org, context bucket, status), and every retention horizon, on a timer |
+| `query.py` | 652 | reading it back: resolution chosen for you, gaps reported; `usage()`, `requests_list()` and their CSV writers |
 | `service.py` | 256 | the `Telemetry` bundle, the one switch that turns it all off, and the lifecycle |
 | `config.py` | 237 | paths, horizons, env-var bindings, and the byte arithmetic behind each default |
-| `records.py` | 223 | the four record kinds and the `TelemetrySink` Protocol every producer writes through |
+| `records.py` | 410 | the four record kinds, `REQUEST_RECORD_FIELDS`, and the `TelemetrySink` Protocol every producer writes through |
+| `engine_metrics.py` | 300 | `EngineMetricsPoller`: vLLM spec-decode counters scraped from `/metrics`, attributed to a request only when it ran alone |
 | `loghandler.py` | 156 | structured logs into the journal, as a handler on the root logger |
 | `events.py` | 155 | the deploy and gateway event buses tapped into the journal, with a `source` |
 | `hist.py` | 141 | the log-spaced latency histogram: fixed cost, exact merge |
 | `__init__.py` | 37 | the export surface: the sink, the record types, and the `KIND_*` constants |
+
+## `engine_metrics.py`
+
+`EngineMetricsPoller(http, deployments_fn, interval_s=1.0)` scrapes
+`<backend_url>/metrics` of every target `deployments_fn()` returns (the gateway
+passes READY local text deployments as objects with `deployment_id`,
+`backend_url`, `runtime`). The names it parses were read off the pinned image,
+not the docs: `vllm:spec_decode_num_drafts`, `..._num_draft_tokens`,
+`..._num_accepted_tokens` and `..._num_accepted_tokens_per_pos{position=}`, each
+exposed with `_total` and summed across `engine` labels. Counters are per
+engine, so `attribute(deployment_id, start, end, alone)` returns a delta only
+when the request ran alone and scrapes bracket it; otherwise a `FieldError`:
+`not_enabled` (no spec counters in the scrape), `ambiguous_concurrency`
+(shared engine), `not_reported` (no bracketing sample, unknown runtime such as
+sglang, or a counter that went backwards). It never raises and is never awaited
+on the request path; `attribute_when_ready` is for a background task after
+settle.
+
+## Schema v2 and the per-key columns
+
+`RequestRecord` grew 34 columns (identity, routing outcome, generation shape,
+cache, spec decode, cost basis); `REQUEST_RECORD_FIELDS` is their order and
+equals the contract's. Every new optional column is `None` when nobody reported
+it -- never 0 -- and `cache_error` / `spec_decode_error` say why.
+`context_bucket` is derived from `prompt_tokens` in `__post_init__` (edges
+8192/32768/131072 belong to the upper bucket; 0 means unknown, so `None`).
+Opening a v1 archive adds the columns by `ALTER TABLE`, drops and recreates
+`rollup_requests` with the wider key, and sets `meta.reroll_pending`, which the
+next `compact()` honours by re-rolling the whole raw window once. Hourly
+rollups older than the raw window are lost by that migration.
 
 ## `journal.py`
 
@@ -158,7 +190,7 @@ each down.
 
 `_expire` scales five horizons together off `DERATE_TELEMETRY_RETENTION_DAYS`,
 so halving it preserves the ratios between them: `samples` and `events` at 30
-days, `requests` and `logs` at 7, and `gaps` on its `to_ts` against the `events`
+days, `requests` at 90, `logs` at 7, and `gaps` on its `to_ts` against the `events`
 window, whose holes it describes. The rollup horizons are deliberately not
 scaled, because somebody shortening the raw window to save disk wants a shorter
 raw window, not a shorter memory. `gaps` used to have no horizon at all — the
@@ -228,8 +260,10 @@ Local to this package, and nothing here is a frozen contract. Every horizon is a
 default chosen against arithmetic rather than a round number: a node sample is
 roughly 96 bytes on disk, so thirty days at 1 Hz is about 250 MB per node — but
 a request row is roughly 260 bytes, which is 2.2 GB/day at a sustained 100 rps.
-That asymmetry is why `REQUESTS_RAW_RETENTION_S` is 7 days against
-`SAMPLES_RAW_RETENTION_S`'s 30. Six variables bind at runtime:
+`REQUESTS_RAW_RETENTION_S` is nevertheless 90 days against
+`SAMPLES_RAW_RETENTION_S`'s 30, because a request row is evidence -- key,
+client address, request id -- and an investigation starts weeks after the
+fact; `_enforce_size` still caps the archive by bytes first. Six variables bind at runtime:
 `DERATE_TELEMETRY`, `DERATE_TELEMETRY_RETENTION_DAYS`,
 `DERATE_TELEMETRY_LOG_LEVEL`, `DERATE_TELEMETRY_MAX_BYTES`,
 `DERATE_TELEMETRY_SHIP_INTERVAL_S` and `DERATE_TELEMETRY_QUIET_LOGGERS`.
@@ -402,10 +436,16 @@ its window. The UI draws them as hatched stretches under the trace
 them, because a hole the archive knows it is missing and a machine that was
 merely quiet are the same flat line otherwise.
 
-**`events` is the one raw table the archive's size cap never evicts.**
-`retention.py::_enforce_size` deletes from `samples`, `requests` and `logs`
-only. Sample detail is reconstructible in outline from the rollups; the fact
-that a breaker opened is not.
+**The archive's size cap evicts in three tiers, oldest day first.**
+`retention.py::_enforce_size` drops `samples`, `logs` and every event that is
+not an agent's or a shell's; then anonymous (`who = '-'`) `access` rows; and
+only then `requests`, attributed `access` rows and `agent`/`shell` events --
+the record of who asked, and of what a node did for whom. Sample detail is
+reconstructible in outline from the rollups; that record is not. Each node's
+raw `logs`/`events` are also capped at `NODE_RAW_BYTES_PER_DAY` per UTC day
+(a `node_quota` gap past it), so one member cannot drive the archive into the
+cap, and only the coordinator's own journal may write `requests` or `access`
+rows (a member's are dropped and counted in `cursors.rejected`).
 
 **`retry_reason` keeps `pool_exhausted` apart from `transport`.** It means this
 gateway had no free upstream connection, which is not evidence that the backend

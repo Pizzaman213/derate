@@ -1,0 +1,1 @@
+{"description":"Missing values: null, empty string and an absent key.","data":[{"label":"Visits","value":12000},{"label":"Product views","value":null},{"label":"Added to cart","value":""},{"label":"Checkout","value":1060},{"label":"Purchase"}]}

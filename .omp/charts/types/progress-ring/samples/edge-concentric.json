@@ -1,0 +1,1 @@
+{"description":"Daily activity goals as nested rings with a key; one goal exceeded.","data":[{"label":"Move","value":520,"max":600},{"label":"Exercise","value":42,"max":30},{"label":"Stand","value":9,"max":12}],"options":{"layout":"concentric"}}

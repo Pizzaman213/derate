@@ -1,12 +1,21 @@
 import { useMemo, useRef, useState } from 'react'
 import { ENDPOINT_FOR_MODALITY } from '../api/types'
-import type { ChatMessage } from '../api/types'
+import type { ChatMessage, ChatTurnMeta, ThinkingChoice } from '../api/types'
 import { useBackend } from '../state/backend'
 import { useCluster, useModels } from '../state/resources'
 import { useSelection } from '../state/selection'
 import { ModelList, buildRows, emptyNote } from './chat/ModelList'
-import { Transcript, type Turn } from './chat/Transcript'
+import { Transcript } from './chat/Transcript'
+import type { Turn } from './chat/turn'
 import { Composer, type SendExtra } from './chat/Composer'
+import { SessionStats } from './chat/SessionStats'
+import {
+  THINKING_CHOICES,
+  describeSetup,
+  expectsInlineThinking,
+  reasoningSetup,
+  requestOptions,
+} from './chat/reasoning'
 import { useVoices } from './chat/useVoices'
 
 // Why this exists against a named non-goal.
@@ -89,6 +98,21 @@ export function ChatTab() {
   // endpoint it goes to" are one value.
   const speaking = activeRow?.modality === 'speech'
   const transcribing = activeRow?.modality === 'transcription'
+  const texting = activeRow?.modality === 'text'
+
+  // How the picked model is set up to think: its family, off the deployment's
+  // HF id (a served name can be anything), and whether that deployment was
+  // launched with `--reasoning-parser`. A row with no deployment behind it is
+  // a provider's. See chat/reasoning.ts.
+  const deployment = useMemo(
+    () =>
+      active ? ((cluster.data?.deployments ?? []).find((d) => d.served_name === active) ?? null) : null,
+    [active, cluster.data],
+  )
+  const setup = reasoningSetup(active, deployment, deployment === null && (activeRow?.kinds.includes('remote') ?? false))
+  // Per model, so switching away and back keeps the choice without an effect.
+  const [thinkingBy, setThinkingBy] = useState<Record<string, ThinkingChoice>>({})
+  const thinking: ThinkingChoice = (active && thinkingBy[active]) || 'default'
 
   // Only asked for a speech model: the gateway answers `wrong_modality` for
   // anything else, correctly, and a refusal on screen about a control this
@@ -133,10 +157,21 @@ export function ChatTab() {
     // turn that reads the current selection at render time would relabel and
     // recolour itself every time somebody switched -- which is the opposite of
     // what the colour is for. See chat/tags.ts.
+    // `requested` and `setup` likewise: what the control said and how the
+    // model was set up when this was sent, so the verdict under the answer
+    // stays about this request after the picker or the chips move.
+    const thinks = texting && extra === null
     setTurns((prev) => [
       ...prev,
-      { key: userKey, role: 'user', content: text, meta: null, error: null, requestId: null, audio: null, model: active },
-      { key: replyKey, role: 'assistant', content: '', meta: null, error: null, requestId: null, audio: null, model: active },
+      {
+        key: userKey, role: 'user', content: text, reasoning: '', requested: null, setup: null,
+        meta: null, error: null, requestId: null, audio: null, model: active,
+      },
+      {
+        key: replyKey, role: 'assistant', content: '', reasoning: '',
+        requested: thinks ? thinking : null, setup: thinks ? setup : null,
+        meta: null, error: null, requestId: null, audio: null, model: active,
+      },
     ])
     setStreamingKey(replyKey)
 
@@ -159,19 +194,11 @@ export function ChatTab() {
           ...t,
           content: out.text,
           requestId: out.requestId,
-          meta: {
-            model: active,
-            requestId: out.requestId,
-            // Nothing token-denominated is measured on this path either. The
-            // gateway deliberately counts no tokens over a binary body, and
-            // inventing a count from the returned characters would be a
-            // figure nobody reported.
-            ttftMs: null,
-            elapsedMs: null,
-            completionTokens: null,
-            tokensEstimated: false,
-            stopped: false,
-          },
+          // Nothing token-denominated is measured on this path either. The
+          // gateway deliberately counts no tokens over a binary body, and
+          // inventing a count from the returned characters would be a figure
+          // nobody reported.
+          meta: bareMeta(active, out.requestId, false),
         }))
       } else if (extra?.kind === 'speech') {
         // The whole of the branch. No history is sent -- a speech request has
@@ -196,26 +223,26 @@ export function ChatTab() {
           // A ChatTurnMeta so the turn is `finished` to every reader that
           // already understood one. Every token-denominated figure is null
           // rather than 0: there are no tokens here, and the dash rule says
-          // an absent figure is a dash. `elapsedMs` is real whatever the
-          // bytes are, so it is measured.
-          meta: {
-            model: active,
-            requestId: clip.requestId,
-            ttftMs: null,
-            elapsedMs: null,
-            completionTokens: null,
-            tokensEstimated: false,
-            stopped: false,
-          },
+          // an absent figure is a dash.
+          meta: bareMeta(active, clip.requestId, false),
         }))
       } else {
         const meta = await backend.chatStream({
           model: active,
           messages,
+          options: thinks ? requestOptions(setup, thinking) : undefined,
+          thinkOpen: thinks && expectsInlineThinking(setup, thinking),
           // The id lands before the body does, so a turn that goes on to be
           // refused still names the row that recorded the refusal.
           onOpen: (id) => patch((t) => ({ ...t, requestId: id })),
           onDelta: (chunk) => patch((t) => ({ ...t, content: t.content + chunk })),
+          // Its own field, never `content`: history above is built from
+          // `content` alone, so reasoning is never sent back to the model.
+          onReasoning: (chunk) => patch((t) => ({ ...t, reasoning: t.reasoning + chunk })),
+          // The browser's split of inline reasoning was revised -- a bare
+          // `</think>` arrived, or an expected one never did. Both fields at
+          // once, so the answer and its thinking never show the same text.
+          onRewrite: (reasoning, content) => patch((t) => ({ ...t, reasoning, content })),
           signal: ac.signal,
         })
         patch((t) => ({ ...t, meta }))
@@ -225,18 +252,7 @@ export function ChatTab() {
       // returns a stopped meta; `speech()` cannot -- there is no partial
       // audio to keep -- so the turn is marked stopped rather than failed.
       if ((speaking || transcribing) && ac.signal.aborted) {
-        patch((t) => ({
-          ...t,
-          meta: {
-            model: active,
-            requestId: t.requestId,
-            ttftMs: null,
-            elapsedMs: null,
-            completionTokens: null,
-            tokensEstimated: false,
-            stopped: true,
-          },
-        }))
+        patch((t) => ({ ...t, meta: bareMeta(active, t.requestId, true) }))
         return
       }
       // ApiError already unwrapped the gateway's `{error:{message}}` envelope,
@@ -262,23 +278,26 @@ export function ChatTab() {
 
       <div className="chatpane">
         <div className="chatbody">
-          <div className="chathead">
-            <span className="mono">{active ?? '—'}</span>
-            {/* The endpoint this pane will actually post to, beside the model
-                it will post about. Same string as the picker's section
-                heading, from the same field. */}
-            <span className="unit">
-              POST {ENDPOINT_FOR_MODALITY[activeRow?.modality ?? 'text']} · not stored ·
-              this transcript is gone on reload
-            </span>
+          <div className="chattop">
+            <div className="chathead">
+              <span className="mono">{active ?? '—'}</span>
+              {/* The endpoint this pane will actually post to, beside the model
+                  it will post about. Same string as the picker's section
+                  heading, from the same field. */}
+              <span className="unit">
+                POST {ENDPOINT_FOR_MODALITY[activeRow?.modality ?? 'text']} · not stored
+              </span>
+            </div>
+            {texting ? <span className="unit">{describeSetup(setup)}</span> : null}
+            {substituted ? (
+              <p className="unit" style={{ margin: 0, color: 'var(--warn)' }}>
+                The link named <span className="mono">{substituted}</span>, which this picker
+                has no row for — it is not serving, or it answers on an endpoint this pane
+                cannot send to. Showing <span className="mono">{active}</span> instead.
+              </p>
+            ) : null}
+            <SessionStats turns={turns} contextLength={activeRow?.contextLength ?? null} />
           </div>
-          {substituted ? (
-            <p className="unit" style={{ margin: 'var(--s-2) 0 0', color: 'var(--warn)' }}>
-              The link named <span className="mono">{substituted}</span>, which this picker
-              has no row for — it is not serving, or it answers on an endpoint this pane
-              cannot send to. Showing <span className="mono">{active}</span> instead.
-            </p>
-          ) : null}
           <Transcript
             turns={turns}
             streamingKey={streamingKey}
@@ -298,8 +317,38 @@ export function ChatTab() {
           library={library}
           voicesError={voicesError}
           transcribing={transcribing}
+          thinking={
+            texting && active
+              ? {
+                  choices: THINKING_CHOICES,
+                  value: thinking,
+                  onChange: (c) => setThinkingBy((prev) => ({ ...prev, [active]: c })),
+                }
+              : undefined
+          }
         />
       </div>
     </div>
   )
+}
+
+/** The meta of a turn that measured nothing token-denominated: an audio
+ *  request, or one stopped before it answered. Every figure null, so each
+ *  reader prints a dash or nothing -- never a 0. */
+function bareMeta(model: string, requestId: string | null, stopped: boolean): ChatTurnMeta {
+  return {
+    model,
+    requestId,
+    ttftMs: null,
+    firstContentMs: null,
+    elapsedMs: null,
+    promptTokens: null,
+    completionTokens: null,
+    reasoningTokens: null,
+    tokensEstimated: false,
+    reasoningEstimated: false,
+    reasoningSource: null,
+    finishReason: null,
+    stopped,
+  }
 }

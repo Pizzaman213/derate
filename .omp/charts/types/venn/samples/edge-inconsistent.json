@@ -1,0 +1,1 @@
+{"description":"An overlap larger than one of its sets is clamped, and pairwise sizes that cannot form a triangle are noted.","data":[{"sets":"A","size":30},{"sets":"B","size":30},{"sets":"C","size":30},{"sets":"A,B","size":40},{"sets":"A,C","size":0},{"sets":"B,C","size":29}]}

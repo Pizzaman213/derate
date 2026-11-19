@@ -1,0 +1,1 @@
+{"description":"Model download progress per node, from column arrays with a field mapping (bytes fetched of total).","data":{"node":["spark-01","spark-02","spark-03","spark-04"],"fetched_gb":[61.2,61.2,18.7,0],"size_gb":[61.2,61.2,61.2,61.2]},"options":{"fields":{"label":"node","value":"fetched_gb","max":"size_gb"}}}

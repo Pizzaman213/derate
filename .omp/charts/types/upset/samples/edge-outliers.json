@@ -1,0 +1,1 @@
+{"description":"Exclusive aggregated sizes with one intersection a thousand times the others: bars stay on a linear scale, the small ones a sliver with their values printed.","data":[{"sets":"A","size":42000},{"sets":"B","size":38},{"sets":"A,B","size":21},{"sets":"C","size":12},{"sets":"B,C","size":7}],"options":{"sizes":"exclusive"}}

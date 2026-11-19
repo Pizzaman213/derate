@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from control_plane.contracts import (
     Deployment,
@@ -25,10 +25,16 @@ from control_plane.contracts import (
 
 from . import policies
 from .policies import PolicyState, RouteContext
+from .routing_store import RoutingState, RoutingStore
 from .settings import GatewaySettings
 from .stats import StatsRegistry
 from .strength import strength_spread
 from .targets import ROUTABLE_STATES, TargetIndex, apply_scores, build_index
+
+# The only keys a route limit may set.
+LIMIT_KEYS = frozenset({"rpm", "tpm"})
+#: The policy whose weights an operator's shares replace.
+SHARES_POLICY = RoutingPolicy.WEIGHTED_CAPACITY
 
 log = logging.getLogger("gateway.router")
 
@@ -55,6 +61,7 @@ class Router:
         breaker=None,
         clock=time.monotonic,
         events=None,
+        store: RoutingStore | None = None,
     ) -> None:
         self._events = events
         self._deployments = deployments
@@ -72,7 +79,17 @@ class Router:
         # target_id -> (strength, weight, zero_weight_reason), held between
         # weight refreshes
         self._scores: dict[str, tuple[float, float, str | None]] = {}
-        self._overrides: dict[str, RoutingPolicy] = {}
+        # Operator overrides and route limits. Loaded from routing.json when a
+        # store is given, so a restart keeps them; tests run without one.
+        self._store = store
+        state = store.load() if store is not None else RoutingState.empty()
+        self._overrides: dict[str, RoutingPolicy] = dict(state.overrides)
+        self._limits: dict[str, dict[str, int]] = {
+            k: dict(v) for k, v in state.limits.items() if v
+        }
+        self._shares: dict[str, dict[str, int]] = {
+            k: dict(v) for k, v in state.shares.items() if v
+        }
         self._state: dict[str, PolicyState] = {}
         # served_name -> the reason auto_policy gave its most recent verdict.
         # Read-only outside this class; write happens as a side effect of
@@ -145,6 +162,8 @@ class Router:
             stats=self._stats,
             settings=self._settings,
             is_blocked=self._admission.is_blocked,
+            runtime_key=getattr(self._deployments, "runtime_api_key", None),
+            remote_block=self._remote_block(providers),
         )
 
         due = force_scores or (
@@ -174,6 +193,12 @@ class Router:
                     t.strength = strength
                     t.weight = weight
                     index.zero_weight_reason[t.target_id] = reason
+        # A containment switch outranks scoring: a blocked remote says why.
+        for tid in index.remotes:
+            if index.zero_weight_reason.get(tid) is None:
+                block = self._remote_block_reason
+                if block is not None:
+                    index.zero_weight_reason[tid] = block
 
         self._index = index
         self._index_at = now
@@ -190,6 +215,28 @@ class Router:
             state.capacity = index.capacity
             state.remote_priority = index.remote_priority
         return index
+
+    def _remote_block(self, providers) -> str | None:
+        """``local_only`` or ``daily_spend_cap`` when either holds, else None.
+
+        The spend cap is measured at each rebuild, so the overshoot is bounded
+        by ``index_ttl_s``/``weight_refresh_interval_s``, not prevented to the
+        cent."""
+        block: str | None = None
+        if getattr(self._settings, "local_only", False):
+            block = "local_only"
+        else:
+            cap = getattr(self._settings, "daily_spend_cap_usd", None)
+            spend_today = getattr(self._providers, "spend_today", None)
+            if cap is not None and callable(spend_today):
+                spent = sum(
+                    self._safe(lambda p=p: spend_today(p.provider_id), 0.0) or 0.0
+                    for p in providers
+                )
+                if spent >= cap:
+                    block = "daily_spend_cap"
+        self._remote_block_reason = block
+        return block
 
     def index(self) -> TargetIndex:
         if time.monotonic() - self._index_at >= self._settings.index_ttl_s:
@@ -215,6 +262,8 @@ class Router:
             if t.healthy and self._breaker is not None and self._breaker.is_open(t.target_id):
                 t.healthy = False
             t.admitting = t.healthy and not blocked
+            if t.kind is not TargetKind.LOCAL and getattr(self, "_remote_block_reason", None):
+                t.admitting = False
 
     # -- policy ------------------------------------------------------------
 
@@ -289,13 +338,75 @@ class Router:
             return None
         return self._flow.get(served_name)
 
-    def set_policy(self, served_name: str, policy: RoutingPolicy) -> RoutingConfig:
+    def validate_policy(
+        self,
+        served_name: str,
+        policy: RoutingPolicy,
+        limits: dict | None = None,
+        shares: dict | None = None,
+    ) -> None:
+        """Every check ``set_policy`` makes before it writes, and nothing else.
+
+        Unknown name -> ``KeyError``; a bad limits or shares entry ->
+        ``ValueError`` carrying the sentence the API returns verbatim. Share
+        keys are not checked against today's targets: a batch may wire the
+        target in the same Save, and a share naming nothing is simply unused.
+        """
+        if served_name not in self.index().targets:
+            raise KeyError(served_name)
+        if limits is not None:
+            for key, value in limits.items():
+                if key not in LIMIT_KEYS:
+                    raise ValueError("limits may only set rpm and tpm.")
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError("limits must be whole numbers of 1 or more.")
+        if shares:
+            if policy is not SHARES_POLICY:
+                raise ValueError(
+                    f"shares split traffic only under {SHARES_POLICY.value}; "
+                    "set that policy to set them."
+                )
+            for value in shares.values():
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+                    raise ValueError("shares must be whole numbers from 0 to 100.")
+            if not any(shares.values()):
+                raise ValueError("shares must give at least one target more than 0.")
+
+    def set_policy(
+        self,
+        served_name: str,
+        policy: RoutingPolicy,
+        *,
+        limits: dict | None = None,
+        shares: dict | None = None,
+    ) -> RoutingConfig:
+        """Override the policy for a name and, when given, replace its limits
+        and its shares.
+
+        ``None`` leaves the stored value alone; ``{}`` deletes it. Shares only
+        mean something under ``SHARES_POLICY``, so moving to another policy
+        drops them.
+        """
+        self.validate_policy(served_name, policy, limits, shares)
         self._overrides[served_name] = policy
+        if limits is not None:
+            if limits:
+                self._limits[served_name] = dict(limits)
+            else:
+                self._limits.pop(served_name, None)
+        if shares is not None:
+            if shares:
+                self._shares[served_name] = {str(k): int(v) for k, v in shares.items()}
+            else:
+                self._shares.pop(served_name, None)
+        if policy is not SHARES_POLICY:
+            self._shares.pop(served_name, None)
         # Reset selection state so the new policy starts from a clean rotation.
         self._state[served_name] = PolicyState(
             capacity=self._index.capacity,
             remote_priority=self._index.remote_priority,
         )
+        self._persist()
         config = self.config_for(served_name)
         if config is None:
             raise KeyError(served_name)
@@ -303,9 +414,32 @@ class Router:
 
     def clear_policy(self, served_name: str) -> None:
         self._overrides.pop(served_name, None)
+        self._limits.pop(served_name, None)
+        self._shares.pop(served_name, None)
+        self._persist()
 
     def overrides(self) -> dict[str, RoutingPolicy]:
         return dict(self._overrides)
+
+    def limits_for(self, served_name: str) -> dict[str, int]:
+        """The route limits for a name. Cheap: no index build; the proxy calls
+        this on every request."""
+        return dict(self._limits.get(served_name, {}))
+
+    def shares_for(self, served_name: str) -> dict[str, int]:
+        """The operator's traffic shares for a name, ``{}`` when none."""
+        return dict(self._shares.get(served_name, {}))
+
+    def _persist(self) -> None:
+        if self._store is None:
+            return
+        self._store.save(
+            RoutingState(
+                overrides=dict(self._overrides),
+                limits=dict(self._limits),
+                shares=dict(self._shares),
+            )
+        )
 
     # -- reads -------------------------------------------------------------
 
@@ -317,11 +451,22 @@ class Router:
         self._refresh_live(targets)
         if any(t.healthy and t.admitting for t in targets):
             self._last_eligible[served_name] = self._clock()
+        policy = self.policy_for(served_name, targets)
+        shares = self.shares_for(served_name)
+        if shares and policy is SHARES_POLICY:
+            # The operator's split replaces the measured weights, normalized
+            # over the targets this name has right now. Copies: the index's
+            # targets keep their measured weights for the next refresh.
+            total = sum(shares.get(t.target_id, 0) for t in targets)
+            if total > 0:
+                targets = [replace(t, weight=shares.get(t.target_id, 0) / total) for t in targets]
         return RoutingConfig(
             served_name=served_name,
-            policy=self.policy_for(served_name, targets),
+            policy=policy,
             targets=targets,
             sticky_ttl_s=self._settings.sticky_ttl_s,
+            limits=self.limits_for(served_name),
+            shares=shares,
         )
 
     def configs(self) -> list[RoutingConfig]:
@@ -375,22 +520,29 @@ class Router:
         served_name: str,
         prefix_key: str | None = None,
         exclude: set[str] | None = None,
+        policy: RoutingPolicy | None = None,
     ) -> Selection | None:
         """Pick a target, optionally skipping ones already tried.
 
         ``exclude`` is applied before the policy runs rather than inside it, so
         the seven policies in ``policies.py`` keep their frozen semantics and
-        simply see a smaller field.
+        simply see a smaller field. ``policy`` is a key's or org's routing
+        override, substituted the same way: the policy sees the same field
+        under a different rule.
         """
         config = self.config_for(served_name)
         if config is None:
             return None
-        if exclude:
+        if exclude or (policy is not None and policy is not config.policy):
             config = RoutingConfig(
                 served_name=config.served_name,
-                policy=config.policy,
-                targets=[t for t in config.targets if t.target_id not in exclude],
+                policy=policy if policy is not None else config.policy,
+                targets=[
+                    t for t in config.targets if not exclude or t.target_id not in exclude
+                ],
                 sticky_ttl_s=config.sticky_ttl_s,
+                limits=config.limits,
+                shares=config.shares,
             )
             if not config.targets:
                 return None

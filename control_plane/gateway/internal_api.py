@@ -9,19 +9,24 @@ so the UI can be built against the full shape from day 0.
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
+import html
 import itertools
 import json
 import logging
+import re
 import shlex
 from functools import partial
 import time
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit
 
 from fastapi import APIRouter, Query, Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from control_plane.contracts.constants import JOIN_PER_ADDRESS_PER_MIN
+from control_plane.contracts.deployment import check_speculative_tokens
 from control_plane.contracts import (
     DeviceClass,
     DeploymentState,
@@ -31,7 +36,12 @@ from control_plane.contracts import (
     Verdict,
 )
 from control_plane.fit.capacity import context_for
-from control_plane.providers import AdapterUnsupportedError, UnknownProviderError, UpstreamError
+from control_plane.providers import (
+    AdapterUnsupportedError,
+    SignInError,
+    UnknownProviderError,
+    UpstreamError,
+)
 from control_plane.planner import (
     Candidate,
     IllegalDegrees,
@@ -43,17 +53,36 @@ from control_plane.planner import (
 )
 from control_plane.registry import JoinRejected, NodeNotFound
 from control_plane.version import build_id
-from control_plane.registry import modelcache, storage as registry_storage
+from control_plane.registry import joinproof, modelcache, reach, storage as registry_storage
+from control_plane.registry import net as registry_net
 from control_plane.registry.serde import profile_from_dict
 
 from control_plane.telemetry import query as tquery
 
 from control_plane.humanize import binary_bytes
 
+from control_plane.contracts.auth import AuditAction, AuthUnavailable
+
 from . import errors, gpu_procs, livefit, serialize, states, ui_detail
+from .authz import audit_request, client_ip, is_loopback, request_context, stores_of
+from .body import BodyTooLarge, optional_json_object, payload_too_large, read_json_object
+from .loopback import LoopbackCallback
+from control_plane.providers.config import CHATGPT_REDIRECT_URI, SIGN_IN_ATTEMPT_TTL_S
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.api")
+
+
+def _sign_in_page(title: str, message: str) -> str:
+    """The page a ChatGPT redirect lands on. Static, no script, every value escaped."""
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        f"<title>{html.escape(title)} — derate</title>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'></head>"
+        "<body style='font:16px/1.5 system-ui,sans-serif;max-width:36em;margin:4em auto;padding:0 1em'>"
+        f"<h1 style='font-size:1.25em'>{html.escape(title)}</h1>"
+        f"<p>{html.escape(message)}</p></body></html>"
+    )
 
 
 #: Named for exactly what it overrides, so the request body says it.
@@ -137,6 +166,9 @@ class _PlanOutcome:
     #: speech model as text, and the gateway would then refuse the very
     #: requests the deployment exists to serve.
     modality: object = Modality.TEXT
+    #: The repo ships Python --trust-remote-code would run (R2), so the
+    #: Serve panel can offer that opt-in beside the resolver's warning.
+    remote_code: bool = False
     #: What was placed where, and whose choice it was. Always present; `mode`
     #: is "planner" for a request that named no nodes.
     placement: dict = dataclasses.field(default_factory=dict)
@@ -149,6 +181,9 @@ class _PlanOutcome:
     #: prose): enough to say what is legal without shipping a rejection list
     #: per entry.
     alternatives: list = dataclasses.field(default_factory=list)
+    #: The commit sha the resolver read the shape from, so the launch runs
+    #: exactly that revision's remote code (M7). None when unknown.
+    revision: str | None = None
 
 def _parse_node_ids(payload: dict) -> list[str] | None:
     """The machines the operator named, or None when they named none.
@@ -496,6 +531,13 @@ _KILL_TIMEOUT_S = 25.0
 #: the alternative is a timeout on a delete that is actually succeeding.
 _DELETE_TIMEOUT_S = 120.0
 
+#: A cache folder the delete route relays: exactly one `models--` segment (E2).
+_CACHE_FOLDER = re.compile(r"models--[A-Za-z0-9._-]+")
+
+#: The batch avatar route's per-session budget (R7).
+AVATAR_OWNERS_PER_WINDOW = 240
+AVATAR_WINDOW_S = 60.0
+
 #: A deployment past these is not serving anything and its weights are fair
 #: game. Taken from ``gateway.states``, which is the gateway's one spelling of
 #: a judgement ``deploy.fsm`` owns -- importing the original would run the
@@ -785,6 +827,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     runtime = payload.get("runtime") or "vllm"
     requested_nodes = _parse_node_ids(payload)
     requested_degrees = _parse_degrees(payload)
+    speculative_tokens = check_speculative_tokens(payload.get("speculative_tokens", 0))
 
     # Prefer resolve_full when the port exposes it: it carries warnings
     # worth showing and, on mixed-precision repos, real measured weight
@@ -793,12 +836,30 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     resolver_warnings: list[str] = []
     weight_bytes: int | None = None
     modality = Modality.TEXT
+    remote_code = False
     if callable(resolve_full):
         resolution = await asyncio.to_thread(resolve_full, model_id, dtype)
         shape = resolution.shape
         resolver_warnings = list(resolution.warnings)
+        remote_code = bool(getattr(resolution, "remote_code", False))
         weight_bytes = resolution.effective_weight_bytes()
         modality = _modality_of(resolution.architectures)
+        if speculative_tokens > 0:
+            mtp = int((resolution.param_breakdown or {}).get("mtp") or 0)
+            if mtp <= 0:
+                raise ValueError(
+                    f"{model_id} carries no multi-token-prediction module; "
+                    "speculative decoding has nothing to draft with."
+                )
+            # The resolver excluded the module from the charge because no
+            # runtime loads it by default; speculative decoding does load it.
+            total = shape.total_params
+            if weight_bytes and total:
+                weight_bytes = int(weight_bytes * (total + mtp) / total)
+            resolver_warnings.append(
+                f"speculative decoding loads the {mtp/1e9:.1f}B-parameter "
+                "multi-token-prediction module; the fit above includes it"
+            )
     else:
         shape = await asyncio.to_thread(ctx.deps.resolver.resolve, model_id, dtype)
 
@@ -1031,10 +1092,12 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         concurrency=concurrency,
         resolver_warnings=resolver_warnings,
         modality=modality,
+        remote_code=remote_code,
         placement=placement,
         degrees=degrees,
         recommended=recommended,
         alternatives=[serialize.plan_degrees_payload(p) for p in ranked],
+        revision=(getattr(resolution, "revision", None) if callable(resolve_full) else None),
     )
 
 
@@ -1317,6 +1380,25 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             log.exception("candidate listing failed")
             return JSONResponse([])
 
+    def _agent_token(node_id: str) -> str | None:
+        """What *node_id*'s agent expects on its gated routes, or None.
+
+        The per-node agent token (``Registry.agent_token``), never the cluster
+        token: each agent is shown only its own credential.
+        """
+        token_fn = getattr(ctx.deps.registry, "agent_token", None)
+        if not callable(token_fn):
+            return None
+        try:
+            return token_fn(node_id) or None
+        except Exception:
+            log.exception("agent token unavailable")
+            return None
+
+    def _agent_headers(node_id: str) -> dict[str, str] | None:
+        token = _agent_token(node_id)
+        return {"X-Derate-Token": token} if token else None
+
     async def _agent_processes(node_id: str) -> tuple[dict | None, Response | None]:
         """The node agent's resident-process payload, annotated. (payload, error).
 
@@ -1339,11 +1421,26 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "node_agent_unreachable",
             )
+        token = _agent_token(node_id)
+        if not token:
+            # The agent gates its process list on its agent token (the
+            # command lines are the whole GPU's), derived from the cluster
+            # token, so without one there is nothing to ask.
+            return None, errors.error_response(
+                503,
+                "No cluster token is available, so the node agent cannot be "
+                "asked for its resident processes.",
+                "server_error",
+                "cluster_token_unavailable",
+            )
         import httpx
 
         try:
             async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
-                res = await client.get(f"{agent_url.rstrip('/')}/agent/processes")
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/processes",
+                    headers={"X-Derate-Token": token},
+                )
                 res.raise_for_status()
                 payload = res.json()
         except Exception as exc:
@@ -1379,7 +1476,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return error if error is not None else JSONResponse(payload)
 
     @router.delete("/api/nodes/{node_id}/processes/{pid}")
-    async def kill_node_process(node_id: str, pid: int) -> Response:
+    async def kill_node_process(node_id: str, pid: int, request: Request) -> Response:
         payload, error = await _agent_processes(node_id)
         if error is not None:
             return error
@@ -1403,13 +1500,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "process_is_managed",
             )
 
-        token = None
-        token_fn = getattr(ctx.deps.registry, "cluster_token", None)
-        if callable(token_fn):
-            try:
-                token = token_fn()
-            except Exception:
-                log.exception("cluster token unavailable")
+        token = _agent_token(node_id)
         if not token:
             return errors.error_response(
                 503,
@@ -1448,6 +1539,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "kill_refused",
             )
+        audit_request(
+            request, AuditAction.NODE_PROCESS_KILLED, "node", node_id,
+            after={
+                "node_id": node_id,
+                "pid": pid,
+                "command": target.get("command") or target.get("name") or "",
+            },
+        )
         return JSONResponse(res.json())
 
     @router.get("/api/nodes/{node_id}")
@@ -1465,29 +1564,83 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             serialize.node_payload(node, _labels().get(node_id), _coordinator_build())
         )
 
+    # client address -> monotonic times of its joins in the last minute (N-8).
+    join_window: dict[str, collections.deque[float]] = {}
+
+    def _join_over_limit(ip: str) -> bool:
+        """Record one join from *ip*; True when it is over the window."""
+        now = time.monotonic()
+        cutoff = now - 60.0
+        for key in [k for k, q in join_window.items() if not q or q[-1] < cutoff]:
+            del join_window[key]
+        recent = join_window.setdefault(ip, collections.deque())
+        while recent and recent[0] < cutoff:
+            recent.popleft()
+        if len(recent) >= JOIN_PER_ADDRESS_PER_MIN:
+            return True
+        recent.append(now)
+        return False
+
     @router.post("/api/nodes/join")
     async def join_node(request: Request) -> Response:
         handle_join = getattr(ctx.deps.registry, "handle_join", None)
         if not callable(handle_join):
             return _not_implemented("Node join", "registry")
+        ip = client_ip(request) or "-"
+        if _join_over_limit(ip):
+            ctx.secevents.note(
+                AuditAction.JOIN_REJECTED,
+                actor="-",
+                ip=ip,
+                user_agent=request.headers.get("user-agent", "")[:512],
+                request_id=getattr(request.state, "request_id", None),
+                target_kind="node",
+                target_id="",
+                detail={"reason": "rate"},
+            )
+            return errors.error_response(
+                429, "Too many join attempts from this address.",
+                "rate_limit_error", "rate_limited",
+                headers={"Retry-After": "60"},
+            )
         try:
-            payload = await request.json()
+            payload = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Join body must be JSON.", "invalid_request_error", "invalid_json"
             )
         try:
-            token = payload.get("token")
+            raw_proof = payload.get("proof")
+            proof = None if raw_proof is None else joinproof.from_dict(raw_proof)
             profile = profile_from_dict(payload["profile"])
-            agent_url = str(payload["agent_url"])
+            # Validated before the registry dials it: this route is open, and
+            # an unchecked address makes the coordinator GET whatever the
+            # caller names (UnusableTarget is a ValueError).
+            agent_url = reach.validate_target(str(payload["agent_url"]))
         except (KeyError, TypeError, ValueError) as exc:
             return errors.error_response(
-                400, f"Join body malformed: {exc}.",
+                400, f"Join body malformed: {str(exc).rstrip('.')}.",
                 "invalid_request_error", "invalid_join_body",
             )
+        facts: dict = {}
         try:
-            result = await handle_join(token, profile, agent_url)
+            requester = _requesting_host(request, agent_url)
+            result = await handle_join(
+                proof, profile, agent_url, peer=requester, facts=facts
+            )
         except JoinRejected as exc:
+            ctx.secevents.note(
+                AuditAction.JOIN_REJECTED,
+                actor=profile.node_id or "-",
+                ip=client_ip(request),
+                user_agent=request.headers.get("user-agent", "")[:512],
+                request_id=getattr(request.state, "request_id", None),
+                target_kind="node",
+                target_id=profile.node_id,
+                detail={"agent_url": agent_url, "reason": str(exc)},
+            )
             # Registry.handle_join raises this for three distinct causes --
             # a wrong token, a failed probe-back (e.g. unreachable agent_url,
             # bridge networking), or a node_id mismatch on probe-back -- and
@@ -1504,20 +1657,144 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return _not_implemented("Node join", "registry")
         # Passes through with whatever status handle_join decided -- "member"
         # or "candidate" -- rather than the gateway interpreting it.
+        if not facts.get("unchanged"):
+            await _audit_join(request, profile.node_id, agent_url, proof, result, facts)
         return JSONResponse(serialize.plain(result))
 
+    def _requesting_host(request: Request, agent_url: str) -> str:
+        """The host a join may register: the address that sent it.
+
+        Raises JoinRejected otherwise. ``agent_url`` is where the coordinator
+        will send prompts, kills and the agent token from now on, so it must
+        name the machine asking -- never a third host, and never the
+        coordinator's own loopback or a metadata address. A loopback peer is
+        a worker on this very machine (single-box dev): it dials 127.0.0.1 yet
+        names its LAN address, so any address this machine holds is accepted.
+        """
+        peer = client_ip(request) or ""
+        host = urlparse(agent_url).hostname or ""
+        if is_loopback(peer):
+            if not registry_net.is_local_address(host):
+                raise JoinRejected("agent_url must name the requesting address")
+            return host
+        if not registry_net.is_peer_address(host):
+            raise JoinRejected("agent_url is not a peer address")
+        if not registry_net.same_host(host, peer):
+            raise JoinRejected("agent_url must name the requesting address")
+        return host
+
+    async def _audit_join(
+        request: Request,
+        node_id: str,
+        agent_url: str,
+        proof,
+        result: dict,
+        facts: dict,
+    ) -> None:
+        """``node_joined``: who joined, from where, on which credential.
+
+        The route is open, so the gate writes no ``api_write`` row for it;
+        without this a membership change -- or a member's traffic being
+        re-pointed -- left nothing in the record. Routine re-polls that change
+        nothing (``facts["unchanged"]``) are not written.
+        """
+        previous_url = facts.get("previous_agent_url")
+        try:
+            auth = stores_of(request).auth
+            await asyncio.to_thread(
+                auth.audit,
+                node_id,
+                AuditAction.NODE_JOINED,
+                "node",
+                node_id,
+                before={"agent_url": previous_url} if previous_url else None,
+                after={
+                    "status": result.get("status") if isinstance(result, dict) else None,
+                    "agent_url": agent_url,
+                    "address": facts.get("address"),
+                    "source": facts.get(
+                        "source", "cluster_token" if proof is not None else "none"
+                    ),
+                    "enrollment_token_id": facts.get("enrollment_token_id"),
+                },
+                **request_context(request),
+            )
+        except Exception:
+            log.exception("could not write the node_joined audit row for %s", node_id)
+
     @router.post("/api/nodes/{node_id}/admit")
-    async def admit_node(node_id: str) -> Response:
+    async def admit_node(node_id: str, request: Request) -> Response:
         admit = getattr(ctx.deps.registry, "admit", None)
         if not callable(admit):
             return _not_implemented("Node admission", "registry")
+        # What the click admits, read before the candidate record is popped
+        # (N-15): the name alone does not say which machine got in.
+        record: dict = {}
+        candidates = getattr(ctx.deps.registry, "candidates", None)
+        if callable(candidates):
+            try:
+                record = next(
+                    (c for c in candidates() if isinstance(c, dict) and c.get("node_id") == node_id),
+                    {},
+                )
+            except Exception:
+                log.debug("could not read the candidate record for %s", node_id, exc_info=True)
         try:
-            return JSONResponse(serialize.plain(admit(node_id)))
+            admitted = serialize.plain(admit(node_id))
+            audit_request(
+                request, AuditAction.NODE_ADMITTED, "node", node_id,
+                after={
+                    "node_id": node_id,
+                    **{
+                        k: record.get(k)
+                        for k in ("agent_url", "address", "source", "first_seen")
+                        if record
+                    },
+                },
+            )
+            return JSONResponse(admitted)
         except NodeNotFound:
             return errors.error_response(
                 404, f"No candidate '{node_id}'.",
                 "invalid_request_error", "node_not_found",
             )
+
+    @router.post("/api/cluster/token/rotate")
+    async def rotate_cluster_token(request: Request) -> Response:
+        """Replace the cluster token (CT-1). Asks for ``current_password``.
+
+        Refused with 409 while any member would still present the old token
+        on its next join. The new token is never in a response or in the
+        audit row: members do not need it, and new nodes join on enrollment
+        tokens minted in the UI.
+        """
+        from control_plane.registry import MembersNotMigrated
+
+        from .auth_api import json_object, reauthenticated
+
+        rotate = getattr(ctx.deps.registry, "rotate_cluster_token", None)
+        if not callable(rotate):
+            return _not_implemented("Rotating the cluster token", "registry")
+        body = await json_object(request)
+        if isinstance(body, Response):
+            return body
+        refused = await reauthenticated(request, stores_of(request), body)
+        if refused is not None:
+            return refused
+        try:
+            members = rotate()
+        except MembersNotMigrated as exc:
+            return errors.error_response(
+                409,
+                "These members have not re-joined since the upgrade: "
+                f"{', '.join(exc.node_ids)}. Wait for them or remove them first.",
+                "invalid_request_error", "members_not_migrated",
+            )
+        audit_request(
+            request, AuditAction.CLUSTER_TOKEN_ROTATED, "cluster", "cluster",
+            after={"members": members},
+        )
+        return JSONResponse({"rotated": True})
 
     @router.put("/api/nodes/{node_id}/label")
     async def rename_node(node_id: str, request: Request) -> Response:
@@ -1533,7 +1810,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if not callable(rename):
             return _not_implemented("Renaming a node", "registry")
         try:
-            payload = await request.json()
+            payload = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, 'Body must be {"label": "a name"}.',
@@ -1559,7 +1838,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return JSONResponse({"node_id": node_id, "label": label})
 
     @router.delete("/api/nodes/{node_id}")
-    async def remove_node(node_id: str) -> Response:
+    async def remove_node(node_id: str, request: Request) -> Response:
         remove = getattr(ctx.deps.registry, "remove_node", None)
         if not callable(remove):
             return _not_implemented("Node removal", "registry")
@@ -1569,6 +1848,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 404, f"No node '{node_id}'.", "invalid_request_error", "node_not_found"
             )
+        audit_request(
+            request, AuditAction.NODE_REMOVED, "node", node_id,
+            before={"node_id": node_id},
+        )
         return JSONResponse({"removed": node_id})
 
     # -- links -------------------------------------------------------------
@@ -1580,12 +1863,28 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.post("/api/links/measure")
     async def measure_link(request: Request) -> Response:
         try:
-            payload = await request.json()
+            payload = await read_json_object(request)
             a, b = payload["a"], payload["b"]
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be {\"a\": node_id, \"b\": node_id}.",
                 "invalid_request_error", "invalid_request",
+            )
+        # Only a member is measured: an id the registry does not know would
+        # otherwise be dialled verbatim as an ssh host, and "-oProxyCommand=..."
+        # is an ssh option.
+        try:
+            known = all(
+                isinstance(n, str) and ctx.deps.registry.get_node(n) is not None for n in (a, b)
+            )
+        except Exception:
+            log.exception("registry unavailable")
+            known = False
+        if not known:
+            return errors.error_response(
+                404, f"Unknown node: {a!r} / {b!r}.", "invalid_request_error", "unknown_node",
             )
         try:
             measurement = await asyncio.to_thread(ctx.deps.links.measure, a, b)
@@ -1622,8 +1921,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if not callable(check):
             return _not_implemented("Reachability checks", "registry")
         try:
-            payload = await request.json()
+            payload = await read_json_object(request)
             a, b = payload["a"], payload["b"]
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, 'Body must be {"a": node_id, "b": node_id}.',
@@ -1674,8 +1975,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.put("/api/routing/{served_name}")
     async def set_routing(served_name: str, request: Request) -> Response:
         try:
-            payload = await request.json()
+            payload = await read_json_object(request)
             policy = RoutingPolicy(payload["policy"])
+        except BodyTooLarge:
+            return payload_too_large()
         except (KeyError, TypeError):
             return errors.error_response(
                 400, "Body must be {\"policy\": <routing policy>}.",
@@ -1694,18 +1997,47 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
+        limits = payload.get("limits") if isinstance(payload, dict) else None
+        if limits is not None and not isinstance(limits, dict):
+            return errors.error_response(
+                400, "limits must be an object with rpm and/or tpm.",
+                "invalid_request_error", "invalid_request",
+            )
+        shares = payload.get("shares") if isinstance(payload, dict) else None
+        if shares is not None and not isinstance(shares, dict):
+            return errors.error_response(
+                400, "shares must be an object of target id to a whole number.",
+                "invalid_request_error", "invalid_request",
+            )
+        previous = ctx.router.config_for(served_name)
         try:
-            config = ctx.router.set_policy(served_name, policy)
+            config = ctx.router.set_policy(served_name, policy, limits=limits, shares=shares)
         except KeyError:
             return errors.error_response(
                 404, f"No model '{served_name}' is being served.",
                 "invalid_request_error", "model_not_found",
             )
+        except ValueError as exc:
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "invalid_request",
+            )
+        before = {"policy": _policy_name(previous)}
+        after = {"policy": _policy_name(config), "override": True}
+        if limits is not None:
+            before["limits"] = dict(getattr(previous, "limits", {}) or {})
+            after["limits"] = dict(config.limits)
+        if shares is not None:
+            before["shares"] = dict(getattr(previous, "shares", {}) or {})
+            after["shares"] = dict(config.shares)
+        audit_request(
+            request, AuditAction.ROUTING_CHANGED, "routing", served_name,
+            before=before, after=after,
+        )
         index = ctx.router.index()
         return JSONResponse(_routing_payload(index, config))
 
     @router.delete("/api/routing/{served_name}")
-    async def clear_routing(served_name: str) -> Response:
+    async def clear_routing(served_name: str, request: Request) -> Response:
         """Drop the explicit override and go back to what auto_policy picks.
 
         The PUT is not its own inverse. Re-PUTting the policy a model currently
@@ -1722,12 +2054,22 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "model_not_found",
             )
         if not ctx.router.auto_selected(served_name):
+            previous = config
             ctx.router.clear_policy(served_name)
             # Re-read: clearing the override changes the resolved policy, and
             # the reply has to be the state the caller is left with.
             config = ctx.router.config_for(served_name) or config
+            audit_request(
+                request, AuditAction.ROUTING_CHANGED, "routing", served_name,
+                before={"policy": _policy_name(previous), "override": True},
+                after={"policy": _policy_name(config), "override": False},
+            )
         index = ctx.router.index()
         return JSONResponse(_routing_payload(index, config))
+
+    def _policy_name(config) -> str | None:
+        policy = getattr(config, "policy", None)
+        return getattr(policy, "value", policy)
 
     # -- providers ---------------------------------------------------------
 
@@ -1779,6 +2121,29 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         except Exception:
             log.exception("provider key status failed")
             return None
+
+    def _sign_in_account(provider_id: str) -> str | None:
+        """The account a sign-in provider is signed in as. Optional like ``_key_state``."""
+        account = getattr(ctx.deps.providers, "sign_in_account", None)
+        if not callable(account):
+            return None
+        try:
+            return account(provider_id)
+        except Exception:
+            log.exception("provider sign-in account lookup failed")
+            return None
+
+    def _backend_pins(provider_id: str) -> dict:
+        """``{upstream_id: (tag, fallback)}``. Optional like ``_key_state``: a
+        port without ``backend_pin_state`` reports no pins."""
+        state = getattr(ctx.deps.providers, "backend_pin_state", None)
+        if not callable(state):
+            return {}
+        try:
+            return state(provider_id)
+        except Exception:
+            log.exception("provider backend pin lookup failed")
+            return {}
 
     @router.get("/api/providers/kinds")
     async def provider_kinds() -> JSONResponse:
@@ -1855,7 +2220,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return JSONResponse(
             [
                 serialize.provider_payload(
-                    p, spend.get(p.provider_id), _key_state(p.provider_id)
+                    p, spend.get(p.provider_id), _key_state(p.provider_id),
+                    sign_in_account=_sign_in_account(p.provider_id),
+                    pins=_backend_pins(p.provider_id),
                 )
                 for p in providers
             ]
@@ -1864,7 +2231,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.post("/api/providers")
     async def add_provider(request: Request) -> Response:
         try:
-            spec = await request.json()
+            spec = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
@@ -1882,12 +2251,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "provider_add_failed",
             )
         ctx.router.rebuild(force_scores=True)
+        audit_request(
+            request, AuditAction.PROVIDER_CREATED, "provider", provider.provider_id,
+            after=_provider_audit(provider),
+        )
         spend = ui_detail.provider_spend(ctx.deps.providers)
         return JSONResponse(
             serialize.provider_payload(
                 _served_view(ctx.deps.providers, provider),
                 spend.get(provider.provider_id),
                 _key_state(provider.provider_id),
+                sign_in_account=_sign_in_account(provider.provider_id),
+                pins=_backend_pins(provider.provider_id),
             ),
             status_code=201,
         )
@@ -1898,11 +2273,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if not callable(update):
             return _not_implemented("Provider update", "provider store")
         try:
-            patch = await request.json()
+            patch = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
+        before = _provider_audit_by_id(provider_id)
         try:
             provider = update(provider_id, patch)
         except UnknownProviderError:
@@ -1920,12 +2298,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "provider_update_failed",
             )
         ctx.router.rebuild(force_scores=True)
+        audit_request(
+            request, AuditAction.PROVIDER_UPDATED, "provider", provider_id,
+            before=before, after=_provider_audit(provider),
+        )
         spend = ui_detail.provider_spend(ctx.deps.providers)
         return JSONResponse(
             serialize.provider_payload(
                 _served_view(ctx.deps.providers, provider),
                 spend.get(provider.provider_id),
                 _key_state(provider.provider_id),
+                sign_in_account=_sign_in_account(provider.provider_id),
+                pins=_backend_pins(provider.provider_id),
             )
         )
 
@@ -1965,7 +2349,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
 
         try:
-            body = await request.json()
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
@@ -2185,10 +2571,17 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
 
     @router.delete("/api/providers/{provider_id}")
-    async def delete_provider(provider_id: str) -> Response:
+    async def delete_provider(provider_id: str, request: Request) -> Response:
         remove = getattr(ctx.deps.providers, "remove", None)
         if not callable(remove):
             return _not_implemented("Provider removal", "provider store")
+        # Try remote revocation first where the provider supports it. Local
+        # removal still succeeds if the grant may outlive this connection.
+        revoked = None
+        before = _provider_audit_by_id(provider_id)
+        sign_out = getattr(ctx.deps.providers, "sign_out_async", None)
+        if callable(sign_out):
+            revoked = await sign_out(provider_id)
         try:
             remove(provider_id)
         except UnknownProviderError:
@@ -2197,7 +2590,295 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "provider_not_found",
             )
         ctx.router.rebuild(force_scores=True)
-        return JSONResponse({"removed": provider_id})
+        audit_request(
+            request, AuditAction.PROVIDER_DELETED, "provider", provider_id,
+            before=before, after={"revoked": revoked},
+        )
+        return JSONResponse({"removed": provider_id, "revoked": revoked})
+
+    # attempt_id -> (admin who started it, when): the redirect that finishes
+    # an attempt carries no session, so its audit row names this admin.
+    sign_in_started_by: dict[str, tuple[str, float]] = {}
+
+    def _note_sign_in_start(attempt_id: str, request: Request) -> None:
+        now = time.time()
+        for stale in [a for a, (_, t) in sign_in_started_by.items() if now - t > SIGN_IN_ATTEMPT_TTL_S]:
+            del sign_in_started_by[stale]
+        session = request.scope.get("state", {}).get("session")
+        sign_in_started_by[attempt_id] = (session.username if session is not None else "-", now)
+
+    async def _audit_signed_in(
+        attempt_id: str, provider_id: str, rebound: bool, request: Request | None
+    ) -> None:
+        """The ``provider_signed_in`` row: the redirect created or rebound a
+        provider credential, so it is recorded like any other provider write."""
+        started = sign_in_started_by.pop(attempt_id, None)
+        actor = started[0] if started is not None else "-"
+        context = (
+            request_context(request) if request is not None
+            else {"ip": None, "request_id": None, "user_agent": None, "session_id": None}
+        )
+        if request is not None:
+            request.scope.setdefault("state", {})["audited"] = True
+        provider = _provider_audit_by_id(provider_id)
+        kind = provider.get("kind") if provider is not None else None
+        try:
+            await asyncio.to_thread(
+                ctx.auth_stores.auth.audit,
+                actor, AuditAction.PROVIDER_SIGNED_IN, "provider", provider_id,
+                after={"kind": kind, "rebound": rebound, "attempt_id": attempt_id},
+                **context,
+            )
+        except AuthUnavailable as exc:
+            log.error("Provider sign-in of %s not audited: %s", provider_id, exc.message)
+
+    async def _finish_redirect(query: str, request: Request | None = None) -> tuple[int, str]:
+        """Finish the attempt a redirect's query belongs to: (status, page).
+
+        Shared by ``GET /auth/callback`` and the loopback listener, so the
+        browser sees the same page whichever one the redirect reached."""
+        complete = ctx.deps.providers.complete_chatgpt_callback
+        before = {p.provider_id for p in ctx.deps.providers.list()}
+        try:
+            attempt_id, provider = await complete(query)
+        except (SignInError, UpstreamError) as exc:
+            log.warning("ChatGPT sign-in redirect refused: %s", getattr(exc, "code", exc))
+            redactor = _redactor()
+            message = getattr(exc, "message", str(exc))
+            message = redactor.scrub(message) if redactor is not None else message
+            return 400, _sign_in_page("Sign-in did not finish", message)
+        await _audit_signed_in(attempt_id, provider.provider_id, provider.provider_id in before, request)
+        ctx.router.rebuild(force_scores=True)
+        account = _sign_in_account(provider.provider_id) or "your ChatGPT account"
+        return 200, _sign_in_page(
+            "Signed in to ChatGPT",
+            f"derate is using the ChatGPT plan of {account}. "
+            "Close this tab and go back to derate.",
+        )
+
+    redirect = urlsplit(CHATGPT_REDIRECT_URI)
+    loopback = LoopbackCallback(
+        redirect.hostname or "127.0.0.1", redirect.port or 1455, redirect.path, _finish_redirect
+    )
+
+    @router.post("/api/sign-in/chatgpt")
+    async def start_chatgpt_sign_in(request: Request) -> Response:
+        """Begin Sign in with ChatGPT: the address to open in a browser.
+
+        ``{"provider_id": ...}`` signs an existing provider in again; an empty
+        body starts a new one. The coordinator then listens on the redirect
+        address itself (``loopback.py``) until the attempt expires, so a
+        browser whose port 1455 reaches this machine -- on it, tunnelled, or
+        port-forwarded by an editor -- finishes by itself. Anywhere else the
+        operator pastes where the browser lands into the ``complete`` route.
+        """
+        start = getattr(ctx.deps.providers, "start_chatgpt_sign_in", None)
+        if not callable(start):
+            return _not_implemented("Sign in with ChatGPT", "provider store")
+        try:
+            body = await optional_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except Exception:
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("provider_id", ""), (str, type(None))):
+            return errors.error_response(
+                400, "Body must be a JSON object, with an optional string provider_id.",
+                "invalid_request_error", "invalid_json",
+            )
+        provider_id = body.get("provider_id") or None
+        try:
+            started = start(provider_id)
+        except UnknownProviderError:
+            return errors.error_response(
+                404, f"No provider '{provider_id}'.",
+                "invalid_request_error", "provider_not_found",
+            )
+        except ValueError as exc:
+            return errors.error_response(
+                400, f"Could not start sign-in. {errors.detail(exc, _redactor())}",
+                "invalid_request_error", "sign_in_failed",
+            )
+        if callable(getattr(ctx.deps.providers, "complete_chatgpt_callback", None)):
+            # Best effort: a port somebody else holds is logged, and the paste
+            # path still finishes the sign-in.
+            await loopback.hold(SIGN_IN_ATTEMPT_TTL_S)
+        if isinstance(started, dict) and isinstance(started.get("attempt_id"), str):
+            _note_sign_in_start(started["attempt_id"], request)
+        return JSONResponse(started)
+
+    @router.get("/api/sign-in/chatgpt/{attempt_id}")
+    async def chatgpt_sign_in_status(attempt_id: str) -> Response:
+        """Where a sign-in stands: ``pending``, ``done`` (with ``provider_id``) or
+        ``failed`` (with ``code`` and ``message``). The UI polls this so a
+        redirect that reached ``GET /auth/callback`` finishes its screen too."""
+        status = getattr(ctx.deps.providers, "chatgpt_sign_in_status", None)
+        if not callable(status):
+            return _not_implemented("Sign in with ChatGPT", "provider store")
+        try:
+            return JSONResponse(status(attempt_id))
+        except SignInError as exc:
+            return errors.error_response(404, exc.message, "invalid_request_error", exc.code)
+
+    @router.get("/auth/callback")
+    async def chatgpt_redirect_landing(request: Request) -> Response:
+        """Where OpenAI's redirect lands when it can reach the coordinator.
+
+        The redirect is ``http://127.0.0.1:1455/auth/callback`` and OpenAI
+        allows nothing but a loopback address, so this is reached from a
+        browser on the coordinator or one tunnelled to this port
+        (``ssh -L 1455:127.0.0.1:<port>``); the coordinator's own listener on
+        1455 (``loopback.py``) answers the same way. Open by path -- it is not under /api -- because the browser
+        following a redirect carries no session for this origin; the ``state``
+        in the query, which only the attempt's own authorize URL ever carried,
+        is what authorises it. Everybody else pastes the address into the UI,
+        which ends at the same code.
+        """
+        if not callable(getattr(ctx.deps.providers, "complete_chatgpt_callback", None)):
+            return _not_implemented("Sign in with ChatGPT", "provider store")
+        status, page = await _finish_redirect(request.url.query, request)
+        return HTMLResponse(page, status_code=status)
+
+    @router.post("/api/sign-in/chatgpt/{attempt_id}/complete")
+    async def complete_chatgpt_sign_in(attempt_id: str, request: Request) -> Response:
+        """Finish a sign-in from the pasted callback address.
+
+        201 with the new provider, or 200 with the provider signed in again.
+        A refusal is 400 with a code per cause and a sentence saying what to do.
+        """
+        complete = getattr(ctx.deps.providers, "complete_chatgpt_sign_in", None)
+        if not callable(complete):
+            return _not_implemented("Sign in with ChatGPT", "provider store")
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except Exception:
+            body = None
+        callback_url = body.get("callback_url") if isinstance(body, dict) else None
+        if not isinstance(callback_url, str):
+            return errors.error_response(
+                400, "Body must be JSON with a string callback_url.",
+                "invalid_request_error", "invalid_json",
+            )
+        before = {p.provider_id for p in ctx.deps.providers.list()}
+        try:
+            provider = await complete(attempt_id, callback_url)
+        except SignInError as exc:
+            redactor = _redactor()
+            message = redactor.scrub(exc.message) if redactor is not None else exc.message
+            return errors.error_response(400, message, "invalid_request_error", exc.code)
+        except UpstreamError as exc:
+            log.warning("ChatGPT sign-in failed: %s", exc)
+            return errors.error_response(
+                502, f"Could not finish sign-in. {errors.detail(exc, _redactor())}",
+                "server_error", "sign_in_failed",
+            )
+        await _audit_signed_in(attempt_id, provider.provider_id, provider.provider_id in before, request)
+        ctx.router.rebuild(force_scores=True)
+        spend = ui_detail.provider_spend(ctx.deps.providers)
+        return JSONResponse(
+            serialize.provider_payload(
+                _served_view(ctx.deps.providers, provider),
+                spend.get(provider.provider_id),
+                _key_state(provider.provider_id),
+                sign_in_account=_sign_in_account(provider.provider_id),
+                pins=_backend_pins(provider.provider_id),
+            ),
+            status_code=200 if provider.provider_id in before else 201,
+        )
+
+    @router.post("/api/sign-in/claude")
+    async def start_claude_sign_in(request: Request) -> Response:
+        """Begin an unofficial Claude subscription connection or reconnect."""
+        start = getattr(ctx.deps.providers, "start_claude_sign_in", None)
+        if not callable(start):
+            return _not_implemented("Sign in with Claude", "provider store")
+        try:
+            body = await optional_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except Exception:
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("provider_id", ""), (str, type(None))):
+            return errors.error_response(
+                400, "Body must be a JSON object, with an optional string provider_id.",
+                "invalid_request_error", "invalid_json",
+            )
+        provider_id = body.get("provider_id") or None
+        try:
+            started = start(provider_id)
+        except UnknownProviderError:
+            return errors.error_response(
+                404, f"No provider '{provider_id}'.",
+                "invalid_request_error", "provider_not_found",
+            )
+        except ValueError as exc:
+            return errors.error_response(
+                400, f"Could not start sign-in. {errors.detail(exc, _redactor())}",
+                "invalid_request_error", "sign_in_failed",
+            )
+        if isinstance(started, dict) and isinstance(started.get("attempt_id"), str):
+            _note_sign_in_start(started["attempt_id"], request)
+        return JSONResponse(started)
+
+    @router.get("/api/sign-in/claude/{attempt_id}")
+    async def claude_sign_in_status(attempt_id: str) -> Response:
+        """Return pending/done/failed without exposing authorization material."""
+        status = getattr(ctx.deps.providers, "claude_sign_in_status", None)
+        if not callable(status):
+            return _not_implemented("Sign in with Claude", "provider store")
+        try:
+            return JSONResponse(status(attempt_id))
+        except SignInError as exc:
+            redactor = _redactor()
+            message = redactor.scrub(exc.message) if redactor is not None else exc.message
+            return errors.error_response(404, message, "invalid_request_error", exc.code)
+
+    @router.post("/api/sign-in/claude/{attempt_id}/complete")
+    async def complete_claude_sign_in(attempt_id: str, request: Request) -> Response:
+        """Finish pasted Claude authorization: 201 for new, 200 for reconnect."""
+        complete = getattr(ctx.deps.providers, "complete_claude_sign_in", None)
+        if not callable(complete):
+            return _not_implemented("Sign in with Claude", "provider store")
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except Exception:
+            body = None
+        callback_url = body.get("callback_url") if isinstance(body, dict) else None
+        if not isinstance(callback_url, str):
+            return errors.error_response(
+                400, "Body must be JSON with a string callback_url.",
+                "invalid_request_error", "invalid_json",
+            )
+        before = {p.provider_id for p in ctx.deps.providers.list()}
+        try:
+            provider = await complete(attempt_id, callback_url)
+        except SignInError as exc:
+            redactor = _redactor()
+            message = redactor.scrub(exc.message) if redactor is not None else exc.message
+            return errors.error_response(400, message, "invalid_request_error", exc.code)
+        except UpstreamError as exc:
+            log.warning("Claude sign-in failed: %s", exc)
+            return errors.error_response(
+                502, f"Could not finish sign-in. {errors.detail(exc, _redactor())}",
+                "server_error", "sign_in_failed",
+            )
+        await _audit_signed_in(attempt_id, provider.provider_id, provider.provider_id in before, request)
+        ctx.router.rebuild(force_scores=True)
+        spend = ui_detail.provider_spend(ctx.deps.providers)
+        return JSONResponse(
+            serialize.provider_payload(
+                _served_view(ctx.deps.providers, provider),
+                spend.get(provider.provider_id),
+                _key_state(provider.provider_id),
+                sign_in_account=_sign_in_account(provider.provider_id),
+                pins=_backend_pins(provider.provider_id),
+            ),
+            status_code=200 if provider.provider_id in before else 201,
+        )
 
     @router.post("/api/providers/{provider_id}/refresh")
     async def refresh_provider(provider_id: str) -> Response:
@@ -2225,6 +2906,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 _served_view(ctx.deps.providers, provider),
                 spend.get(provider.provider_id),
                 _key_state(provider.provider_id),
+                sign_in_account=_sign_in_account(provider.provider_id),
+                pins=_backend_pins(provider.provider_id),
             )
         )
 
@@ -2339,7 +3022,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return Response(
                 body,
                 media_type=content_type,
-                headers={"cache-control": "public, max-age=86400"},
+                headers={"cache-control": "private, max-age=86400"},
             )
 
         if not cache.is_fresh_miss(provider_id):
@@ -2348,6 +3031,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             404, f"No logo for '{provider_id}'.",
             "invalid_request_error", "logo_not_found",
         )
+
+    #: Per-session budget for the batch route (R7): 240 publishers a minute
+    #: that the batch would go to the hub for. Answers out of the cache cost
+    #: nothing -- every screen asks for the same grid, and charging those
+    #: 429ed ordinary navigation -- so the bound is on the outbound fan-out,
+    #: which is the thing a looping session could abuse.
+    #: {session id: (window start, lookups charged)}.
+    avatar_windows: dict[str, tuple[float, int]] = {}
 
     @router.get("/api/publishers/avatars")
     async def publisher_avatars(request: Request) -> Response:
@@ -2383,6 +3074,25 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # A cap, not a pagination scheme: the client chunks, and an unbounded
         # list here would be an unbounded fan-out at somebody else's hub.
         owners = owners[:64]
+
+        session = getattr(request.state, "session", None)
+        sid = str(getattr(session, "session_id", "") or "-")
+        cost = len(avatars.uncached(owners))
+        now = time.monotonic()
+        start, used = avatar_windows.get(sid, (now, 0))
+        if now - start >= AVATAR_WINDOW_S:
+            start, used = now, 0
+        if cost and used + cost > AVATAR_OWNERS_PER_WINDOW:
+            retry = max(1, int(AVATAR_WINDOW_S - (now - start)) + 1)
+            return errors.error_response(
+                429, "Too many publisher lookups; try again shortly.",
+                "rate_limit_error", "rate_limited",
+                headers={"retry-after": str(retry)},
+            )
+        # Drop expired windows so the map is bounded by live sessions.
+        for stale in [k for k, (s, _) in avatar_windows.items() if now - s >= AVATAR_WINDOW_S]:
+            avatar_windows.pop(stale, None)
+        avatar_windows[sid] = (start, used + cost)
 
         try:
             found = await avatars.resolve_many(owners)
@@ -2424,7 +3134,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return Response(
             body,
             media_type=content_type,
-            headers={"cache-control": "public, max-age=86400"},
+            headers={"cache-control": "private, max-age=86400"},
         )
 
     # -- plan and deployments ---------------------------------------------
@@ -2453,6 +3163,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         """The shared provider redactor, or None. Reached the way the telemetry
         service reaches it -- a fresh Redactor knows no secrets to scrub."""
         return getattr(ctx.deps.providers, "redactor", None)
+
+    def _provider_audit(provider) -> dict | None:
+        return serialize.provider_audit(provider, _redactor())
+
+    def _provider_audit_by_id(provider_id: str) -> dict | None:
+        get = getattr(ctx.deps.providers, "get", None)
+        if not callable(get):
+            return None
+        try:
+            return _provider_audit(get(provider_id))
+        except Exception:
+            return None
 
     def _plan_error_response(exc: Exception, model_id: str | None) -> JSONResponse:
         """The refusal, carrying the reason instead of only the class name."""
@@ -2494,7 +3216,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.post("/api/plan")
     async def plan_endpoint(request: Request) -> Response:
         try:
-            payload = await request.json()
+            payload = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
@@ -2534,6 +3258,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # governs is decided here, not in the client.
                 "serve": out.serve,
                 "resolver_warnings": out.resolver_warnings,
+                "remote_code": out.remote_code,
                 # Whose choice the machines and the degrees were.
                 "placement": out.placement,
                 "degrees": out.degrees,
@@ -2606,7 +3331,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.post("/api/deployments")
     async def create_deployment(request: Request) -> Response:
         try:
-            payload = await request.json()
+            payload = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
@@ -2675,6 +3402,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         custom_command = _parse_cli_tokens("custom_command")
         if isinstance(custom_command, Response):
             return custom_command
+        # Opt-in (R2): the repo's own Python runs in the container only when
+        # the operator asked for it, and the audit row says they did.
+        trust_remote_code = (
+            payload.get("trust_remote_code", False) if isinstance(payload, dict) else False
+        )
+        if not isinstance(trust_remote_code, bool):
+            return errors.error_response(
+                400, "trust_remote_code must be true or false.",
+                "invalid_request_error", "invalid_request",
+            )
 
         try:
             out = await _plan_and_fit(ctx, payload)
@@ -2901,6 +3638,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     modality=out.modality,
                     extra_args=extra_args,
                     custom_command=custom_command,
+                    revision=out.revision,
+                    speculative_tokens=payload.get("speculative_tokens", 0),
+                    # Only sent when set, so a DeploymentPort that predates
+                    # the opt-in still launches everything it always did.
+                    **({"trust_remote_code": True} if trust_remote_code else {}),
                 )
             )
         except ValueError as exc:
@@ -2951,12 +3693,17 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "launch_failed",
             )
         ctx.router.rebuild(force_scores=True)
+        audit_request(
+            request, AuditAction.DEPLOYMENT_LAUNCHED, "deployment",
+            str(getattr(deployment, "deployment_id", "")),
+            after=_deployment_audit(deployment),
+        )
         return JSONResponse(
             serialize.deployment_payload(deployment), status_code=201
         )
 
     @router.delete("/api/deployments/{deployment_id}")
-    async def delete_deployment(deployment_id: str) -> Response:
+    async def delete_deployment(deployment_id: str, request: Request) -> Response:
         try:
             existing = ctx.deps.deployments.get(deployment_id)
         except Exception:
@@ -2978,7 +3725,33 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "stop_failed",
             )
         ctx.router.rebuild(force_scores=True)
+        audit_request(
+            request, AuditAction.DEPLOYMENT_STOPPED, "deployment", deployment_id,
+            before=_deployment_audit(existing),
+        )
         return JSONResponse({"stopping": deployment_id})
+
+    def _deployment_audit(dep) -> dict:
+        """What an investigator needs of a deployment: what ran, where, how."""
+        runtime = getattr(dep, "runtime", None)
+        row = {
+            "served_name": getattr(dep, "served_name", None),
+            "model_id": getattr(getattr(dep, "shape", None), "model_id", None),
+            "node_ids": list(getattr(getattr(dep, "plan", None), "node_ids", None) or []),
+            "runtime": getattr(runtime, "value", runtime),
+        }
+        revision = getattr(dep, "revision", None)
+        if revision:
+            row["revision"] = revision
+        # How the command was shaped, and what it trusted and ran (R6, SC-05):
+        # an investigator reconstructing a launch needs the operator's own
+        # tokens and the image as much as the model id.
+        row["extra_args"] = list(getattr(dep, "extra_args", ()) or ())
+        row["custom_command"] = list(getattr(dep, "custom_command", ()) or ())
+        row["speculative_tokens"] = int(getattr(dep, "speculative_tokens", 0) or 0)
+        row["trust_remote_code"] = bool(getattr(dep, "trust_remote_code", False))
+        row["image"] = str(getattr(dep, "image", "") or "")
+        return row
 
     @router.get("/api/deployments/{deployment_id}/logs")
     async def deployment_logs(deployment_id: str, tail: int = 500) -> Response:
@@ -3361,7 +4134,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         try:
             async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
-                res = await client.get(f"{agent_url.rstrip('/')}/agent/storage")
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/storage",
+                    headers=_agent_headers(node_id),
+                )
         except Exception as exc:
             log.warning("storage read failed for %s: %s", node_id, exc)
             return _unavailable(
@@ -3409,7 +4185,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         try:
             async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
-                res = await client.get(f"{agent_url.rstrip('/')}/agent/models/cache")
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/models/cache",
+                    headers=_agent_headers(node_id),
+                )
         except Exception as exc:
             log.warning("model cache read failed for %s: %s", node_id, exc)
             return _unavailable(
@@ -3552,7 +4331,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return JSONResponse(body)
 
     @router.delete("/api/storage/nodes/{node_id}/models/{folder}")
-    async def delete_cached_model(node_id: str, folder: str) -> Response:
+    async def delete_cached_model(node_id: str, folder: str, request: Request) -> Response:
         """Delete one downloaded repository from one node.
 
         The largest reclaim in the product by orders of magnitude -- a single
@@ -3561,6 +4340,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         agent. The agent has no idea what a deployment is; this is the same
         split, and the same 409, that killing a GPU process already uses.
         """
+        # One cache folder, by name, before anything is relayed (E2): a
+        # decoded `?`, `#` or `/` here would make the agent act on a different
+        # path than the one the audit row records.
+        if not _CACHE_FOLDER.fullmatch(folder):
+            return errors.error_response(
+                400,
+                "folder must be a single models--<org>--<name> cache folder.",
+                "invalid_request_error",
+                "invalid_folder",
+            )
         try:
             deployments = ctx.deps.deployments.list()
         except Exception:
@@ -3589,13 +4378,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "model_in_use",
             )
 
-        token = None
-        token_fn = getattr(ctx.deps.registry, "cluster_token", None)
-        if callable(token_fn):
-            try:
-                token = token_fn()
-            except Exception:
-                log.exception("cluster token unavailable")
+        token = _agent_token(node_id)
         if not token:
             return errors.error_response(
                 503,
@@ -3621,7 +4404,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         try:
             async with httpx.AsyncClient(timeout=_DELETE_TIMEOUT_S) as client:
                 res = await client.delete(
-                    f"{agent_url.rstrip('/')}/agent/models/cache/{folder}",
+                    f"{agent_url.rstrip('/')}/agent/models/cache/{quote(folder, safe='')}",
                     headers={"X-Derate-Token": token},
                 )
         except Exception as exc:
@@ -3643,10 +4426,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "delete_refused",
             )
-        return JSONResponse(res.json())
+        answer = res.json()
+        audit_request(
+            request, AuditAction.STORAGE_DELETED, "model_cache", f"{node_id}/{folder}",
+            before={"node_id": node_id, "folder": folder},
+            after=answer if isinstance(answer, dict) else None,
+        )
+        return JSONResponse(answer)
 
     @router.delete("/api/storage/cache/resolver")
-    async def clear_resolver_cache() -> Response:
+    async def clear_resolver_cache(request: Request) -> Response:
         """Drop every cached model resolution.
 
         The only mutation on this surface. Safe by construction: a cache miss
@@ -3681,8 +4470,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         after = 0
         if directory is not None:
             after = registry_storage.path_bytes(Path(directory)) or 0
-        return JSONResponse(
-            {"cleared": True, "bytes_freed": max(0, before - after)}
+        freed = max(0, before - after)
+        audit_request(
+            request, AuditAction.STORAGE_DELETED, "resolver_cache",
+            str(directory) if directory is not None else "-",
+            after={"bytes_freed": freed},
         )
+        return JSONResponse({"cleared": True, "bytes_freed": freed})
 
     return router

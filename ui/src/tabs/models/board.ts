@@ -7,8 +7,7 @@ import type {
 } from '../../api/types'
 import { TERMINAL, type CacheIndex } from './rows'
 
-// The machine board's arithmetic, with no DOM and no React in it, for the same
-// reason `tabs/cluster/layout.ts` is split from `ClusterGraph.tsx`: it is the
+// The machine board's arithmetic, with no DOM and no React in it: it is the
 // part that can be wrong in a way types cannot catch, so it is the part
 // `rows.check.mjs` bundles and asserts against the live cluster.
 //
@@ -113,8 +112,8 @@ export interface BoardInput {
   chosen: string[] | null
 }
 
-/** The one definition of "measured" this board is allowed to use, matching
- *  `tabs/cluster/layout.ts`: the wire's own flag AND a figure to show for it.
+/** The one definition of "measured" this board, the wiring editor's link
+ *  lines and the Links rail use: the wire's own flag AND a figure to show for it.
  *  An edge claiming `measured: true` with no `all_reduce_gbps` has nothing to
  *  draw and must read exactly like one that was never probed. */
 export function linkMeasured(

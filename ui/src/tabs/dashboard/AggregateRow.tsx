@@ -1,48 +1,62 @@
-import type { Cluster, MetricsNodeFrame } from '../../api/types'
+import type { ReactNode } from 'react'
+import type { Cluster } from '../../api/types'
 import { Readout } from '../../components/Readout'
 import { gbNum } from '../../format'
-import { runners } from '../cluster/layout'
+import { runners } from '../models/rows'
 import type { SafeMetricsFrame } from '../../state/useMetrics'
 
 interface Props {
   cluster: Cluster | null
   frame: SafeMetricsFrame | null
+  /** More tiles on the same line (the Overview's usage tiles). */
+  children?: ReactNode
 }
 
-/** Four tiles, mockups-next's `#s-overview` quad. The mockup's fourth tile
- *  ("slots free") is dead: there is no slots model, so it is replaced with
- *  addressable memory actually free across the cluster. */
-export function AggregateRow({ cluster, frame }: Props) {
+/** The Overview's one line of tiles: live throughput and deployments serving,
+ *  then whatever the caller adds (the usage tiles). Free memory is on
+ *  Telemetry (`freeGiB`). */
+export function AggregateRow({ cluster, frame, children }: Props) {
   const deployments = cluster?.deployments ?? null
   const serving = deployments
     ? deployments.filter((d) => d.state === 'ready' || d.state === 'degraded').length
     : null
 
   return (
-    <div className="quad" style={{ margin: '4px 0 6px' }}>
-      <Tile value={totalTps(deployments, frame)} decimals={0} width={6} label="tokens per second, all models" />
-      <Tile value={serving} decimals={0} width={3} label="deployments serving" />
-      <Tile value={totalWatts(frame?.nodes ?? null)} decimals={0} width={5} label="watts drawn" />
-      <Tile value={cluster ? gbNum(freeBytes(cluster)) : null} decimals={1} width={6} label="GiB addressable free" />
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+        gap: 'var(--space-16)',
+        margin: 'var(--space-4) 0 var(--space-6)',
+      }}
+    >
+      <Tile value={totalTps(deployments, frame)} width={5} label="tok/s, all models" />
+      <Tile value={serving} width={3} label="serving" />
+      {children}
     </div>
   )
 }
 
-function Tile({
+export function Tile({
   value,
-  decimals,
+  decimals = 0,
+  unit,
   width,
   label,
+  title,
 }: {
   value: number | null
-  decimals: number
+  decimals?: number
+  unit?: string
   width: number
   label: string
+  /** Hover detail, e.g. the in/out split under a token total. */
+  title?: string
 }) {
   return (
-    <div>
-      <Readout value={value} decimals={decimals} width={width} size="readout" align="left" />
-      <div className="unit" style={{ marginTop: 4 }}>
+    <div title={title}>
+      <Readout value={value} decimals={decimals} unit={unit} width={width} size="readout" align="left" />
+      <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
         {label}
       </div>
     </div>
@@ -79,24 +93,15 @@ function totalTps(
   return any ? sum : null
 }
 
-/** Same honesty rule as above: a node that has never reported power is
- *  skipped, not treated as drawing zero watts. Only when every node is
- *  missing does the tile itself go to em dash. */
-function totalWatts(nodes: MetricsNodeFrame[] | null): number | null {
-  if (!nodes) return null
-  const values: number[] = []
-  for (const n of nodes) {
-    if (n.power_w != null) values.push(n.power_w)
-  }
-  return values.length ? values.reduce((a, b) => a + b, 0) : null
-}
-
-function freeBytes(cluster: Cluster): number {
+/** Addressable memory free across the cluster, in GiB; null before the first
+ *  cluster read. Shown on Telemetry. */
+export function freeGiB(cluster: Cluster | null): number | null {
+  if (!cluster) return null
   let addressable = 0
   let used = 0
   for (const n of cluster.nodes) {
     addressable += n.profile.addressable_memory
     used += n.memory_used
   }
-  return addressable - used
+  return gbNum(addressable - used)
 }

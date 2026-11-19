@@ -3,13 +3,15 @@ import { useCluster, useRouting, useTopology } from '../state/resources'
 import { useMetrics } from '../state/metrics'
 import { useTelemetrySeries } from '../state/telemetry'
 import { useSelection } from '../state/selection'
-import { AggregateRow } from './dashboard/AggregateRow'
+import { freeGiB, Tile } from './dashboard/AggregateRow'
 import { DeploymentsStrip } from './dashboard/DeploymentsStrip'
 import { TelemetrySub } from './dashboard/TelemetrySub'
 import { LoadSub } from './dashboard/LoadSub'
 import { HeadroomSub } from './dashboard/HeadroomSub'
+import { UsageCard, UsageWindow } from './dashboard/UsageCard'
+import { DEFAULT_DAYS, type UsageDays } from './dashboard/usageSummary'
 
-type Sub = 'overview' | 'headroom' | 'telemetry' | 'load'
+type Sub = 'overview' | 'headroom' | 'telemetry'
 
 const SUBS: { id: Sub; label: string }[] = [
   { id: 'overview', label: 'Overview' },
@@ -17,11 +19,10 @@ const SUBS: { id: Sub; label: string }[] = [
   // this fit" but "what fits". The planner itself is on the model's screen.
   { id: 'headroom', label: 'Headroom' },
   { id: 'telemetry', label: 'Telemetry' },
-  { id: 'load', label: 'Load' },
 ]
 
-/** The Dashboard destination: four sub-tabs (`.subs`) -- what is running, what
- *  it is doing right now, what would still fit, and who it is doing it for.
+/** The Dashboard destination: three sub-tabs (`.subs`) -- usage at a glance,
+ *  what would still fit, and what is running right now with where its load lands.
  *
  *  Planning is not here. The bar that used to sit above these tabs, always
  *  visible, was a second copy of `tabs/models/ServePanel.tsx`: the same
@@ -38,6 +39,7 @@ const SUBS: { id: Sub; label: string }[] = [
  *  this tab. */
 export function DashboardTab() {
   const [sub, setSub] = useState<Sub>('overview')
+  const [usageDays, setUsageDays] = useState<UsageDays>(DEFAULT_DAYS)
   const cluster = useCluster()
   const topology = useTopology()
   const routing = useRouting()
@@ -47,40 +49,46 @@ export function DashboardTab() {
   const telemetry = useTelemetrySeries()
 
   return (
-    <div style={{ display: 'grid', gap: 'var(--s-4)' }}>
-      <div className="subs" role="tablist" aria-label="Dashboard sections">
-        {SUBS.map((s) => (
-          <button key={s.id} role="tab" aria-selected={sub === s.id} onClick={() => setSub(s.id)}>
-            {s.label}
-          </button>
-        ))}
+    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 'var(--space-16)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-12)', flexWrap: 'wrap' }}>
+        <div className="subs" role="tablist" aria-label="Dashboard sections" style={{ flex: 1, margin: 0 }}>
+          {SUBS.map((s) => (
+            <button type="button" key={s.id} role="tab" aria-selected={sub === s.id} onClick={() => setSub(s.id)}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+        {sub === 'overview' ? <UsageWindow days={usageDays} onChange={setUsageDays} /> : null}
       </div>
 
       <div hidden={sub !== 'headroom'}>
         <HeadroomSub context={8192} concurrency={1} />
       </div>
 
-      <div hidden={sub !== 'overview'} style={{ display: 'grid', gap: 'var(--s-4)' }}>
-        <AggregateRow cluster={cluster.data} frame={frame} />
-        <section>
-          <h2>Deployments</h2>
-          <DeploymentsStrip
-            deployments={cluster.data?.deployments ?? []}
-            topologyDeployments={topology.data?.deployments ?? []}
-            frame={frame}
-            routing={routing.data ?? []}
-            telemetry={telemetry}
-            selection={selection}
-          />
-        </section>
+      <div hidden={sub !== 'overview'}>
+        <UsageCard days={usageDays} cluster={cluster.data} frame={frame} />
       </div>
 
       <div hidden={sub !== 'telemetry'}>
-        <TelemetrySub nodes={cluster.data?.nodes ?? []} telemetry={telemetry} selection={selection} />
-      </div>
-
-      <div hidden={sub !== 'load'}>
-        <LoadSub routing={routing.data ?? []} nodes={cluster.data?.nodes ?? []} />
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 'var(--space-16)' }}>
+          <Tile value={freeGiB(cluster.data)} decimals={1} width={6} label="GiB addressable free" />
+          <section>
+            <h2>Deployments</h2>
+            <DeploymentsStrip
+              deployments={cluster.data?.deployments ?? []}
+              topologyDeployments={topology.data?.deployments ?? []}
+              frame={frame}
+              routing={routing.data ?? []}
+              telemetry={telemetry}
+              selection={selection}
+            />
+          </section>
+          <TelemetrySub nodes={cluster.data?.nodes ?? []} telemetry={telemetry} selection={selection} />
+          <section>
+            <h2>Load</h2>
+            <LoadSub routing={routing.data ?? []} nodes={cluster.data?.nodes ?? []} />
+          </section>
+        </div>
       </div>
     </div>
   )

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Icon } from '../../components/Icon'
 import type {
   Cluster,
   LadderBasis,
@@ -273,7 +274,7 @@ export function QuantLadder({
 
   return (
     <>
-      <p className="unit" style={{ margin: '0 0 8px' }}>
+      <p className="unit" style={{ margin: '0 0 var(--space-8)' }}>
         {!onCluster ? (
           <>
             Sizes are the measured download. Nothing here is judged by the fit gate:
@@ -310,8 +311,8 @@ export function QuantLadder({
 
       {/* The pick, already made. Everything needed to act is on this one card:
           what it is, what it costs, whether it runs, and the button. */}
-      <div className={recommendedVariant ? 'verdict on' : 'verdict'} style={{ marginBottom: 10 }}>
-        <div className="vhead" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <div className={recommendedVariant ? 'verdict on' : 'verdict'} style={{ marginBottom: 'var(--space-10)' }}>
+        <div className="vhead" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)', flexWrap: 'wrap' }}>
           <Lamp {...pickLamp} hollow={pickLamp.signal === 'idle'} />
           <span className="mono">{pick.label}</span>
           <span className="unit">{pick.dtype}</span>
@@ -342,8 +343,9 @@ export function QuantLadder({
                 />
               ) : (
                 <button
+                  type="button"
                   className="ghost"
-                  style={{ padding: '2px 10px', fontSize: 12 }}
+                  style={{ padding: 'var(--space-2) var(--space-10)', fontSize: 'var(--size-unit)' }}
                   disabled={launching === pickKey}
                   onClick={() => void serve(pick)}
                 >
@@ -358,7 +360,7 @@ export function QuantLadder({
             )}
           </span>
         </div>
-        <div className="unit" style={{ wordBreak: 'break-all', marginTop: 2 }}>
+        <div className="unit" style={{ wordBreak: 'break-all', marginTop: 'var(--space-2)' }}>
           {pick.repo_id}
           {pick.gguf_file ? ` · ${pick.gguf_file.split('/').pop()}` : ''}
         </div>
@@ -386,14 +388,14 @@ export function QuantLadder({
         pick.launchable &&
         pick.file_bytes != null &&
         cache.complete(pick.repo_id, pick.file_bytes) !== true ? (
-          <p className="unit" style={{ margin: '4px 0 0' }}>
+          <p className="unit" style={{ margin: 'var(--space-4) 0 0' }}>
             {cache.nodes(pick.repo_id).length
               ? `Only part of this is cached — the first launch pulls the rest of ${gbytes(pick.file_bytes)} GiB.`
               : `Not cached on any node — the first launch pulls ${gbytes(pick.file_bytes)} GiB.`}
           </p>
         ) : null}
         {recommendedVariant ? null : (
-          <p className="unit" style={{ margin: '4px 0 0' }}>
+          <p className="unit" style={{ margin: 'var(--space-4) 0 0' }}>
             {!onCluster
               ? servable.length
                 ? // Not "the gateway recommended nothing": it recommends for a
@@ -413,8 +415,8 @@ export function QuantLadder({
           rendered inside the card would leave a row-triggered 409 with nowhere
           to go -- the launch would refuse and the screen would say nothing. */}
       {refused ? (
-        <div className="verdict on bad" style={{ marginBottom: 10 }}>
-          <div className="vhead" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div className="verdict on bad" style={{ marginBottom: 'var(--space-10)' }}>
+          <div className="vhead" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
             <Lamp signal="fault" label="refused on live memory" />
             <span className="mono">{refused.label}</span>
             <span className="unit" style={{ wordBreak: 'break-all' }}>
@@ -444,16 +446,18 @@ export function QuantLadder({
           making. */}
       {servable.length > 1 ? (
         <button
+          type="button"
           className="ghost"
           aria-expanded={showAll}
-          style={{ padding: '2px 0', border: 0, fontSize: 12 }}
+          style={{ padding: 'var(--space-2) 0', border: 0, fontSize: 'var(--size-unit)' }}
           onClick={() => setShowAll(!showAll)}
         >
+          <Icon name={showAll ? 'minus' : 'plus'} size={12} decorative className="icon-inline" />{' '}
           {showAll
-            ? '– Hide the servable list'
+            ? 'Hide the servable list'
             : onCluster
-              ? `+ Show all ${servable.length} that can be served here`
-              : `+ Show all ${servable.length} a provider could fetch`}
+              ? `Show all ${servable.length} that can be served here`
+              : `Show all ${servable.length} a provider could fetch`}
         </button>
       ) : null}
 
@@ -466,7 +470,7 @@ export function QuantLadder({
           {onCluster ? (
             <label
               className="unit"
-              style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '8px 0' }}
+              style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)', margin: 'var(--space-8) 0' }}
             >
               <input
                 type="checkbox"
@@ -534,7 +538,7 @@ export function QuantLadder({
           </div>
 
           {rows.length === 0 ? (
-            <p className="unit" style={{ marginTop: 8 }}>
+            <p className="unit" style={{ marginTop: 'var(--space-8)' }}>
               {onCluster
                 ? 'Nothing here fits at this context and concurrency.'
                 : 'No GGUF was found in this repository, and Ollama loads nothing else.'}
@@ -548,7 +552,7 @@ export function QuantLadder({
           somebody may be looking for one, and a list that quietly drops most of
           a repository is lying about the repository. */}
       {reference.length ? (
-        <div style={{ marginTop: 10 }}>
+        <div style={{ marginTop: 'var(--space-10)' }}>
           <Disclosure
             summary={
               onCluster
@@ -558,7 +562,7 @@ export function QuantLadder({
             open={showReference}
             onToggle={() => setShowReference(!showReference)}
           >
-            <p className="unit" style={{ margin: '0 0 8px' }}>
+            <p className="unit" style={{ margin: '0 0 var(--space-8)' }}>
               {/* The group's own note only describes it under the cluster
                   runtimes, where the reference rows are the GGUFs and the note
                   is about GGUF repositories. Under a provider runtime the
@@ -624,7 +628,7 @@ export function QuantLadder({
             fontWeight: 400,
             color: 'var(--fault)',
             whiteSpace: 'pre-wrap',
-            marginTop: 8,
+            marginTop: 'var(--space-8)',
           }}
         >
           {launchError}
@@ -634,7 +638,7 @@ export function QuantLadder({
       {/* Not a footnote anyone should be able to miss: the ladder is built
           from repository and file names, which is the only signal most
           quantizers leave. */}
-      <p className="unit" style={{ marginTop: 8 }}>
+      <p className="unit" style={{ marginTop: 'var(--space-8)' }}>
         {ladder.note}
       </p>
     </>
@@ -647,19 +651,19 @@ export function QuantLadder({
 function Skeleton() {
   return (
     <div aria-busy="true" aria-live="polite">
-      <p className="unit" style={{ margin: '0 0 8px' }}>
+      <p className="unit" style={{ margin: '0 0 var(--space-8)' }}>
         Looking for quantizations…
       </p>
       {[0, 1, 2].map((i) => (
         <div
           key={i}
           className="deprow"
-          style={{ gridTemplateColumns: '1fr 2fr auto', opacity: 0.38 }}
+          style={{ gridTemplateColumns: '1fr 2fr auto', opacity: 'var(--opacity-38)' }}
           aria-hidden
         >
-          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 2 }} />
-          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 2 }} />
-          <span style={{ background: 'var(--panel-sunk)', height: 12, width: 48, borderRadius: 2 }} />
+          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 'var(--radius-sm)' }} />
+          <span style={{ background: 'var(--panel-sunk)', height: 12, borderRadius: 'var(--radius-sm)' }} />
+          <span style={{ background: 'var(--panel-sunk)', height: 12, width: 48, borderRadius: 'var(--radius-sm)' }} />
         </div>
       ))}
     </div>
@@ -700,10 +704,15 @@ function Served({
         ? 'fault'
         : 'warn'
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-6)' }}>
       <Lamp signal={signal} label={`${dep.served_name}: ${dep.state}`} />
       <span className="unit">{dep.served_name}</span>
       <span className="unit">{dep.state}</span>
+      {dep.revision ? (
+        <span className="mono unit" title={`pinned to revision ${dep.revision}`}>
+          @{dep.revision.slice(0, 7)}
+        </span>
+      ) : null}
       {dep.last_error ? (
         <span className="unit" style={{ color: 'var(--fault)' }} title={dep.last_error}>
           — {dep.last_error}
@@ -775,13 +784,13 @@ function Consequence({ variant }: { variant: QuantVariant }) {
   return (
     <>
       {bits.length ? (
-        <p className="unit" style={{ margin: '4px 0 0' }}>
+        <p className="unit" style={{ margin: 'var(--space-4) 0 0' }}>
           {bits.join(' · ')}
         </p>
       ) : null}
       {blockedNow ? (
         <>
-          <p className="unit" style={{ margin: '4px 0 0' }}>
+          <p className="unit" style={{ margin: 'var(--space-4) 0 0' }}>
             This hardware holds it. What is resident right now is what blocks it:
           </p>
           <Verbatim text={variant.static_reason ?? ''} size="unit" />
@@ -895,7 +904,7 @@ function Row({
       </td>
       <td className="mono" style={{ wordBreak: 'break-all' }}>
         {variant.label}
-        {recommended ? <span className="pill" style={{ marginLeft: 6 }}>recommended</span> : null}
+        {recommended ? <span className="pill" style={{ marginLeft: 'var(--space-6)' }}>recommended</span> : null}
         {onCluster ? (
           <OnDisk repoId={variant.repo_id} expectedBytes={variant.file_bytes} cache={cache} />
         ) : (
@@ -966,8 +975,9 @@ function Row({
           <Served repoId={variant.repo_id} cluster={cluster} pulled={pulled} />
         ) : servable ? (
           <button
+            type="button"
             className="ghost"
-            style={{ padding: '2px 8px', fontSize: 12 }}
+            style={{ padding: 'var(--space-2) var(--space-8)', fontSize: 'var(--size-unit)' }}
             disabled={launching}
             onClick={onServe}
           >
@@ -998,7 +1008,7 @@ function Pulled({ reply }: { reply: PullAccepted }) {
     return <span className="unit">already on {reply.checked_against}</span>
   }
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-6)', flexWrap: 'wrap' }}>
       <Lamp signal="warn" label={`pulling ${reply.model}`} />
       <span className="unit">
         pulling {gbytes(reply.download_bytes, 2)} GiB

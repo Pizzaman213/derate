@@ -49,8 +49,7 @@ export function usePlacement(): PlacementApi {
   // Both setters take only `navigate`, so they keep one identity for the life
   // of the pane. `NodeBoard` hands them to a checkbox per row, and a new
   // function on every plan that lands would rebuild every row underneath the
-  // cursor -- the same identity trap `selection.tsx` documents for the toggles
-  // `ClusterGraph` keys its listeners on.
+  // cursor -- the same identity trap `selection.tsx` documents for its toggles.
   const setNodeIds = useCallback(
     (next: string[] | null) => {
       // `[]` is not a request anybody can mean here -- unticking the last

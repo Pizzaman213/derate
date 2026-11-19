@@ -6,6 +6,7 @@
 // whether four hundred models are on the screen.
 
 import { useState } from 'react'
+import { Icon } from '../../components/Icon'
 
 import { bandSubtitle, isCollapsibleBand } from './rows'
 import type { Band, Group } from './rows'
@@ -69,12 +70,12 @@ export function BandHeading({
         alignItems: 'baseline',
         justifyContent: 'space-between',
         width: '100%',
-        gap: 'var(--s-2)',
+        gap: 'var(--space-8)',
         textAlign: 'left',
       }}
     >
       <span>
-        <span aria-hidden>{open ? '▾ ' : '▸ '}</span>
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} decorative className="icon-inline" />{' '}
         {group.title}
         {subtitle ? <span className="unit"> · {subtitle}</span> : null}
       </span>
