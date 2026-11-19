@@ -1179,8 +1179,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         streaming=streaming,
                         open_upstream=open_upstream,
                         open_upstream_raw=open_upstream_raw,
-                        content=upstream_content if content is not None else None,
-                        content_type=content_type,
                         count_tokens=count_tokens,
                         on_finish=on_finish,
                         selection=selection,
