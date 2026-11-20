@@ -439,10 +439,14 @@ export function ProvidersCard() {
                       <div><a href={href({ ...parse('/usage/rate-limits'), fprovider: p.provider_id, win: '30d' })} onClick={openHistory}>Rate-limit history</a></div>
                     </td>
                     <td className="unit">{p.last_refreshed ? relativeTime(p.last_refreshed) : '—'}</td>
-                    <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <td>
+                      {/* Five actions no longer fit one line beside the key
+                          column at a laptop width; they wrap, right-aligned,
+                          rather than pushing Remove out of the card. */}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 'var(--space-6)', minWidth: 'calc(var(--space-96) * 3)' }}>
                       <button
                         type="button"
-                        style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
+                        style={{ padding: 'var(--space-3) var(--space-9)' }}
                         aria-pressed={p.enabled}
                         onClick={() => void toggleEnabled(p)}
                         disabled={busy === `enable:${p.provider_id}`}
@@ -452,7 +456,7 @@ export function ProvidersCard() {
                       {checkable && p.key_state === 'set' ? (
                         <button
                           type="button"
-                          style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
+                          style={{ padding: 'var(--space-3) var(--space-9)' }}
                           onClick={() => void testKey(p)}
                           disabled={busy === `check:${p.provider_id}`}
                         >
@@ -461,7 +465,7 @@ export function ProvidersCard() {
                       ) : null}
                       <button
                         type="button"
-                        style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
+                        style={{ padding: 'var(--space-3) var(--space-9)' }}
                         aria-expanded={showingBackup}
                         aria-controls={`pbackuprow-${p.provider_id}`}
                         onClick={() => setBackupRow(showingBackup ? null : p.provider_id)}
@@ -470,7 +474,7 @@ export function ProvidersCard() {
                       </button>
                       <button
                         type="button"
-                        style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
+                        style={{ padding: 'var(--space-3) var(--space-9)' }}
                         aria-expanded={editing}
                         aria-controls={`pkeyrow-${p.provider_id}`}
                         onClick={() => (editing ? closeKeyRow() : openKeyRow(p.provider_id))}
@@ -491,6 +495,7 @@ export function ProvidersCard() {
                       >
                         {busy === p.provider_id ? 'Removing…' : 'Remove'}
                       </button>
+                      </div>
                     </td>
                   </tr>
                   {p.models.length > 0 ? (
