@@ -82,10 +82,9 @@ _SPEND_KEYS = (
 def provider_spend(port: Any) -> dict[str, dict[str, Any]]:
     """provider_id -> accounting fields, or `{}` when the port does not account.
 
-    Duck-typed on `public_list`, like every other optional port operation in the
-    gateway. `include_models=False` because the payload builds `models` from the
-    `Provider` record through its own allowlist; fetching them twice doubles the
-    response for nothing.
+    Duck-typed on `public_list`, like every other optional port operation.
+    Models carry live admission state that the frozen Provider record cannot.
+    Only the explicitly named model-status fields below cross this boundary.
 
     Note what is NOT done here: zeros are passed through untouched. A
     `requests_today` of 0 from a live provider is a real observation -- it is the
@@ -97,7 +96,7 @@ def provider_spend(port: Any) -> dict[str, dict[str, Any]]:
     if not callable(lister):
         return {}
     try:
-        rows = lister(include_models=False)
+        rows = lister(include_models=True)
     except TypeError:
         # An older or narrower implementation without the keyword.
         try:
@@ -117,6 +116,14 @@ def provider_spend(port: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(pid, str):
             continue
         out[pid] = {key: row.get(key) for key in _SPEND_KEYS}
+        out[pid]["model_status"] = {
+            model["upstream_id"]: {
+                key: model.get(key)
+                for key in ("admitting", "admission_block", "last_error", "retry_in_s")
+            }
+            for model in row.get("models", [])
+            if isinstance(model, dict) and isinstance(model.get("upstream_id"), str)
+        }
     return out
 
 

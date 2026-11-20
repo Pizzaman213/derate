@@ -119,8 +119,18 @@ def build_index(
     stats: StatsRegistry,
     settings: GatewaySettings,
     is_blocked,
+    runtime_key=None,
+    remote_block: str | None = None,
 ) -> TargetIndex:
-    """Assemble every routable target. Pure given its inputs."""
+    """Assemble every routable target. Pure given its inputs.
+
+    *runtime_key* is ``DeploymentManager.runtime_api_key`` when the port has
+    one: the bearer each LOCAL engine requires (H3). Absent, or None for a
+    deployment launched before keys existed, means no header is sent.
+
+    *remote_block* names a containment switch that holds (``local_only``,
+    ``daily_spend_cap``): every remote target is listed but not admitting,
+    so /v1 refuses a remote-only name rather than letting a prompt leave."""
     index = TargetIndex()
     profiles: dict[str, NodeProfile] = {n.profile.node_id: n.profile for n in nodes}
     power: dict[str, float] = {n.profile.node_id: n.power_watts for n in nodes}
@@ -174,6 +184,7 @@ def build_index(
                 admitting=not is_blocked(tid),
                 strength=0.0,  # filled in by the router
                 cost_per_mtok=cost,
+                runtime_api_key=runtime_key(tid) if runtime_key else None,
             )
         )
 
@@ -185,7 +196,7 @@ def build_index(
             index.remotes[tid] = (provider, model)
             index.raw_strength[tid] = remote_strength(tid, stats, settings)
             index.remote_priority[tid] = provider.priority
-            index.zero_weight_reason[tid] = None  # remotes are never floored
+            index.zero_weight_reason[tid] = remote_block  # remotes are never floored
             index.context_length.setdefault(model.served_name, model.context_length)
             index.modality.setdefault(model.served_name, model.modality)
             index.targets.setdefault(model.served_name, []).append(
@@ -196,7 +207,7 @@ def build_index(
                     weight=0.0,
                     outstanding=stats.outstanding(tid),
                     healthy=provider.healthy,
-                    admitting=provider.healthy and not is_blocked(tid),
+                    admitting=provider.healthy and not is_blocked(tid) and remote_block is None,
                     strength=0.0,
                     cost_per_mtok=remote_cost_per_mtok(model),
                 )

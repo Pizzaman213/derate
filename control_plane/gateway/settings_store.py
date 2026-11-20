@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import math
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +87,15 @@ def settings_path(root: Path | None = None) -> Path:
     return (root or data_dir()) / "settings.json"
 
 
+def _finite(value: int | float) -> bool:
+    """NaN, Infinity and an int too large for a float are not settings:
+    rendering one 500s every later read of /api/settings and of its audit row."""
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def _coerce(key: str, value: Any) -> Any:
     """Validate one field. Raises SettingsError with a reason, never silently
     coerces a nonsense value into a plausible one."""
@@ -97,6 +107,8 @@ def _coerce(key: str, value: Any) -> Any:
     if key == "electricity_rate_usd_per_kwh":
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise SettingsError(f"{key} must be a number, got {type(value).__name__}")
+        if not _finite(value):
+            raise SettingsError(f"{key} must be a finite number, got {value!r}")
         if value < 0:
             raise SettingsError(f"{key} must not be negative, got {value}")
         return float(value)
@@ -110,6 +122,8 @@ def _coerce(key: str, value: Any) -> Any:
             return None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise SettingsError(f"{key} must be a number or null, got {type(value).__name__}")
+        if not _finite(value):
+            raise SettingsError(f"{key} must be a finite number, got {value!r}")
         if value < 0:
             raise SettingsError(f"{key} must not be negative, got {value}")
         return float(value)
