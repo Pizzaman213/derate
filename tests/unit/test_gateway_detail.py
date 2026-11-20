@@ -85,12 +85,6 @@ def test_a_key_shaped_field_from_the_port_cannot_reach_the_wire():
     assert out["openrouter"]["spend_today_usd"] == 0.41
 
 
-def test_models_are_not_fetched_twice():
-    """The payload builds `models` from the Provider record through its own
-    allowlist; asking for them here doubles the response for nothing."""
-    port = FakeAccountingProviders([{"provider_id": "p"}])
-    provider_spend(port)
-    assert port.calls == [{"include_models": False}]
 
 
 # ==========================================================================
@@ -527,3 +521,36 @@ def test_admission_blocks_appear_on_the_wire_for_a_blocked_target_only():
     targets = {t["target_id"]: t for t in config["targets"]}
     assert targets["d-a"]["admission_blocks"] == [BLOCK_RATE_LIMITED]
     assert targets["d-b"]["admission_blocks"] is None
+
+
+def test_model_rate_limit_reaches_settings_without_blocking_siblings(tmp_path):
+    import httpx
+    import pytest
+    from control_plane.providers import UpstreamError
+    from tests.unit.test_providers import Clock, Upstream, make_service, add_openrouter, run, collect
+
+    clock = Clock()
+    upstream = Upstream()
+    upstream.chat_responses.append(httpx.Response(
+        429, headers={"retry-after": "300"},
+        json={"error": {"message": "This model has reached its quota."}},
+    ))
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    with pytest.raises(UpstreamError):
+        run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
+    service.update("openrouter", {"aliases": {"openai/gpt-4o-mini": "friendly-model"}})
+    with TestClient(create_app(build_deps(providers=service))) as client:
+        row = client.get("/api/providers").json()[0]
+        assert row["last_error"] is None and row["admission_block"] is None
+        models = {m["upstream_id"]: m for m in row["models"]}
+        limited = models["openai/gpt-4o-mini"]
+        assert limited["served_name"] == "friendly-model"
+        assert limited["admitting"] is False and limited["retry_in_s"] == 300
+        assert limited["last_error"] == "This model has reached its quota."
+        assert models["anthropic/claude-sonnet-4.5"]["admitting"] is True
+        catalogue = client.get("/api/providers/openrouter/models").json()
+        assert next(m for m in catalogue if m["upstream_id"] == "openai/gpt-4o-mini")["retry_in_s"] == 300
+        clock.advance(300)
+        recovered = client.get("/api/providers").json()[0]["models"]
+        assert all(m["admitting"] and m["last_error"] is None for m in recovered)

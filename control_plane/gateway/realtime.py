@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from urllib.parse import urlencode, urlparse, urlunparse
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from control_plane.contracts import TargetKind
+from control_plane.contracts.auth import KeyStatus
 
 log = logging.getLogger("gateway.realtime")
 
@@ -39,6 +41,13 @@ log = logging.getLogger("gateway.realtime")
 #: rather than a network blip.
 CLOSE_POLICY = 1008
 CLOSE_UPSTREAM = 1011  # internal error: we could not reach the upstream
+
+#: How often an open session re-asks whether its key is still active. A key
+#: disabled (one key, or every key of an org) ends the session within this
+#: long rather than when the client hangs up.
+RECHECK_S = 5.0
+#: The close reason a disabled key's session ends with.
+ENDED_KEY_DISABLED = "key_disabled"
 
 #: Sub-protocols a client may offer. Passed through untouched when the upstream
 #: accepts one; realtime clients use these to carry auth in browsers.
@@ -120,12 +129,34 @@ class _UpstreamSide:
         await self._conn.send(payload)
 
 
-async def relay(ctx, websocket: WebSocket) -> None:
+def key_active(stores, key_id: str, *, now: float | None = None) -> bool:
+    """Whether the key that opened a session may still use it: present,
+    ``active``, unexpired and in an org that still exists. Synchronous (a
+    store read); the relay runs it off the loop."""
+    keys = stores.keys
+    key = keys.get_key(key_id)
+    if key is None or key.status is not KeyStatus.ACTIVE:
+        return False
+    if getattr(key, "deleted_at", None) is not None:
+        return False
+    now = time.time() if now is None else now
+    if key.expires_at is not None and key.expires_at <= now:
+        return False
+    org = keys.get_org(key.org_id)
+    return org is not None and org.deleted_at is None
+
+
+async def relay(ctx, websocket: WebSocket, *, still_valid=None) -> str | None:
     """Join a client's realtime socket to a provider that speaks the protocol.
 
     Refusals happen before `accept()` wherever possible: a client that is
     rejected during the handshake sees an HTTP status, which is far easier to
     act on than a socket that opens and immediately closes.
+
+    Every :data:`RECHECK_S` the awaitable ``still_valid()`` is asked whether
+    the key that opened the session is still good; ``False`` closes the socket
+    1008 ``key_disabled``. Returns how an accepted session ended (``client``,
+    ``upstream`` or ``key_disabled``), ``None`` when it was refused.
     """
     model = websocket.query_params.get("model")
     if not model:
@@ -157,6 +188,28 @@ async def relay(ctx, websocket: WebSocket) -> None:
             ),
         )
         return
+
+    # The provider's own gates -- daily budget first among them -- apply to a
+    # session exactly as to a completion (finding M4). Asked before
+    # connecting: once audio flows nothing here can stop it short.
+    admitting = getattr(ctx.deps.providers, "admitting", None)
+    provider_id = selection.provider.provider_id
+    if admitting is not None:
+        try:
+            open_door = admitting(provider_id)
+        except Exception:
+            log.debug("could not ask provider %s whether it admits", provider_id, exc_info=True)
+            open_door = False
+        if not open_door:
+            await websocket.close(
+                code=CLOSE_POLICY,
+                # A close reason is capped at 123 bytes by the protocol.
+                reason=(
+                    f"provider '{provider_id}' is not admitting: daily budget "
+                    "reached, rate limited or unhealthy"
+                ),
+            )
+            return
 
     upstream_id = selection.model.upstream_id if selection.model else model
     url = realtime_url(selection.provider.base_url, upstream_id)
@@ -202,18 +255,39 @@ async def relay(ctx, websocket: WebSocket) -> None:
     # Both directions run until either ends. The first to finish cancels the
     # other: a half-open relay would leave a client waiting on a socket whose
     # far end is already gone.
-    tasks = [
-        asyncio.create_task(_pump(client, upstream, "client->upstream")),
-        asyncio.create_task(_pump(upstream, client, "upstream->client")),
-    ]
+    tasks = {
+        asyncio.create_task(_pump(client, upstream, "client->upstream")): "client",
+        asyncio.create_task(_pump(upstream, client, "upstream->client")): "upstream",
+    }
+    ended_by: str | None = None
+    close_code, close_reason = 1000, ""
     try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        while ended_by is None:
+            done, _ = await asyncio.wait(
+                tasks, timeout=RECHECK_S, return_when=asyncio.FIRST_COMPLETED
+            )
+            if done:
+                ended_by = tasks[next(iter(done))]
+                break
+            if still_valid is None:
+                continue
+            try:
+                valid = await still_valid()
+            except Exception:
+                # An unreadable key store is not a revocation; ask again next tick.
+                log.warning("could not re-check the realtime session's key", exc_info=True)
+                continue
+            if not valid:
+                ended_by = ENDED_KEY_DISABLED
+                close_code, close_reason = CLOSE_POLICY, ENDED_KEY_DISABLED
+                log.warning("realtime session closed: %s", ENDED_KEY_DISABLED)
     finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await connection.close()
         try:
-            await websocket.close()
+            await websocket.close(code=close_code, reason=close_reason)
         except RuntimeError:
             pass  # already closed by the client
+    return ended_by

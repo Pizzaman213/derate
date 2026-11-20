@@ -23,6 +23,9 @@ class _AccountingProviders:
     def public_list(self, *, include_models: bool = True):
         return [{"provider_id": "openrouter", "spend_today_usd": 0.41}]
 
+    def spend_today(self, provider_id: str) -> float:
+        return 0.41
+
     def list(self):
         return []
 
@@ -223,3 +226,33 @@ def test_settings_survive_a_restart(client):
         body = c.get("/api/settings").json()
     assert body["electricity_rate_usd_per_kwh"] == 0.28
     assert body["sources"]["electricity_rate_usd_per_kwh"] == "file"
+
+
+def test_a_cap_is_refused_when_the_port_only_lists_providers(client):
+    """``public_list`` is a listing, not a meter: the router sums
+    ``spend_today``, so a port without it cannot enforce a cap."""
+
+    class _ListingOnly:
+        def public_list(self, *, include_models: bool = True):
+            return []
+
+        def list(self):
+            return []
+
+    with TestClient(client(providers=_ListingOnly())) as c:
+        assert c.get("/api/settings").json()["daily_spend_cap_enforceable"] is False
+        assert c.patch("/api/settings", json={"daily_spend_cap_usd": 5.0}).status_code == 501
+
+
+def test_a_non_finite_setting_is_refused_and_every_read_survives(client):
+    """``NaN`` saved here used to 500 GET /api/settings and the audit page
+    holding the row, forever."""
+    with TestClient(client()) as c:
+        r = c.patch(
+            "/api/settings",
+            content=b'{"electricity_rate_usd_per_kwh": NaN}',
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400, r.text
+        assert c.get("/api/settings").status_code == 200
+        assert c.get("/api/audit").status_code == 200

@@ -86,7 +86,7 @@ export function NodeBoard({
       ) : null}
 
       {board.owned ? (
-        <div style={{ marginTop: 'var(--s-2)' }}>
+        <div style={{ marginTop: 'var(--space-8)' }}>
           <button type="button" className="ghost" onClick={() => onChange(null)}>
             Let the planner choose
           </button>
@@ -122,7 +122,7 @@ function Row({
       />
 
       <label htmlFor={id} className={row.selectable ? undefined : 'muted'}>
-        <span style={{ display: 'grid', gap: 2 }}>
+        <span style={{ display: 'grid', gap: 'var(--space-2)' }}>
           <span>
             <span className="mono">{row.name}</span>{' '}
             <span className="unit">{shortGpu(row.gpu) || deviceClassLabel(row.deviceClass)}</span>
@@ -155,8 +155,8 @@ function Row({
         ) : row.allocatable == null ? (
           <span className="unit">no reading</span>
         ) : (
-          <span style={{ display: 'grid', gap: 3 }}>
-            <span style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+          <span style={{ display: 'grid', gap: 'var(--space-3)' }}>
+            <span style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-6)' }}>
               <Readout
                 value={gbNum(row.allocatable)}
                 decimals={1}
@@ -202,7 +202,7 @@ function Row({
 
       <span className="unit">
         {row.occupants.length ? (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)' }}>
             <Lamp signal="live" label={`${row.name} is serving`} size={6} />
             {row.occupants.join(', ')}
           </span>

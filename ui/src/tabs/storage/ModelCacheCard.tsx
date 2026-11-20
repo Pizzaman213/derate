@@ -68,7 +68,7 @@ export function ModelCacheCard() {
   return (
     <div className="card2">
       <h3>Downloaded models</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         Model weights on each node, largest first. These are pulled by the
         runtime, not by this control plane, into the cache it mounts — deleting
         one here frees the disk, and serving that model again downloads it
@@ -95,7 +95,7 @@ export function ModelCacheCard() {
       {error ? (
         <div
           className="label"
-          style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}
+          style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}
         >
           {error}
         </div>

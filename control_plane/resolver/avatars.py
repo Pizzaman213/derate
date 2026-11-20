@@ -114,6 +114,12 @@ def _lock_for(owner: str) -> asyncio.Lock:
     return lock
 
 
+def _prune_locks() -> None:
+    """Forget every per-owner lock nobody holds or waits on."""
+    for owner in [o for o, lock in _locks.items() if not lock.locked()]:
+        del _locks[owner]
+
+
 def normalize(owner: str) -> str:
     """The cache key for a publisher name, or "" for something unusable.
 
@@ -218,6 +224,22 @@ async def _warm(owner: str) -> None:
         store.put(owner, body, content_type)
 
 
+def uncached(owners: Iterable[str]) -> list[str]:
+    """The distinct publishers among *owners* that a batch would go to the hub
+    for: neither cached nor remembered as a miss. What a caller's lookup budget
+    is charged against -- an answer from the cache costs the hub nothing."""
+    store = cache()
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in owners:
+        name = normalize(raw)
+        if name and name not in seen:
+            seen.add(name)
+            if store.get(name) is None and store.miss_kind(name) is None:
+                out.append(name)
+    return out
+
+
 async def resolve_many(
     owners: Iterable[str], *, deadline_s: float = DEFAULT_DEADLINE_S
 ) -> dict[str, bool]:
@@ -248,6 +270,10 @@ async def resolve_many(
             wanted.append(name)
 
     store = cache()
+    # Evict at TTL before adding (R7): both the per-owner locks here and the
+    # cache's memory tier are keyed by caller-supplied names.
+    _prune_locks()
+    store.prune()
     answer: dict[str, bool] = {}
     cold: list[str] = []
     for name in wanted:

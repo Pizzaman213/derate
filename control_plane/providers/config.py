@@ -18,6 +18,53 @@ from control_plane.redaction import REDACTED  # noqa: F401
 
 PROVIDERS_FILE = "providers.json"
 SECRETS_FILE = "secrets.json"
+OAUTH_FILE = "oauth.json"
+
+# Sign in with ChatGPT plan usage (OpenAI's flow for open-source apps). The
+# coordinator never listens on the redirect port: the operator pastes the
+# 127.0.0.1 address the browser lands on back into derate, which is what lets
+# a browser on any machine finish the sign-in.
+CHATGPT_ISSUER = "https://auth.openai.com"
+CHATGPT_AUTHORIZE_URL = "https://auth.openai.com/api/accounts/authorize"
+CHATGPT_TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token"
+CHATGPT_DISCOVERY_URL = "https://auth.openai.com/.well-known/openid-configuration"
+CHATGPT_RESOURCE = "https://api.openai.com/v1"
+# Exact, and never `localhost`: the authorize endpoint matches it literally.
+CHATGPT_REDIRECT_URI = "http://127.0.0.1:1455/auth/callback"
+CHATGPT_SCOPES = (
+    "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+)
+CHATGPT_AGENT_NAME = "derate"
+# The scope that means "bill this to the user's plan". A grant without it
+# signed somebody in and authorised nothing derate can use.
+CHATGPT_PLAN_SCOPE = "chatgpt.tokens.use.direct"
+
+# Unofficial subscription OAuth protocol, pinned rather than destination-configurable.
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
+CLAUDE_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+CLAUDE_SCOPES = "user:profile user:inference"
+CLAUDE_CODE_VERSION = "2.1.326"
+# Refresh an access token this long before it expires rather than on the 401.
+TOKEN_REFRESH_SKEW_S = 300
+# How long a started sign-in waits for its pasted callback. In memory only.
+SIGN_IN_ATTEMPT_TTL_S = 600
+# Revoking at sign-out: this many retries after the first try, on a transport
+# error or a 5xx only.
+SIGN_OUT_RETRIES = 2
+# A refresh answering any of these needs the user, not a retry.
+REAUTH_ERROR_CODES = frozenset(
+    {
+        "invalid_grant",
+        "invalid_refresh_token",
+        "token_expired",
+        "refresh_token_expired",
+        "refresh_token_invalidated",
+        "refresh_token_reused",
+    }
+)
 
 # Model lists refresh on add, on demand, and on this timer.
 PROVIDER_REFRESH_S = 6 * 3600

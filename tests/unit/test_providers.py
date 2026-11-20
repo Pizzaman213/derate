@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import stat
 import time
 from collections.abc import AsyncIterator, Callable
@@ -41,7 +42,12 @@ from control_plane.providers import (
     build_stub_service,
     looks_like_secret,
 )
-from control_plane.providers.config import BACKOFF_MAX_S, RETRY_AFTER_MAX_S
+from control_plane.providers.config import (
+    BACKOFF_MAX_S,
+    COST_BLEND_INPUT_WEIGHT,
+    COST_BLEND_OUTPUT_WEIGHT,
+    RETRY_AFTER_MAX_S,
+)
 from control_plane.providers.discovery import parse_models
 from control_plane.providers.kinds import spec_for
 from control_plane.providers.service import minted_ref
@@ -49,7 +55,7 @@ from control_plane.providers.stub import sse_chunks
 
 # A key value distinctive enough that finding it in any output is unambiguous.
 REAL_KEY = "sk-or-v1-supersecretkeymaterial0123456789abcdef"
-KEY_REF = "OPENROUTER_API_KEY"
+KEY_REF = "DERATE_SECRET_OPENROUTER"
 
 
 def run(coro):
@@ -507,13 +513,13 @@ def test_a_pasted_key_can_be_stored_under_a_name_the_operator_chooses(tmp_path):
     provider = service.add(
         {
             "kind": ProviderKind.OPENROUTER,
-            "api_key_ref": "my-openrouter-key",
+            "api_key_ref": "DERATE_SECRET_MY_OPENROUTER",
             "api_key": REAL_KEY,
         }
     )
-    assert provider.api_key_ref == "my-openrouter-key"
+    assert provider.api_key_ref == "DERATE_SECRET_MY_OPENROUTER"
     assert service.resolve_key("openrouter") == REAL_KEY
-    assert service.secrets.refs() == ["my-openrouter-key"]
+    assert service.secrets.refs() == ["DERATE_SECRET_MY_OPENROUTER"]
 
 
 def test_the_reference_field_refusal_names_the_field_that_works(tmp_path):
@@ -950,7 +956,37 @@ def test_no_pin_means_no_provider_field_at_all(tmp_path):
     assert "provider" not in sent
 
 
-def test_a_callers_own_provider_field_is_not_overridden(tmp_path):
+def test_client_routing_fields_never_reach_the_upstream(tmp_path):
+    """OpenRouter's `models`/`route`/`provider` fields let a key holder be
+    served a model, or a backend, outside what its key names (K-2)."""
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+
+    run(
+        collect(
+            service.forward(
+                "openrouter",
+                "anthropic/claude-sonnet-4.5",
+                {
+                    "model": "anthropic/claude-sonnet-4.5",
+                    "messages": [],
+                    "models": ["anthropic/claude-opus-4.1"],
+                    "route": "fallback",
+                    "fallbacks": ["anthropic/claude-opus-4.1"],
+                    "provider": {"order": ["anthropic"]},
+                },
+            )
+        )
+    )
+    sent = json.loads(upstream.requests[-1].content)
+    for name in ("models", "route", "fallbacks", "provider"):
+        assert name not in sent
+
+
+def test_a_callers_own_provider_field_does_not_override_the_pin(tmp_path):
+    """The pin is the operator's routing decision; a key holder's `provider`
+    field would route around it, onto a backend and price nobody chose (K7)."""
     upstream = Upstream()
     service = make_service(tmp_path, upstream)
     add_openrouter(service)
@@ -972,7 +1008,7 @@ def test_a_callers_own_provider_field_is_not_overridden(tmp_path):
         )
     )
     sent = json.loads(upstream.requests[-1].content)
-    assert sent["provider"] == {"only": ["anthropic"]}
+    assert sent["provider"] == {"only": ["google-vertex"]}
 
 
 def test_upstream_error_keeps_its_status_and_message(tmp_path):
@@ -1086,13 +1122,28 @@ def test_429_sets_a_backoff_window_and_clears_on_expiry(tmp_path):
 
     # Not admitting, but not unhealthy: rate limited is busy, not broken.
     assert service.health("openrouter")[0] is True
-    assert all(not t.admitting for t in service.route_targets())
+    targets = {t.target_id: t for t in service.route_targets()}
+    assert targets["openrouter:openai/gpt-4o-mini"].admitting is False
+    assert targets["openrouter:anthropic/claude-sonnet-4.5"].admitting is True
+    # A successful sibling must not erase the limited model's cooldown.
+    run(collect(service.forward("openrouter", "anthropic/claude-sonnet-4.5", {"messages": []})))
     assert all(t.healthy for t in service.route_targets())
     with pytest.raises(ProviderNotAdmittingError):
         run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
+    # The UI must attribute the cooldown and upstream reason only to this model.
+    public = service.public_dict("openrouter")
+    rows = {m["upstream_id"]: m for m in public["models"]}
+    assert public["last_error"] is None
+    assert public["admission_block"] is None
+    assert rows["openai/gpt-4o-mini"]["last_error"] == "rate limit exceeded"
+    assert rows["openai/gpt-4o-mini"]["retry_in_s"] == 1
+    assert rows["anthropic/claude-sonnet-4.5"]["last_error"] is None
+    assert rows["anthropic/claude-sonnet-4.5"]["retry_in_s"] == 0
 
     clock.advance(1.5)  # first backoff is one second
     assert all(t.admitting for t in service.route_targets())
+    expired = service.public_dict("openrouter")["models"]
+    assert all(m["last_error"] is None and m["admitting"] for m in expired)
     run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
 
 
@@ -1105,9 +1156,15 @@ def test_backoff_grows_exponentially_to_a_sixty_second_cap(tmp_path):
 
     seen = []
     for _ in range(10):
-        seen.append(runtime.note_rate_limit(clock(), None, "slow down"))
+        seen.append(runtime.note_rate_limit(clock(), "openai/gpt-4o-mini", None, "slow down"))
     assert seen[:4] == [1.0, 2.0, 4.0, 8.0]
     assert max(seen) == 60.0
+    # A different model starts its own curve, independent of the first.
+    assert runtime.note_rate_limit(clock(), "anthropic/claude-sonnet-4.5", None, "slow") == 1
+    runtime.note_success(clock(), "anthropic/claude-sonnet-4.5")
+    assert runtime.note_rate_limit(clock(), "openai/gpt-4o-mini", None, "slow") == 60
+    runtime.note_success(clock(), "openai/gpt-4o-mini")
+    assert runtime.note_rate_limit(clock(), "openai/gpt-4o-mini", None, "slow") == 1
 
 
 def test_retry_after_header_is_honoured(tmp_path):
@@ -1124,7 +1181,7 @@ def test_retry_after_header_is_honoured(tmp_path):
     assert excinfo.value.retry_after_s == pytest.approx(30.0)
 
     clock.advance(29)
-    assert not any(t.admitting for t in service.route_targets())
+    assert not next(t for t in service.route_targets() if t.target_id == "openrouter:openai/gpt-4o-mini").admitting
     clock.advance(2)
     assert all(t.admitting for t in service.route_targets())
 
@@ -1151,7 +1208,7 @@ def test_retry_after_beyond_the_backoff_cap_is_still_honoured(tmp_path):
     assert excinfo.value.retry_after_s == pytest.approx(200.0)
 
     clock.advance(61)  # past our own backoff cap...
-    assert not any(t.admitting for t in service.route_targets())  # ...but not admitting yet
+    assert not service.admitting("openrouter", "openai/gpt-4o-mini")
     clock.advance(140)
     assert all(t.admitting for t in service.route_targets())
 
@@ -1171,7 +1228,7 @@ def test_retry_after_above_the_dos_guard_is_clamped(tmp_path):
     assert excinfo.value.retry_after_s == pytest.approx(RETRY_AFTER_MAX_S)
 
     clock.advance(RETRY_AFTER_MAX_S - 1)
-    assert not any(t.admitting for t in service.route_targets())
+    assert not service.admitting("openrouter", "openai/gpt-4o-mini")
     clock.advance(2)
     assert all(t.admitting for t in service.route_targets())
 
@@ -2270,8 +2327,8 @@ def test_list_backends_marks_the_pinned_row(tmp_path):
 
 def test_list_backends_refuses_a_kind_that_does_not_aggregate_hosts(tmp_path):
     upstream = Upstream()
-    service = make_service(tmp_path, upstream, env={KEY_REF: REAL_KEY, "TOGETHER_KEY": REAL_KEY})
-    service.add({"provider_id": "together", "kind": ProviderKind.TOGETHER, "api_key_ref": "TOGETHER_KEY"})
+    service = make_service(tmp_path, upstream, env={KEY_REF: REAL_KEY, "DERATE_SECRET_TOGETHER": REAL_KEY})
+    service.add({"provider_id": "together", "kind": ProviderKind.TOGETHER, "api_key_ref": "DERATE_SECRET_TOGETHER"})
 
     with pytest.raises(AdapterUnsupportedError):
         run(service.list_backends_async("together", "meta-llama/Llama-3-70b"))
@@ -2285,9 +2342,9 @@ def test_backend_pins_are_refused_for_a_model_not_in_the_catalogue(tmp_path):
 
 
 def test_backend_pins_are_refused_for_a_kind_that_does_not_aggregate_hosts(tmp_path):
-    service = make_service(tmp_path, env={KEY_REF: REAL_KEY, "TOGETHER_KEY": REAL_KEY})
+    service = make_service(tmp_path, env={KEY_REF: REAL_KEY, "DERATE_SECRET_TOGETHER": REAL_KEY})
     provider = service.add(
-        {"provider_id": "together", "kind": ProviderKind.TOGETHER, "api_key_ref": "TOGETHER_KEY"}
+        {"provider_id": "together", "kind": ProviderKind.TOGETHER, "api_key_ref": "DERATE_SECRET_TOGETHER"}
     )
     model_id = provider.models[0].upstream_id if provider.models else "meta-llama/Llama-3-70b"
     with pytest.raises(ValueError, match="does not aggregate"):
@@ -2305,6 +2362,218 @@ def test_backend_pins_survive_a_restart(tmp_path):
     rows = run(reloaded.list_backends_async("openrouter", "anthropic/claude-sonnet-4.5"))
     pinned = {r["tag"] for r in rows if r["pinned"]}
     assert pinned == {"google-vertex"}
+
+
+SONNET = "anthropic/claude-sonnet-4.5"
+
+
+def test_a_pin_to_a_host_openrouter_does_not_list_is_refused(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    with pytest.raises(ValueError) as caught:
+        service.update("openrouter", {"backend_pins": {SONNET: "nope"}})
+    assert str(caught.value) == (
+        f"openrouter lists no backend 'nope' for {SONNET}; pick one from its backend list"
+    )
+    assert service.backend_pin_state("openrouter") == {}
+
+
+def test_an_endpoints_call_that_fails_refuses_the_pin_with_its_reason(tmp_path):
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+    upstream.endpoints_responses.append(
+        httpx.Response(503, json={"error": {"message": "endpoints are down"}})
+    )
+    with pytest.raises(ValueError, match="endpoints are down"):
+        service.update("openrouter", {"backend_pins": {SONNET: "google-vertex"}})
+
+
+def test_the_pinned_hosts_price_becomes_the_models_price(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update("openrouter", {"backend_pins": {SONNET: "google-vertex"}})
+
+    model = next(m for m in service.get("openrouter").models if m.upstream_id == SONNET)
+    assert model.input_cost_per_mtok == pytest.approx(3.5)
+    assert model.output_cost_per_mtok == pytest.approx(17.5)
+    assert ProviderService.blended_cost(model) == pytest.approx(
+        3.5 * COST_BLEND_INPUT_WEIGHT + 17.5 * COST_BLEND_OUTPUT_WEIGHT
+    )
+    # What routing reads, not only what the record says.
+    found = service.find_model("openrouter", SONNET)
+    assert found.output_cost_per_mtok == pytest.approx(17.5)
+    row = next(r for r in service.catalogue("openrouter") if r["upstream_id"] == SONNET)
+    assert row["backend_pin"] == "google-vertex"
+    assert row["backend_fallback"] is False
+    assert row["output_cost_per_mtok"] == pytest.approx(17.5)
+
+
+def test_clearing_a_pin_restores_the_catalogue_price_and_drops_the_fallback(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update(
+        "openrouter",
+        {"backend_pins": {SONNET: "google-vertex"}, "backend_fallbacks": {SONNET: True}},
+    )
+    assert service.backend_pin_state("openrouter") == {SONNET: ("google-vertex", True)}
+
+    service.update("openrouter", {"backend_pins": {SONNET: ""}})
+
+    model = service.find_model("openrouter", SONNET)
+    assert model.input_cost_per_mtok == pytest.approx(3.0)
+    assert model.output_cost_per_mtok == pytest.approx(15.0)
+    assert service.backend_pin_state("openrouter") == {}
+
+
+def test_a_pinned_price_survives_a_restart_and_a_refresh_and_still_clears(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update("openrouter", {"backend_pins": {SONNET: "google-vertex"}})
+
+    # The file keeps the catalogue's price; the host's is runtime state.
+    record = json.loads((tmp_path / "providers.json").read_text())["providers"][0]
+    on_disk = next(m for m in record["models"] if m["upstream_id"] == SONNET)
+    assert on_disk["output_cost_per_mtok"] == pytest.approx(15.0)
+    assert record["backend_pin_prices"][SONNET] == [pytest.approx(3.5), pytest.approx(17.5)]
+
+    reloaded = make_service(tmp_path)
+    assert reloaded.find_model("openrouter", SONNET).output_cost_per_mtok == pytest.approx(17.5)
+    reloaded.refresh("openrouter")
+    assert reloaded.find_model("openrouter", SONNET).output_cost_per_mtok == pytest.approx(17.5)
+
+    reloaded.update("openrouter", {"backend_pins": {SONNET: ""}})
+    assert reloaded.find_model("openrouter", SONNET).output_cost_per_mtok == pytest.approx(15.0)
+
+
+def _transcribe_once(service, upstream_id: str) -> None:
+    from control_plane.providers.usage import UsageSniffer
+
+    sniffer = UsageSniffer(stream=False)
+    sniffer.feed(b'{"text": "hello", "duration": 120}')
+    service._record_usage(service._entry("openrouter"), upstream_id, sniffer)
+
+
+def test_an_audio_rate_set_by_patch_prices_a_transcription(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update("openrouter", {"audio_prices": {SONNET: 0.006}})
+    assert service.find_model("openrouter", SONNET).price_per_minute_usd == pytest.approx(0.006)
+    before = service.spend_today("openrouter")
+    _transcribe_once(service, SONNET)
+    assert service.spend_today("openrouter") - before == pytest.approx(0.012)
+
+
+def test_an_audio_rate_survives_a_refresh_and_a_reload_and_null_clears_it(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update("openrouter", {"audio_prices": {SONNET: 0.006}})
+    service.refresh("openrouter")
+    assert service.find_model("openrouter", SONNET).price_per_minute_usd == pytest.approx(0.006)
+
+    reloaded = make_service(tmp_path)
+    assert reloaded.find_model("openrouter", SONNET).price_per_minute_usd == pytest.approx(0.006)
+    reloaded.refresh("openrouter")
+    assert reloaded.find_model("openrouter", SONNET).price_per_minute_usd == pytest.approx(0.006)
+
+    reloaded.update("openrouter", {"audio_prices": {SONNET: None}})
+    assert reloaded.find_model("openrouter", SONNET).price_per_minute_usd is None
+    assert make_service(tmp_path).find_model("openrouter", SONNET).price_per_minute_usd is None
+
+
+@pytest.mark.parametrize("rate", [-1, "0.006", True, float("nan"), float("inf")])
+def test_an_audio_rate_must_be_a_finite_non_negative_number(tmp_path, rate):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    with pytest.raises(ValueError, match="audio_prices"):
+        service.update("openrouter", {"audio_prices": {SONNET: rate}})
+    assert service.find_model("openrouter", SONNET).price_per_minute_usd is None
+
+
+def test_an_audio_rate_only_for_a_published_model(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    with pytest.raises(ValueError, match="does not publish"):
+        service.update("openrouter", {"audio_prices": {"nope/model": 0.01}})
+
+def test_audio_prices_over_http_read_back_and_refuse_bad_values(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from control_plane.gateway import create_app
+    from tests.unit.test_gateway import build_deps
+
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update("openrouter", {"enabled_models": [SONNET]})
+    with TestClient(create_app(build_deps(providers=service))) as client:
+        ok = client.patch("/api/providers/openrouter", json={"audio_prices": {SONNET: 0.006}})
+        negative = client.patch("/api/providers/openrouter", json={"audio_prices": {SONNET: -1}})
+        text = client.patch("/api/providers/openrouter", json={"audio_prices": {SONNET: "x"}})
+        audit = client.get("/api/audit", params={"action": "provider_updated"}).json()
+    assert ok.status_code == 200, ok.text
+    row = next(m for m in ok.json()["models"] if m["upstream_id"] == SONNET)
+    assert row["price_per_minute_usd"] == pytest.approx(0.006)
+    assert negative.status_code == 400 and text.status_code == 400
+    assert service.find_model("openrouter", SONNET).price_per_minute_usd == pytest.approx(0.006)
+    rows = audit["entries"]
+    changed = [r for r in rows if r["action"] == "provider_updated"]
+    assert len(changed) == 1
+    after = next(m for m in changed[0]["after"]["models"] if m["upstream_id"] == SONNET)
+    before = next(m for m in changed[0]["before"]["models"] if m["upstream_id"] == SONNET)
+    assert (before["price_per_minute_usd"], after["price_per_minute_usd"]) == (None, 0.006)
+
+
+
+def test_a_dry_run_pin_changes_nothing(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.validate_patch(
+        "openrouter",
+        {"backend_pins": {SONNET: "google-vertex"}, "backend_fallbacks": {SONNET: True}},
+    )
+    assert service.backend_pin_state("openrouter") == {}
+    assert service.find_model("openrouter", SONNET).output_cost_per_mtok == pytest.approx(15.0)
+    with pytest.raises(ValueError, match="lists no backend 'nope'"):
+        service.validate_patch("openrouter", {"backend_pins": {SONNET: "nope"}})
+
+
+def test_a_fallback_pin_lets_openrouter_move_off_the_pinned_host(tmp_path):
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+    service.update(
+        "openrouter",
+        {"backend_pins": {SONNET: "google-vertex"}, "backend_fallbacks": {SONNET: True}},
+    )
+
+    run(collect(service.forward("openrouter", SONNET, {"model": SONNET, "messages": []})))
+    sent = json.loads(upstream.requests[-1].content)
+    assert sent["provider"] == {"order": ["google-vertex"], "allow_fallbacks": True}
+
+    service.update("openrouter", {"backend_fallbacks": {SONNET: False}})
+    run(collect(service.forward("openrouter", SONNET, {"model": SONNET, "messages": []})))
+    sent = json.loads(upstream.requests[-1].content)
+    assert sent["provider"] == {"only": ["google-vertex"]}
+
+
+def test_a_fallback_flag_must_be_a_boolean(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    with pytest.raises(ValueError) as caught:
+        service.update("openrouter", {"backend_fallbacks": {SONNET: "false"}})
+    assert str(caught.value) == "backend_fallbacks values must be true or false"
+
+
+def test_backend_fallbacks_are_refused_off_the_catalogue_and_off_openrouter(tmp_path):
+    service = make_service(tmp_path, env={KEY_REF: REAL_KEY, "DERATE_SECRET_TOGETHER": REAL_KEY})
+    add_openrouter(service)
+    with pytest.raises(ValueError, match="does not publish"):
+        service.update("openrouter", {"backend_fallbacks": {"nobody/such-model": True}})
+    service.add(
+        {"provider_id": "together", "kind": ProviderKind.TOGETHER, "api_key_ref": "DERATE_SECRET_TOGETHER"}
+    )
+    with pytest.raises(ValueError, match="backend_fallbacks does not apply"):
+        service.update("together", {"backend_fallbacks": {}})
 
 
 def test_an_ordinary_model_id_is_not_mistaken_for_key_material(tmp_path):
@@ -2661,13 +2930,17 @@ def test_a_cached_logo_survives_a_coordinator_restart(tmp_path):
 
 
 def test_a_provider_id_never_becomes_a_path_segment_raw(tmp_path):
-    """An operator names their own providers, so the id is untrusted here."""
+    """An operator names their own providers, so the id is untrusted here.
+    The file name is a digest of the id: no part of it survives, and two ids
+    that differ only in punctuation no longer share a file."""
     from control_plane.providers.logos import LogoCache
 
     cache = LogoCache(tmp_path)
     cache.put("../../etc/passwd", b"\x89PNG", "image/png")
-    written = [p.name for p in tmp_path.iterdir()]
-    assert written == ["______etc_passwd.png"]
+    cache.put("__/__/etc/passwd", b"\x89PNG", "image/png")
+    written = sorted(p.name for p in tmp_path.iterdir())
+    assert len(written) == 2
+    assert all(re.fullmatch(r"[0-9a-f]{16}\.png", name) for name in written)
 
 
 def test_no_api_key_is_sent_when_fetching_a_logo():
@@ -2948,3 +3221,80 @@ def test_a_raw_upstream_still_latches_an_auth_failure(tmp_path):
                  MULTIPART_TYPE, "audio/transcriptions"))
     assert caught.value.status_code == 401
     assert service._entry("openrouter").runtime.auth_rejected is True
+
+
+# -- api_key_ref is derate's own (audit M2) ------------------------------------
+
+
+def test_a_reference_to_any_other_environment_variable_is_refused(tmp_path):
+    """`DERATE_TOKEN` is the cluster token; resolving it would send it as a
+    bearer to whatever base_url the same request chose."""
+    service = make_service(tmp_path, env={"DERATE_TOKEN": "cluster-secret"})
+    for ref in ("DERATE_TOKEN", "DERATE_HF_TOKEN", "HOME", minted_ref("other")):
+        with pytest.raises(ValueError, match="DERATE_SECRET_"):
+            service.add({"provider_id": "mine", "kind": ProviderKind.OPENROUTER, "api_key_ref": ref})
+    assert service.list() == []
+    service.add({"provider_id": "mine", "kind": ProviderKind.OPENROUTER, "api_key": REAL_KEY})
+    with pytest.raises(ValueError, match="DERATE_SECRET_"):
+        service.update("mine", {"api_key_ref": "DERATE_TOKEN"})
+
+
+def test_an_operator_secret_reference_resolves_from_the_environment(tmp_path):
+    service = make_service(tmp_path, env={"DERATE_SECRET_OPENAI": REAL_KEY})
+    service.add({"provider_id": "oa", "kind": ProviderKind.OPENROUTER, "api_key_ref": "DERATE_SECRET_OPENAI"})
+    assert service.key_status("oa") == {"key_state": "set", "key_source": "environment"}
+    assert service.resolve_key("oa") == REAL_KEY
+
+
+def test_a_stored_record_holding_a_foreign_reference_resolves_nothing(tmp_path, caplog):
+    service = make_service(tmp_path)
+    service.add({"provider_id": "legacy", "kind": ProviderKind.OPENROUTER, "api_key_ref": KEY_REF})
+    service._entries["legacy"].provider.api_key_ref = "OPENROUTER_API_KEY"
+    service._persist()
+    service.secrets.put("OPENROUTER_API_KEY", REAL_KEY)
+
+    with caplog.at_level("WARNING"):
+        reloaded = make_service(tmp_path, env={"OPENROUTER_API_KEY": REAL_KEY})
+    assert reloaded.key_status("legacy") == {"key_state": "missing", "key_source": None}
+    with pytest.raises(MissingKeyError):
+        reloaded.resolve_key("legacy")
+    assert any("legacy" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
+def test_the_default_client_does_not_follow_redirects():
+    client = ProviderService._default_client_factory()
+    try:
+        assert client.follow_redirects is False
+    finally:
+        run(client.aclose())
+
+
+@pytest.mark.parametrize("budget", [float("nan"), float("inf"), -1, "lots", True])
+def test_a_daily_budget_must_be_a_finite_non_negative_number(tmp_path, budget):
+    service = make_service(tmp_path)
+    with pytest.raises(ValueError, match="daily_budget_usd"):
+        service.add({**{"kind": ProviderKind.OPENROUTER, "api_key_ref": KEY_REF}, "daily_budget_usd": budget})
+    service.add({"provider_id": "p", "kind": ProviderKind.OPENROUTER, "api_key_ref": KEY_REF})
+    with pytest.raises(ValueError, match="daily_budget_usd"):
+        service.update("p", {"daily_budget_usd": budget})
+
+
+@pytest.mark.parametrize("host", ["2852039166", "0xa9fea9fe", "0251.0376.0251.0376"])
+def test_a_numeric_literal_base_url_is_refused_over_http(tmp_path, host):
+    """Integer, hex and octal spellings of 169.254.169.254 used to pass as
+    hostnames and resolve through ``inet_aton`` (K3r)."""
+    from fastapi.testclient import TestClient
+
+    from control_plane.gateway import create_app
+    from tests.unit.test_gateway import _real_providers, build_deps
+
+    providers = _real_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        assert client.post(
+            "/api/providers",
+            json={"provider_id": "box", "kind": "custom", "base_url": "http://box.local/v1"},
+        ).status_code in (200, 201)
+        reply = client.patch("/api/providers/box", json={"base_url": f"http://{host}/v1"})
+    assert reply.status_code == 400, reply.text
+    assert "dotted-quad" in reply.json()["error"]["message"]
+    assert providers.get("box").base_url == "http://box.local/v1"

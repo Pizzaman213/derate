@@ -327,7 +327,7 @@ def test_one_unreachable_node_does_not_stop_the_others(tmp_path, archive):
     drain(good)
 
     class Dead:
-        async def get_json(self, url, timeout):
+        async def get_json(self, url, timeout, headers=None, **_):
             raise ConnectionError("no route to host")
 
     collector = Collector(
@@ -355,7 +355,7 @@ def test_a_backlog_drains_over_several_capped_polls(tmp_path, archive):
     calls = []
 
     class Agent:
-        async def get_json(self, url, timeout):
+        async def get_json(self, url, timeout, headers=None, **_):
             calls.append(url)
             params = dict(p.split("=") for p in url.split("?", 1)[1].split("&"))
             return j.read(int(params["since"]), int(params["limit"]))
@@ -426,7 +426,7 @@ def _fill(archive, *, hours=2, seed=3):
                     ),
                 }
             )
-    archive.ingest("spark-01", {"rows": rows, "next": seq, "head": seq})
+    archive.ingest("spark-01", {"rows": rows, "next": seq, "head": seq}, trusted=True)
     return now
 
 
@@ -954,7 +954,7 @@ def test_a_worker_journal_reaches_the_coordinator_over_the_agent_api(tmp_path, a
 
     worker_journal = Journal(tmp_path / "worker.db", node_id=worker_profile.node_id)
     worker_journal.start()
-    agent = NodeAgent(worker_profile, sink=worker_journal)
+    agent = NodeAgent(worker_profile, sink=worker_journal, token="cluster-secret")
 
     # The worker records with no coordinator listening.
     for i in range(120):
@@ -962,17 +962,21 @@ def test_a_worker_journal_reaches_the_coordinator_over_the_agent_api(tmp_path, a
     drain(worker_journal)
 
     with TestClient(create_agent_app(agent)) as http:
-        direct = http.get("/agent/journal", params={"since": 0, "limit": 10})
+        direct = http.get(
+            "/agent/journal",
+            params={"since": 0, "limit": 10},
+            headers={"X-Derate-Token": "cluster-secret"},
+        )
         assert direct.status_code == 200
         assert len(direct.json()["rows"]) == 10
 
         class ViaHttp:
             """The coordinator's AgentClient, backed by the real route."""
 
-            async def get_json(self, url, timeout):
+            async def get_json(self, url, timeout, headers=None, **_):
                 path, _, query = url.partition("?")
                 params = dict(p.split("=") for p in query.split("&"))
-                reply = http.get(path, params=params)
+                reply = http.get(path, params=params, headers=headers)
                 reply.raise_for_status()
                 return reply.json()
 
@@ -980,6 +984,7 @@ def test_a_worker_journal_reaches_the_coordinator_over_the_agent_api(tmp_path, a
             archive,
             client=ViaHttp(),
             agents=lambda: {worker_profile.node_id: "http://worker:8081"},
+            token=lambda node_id: "cluster-secret",
             max_rows=25,
         )
         collected = asyncio.run(collector.poll_once())
@@ -1055,6 +1060,7 @@ def test_strength_source_is_recorded_not_left_blank(archive):
             "next": 1,
             "head": 1,
         },
+        trusted=True,
     )
     answer = q_requests(
         archive, from_ts=1_699_999_000.0, to_ts=1_700_001_000.0, step="raw"

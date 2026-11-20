@@ -1,4 +1,5 @@
 import type { CustomServe } from '../../state/customServes'
+import { Icon } from '../../components/Icon'
 import { removeCustomServe, useCustomServes } from '../../state/customServes'
 
 /** A custom launch command replayed from a previous launch, so a command
@@ -18,13 +19,13 @@ export function CustomServesCard({
   if (!serves.length) return null
 
   return (
-    <div style={{ margin: '0 0 10px' }}>
+    <div style={{ margin: '0 0 var(--space-10)' }}>
       <div className="sub">custom serves</div>
       <div className="chips" role="group" aria-label="Previously used custom launch commands">
         {serves.map((s) => (
           <span
             key={`${s.modelId} ${s.runtime} ${s.command}`}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-4)' }}
           >
             <button
               type="button"
@@ -46,9 +47,9 @@ export function CustomServesCard({
               aria-label={`Forget ${s.modelId}: ${s.command}`}
               title="Forget this"
               onClick={() => removeCustomServe(s)}
-              style={{ padding: '4px 6px' }}
+              style={{ padding: 'var(--space-4) var(--space-6)' }}
             >
-              &#10005;
+              <Icon name="close" size={12} decorative />
             </button>
           </span>
         ))}

@@ -192,7 +192,7 @@ class TestCoordinatorApp:
             r = client.post(
                 "/api/nodes/join",
                 json={
-                    "token": "definitely-wrong",
+                    "proof": {"nonce": "00", "ts": 0, "mac": "00"},
                     "profile": profile_to_dict(joiner),
                     "agent_url": "http://127.0.0.1:1",
                 },
@@ -207,7 +207,9 @@ class TestCoordinatorApp:
 
 
 class TestKillShot:
-    def test_70b_at_1m_context_is_refused_by_the_real_fit_calculator(self, tmp_path):
+    def test_70b_at_1m_context_is_refused_by_the_real_fit_calculator(self, tmp_path, monkeypatch):
+        # Local model directories resolve only under a configured root.
+        monkeypatch.setenv("DERATE_MODEL_DIRS", str(tmp_path))
         config = _coordinator_config(tmp_path)
         runtime, registry = _local_runtime(config)
         deps = node.build_gateway_deps(runtime, config)

@@ -458,6 +458,54 @@
           "default": []
         },
         {
+          "name": "speculative",
+          "type": "SpeculativeSpec | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "origin",
+          "type": "DeploymentOrigin",
+          "optional": true,
+          "default": "launched"
+        },
+        {
+          "name": "enforce_eager",
+          "type": "bool",
+          "optional": true,
+          "default": false
+        },
+        {
+          "name": "cudagraph_capture_sizes",
+          "type": "tuple[int, ...] | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "kv_dtype",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "quantization",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "serving",
+          "type": "bool",
+          "optional": true,
+          "default": true
+        },
+        {
+          "name": "image",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
           "name": "revision",
           "type": "str | None",
           "optional": true,
@@ -476,18 +524,21 @@
           "default": false
         },
         {
-          "name": "image",
-          "type": "str",
-          "optional": true,
-          "default": ""
-        },
-        {
           "name": "image_id",
           "type": "str",
           "optional": true,
           "default": ""
         }
       ]
+    },
+    "DeploymentOrigin": {
+      "kind": "enum",
+      "module": "control_plane.contracts.deployment",
+      "base": "str",
+      "members": {
+        "LAUNCHED": "launched",
+        "ADOPTED": "adopted"
+      }
     },
     "DeploymentPort": {
       "kind": "protocol",
@@ -592,6 +643,12 @@
           "type": "int | None",
           "optional": true,
           "default": null
+        },
+        {
+          "name": "speculative",
+          "type": "SpeculativeSpec | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -649,6 +706,30 @@
           "type": "str",
           "optional": true,
           "default": "static"
+        },
+        {
+          "name": "speculative_decode_tps_floor",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "speculative_decode_tps_ceiling",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "speculative_reason",
+          "type": "str",
+          "optional": true,
+          "default": ""
+        },
+        {
+          "name": "predicted_decode_tps_empty",
+          "type": "float | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -893,7 +974,7 @@
         },
         {
           "name": "latency_us",
-          "type": "float",
+          "type": "float | None",
           "optional": false
         },
         {
@@ -1110,6 +1191,12 @@
         },
         {
           "name": "vision_params",
+          "type": "int",
+          "optional": true,
+          "default": 0
+        },
+        {
+          "name": "routed_expert_params",
           "type": "int",
           "optional": true,
           "default": 0
@@ -1830,6 +1917,58 @@
         }
       ]
     },
+    "SpeculativeMethod": {
+      "kind": "enum",
+      "module": "control_plane.contracts.plan",
+      "base": "str",
+      "members": {
+        "MTP": "mtp",
+        "DSPARK": "dspark",
+        "NGRAM": "ngram",
+        "EAGLE": "eagle",
+        "EAGLE3": "eagle3",
+        "MEDUSA": "medusa",
+        "DFLASH": "dflash"
+      }
+    },
+    "SpeculativeSpec": {
+      "kind": "dataclass",
+      "module": "control_plane.contracts.plan",
+      "fields": [
+        {
+          "name": "method",
+          "type": "SpeculativeMethod",
+          "optional": false
+        },
+        {
+          "name": "num_speculative_tokens",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "draft_bytes",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "draft_params",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "model",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "draft_kv_ratio",
+          "type": "float",
+          "optional": true,
+          "default": 0.0
+        }
+      ]
+    },
     "TargetKind": {
       "kind": "enum",
       "module": "control_plane.contracts.routing",
@@ -2444,6 +2583,10 @@
       "module": "control_plane.contracts.constants",
       "value": 40.0
     },
+    "UNMEASURED_COLLECTIVE_LATENCY_US": {
+      "module": "control_plane.contracts.constants",
+      "value": 40.0
+    },
     "USAGE_BUCKETS": {
       "module": "control_plane.contracts.telemetry",
       "value": [
@@ -2528,6 +2671,28 @@
       ],
       "restated_at": []
     },
+    "drt_key_pattern": {
+      "canonical": "control_plane.keys.format:KEY_PATTERN",
+      "value": "\\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\\-]{32,}",
+      "why": "the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, copy",
+      "copies": [
+        "control_plane.redaction:KEY_PATTERN"
+      ],
+      "restated_at": [
+        "ui/src/api/redact.ts",
+        "ui/src/shell/screens.check.mjs"
+      ]
+    },
+    "login_lock_username_cap": {
+      "canonical": "control_plane.contracts.auth:LOGIN_LOCK_USERNAME_MAX_S",
+      "value": 300,
+      "why": "a policy about the lockout rather than a shape: anyone can type a username, so the bare-username lock is a denial of service on the real admin and is capped short. auth/service.py enforces it; the auth README and the forensics runbook state the number",
+      "copies": [],
+      "restated_at": [
+        "control_plane/auth/README.md",
+        "docs/FORENSICS.md"
+      ]
+    },
     "node_roles": {
       "canonical": "control_plane.registry.config:ROLE_COORDINATOR",
       "value": "coordinator",
@@ -2545,12 +2710,87 @@
       ],
       "restated_at": []
     },
+    "request_record_fields": {
+      "canonical": "control_plane.contracts.telemetry:REQUEST_RECORD_FIELDS",
+      "value": [
+        "request_id",
+        "ts",
+        "served_name",
+        "node_id",
+        "target_id",
+        "target_kind",
+        "provider_id",
+        "deployment_id",
+        "policy",
+        "strength_source",
+        "attempt_no",
+        "attempts",
+        "retry_reason",
+        "status",
+        "error_code",
+        "error_class",
+        "prompt_tokens",
+        "completion_tokens",
+        "tokens",
+        "tokens_estimated",
+        "cost_usd",
+        "ttft_ms",
+        "decode_ms",
+        "duration_ms",
+        "parked_ms",
+        "streaming",
+        "body_bytes",
+        "admission_code",
+        "kv_bytes",
+        "key_id",
+        "key_name",
+        "org_id",
+        "client_ip",
+        "user_agent",
+        "model_requested",
+        "model_served",
+        "attempt_chain",
+        "fallback_used",
+        "fallback_reason",
+        "finish_reason",
+        "cancelled",
+        "limit_source",
+        "generation_ms",
+        "tokens_per_s",
+        "tpot_mean_ms",
+        "tpot_p95_ms",
+        "tail_ms",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "max_tokens_requested",
+        "message_count",
+        "context_bucket",
+        "prefix_cache_hit_rate",
+        "cache_error",
+        "spec_num_drafts",
+        "spec_draft_tokens",
+        "spec_accepted_tokens",
+        "spec_acceptance_rate",
+        "spec_mean_accepted_len",
+        "spec_accepted_per_position",
+        "spec_decode_error",
+        "cost_basis",
+        "client_port"
+      ],
+      "why": "the record is a dataclass in telemetry/, the column list is a contract the archive schema, the usage API and the UI read",
+      "copies": [
+        "control_plane.telemetry.records:REQUEST_RECORD_FIELDS"
+      ],
+      "restated_at": []
+    },
     "runtime_names": {
       "canonical": "control_plane.deploy.flags:SUPPORTED_RUNTIMES",
       "value": [
         "vllm",
         "sglang",
-        "tts"
+        "tts",
+        "llamacpp"
       ],
       "why": "the launcher owns which runtimes exist, because a runtime without a RuntimeSpec cannot be launched whatever else claims to know it",
       "copies": [
@@ -2580,6 +2820,11 @@
       "owner": "tests/load/loadtest.py",
       "note": ""
     },
+    "DERATE_API_TOKEN": {
+      "default": null,
+      "owner": "control_plane/gateway/settings.py",
+      "note": "opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op"
+    },
     "DERATE_AUDIT_LOG_DAYS": {
       "default": "400",
       "owner": "control_plane/auditlog.py",
@@ -2594,6 +2839,16 @@
       "default": "",
       "owner": "control_plane/auditlog.py",
       "note": "bearer token sent to an http(s) audit sink; never rendered"
+    },
+    "DERATE_AUTO_ADOPT_CONTAINERS": {
+      "default": "1",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "0 disables the background scan that reconstructs a deployment record for a derate-launched sparkrun container running with no matching entry in the deployment store"
+    },
+    "DERATE_AUTO_ADOPT_RUNTIMES": {
+      "default": "1",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "0 disables the background scan that registers a detected external runtime (e.g. Ollama) as a provider without a human clicking Adopt; the manual POST /api/nodes/{id}/runtime route is unaffected either way"
     },
     "DERATE_BASE_URL": {
       "default": "http://localhost:8088",
@@ -2725,6 +2980,11 @@
       "owner": "control_plane/registry/config.py",
       "note": "unset: find the coordinator over mDNS"
     },
+    "DERATE_LLAMACPP_IMAGE": {
+      "default": null,
+      "owner": "control_plane/deploy/flags.py",
+      "note": "the CPU runtime's image; the default is a CPU build, so a CUDA llama.cpp tag has to be named here to be used"
+    },
     "DERATE_LOAD_LOGS": {
       "default": null,
       "owner": "tests/load/harness.py",
@@ -2769,6 +3029,26 @@
       "default": "",
       "owner": "control_plane/links/measure.py",
       "note": ""
+    },
+    "DERATE_NCCL_AUTOCALIBRATE": {
+      "default": "1",
+      "owner": "control_plane/links/service.py",
+      "note": "0 stops a link measurement also calibrating a never-calibrated pair. Calibration costs one two-rank collective per candidate setting and runs only when nothing is stored for that pair and image, so it is once per pair per image rather than per measurement"
+    },
+    "DERATE_NCCL_ENV": {
+      "default": null,
+      "owner": "control_plane/deploy/manager.py",
+      "note": "NAME=VALUE,... rendered into a multi-rank launch's recipe env: block. Every name is checked against the image's own NCCL_TUNABLES first, because NCCL ignores an unknown one silently. No default on purpose: nothing has measured a collective on this fabric, and NCCL already picks a protocol by message size. See tests/nccl_sweep.py"
+    },
+    "DERATE_NCCL_MASTER": {
+      "default": "127.0.0.1",
+      "owner": "tests/nccl_sweep.py",
+      "note": "rendezvous address for the two-rank collective harness"
+    },
+    "DERATE_NCCL_PORT": {
+      "default": "29555",
+      "owner": "tests/nccl_sweep.py",
+      "note": "rendezvous port for the same; not a served port"
     },
     "DERATE_NCCL_TESTS_DIR": {
       "default": null,
@@ -2854,11 +3134,6 @@
       "default": null,
       "owner": "control_plane/deploy/sparkrun.py",
       "note": "unset: whatever `sparkrun` resolves to on PATH"
-    },
-    "DERATE_STUB_PROVIDER_KEY": {
-      "default": null,
-      "owner": "control_plane/providers/stub.py",
-      "note": "the key reference the day-0 provider stub hands out"
     },
     "DERATE_TELEMETRY": {
       "default": "1",

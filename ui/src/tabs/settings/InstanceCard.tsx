@@ -15,7 +15,7 @@ import { fromState, nodeName } from '../../state/names'
 import { useCluster, useRouting } from '../../state/resources'
 import { useRouter } from '../../state/router'
 import { useSelection } from '../../state/selection'
-import { runningOrPrevious } from '../cluster/layout'
+import { runningOrPrevious } from '../models/rows'
 
 /** Settings -> Instance: pick a node and, optionally, a deployment on it, and
  *  see everything `NodeInspector` already shows for the pair -- reused

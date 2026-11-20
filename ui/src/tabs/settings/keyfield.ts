@@ -66,6 +66,10 @@ export function keyPlaceholder(kind: string): string {
       return 'sk-ant-…'
     case 'groq':
       return 'gsk_…'
+    // Added by signing in; the field is never shown for this kind.
+    case 'chatgpt':
+    case 'claude_code':
+      return ''
     default:
       return GENERIC_KEY_PLACEHOLDER
   }
@@ -112,6 +116,8 @@ export function keyStateNote(state: KeyState, source: KeySource): string {
       return source ? `resolves from ${source}` : 'resolves'
     case 'missing':
       return 'does not resolve'
+    case 'reauth':
+      return 'sign-in expired — sign in again'
     case 'not_needed':
       return 'no key needed'
     default:
@@ -126,6 +132,6 @@ export function keyStateNote(state: KeyState, source: KeySource): string {
  *  State column is where a fault belongs. */
 export function keyStateTone(state: KeyState): 'ok' | 'warn' | 'muted' {
   if (state === 'set') return 'ok'
-  if (state === 'missing') return 'warn'
+  if (state === 'missing' || state === 'reauth') return 'warn'
   return 'muted'
 }

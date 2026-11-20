@@ -104,6 +104,9 @@ def test_a_zero_rate_round_trips_as_zero_not_as_absent(store):
         ("local_only", 1),
         ("auto_restart_crashed_deployments", "true"),
         ("auto_restart_crashed_deployments", 1),
+        ("daily_spend_cap_usd", float("nan")),
+        ("electricity_rate_usd_per_kwh", float("inf")),
+        ("electricity_rate_usd_per_kwh", 10**400),
     ],
 )
 def test_bad_values_are_refused_with_a_reason(store, key, value):

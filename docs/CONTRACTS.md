@@ -23,6 +23,7 @@ Every value that crosses the wire as a string.
 | `AuthErrorCode` | `missing_api_key`, `invalid_api_key`, `api_key_disabled`, `api_key_expired`, `session_required`, `invalid_credentials`, `login_locked`, `setup_closed`, `auth_unavailable`, `limit_exceeded`, `max_output_tokens_exceeded`, `max_prompt_tokens_exceeded`, `limit_exceeds_org`, `allowlist_exceeds_org`, `model_not_allowed`, `setup_local_only` | `control_plane.contracts.auth` |
 | `ContextBucket` | `0-8k`, `8-32k`, `32-128k`, `128k+` | `control_plane.contracts.telemetry` |
 | `CostBasis` | `metered`, `estimated`, `unpriced` | `control_plane.contracts.telemetry` |
+| `DeploymentOrigin` | `launched`, `adopted` | `control_plane.contracts.deployment` |
 | `DeploymentState` | `planned`, `launching`, `ready`, `degraded`, `failed`, `stopping`, `stopped` | `control_plane.contracts.deployment` |
 | `DeviceClass` | `gb10`, `discrete`, `apple`, `cpu`, `unknown` | `control_plane.contracts.hardware` |
 | `FallbackReason` | `cloud_pool_exhausted`, `upstream_failed` | `control_plane.contracts.telemetry` |
@@ -34,6 +35,7 @@ Every value that crosses the wire as a string.
 | `PrincipalVia` | `api_key`, `session` | `control_plane.contracts.auth` |
 | `ProviderKind` | `openrouter`, `openai`, `anthropic`, `together`, `groq`, `ollama`, `custom`, `chatgpt`, `claude_code` | `control_plane.contracts.providers` |
 | `RoutingPolicy` | `least_outstanding`, `round_robin`, `weighted_capacity`, `cache_affinity`, `failover`, `local_first`, `cost_aware` | `control_plane.contracts.routing` |
+| `SpeculativeMethod` | `mtp`, `dspark`, `ngram`, `eagle`, `eagle3`, `medusa`, `dflash` | `control_plane.contracts.plan` |
 | `TargetKind` | `local`, `remote` | `control_plane.contracts.routing` |
 | `Verdict` | `fits`, `fits_degraded`, `wont_fit` | `control_plane.contracts.plan` |
 
@@ -130,10 +132,17 @@ Every value that crosses the wire as a string.
 | `modality` | `Modality` | yes |
 | `extra_args` | `tuple[str, ...]` | yes |
 | `custom_command` | `tuple[str, ...]` | yes |
+| `speculative` | `SpeculativeSpec | None` | yes |
+| `origin` | `DeploymentOrigin` | yes |
+| `enforce_eager` | `bool` | yes |
+| `cudagraph_capture_sizes` | `tuple[int, ...] | None` | yes |
+| `kv_dtype` | `str | None` | yes |
+| `quantization` | `str | None` | yes |
+| `serving` | `bool` | yes |
+| `image` | `str | None` | yes |
 | `revision` | `str | None` | yes |
 | `speculative_tokens` | `int` | yes |
 | `trust_remote_code` | `bool` | yes |
-| `image` | `str` | yes |
 | `image_id` | `str` | yes |
 
 ### `FitRequest`
@@ -149,6 +158,7 @@ Every value that crosses the wire as a string.
 | `plan` | `ParallelismPlan` | no |
 | `weight_bytes` | `int | None` | yes |
 | `native_window` | `int | None` | yes |
+| `speculative` | `SpeculativeSpec | None` | yes |
 
 ### `FitResult`
 
@@ -166,6 +176,10 @@ Every value that crosses the wire as a string.
 | `predicted_decode_tps` | `float | None` | no |
 | `warnings` | `list[str]` | yes |
 | `budget_basis` | `str` | yes |
+| `speculative_decode_tps_floor` | `float | None` | yes |
+| `speculative_decode_tps_ceiling` | `float | None` | yes |
+| `speculative_reason` | `str` | yes |
+| `predicted_decode_tps_empty` | `float | None` | yes |
 
 ### `GpuProcess`
 
@@ -224,7 +238,7 @@ Every value that crosses the wire as a string.
 | `dst` | `str` | no |
 | `all_reduce_gbps` | `float` | no |
 | `sendrecv_gbps` | `float` | no |
-| `latency_us` | `float` | no |
+| `latency_us` | `float | None` | no |
 | `gpudirect_rdma` | `bool` | no |
 | `measured_at` | `float` | no |
 | `method` | `str` | no |
@@ -286,6 +300,7 @@ Every value that crosses the wire as a string.
 | `mla_latent_dim` | `int | None` | yes |
 | `mla_rope_dim` | `int | None` | yes |
 | `vision_params` | `int` | yes |
+| `routed_expert_params` | `int` | yes |
 | `is_encoder_decoder` | `bool` | yes |
 
 ### `NodeProfile`
@@ -476,6 +491,19 @@ Every value that crosses the wire as a string.
 | `user_agent` | `str | None` | yes |
 | `login_ip` | `str | None` | yes |
 
+### `SpeculativeSpec`
+
+`control_plane.contracts.plan`
+
+| Field | Type | Optional |
+|---|---|---|
+| `method` | `SpeculativeMethod` | no |
+| `num_speculative_tokens` | `int` | no |
+| `draft_bytes` | `int` | no |
+| `draft_params` | `int` | no |
+| `model` | `str | None` | yes |
+| `draft_kv_ratio` | `float` | yes |
+
 ### `UsageActuals`
 
 `control_plane.contracts.auth`
@@ -550,6 +578,7 @@ The interfaces components hold each other to.
 | `SESSION_IDLE_S` | `604800` | `control_plane.contracts.auth` |
 | `SESSION_MAX_S` | `2592000` | `control_plane.contracts.auth` |
 | `TP_VIABLE_THRESHOLD` | `40.0` | `control_plane.contracts.constants` |
+| `UNMEASURED_COLLECTIVE_LATENCY_US` | `40.0` | `control_plane.contracts.constants` |
 | `USAGE_BUCKETS` | `['1m', '1h', '1d']` | `control_plane.contracts.telemetry` |
 | `USAGE_GROUP_BY` | `['key_id', 'org_id', 'model', 'node', 'provider', 'status', 'context_bucket']` | `control_plane.contracts.telemetry` |
 | `VERIFY_INFLIGHT_MAX` | `4` | `control_plane.contracts.auth` |
@@ -590,6 +619,19 @@ the canonical value.
 - **Why not in `contracts/`**: a judgement about DeploymentState rather than part of it, and it belongs beside the transition table that enforces it. The gateway cannot import it -- the deploy package __init__ pulls the manager, the sparkrun adapter and the event bus into a request module -- so gateway/states.py holds the gateway's one spelling and this holds the two together
 - **Checked copies**: `control_plane.gateway.states:TERMINAL`
 
+### `drt_key_pattern`
+
+- **Canonical**: `control_plane.keys.format:KEY_PATTERN` = `\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}`
+- **Why not in `contracts/`**: the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, copy
+- **Checked copies**: `control_plane.redaction:KEY_PATTERN`
+- **Restated (not checkable)**: `ui/src/api/redact.ts`, `ui/src/shell/screens.check.mjs`
+
+### `login_lock_username_cap`
+
+- **Canonical**: `control_plane.contracts.auth:LOGIN_LOCK_USERNAME_MAX_S` = `300`
+- **Why not in `contracts/`**: a policy about the lockout rather than a shape: anyone can type a username, so the bare-username lock is a denial of service on the real admin and is capped short. auth/service.py enforces it; the auth README and the forensics runbook state the number
+- **Restated (not checkable)**: `control_plane/auth/README.md`, `docs/FORENSICS.md`
+
 ### `node_roles`
 
 - **Canonical**: `control_plane.registry.config:ROLE_COORDINATOR` = `coordinator`
@@ -601,28 +643,54 @@ the canonical value.
 - **Why not in `contracts/`**: it belongs with the scrubber that writes it, and that scrubber is no longer inside the provider package -- logfiles.py redacts on every node, and the worker path may not import providers
 - **Checked copies**: `control_plane.providers.config:REDACTED`, `control_plane.gateway.serialize:REDACTED`
 
+### `request_record_fields`
+
+- **Canonical**: `control_plane.contracts.telemetry:REQUEST_RECORD_FIELDS` = `request_id`, `ts`, `served_name`, `node_id`, `target_id`, `target_kind`, `provider_id`, `deployment_id`, `policy`, `strength_source`, `attempt_no`, `attempts`, `retry_reason`, `status`, `error_code`, `error_class`, `prompt_tokens`, `completion_tokens`, `tokens`, `tokens_estimated`, `cost_usd`, `ttft_ms`, `decode_ms`, `duration_ms`, `parked_ms`, `streaming`, `body_bytes`, `admission_code`, `kv_bytes`, `key_id`, `key_name`, `org_id`, `client_ip`, `user_agent`, `model_requested`, `model_served`, `attempt_chain`, `fallback_used`, `fallback_reason`, `finish_reason`, `cancelled`, `limit_source`, `generation_ms`, `tokens_per_s`, `tpot_mean_ms`, `tpot_p95_ms`, `tail_ms`, `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens`, `max_tokens_requested`, `message_count`, `context_bucket`, `prefix_cache_hit_rate`, `cache_error`, `spec_num_drafts`, `spec_draft_tokens`, `spec_accepted_tokens`, `spec_acceptance_rate`, `spec_mean_accepted_len`, `spec_accepted_per_position`, `spec_decode_error`, `cost_basis`, `client_port`
+- **Why not in `contracts/`**: the record is a dataclass in telemetry/, the column list is a contract the archive schema, the usage API and the UI read
+- **Checked copies**: `control_plane.telemetry.records:REQUEST_RECORD_FIELDS`
+
 ### `runtime_names`
 
-- **Canonical**: `control_plane.deploy.flags:SUPPORTED_RUNTIMES` = `vllm`, `sglang`, `tts`
+- **Canonical**: `control_plane.deploy.flags:SUPPORTED_RUNTIMES` = `vllm`, `sglang`, `tts`, `llamacpp`
 - **Why not in `contracts/`**: the launcher owns which runtimes exist, because a runtime without a RuntimeSpec cannot be launched whatever else claims to know it
 - **Checked copies**: `control_plane.resolver.support:RUNTIMES`
 
 ## HTTP surface
 
-### Coordinator gateway (79 routes)
+### Coordinator gateway (135 routes)
 
 | Method | Path |
 |---|---|
 | GET | `/api/activity` |
+| GET | `/api/admins` |
+| POST | `/api/admins` |
+| DELETE | `/api/admins/{username}` |
+| DELETE | `/api/admins/{username}/sessions` |
+| GET | `/api/alerts` |
+| GET | `/api/audit` |
+| GET | `/api/audit/integrity` |
+| POST | `/api/auth/login` |
+| POST | `/api/auth/logout` |
+| GET | `/api/auth/me` |
+| POST | `/api/auth/password` |
+| DELETE | `/api/auth/sessions` |
+| GET | `/api/auth/sessions` |
+| GET | `/api/auth/state` |
 | GET | `/api/capacity` |
 | GET | `/api/catalog` |
+| POST | `/api/chat/completions` |
+| GET | `/api/chat/models` |
+| POST | `/api/chat/speech` |
+| POST | `/api/chat/transcriptions` |
+| GET | `/api/chat/voices` |
 | GET | `/api/cluster` |
+| POST | `/api/cluster/token/rotate` |
 | GET | `/api/deployments` |
 | POST | `/api/deployments` |
 | DELETE | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}` |
+| PATCH | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}/logs` |
-| GET | `/api/docs` |
 | GET | `/api/enroll` |
 | POST | `/api/enroll` |
 | DELETE | `/api/enroll/{token_id}` |
@@ -631,15 +699,28 @@ the canonical value.
 | GET | `/api/history/nodes` |
 | GET | `/api/history/requests` |
 | GET | `/api/history/status` |
+| GET | `/api/keys` |
+| POST | `/api/keys` |
+| DELETE | `/api/keys/{key_id}` |
+| GET | `/api/keys/{key_id}` |
+| PATCH | `/api/keys/{key_id}` |
+| POST | `/api/keys/{key_id}/disable` |
+| POST | `/api/keys/{key_id}/enable` |
+| POST | `/api/keys/{key_id}/raise` |
+| GET | `/api/keys/{key_id}/requests` |
+| POST | `/api/keys/{key_id}/reset-cycle` |
+| POST | `/api/keys/{key_id}/rotate` |
 | GET | `/api/links` |
 | POST | `/api/links/measure` |
 | POST | `/api/links/reach` |
+| POST | `/api/links/tune` |
 | GET | `/api/memory` |
 | GET | `/api/metrics/stream` |
 | GET | `/api/models` |
 | GET | `/api/models/detail` |
 | GET | `/api/models/quant-table` |
 | GET | `/api/models/search` |
+| GET | `/api/models/speculative-heads` |
 | GET | `/api/models/variants` |
 | GET | `/api/nodes` |
 | GET | `/api/nodes/candidates` |
@@ -648,6 +729,7 @@ the canonical value.
 | GET | `/api/nodes/{node_id}` |
 | POST | `/api/nodes/{node_id}/admit` |
 | PUT | `/api/nodes/{node_id}/label` |
+| GET | `/api/nodes/{node_id}/logs` |
 | GET | `/api/nodes/{node_id}/memory` |
 | GET | `/api/nodes/{node_id}/processes` |
 | DELETE | `/api/nodes/{node_id}/processes/{pid}` |
@@ -655,7 +737,18 @@ the canonical value.
 | POST | `/api/nodes/{node_id}/runtime` |
 | POST | `/api/nodes/{node_id}/runtime/model` |
 | GET | `/api/openapi.json` |
+| GET | `/api/orgs` |
+| POST | `/api/orgs` |
+| DELETE | `/api/orgs/{org_id}` |
+| GET | `/api/orgs/{org_id}` |
+| PATCH | `/api/orgs/{org_id}` |
+| POST | `/api/orgs/{org_id}/keys/disable` |
+| GET | `/api/orgs/{org_id}/limits` |
 | POST | `/api/plan` |
+| GET | `/api/pricing` |
+| DELETE | `/api/pricing/{model:path}` |
+| GET | `/api/pricing/{model:path}` |
+| PUT | `/api/pricing/{model:path}` |
 | GET | `/api/providers` |
 | POST | `/api/providers` |
 | GET | `/api/providers/kinds` |
@@ -669,19 +762,29 @@ the canonical value.
 | POST | `/api/providers/{provider_id}/refresh` |
 | GET | `/api/publishers/avatars` |
 | GET | `/api/publishers/{owner}/avatar` |
+| GET | `/api/requests` |
 | GET | `/api/routing` |
 | DELETE | `/api/routing/{served_name}` |
 | PUT | `/api/routing/{served_name}` |
 | GET | `/api/settings` |
 | PATCH | `/api/settings` |
 | GET | `/api/setup` |
+| POST | `/api/setup/admin` |
 | POST | `/api/setup/complete` |
 | GET | `/api/shell/status` |
+| POST | `/api/sign-in/chatgpt` |
+| GET | `/api/sign-in/chatgpt/{attempt_id}` |
+| POST | `/api/sign-in/chatgpt/{attempt_id}/complete` |
+| POST | `/api/sign-in/claude` |
+| GET | `/api/sign-in/claude/{attempt_id}` |
+| POST | `/api/sign-in/claude/{attempt_id}/complete` |
 | GET | `/api/storage` |
 | DELETE | `/api/storage/cache/resolver` |
 | DELETE | `/api/storage/nodes/{node_id}/models/{folder}` |
 | GET | `/api/topology` |
-| GET | `/docs/oauth2-redirect` |
+| GET | `/api/usage` |
+| POST | `/api/wiring` |
+| GET | `/auth/callback` |
 | GET | `/healthz` |
 | GET | `/install.sh` |
 | POST | `/v1/audio/speech` |
@@ -690,15 +793,18 @@ the canonical value.
 | POST | `/v1/chat/completions` |
 | POST | `/v1/completions` |
 | POST | `/v1/embeddings` |
+| GET | `/v1/key` |
 | GET | `/v1/models` |
 | WEBSOCKET | `/v1/realtime` |
 
-### Node agent (11 routes)
+### Node agent (12 routes)
 
 | Method | Path |
 |---|---|
+| GET | `/agent/containers` |
 | GET | `/agent/health` |
 | GET | `/agent/journal` |
+| GET | `/agent/logs` |
 | GET | `/agent/models/cache` |
 | DELETE | `/agent/models/cache/{folder}` |
 | GET | `/agent/processes` |
@@ -707,7 +813,6 @@ the canonical value.
 | POST | `/agent/reach` |
 | GET | `/agent/storage` |
 | GET | `/agent/telemetry` |
-| GET | `/openapi.json` |
 
 ## Environment
 
@@ -721,9 +826,12 @@ default. A blank default means absence is itself the answer.
 | `DERATE_ALLOWED_ORIGINS` | `` | `control_plane/gateway/settings.py` |
 | `DERATE_ALLOW_BRIDGE` |  | `control_plane/registry/config.py` — the container refuses bridge networking unless this is set |
 | `DERATE_API_KEY` | `` | `tests/load/loadtest.py` |
+| `DERATE_API_TOKEN` |  | `control_plane/gateway/settings.py` — opt-in bearer token gating /api (see gateway/auth.py); unset is a no-op |
 | `DERATE_AUDIT_LOG_DAYS` | `400` | `control_plane/auditlog.py` — days of logs/audit/*.jsonl kept on disk |
 | `DERATE_AUDIT_SINK` | `` | `control_plane/auditlog.py` — remote copy of every audit row: udp://host:port or tcp://host:port (RFC 5424 syslog), http(s)://... (NDJSON POST); empty = no remote copy |
 | `DERATE_AUDIT_SINK_TOKEN` | `` | `control_plane/auditlog.py` — bearer token sent to an http(s) audit sink; never rendered |
+| `DERATE_AUTO_ADOPT_CONTAINERS` | `1` | `control_plane/gateway/settings.py` — 0 disables the background scan that reconstructs a deployment record for a derate-launched sparkrun container running with no matching entry in the deployment store |
+| `DERATE_AUTO_ADOPT_RUNTIMES` | `1` | `control_plane/gateway/settings.py` — 0 disables the background scan that registers a detected external runtime (e.g. Ollama) as a provider without a human clicking Adopt; the manual POST /api/nodes/{id}/runtime route is unaffected either way |
 | `DERATE_BASE_URL` | `http://localhost:8088` | `tests/load/loadtest.py` |
 | `DERATE_BUILD` |  | `control_plane/version.py` — stamped into the image; absent means a source checkout |
 | `DERATE_CACHE_DIR` |  | `control_plane/resolver/cache.py` — also read by registry/storage.py |
@@ -750,6 +858,7 @@ default. A blank default means absence is itself the answer.
 | `DERATE_IMAGE_DIGEST` |  | `control_plane/gateway/enroll_api.py` — the sha256 digest this node's image was installed by; install.sh --digest sets it, and the join command then pins it |
 | `DERATE_INSTALL_SH` |  | `control_plane/gateway/enroll_api.py` — override the installer script the coordinator serves |
 | `DERATE_JOIN` |  | `control_plane/registry/config.py` — unset: find the coordinator over mDNS |
+| `DERATE_LLAMACPP_IMAGE` |  | `control_plane/deploy/flags.py` — the CPU runtime's image; the default is a CPU build, so a CUDA llama.cpp tag has to be named here to be used |
 | `DERATE_LOAD_LOGS` |  | `tests/load/harness.py` |
 | `DERATE_LOG_BACKUPS` | `LOG_BACKUPS` | `control_plane/logfiles.py` — rotated files kept, per file |
 | `DERATE_LOG_DIR` |  | `control_plane/paths.py` — where node.log, proxy.log and audit/ are written; unset means <data dir>/logs, which is on the volume and survives docker rm |
@@ -759,6 +868,10 @@ default. A blank default means absence is itself the answer.
 | `DERATE_MODEL_DIRS` |  | `control_plane/resolver/resolver.py` — colon-separated directories a local model path may resolve under, beside the HF cache and the data dir; anything else is refused |
 | `DERATE_MPIRUN` |  | `control_plane/links/measure.py` |
 | `DERATE_MPIRUN_ARGS` | `` | `control_plane/links/measure.py` |
+| `DERATE_NCCL_AUTOCALIBRATE` | `1` | `control_plane/links/service.py` — 0 stops a link measurement also calibrating a never-calibrated pair. Calibration costs one two-rank collective per candidate setting and runs only when nothing is stored for that pair and image, so it is once per pair per image rather than per measurement |
+| `DERATE_NCCL_ENV` |  | `control_plane/deploy/manager.py` — NAME=VALUE,... rendered into a multi-rank launch's recipe env: block. Every name is checked against the image's own NCCL_TUNABLES first, because NCCL ignores an unknown one silently. No default on purpose: nothing has measured a collective on this fabric, and NCCL already picks a protocol by message size. See tests/nccl_sweep.py |
+| `DERATE_NCCL_MASTER` | `127.0.0.1` | `tests/nccl_sweep.py` — rendezvous address for the two-rank collective harness |
+| `DERATE_NCCL_PORT` | `29555` | `tests/nccl_sweep.py` — rendezvous port for the same; not a served port |
 | `DERATE_NCCL_TESTS_DIR` |  | `control_plane/links/measure.py` |
 | `DERATE_NODE_ID` |  | `control_plane/registry/config.py` — unset: derived from the hostname |
 | `DERATE_OFFLINE` |  | `control_plane/resolver/resolver.py` — answer from cache and fixtures, never reach the network |
@@ -776,7 +889,6 @@ default. A blank default means absence is itself the answer.
 | `DERATE_SHELL_ORIGINS` | `` | `control_plane/registry/shell_config.py` |
 | `DERATE_SHELL_SESSION` |  | `control_plane/registry/shell.py` — set by the server into the session it spawns; not operator-facing |
 | `DERATE_SPARKRUN_BIN` |  | `control_plane/deploy/sparkrun.py` — unset: whatever `sparkrun` resolves to on PATH |
-| `DERATE_STUB_PROVIDER_KEY` |  | `control_plane/providers/stub.py` — the key reference the day-0 provider stub hands out |
 | `DERATE_TELEMETRY` | `1` | `control_plane/telemetry/config.py` — 0 switches metrics, events and log capture off; /v1 request rows and access rows are evidence and are still recorded |
 | `DERATE_TELEMETRY_LOG_LEVEL` | `LOG_SHIP_LEVEL` | `control_plane/telemetry/config.py` |
 | `DERATE_TELEMETRY_MAX_BYTES` |  | `control_plane/telemetry/config.py` |

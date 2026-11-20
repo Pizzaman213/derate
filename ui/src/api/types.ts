@@ -1778,15 +1778,15 @@ export interface ChatTurnMeta {
   ttftMs: number | null
   /** Milliseconds to the first delta carrying answer text; equals `ttftMs`
    *  when nothing was reasoned. */
-  firstContentMs?: number | null
+  firstContentMs: number | null
   /** Milliseconds from send to the end of the stream. */
   elapsedMs: number | null
   /** `usage.prompt_tokens`; never estimated, so `null` without a usage block. */
-  promptTokens?: number | null
+  promptTokens: number | null
   completionTokens: number | null
   /** `usage.completion_tokens_details.reasoning_tokens`, else counted
    *  reasoning frames. Part of `completionTokens`, not added to it. */
-  reasoningTokens?: number | null
+  reasoningTokens: number | null
   /** True when `completionTokens` counts delta frames rather than reading an
    *  upstream `usage` block. The backend draws exactly this distinction on its
    *  own request records (`tokens_estimated`); presenting a counted frame as a
@@ -1798,11 +1798,11 @@ export interface ChatTurnMeta {
    *  claim a model thought for no time rather than not thinking out loud. */
   reasoningMs?: number | null
   /** True when `reasoningTokens` counts frames rather than reading usage. */
-  reasoningEstimated?: boolean
+  reasoningEstimated: boolean
   /** `null` when no reasoning came back at all. */
-  reasoningSource?: ReasoningSource | null
+  reasoningSource: ReasoningSource | null
   /** `choices[0].finish_reason` of the last frame that carried one. */
-  finishReason?: string | null
+  finishReason: string | null
   /** The reader was cancelled from the Stop button. The text is a real partial
    *  answer, not a failure. */
   stopped: boolean

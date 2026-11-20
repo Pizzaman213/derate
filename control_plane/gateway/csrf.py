@@ -1,9 +1,11 @@
 """Refuses a cross-site write before it reaches any /api or /v1 route.
 
-The gateway has no per-request credential (00-architecture.md: "the /api
-surface has no authentication"), so the only thing standing between "a page
-you opened" and "a page that rewrote your cluster" is whether a browser sent
-the request on your behalf. A GET can't do that -- navigation and
+The /api surface is authenticated by a session cookie (``authz.py``), and a
+cookie is exactly what a browser attaches to a request it sends on your
+behalf. ``SameSite=Strict`` keeps it off a cross-site request; this check is
+the second wall, and the one that holds for a client that ignores SameSite.
+So the question is still whether a browser sent the request on your behalf.
+A GET can't change anything that way -- navigation and
 `<img>`/`<script>` tags can't set a method or a JSON body -- but a
 same-origin `fetch` can, and so can a cross-origin one that stays inside the
 CORS "simple request" shape (no preflight): `internal_api.py`'s handlers read
@@ -32,6 +34,14 @@ GUARDED_PREFIXES = ("/api", "/v1")
 #: A request with one of these methods cannot carry a JSON body a page's own
 #: script chose, so there is nothing here for this check to catch.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def trusted_origins(settings) -> tuple[str, ...]:
+    """``DERATE_ALLOWED_ORIGINS`` plus ``DERATE_PUBLIC_ORIGIN``: behind a TLS
+    terminator the browser's ``Origin`` is the public one, never the scheme
+    and host the gateway itself sees."""
+    public = getattr(settings, "public_origin", "")
+    return tuple(settings.allowed_origins) + ((public,) if public else ())
 
 
 def is_cross_site_write(

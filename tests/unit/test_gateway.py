@@ -48,6 +48,7 @@ from control_plane.gateway.stubs import (
 from control_plane.planner import Planner
 from control_plane.providers import UnknownProviderError
 from control_plane.registry import JoinRejected, NodeNotFound
+from tests.unit.conftest import credentials, with_credentials
 from tests.fixtures import (
     LINKS,
     MODEL_SHAPES,
@@ -125,11 +126,12 @@ class FakeJoinableRegistry(FakeRegistry):
         self.admitted = []
         self.removed = []
 
-    async def handle_join(self, token, profile, agent_url):
-        self.joins.append((token, profile, agent_url))
+    async def handle_join(self, proof, profile, agent_url, *, peer=None, facts=None):
+        self.joins.append((proof, profile, agent_url))
+        self.peers = getattr(self, "peers", []) + [peer]
         if self.reject_join:
             raise JoinRejected("invalid cluster token")
-        if token:
+        if proof:
             return {
                 "node_id": profile.node_id,
                 "cluster_id": "c-test",
@@ -178,7 +180,8 @@ class FakeDeployments:
 
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
-        modality=Modality.TEXT, extra_args=(), custom_command=(),
+        modality=Modality.TEXT, extra_args=(), custom_command=(), revision=None,
+        speculative_tokens=0,
         enforce_eager=False, cudagraph_capture_sizes=None, kv_dtype=None,
     ):
         if extra_args and custom_command:
@@ -202,6 +205,7 @@ class FakeDeployments:
             # test for behaviour it does not have.
             kv_dtype=kv_dtype,
         )
+        dep.speculative_tokens = speculative_tokens
         self.launched.append(dep)
         self.deployments.append(dep)
         return dep
@@ -746,8 +750,10 @@ class RunningServer:
     def __init__(self, app, path_prefix=""):
         self.port = _free_port()
         self.url = f"http://127.0.0.1:{self.port}{path_prefix}"
+        # A gateway is secured; requests that bring no credential of their own
+        # get the suite's, exactly as the patched TestClient attaches them.
         config = uvicorn.Config(
-            app, host="127.0.0.1", port=self.port, log_level="error"
+            with_credentials(app), host="127.0.0.1", port=self.port, log_level="error"
         )
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, daemon=True)
@@ -2063,6 +2069,46 @@ def test_transcription_refuses_a_body_that_is_not_multipart():
     assert reply.json()["error"]["code"] == "invalid_content_type"
 
 
+def _multipart(*parts: tuple[str, bytes]) -> tuple[bytes, str]:
+    """A hand-built body: each part is (content-disposition params, value)."""
+    boundary = "xBOUNDARYx"
+    out = b""
+    for disposition, value in parts:
+        out += (
+            f"--{boundary}\r\ncontent-disposition: form-data; {disposition}\r\n\r\n"
+        ).encode() + value + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return out, f"multipart/form-data; boundary={boundary}"
+
+
+def test_a_second_model_part_is_refused_not_resolved_to_the_first():
+    """The gateway would authorise and price the first while the provider takes
+    the last: two `model` parts are a 400, before anything is routed."""
+    body, content_type = _multipart(
+        ('name="model"', b"whisper-cheap"),
+        ('name="model"', b"gpt-4o-transcribe"),
+        ('name="file"; filename="a.mp3"', b"\x00\x01"),
+    )
+    with TestClient(create_app(build_deps())) as client:
+        reply = client.post(
+            "/v1/audio/transcriptions", content=body, headers={"content-type": content_type}
+        )
+    assert reply.status_code == 400
+    assert reply.json()["error"]["code"] == "invalid_request"
+
+
+def test_a_file_named_model_is_not_the_model_field():
+    from control_plane.gateway.openai_api import _multipart_field
+
+    body, content_type = _multipart(
+        ('name="file"; filename="model"', b"audio-bytes"),
+        ('name="model"', b"whisper"),
+    )
+    assert _multipart_field(body, content_type, "model") == "whisper"
+    only_file, content_type = _multipart(('name="file"; filename="model"', b"audio-bytes"))
+    assert _multipart_field(only_file, content_type, "model") is None
+
+
 def test_an_oversized_upload_is_refused_rather_than_buffered():
     """The cap is a real limit, not a formality: this body is read whole and
     held for the life of the call so a failed target stays retryable."""
@@ -2493,9 +2539,15 @@ def test_realtime_relays_both_directions_over_a_real_socket():
             upstream_id="gpt-4o-realtime",
         )
         deps = build_deps(providers=FakeProviders([provider]))
-        with RunningServer(create_app(deps)) as gateway:
+        app = create_app(deps)
+        # A real socket: no patched test client is in the path, so the key is
+        # sent the way any outside client sends it.
+        _, key = credentials(app)
+        with RunningServer(app) as gateway:
             url = f"ws://127.0.0.1:{gateway.port}/v1/realtime?model=voice"
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(
+                url, additional_headers={"Authorization": f"Bearer {key}"}
+            ) as ws:
                 hello = json.loads(await asyncio.wait_for(ws.recv(), 10))
                 await ws.send(json.dumps({"type": "session.update"}))
                 echoed = json.loads(await asyncio.wait_for(ws.recv(), 10))
@@ -3126,6 +3178,147 @@ def test_deleting_a_routing_override_is_idempotent_and_404s_on_an_unknown_model(
         gone = client.delete("/api/routing/nope")
         assert gone.status_code == 404
         assert "nope" in gone.json()["error"]["message"]
+
+
+def test_routing_overrides_and_limits_survive_a_restart(tmp_path, monkeypatch):
+    """routing.json is what makes a PUT outlive the process, and DELETE is
+    what empties it -- three apps over one data directory prove both."""
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    name = "llama-3.3-70b"
+
+    def row(client):
+        return next(c for c in client.get("/api/routing").json() if c["served_name"] == name)
+
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+        put = client.put(
+            f"/api/routing/{name}", json={"policy": "failover", "limits": {"rpm": 5}}
+        )
+        assert put.status_code == 200, put.text
+        assert put.json()["limits"] == {"rpm": 5}
+
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+        config = row(client)
+        assert config["policy"] == "failover"
+        assert config["limits"] == {"rpm": 5}
+        assert config["auto_selected"] is False
+        assert client.delete(f"/api/routing/{name}").status_code == 200
+
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+        config = row(client)
+        assert config["auto_selected"] is True
+        assert config["limits"] == {}
+    stored = json.loads((tmp_path / "routing.json").read_text())
+    assert stored == {"limits": {}, "overrides": {}, "shares": {}, "version": 1}
+
+
+def test_operator_shares_set_the_split_and_survive_a_restart(tmp_path, monkeypatch):
+    """Shares replace the measured weights under weighted_capacity, the
+    router actually sends traffic in that ratio, and they outlive the process;
+    any other policy drops them."""
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    name = "llama-3.3-70b"
+
+    def row(client):
+        return next(c for c in client.get("/api/routing").json() if c["served_name"] == name)
+
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+        ids = sorted(t["target_id"] for t in row(client)["targets"])
+        assert len(ids) == 2
+        refused = client.put(f"/api/routing/{name}", json={"policy": "round_robin", "shares": {ids[0]: 50}})
+        assert refused.status_code == 400
+        assert refused.json()["error"]["message"] == (
+            "shares split traffic only under weighted_capacity; set that policy to set them."
+        )
+        zero = client.put(f"/api/routing/{name}", json={"policy": "weighted_capacity", "shares": {ids[0]: 0}})
+        assert zero.json()["error"]["message"] == "shares must give at least one target more than 0."
+        put = client.put(
+            f"/api/routing/{name}",
+            json={"policy": "weighted_capacity", "shares": {ids[0]: 75, ids[1]: 25}},
+        )
+        assert put.status_code == 200, put.text
+        weights = {t["target_id"]: t["weight"] for t in put.json()["targets"]}
+        assert weights == {ids[0]: 0.75, ids[1]: 0.25}
+        picks = [client.app.state.ctx.router.select(name).target.target_id for _ in range(100)]
+        assert picks.count(ids[0]) == 75
+
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+        config = row(client)
+        assert config["shares"] == {ids[0]: 75, ids[1]: 25}
+        assert {t["target_id"]: t["weight"] for t in config["targets"]} == {ids[0]: 0.75, ids[1]: 0.25}
+        moved = client.put(f"/api/routing/{name}", json={"policy": "round_robin"})
+        assert moved.json()["shares"] == {}
+
+
+
+def test_a_bad_route_limit_or_unknown_name_changes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    name = "llama-3.3-70b"
+    with TestClient(create_app(build_deps(deployments=two_unequal_replicas()))) as client:
+        assert client.put(
+            f"/api/routing/{name}", json={"policy": "failover", "limits": {"rpm": 5}}
+        ).status_code == 200
+        before = (tmp_path / "routing.json").read_text()
+
+        bad_key = client.put(
+            f"/api/routing/{name}", json={"policy": "failover", "limits": {"rps": 3}}
+        )
+        assert bad_key.status_code == 400
+        assert bad_key.json()["error"]["message"] == "limits may only set rpm and tpm."
+        bad_value = client.put(
+            f"/api/routing/{name}", json={"policy": "failover", "limits": {"rpm": 0}}
+        )
+        assert bad_value.status_code == 400
+        assert bad_value.json()["error"]["message"] == (
+            "limits must be whole numbers of 1 or more."
+        )
+        not_object = client.put(
+            f"/api/routing/{name}", json={"policy": "failover", "limits": [1]}
+        )
+        assert not_object.status_code == 400
+        assert not_object.json()["error"]["message"] == (
+            "limits must be an object with rpm and/or tpm."
+        )
+        unserved = client.put(
+            "/api/routing/nope", json={"policy": "failover", "limits": {"rpm": 1}}
+        )
+        assert unserved.status_code == 404
+        assert (tmp_path / "routing.json").read_text() == before
+
+
+def test_a_route_rpm_limit_refuses_that_name_only():
+    backend = FakeBackend()
+    with RunningBackend(backend) as up:
+        deps = build_deps(
+            deployments=FakeDeployments(
+                [
+                    make_deployment("d-a", "llama-3.3-70b", backend_url=up.base_url),
+                    make_deployment("d-b", "qwen3-30b-a3b", backend_url=up.base_url),
+                ]
+            )
+        )
+
+        def chat(client, model):
+            return client.post(
+                "/v1/chat/completions",
+                json={"model": model, "messages": [{"role": "user", "content": "x"}]},
+            )
+
+        with TestClient(create_app(deps)) as client:
+            assert client.put(
+                "/api/routing/llama-3.3-70b",
+                json={"policy": "failover", "limits": {"rpm": 2}},
+            ).status_code == 200
+            assert chat(client, "llama-3.3-70b").status_code == 200
+            assert chat(client, "llama-3.3-70b").status_code == 200
+            refused = chat(client, "llama-3.3-70b")
+            assert refused.status_code == 429
+            error = refused.json()["error"]
+            assert error["code"] == "limit_exceeded"
+            assert error["limit_source"] == "route:rpm"
+            assert error["used"] == 2 and error["limit"] == 2
+            # The window is the name's own: another name is not refused.
+            assert chat(client, "qwen3-30b-a3b").status_code == 200
+
 
 
 def test_routing_endpoint_exposes_live_weights_and_their_source():
@@ -3993,9 +4186,12 @@ def test_an_unmodified_openai_client_lists_models_and_completes_a_chat():
                 [make_deployment("d-1", "llama-3.3-70b", backend_url=running.base_url)]
             )
         )
-        with RunningServer(create_app(deps)) as gateway:
+        app = create_app(deps)
+        # An unmodified client, holding the key an admin would hand it.
+        _, key = credentials(app)
+        with RunningServer(app) as gateway:
             client = openai.OpenAI(
-                base_url=f"{gateway.url}/v1", api_key="anything", max_retries=0
+                base_url=f"{gateway.url}/v1", api_key=key, max_retries=0
             )
 
             assert "llama-3.3-70b" in [m.id for m in client.models.list()]
@@ -4589,7 +4785,7 @@ def test_join_with_a_bad_token_is_rejected_with_403():
         reply = client.post(
             "/api/nodes/join",
             json={
-                "token": "wrong-token",
+                "proof": {"nonce": "00", "ts": 0, "mac": "00"},
                 "profile": {
                     "node_id": profile.node_id,
                     "hostname": profile.hostname,
@@ -4614,7 +4810,9 @@ def test_join_with_no_token_passes_through_the_candidate_status():
     registry = FakeJoinableRegistry()
     deps = build_deps(registry=registry)
     profile = make_node_profile()
-    with TestClient(create_app(deps)) as client:
+    # The join comes from the machine it describes: agent_url must name the
+    # requesting address (internal_api._requesting_host).
+    with TestClient(create_app(deps), client=("192.168.11.99", 50000)) as client:
         reply = client.post(
             "/api/nodes/join",
             json={
@@ -4643,6 +4841,7 @@ def test_join_with_no_token_passes_through_the_candidate_status():
     assert token is None
     assert sent_profile.node_id == profile.node_id
     assert agent_url == "http://192.168.11.99:8770"
+    assert registry.peers == ["192.168.11.99"]
 
 
 def test_join_with_a_malformed_body_is_a_400_not_a_500():
@@ -4710,7 +4909,9 @@ def test_remove_a_known_node_succeeds():
 def test_the_default_stub_registry_wires_the_same_admission_surface():
     """gateway/stubs.py's StubRegistry must expose the real method names and
     exceptions, not just the RegistryPort trio (H-5)."""
-    with TestClient(create_app()) as client:
+    # Loopback: a worker on this very machine, which may name 127.0.0.1 as
+    # its agent address (internal_api._requesting_host).
+    with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:
         assert client.get("/api/nodes/candidates").json() == []
         admit_reply = client.post("/api/nodes/spark-01/admit")
         assert admit_reply.status_code == 200
@@ -4720,7 +4921,7 @@ def test_the_default_stub_registry_wires_the_same_admission_surface():
         assert removed.status_code == 200
         join_reply = client.post(
             "/api/nodes/join",
-            json={"profile": {"node_id": "x"}, "agent_url": "http://x"},
+            json={"profile": {"node_id": "x"}, "agent_url": "http://127.0.0.1:8081"},
         )
         # The stub genuinely cannot accept a join; degrades to 501 rather
         # than crashing with an unhandled NotImplementedError.
@@ -4851,6 +5052,28 @@ def test_posting_a_key_into_the_reference_field_is_a_400_naming_the_field_that_w
     assert "api_key" in error["message"]
     # The refusal cannot carry the key it is refusing.
     assert SECRET_KEY not in reply.text
+
+
+def test_a_reference_to_the_cluster_token_and_a_nan_budget_are_400s(tmp_path):
+    """`DERATE_TOKEN` would be sent as a bearer to the provider's base_url; a
+    NaN budget compares false against every spend and switches the cap off."""
+    providers = _real_providers(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        token_ref = client.post(
+            "/api/providers",
+            json={"kind": "openrouter", "base_url": "https://attacker.invalid/v1", "api_key_ref": "DERATE_TOKEN"},
+        )
+        nan_budget = client.post(
+            "/api/providers",
+            content=b'{"kind": "openrouter", "api_key": "' + SECRET_KEY.encode() + b'", "daily_budget_usd": NaN}',
+            headers={"content-type": "application/json"},
+        )
+    assert token_ref.status_code == 400
+    assert "DERATE_SECRET_" in token_ref.json()["error"]["message"]
+    assert nan_budget.status_code == 400
+    # Refused at parse now (NaN is not JSON), before the field is ever read.
+    assert nan_budget.json()["error"]["code"] in ("invalid_json", "invalid_request")
+    assert providers.list() == []
 
 
 def test_patching_a_key_into_the_reference_field_is_a_400_not_a_500(tmp_path):
@@ -5080,7 +5303,7 @@ def test_create_deployment_maps_a_launch_value_error_to_400():
     """M-11: a launch-time input validation error is a 400, not a 502."""
 
     class RejectingDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), enforce_eager=False, cudagraph_capture_sizes=None):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), revision=None, speculative_tokens=0, enforce_eager=False, cudagraph_capture_sizes=None):
             raise ValueError("model id is not a safe command argument")
 
     deployments = RejectingDeployments()
@@ -5113,7 +5336,7 @@ def test_a_launch_onto_a_node_already_running_the_model_is_a_409():
     )
 
     class OccupiedDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), enforce_eager=False, cudagraph_capture_sizes=None):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), revision=None, speculative_tokens=0, enforce_eager=False, cudagraph_capture_sizes=None):
             raise DuplicateDeployment(running, clash="model")
 
     deps = build_deps(deployments=OccupiedDeployments())
@@ -5141,7 +5364,7 @@ def test_a_launch_that_really_did_fail_is_still_a_502():
     """The 409 is keyed on the conflict, not on any exception reaching here."""
 
     class BrokenDeployments(FakeDeployments):
-        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), enforce_eager=False, cudagraph_capture_sizes=None):
+        def launch(self, shape, plan, fit, runtime, ctx, max_seqs, *, modality=None, extra_args=(), custom_command=(), revision=None, speculative_tokens=0, enforce_eager=False, cudagraph_capture_sizes=None):
             raise RuntimeError("sparkrun exited 1")
 
     deps = build_deps(deployments=BrokenDeployments())
@@ -6416,7 +6639,7 @@ def _catalogue_providers(tmp_path, *, count=4):
     """
     from control_plane.providers import ProviderService, SecretStore
 
-    ref, key = "OPENROUTER_API_KEY", "sk-or-v1-catalogueproviderstestkey0123456789"
+    ref, key = "DERATE_SECRET_OPENROUTER", "sk-or-v1-catalogueproviderstestkey0123456789"
 
     def handler(request):
         if request.method == "GET" and request.url.path.endswith("/models"):
@@ -6446,7 +6669,7 @@ def test_adding_a_provider_adds_no_servable_names_until_two_are_enabled(tmp_path
     with TestClient(create_app(build_deps(providers=providers))) as client:
         before = {m["id"] for m in client.get("/v1/models").json()["data"]}
         added = client.post(
-            "/api/providers", json={"kind": "openrouter", "api_key_ref": "OPENROUTER_API_KEY"}
+            "/api/providers", json={"kind": "openrouter", "api_key_ref": "DERATE_SECRET_OPENROUTER"}
         )
         assert added.status_code == 201
         provider_id = added.json()["provider_id"]
@@ -6499,7 +6722,7 @@ def test_models_chosen_reaches_the_wire_through_the_spend_allowlist(tmp_path):
     providers = _catalogue_providers(tmp_path)
     with TestClient(create_app(build_deps(providers=providers))) as client:
         added = client.post(
-            "/api/providers", json={"kind": "openrouter", "api_key_ref": "OPENROUTER_API_KEY"}
+            "/api/providers", json={"kind": "openrouter", "api_key_ref": "DERATE_SECRET_OPENROUTER"}
         )
         provider_id = added.json()["provider_id"]
 
@@ -6525,7 +6748,7 @@ def test_enabling_a_model_the_provider_does_not_publish_is_a_400(tmp_path):
     providers = _catalogue_providers(tmp_path)
     with TestClient(create_app(build_deps(providers=providers))) as client:
         added = client.post(
-            "/api/providers", json={"kind": "openrouter", "api_key_ref": "OPENROUTER_API_KEY"}
+            "/api/providers", json={"kind": "openrouter", "api_key_ref": "DERATE_SECRET_OPENROUTER"}
         )
         reply = client.patch(
             f"/api/providers/{added.json()['provider_id']}",
@@ -7019,3 +7242,126 @@ def test_a_hedge_is_refused_onto_a_target_that_cannot_win():
     # the pick would let this one through the floor it exists to enforce.
     assert not policies.may_hedge(config, strong, feeble, settings)
     assert policies.may_hedge(config, strong, target("d-c", 1.0), settings)
+
+
+def _mtp_deps(mtp: int):
+    from control_plane.resolver.support import build_verdict
+    from control_plane.resolver.types import ParamSource, QuantSource, Resolution
+
+    shape = MODEL_SHAPES["llama-3.3-70b"]
+    resolution = Resolution(
+        shape=shape,
+        revision="main",
+        param_source=ParamSource.SAFETENSORS_HEADERS,
+        quant_source=QuantSource.QUANT_CONFIG,
+        support=build_verdict((), shape.dtype),
+        warnings=[],
+        param_breakdown={"total": shape.total_params, "mtp": mtp},
+    )
+
+    class Resolver(StubResolver):
+        def resolve_full(self, model_id, dtype=None):
+            return resolution
+
+    seen = []
+
+    class RecordingFit(StubFit):
+        def check(self, req, nodes):
+            seen.append(req)
+            return fits()
+
+    deps = build_deps()
+    deps.resolver = Resolver()
+    deps.fit = RecordingFit()
+    return deps, resolution, seen
+
+
+def test_speculative_decoding_charges_the_mtp_module_in_the_plan():
+    mtp = 2_000_000_000
+    deps, resolution, seen = _mtp_deps(mtp)
+    body = {"model_id": "meta-llama/Llama-3.3-70B-Instruct"}
+    with TestClient(create_app(deps)) as client:
+        plain = client.post("/api/plan", json=body)
+        base = seen[-1].weight_bytes
+        spec = client.post("/api/plan", json={**body, "speculative_tokens": 2})
+    assert plain.status_code == 200 and spec.status_code == 200
+    total = resolution.shape.total_params
+    assert base == resolution.effective_weight_bytes()
+    assert seen[-1].weight_bytes == int(base * (total + mtp) / total)
+    assert (
+        "speculative decoding loads the 2.0B-parameter multi-token-prediction "
+        "module; the fit above includes it"
+    ) in spec.json()["resolver_warnings"]
+
+
+def test_speculative_decoding_without_an_mtp_module_is_refused():
+    deps, _, _ = _mtp_deps(0)
+    body = {"model_id": "meta-llama/Llama-3.3-70B-Instruct", "speculative_tokens": 2}
+    with TestClient(create_app(deps)) as client:
+        for path in ("/api/plan", "/api/deployments"):
+            reply = client.post(path, json=body)
+            assert reply.status_code == 400, (path, reply.text)
+            assert (
+                "meta-llama/Llama-3.3-70B-Instruct carries no multi-token-prediction "
+                "module; speculative decoding has nothing to draft with."
+            ) in reply.text
+        bad = client.post("/api/plan", json={**body, "speculative_tokens": 9})
+    assert bad.status_code == 400
+    assert "speculative_tokens must be a whole number from 0 to 8." in bad.text
+
+
+# ---------------------------------------------------------------------------
+# containment switches: local_only and the daily spend cap are enforced at
+# routing, not merely stored (CAP-1, CAP-2)
+# ---------------------------------------------------------------------------
+
+
+class SpendingProviders(FakeProviders):
+    def __init__(self, providers, spent):
+        super().__init__(providers)
+        self.spent = spent
+
+    def spend_today(self, provider_id):
+        return self.spent
+
+
+def _remote_chat(providers, settings):
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        for p in providers.providers:
+            p.base_url = running.base_url
+        app = create_app(build_deps(providers=providers, settings=settings))
+        with TestClient(app) as client:
+            app.state.ctx.router.rebuild(force_scores=True)
+            config = app.state.ctx.router.config_for("qwen3-30b-a3b")
+            reply = client.post(
+                "/v1/chat/completions",
+                json={"model": "qwen3-30b-a3b", "messages": [{"role": "user", "content": "hi"}]},
+            )
+    return config, reply, backend
+
+
+def test_local_only_refuses_a_remote_target():
+    config, reply, backend = _remote_chat(
+        FakeProviders([make_provider()]), GatewaySettings(local_only=True)
+    )
+    assert config.targets[0].admitting is False
+    assert reply.status_code == 503, reply.text
+    assert reply.json()["error"]["code"] == "no_target_admitting"
+    assert backend.requests == []  # the prompt never left
+
+
+def test_a_spent_daily_cap_refuses_a_remote_target():
+    config, reply, _ = _remote_chat(
+        SpendingProviders([make_provider()], 6.0), GatewaySettings(daily_spend_cap_usd=5.0)
+    )
+    assert config.targets[0].admitting is False
+    assert reply.status_code == 503, reply.text
+
+
+def test_no_cap_leaves_the_remote_admitting():
+    config, reply, _ = _remote_chat(
+        SpendingProviders([make_provider()], 6.0), GatewaySettings(daily_spend_cap_usd=None)
+    )
+    assert config.targets[0].admitting is True
+    assert reply.status_code == 200, reply.text

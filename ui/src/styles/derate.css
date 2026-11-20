@@ -1172,14 +1172,14 @@ svg text.m {
 .mdbody ul,
 .mdbody ol,
 .mdbody blockquote {
-  margin: var(--s-2) 0 0;
+  margin: var(--space-8) 0 0;
 }
 .mdbody ul,
 .mdbody ol {
-  padding-left: var(--s-4);
+  padding-left: var(--space-16);
 }
 .mdbody blockquote {
-  padding-left: var(--s-3);
+  padding-left: var(--space-12);
   border-left: 2px solid var(--rule-strong);
   color: var(--ink-muted);
 }
@@ -1195,7 +1195,7 @@ svg text.m {
 }
 
 .codeblock {
-  margin: var(--s-2) 0 0;
+  margin: var(--space-8) 0 0;
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   overflow: hidden;
@@ -1204,8 +1204,8 @@ svg text.m {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--s-2);
-  padding: var(--s-1) var(--s-2);
+  gap: var(--space-8);
+  padding: var(--space-4) var(--space-8);
   background: var(--panel-sunk);
   border-bottom: 1px solid var(--rule);
 }
@@ -1214,7 +1214,7 @@ svg text.m {
 }
 .codeblock pre {
   margin: 0;
-  padding: var(--s-2);
+  padding: var(--space-8);
   overflow-x: auto;
 }
 .codeblock code {
@@ -1228,15 +1228,15 @@ svg text.m {
    uses `.unit`'s own muted colour rather than a new one: this is chrome
    about the answer, not part of it. */
 .reasoning {
-  margin: 0 0 var(--s-2);
+  margin: 0 0 var(--space-8);
 }
 .reasoning summary {
   cursor: pointer;
   color: var(--ink-muted);
 }
 .reasoning .mdbody {
-  margin-top: var(--s-1);
-  padding-left: var(--s-3);
+  margin-top: var(--space-4);
+  padding-left: var(--space-12);
   border-left: 2px solid var(--rule);
   color: var(--ink-muted);
 }
@@ -1244,8 +1244,8 @@ svg text.m {
 .turnimages {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--s-2);
-  margin-bottom: var(--s-2);
+  gap: var(--space-8);
+  margin-bottom: var(--space-8);
 }
 .turnimages img {
   max-width: 160px;
@@ -1257,8 +1257,8 @@ svg text.m {
 
 .turnedit {
   display: grid;
-  gap: var(--s-2);
-  margin-top: var(--s-1);
+  gap: var(--space-8);
+  margin-top: var(--space-4);
 }
 .turnedit textarea {
   font: inherit;
@@ -1275,8 +1275,8 @@ svg text.m {
    worse keyboard experience than a small, muted, always-there one. */
 .turnactions {
   display: flex;
-  gap: var(--s-3);
-  margin-top: var(--s-2);
+  gap: var(--space-12);
+  margin-top: var(--space-8);
 }
 .turnaction {
   border: none;
@@ -1295,7 +1295,7 @@ svg text.m {
 /* Request params: closed by default, same reasoning as `.reasoning` above --
    this is the exception, not the thing every send needs set. */
 .reqparams {
-  margin-bottom: var(--s-1);
+  margin-bottom: var(--space-4);
 }
 .reqparams summary {
   cursor: pointer;
@@ -1304,8 +1304,8 @@ svg text.m {
 .reqparamsgrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: var(--s-2) var(--s-3);
-  margin-top: var(--s-2);
+  gap: var(--space-8) var(--space-12);
+  margin-top: var(--space-8);
 }
 .reqparamsgrid label {
   display: grid;
@@ -1325,13 +1325,13 @@ svg text.m {
 .attachrow {
   display: flex;
   align-items: center;
-  gap: var(--s-3);
+  gap: var(--space-12);
   flex-wrap: wrap;
 }
 .filepick {
   display: flex;
   align-items: baseline;
-  gap: var(--s-2);
+  gap: var(--space-8);
 }
 .filepick input[type='file'] {
   font: inherit;
@@ -1341,17 +1341,17 @@ svg text.m {
 .attachchips {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--s-2);
+  gap: var(--space-8);
 }
 .attachchip {
   display: inline-flex;
   align-items: center;
-  gap: var(--s-1);
+  gap: var(--space-4);
   font-size: var(--size-unit);
   color: var(--ink-muted);
   background: var(--panel-sunk);
   border-radius: var(--radius);
-  padding: 2px var(--s-1) 2px 2px;
+  padding: 2px var(--space-4) 2px 2px;
 }
 .attachchip img {
   width: 22px;
@@ -1483,10 +1483,10 @@ svg text.m {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--s-2);
+  gap: var(--space-8);
   height: var(--control-h);
   width: 100%;
-  padding: 0 var(--s-2);
+  padding: 0 var(--space-8);
   text-align: left;
   background: var(--panel);
 }

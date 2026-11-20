@@ -222,10 +222,12 @@ def test_the_recipe_turns_off_the_gpu_request_and_the_image_entrypoint(tmp_path)
     assert '  entrypoint: ""\n' in body
 
 
-def test_the_other_runtimes_carry_no_executor_block(tmp_path):
+def test_the_other_runtimes_carry_only_the_hardening_entries(tmp_path):
     """`()` is a decision, not an omission: sparkrun's defaults were written
-    for the hardware those three run on, and a block here would override them
-    from a file that has no opinion about them."""
+    for the hardware those three run on, so nothing here clears their `gpus`
+    or their image's entrypoint. The one block they do carry is the privilege
+    hardening every runtime gets (M8): no --privileged, IPC_LOCK for pinned
+    memory."""
     body = recipes.synthesize(
         _shape("meta-llama/Llama-3.1-8B"),
         _plan(["spark-01"]),
@@ -237,7 +239,10 @@ def test_the_other_runtimes_carry_no_executor_block(tmp_path):
         gpu_memory_utilization=0.9,
         recipe_dir=tmp_path,
     ).content
-    assert "executor_config:" not in body
+    assert "executor_config:\n  privileged: false\n  cap_add: [IPC_LOCK]\n" in body
+    assert body.count("executor_config:") == 1
+    assert "gpus:" not in body
+    assert "entrypoint:" not in body
 
 
 def test_the_command_names_no_flag_the_binary_does_not_take(tmp_path):

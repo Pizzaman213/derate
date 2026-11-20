@@ -14,9 +14,11 @@ Three rules, in order of importance:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
 import anyio
@@ -31,30 +33,16 @@ from control_plane.providers.errors import (
     ProviderNotAdmittingError,
     UpstreamError,
 )
+from control_plane.providers.service import RESPONSE_HEADER_ALLOWLIST
 from control_plane.redaction import Redactor
 
-from control_plane.providers.usage import UsageSniffer
+from control_plane.providers.usage import UsageSniffer, audio_duration_of
 
 from .errors import error_response
 from .settings import GatewaySettings
 from .stats import StatsRegistry
 
 log = logging.getLogger("gateway.proxy")
-
-# Headers we never copy in either direction: they describe the hop, not the
-# payload, and forwarding them corrupts a streamed response.
-_HOP_BY_HOP = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-    "host",
-}
 
 _SSE_TOKEN_MARKER = b"data:"
 _DONE_MARKER = b"[DONE]"
@@ -161,9 +149,110 @@ class _Usage:
     tokens: int = 0
     ttft_s: float | None = None
     decode_s: float | None = None
-    prompt_tokens: int = 0
+    # None until the upstream's own usage block says: the record then falls
+    # back to the request's admission estimate rather than recording zero.
+    prompt_tokens: int | None = None
     completion_tokens: int = 0
     estimated: bool = True
+    # Read off the response as it passed; None when it did not say. A missing
+    # count is recorded as missing, never as zero.
+    finish_reason: str | None = None
+    reasoning_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    # Per-token timing, streams only: first token to last, the mean and p95
+    # gap between tokens, and how long the stream ran on after its last token.
+    generation_s: float | None = None
+    tpot_mean_ms: float | None = None
+    tpot_p95_ms: float | None = None
+    tail_ms: float | None = None
+    # A transcription's own `duration` (seconds), read off an audio
+    # response's small JSON body; priced per minute when the provider model
+    # carries a rate (K5r). None for every other body.
+    audio_duration_s: float | None = None
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _usage_details(usage: dict) -> dict[str, int | None]:
+    """Reasoning and cache counts out of a usage block, whoever wrote it.
+
+    OpenAI and vLLM: ``prompt_tokens_details.cached_tokens`` and
+    ``completion_tokens_details.reasoning_tokens``. Anthropic:
+    ``cache_read_input_tokens`` / ``cache_creation_input_tokens``.
+    OpenRouter: ``native_tokens_cached``.
+    """
+    prompt_details = usage.get("prompt_tokens_details")
+    completion_details = usage.get("completion_tokens_details")
+    cache_read = None
+    if isinstance(prompt_details, dict):
+        cache_read = _int_or_none(prompt_details.get("cached_tokens"))
+    if cache_read is None:
+        cache_read = _int_or_none(usage.get("cache_read_input_tokens"))
+    if cache_read is None:
+        cache_read = _int_or_none(usage.get("native_tokens_cached"))
+    reasoning = None
+    if isinstance(completion_details, dict):
+        reasoning = _int_or_none(completion_details.get("reasoning_tokens"))
+    return {
+        "reasoning_tokens": reasoning,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": _int_or_none(usage.get("cache_creation_input_tokens")),
+    }
+
+
+class _DetailSniffer(UsageSniffer):
+    """The usage sniffer, also reading what the token counts leave out: the
+    finish reason, and the reasoning and cache counts beside them. Parses the
+    same bounded buffer, once, at the end -- never a byte more is held."""
+
+    def _objects(self) -> list[dict]:
+        if self._overflowed or not self._buffer:
+            return []
+        text = bytes(self._buffer).decode("utf-8", "replace")
+        if not self._stream:
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                return []
+            return [obj] if isinstance(obj, dict) else []
+        lines = text.split("\n")
+        if self._truncated and len(lines) > 1:
+            lines = lines[1:]
+        out = []
+        for line in lines:
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+        return out
+
+    def details(self) -> dict:
+        found: dict = {}
+        for obj in self._objects():
+            usage = obj.get("usage")
+            if isinstance(usage, dict):
+                found.update(_usage_details(usage))
+            choices = obj.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if isinstance(choice, dict) and isinstance(choice.get("finish_reason"), str):
+                        found["finish_reason"] = choice["finish_reason"]
+            elif isinstance(obj.get("stop_reason"), str):
+                found["finish_reason"] = obj["stop_reason"]
+        return found
 
 
 def _apply_sniffed(usage: _Usage, sniffer: "UsageSniffer") -> None:
@@ -172,6 +261,12 @@ def _apply_sniffed(usage: _Usage, sniffer: "UsageSniffer") -> None:
         sniffed = sniffer.result()
     except Exception:  # a malformed tail is not worth a failed request
         sniffed = None
+    try:
+        details = sniffer.details() if isinstance(sniffer, _DetailSniffer) else {}
+    except Exception:
+        details = {}
+    for name, value in details.items():
+        setattr(usage, name, value)
     if sniffed is None:
         usage.completion_tokens = usage.tokens
         return
@@ -182,6 +277,20 @@ def _apply_sniffed(usage: _Usage, sniffer: "UsageSniffer") -> None:
         usage.tokens = sniffed.output_tokens
 
 
+def _weighted_p95(gaps: list[tuple[float, int]]) -> float:
+    """The 95th percentile per-token gap, each chunk's gap split evenly over
+    the tokens it carried."""
+    per_token = sorted((gap / n, n) for gap, n in gaps)
+    total = sum(n for _, n in per_token)
+    threshold = 0.95 * total
+    seen = 0
+    for value, n in per_token:
+        seen += n
+        if seen >= threshold:
+            return value
+    return per_token[-1][0]
+
+
 class _StreamAccounting:
     """Counts tokens in a passing SSE stream without holding it up.
 
@@ -190,15 +299,22 @@ class _StreamAccounting:
     a substring scan per chunk rather than a parse.
     """
 
-    def __init__(self, started: float) -> None:
+    def __init__(self, started: float, on_tokens: Callable[[int], None] | None = None) -> None:
         self.started = started
         self.usage = _Usage()
+        # Tokens already handed to ``on_tokens`` as they streamed, so the
+        # settle step can add only what the final count says on top.
+        self.live = 0
+        self._on_tokens = on_tokens
         self._tail = b""
         self._first_token_at: float | None = None
+        self._last_token_at: float | None = None
+        # (seconds since the previous token-bearing chunk, tokens in this one)
+        self._gaps: list[tuple[float, int]] = []
         # The frame count keeps driving routing exactly as before. This reads
         # the real usage block out of the stream's tail in parallel, using the
         # implementation the provider path already trusts for spend.
-        self._sniffer = UsageSniffer(stream=True)
+        self._sniffer = _DetailSniffer(stream=True)
 
     def note_chunk(self, chunk: bytes, now: float) -> None:
         if self.usage.ttft_s is None:
@@ -211,14 +327,31 @@ class _StreamAccounting:
         if count > 0:
             if self._first_token_at is None:
                 self._first_token_at = now
+            else:
+                self._gaps.append((now - self._last_token_at, count))
+            self._last_token_at = now
             self.usage.tokens += count
+            if self._on_tokens is not None:
+                # Live throughput only; never allowed to break the stream.
+                try:
+                    self._on_tokens(count)
+                    self.live += count
+                except Exception:
+                    log.debug("live token count failed", exc_info=True)
         self._tail = window[-len(_SSE_TOKEN_MARKER) :]
 
     def finish(self, now: float) -> _Usage:
+        usage = self.usage
         if self._first_token_at is not None:
-            self.usage.decode_s = max(0.0, now - self._first_token_at)
-        _apply_sniffed(self.usage, self._sniffer)
-        return self.usage
+            usage.decode_s = max(0.0, now - self._first_token_at)
+            usage.generation_s = max(0.0, self._last_token_at - self._first_token_at)
+            usage.tail_ms = max(0.0, now - self._last_token_at) * 1000.0
+        if self._gaps:
+            tokens = sum(n for _, n in self._gaps)
+            usage.tpot_mean_ms = sum(g for g, _ in self._gaps) / tokens * 1000.0
+            usage.tpot_p95_ms = _weighted_p95(self._gaps) * 1000.0
+        _apply_sniffed(usage, self._sniffer)
+        return usage
 
 
 class _BodyAccounting:
@@ -230,7 +363,7 @@ class _BodyAccounting:
     def __init__(self, started: float) -> None:
         self.started = started
         self.usage = _Usage()
-        self._sniffer = UsageSniffer(stream=False)
+        self._sniffer = _DetailSniffer(stream=False)
         self._seen = 0
 
     def note_chunk(self, chunk: bytes, now: float) -> None:
@@ -250,33 +383,123 @@ class _NoAccounting:
 
     TTFT is still real -- it is when the client could first have seen a byte,
     whatever those bytes are -- so it is kept. Everything else stays None,
-    which is what settle() records as "not measured" rather than as zero.
+    which is what settle() records as "not measured" rather than as zero --
+    except a transcription's JSON ``duration``, read from a small bounded copy
+    when the body starts as JSON (never an MP3), for per-minute pricing.
     """
+
+    LIMIT = 64 * 1024
 
     def __init__(self, started: float) -> None:
         self.started = started
         self.usage = _Usage()
+        self._head = bytearray()
+        self._json: bool | None = None
 
     def note_chunk(self, chunk: bytes, now: float) -> None:
         if self.usage.ttft_s is None:
             self.usage.ttft_s = now - self.started
+        if self._json is None and chunk.strip():
+            self._json = chunk.lstrip()[:1] == b"{"
+        if self._json and len(self._head) <= self.LIMIT:
+            self._head.extend(chunk[: self.LIMIT + 1 - len(self._head)])
 
     def finish(self, now: float) -> _Usage:
+        if self._json and len(self._head) <= self.LIMIT:
+            self.usage.audio_duration_s = audio_duration_of(bytes(self._head))
         return self.usage
 
 
+#: The only client headers any upstream is sent (finding L11). Everything else
+#: -- the client's own ``authorization`` and ``cookie``, ``openai-organization``
+#: naming somebody else's account, an ``x-forwarded-for`` the client chose --
+#: describes the client's relationship with derate, not derate's with the
+#: upstream. A REMOTE target gets the provider's key instead; a LOCAL one its
+#: runtime key. ``x-request-id`` is not the client's to choose either: the
+#: upstream is sent derate's trace id, so an engine's log joins the
+#: ``requests`` row and a client cannot forge the id it records (K10).
+_FORWARDED_REQUEST_HEADERS = frozenset(
+    {"content-type", "accept", "user-agent", "openai-beta"}
+)
+
+
 def _forward_request_headers(incoming: dict[str, str]) -> dict[str, str]:
-    out = {}
-    for key, value in incoming.items():
-        lowered = key.lower()
-        if lowered in _HOP_BY_HOP or lowered == "authorization":
-            continue
-        out[key] = value
+    return {
+        key: value
+        for key, value in incoming.items()
+        if key.lower() in _FORWARDED_REQUEST_HEADERS
+    }
+
+
+def _trace_record(
+    trace,
+    usage: _Usage | None,
+    *,
+    selection,
+    attempt_no: int,
+    retry_reason: str,
+    status: int | None,
+    error_class: str,
+    duration_s: float,
+    error_message: str | None = None,
+    retry_after_s: float | None = None,
+):
+    """One attempt's row. Shared by both forward paths so neither drifts."""
+    rate = getattr(getattr(selection, "model", None), "price_per_minute_usd", None)
+    seconds = None if usage is None else usage.audio_duration_s
+    record = trace.record(
+        selection=selection,
+        attempt_no=attempt_no,
+        retry_reason=retry_reason,
+        status=status,
+        error_class=error_class,
+        tokens=0 if usage is None else usage.tokens,
+        completion_tokens=None if usage is None else usage.completion_tokens,
+        prompt_tokens=None if usage is None else usage.prompt_tokens,
+        tokens_estimated=True if usage is None else usage.estimated,
+        ttft_s=None if usage is None else usage.ttft_s,
+        decode_s=None if usage is None else usage.decode_s,
+        duration_s=duration_s,
+        finish_reason=None if usage is None else usage.finish_reason,
+        cancelled=error_class == "ClientDisconnected",
+        generation_s=None if usage is None else usage.generation_s,
+        tpot_mean_ms=None if usage is None else usage.tpot_mean_ms,
+        tpot_p95_ms=None if usage is None else usage.tpot_p95_ms,
+        tail_ms=None if usage is None else usage.tail_ms,
+        reasoning_tokens=None if usage is None else usage.reasoning_tokens,
+        cache_read_tokens=None if usage is None else usage.cache_read_tokens,
+        cache_write_tokens=None if usage is None else usage.cache_write_tokens,
+        # Metered for audio when a per-minute rate exists; otherwise None and
+        # the request settles unpriced, as before (K5r).
+        cost_usd=rate * seconds / 60.0 if rate is not None and seconds is not None else None,
+    )
+    if error_message is not None:
+        record = replace(record, attempt_chain=[{
+            "target_id": record.target_id,
+            "status": record.status,
+            "error_class": record.error_class or None,
+            "retry_reason": record.retry_reason or None,
+            "ms": record.duration_ms,
+            "error_message": error_message,
+            "retry_after_s": retry_after_s,
+        }])
+    return record
+
+
+#: What a client is shown of an upstream's response headers: the provider
+#: path's allowlist (finding K6), plus ``content-encoding`` because this path
+#: relays ``aiter_raw()`` bytes and the header has to travel with them.
+#: ``x-request-id`` is derate's own trace id, set below, never the upstream's.
+_RESPONSE_PASS = RESPONSE_HEADER_ALLOWLIST | {"content-encoding"}
+
+
+def _forward_response_headers(
+    headers: httpx.Headers, request_id: str | None = None
+) -> dict[str, str]:
+    out = {k: v for k, v in headers.items() if k.lower() in _RESPONSE_PASS}
+    if request_id:
+        out["x-request-id"] = request_id
     return out
-
-
-def _forward_response_headers(headers: httpx.Headers) -> dict[str, str]:
-    return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
 
 def _scrub_upstream_body(body: bytes, api_key: str | None) -> bytes:
@@ -457,7 +680,11 @@ class UpstreamProxy:
             max_connections=self._settings.upstream_per_origin_limit,
             max_keepalive_connections=self._settings.upstream_per_origin_limit,
         )
-        client = httpx.AsyncClient(timeout=timeout, limits=limits)
+        # identity: an upstream error body is scrubbed for key material before
+        # a client sees it, and a scrubber cannot read gzip (finding K4).
+        client = httpx.AsyncClient(
+            timeout=timeout, limits=limits, headers={"accept-encoding": "identity"}
+        )
         self._clients[origin] = (client, now)
         return client
 
@@ -553,6 +780,29 @@ class UpstreamProxy:
         if self._breaker is not None:
             self._breaker.record_success(target_id)
 
+    def _emit(self, trace, usage, on_record, *, failed: bool, selection, **fields) -> None:
+        """Write one attempt's row, after ``on_record`` has had its say.
+
+        ``on_record(record, failed=, selection=)`` is the caller's hook: it
+        returns the row to write (with the attempt chain, cost and basis
+        filled in) and is where the request's limits are settled. A hook that
+        fails still leaves the row written as it stood.
+        """
+        try:
+            record = _trace_record(trace, usage, selection=selection, **fields)
+        except Exception:
+            log.debug("could not record request telemetry", exc_info=True)
+            return
+        if on_record is not None:
+            try:
+                record = on_record(record, failed=failed or usage is None, selection=selection)
+            except Exception:
+                log.exception("request accounting failed for %s", trace.request_id)
+        try:
+            self._sink.request(record)
+        except Exception:
+            log.debug("could not record request telemetry", exc_info=True)
+
     async def forward(
         self,
         *,
@@ -570,6 +820,7 @@ class UpstreamProxy:
         content_type: str | None = None,
         count_tokens: bool = True,
         reopen=None,
+        on_record=None,
     ) -> Attempt:
         """One target's turn. Returns an :class:`Attempt`, not a response.
 
@@ -599,17 +850,22 @@ class UpstreamProxy:
         # content-type, boundary included -- re-encoding it would mean parsing
         # and rebuilding an audio file to change nothing about it.
         headers["content-type"] = content_type or "application/json"
+        # Uncompressed, on an injected client too: an error body is scrubbed
+        # before it is relayed, and gzip would hide a key from the scrubber.
+        headers["accept-encoding"] = "identity"
+        rid = trace.request_id if trace is not None else None
+        if rid:
+            headers["x-request-id"] = rid
 
-        if target.kind is TargetKind.REMOTE:
-            if api_key:
-                headers["authorization"] = f"Bearer {api_key}"
-        else:
-            incoming_auth = next(
-                (v for k, v in client_headers.items() if k.lower() == "authorization"),
-                None,
-            )
-            if incoming_auth:
-                headers["authorization"] = incoming_auth
+        # Only a REMOTE target is sent a credential, and it is the provider's
+        # own. The client's key is derate's, and a LOCAL backend is never
+        # handed it: _forward_request_headers has already dropped it.
+        if target.kind is TargetKind.REMOTE and api_key:
+            headers["authorization"] = f"Bearer {api_key}"
+        elif target.kind is TargetKind.LOCAL and target.runtime_api_key:
+            # H3: the engine requires its per-deployment key; the gateway is
+            # its only holder.
+            headers["authorization"] = f"Bearer {target.runtime_api_key}"
 
         target_stats = stats.get(target.target_id)
         target_stats.begin()
@@ -620,7 +876,7 @@ class UpstreamProxy:
         if not count_tokens:
             accounting = _NoAccounting(started)
         elif streaming:
-            accounting = _StreamAccounting(started)
+            accounting = _StreamAccounting(started, on_tokens=target_stats.note_tokens)
         else:
             accounting = _BodyAccounting(started)
         finished = False
@@ -632,13 +888,17 @@ class UpstreamProxy:
             status: int | None = None,
             retry_reason: str = "",
             error_class: str = "",
+            truncated: bool = False,
         ) -> None:
             nonlocal finished
             if finished:
                 return
             finished = True
             duration = time.monotonic() - started
-            if failed or usage is None:
+            # A stream cut short is served (and counted against the key) but
+            # says nothing about how fast this target is, so it never feeds
+            # the strength EWMA.
+            if failed or usage is None or truncated:
                 target_stats.fail()
             else:
                 target_stats.complete(
@@ -646,29 +906,16 @@ class UpstreamProxy:
                     duration_s=duration,
                     decode_s=usage.decode_s,
                     ttft_s=usage.ttft_s,
+                    already_counted=getattr(accounting, "live", 0),
                 )
             # The numbers above are folded into an EWMA and are unrecoverable
             # from here on. This is the one moment they exist as themselves.
             if trace is not None:
-                try:
-                    self._sink.request(
-                        trace.record(
-                            selection=selection,
-                            attempt_no=attempt_no,
-                            retry_reason=retry_reason,
-                            status=status,
-                            error_class=error_class,
-                            tokens=0 if usage is None else usage.tokens,
-                            completion_tokens=None if usage is None else usage.completion_tokens,
-                            prompt_tokens=None if usage is None else usage.prompt_tokens,
-                            tokens_estimated=True if usage is None else usage.estimated,
-                            ttft_s=None if usage is None else usage.ttft_s,
-                            decode_s=None if usage is None else usage.decode_s,
-                            duration_s=duration,
-                        )
-                    )
-                except Exception:
-                    log.debug("could not record request telemetry", exc_info=True)
+                self._emit(
+                    trace, usage, on_record, failed=failed, selection=selection,
+                    attempt_no=attempt_no, retry_reason=retry_reason, status=status,
+                    error_class=error_class, duration_s=duration,
+                )
             if on_finish is not None:
                 on_finish()
 
@@ -749,7 +996,7 @@ class UpstreamProxy:
                 reason=RETRY_SERVER_ERROR,
                 target_id=target.target_id,
                 status=response.status_code,
-                headers=_forward_response_headers(response.headers),
+                headers=_forward_response_headers(response.headers, rid),
                 body=captured,
             )
 
@@ -772,7 +1019,7 @@ class UpstreamProxy:
                 response=Response(
                     content=captured,
                     status_code=response.status_code,
-                    headers=_forward_response_headers(response.headers),
+                    headers=_forward_response_headers(response.headers, rid),
                 ),
                 target_id=target.target_id,
             )
@@ -889,13 +1136,23 @@ class UpstreamProxy:
                 )
             except httpx.HTTPError as exc:
                 self._note_transport_failure(target.target_id)
-                if committed or reopen is None:
+                replacement = None
+                if not committed and reopen is not None:
+                    replacement = await reopen(sent_content_type)
+                if replacement is None:
                     # Rule 1: a body the client has already begun reading is
                     # never rewritten. Past the first byte this is somebody
-                    # else's stream only in the sense that it is broken.
-                    raise
-                replacement = await reopen(sent_content_type)
-                if replacement is None:
+                    # else's stream only in the sense that it is broken. The
+                    # row keeps what did get through; the request's limits
+                    # count it from the reservation (the transfer started).
+                    settle(
+                        accounting.finish(time.monotonic()),
+                        failed=True,
+                        status=response.status_code,
+                        retry_reason=RETRY_TRANSPORT,
+                        error_class=type(exc).__name__,
+                        truncated=True,
+                    )
                     raise
                 log.info(
                     "%s died before the client saw a byte; finishing from "
@@ -932,7 +1189,19 @@ class UpstreamProxy:
                 # already cancelled, so a bare `await response.aclose()` raises
                 # at its first checkpoint and the connection is never returned.
                 # `close_quietly` shields it. Do not unwrap it.
-                settle(None, failed=True, error_class="ClientDisconnected")
+                #
+                # A client that hangs up was still *served*: the upstream ran
+                # the prompt and every token up to the hang-up, and a provider
+                # bills for all of it. So this is settled with what was seen,
+                # not voided -- voiding is how a key streamed without being
+                # counted (finding H5).
+                settle(
+                    accounting.finish(time.monotonic()),
+                    failed=False,
+                    status=response.status_code,
+                    error_class="ClientDisconnected",
+                    truncated=True,
+                )
                 self._release(response)
                 await close_quietly(response)
 
@@ -946,7 +1215,7 @@ class UpstreamProxy:
             response=StreamingResponse(
                 stream_body(),
                 status_code=response.status_code,
-                headers=_forward_response_headers(response.headers),
+                headers=_forward_response_headers(response.headers, rid),
             ),
             target_id=target.target_id,
             discard=discard,
@@ -959,7 +1228,7 @@ class UpstreamProxy:
         provider_id: str,
         upstream_id: str,
         path: str,
-        body: dict,
+        body: dict | None,
         stats: StatsRegistry,
         streaming: bool,
         open_upstream,
@@ -968,6 +1237,7 @@ class UpstreamProxy:
         trace=None,
         attempt_no: int = 0,
         reopen=None,
+        on_record=None,
         content: bytes | None = None,
         content_type: str | None = None,
         open_upstream_raw=None,
@@ -991,19 +1261,23 @@ class UpstreamProxy:
         anything was sent. That is not a backend failure to replay -- there
         is nothing of the backend's to replay -- it is a reason for the
         caller to try a different target right away.
+
+        ``content`` is an opaque upload (a transcription) forwarded under the
+        client's ``content_type`` instead of ``body``: it goes through the same
+        provider gate and spend accounting as a JSON request (finding K5) and,
+        like :meth:`forward`'s audio path, counts no tokens.
         """
         target_stats = stats.get(target.target_id)
         target_stats.begin()
         started = time.monotonic()
-        if not count_tokens:
-            # The response is audio bytes: there is no usage block in it and
-            # buffering it to look for one costs a megabyte to learn nothing.
-            # `forward` has had this branch all along; this method did not.
+        if not count_tokens or content is not None:
+            # An opaque upload, or audio bytes: no usage block to look for, and
+            # buffering the body to look for one costs a megabyte to learn nothing.
             accounting = _NoAccounting(started)
+        elif streaming:
+            accounting = _StreamAccounting(started, on_tokens=target_stats.note_tokens)
         else:
-            accounting = (
-                _StreamAccounting(started) if streaming else _BodyAccounting(started)
-            )
+            accounting = _BodyAccounting(started)
         finished = False
 
         def settle(
@@ -1013,13 +1287,17 @@ class UpstreamProxy:
             status: int | None = None,
             retry_reason: str = "",
             error_class: str = "",
+            truncated: bool = False,
+            error_message: str | None = None,
+            retry_after_s: float | None = None,
         ) -> None:
             nonlocal finished
             if finished:
                 return
             finished = True
             duration = time.monotonic() - started
-            if failed or usage is None:
+            # See forward(): a truncated stream is counted, never timed.
+            if failed or usage is None or truncated:
                 target_stats.fail()
             else:
                 target_stats.complete(
@@ -1027,6 +1305,7 @@ class UpstreamProxy:
                     duration_s=duration,
                     decode_s=usage.decode_s,
                     ttft_s=usage.ttft_s,
+                    already_counted=getattr(accounting, "live", 0),
                 )
             # Mirrors forward(): the one moment these numbers exist as
             # themselves, before they are folded into an EWMA. Without this a
@@ -1034,25 +1313,12 @@ class UpstreamProxy:
             # once the providers port exposes open_upstream -- exactly the
             # failure RequestTrace exists to prevent (audit H-9).
             if trace is not None:
-                try:
-                    self._sink.request(
-                        trace.record(
-                            selection=selection,
-                            attempt_no=attempt_no,
-                            retry_reason=retry_reason,
-                            status=status,
-                            error_class=error_class,
-                            tokens=0 if usage is None else usage.tokens,
-                            completion_tokens=None if usage is None else usage.completion_tokens,
-                            prompt_tokens=None if usage is None else usage.prompt_tokens,
-                            tokens_estimated=True if usage is None else usage.estimated,
-                            ttft_s=None if usage is None else usage.ttft_s,
-                            decode_s=None if usage is None else usage.decode_s,
-                            duration_s=duration,
-                        )
-                    )
-                except Exception:
-                    log.debug("could not record request telemetry", exc_info=True)
+                self._emit(
+                    trace, usage, on_record, failed=failed, selection=selection,
+                    attempt_no=attempt_no, retry_reason=retry_reason, status=status,
+                    error_class=error_class, duration_s=duration,
+                    error_message=error_message, retry_after_s=retry_after_s,
+                )
             if on_finish is not None:
                 on_finish()
 
@@ -1061,15 +1327,23 @@ class UpstreamProxy:
         # there -- every branch below except the final one -- the generator
         # is already fully unwound and __aexit__ must not be called: the
         # context manager was never successfully entered.
-        if content is not None:
+        extra: dict = {}
+        if trace is not None:
+            extra["request_id"] = trace.request_id
+        if content is not None and open_upstream_raw is not None:
             # An opaque upload: multipart, which has no dict to build a payload
             # from. Same class, same gates, same accounting -- only the body
             # differs. See ProviderService.open_upstream_raw.
             manager = open_upstream_raw(
-                provider_id, upstream_id, content, content_type, endpoint=path
+                provider_id, upstream_id, content, content_type, endpoint=path, **extra
             )
         else:
-            manager = open_upstream(provider_id, upstream_id, body, streaming, endpoint=path)
+            if content is not None:
+                extra["content"] = content
+                extra["content_type"] = content_type
+            manager = open_upstream(
+                provider_id, upstream_id, body, streaming, endpoint=path, **extra
+            )
         try:
             upstream = await manager.__aenter__()
         except ProviderNotAdmittingError:
@@ -1188,7 +1462,12 @@ class UpstreamProxy:
                     headers=headers,
                     body=exc.body.encode("utf-8", "replace"),
                 )
-            settle(None, failed=True, status=exc.status_code)
+            settle(
+                None, failed=True, status=exc.status_code,
+                error_class="RateLimitError" if exc.status_code == 429 else "",
+                error_message=exc.message if exc.status_code == 429 else None,
+                retry_after_s=exc.retry_after_s,
+            )
             return Attempt(
                 response=Response(
                     content=exc.body.encode("utf-8", "replace"),
@@ -1250,6 +1529,20 @@ class UpstreamProxy:
 
         sent_content_type = upstream.headers.get("content-type") if upstream.headers else None
 
+        def settle_body(**fields) -> None:
+            # ProviderService owns adapter classification. The HTTP response
+            # stays 200 once streaming starts, but history must name the
+            # logical error, even if the client closes on its error frame.
+            error = upstream.error
+            if error is not None:
+                fields.update(
+                    failed=True, status=error.status_code,
+                    error_class="RateLimitError" if error.status_code == 429 else "UpstreamError",
+                    error_message=error.message if error.status_code == 429 else None,
+                    retry_after_s=error.retry_after_s,
+                )
+            settle(accounting.finish(time.monotonic()), **fields)
+
         async def stream_body():
             exc_info: tuple = (None, None, None)
             # See `forward`: bytes the CLIENT has seen, which is what decides
@@ -1264,8 +1557,7 @@ class UpstreamProxy:
                     accounting.note_chunk(chunk, time.monotonic())
                     committed += len(chunk)
                     yield chunk
-                settle(
-                    accounting.finish(time.monotonic()),
+                settle_body(
                     failed=False,
                     status=upstream.status_code,
                 )
@@ -1314,8 +1606,9 @@ class UpstreamProxy:
                 # goes to the provider's own context manager below: passing
                 # None there would tell ProviderService.open_upstream this
                 # transfer finished cleanly, and it would call
-                # runtime.note_success() and record spend for one that did
-                # not (service.py's post-yield path).
+                # runtime.note_success() for one that did not. (It records
+                # the spend either way once the body was read: a provider
+                # bills a stream the client walked away from.)
                 if isinstance(exc, httpx.HTTPError):
                     self._note_transport_failure(target.target_id)
                 exc_info = (type(exc), exc, exc.__traceback__)
@@ -1330,7 +1623,28 @@ class UpstreamProxy:
                 # already-cancelled anyio scope, where an unshielded await
                 # raises at once and the provider's context manager never gets
                 # to release its connection.
-                settle(None, failed=True)
+                #
+                # What it settles with is what was served: a hang-up is
+                # counted against the key, not voided (finding H5), and a
+                # transfer that broke keeps its partial counts on the row.
+                kind = exc_info[0]
+                if kind is None or issubclass(kind, (GeneratorExit, asyncio.CancelledError)):
+                    settle_body(
+                        failed=False,
+                        status=upstream.status_code,
+                        error_class="ClientDisconnected",
+                        truncated=True,
+                    )
+                else:
+                    settle_body(
+                        failed=True,
+                        status=upstream.status_code,
+                        retry_reason=(
+                            RETRY_TRANSPORT if issubclass(kind, httpx.HTTPError) else ""
+                        ),
+                        error_class=kind.__name__,
+                        truncated=True,
+                    )
                 if not torn_down:
                     with anyio.CancelScope(shield=True):
                         try:

@@ -17,6 +17,7 @@ percentiles. That distinction is the whole reason for the blob columns.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 
 STEP_1M = 60
 STEP_1H = 3600
+STEP_1D = 86400
 
 #: A bucket is only rolled once it is closed and has had a moment to settle,
 #: so an in-flight second does not produce a rollup row that is wrong the
@@ -161,6 +163,14 @@ def compact(archive: Archive, now: float | None = None) -> dict[str, Any]:
     dirty = archive.take_dirty_from()
     roll_to = now - ROLL_LAG_S
     roll_from = min(dirty, now - REROLL_WINDOW_S) if dirty else now - REROLL_WINDOW_S
+    # A schema migration dropped the request rollups; rebuild them from the
+    # whole raw window once. Cleared only after the pass below committed.
+    reroll = archive.take_reroll_pending()
+    if reroll:
+        with archive.lock:
+            oldest = archive.conn.execute("SELECT MIN(ts) AS t FROM requests").fetchone()["t"]
+        if oldest is not None:
+            roll_from = min(roll_from, float(oldest))
     roll_from = _floor(roll_from, STEP_1H)
 
     # One lock for the whole pass. Compaction rewrites the same tables the
@@ -177,6 +187,10 @@ def compact(archive: Archive, now: float | None = None) -> dict[str, Any]:
         if roll_to > roll_from:
             report["rolled_1m"] = _roll(conn, archive, roll_from, roll_to, STEP_1M)
             report["rolled_1h"] = _roll(conn, archive, roll_from, roll_to, STEP_1H)
+            report["rolled_1d"] = _roll(conn, archive, roll_from, roll_to, STEP_1D)
+        if reroll:
+            archive.clear_reroll_pending()
+            report["rerolled"] = True
 
         report["deleted"] = _expire(conn, now)
         report["size_trimmed"] = _enforce_size(archive, now)
@@ -222,7 +236,7 @@ def _roll(conn, archive: Archive, from_ts: float, to_ts: float, step: int) -> in
         try:
             if step == STEP_1M:
                 conn.execute(_SAMPLE_ROLL_1M, (step, step, step, start, stop, step))
-            else:
+            elif step == STEP_1H:
                 conn.execute(
                     _SAMPLE_ROLL_1H,
                     (step, step, step, STEP_1M, start, stop, step),
@@ -236,112 +250,337 @@ def _roll(conn, archive: Archive, from_ts: float, to_ts: float, step: int) -> in
     return rolled
 
 
+#: Rollup dimensions, in primary-key order after (step, bucket). Raw NULLs
+#: become '' (or 0 for status) because a NULL in a primary key never collides.
+_DIMS = (
+    "served_name",
+    "target_id",
+    "node_id",
+    "provider_id",
+    "key_id",
+    "org_id",
+    "context_bucket",
+    "status",
+)
+
+_HISTS = (
+    ("ttft", "ttft_hist"),
+    ("duration", "duration_hist"),
+    ("queue", "queue_hist"),
+    ("tpot", "tpot_hist"),
+    ("tps", "tps_hist"),
+)
+
+#: Raw column feeding each histogram.
+_RAW_HIST_COL = {
+    "ttft": "ttft_ms",
+    "duration": "duration_ms",
+    "queue": "parked_ms",
+    "tpot": "tpot_mean_ms",
+    "tps": "tokens_per_s",
+}
+
+#: Optional sums, each paired with the count of rows that contributed to it so
+#: an average divides by the rows that reported, never by all of them.
+_OPT_SUMS = (
+    ("reasoning_tokens", "reasoning_n"),
+    ("cache_read_tokens", "cache_n"),
+    ("cache_write_tokens", "cache_write_n"),
+)
+
+_SPEC_SUMS = ("spec_drafts", "spec_draft_tokens", "spec_accepted_tokens")
+
+_ROLLUP_COLS = (
+    "step",
+    "bucket",
+    *_DIMS,
+    "n",
+    "ok",
+    "failed",
+    "cancelled",
+    "fallback",
+    "tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "reasoning_n",
+    "cache_read_tokens",
+    "cache_n",
+    "cache_prompt_tokens",
+    "cache_write_tokens",
+    "cache_write_n",
+    "cost_usd",
+    "metered_usd",
+    "estimated_usd",
+    "unpriced_n",
+    "errors_json",
+    "spec_n",
+    "spec_drafts",
+    "spec_draft_tokens",
+    "spec_accepted_tokens",
+    "spec_per_position_json",
+    "spec_error_json",
+    "cache_error_json",
+    *(col for _, col in _HISTS),
+)
+
+_INSERT_ROLLUP = (
+    "INSERT OR REPLACE INTO rollup_requests("
+    + ", ".join(_ROLLUP_COLS)
+    + ") VALUES("
+    + ", ".join("?" * len(_ROLLUP_COLS))
+    + ")"
+)
+
+
 def _roll_requests(conn, from_ts: float, to_ts: float, step: int) -> int:
     """Request rollups, in Python because the histograms are not SQL.
 
-    The 1-minute step reads raw rows; the hourly step merges the 1-minute
-    blobs rather than re-reading raw, so hours survive the raw rows expiring.
+    1m reads raw rows; 1h merges 1m rows and 1d merges 1h rows, so each tier
+    survives the one below it expiring. Histograms are merged bucket-wise
+    (exact), never averaged; counters and the JSON count maps are summed.
     """
-    groups: dict[tuple, dict[str, Any]] = {}
+    groups: dict[tuple, _Group] = {}
 
     if step == STEP_1M:
+        # Final attempts only: a request retried onto another target counts
+        # once, with the outcome the client received.
         rows = conn.execute(
-            "SELECT ts, served_name, target_id, status, tokens, prompt_tokens, "
-            "cost_usd, ttft_ms, duration_ms FROM requests "
-            "WHERE ts >= ? AND ts < ?",
-            (from_ts, to_ts),
+            "SELECT r.* FROM requests r JOIN ("
+            "SELECT request_id, MAX(attempt_no) AS a FROM requests "
+            "WHERE ts >= ? AND ts < ? GROUP BY request_id) f "
+            "ON r.request_id = f.request_id AND r.attempt_no = f.a "
+            "WHERE r.ts >= ? AND r.ts < ?",
+            (from_ts, to_ts, from_ts, to_ts),
         )
         for r in rows:
-            key = (int(r["ts"] // step) * step, r["served_name"] or "", r["target_id"] or "")
+            key = (int(r["ts"] // step) * step, *_dims_of(r))
             g = groups.get(key)
             if g is None:
-                g = groups[key] = _empty_group()
-            status = r["status"]
-            g["n"] += 1
-            if status is not None and 200 <= int(status) < 400:
-                g["ok"] += 1
-            else:
-                g["failed"] += 1
-            g["tokens"] += int(r["tokens"] or 0)
-            g["prompt_tokens"] += int(r["prompt_tokens"] or 0)
-            g["cost_usd"] += float(r["cost_usd"] or 0.0)
-            if r["ttft_ms"] is not None:
-                g["ttft"].add(float(r["ttft_ms"]))
-            if r["duration_ms"] is not None:
-                g["duration"].add(float(r["duration_ms"]))
+                g = groups[key] = _Group()
+            g.add_raw(r)
     else:
+        source = STEP_1M if step == STEP_1H else STEP_1H
         rows = conn.execute(
-            "SELECT bucket, served_name, target_id, n, ok, failed, tokens, "
-            "prompt_tokens, cost_usd, ttft_hist, duration_hist FROM rollup_requests "
-            "WHERE step = ? AND bucket >= ? AND bucket < ?",
-            (STEP_1M, from_ts, to_ts),
+            "SELECT * FROM rollup_requests WHERE step = ? AND bucket >= ? AND bucket < ?",
+            (source, from_ts, to_ts),
         )
         for r in rows:
-            key = (int(r["bucket"] // step) * step, r["served_name"] or "", r["target_id"] or "")
+            key = (int(r["bucket"] // step) * step, *(r[d] for d in _DIMS))
             g = groups.get(key)
             if g is None:
-                g = groups[key] = _empty_group()
-            g["n"] += int(r["n"] or 0)
-            g["ok"] += int(r["ok"] or 0)
-            g["failed"] += int(r["failed"] or 0)
-            g["tokens"] += int(r["tokens"] or 0)
-            g["prompt_tokens"] += int(r["prompt_tokens"] or 0)
-            g["cost_usd"] += float(r["cost_usd"] or 0.0)
-            g["ttft"].merge(Hist.from_blob(r["ttft_hist"]))
-            g["duration"].merge(Hist.from_blob(r["duration_hist"]))
+                g = groups[key] = _Group()
+            g.add_rollup(r)
 
     if not groups:
         return 0
     conn.executemany(
-        "INSERT OR REPLACE INTO rollup_requests(step, bucket, served_name, "
-        "target_id, n, ok, failed, tokens, prompt_tokens, cost_usd, ttft_hist, "
-        "duration_hist) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            (
-                step,
-                bucket,
-                served,
-                target,
-                g["n"],
-                g["ok"],
-                g["failed"],
-                g["tokens"],
-                g["prompt_tokens"],
-                g["cost_usd"],
-                g["ttft"].to_blob(),
-                g["duration"].to_blob(),
-            )
-            for (bucket, served, target), g in groups.items()
-        ],
+        _INSERT_ROLLUP,
+        [(step, *key, *g.measures()) for key, g in groups.items()],
     )
     return len(groups)
 
 
-def _empty_group() -> dict[str, Any]:
-    return {
-        "n": 0,
-        "ok": 0,
-        "failed": 0,
-        "tokens": 0,
-        "prompt_tokens": 0,
-        "cost_usd": 0.0,
-        "ttft": Hist(),
-        "duration": Hist(),
-    }
+def _dims_of(r) -> tuple:
+    status = r["status"]
+    return (
+        r["served_name"] or "",
+        r["target_id"] or "",
+        r["node_id"] or "",
+        r["provider_id"] or "",
+        r["key_id"] or "",
+        r["org_id"] or "",
+        r["context_bucket"] or "",
+        int(status) if status is not None else 0,
+    )
+
+
+def _bump(counts: dict[str, int], key: str | None, n: int = 1) -> None:
+    if key:
+        counts[key] = counts.get(key, 0) + n
+
+
+def _counts(text: str | None) -> dict[str, int]:
+    if not text:
+        return {}
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _add_positions(into: list[int] | None, more) -> list[int] | None:
+    """Element-wise sum of two per-position lists of possibly different length."""
+    if more is None:
+        return into
+    out = list(into or [])
+    for i, v in enumerate(more):
+        if i < len(out):
+            out[i] += int(v)
+        else:
+            out.append(int(v))
+    return out
+
+
+def _opt_add(a, b):
+    if b is None:
+        return a
+    return b if a is None else a + b
+
+
+class _Group:
+    """One rollup row being accumulated."""
+
+    def __init__(self) -> None:
+        self.n = self.ok = self.failed = self.cancelled = self.fallback = 0
+        self.tokens = self.prompt_tokens = self.completion_tokens = 0
+        self.opt: dict[str, Any] = {name: None for name, _ in _OPT_SUMS}
+        self.opt_n: dict[str, int] = {cnt: 0 for _, cnt in _OPT_SUMS}
+        self.cache_prompt_tokens = 0
+        self.cost_usd = 0.0
+        self.metered_usd: float | None = None
+        self.estimated_usd: float | None = None
+        self.unpriced_n = 0
+        self.errors: dict[str, int] = {}
+        self.spec_n = 0
+        self.spec: dict[str, Any] = {name: None for name in _SPEC_SUMS}
+        self.spec_positions: list[int] | None = None
+        self.spec_errors: dict[str, int] = {}
+        self.cache_errors: dict[str, int] = {}
+        self.hists = {name: Hist() for name, _ in _HISTS}
+
+    def add_raw(self, r) -> None:
+        status = r["status"]
+        self.n += 1
+        if status is not None and 200 <= int(status) < 400:
+            self.ok += 1
+        else:
+            self.failed += 1
+        self.cancelled += 1 if r["cancelled"] else 0
+        self.fallback += 1 if r["fallback_used"] else 0
+        self.tokens += int(r["tokens"] or 0)
+        self.prompt_tokens += int(r["prompt_tokens"] or 0)
+        self.completion_tokens += int(r["completion_tokens"] or 0)
+        for name, cnt in _OPT_SUMS:
+            if r[name] is not None:
+                self.opt[name] = (self.opt[name] or 0) + int(r[name])
+                self.opt_n[cnt] += 1
+        if r["cache_read_tokens"] is not None:
+            self.cache_prompt_tokens += int(r["prompt_tokens"] or 0)
+        cost = r["cost_usd"]
+        basis = r["cost_basis"]
+        self.cost_usd += float(cost or 0.0)
+        if basis == "metered" and cost is not None:
+            self.metered_usd = _opt_add(self.metered_usd, float(cost))
+        elif basis == "estimated" and cost is not None:
+            self.estimated_usd = _opt_add(self.estimated_usd, float(cost))
+        elif basis == "unpriced":
+            self.unpriced_n += 1
+        _bump(self.errors, r["error_class"] or r["error_code"])
+        if r["spec_num_drafts"] is not None:
+            self.spec_n += 1
+            self.spec["spec_drafts"] = _opt_add(self.spec["spec_drafts"], int(r["spec_num_drafts"]))
+            self.spec["spec_draft_tokens"] = _opt_add(
+                self.spec["spec_draft_tokens"], int(r["spec_draft_tokens"] or 0)
+            )
+            self.spec["spec_accepted_tokens"] = _opt_add(
+                self.spec["spec_accepted_tokens"], int(r["spec_accepted_tokens"] or 0)
+            )
+            per_pos = r["spec_accepted_per_position"]
+            if per_pos:
+                try:
+                    self.spec_positions = _add_positions(self.spec_positions, json.loads(per_pos))
+                except ValueError:
+                    pass
+        _bump(self.spec_errors, r["spec_decode_error"])
+        _bump(self.cache_errors, r["cache_error"])
+        for name, col in _RAW_HIST_COL.items():
+            if r[col] is not None:
+                self.hists[name].add(float(r[col]))
+
+    def add_rollup(self, r) -> None:
+        for attr in ("n", "ok", "failed", "cancelled", "fallback", "tokens",
+                     "prompt_tokens", "completion_tokens", "cache_prompt_tokens",
+                     "unpriced_n", "spec_n"):
+            setattr(self, attr, getattr(self, attr) + int(r[attr] or 0))
+        for name, cnt in _OPT_SUMS:
+            self.opt[name] = _opt_add(self.opt[name], r[name])
+            self.opt_n[cnt] += int(r[cnt] or 0)
+        self.cost_usd += float(r["cost_usd"] or 0.0)
+        self.metered_usd = _opt_add(self.metered_usd, r["metered_usd"])
+        self.estimated_usd = _opt_add(self.estimated_usd, r["estimated_usd"])
+        for name in _SPEC_SUMS:
+            self.spec[name] = _opt_add(self.spec[name], r[name])
+        if r["spec_per_position_json"]:
+            try:
+                self.spec_positions = _add_positions(
+                    self.spec_positions, json.loads(r["spec_per_position_json"])
+                )
+            except ValueError:
+                pass
+        for target, col in (
+            (self.errors, "errors_json"),
+            (self.spec_errors, "spec_error_json"),
+            (self.cache_errors, "cache_error_json"),
+        ):
+            for k, v in _counts(r[col]).items():
+                _bump(target, k, int(v))
+        for name, col in _HISTS:
+            self.hists[name].merge(Hist.from_blob(r[col]))
+
+    def measures(self) -> tuple:
+        def js(value) -> str | None:
+            return json.dumps(value, sort_keys=True, separators=(",", ":")) if value else None
+
+        return (
+            self.n,
+            self.ok,
+            self.failed,
+            self.cancelled,
+            self.fallback,
+            self.tokens,
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.opt["reasoning_tokens"],
+            self.opt_n["reasoning_n"],
+            self.opt["cache_read_tokens"],
+            self.opt_n["cache_n"],
+            self.cache_prompt_tokens,
+            self.opt["cache_write_tokens"],
+            self.opt_n["cache_write_n"],
+            self.cost_usd,
+            self.metered_usd,
+            self.estimated_usd,
+            self.unpriced_n,
+            js(self.errors),
+            self.spec_n,
+            self.spec["spec_drafts"],
+            self.spec["spec_draft_tokens"],
+            self.spec["spec_accepted_tokens"],
+            js(self.spec_positions),
+            js(self.spec_errors),
+            js(self.cache_errors),
+            *(self.hists[name].to_blob() for name, _ in _HISTS),
+        )
 
 
 # -- retention ---------------------------------------------------------------
 
 
 def _expire(conn, now: float) -> dict[str, int]:
-    # DERATE_TELEMETRY_RETENTION_DAYS moves every raw horizon together
-    # rather than only the samples one, so halving it halves the request and
-    # log windows too and the ratios between them are preserved. Unset, this
-    # is exactly 1.0.
+    # DERATE_TELEMETRY_RETENTION_DAYS moves every raw *telemetry* horizon
+    # together rather than only the samples one, so halving it halves the log
+    # window too and the ratios between them are preserved. Unset, this is
+    # exactly 1.0. The evidence tables -- `requests` and `access`, who asked
+    # for what from where -- are not telemetry and are not scaled: they keep
+    # DERATE_REQUESTS_RETENTION_DAYS (F10).
     scale = config.retention_days() * config.DAY_S / config.SAMPLES_RAW_RETENTION_S
+    evidence = config.requests_retention_days() * config.DAY_S
     horizons = (
         ("samples", "ts", config.SAMPLES_RAW_RETENTION_S * scale),
-        ("requests", "ts", config.REQUESTS_RAW_RETENTION_S * scale),
+        ("requests", "ts", evidence),
+        ("access", "ts", evidence),
         ("events", "ts", config.EVENTS_RETENTION_S * scale),
         ("logs", "ts", config.LOGS_RETENTION_S * scale),
         # `gaps` had no horizon at all -- the one table that grew forever.
@@ -365,12 +604,19 @@ def _expire(conn, now: float) -> dict[str, int]:
     n = conn.execute("DELETE FROM gaps WHERE to_ts <= from_ts").rowcount
     if n:
         deleted["gaps_degenerate"] = n
+    # The per-node daily budget only ever reads today's row.
+    n = conn.execute(
+        "DELETE FROM quota WHERE day < ?", (int(now // config.DAY_S) - 1,)
+    ).rowcount
+    if n:
+        deleted["quota"] = n
     # Rollup horizons are deliberately not scaled. They cost almost nothing,
     # and someone shortening the raw window to save disk wants a shorter raw
     # window, not a shorter memory.
     for step, window in (
         (STEP_1M, config.ROLLUP_1M_RETENTION_S),
         (STEP_1H, config.ROLLUP_1H_RETENTION_S),
+        (STEP_1D, config.ROLLUP_1D_RETENTION_S),
     ):
         cutoff = now - window
         for table in ("rollup_samples", "rollup_requests"):
@@ -382,28 +628,74 @@ def _expire(conn, now: float) -> dict[str, int]:
     return deleted
 
 
+#: An agent's or a shell's own record of what it did and refused: evidence.
+_AGENT_EVENTS = "source IN ('agent', 'shell')"
+
+#: Evicted first under the size cap: telemetry, not evidence. Each entry is a
+#: table and the rows of it the tier owns (an empty clause is every row).
+_TELEMETRY_TABLES = (
+    ("samples", ""),
+    ("logs", ""),
+    ("events", f"source IS NULL OR NOT ({_AGENT_EVENTS})"),
+)
+#: Next: requests nobody was authenticated for. An anonymous flood writes one
+#: access row per request, and it must cost its own rows before it costs the
+#: attributed record (EV-1).
+_ANONYMOUS_TABLES = (("access", "who IS NULL OR who = '-'"),)
+#: Evicted only once every row above is gone: the attribution record, and the
+#: agents' own (N-5).
+_EVIDENCE_TABLES = (("requests", ""), ("access", ""), ("events", _AGENT_EVENTS))
+
+_TIERS = (_TELEMETRY_TABLES, _ANONYMOUS_TABLES, _EVIDENCE_TABLES)
+
+
+def _scoped(clause: str) -> str:
+    return f" AND ({clause})" if clause else ""
+
+
+def _oldest(conn, tables: tuple[tuple[str, str], ...]) -> float | None:
+    found = [
+        conn.execute(
+            f"SELECT MIN(ts) AS t FROM {table} WHERE 1{_scoped(clause)}"
+        ).fetchone()["t"]
+        for table, clause in tables
+    ]
+    found = [t for t in found if t is not None]
+    return min(found) if found else None
+
+
 def _enforce_size(archive: Archive, now: float) -> int:
     """Drop the oldest raw day until the file fits, recording each as a gap.
 
-    The rollups for those days stay. Losing per-second detail to a disk
-    ceiling is a trade; losing the fact that the day happened is not.
+    Samples, logs and telemetry events go first, a day at a time; then
+    anonymous `access` rows; and only then `requests`, attributed `access`
+    and the agents' and shells' own events -- the record of who asked for
+    what from where, and of what a node did for whom. A disk ceiling costs
+    detail before it costs evidence, and an anonymous flood costs its own
+    rows before anybody else's. The rollups for evicted days stay. Losing
+    per-second detail to a disk ceiling is a trade; losing the fact that the
+    day happened is not.
     """
     conn = archive.conn
     dropped = 0
     for _ in range(MAX_EVICT_DAYS):
         if _file_bytes(conn) <= config.ARCHIVE_MAX_BYTES:
             break
-        row = conn.execute("SELECT MIN(ts) AS t FROM samples").fetchone()
-        oldest = row["t"] if row else None
+        tables: tuple[tuple[str, str], ...] = ()
+        oldest = None
+        for tables in _TIERS:
+            oldest = _oldest(conn, tables)
+            if oldest is not None:
+                break
         if oldest is None:
             return dropped
         stop = _floor(oldest, int(config.DAY_S)) + config.DAY_S
         before = dropped
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for table in ("samples", "requests", "logs"):
+            for table, clause in tables:
                 dropped += conn.execute(
-                    f"DELETE FROM {table} WHERE ts < ?", (stop,)
+                    f"DELETE FROM {table} WHERE ts < ?{_scoped(clause)}", (stop,)
                 ).rowcount
             for node in conn.execute(
                 "SELECT DISTINCT node_id FROM cursors"

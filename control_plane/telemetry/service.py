@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import config
 from .events import SOURCE_DEPLOY, GatewayEvents, journal_events
-from .records import NULL_SINK, TelemetrySink
+from .records import NULL_SINK, RecordsOnlySink, TelemetrySink
 
 if TYPE_CHECKING:
     from control_plane.deploy.events import EventBus
@@ -43,13 +43,22 @@ class Telemetry:
         *,
         coordinator: bool = True,
         reason: str = "",
+        records_only: bool = False,
     ) -> None:
+        # DERATE_TELEMETRY=0 with somewhere to write: a journal that keeps
+        # request and access rows and drops the rest, collected into an
+        # archive that the history and usage screens do not see -- telemetry
+        # is off, so they answer as off -- but forensics.py reads (F10).
+        self.records_only = records_only and journal is not None
         self.journal = journal
-        self.archive = archive
+        self.archive = None if self.records_only else archive
+        self._records_archive = archive if self.records_only else None
         self.collector = None
         self.coordinator = coordinator
         self.reason = reason
-        self.sink: TelemetrySink = journal or NULL_SINK
+        self.sink: TelemetrySink = (
+            RecordsOnlySink(journal) if self.records_only else (journal or NULL_SINK)
+        )
         self._gateway_events: GatewayEvents | None = None
         self._log_handler = None
         self._started = False
@@ -66,7 +75,9 @@ class Telemetry:
 
     @property
     def enabled(self) -> bool:
-        return self.journal is not None
+        """Whether telemetry is on. False for records-only, which still runs
+        a journal and a collector for the evidence rows."""
+        return self.journal is not None and not self.records_only
 
     # -- construction ----------------------------------------------------
 
@@ -76,8 +87,7 @@ class Telemetry:
 
     @classmethod
     def from_env(cls, root: Path | str | None = None, node_id: str = "") -> "Telemetry":
-        if not config.enabled():
-            return cls.disabled("DERATE_TELEMETRY is off")
+        records_only = not config.enabled()
         base = Path(root) if root is not None else config.data_dir()
         if not base.is_dir():
             # Not an error. It is how a dev machine and the test suite stay
@@ -86,11 +96,21 @@ class Telemetry:
         if not os.access(base, os.W_OK):
             log.warning("telemetry is off: %s is not writable", base)
             return cls.disabled(f"{base} is not writable")
-        return cls.open(base, node_id=node_id)
+        if records_only:
+            # DERATE_TELEMETRY=0 switches metrics off, not the evidence: the
+            # request and access rows still reach the journal and the archive
+            # (RecordsOnlySink), so attribution survives (F10).
+            log.info("DERATE_TELEMETRY is off: recording request and access rows only")
+        return cls.open(base, node_id=node_id, records_only=records_only)
 
     @classmethod
     def open(
-        cls, root: Path | str, node_id: str = "", coordinator: bool = True
+        cls,
+        root: Path | str,
+        node_id: str = "",
+        coordinator: bool = True,
+        *,
+        records_only: bool = False,
     ) -> "Telemetry":
         from .archive import Archive
         from .journal import Journal
@@ -110,7 +130,13 @@ class Telemetry:
                 # A journal without an archive still records. The node keeps
                 # its own history and a later coordinator can collect it.
                 log.warning("telemetry archive unavailable (%s); journalling only", exc)
-        return cls(journal, archive, coordinator=coordinator)
+        return cls(
+            journal,
+            archive,
+            coordinator=coordinator,
+            records_only=records_only,
+            reason="DERATE_TELEMETRY is off" if records_only else "",
+        )
 
     # -- lifecycle -------------------------------------------------------
 
@@ -130,7 +156,7 @@ class Telemetry:
         because then a coordinator would never learn how to reach its workers.
         So it rewires what is already running.
         """
-        if not self.enabled:
+        if self.journal is None:
             log.info("telemetry not recording: %s", self.reason)
             return
         if registry is not None:
@@ -146,20 +172,23 @@ class Telemetry:
                 self.collector.rewire(
                     client=_agent_client(self._registry),
                     agents=lambda: _agent_urls(self._registry),
+                    token=lambda node_id: _agent_token(self._registry, node_id),
                 )
                 log.debug("telemetry rewired to the registry")
             return
 
         self._started = True
-        if self.archive is None:
+        archive = self.archive or self._records_archive
+        if archive is None:
             return
 
         from .collector import Collector
 
         self.collector = Collector(
-            self.archive,
+            archive,
             client=_agent_client(self._registry),
             agents=lambda: _agent_urls(self._registry),
+            token=lambda node_id: _agent_token(self._registry, node_id),
         )
         # Under the registry's own name for this node when there is one, so
         # the local journal and the roster agree and the coordinator does not
@@ -173,9 +202,10 @@ class Telemetry:
         self.collector.add_local(local_id, self.journal)
         await self.collector.start()
         log.info(
-            "telemetry recording to %s, archiving to %s",
+            "telemetry recording to %s, archiving to %s%s",
             self.journal.path,
-            self.archive.path,
+            archive.path,
+            " (request and access rows only)" if self.records_only else "",
         )
 
     async def stop(self) -> None:
@@ -190,8 +220,9 @@ class Telemetry:
             self.collector = None
         if self.journal is not None:
             self.journal.close()
-        if self.archive is not None:
-            self.archive.close()
+        for archive in (self.archive, self._records_archive):
+            if archive is not None:
+                archive.close()
 
     # -- wiring other producers ------------------------------------------
 
@@ -202,7 +233,7 @@ class Telemetry:
         resolved is scrubbed here too. Without one, only the pattern rules
         apply -- still better than the gateway loggers' current nothing.
         """
-        if not self.enabled or self._log_handler is not None:
+        if not self.enabled or self.records_only or self._log_handler is not None:
             return
         from .loghandler import install
 
@@ -213,6 +244,8 @@ class Telemetry:
         journal_events(bus, self.sink, SOURCE_DEPLOY)
 
     def status(self) -> dict[str, Any]:
+        if self.records_only:
+            return {"enabled": False, "reason": self.reason, "records_only": True}
         if not self.enabled:
             return {"enabled": False, "reason": self.reason}
         out: dict[str, Any] = {"enabled": True, "journal": self.journal.stats()}
@@ -254,3 +287,18 @@ def _agent_client(registry: Any) -> Any:
     if registry is None:
         return None
     return getattr(registry, "_client", None) or getattr(registry, "client", None)
+
+
+def _agent_token(registry: Any, node_id: str) -> str | None:
+    """The agent token *node_id*'s agent expects on /agent/journal, or None.
+
+    Duck-typed like _agent_urls: a registry without one sends no header, and
+    a peer that gates its journal answers 403, which the collector records.
+    """
+    getter = getattr(registry, "agent_token", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(node_id) or None
+    except Exception:
+        return None

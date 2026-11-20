@@ -2,7 +2,7 @@
 // checked against the live coordinator (`spend.check.mjs`) rather than only
 // typechecked. Everything here is pure.
 //
-// The rule the whole file follows is the one `SpendTab.tsx` was written to
+// The rule the whole file follows is the one `OverviewSub.tsx` was written to
 // enforce and then only enforced on the local half: **a number we do not know
 // is `null`, never `0`.** Cloud spend arrives as a real float from
 // `providers/serialization.py` -- `round(runtime.spend_today(now), 6)` is never
@@ -113,18 +113,6 @@ export function fleetSpend(providers: Provider[]): FleetSpend {
   return { usd, floor, blindProviders, unpricedRequests, anyMetered, anyEstimated }
 }
 
-/** Output tokens a provider generated today. Null when nobody counted.
- *
- *  Output, not input+output, so it means the same thing as a local target's
- *  `counters.total_tokens` -- which `gateway/proxy.py` fills from the
- *  completion count alone. Summing the two halves here would make the "tokens
- *  generated" tile compare a cloud number against a local one measuring
- *  something else.
- */
-export function cloudTokens(p: Provider): number | null {
-  return p.tokens_today?.output ?? null
-}
-
 export interface PriceRange {
   low: number
   high: number
@@ -172,45 +160,12 @@ export function formatRange(range: PriceRange | null): string {
   return range.low === range.high ? at(range.low) : `${at(range.low)}–${at(range.high)}`
 }
 
-/** `$1.23`, or `≥ $1.23` when unpriced traffic sits underneath it. */
+/** `$1.23`, or `≥ $1.23` when unpriced traffic sits underneath it. Under a
+ *  dollar it carries four places (the keys screen's rule), so one key's
+ *  $0.0032 does not print as `$0.00`. */
 export function money(usd: number | null, floor = false): string {
   if (usd == null) return '—'
-  return `${floor ? '≥ ' : ''}$${usd.toFixed(2)}`
-}
-
-/** The label under the spend figure, naming everything the figure leaves out.
- *
- *  The old string had one exclusion in it -- "cloud only", for an unset
- *  electricity rate -- and read as the whole truth in the other case it could
- *  not see. A total that silently omits a provider's unpriced traffic is the
- *  same failure the local half was fixed for, so both exclusions are listed by
- *  the same code and neither can be forgotten alone.
- */
-export function spendCaption(rateSet: boolean, cloud: FleetSpend): string {
-  const missing: string[] = []
-  if (!rateSet) missing.push('local generation')
-  if (cloud.blindProviders.length > 0) missing.push('unpriced cloud models')
-  if (missing.length === 0) return 'spent today'
-  return `spent today · excludes ${missing.join(' and ')}`
-}
-
-/** The muted lines under the caption: what to do, and what we could not price.
- *
- *  Each one names a specific thing rather than warning in general, because the
- *  first is an action the operator can take and the second is a fact about
- *  their own traffic.
- */
-export function spendNotes(rateSet: boolean, cloud: FleetSpend): string[] {
-  const notes: string[] = []
-  if (!rateSet) notes.push('set an electricity rate to price local generation')
-  if (cloud.blindProviders.length > 0) {
-    const n = cloud.unpricedRequests
-    notes.push(
-      `${n.toLocaleString()} ${n === 1 ? 'request' : 'requests'} went to models ` +
-        `${cloud.blindProviders.join(', ')} publishes no price for`,
-    )
-  }
-  return notes
+  return `${floor ? '≥ ' : ''}$${usd.toFixed(Math.abs(usd) < 1 ? 4 : 2)}`
 }
 
 /** One sentence on where the dollars came from. Null when there are none. */

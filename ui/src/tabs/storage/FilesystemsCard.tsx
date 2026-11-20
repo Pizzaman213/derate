@@ -38,13 +38,13 @@ function NodeRow({ node }: { node: NodeStorage }) {
   return (
     <>
       {node.filesystems.map((fs, i) => (
-        <div key={fs.device} style={{ marginBottom: 10 }}>
+        <div key={fs.device} style={{ marginBottom: 'var(--space-10)' }}>
           <div
             style={{
               display: 'flex',
               alignItems: 'baseline',
-              gap: 8,
-              marginBottom: 4,
+              gap: 'var(--space-8)',
+              marginBottom: 'var(--space-4)',
             }}
           >
             <span className="mono" style={{ minWidth: '14ch' }}>
@@ -70,7 +70,7 @@ function NodeRow({ node }: { node: NodeStorage }) {
             tone={tone(fs.severity)}
             label={`${node.node_id}: ${fs.used_pct}% of this filesystem used`}
           />
-          <div className="unit" style={{ marginTop: 3 }}>
+          <div className="unit" style={{ marginTop: 'var(--space-3)' }}>
             {/* Naming every one of our paths that landed here is what shows an
                 operator that two things they think are separate are not. */}
             {fs.mount_paths.join(' · ')}
@@ -99,7 +99,7 @@ export function FilesystemsCard() {
   return (
     <div className="card2">
       <h3>Filesystems</h3>
-      <div className="unit" style={{ marginBottom: 10 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-10)' }}>
         Capacity where this cluster keeps its data. Model weights are pulled by
         the runtime on each node and are not counted here — but they land on
         these filesystems, so this is the space a launch has to fit into.
@@ -116,7 +116,7 @@ export function FilesystemsCard() {
       {storage.error ? (
         <div
           className="label"
-          style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}
+          style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}
         >
           {storage.error.message}
         </div>

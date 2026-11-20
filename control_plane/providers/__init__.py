@@ -29,6 +29,7 @@ from .errors import (
     MissingKeyError,
     ProviderError,
     ProviderNotAdmittingError,
+    SignInError,
     UnknownProviderError,
     UpstreamError,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "Redactor",
     "SecretRedactingFilter",
     "SecretStore",
+    "SignInError",
     "UnknownProviderError",
     "UpstreamError",
     "UpstreamResponse",

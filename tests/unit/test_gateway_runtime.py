@@ -176,7 +176,7 @@ class _FakeOpenUpstreamProviders:
         return (True, None)
 
     @asynccontextmanager
-    async def open_upstream(self, provider_id, upstream_id, body, stream=False, *, endpoint="chat/completions"):
+    async def open_upstream(self, provider_id, upstream_id, body, stream=False, *, endpoint="chat/completions", **_kw):
         self.calls.append((provider_id, upstream_id, dict(body), stream, endpoint))
 
         async def body_iter():
@@ -196,7 +196,7 @@ def _raising_open_upstream(exc: BaseException):
     exactly how ProviderService._prepare()'s failures surface."""
 
     @asynccontextmanager
-    async def open_upstream(provider_id, upstream_id, body, stream=False, *, endpoint="chat/completions"):
+    async def open_upstream(provider_id, upstream_id, body, stream=False, *, endpoint="chat/completions", **_kw):
         raise exc
         yield  # pragma: no cover -- unreachable; keeps this an async generator
 
@@ -535,7 +535,7 @@ def test_forward_provider_transport_failure_through_the_real_provider_service(tm
         raise httpx.ConnectError("boom", request=request)
 
     async def run() -> None:
-        secrets = SecretStore(tmp_path / "secrets.json", env={"OPENROUTER_API_KEY": "sk-test"})
+        secrets = SecretStore(tmp_path / "secrets.json", env={"DERATE_SECRET_OPENROUTER": "sk-test"})
         service = ProviderService(
             data_path=tmp_path,
             secrets=secrets,
@@ -545,7 +545,7 @@ def test_forward_provider_transport_failure_through_the_real_provider_service(tm
             {
                 "provider_id": "openrouter",
                 "kind": ProviderKind.OPENROUTER,
-                "api_key_ref": "OPENROUTER_API_KEY",
+                "api_key_ref": "DERATE_SECRET_OPENROUTER",
                 "priority": 10,
             }
         )
@@ -769,7 +769,7 @@ def test_forward_provider_settles_exactly_once_on_a_client_disconnect_mid_stream
         chunks = [f"data: chunk-{i}\n\n".encode() for i in range(50)]
 
         @asynccontextmanager
-        async def open_upstream(provider_id, upstream_id, body, stream=False, *, endpoint="chat/completions"):
+        async def open_upstream(provider_id, upstream_id, body, stream=False, *, endpoint="chat/completions", **_kw):
             async def body_iter():
                 for chunk in chunks:
                     yield chunk
@@ -1375,14 +1375,17 @@ def test_ui_dir_setting_defaults_to_none_without_the_environment_variable(monkey
 
 
 # ---------------------------------------------------------------------------
-# small: /redoc disabled, coordinator inference safe on an empty roster
+# small: no generated docs pages, coordinator inference safe on an empty roster
 # ---------------------------------------------------------------------------
 
 
-def test_redoc_is_disabled_but_docs_and_openapi_remain():
+def test_no_docs_pages_are_served_but_the_schema_remains():
+    """Swagger UI loads a third-party CDN script into the admin's origin, and
+    its /docs/oauth2-redirect page answered outside /api, ungated."""
     with TestClient(create_app(GatewayDeps(registry=_EmptyRegistry()))) as client:
         assert client.get("/redoc").status_code == 404
-        assert client.get("/api/docs").status_code == 200
+        assert client.get("/api/docs").status_code == 404
+        assert client.get("/docs/oauth2-redirect").status_code == 404
         assert client.get("/api/openapi.json").status_code == 200
 
 

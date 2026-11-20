@@ -18,7 +18,7 @@ vllm serve \\
     --max-model-len {max_model_len} \\
     --max-num-seqs {max_num_seqs} \\
     --gpu-memory-utilization {gpu_memory_utilization} \\
-    --trust-remote-code"""
+    --enable-prompt-tokens-details"""
 
 
 # The binary-and-model half of the command above, with none of the
@@ -77,6 +77,9 @@ SPEC = EngineSpec(
     # has already been told the slow part is over. One variable moves the
     # whole tree onto the one mount that survives.
     cache_env=(("VLLM_CACHE_ROOT", RUNTIME_CACHE_DIR + "/vllm"),),
+    api_key_env="VLLM_API_KEY",
+    revision_arg="--revision {revision} --code-revision {revision} --tokenizer-revision {revision}",
+    cache_per_model=True,
 )
 
 

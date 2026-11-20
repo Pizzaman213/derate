@@ -72,7 +72,7 @@ export function ScopeCards() {
         <h3>
           Scope changed <span className="pill">was out of scope</span>
         </h3>
-        <div className="unit" style={{ marginBottom: 6 }}>
+        <div className="unit" style={{ marginBottom: 'var(--space-6)' }}>
           A named non-goal that was built anyway. Recorded here rather than
           removed, because the card below is the thing that stops these
           happening by accident and it only works if reversals are visible.
@@ -89,7 +89,7 @@ export function ScopeCards() {
         <h3>
           Deliberately out of scope <span className="pill">will not build</span>
         </h3>
-        <div className="unit" style={{ marginBottom: 6 }}>
+        <div className="unit" style={{ marginBottom: 'var(--space-6)' }}>
           Named non-goals. Each looks like a small addition to a screen that already exists, which
           is exactly how they get built by accident.
         </div>

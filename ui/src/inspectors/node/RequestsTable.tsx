@@ -102,7 +102,7 @@ export function RequestsTable({
           </tbody>
         </table>
       </div>
-      <div className="unit" style={{ marginTop: 6 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
         One row per attempt, newest first
         {rows.length > SHOWN ? `; ${SHOWN} of ${rows.length} that ran here are shown` : ''}.
         {elsewhere > 0

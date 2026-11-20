@@ -28,7 +28,7 @@ export function AlertsSection() {
   return (
     <section>
       <h2>Wrong now</h2>
-      <div style={{ display: 'grid', gap: 'var(--s-3)' }}>
+      <div style={{ display: 'grid', gap: 'var(--space-12)' }}>
         {rows.map((row) => (
           <div key={row.key} style={{ display: 'grid', gap: 2 }}>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>

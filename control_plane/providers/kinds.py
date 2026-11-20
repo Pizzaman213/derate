@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ..contracts.providers import ProviderKind
+from .config import CHATGPT_RESOURCE
 
 
 class AuthStyle(str, Enum):
@@ -22,6 +23,19 @@ class PricingUnit(str, Enum):
     NONE = "none"  # provider publishes no pricing; costs stay None
     PER_TOKEN_USD = "per_token_usd"  # OpenRouter: dollars per single token
     PER_MTOK_USD = "per_mtok_usd"  # Together: dollars per million tokens
+
+
+class ChatWire(str, Enum):
+    """What the upstream's chat endpoint speaks.
+
+    Clients always send Chat Completions to derate. Adapted kinds translate
+    to Responses (``responses_adapter.py``) or native Messages
+    (``anthropic_adapter.py``), then translate the stream back.
+    """
+
+    CHAT_COMPLETIONS = "chat_completions"
+    RESPONSES = "responses"
+    ANTHROPIC_MESSAGES = "anthropic_messages"
 
 
 @dataclass(frozen=True)
@@ -67,6 +81,12 @@ class KindSpec:
     #: to pick among them. True only for OpenRouter -- no other kind here
     #: multiplexes a model id over more than one upstream host.
     supports_backend_routing: bool = False
+    #: The wire the chat endpoint speaks upstream. See :class:`ChatWire`.
+    chat_wire: ChatWire = ChatWire.CHAT_COMPLETIONS
+    #: The sign-in flow that supplies this kind's credential, or "" for a kind
+    #: whose credential is a key. A sign-in kind is never added by a key and
+    #: never has an ``api_key_ref``.
+    sign_in: str = ""
 
 
 _SPECS: dict[ProviderKind, KindSpec] = {
@@ -145,6 +165,30 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         requires_base_url=True,
         # Unknown upstream. Assume nothing beyond the OpenAI core.
         supports_stream_usage=False,
+    ),
+    ProviderKind.CHATGPT: KindSpec(
+        kind=ProviderKind.CHATGPT,
+        display_name="ChatGPT plan",
+        base_url=CHATGPT_RESOURCE,
+        models_path="models",
+        auth=AuthStyle.BEARER,
+        # Plan usage is not billed per token to derate.
+        pricing=PricingUnit.NONE,
+        requires_key=True,
+        supports_stream_usage=False,
+        chat_wire=ChatWire.RESPONSES,
+        sign_in="chatgpt",
+    ),
+    ProviderKind.CLAUDE_CODE: KindSpec(
+        kind=ProviderKind.CLAUDE_CODE,
+        display_name="Anthropic plan (unofficial)",
+        base_url="https://api.anthropic.com/v1",
+        models_path="models",
+        auth=AuthStyle.BEARER,
+        pricing=PricingUnit.NONE,
+        supports_stream_usage=False,
+        chat_wire=ChatWire.ANTHROPIC_MESSAGES,
+        sign_in="claude",
     ),
 }
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 from dataclasses import asdict
@@ -45,6 +46,7 @@ def _model_from_dict(raw: dict) -> ProviderModel:
         input_cost_per_mtok=_opt_float(raw.get("input_cost_per_mtok")),
         output_cost_per_mtok=_opt_float(raw.get("output_cost_per_mtok")),
         modality=_modality(raw.get("modality")),
+        price_per_minute_usd=_opt_float(raw.get("price_per_minute_usd")),
     )
 
 
@@ -90,6 +92,17 @@ def _opt_float(value: object) -> float | None:
     return None
 
 
+def _pin_prices(value: object) -> dict[str, tuple[float | None, float | None]]:
+    """``{upstream_id: [input, output]}`` back as tuples; anything malformed is dropped."""
+    out: dict[str, tuple[float | None, float | None]] = {}
+    if not isinstance(value, dict):
+        return out
+    for key, pair in value.items():
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            out[str(key)] = (_opt_float(pair[0]), _opt_float(pair[1]))
+    return out
+
+
 def provider_to_dict(provider: Provider, runtime: ProviderRuntime | None = None) -> dict:
     """The persisted shape. ``api_key_ref`` is a name; there is no key field at all."""
     record = {
@@ -109,6 +122,11 @@ def provider_to_dict(provider: Provider, runtime: ProviderRuntime | None = None)
         record["daily_budget_usd"] = runtime.daily_budget_usd
         record["aliases"] = dict(runtime.aliases)
         record["backend_pins"] = dict(runtime.backend_pins)
+        record["backend_fallbacks"] = dict(runtime.backend_fallbacks)
+        record["backend_pin_prices"] = {
+            k: [v[0], v[1]] for k, v in runtime.backend_pin_prices.items()
+        }
+        record["audio_prices"] = dict(runtime.audio_prices)
         # Sorted, so a file two people read side by side does not differ by set
         # iteration order. `null` is not the same as `[]` here and is written as
         # itself: see ProviderRuntime.enabled_models for why the two must stay
@@ -155,6 +173,16 @@ def provider_from_dict(raw: dict) -> tuple[Provider, ProviderRuntime]:
         aliases={str(k): str(v) for k, v in (raw.get("aliases") or {}).items()},
         enabled_models=_enabled_models(raw.get("enabled_models")),
         backend_pins={str(k): str(v) for k, v in (raw.get("backend_pins") or {}).items()},
+        backend_fallbacks={
+            str(k): bool(v) for k, v in (raw.get("backend_fallbacks") or {}).items()
+        },
+        backend_pin_prices=_pin_prices(raw.get("backend_pin_prices")),
+        audio_prices={
+            str(k): float(v)
+            for k, v in (raw.get("audio_prices") or {}).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v) and v >= 0
+        },
     )
     for day, spend in (raw.get("spend") or {}).items():
         if isinstance(spend, dict):

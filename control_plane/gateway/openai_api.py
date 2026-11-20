@@ -11,20 +11,40 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import re
 import time
-from uuid import uuid4
+from dataclasses import replace
 
 from fastapi import APIRouter, Request, WebSocket
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from control_plane.contracts import Modality, TargetKind
+from control_plane.contracts.auth import (
+    AuthError,
+    AuthErrorCode,
+    AuthUnavailable,
+    LimitScope,
+    Principal,
+    UsageActuals,
+)
+from control_plane.contracts.telemetry import CostBasis, FallbackReason, FieldError
 from control_plane.telemetry import RequestTrace
+from control_plane.telemetry.records import spec_fields
 
-from . import errors, policies, proxy as proxy_mod, realtime
+from . import authz, errors, policies, proxy as proxy_mod, realtime
+from .body import read_bounded_body
 from .proxy import Attempt
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.openai")
+
+#: Endpoints whose body takes a ``max_tokens``. Only these get one injected
+#: when a key's ``max_output_tokens_per_request`` applies and none was sent.
+_GENERATION_PATHS = frozenset({"/chat/completions", "/completions"})
+
+#: Background attributions in flight; held so the loop does not drop them.
+_BACKGROUND: set[asyncio.Task] = set()
 
 # Which kind of model each endpoint family needs. The gateway has always had
 # one family, so naming a model was the only question a request had to answer;
@@ -101,30 +121,64 @@ def _prefix_key(body: dict) -> str | None:
     return None
 
 
-async def _read_bounded_body(request: Request, limit: int) -> bytes | None:
-    """Read the whole body, or None if it goes past *limit*.
+class _AmbiguousBoundary(ValueError):
+    """The content-type names more than one ``boundary`` parameter.
 
-    Streamed rather than `await request.body()` so an oversized upload is
-    dropped at the limit instead of being buffered in full and then rejected.
+    Parsers disagree on which one wins (first here, last in most upstreams),
+    so the part the gateway authorises and the part the provider reads could
+    differ. Refused rather than guessed.
     """
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > limit:
-            return None
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _boundary_of(content_type: str) -> bytes | None:
-    """The boundary token out of a multipart content-type header."""
+    """The boundary token out of a multipart content-type header.
+
+    :class:`_AmbiguousBoundary` when the header names more than one.
+    """
+    found: bytes | None = None
+    seen = False
     for part in content_type.split(";")[1:]:
         key, _, value = part.strip().partition("=")
         if key.strip().lower() == "boundary":
+            if seen:
+                raise _AmbiguousBoundary(content_type)
+            seen = True
             token = value.strip().strip('"')
-            return token.encode("latin-1") if token else None
-    return None
+            found = token.encode("latin-1") if token else None
+    return found
+
+
+class _DuplicateField(ValueError):
+    """A form field the gateway reads appears in more than one part."""
+
+
+def _part_name(headers: bytes) -> str | None:
+    """The ``name`` parameter of a part's content-disposition, or None.
+
+    Only that header and only that parameter: ``filename="model"`` or a
+    ``name="model"`` in some other header is not the field. A part with two
+    content-disposition headers, or two ``name=`` parameters, is refused: the
+    upstream parser keeps the last where this one would read the first.
+    """
+    found: str | None = None
+    seen = False
+    for line in headers.split(b"\r\n"):
+        key, sep, value = line.partition(b":")
+        if not sep or key.strip().lower() != b"content-disposition":
+            continue
+        if seen:
+            raise _DuplicateField("content-disposition")
+        seen = True
+        names = _DISPOSITION_NAME.findall(value.decode("latin-1"))
+        if len(names) > 1:
+            raise _DuplicateField("content-disposition")
+        found = names[0].strip() if names else None
+    return found
+
+
+#: Quoted or bare, any case: upstream parsers accept ``name=model`` and
+#: ``NAME="model"`` both, so a second spelling must count as a second part.
+_DISPOSITION_NAME = re.compile(r';\s*name\s*=\s*"?([^";]*)"?', re.IGNORECASE)
 
 
 def _field_span(raw: bytes, content_type: str, name: str) -> tuple[str, int, int] | None:
@@ -135,29 +189,36 @@ def _field_span(raw: bytes, content_type: str, name: str) -> tuple[str, int, int
     value can be swapped without re-encoding the file part beside it. Anything
     it does not understand it declines to find, and the caller answers with a
     missing-parameter 400 rather than guessing.
+
+    A second part with the same name raises :class:`_DuplicateField`: the
+    gateway would authorise and price one value while the upstream's parser
+    takes the other.
     """
     boundary = _boundary_of(content_type)
     if not boundary:
         return None
-    needle = b'name="%s"' % name.encode("latin-1")
     delimiter = b"--" + boundary
     cursor = 0
+    found: tuple[str, int, int] | None = None
     while True:
         start = raw.find(delimiter, cursor)
         if start < 0:
-            return None
+            return found
         cursor = start + len(delimiter)
         head_end = raw.find(b"\r\n\r\n", cursor)
         if head_end < 0:
-            return None
+            return found
         headers = raw[cursor:head_end]
         body_start = head_end + 4
         body_end = raw.find(b"\r\n" + delimiter, body_start)
         if body_end < 0:
-            return None
-        if needle in headers:
+            return found
+        part_name = _part_name(headers)
+        if part_name is not None and part_name.lower() == name.lower():
+            if found is not None:
+                raise _DuplicateField(name)
             try:
-                return raw[body_start:body_end].decode("utf-8"), body_start, body_end
+                found = raw[body_start:body_end].decode("utf-8"), body_start, body_end
             except UnicodeDecodeError:
                 return None
         cursor = body_end
@@ -183,15 +244,154 @@ def _rewrite_multipart_field(
     return raw[:start] + value.encode("utf-8") + raw[end:]
 
 
+class _EngineSlot:
+    """One request's stay on one local engine."""
+
+    __slots__ = ("started_at", "shared")
+
+    def __init__(self, started_at: float) -> None:
+        self.started_at = started_at
+        #: Set when another request was on the same engine at any point.
+        self.shared = False
+
+
+def _requested_max_tokens(body: dict) -> int | None:
+    for name in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        value = body.get(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _num(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def _limit_refusal(decision) -> Response:
+    """A limit service refusal as the response a client gets, verbatim.
+
+    429 carries the limit that stopped it, how much is used, and when it frees,
+    in the body and in ``X-RateLimit-*`` (Reset in epoch seconds); the
+    per-request caps (400/413) and the allowlist (403) carry their sentence.
+    """
+    if decision.status != 429:
+        return errors.error_response(
+            decision.status, decision.message, "invalid_request_error", decision.code
+        )
+    reset = decision.resets_at if decision.resets_at is not None else time.time()
+    headers = {"X-RateLimit-Reset": str(int(math.ceil(reset)))}
+    if decision.limit is not None:
+        headers["X-RateLimit-Limit"] = _num(decision.limit)
+        headers["X-RateLimit-Remaining"] = _num(max(0.0, decision.limit - (decision.used or 0.0)))
+    return errors.error_response(
+        429,
+        decision.message,
+        "rate_limit_error",
+        decision.code or "limit_exceeded",
+        headers=headers,
+        limit_source=decision.limit_source,
+        used=decision.used,
+        limit=decision.limit,
+        resets_at=decision.resets_at,
+    )
+
+
+def _model_not_allowed(model: str) -> Response:
+    """The allowlist's 403, answered before any catalogue lookup (K-3): a
+    name the key may not use gets this whether it exists or not."""
+    return errors.error_response(
+        403,
+        f"model {model!r} is not in this key's allowed models",
+        "invalid_request_error",
+        AuthErrorCode.MODEL_NOT_ALLOWED.value,
+    )
+
+
+async def _released_at_end(body_iterator, release, started=None):
+    """A response body that runs ``release`` once it is over, however it ends.
+
+    ``started`` runs once, when the first chunk of the answer exists: from
+    then on the request was served, and a release that has no actuals to
+    give counts the reservation's estimate instead of voiding it.
+    """
+    first = True
+    try:
+        async for chunk in body_iterator:
+            if first and started is not None:
+                first = False
+                try:
+                    started()
+                except Exception:
+                    log.exception("could not mark a reservation started")
+            yield chunk
+    finally:
+        try:
+            aclose = getattr(body_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        except BaseException:
+            pass
+        release(None)
+
+
+
 def create_router(ctx: GatewayContext) -> APIRouter:
     router = APIRouter()
+    # deployment_id -> the requests on that engine right now (see _EngineSlot).
+    engine_busy: dict[str, set[_EngineSlot]] = {}
+
+    def _attribute_spec(record, slot: _EngineSlot) -> None:
+        """Fill a local row's spec-decode columns once the engine's next
+        scrape brackets the request, then re-emit it under the same
+        ``(request_id, attempt_no)``, which replaces the first row. Scheduled,
+        never awaited: the response does not wait for a scrape."""
+        poller = ctx.engine_metrics
+        if poller is None:
+            return
+        start, end, alone = slot.started_at, time.time(), not slot.shared
+
+        async def attribute() -> None:
+            try:
+                spec = await poller.attribute_when_ready(record.deployment_id, start, end, alone)
+                if spec == FieldError.NOT_REPORTED:
+                    return  # what the first row already says
+                ctx.sink.request(replace(record, **spec_fields(spec)))
+            except Exception:
+                log.debug("spec attribution failed for %s", record.request_id, exc_info=True)
+
+        try:
+            task = asyncio.get_running_loop().create_task(attribute())
+        except RuntimeError:
+            return
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
+
+    def _visible_names(request: Request, names) -> list[str]:
+        """*names* as the caller may see them: a key with an allowlist (its
+        own or its org's) sees only that; a session, or an unrestricted key,
+        sees everything."""
+        names = list(names)
+        principal = getattr(request.state, "principal", None)
+        if principal is None:
+            return names
+        key, org = principal.key, principal.org
+        if key.allowed_models is None and org.allowed_models is None:
+            return names
+        allowed = set(ctx.auth_stores.keys.effective_allowlist(key, org, names))
+        return [n for n in names if n in allowed]
 
     @router.get("/v1/models")
-    async def list_models() -> JSONResponse:
+    @router.get("/api/chat/models")
+    async def list_models(request: Request) -> JSONResponse:
+        """Every served model. ``/api/chat/models`` is the same list behind the
+        session gate, for the UI, which holds a session and never a key.
+
+        A key with an allowlist sees only its allowlist: the full catalogue
+        is the admin's business, not every key holder's."""
         index = ctx.router.index()
         created = int(ctx.started_at or time.time())
         data = []
-        for served_name in sorted(index.targets):
+        for served_name in _visible_names(request, sorted(index.targets)):
             targets = index.targets[served_name]
             kinds = sorted({t.kind.value for t in targets})
             data.append(
@@ -214,12 +414,56 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         return JSONResponse({"object": "list", "data": data})
 
+    @router.get("/v1/key")
+    async def current_key(request: Request) -> JSONResponse:
+        """The calling key: what it is, what it may use, and how much is left.
+
+        Never the secret or its hash -- ``ApiKey`` has neither -- and never
+        the admin's notes about it.
+        """
+        from .keys_api import usage_totals
+
+        principal: Principal = request.state.principal
+        stores = ctx.auth_stores
+        key, org = principal.key, principal.org
+        now = time.time()
+        exposed = list(ctx.router.index().served_names())
+        cycle_start, resets_at = stores.limits.cycle_bounds(key.created_at, now)
+        archive = getattr(getattr(ctx, "telemetry", None), "archive", None)
+        usage = None
+        if archive is not None:
+            try:
+                totals = await asyncio.to_thread(
+                    usage_totals, archive, "key_id", [key.key_id], cycle_start, now
+                )
+                usage = totals.get(key.key_id)
+            except Exception:
+                log.exception("cycle usage for %s failed", key.key_id)
+        body = authz.key_dict(key)
+        # Admin bookkeeping, not the key holder's: who minted it, from where
+        # it was last used. The notes never left; these three no longer do.
+        for private in ("notes", "created_by", "admin_username", "last_used_ip"):
+            body.pop(private, None)
+        return JSONResponse(
+            {
+                "key": body,
+                "org": {"org_id": org.org_id, "name": org.name},
+                "expires_at": key.expires_at,
+                "allowed_models": stores.keys.effective_allowlist(key, org, exposed),
+                "limit_states": {
+                    "key": authz.limit_states(stores, LimitScope.KEY, key.key_id),
+                    "org": authz.limit_states(stores, LimitScope.ORG, org.org_id),
+                },
+                "cycle": {"start": cycle_start, "resets_at": resets_at, "usage": usage},
+            }
+        )
+
     async def _proxy(
         request: Request, path: str, streaming_allowed: bool
     ) -> Response:
         """The JSON entry point: chat, completions, embeddings, audio/speech."""
         limit = ctx.settings.max_json_body_bytes
-        raw = await _read_bounded_body(request, limit)
+        raw = await read_bounded_body(request, limit)
         if raw is None:
             return errors.error_response(
                 413,
@@ -279,9 +523,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "invalid_content_type",
             )
+        try:
+            _boundary_of(content_type)
+        except _AmbiguousBoundary:
+            return errors.error_response(
+                400, "ambiguous multipart boundary",
+                "invalid_request_error", "invalid_request",
+            )
 
         limit = ctx.settings.max_audio_upload_bytes
-        raw = await _read_bounded_body(request, limit)
+        raw = await read_bounded_body(request, limit)
         if raw is None:
             return errors.error_response(
                 413,
@@ -290,7 +541,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "payload_too_large",
             )
 
-        model = _multipart_field(raw, content_type, "model")
+        try:
+            model = _multipart_field(raw, content_type, "model")
+        except _DuplicateField:
+            return errors.error_response(
+                400, "duplicate multipart field: model -- send exactly one 'model' part.",
+                "invalid_request_error", "invalid_request",
+            )
         if not model:
             return errors.error_response(
                 400, "You must provide a 'model' parameter.",
@@ -337,17 +594,31 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # _RESPONSE_IS_AUDIO for why this is not asked of the request.
         count_tokens = path not in _RESPONSE_IS_AUDIO
 
-        # Minted before the first thing that can refuse, so a 404 is recorded
-        # as readily as a 200. Every attempt this request makes shares the id,
-        # and it goes back as X-Request-Id so a client that saw a bad answer
-        # can name the row that explains it.
+        # Minted at the gate (authz.AuthGuard) before the first thing that can
+        # refuse, so a 404 is recorded as readily as a 200 and the id joins
+        # this row to the audit trail and the access line. Every attempt this
+        # request makes shares the id, and it goes back as X-Request-Id so a
+        # client that saw a bad answer can name the row that explains it.
         trace = RequestTrace(
-            request_id=f"r-{uuid4().hex[:12]}",
+            request_id=getattr(request.state, "request_id", None) or authz.new_request_id(),
             served_name=model,
             node_id=settings.coordinator_node_id or "",
             streaming=streaming,
             body_bytes=raw_len,
         )
+        principal: Principal | None = getattr(request.state, "principal", None)
+        trace.model_requested = model
+        if principal is not None:
+            trace.key_id = principal.key.key_id
+            trace.key_name = principal.key.name
+            trace.org_id = principal.org.org_id
+            trace.client_ip = principal.ip
+            trace.user_agent = principal.user_agent
+        trace.client_port = getattr(request.state, "client_port", None)
+        if body is not None:
+            trace.max_tokens_requested = _requested_max_tokens(body)
+            messages = body.get("messages")
+            trace.message_count = len(messages) if isinstance(messages, list) else None
 
         def _tagged(response: Response) -> Response:
             response.headers["X-Request-Id"] = trace.request_id
@@ -368,6 +639,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 log.debug("could not record refusal telemetry", exc_info=True)
             return _tagged(response)
 
+        if principal is not None:
+            try:
+                allowed = authz.model_allowed(ctx.auth_stores, principal, model)
+            except AuthUnavailable as exc:
+                return _refused(authz.unavailable(exc), exc.code.value)
+            if not allowed:
+                return _refused(_model_not_allowed(model), AuthErrorCode.MODEL_NOT_ALLOWED.value)
+
         index = ctx.router.index()
         if model not in index.targets:
             pending = index.pending.get(model)
@@ -382,7 +661,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 )
             if not ctx.router.parkable(model):
                 return _refused(
-                    errors.unknown_model(model, index.served_names()),
+                    errors.unknown_model(model, _visible_names(request, index.served_names())),
                     "model_not_found",
                 )
             # Otherwise it was serving moments ago and its target has gone.
@@ -398,6 +677,173 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 errors.wrong_modality(model, has, wants, f"/v1{path}"),
                 "wrong_modality",
             )
+
+        # Limits, before anything is sent. The allowlist, the per-request
+        # caps, the rate windows and the cycle budgets all answer here, and a
+        # refusal goes through _refused so its row carries the limit_source.
+        # An admitted request holds a reservation until _settle_limits runs.
+        reservation = None
+        route_policy = None
+        if principal is not None:
+            route_policy = principal.key.routing_policy or principal.org.routing_policy
+            kinds = {t.kind for t in index.targets.get(model, ())}
+            # A name with both kinds is admitted as REMOTE, the stricter
+            # assumption: `cloud_*` limits apply up front, and `local_*` ones
+            # are re-checked in _attempt_on if a LOCAL target is picked
+            # (finding L9 -- `None` here used to apply neither).
+            mixed_kinds = len(kinds) > 1
+            target_kind = (
+                TargetKind.REMOTE.value if mixed_kinds
+                else next(iter(kinds)).value if kinds
+                else None
+            )
+            try:
+                limits = ctx.auth_stores.limits
+                decision, reservation = limits.check_and_reserve(
+                    principal, model=model, target_kind=target_kind, body=body or {},
+                    route_limits=ctx.router.limits_for(model),
+                )
+                if (
+                    not decision.allowed
+                    and decision.fallback_model
+                    and target_kind == TargetKind.REMOTE.value
+                ):
+                    # The cloud pool is spent and the key names a local model
+                    # to fall back to: re-check as that model, on a LOCAL target.
+                    fallback = decision.fallback_model
+                    fb_body = dict(body, model=fallback) if body is not None else {}
+                    fb_decision, fb_reservation = limits.check_and_reserve(
+                        principal,
+                        model=fallback,
+                        target_kind=TargetKind.LOCAL.value,
+                        body=fb_body,
+                        route_limits=ctx.router.limits_for(fallback),
+                    )
+                    if fb_decision.allowed and fallback in index.targets:
+                        model = fallback
+                        trace.served_name = fallback
+                        trace.fallback_used = True
+                        trace.fallback_reason = FallbackReason.CLOUD_POOL_EXHAUSTED.value
+                        if body is not None:
+                            body, raw_body = fb_body, None
+                        elif content is not None and content_type is not None:
+                            content = (
+                                _rewrite_multipart_field(content, content_type, "model", fallback)
+                                or content
+                            )
+                        decision, reservation = fb_decision, fb_reservation
+                    elif fb_reservation is not None:
+                        limits.settle(fb_reservation, None)
+            except AuthUnavailable as exc:
+                return _refused(authz.unavailable(exc), exc.code.value)
+            if not decision.allowed:
+                trace.limit_source = decision.limit_source
+                return _refused(_limit_refusal(decision), decision.code)
+            if (
+                decision.inject_max_tokens is not None
+                and body is not None
+                and path in _GENERATION_PATHS
+            ):
+                body = dict(body)
+                body["max_tokens"] = decision.inject_max_tokens
+                # The engine reads `max_completion_tokens or max_tokens`, so
+                # leaving a client's other spelling beside the cap is a bypass.
+                body.pop("max_completion_tokens", None)
+                body.pop("max_output_tokens", None)
+                raw_body = None
+            if reservation is not None:
+                # The estimate the limits were checked on, so a stream whose
+                # upstream never sends a usage frame records it rather than a
+                # prompt of zero (finding H5). Admission overwrites it with its
+                # own on a LOCAL text target.
+                trace.prompt_tokens = reservation.estimated_prompt
+
+        # One entry per attempt, carried on every row this request writes.
+        attempt_chain: list[dict] = []
+        # deployment_id -> this request's slot on that engine, for the
+        # spec-decode attribution's "was it alone" question.
+        engine_slots: dict[str, _EngineSlot] = {}
+
+        def _settle_limits(actuals: UsageActuals | None) -> None:
+            """Count what the request used, or give the reservation back.
+            The limit service ignores a second settle, so the release in the
+            response's own cleanup is a no-op after an attempt counted."""
+            if reservation is None:
+                return
+            try:
+                ctx.auth_stores.limits.settle(reservation, actuals)
+            except Exception:
+                log.exception("could not settle reservation for %s", trace.request_id)
+
+        def _on_record(record, *, failed: bool, selection=None):
+            """Every attempt's row, on its way to the sink: attempt chain,
+            cost and its basis, and -- for the attempt that answered -- the
+            usage counted against the key's and org's limits."""
+            # _trace_record carries upstream error metadata on a complete
+            # singleton entry. Keep it when adding this request's other turns.
+            entry = dict(record.attempt_chain[0]) if record.attempt_chain else {}
+            entry.update(
+                target_id=record.target_id,
+                status=record.status,
+                error_class=record.error_class or None,
+                retry_reason=record.retry_reason or None,
+                ms=record.duration_ms,
+            )
+            attempt_chain.append(entry)
+            cost, basis = record.cost_usd, None
+            if not failed and record.status is not None and ctx.auth_stores is not None:
+                provider_model = getattr(selection, "model", None)
+                try:
+                    cost, cost_basis = ctx.auth_stores.pricing.cost(
+                        model=record.served_name,
+                        target_kind=record.target_kind,
+                        prompt_tokens=record.prompt_tokens or 0,
+                        completion_tokens=record.completion_tokens or 0,
+                        metered_usd=record.cost_usd,
+                        provider_in_per_mtok=getattr(provider_model, "input_cost_per_mtok", None),
+                        provider_out_per_mtok=getattr(provider_model, "output_cost_per_mtok", None),
+                    )
+                    basis = cost_basis.value
+                except Exception:
+                    log.debug("could not price %s", trace.request_id, exc_info=True)
+                    cost, cost_basis = None, CostBasis.UNPRICED
+                _settle_limits(
+                    UsageActuals(
+                        prompt_tokens=record.prompt_tokens or 0,
+                        completion_tokens=record.completion_tokens or 0,
+                        cost_usd=cost,
+                        cost_basis=cost_basis,
+                        target_kind=record.target_kind,
+                        model_served=record.served_name,
+                    )
+                )
+            record = replace(
+                record, attempt_chain=list(attempt_chain), cost_usd=cost, cost_basis=basis
+            )
+            slot = engine_slots.pop(record.deployment_id, None) if record.deployment_id else None
+            if slot is not None:
+                engine_busy.get(record.deployment_id, set()).discard(slot)
+                if record.status is not None:
+                    _attribute_spec(record, slot)
+            return record
+
+        def _occupy_engine(selection) -> None:
+            """Note that this request is on that engine now, and whether it
+            shares it -- spec-decode counters are per engine, so a request
+            that was not alone cannot be told its own share of them."""
+            if ctx.engine_metrics is None or selection.deployment is None:
+                return
+            dep_id = selection.deployment.deployment_id
+            slot = _EngineSlot(time.time())
+            peers = engine_busy.setdefault(dep_id, set())
+            if peers:
+                slot.shared = True
+                for peer in peers:
+                    peer.shared = True
+            peers.add(slot)
+            engine_slots[dep_id] = slot
+
+        policy_kw = {"policy": route_policy} if route_policy is not None else {}
 
         # Nothing to hash in an opaque upload, and cache affinity means
         # nothing for a transcription anyway -- there is no shared prefix.
@@ -458,6 +904,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     # exclusion would only repin the prefix somewhere new.
                     prefix_key=prefix_key if attempt_no == 0 else None,
                     exclude=tried,
+                    # A key's or org's routing override; omitted when there is
+                    # none, so a router double without the kwarg still works.
+                    **policy_kw,
                 )
                 if selection is None:
                     return None
@@ -548,6 +997,21 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 provider_upstream_id = None
                 open_upstream = None
 
+                if reservation is not None:
+                    # The name may have both kinds and was admitted as REMOTE;
+                    # this target's own kind-specific limits answer here.
+                    try:
+                        kind_decision = ctx.auth_stores.limits.check_target_kind(
+                            reservation, target.kind.value
+                        )
+                    except AuthUnavailable as exc:
+                        ctx.breaker.abandon(target.target_id)
+                        return _refused(authz.unavailable(exc), exc.code.value)
+                    if not kind_decision.allowed:
+                        ctx.breaker.abandon(target.target_id)
+                        trace.limit_source = kind_decision.limit_source
+                        return _refused(_limit_refusal(kind_decision), kind_decision.code)
+
                 if target.kind is TargetKind.LOCAL:
                     deployment = selection.deployment
                     # Admission is KV-cache arithmetic end to end, and a KV
@@ -590,6 +1054,21 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                             _id=deployment.deployment_id, _kv=decision.kv_bytes
                         ) -> None:
                             ctx.admission.release(_id, _kv)
+
+                        if streaming and path in _GENERATION_PATHS:
+                            # vLLM and SGLang only send a usage frame when
+                            # asked, and a stream without one is metered on
+                            # an estimate (finding H5). Asked on every local
+                            # stream, whatever the client sent.
+                            options = body.get("stream_options")
+                            upstream_body = dict(
+                                body,
+                                stream_options={
+                                    **(options if isinstance(options, dict) else {}),
+                                    "include_usage": True,
+                                },
+                            )
+                            upstream_raw = None
                 else:
                     # Remote upstreams call the model something else. This is
                     # the only edit made to a request body, and it is required
@@ -645,22 +1124,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         open_upstream is not None
                         and provider_id is not None
                         and provider_upstream_id is not None
-                        # A multipart upload used to be excluded here, because
-                        # the managed path builds its payload with dict(body)
-                        # and an opaque upload has none. It took the raw
-                        # forward below instead -- which carries the provider's
-                        # key and fails over, but runs none of the provider's
-                        # own accounting, so NOTHING a transcription spent was
-                        # ever recorded. `open_upstream_raw` is that path with
-                        # the body left opaque; a providers port that does not
-                        # have it still falls back exactly as before.
-                        and (
-                            content is None
-                            or (
-                                open_upstream_raw is not None
-                                and content_type is not None
-                            )
-                        )
+                        # An upload goes through the same service as JSON: the
+                        # providers port's `open_upstream` takes the bytes as
+                        # `content=` (or `open_upstream_raw`, the same path
+                        # under its own name, when the port has it), so the
+                        # provider's own gates and accounting run for a
+                        # transcription too. Only a body with no content type
+                        # cannot be forwarded as an upload.
+                        and (content is None or content_type is not None)
                     )
                     if not use_provider_service and selection.provider is not None:
                         try:
@@ -697,14 +1168,19 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         streaming=streaming,
                         open_upstream=open_upstream,
                         open_upstream_raw=open_upstream_raw,
-                        content=upstream_content if content is not None else None,
-                        content_type=content_type,
                         count_tokens=count_tokens,
                         on_finish=on_finish,
                         selection=selection,
                         trace=trace,
                         attempt_no=attempt_no,
                         reopen=reopen,
+                        on_record=_on_record,
+                        # An upload goes through the same gate as JSON --
+                        # enabled, serves(), rate limit, budget, spend
+                        # (finding K5) -- byte for byte, with the provider's
+                        # model name already spliced in above.
+                        content=upstream_content if body is None else None,
+                        content_type=content_type if body is None else None,
                     )
                     if result is None:
                         # The provider refused before anything was sent --
@@ -713,6 +1189,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         ctx.breaker.abandon(target.target_id)
                         return None  # nothing was sent; try another target
                 else:
+                    if target.kind is TargetKind.LOCAL:
+                        _occupy_engine(selection)
                     result = await ctx.proxy.forward(
                         selection=selection,
                         path=path,
@@ -730,6 +1208,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         content_type=content_type,
                         count_tokens=count_tokens,
                         reopen=reopen,
+                        on_record=_on_record,
                     )
                 return result
 
@@ -872,31 +1351,87 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # Its deployment has left the index altogether, but it was
                 # serving a moment ago. "No such model" would be a lie.
                 return errors.no_target_admitting(model)
-            return errors.unknown_model(model, fresh.served_names())
+            return errors.unknown_model(model, _visible_names(request, fresh.served_names()))
 
-        answer = await _dispatch()
-        if answer is not None:
-            return answer
+        async def _deliver() -> Response:
+            answer = await _dispatch()
+            if answer is not None:
+                return answer
 
-        # Nothing was reachable. If this model was serving a moment ago and no
-        # target is deliberately shedding load, hold the request briefly for
-        # one to come back rather than refusing outright.
-        if ctx.parking.accepts(model, raw_len) and ctx.router.parkable(model):
-            parked_at = time.monotonic()
-            recovered = await ctx.parking.park(
-                model,
-                select=lambda: ctx.router.select(model, prefix_key=prefix_key),
-                is_disconnected=request.is_disconnected,
+            # Nothing was reachable. If this model was serving a moment ago and
+            # no target is deliberately shedding load, hold the request briefly
+            # for one to come back rather than refusing outright.
+            if ctx.parking.accepts(model, raw_len) and ctx.router.parkable(model):
+                parked_at = time.monotonic()
+                recovered = await ctx.parking.park(
+                    model,
+                    select=lambda: ctx.router.select(model, prefix_key=prefix_key, **policy_kw),
+                    is_disconnected=request.is_disconnected,
+                )
+                # Recorded whether or not it recovered: how long requests wait
+                # in the lot is the gauge this queue has never had.
+                trace.parked_ms = (time.monotonic() - parked_at) * 1000.0
+                if recovered is not None:
+                    answer = await _dispatch()
+                    if answer is not None:
+                        return answer
+            refusal = _nowhere_to_send()
+            return _refused(refusal, "no_target")
+
+        if reservation is None:
+            return await _deliver()
+        # Every reservation is settled exactly once, whatever happens: the
+        # attempt that answered counts its usage in _on_record, and this
+        # releases whatever is still held -- at once for a response that is
+        # already complete, at the end of the body for a stream. The limit
+        # service ignores the second settle, so the release after a counted
+        # attempt is a no-op.
+        try:
+            answer = await _deliver()
+        except BaseException:
+            _settle_limits(None)
+            raise
+        if isinstance(answer, StreamingResponse):
+            answer.body_iterator = _released_at_end(
+                answer.body_iterator,
+                _settle_limits,
+                lambda: ctx.auth_stores.limits.mark_started(reservation),
             )
-            # Recorded whether or not it recovered: how long requests wait in
-            # the lot is the gauge this queue has never had.
-            trace.parked_ms = (time.monotonic() - parked_at) * 1000.0
-            if recovered is not None:
-                answer = await _dispatch()
-                if answer is not None:
-                    return answer
-        refusal = _nowhere_to_send()
-        return _refused(refusal, "no_target")
+        else:
+            _settle_limits(None)
+        return answer
+
+    async def _chat_as_session(request: Request, run) -> Response:
+        """A UI chat request: the session's admin, running as their admin key.
+
+        The session gate has already passed; this attaches the principal the
+        /v1 key gate would have, so the request takes exactly the same path.
+        """
+        try:
+            request.state.principal = authz.session_principal(
+                ctx.auth_stores, request, request.state.session
+            )
+        except AuthUnavailable as exc:
+            return authz.unavailable(exc)
+        except AuthError as exc:
+            return errors.error_response(401, exc.message, "invalid_request_error", exc.code.value)
+        return await run()
+
+    @router.post("/api/chat/completions")
+    async def session_chat_completions(request: Request) -> Response:
+        return await _chat_as_session(
+            request, lambda: _proxy(request, "/chat/completions", True)
+        )
+
+    @router.post("/api/chat/speech")
+    async def session_speech(request: Request) -> Response:
+        return await _chat_as_session(request, lambda: _proxy(request, "/audio/speech", False))
+
+    @router.post("/api/chat/transcriptions")
+    async def session_transcriptions(request: Request) -> Response:
+        return await _chat_as_session(
+            request, lambda: _proxy_multipart(request, "/audio/transcriptions")
+        )
 
     @router.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -935,6 +1470,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return await _proxy_multipart(request, "/audio/transcriptions")
 
     @router.get("/v1/audio/voices")
+    @router.get("/api/chat/voices")
     async def audio_voices(request: Request) -> Response:
         """Which reference voices this deployment has installed.
 
@@ -958,6 +1494,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             this route, and a speech model that exists only behind one is
             refused with the reason rather than handed a 404 from somebody
             else's API.
+
+        A key still answers to its allowlist and limits here (finding K2):
+        the listing is one request against `rpm`, `requests_cycle` and
+        `max_concurrent`, unpriced, and it leaves a `requests` row like any
+        other /v1 call. The session route (`/api/chat/voices`) carries no key.
         """
         model = request.query_params.get("model")
         if not model:
@@ -970,19 +1511,84 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "missing_model",
             )
 
+        principal: Principal | None = getattr(request.state, "principal", None)
+        trace = RequestTrace(
+            request_id=getattr(request.state, "request_id", None) or authz.new_request_id(),
+            served_name=model,
+            node_id=ctx.settings.coordinator_node_id or "",
+            streaming=False,
+        )
+        trace.model_requested = model
+        if principal is not None:
+            trace.key_id = principal.key.key_id
+            trace.key_name = principal.key.name
+            trace.org_id = principal.org.org_id
+            trace.client_ip = principal.ip
+            trace.user_agent = principal.user_agent
+        started = time.monotonic()
+        reservation = None
+        reached = False
+
+        def _done(response: Response, code: str | None = None) -> Response:
+            """Settle what was reserved and write the row, then answer."""
+            if reservation is not None:
+                try:
+                    ctx.auth_stores.limits.settle(
+                        reservation,
+                        UsageActuals(
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            cost_usd=None,
+                            cost_basis=CostBasis.UNPRICED,
+                            target_kind=TargetKind.LOCAL.value,
+                            model_served=model,
+                        )
+                        if reached
+                        else None,
+                    )
+                except Exception:
+                    log.exception("could not settle voices reservation %s", trace.request_id)
+            if code:
+                trace.error_code = code
+            try:
+                ctx.sink.request(
+                    trace.record(
+                        status=response.status_code,
+                        duration_s=time.monotonic() - started if reached else None,
+                    )
+                )
+            except Exception:
+                log.debug("could not record voices telemetry", exc_info=True)
+            response.headers["X-Request-Id"] = trace.request_id
+            return response
+
+        if principal is not None:
+            try:
+                allowed = authz.model_allowed(ctx.auth_stores, principal, model)
+            except AuthUnavailable as exc:
+                return _done(authz.unavailable(exc), exc.code.value)
+            if not allowed:
+                code = AuthErrorCode.MODEL_NOT_ALLOWED.value
+                return _done(_model_not_allowed(model), code)
+
         index = ctx.router.index()
         if model not in index.targets:
             pending = index.pending.get(model)
             if pending:
-                return errors.model_not_ready(
-                    model, sorted({d.state.value for d in pending})
+                return _done(
+                    errors.model_not_ready(model, sorted({d.state.value for d in pending})),
+                    "model_not_ready",
                 )
-            return errors.unknown_model(model, index.served_names())
+            return _done(
+                errors.unknown_model(model, _visible_names(request, index.served_names())),
+                "model_not_found",
+            )
 
         has = index.modality.get(model)
         if has is not None and _modality_conflict(has, Modality.SPEECH):
-            return errors.wrong_modality(
-                model, has, Modality.SPEECH, "/v1/audio/voices"
+            return _done(
+                errors.wrong_modality(model, has, Modality.SPEECH, "/v1/audio/voices"),
+                "wrong_modality",
             )
 
         local = next(
@@ -994,39 +1600,67 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             None,
         )
         if local is None:
-            return errors.error_response(
-                400,
-                f"'{model}' is served by a provider, and a voice library is a "
-                f"property of a deployment this cluster runs: the reference "
-                f"clips live on the node, in the directory the tts runtime was "
-                f"pointed at. Deploy it here to choose a voice, or send "
-                f"/v1/audio/speech without one and the model speaks in its own.",
-                "invalid_request_error",
+            return _done(
+                errors.error_response(
+                    400,
+                    f"'{model}' is served by a provider, and a voice library is a "
+                    f"property of a deployment this cluster runs: the reference "
+                    f"clips live on the node, in the directory the tts runtime was "
+                    f"pointed at. Deploy it here to choose a voice, or send "
+                    f"/v1/audio/speech without one and the model speaks in its own.",
+                    "invalid_request_error",
+                    "no_local_target",
+                ),
                 "no_local_target",
             )
 
+        if principal is not None:
+            try:
+                decision, reservation = ctx.auth_stores.limits.check_and_reserve(
+                    principal, model=model, target_kind=TargetKind.LOCAL.value, body={},
+                    route_limits=ctx.router.limits_for(model),
+                )
+            except AuthUnavailable as exc:
+                return _done(authz.unavailable(exc), exc.code.value)
+            if not decision.allowed:
+                trace.limit_source = decision.limit_source
+                return _done(_limit_refusal(decision), decision.code)
+
         url = local.backend_url.rstrip("/") + "/audio/voices"
         try:
-            upstream = await ctx.proxy.client_for(url).get(url)
+            # The engine requires its per-deployment key on /v1 (H3).
+            headers = (
+                {"authorization": f"Bearer {local.runtime_api_key}"}
+                if local.runtime_api_key
+                else {}
+            )
+            headers["x-request-id"] = trace.request_id
+            upstream = await ctx.proxy.client_for(url).get(url, headers=headers)
         except Exception as exc:  # httpx raises a family, not one class
-            return errors.error_response(
-                502,
-                f"Could not reach '{model}' to list its voices: "
-                # The shared provider redactor, reached the way internal_api's
-                # _redactor does: a fresh one knows no secrets to scrub, and a
-                # local backend_url is not a secret but the exception chain
-                # under it may have come from anywhere.
-                f"{errors.detail(exc, getattr(ctx.deps.providers, 'redactor', None))}.",
-                "server_error",
+            return _done(
+                errors.error_response(
+                    502,
+                    f"Could not reach '{model}' to list its voices: "
+                    # The shared provider redactor, reached the way internal_api's
+                    # _redactor does: a fresh one knows no secrets to scrub, and a
+                    # local backend_url is not a secret but the exception chain
+                    # under it may have come from anywhere.
+                    f"{errors.detail(exc, getattr(ctx.deps.providers, 'redactor', None))}.",
+                    "server_error",
+                    "upstream_unreachable",
+                ),
                 "upstream_unreachable",
             )
+        reached = True
         # The runtime's own envelope, unaltered -- including `skipped`, which
         # is it explaining which clips it declined and why. Re-shaping that
         # would throw away the only sentence a person can act on.
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            media_type=upstream.headers.get("content-type", "application/json"),
+        return _done(
+            Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type", "application/json"),
+            )
         )
 
     @router.websocket("/v1/realtime")
@@ -1038,6 +1672,98 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         another target halfway through, because the upstream holds conversation
         state we never saw. See realtime.py for what this does and does not do.
         """
-        await realtime.relay(ctx, websocket)
+        stores = ctx.auth_stores
+        principal = await authz.require_key(websocket, stores)
+        if principal is None:
+            return
+        model = websocket.query_params.get("model") or ""
+        trace = RequestTrace(
+            request_id=getattr(websocket.state, "request_id", None) or authz.new_request_id(),
+            served_name=model,
+            node_id=ctx.settings.coordinator_node_id or "",
+            streaming=True,
+        )
+        trace.key_id = principal.key.key_id
+        trace.key_name = principal.key.name
+        trace.org_id = principal.org.org_id
+        trace.client_ip = principal.ip
+        trace.user_agent = principal.user_agent
+        trace.client_port = getattr(websocket.state, "client_port", None)
+        trace.model_requested = model or None
+        # The same limits every other /v1 request answers to (finding M4):
+        # the allowlist, max_concurrent, the rate windows and the cloud cycle
+        # budgets. A session is one request that holds its slot until it
+        # closes; its audio minutes are not priced, so it settles unpriced.
+        reservation = None
+        if model:
+            try:
+                decision, reservation = stores.limits.check_and_reserve(
+                    principal, model=model, target_kind=TargetKind.REMOTE.value, body={},
+                    route_limits=ctx.router.limits_for(model),
+                )
+            except AuthUnavailable as exc:
+                await websocket.close(code=realtime.CLOSE_UPSTREAM, reason=exc.code.value)
+                return
+            if not decision.allowed:
+                trace.limit_source = decision.limit_source
+                trace.error_code = decision.code
+                try:
+                    ctx.sink.request(trace.record(status=decision.status, duration_s=None))
+                except Exception:
+                    log.debug("could not record realtime telemetry", exc_info=True)
+                await websocket.close(code=authz.CLOSE_POLICY, reason=decision.code)
+                return
+        # Whether the relay accepted the socket is the session's status: a
+        # refusal before accept is the handshake's 403, an accepted one 101.
+        accepted = False
+        accept = websocket.accept
+
+        async def _accept(*args, **kwargs):
+            nonlocal accepted
+            accepted = True
+            return await accept(*args, **kwargs)
+
+        websocket.accept = _accept
+        started = time.monotonic()
+        key_id = principal.key.key_id
+
+        async def key_still_active() -> bool:
+            return await asyncio.to_thread(realtime.key_active, stores, key_id)
+
+        ended_by = None
+        try:
+            ended_by = await realtime.relay(ctx, websocket, still_valid=key_still_active)
+        finally:
+            if reservation is not None:
+                try:
+                    stores.limits.settle(
+                        reservation,
+                        UsageActuals(
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            cost_usd=None,
+                            cost_basis=CostBasis.UNPRICED,
+                            target_kind=TargetKind.REMOTE.value,
+                            model_served=model,
+                        )
+                        if accepted
+                        else None,
+                    )
+                except Exception:
+                    log.exception("could not settle realtime reservation %s", trace.request_id)
+            if not accepted:
+                trace.error_code = "realtime_refused"
+            elif ended_by == realtime.ENDED_KEY_DISABLED:
+                # The session's close record says it was cut, not hung up.
+                trace.error_code = realtime.ENDED_KEY_DISABLED
+            try:
+                ctx.sink.request(
+                    trace.record(
+                        status=101 if accepted else 403,
+                        duration_s=time.monotonic() - started,
+                    )
+                )
+            except Exception:
+                log.debug("could not record realtime telemetry", exc_info=True)
 
     return router
