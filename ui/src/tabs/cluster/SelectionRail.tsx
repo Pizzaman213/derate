@@ -1,10 +1,9 @@
 import type { LinkMeasurement, LinkTuning, ReachReport, TopologyEdge } from '../../api/types'
 import { useSelection } from '../../state/selection'
 import { fmt, fmtUnit, relativeTime } from '../../format'
-// One spelling of the threshold and of a pair's key, both layout.ts's: a
-// second copy here is how the rail's verdict sentence and the wire's own
-// scale drift apart.
-import { edgeKey, edgeMeasured, TP_THRESHOLD } from './layout'
+import { linkMeasured } from '../models/board'
+
+const TP_THRESHOLD = 40
 // The tuning row's decisions live in a plain module so a verifier can reach
 // them: `check.mjs` bundles with esbuild `platform: 'neutral'` and cannot
 // import anything that pulls in React.
@@ -21,6 +20,10 @@ export interface ReachState {
   report: { key: string; value: ReachReport } | null
   error: { key: string; message: string } | null
   onCheck: (a: string, b: string) => void
+}
+
+function edgeKey(a: string, b: string): string {
+  return [a, b].sort().join('~')
 }
 
 interface Props {
@@ -98,9 +101,8 @@ export function SelectionRail({
         />
       )
     }
-    // A bracket click always carries a valid pair (layout.ts always emits a
-    // `linkKey` for a spanned deployment even with no topology edge record
-    // yet), but the record itself may not exist -- a pair nothing has ever
+    // A link click always carries a valid pair, but the topology edge
+    // record itself may not exist -- a pair nothing has ever
     // touched, not even a `measured: false` placeholder. That is still an
     // unmeasured pair, so it gets the exact same rail, not a silent no-op.
     const [a, b] = selLink.split('~') as [string, string]
@@ -133,11 +135,11 @@ function DefaultRail({
   name: (id: string) => string
 }) {
   const { selectLink } = useSelection()
-  const measured = edges.filter(edgeMeasured).length
+  const measured = edges.filter(linkMeasured).length
 
   return (
     <div>
-      <p className="unit" style={{ marginBottom: 8 }}>
+      <p className="unit" style={{ marginBottom: 'var(--space-8)' }}>
         Double-click a machine, or click a pair below, for detail. {edges.length} node pairs ·{' '}
         {measured} measured · {edges.length - measured} never measured.
         {crowded
@@ -146,10 +148,10 @@ function DefaultRail({
       </p>
       <div className="chips">
         {edges.map((e) => (
-          <button key={edgeKey(e.src, e.dst)} onClick={() => selectLink(e.src, e.dst)}>
+          <button type="button" key={edgeKey(e.src, e.dst)} onClick={() => selectLink(e.src, e.dst)}>
             {name(e.src)} ↔ {name(e.dst)}
-            <span className="unit" style={{ marginLeft: 6 }}>
-              {edgeMeasured(e) ? `${fmt(e.all_reduce_gbps, 1)} GB/s` : 'never measured'}
+            <span className="unit" style={{ marginLeft: 'var(--space-6)' }}>
+              {linkMeasured(e) ? `${fmt(e.all_reduce_gbps, 1)} GB/s` : 'never measured'}
             </span>
           </button>
         ))}
@@ -215,16 +217,16 @@ function UnmeasuredLinkRail({
           that adds one two-rank collective per candidate setting. Saying a
           minute and taking five is worse than saying nothing, because the
           reader concludes it hung. */}
-      <div className="unit" style={{ marginTop: 10 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-10)' }}>
         Measuring saturates the link for about a minute — and a pair that has
         never been tuned is calibrated straight afterwards, which takes several
         more.
       </div>
-      <button style={{ marginTop: 8 }} onClick={() => onMeasure(a, b)} disabled={busy}>
+      <button type="button" style={{ marginTop: 'var(--space-8)' }} onClick={() => onMeasure(a, b)} disabled={busy}>
         {busy ? 'Measuring…' : 'Measure this link'}
       </button>
       {!busy && measureError?.key === key ? (
-        <div className="unit" style={{ marginTop: 8, color: 'var(--fault)' }}>
+        <div className="unit" style={{ marginTop: 'var(--space-8)', color: 'var(--fault)' }}>
           {measureError.message}
         </div>
       ) : null}
@@ -256,10 +258,10 @@ function LinkRail({
     bulkBand: number
   }
 }) {
-  // Same definition of "measured" as the graph and the chips (edgeMeasured):
+  // Same definition of "measured" as the graph and the chips (linkMeasured):
   // a measured:true edge with no figure must open the never-measured rail,
   // not a provenance grid asserting thresholds about a number that isn't there.
-  if (!edgeMeasured(edge)) {
+  if (!linkMeasured(edge)) {
     return (
       <UnmeasuredLinkRail
         a={edge.src}
@@ -342,16 +344,16 @@ function LinkRail({
           <Row label="Measured" value={measuredAt != null ? relativeTime(measuredAt) : '—'} />
         </div>
       </div>
-      {gdrBy ? <div className="unit" style={{ marginTop: 8 }}>{gdrBy}</div> : null}
+      {gdrBy ? <div className="unit" style={{ marginTop: 'var(--space-8)' }}>{gdrBy}</div> : null}
       {notes.length > 0 ? (
-        <div className="why on" style={{ marginTop: 8 }}>
+        <div className="why on" style={{ marginTop: 'var(--space-8)' }}>
           {notes.map((n, i) => (
             <div key={i}>{n}</div>
           ))}
         </div>
       ) : null}
       <ReachPanel a={edge.src} b={edge.dst} name={name} reach={reach} />
-      <div className="unit" style={{ marginTop: 8 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-8)' }}>
         {ar != null && ar >= TP_THRESHOLD
           ? `At or above the ${TP_THRESHOLD} GB/s threshold, so tensor parallel is viable across this pair.`
           : `Below the ${TP_THRESHOLD} GB/s tensor-parallel threshold, which is why the planner chooses pipeline parallel over this pair.`}
@@ -402,22 +404,22 @@ function ReachPanel({
   const error = !busy && reach.error?.key === key ? reach.error.message : null
 
   return (
-    <div style={{ marginTop: 10 }}>
-      <button onClick={() => reach.onCheck(a, b)} disabled={busy}>
+    <div style={{ marginTop: 'var(--space-10)' }}>
+      <button type="button" onClick={() => reach.onCheck(a, b)} disabled={busy}>
         {busy ? 'Checking…' : 'Check connection'}
       </button>
-      <span className="unit" style={{ marginLeft: 8 }}>
+      <span className="unit" style={{ marginLeft: 'var(--space-8)' }}>
         A health check each way. Seconds, and safe while this cluster is serving.
       </span>
 
       {error ? (
-        <div className="unit" style={{ marginTop: 8, color: 'var(--fault)' }}>
+        <div className="unit" style={{ marginTop: 'var(--space-8)', color: 'var(--fault)' }}>
           {error}
         </div>
       ) : null}
 
       {report ? (
-        <div style={{ marginTop: 8 }}>
+        <div style={{ marginTop: 'var(--space-8)' }}>
           <div className="unit" style={{ color: report.ok ? undefined : 'var(--fault)' }}>
             {report.summary}
           </div>
@@ -448,7 +450,7 @@ function ReachPanel({
               <div
                 className="unit"
                 key={`why-${i}`}
-                style={{ color: unchecked ? undefined : 'var(--fault)', marginTop: 4 }}
+                style={{ color: unchecked ? undefined : 'var(--fault)', marginTop: 'var(--space-4)' }}
               >
                 {legDirection(leg, name)}: {detail}
                 {unchecked && leg.error ? ` (${leg.error})` : ''}
@@ -460,12 +462,12 @@ function ReachPanel({
           {report.legs
             .filter((leg) => leg.ok && leg.answered_as && leg.answered_as !== leg.target)
             .map((leg, i) => (
-              <div className="unit" key={`id-${i}`} style={{ color: 'var(--fault)', marginTop: 4 }}>
+              <div className="unit" key={`id-${i}`} style={{ color: 'var(--fault)', marginTop: 'var(--space-4)' }}>
                 {leg.url} answered as {leg.answered_as}, not {leg.target}. Two machines may be
                 sharing an address.
               </div>
             ))}
-          <div className="unit" style={{ marginTop: 4 }}>
+          <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
             Checked {relativeTime(report.checked_at)}.
           </div>
         </div>

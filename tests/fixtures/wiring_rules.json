@@ -1,0 +1,990 @@
+{
+  "_about": "Shared by tests/unit/test_wiring_rules.py (posts each case's ops as a dry run, asserts results) and ui/src/tabs/cluster/doc.check.mjs (builds setups[case.setup] as a ServerSnapshot (cluster.nodes left empty: the editor reads machines off topology), applies edit, asserts diff() === ops byte for byte). setups.default is what tests/unit/test_wiring_api.py::_app serves. edit null = a server-only case. A case's optional `routing` overlays fields onto that served name's routing row before the editor reads it (an override the server would report); the server's answer to the case's ops does not depend on it.",
+  "setups": {
+    "default": {
+      "topology": {
+        "cluster_id": "c-local",
+        "coordinator": "spark-01",
+        "nodes": [
+          {
+            "node_id": "spark-01",
+            "label": null,
+            "hostname": "spark-01",
+            "device_class": "gb10",
+            "gpu_name": "NVIDIA GB10",
+            "gpu_count": 1,
+            "state": "healthy",
+            "role": "coordinator",
+            "memory_used_pct": 20.0,
+            "power_w": 71.0,
+            "temp_c": 62.0,
+            "util_pct": 40.0,
+            "sample_ts": 1757193600.0,
+            "strength": 1.0,
+            "deployments": [
+              "d-spark"
+            ]
+          },
+          {
+            "node_id": "spark-02",
+            "label": null,
+            "hostname": "spark-02",
+            "device_class": "gb10",
+            "gpu_name": "NVIDIA GB10",
+            "gpu_count": 1,
+            "state": "healthy",
+            "role": "worker",
+            "memory_used_pct": 20.0,
+            "power_w": 71.0,
+            "temp_c": 62.0,
+            "util_pct": 40.0,
+            "sample_ts": 1757193600.0,
+            "strength": 1.0,
+            "deployments": [
+              "d-spark"
+            ]
+          },
+          {
+            "node_id": "ws-3090",
+            "label": null,
+            "hostname": "workstation",
+            "device_class": "discrete",
+            "gpu_name": "NVIDIA GeForce RTX 3090",
+            "gpu_count": 1,
+            "state": "healthy",
+            "role": "worker",
+            "memory_used_pct": 20.0,
+            "power_w": 71.0,
+            "temp_c": 62.0,
+            "util_pct": 40.0,
+            "sample_ts": 1757193600.0,
+            "strength": 0.2857,
+            "deployments": [
+              "d-3090"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "src": "spark-01",
+            "dst": "spark-02",
+            "all_reduce_gbps": 10.2,
+            "sendrecv_gbps": 9.0,
+            "latency_us": 40.0,
+            "gpudirect_rdma": false,
+            "measured_at": 1757193600.0,
+            "method": "nccl-tests",
+            "measured": true,
+            "stale": true,
+            "medium": "connectx-7"
+          },
+          {
+            "src": "spark-01",
+            "dst": "ws-3090",
+            "all_reduce_gbps": 1.1,
+            "sendrecv_gbps": 1.0,
+            "latency_us": 180.0,
+            "gpudirect_rdma": false,
+            "measured_at": 1757193600.0,
+            "method": "tcp",
+            "measured": true,
+            "stale": true,
+            "medium": "ethernet"
+          },
+          {
+            "src": "spark-02",
+            "dst": "ws-3090",
+            "measured": false,
+            "stale": false
+          }
+        ],
+        "deployments": [
+          {
+            "deployment_id": "d-spark",
+            "served_name": "llama-3.3-70b",
+            "node_ids": [
+              "spark-01",
+              "spark-02"
+            ],
+            "state": "ready",
+            "plan": "PP 2",
+            "tokens_per_sec": 0.0
+          },
+          {
+            "deployment_id": "d-3090",
+            "served_name": "llama-3.3-70b",
+            "node_ids": [
+              "ws-3090"
+            ],
+            "state": "ready",
+            "plan": "single node",
+            "tokens_per_sec": 0.0
+          }
+        ],
+        "remotes": [
+          {
+            "target_id": "openrouter:anthropic/claude-sonnet-4.5",
+            "provider_id": "openrouter",
+            "served_name": "anthropic/claude-sonnet-4.5",
+            "upstream_id": "anthropic/claude-sonnet-4.5",
+            "node_id": null,
+            "modality": "text",
+            "state": "healthy",
+            "admitting": true,
+            "tokens_per_sec": 0.0
+          },
+          {
+            "target_id": "openrouter:openai/gpt-4o-mini",
+            "provider_id": "openrouter",
+            "served_name": "openai/gpt-4o-mini",
+            "upstream_id": "openai/gpt-4o-mini",
+            "node_id": null,
+            "modality": "text",
+            "state": "healthy",
+            "admitting": true,
+            "tokens_per_sec": 0.0
+          }
+        ]
+      },
+      "cluster": {
+        "summary": {
+          "node_count": 3,
+          "healthy_nodes": 3,
+          "total_memory": 300647710720,
+          "total_power_w": 213.0,
+          "model_count": 3,
+          "deployment_count": 2,
+          "tokens_per_sec": 0,
+          "degraded_startup": []
+        },
+        "nodes": [],
+        "links": [
+          {
+            "src": "spark-01",
+            "dst": "spark-02",
+            "all_reduce_gbps": 10.2,
+            "sendrecv_gbps": 9.0,
+            "latency_us": 40.0,
+            "gpudirect_rdma": false,
+            "measured_at": 1757193600.0,
+            "method": "nccl-tests",
+            "measured": true,
+            "stale": true,
+            "medium": "connectx-7"
+          },
+          {
+            "src": "spark-01",
+            "dst": "ws-3090",
+            "all_reduce_gbps": 1.1,
+            "sendrecv_gbps": 1.0,
+            "latency_us": 180.0,
+            "gpudirect_rdma": false,
+            "measured_at": 1757193600.0,
+            "method": "tcp",
+            "measured": true,
+            "stale": true,
+            "medium": "ethernet"
+          },
+          {
+            "src": "spark-02",
+            "dst": "ws-3090",
+            "measured": false,
+            "stale": false
+          }
+        ],
+        "deployments": [
+          {
+            "deployment_id": "d-spark",
+            "served_name": "llama-3.3-70b",
+            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+            "runtime": "vllm",
+            "state": "ready",
+            "backend_url": "http://spark/v1",
+            "context_length": 4096,
+            "max_concurrent_seqs": 8,
+            "modality": "text",
+            "started_at": 1757193600.0,
+            "last_error": null,
+            "last_error_truncated": false,
+            "node_ids": [
+              "spark-01",
+              "spark-02"
+            ],
+            "plan": {
+              "kind": "pipeline",
+              "tensor_parallel": 1,
+              "pipeline_parallel": 2,
+              "expert_parallel": 1,
+              "data_parallel": 1,
+              "node_ids": [
+                "spark-01",
+                "spark-02"
+              ],
+              "reason": "Pipeline parallel across 2 nodes: measured all-reduce of 10.2 GB/s is far below the 40 GB/s tensor-parallel threshold.",
+              "measured_link_gbps": 10.2,
+              "rejected": [
+                "TP=2: link 10.2 GB/s below 40 GB/s threshold"
+              ],
+              "world_size": 2
+            },
+            "fit": {
+              "verdict": "fits",
+              "breakdown": {
+                "weights": 66571993088,
+                "kv_cache": 12884901888,
+                "activations": 2147483648,
+                "comm_buffers": 1610612736,
+                "replicated": 0,
+                "framework_overhead": 1073741824,
+                "total": 84288733184
+              },
+              "usable_per_node": 115674206698,
+              "headroom": 25769803776,
+              "reason": "Fits with 24.1 GiB headroom per node.",
+              "limiting_term": "weights",
+              "max_context_that_fits": 131072,
+              "predicted_decode_tps": 42.0,
+              "warnings": [],
+              "budget_basis": "static",
+              "ok": true
+            },
+            "extra_args": [],
+            "custom_command": [],
+            "revision": null,
+            "speculative_tokens": 0
+          },
+          {
+            "deployment_id": "d-3090",
+            "served_name": "llama-3.3-70b",
+            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+            "runtime": "vllm",
+            "state": "ready",
+            "backend_url": "http://ws/v1",
+            "context_length": 4096,
+            "max_concurrent_seqs": 8,
+            "modality": "text",
+            "started_at": 1757193600.0,
+            "last_error": null,
+            "last_error_truncated": false,
+            "node_ids": [
+              "ws-3090"
+            ],
+            "plan": {
+              "kind": "single_node",
+              "tensor_parallel": 1,
+              "pipeline_parallel": 1,
+              "expert_parallel": 1,
+              "data_parallel": 1,
+              "node_ids": [
+                "ws-3090"
+              ],
+              "reason": "Fits on one node; no interconnect involved.",
+              "measured_link_gbps": 0.0,
+              "rejected": [],
+              "world_size": 1
+            },
+            "fit": {
+              "verdict": "fits",
+              "breakdown": {
+                "weights": 66571993088,
+                "kv_cache": 12884901888,
+                "activations": 2147483648,
+                "comm_buffers": 1610612736,
+                "replicated": 0,
+                "framework_overhead": 1073741824,
+                "total": 84288733184
+              },
+              "usable_per_node": 115674206698,
+              "headroom": 25769803776,
+              "reason": "Fits with 24.1 GiB headroom per node.",
+              "limiting_term": "weights",
+              "max_context_that_fits": 131072,
+              "predicted_decode_tps": 12.0,
+              "warnings": [],
+              "budget_basis": "static",
+              "ok": true
+            },
+            "extra_args": [],
+            "custom_command": [],
+            "revision": null,
+            "speculative_tokens": 0
+          }
+        ]
+      },
+      "routing": [
+        {
+          "served_name": "anthropic/claude-sonnet-4.5",
+          "policy": "least_outstanding",
+          "sticky_ttl_s": 0,
+          "limits": {},
+          "flow": null,
+          "auto_selected": true,
+          "auto_reason": "targets are close enough in capability that sending each request to the least-busy one balances load well enough on its own",
+          "targets": [
+            {
+              "target_id": "openrouter:anthropic/claude-sonnet-4.5",
+              "kind": "remote",
+              "backend_url": "https://openrouter.ai/api/v1",
+              "weight": 1.0,
+              "outstanding": 0,
+              "healthy": true,
+              "admitting": true,
+              "strength": 0.0238,
+              "strength_source": "default",
+              "circuit": "closed",
+              "cost_per_mtok": 15.0,
+              "zero_weight_reason": null,
+              "node_ids": [],
+              "counters": {
+                "completed": null,
+                "failed": null,
+                "total_tokens": null,
+                "decode_tps": null,
+                "mean_duration_s": null
+              },
+              "strength_raw": 1.0,
+              "admission_blocks": null
+            }
+          ]
+        },
+        {
+          "served_name": "llama-3.3-70b",
+          "policy": "weighted_capacity",
+          "sticky_ttl_s": 0,
+          "limits": {},
+          "flow": null,
+          "auto_selected": true,
+          "auto_reason": "local replicas differ in measured capability by 71%, above the 25% threshold for an even split",
+          "targets": [
+            {
+              "target_id": "d-spark",
+              "kind": "local",
+              "backend_url": "http://spark/v1",
+              "weight": 0.7778,
+              "outstanding": 0,
+              "healthy": true,
+              "admitting": true,
+              "strength": 1.0,
+              "strength_source": "predicted",
+              "circuit": "closed",
+              "cost_per_mtok": 0.0,
+              "zero_weight_reason": null,
+              "node_ids": [
+                "spark-01",
+                "spark-02"
+              ],
+              "counters": {
+                "completed": null,
+                "failed": null,
+                "total_tokens": null,
+                "decode_tps": null,
+                "mean_duration_s": null
+              },
+              "strength_raw": 42.0,
+              "admission_blocks": null
+            },
+            {
+              "target_id": "d-3090",
+              "kind": "local",
+              "backend_url": "http://ws/v1",
+              "weight": 0.2222,
+              "outstanding": 0,
+              "healthy": true,
+              "admitting": true,
+              "strength": 0.2857,
+              "strength_source": "predicted",
+              "circuit": "closed",
+              "cost_per_mtok": 0.0,
+              "zero_weight_reason": null,
+              "node_ids": [
+                "ws-3090"
+              ],
+              "counters": {
+                "completed": null,
+                "failed": null,
+                "total_tokens": null,
+                "decode_tps": null,
+                "mean_duration_s": null
+              },
+              "strength_raw": 12.0,
+              "admission_blocks": null
+            }
+          ]
+        },
+        {
+          "served_name": "openai/gpt-4o-mini",
+          "policy": "least_outstanding",
+          "sticky_ttl_s": 0,
+          "limits": {},
+          "flow": null,
+          "auto_selected": true,
+          "auto_reason": "targets are close enough in capability that sending each request to the least-busy one balances load well enough on its own",
+          "targets": [
+            {
+              "target_id": "openrouter:openai/gpt-4o-mini",
+              "kind": "remote",
+              "backend_url": "https://openrouter.ai/api/v1",
+              "weight": 1.0,
+              "outstanding": 0,
+              "healthy": true,
+              "admitting": true,
+              "strength": 0.0238,
+              "strength_source": "default",
+              "circuit": "closed",
+              "cost_per_mtok": 0.6,
+              "zero_weight_reason": null,
+              "node_ids": [],
+              "counters": {
+                "completed": null,
+                "failed": null,
+                "total_tokens": null,
+                "decode_tps": null,
+                "mean_duration_s": null
+              },
+              "strength_raw": 1.0,
+              "admission_blocks": null
+            }
+          ]
+        }
+      ],
+      "providers": [
+        {
+          "provider_id": "openrouter",
+          "kind": "openrouter",
+          "display_name": "OpenRouter",
+          "base_url": "https://openrouter.ai/api/v1",
+          "api_key_ref": "DERATE_SECRET_OPENROUTER",
+          "api_key": "***",
+          "enabled": true,
+          "priority": 10,
+          "healthy": true,
+          "last_error": null,
+          "last_refreshed": 1795026773.500282,
+          "models": [
+            {
+              "served_name": "anthropic/claude-sonnet-4.5",
+              "upstream_id": "anthropic/claude-sonnet-4.5",
+              "context_length": 200000,
+              "supports_streaming": true,
+              "supports_tools": true,
+              "modality": "text",
+              "input_cost_per_mtok": 3.0,
+              "output_cost_per_mtok": 15.0
+            },
+            {
+              "served_name": "openai/gpt-4o-mini",
+              "upstream_id": "openai/gpt-4o-mini",
+              "context_length": 128000,
+              "supports_streaming": true,
+              "supports_tools": true,
+              "modality": "text",
+              "input_cost_per_mtok": 0.15,
+              "output_cost_per_mtok": 0.6
+            }
+          ],
+          "admitting": true,
+          "admission_block": null,
+          "daily_budget_usd": null,
+          "spend_today_usd": 0.0,
+          "tokens_today": {
+            "input": 0,
+            "output": 0
+          },
+          "requests_today": 0,
+          "unpriced_requests_today": 0,
+          "metered_requests_today": 0,
+          "retry_in_s": 0.0,
+          "model_count": 2,
+          "catalogue_count": 3,
+          "models_chosen": true,
+          "key_state": "set",
+          "key_source": "environment",
+          "sign_in_account": null
+        }
+      ],
+      "catalogues": {
+        "openrouter": [
+          {
+            "served_name": "anthropic/claude-sonnet-4.5",
+            "upstream_id": "anthropic/claude-sonnet-4.5",
+            "context_length": 200000,
+            "supports_streaming": true,
+            "supports_tools": true,
+            "input_cost_per_mtok": 3.0,
+            "output_cost_per_mtok": 15.0,
+            "modality": "text",
+            "enabled": true
+          },
+          {
+            "served_name": "meta-llama/llama-3.3-70b-instruct",
+            "upstream_id": "meta-llama/llama-3.3-70b-instruct",
+            "context_length": 131072,
+            "supports_streaming": true,
+            "supports_tools": false,
+            "input_cost_per_mtok": 0.12,
+            "output_cost_per_mtok": 0.3,
+            "modality": "text",
+            "enabled": false
+          },
+          {
+            "served_name": "openai/gpt-4o-mini",
+            "upstream_id": "openai/gpt-4o-mini",
+            "context_length": 128000,
+            "supports_streaming": true,
+            "supports_tools": true,
+            "input_cost_per_mtok": 0.15,
+            "output_cost_per_mtok": 0.6,
+            "modality": "text",
+            "enabled": true
+          }
+        ]
+      },
+      "mtp": {},
+      "spec": {}
+    }
+  },
+  "cases": [
+    {
+      "name": "move a cloud wire to another split",
+      "setup": "default",
+      "edit": [
+        {
+          "connect": {
+            "from": {
+              "block": "split:llama-3.3-70b",
+              "socket": "cloud"
+            },
+            "to": {
+              "block": "provider:openrouter",
+              "socket": "in:pm:openrouter:openai/gpt-4o-mini"
+            }
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "provider.patch",
+          "provider_id": "openrouter",
+          "patch": {
+            "aliases": {
+              "openai/gpt-4o-mini": "llama-3.3-70b"
+            }
+          }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "provider.patch",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "cut a cloud wire",
+      "setup": "default",
+      "edit": [
+        {
+          "disconnect": "split:openai/gpt-4o-mini|cloud|provider:openrouter|in:pm:openrouter:openai/gpt-4o-mini"
+        }
+      ],
+      "ops": [
+        {
+          "op": "provider.patch",
+          "provider_id": "openrouter",
+          "patch": {
+            "enabled_models": [
+              "anthropic/claude-sonnet-4.5"
+            ]
+          }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "provider.patch",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "enable an unpublished model",
+      "setup": "default",
+      "edit": [
+        {
+          "addProviderModel": {
+            "provider_id": "openrouter",
+            "upstream_id": "nobody/such-model",
+            "served_name": "llama-3.3-70b"
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "provider.patch",
+          "provider_id": "openrouter",
+          "patch": {
+            "enabled_models": [
+              "anthropic/claude-sonnet-4.5",
+              "nobody/such-model",
+              "openai/gpt-4o-mini"
+            ],
+            "aliases": {
+              "nobody/such-model": "llama-3.3-70b"
+            }
+          }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "provider.patch",
+          "ok": false,
+          "error": {
+            "message": "openrouter does not publish nobody/such-model; enable only models from its own catalogue",
+            "code": "invalid_request"
+          }
+        }
+      ]
+    },
+    {
+      "name": "rate limit plugged into two splits",
+      "setup": "default",
+      "edit": [
+        {
+          "addLimit": {
+            "id": "limit:a",
+            "rpm": 3
+          }
+        },
+        {
+          "connect": {
+            "from": {
+              "block": "limit:a",
+              "socket": "out"
+            },
+            "to": {
+              "block": "split:llama-3.3-70b",
+              "socket": "limit"
+            }
+          }
+        },
+        {
+          "connect": {
+            "from": {
+              "block": "limit:a",
+              "socket": "out"
+            },
+            "to": {
+              "block": "split:anthropic/claude-sonnet-4.5",
+              "socket": "limit"
+            }
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "route.set",
+          "served_name": "anthropic/claude-sonnet-4.5",
+          "policy": "failover",
+          "limits": {
+            "rpm": 3
+          }
+        },
+        {
+          "op": "route.set",
+          "served_name": "llama-3.3-70b",
+          "policy": "failover",
+          "limits": {
+            "rpm": 3
+          }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "route.set",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "op": "route.set",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "invalid limit key",
+      "setup": "default",
+      "edit": null,
+      "ops": [
+        {
+          "op": "route.set",
+          "served_name": "llama-3.3-70b",
+          "policy": "failover",
+          "limits": {
+            "rps": 3
+          }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "route.set",
+          "ok": false,
+          "error": {
+            "message": "limits may only set rpm and tpm.",
+            "code": "invalid_request"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pin a model to a host OpenRouter does not list",
+      "setup": "default",
+      "edit": [
+        {
+          "setProviderPin": {
+            "provider_id": "openrouter",
+            "upstream_id": "anthropic/claude-sonnet-4.5",
+            "pin": { "tag": "nope", "fallback": false }
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "provider.patch",
+          "provider_id": "openrouter",
+          "patch": {
+            "backend_pins": {
+              "anthropic/claude-sonnet-4.5": "nope"
+            }
+          }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "provider.patch",
+          "ok": false,
+          "error": {
+            "message": "openrouter lists no backend 'nope' for anthropic/claude-sonnet-4.5; pick one from its backend list",
+            "code": "invalid_request"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pin a policy on a load balancer",
+      "setup": "default",
+      "edit": [
+        {
+          "setRoutePolicy": {
+            "served_name": "llama-3.3-70b",
+            "policy": "round_robin"
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "route.set",
+          "served_name": "llama-3.3-70b",
+          "policy": "round_robin",
+          "limits": {}
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "route.set",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "hand a pinned policy back to auto",
+      "setup": "default",
+      "routing": {
+        "llama-3.3-70b": {
+          "auto_selected": false,
+          "policy": "round_robin"
+        }
+      },
+      "edit": [
+        {
+          "setRoutePolicy": {
+            "served_name": "llama-3.3-70b",
+            "policy": "auto"
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "route.clear",
+          "served_name": "llama-3.3-70b"
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "route.clear",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "split a load balancer by hand",
+      "setup": "default",
+      "edit": [
+        {
+          "setRouteShares": {
+            "served_name": "llama-3.3-70b",
+            "shares": { "d-spark": 70, "d-3090": 30 }
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "route.set",
+          "served_name": "llama-3.3-70b",
+          "policy": "weighted_capacity",
+          "limits": {},
+          "shares": { "d-3090": 30, "d-spark": 70 }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "route.set",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "a split under a policy that ignores it",
+      "setup": "default",
+      "edit": null,
+      "ops": [
+        {
+          "op": "route.set",
+          "served_name": "llama-3.3-70b",
+          "policy": "round_robin",
+          "shares": { "d-spark": 70 }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "route.set",
+          "ok": false,
+          "error": {
+            "message": "shares split traffic only under weighted_capacity; set that policy to set them.",
+            "code": "invalid_request"
+          }
+        }
+      ]
+    },
+    {
+      "name": "valid 3-op batch",
+      "setup": "default",
+      "edit": [
+        {
+          "connect": {
+            "from": {
+              "block": "split:llama-3.3-70b",
+              "socket": "cloud"
+            },
+            "to": {
+              "block": "provider:openrouter",
+              "socket": "in:pm:openrouter:openai/gpt-4o-mini"
+            }
+          }
+        },
+        {
+          "addLimit": {
+            "id": "limit:a",
+            "rpm": 3
+          }
+        },
+        {
+          "connect": {
+            "from": {
+              "block": "limit:a",
+              "socket": "out"
+            },
+            "to": {
+              "block": "split:llama-3.3-70b",
+              "socket": "limit"
+            }
+          }
+        },
+        {
+          "connect": {
+            "from": {
+              "block": "limit:a",
+              "socket": "out"
+            },
+            "to": {
+              "block": "split:anthropic/claude-sonnet-4.5",
+              "socket": "limit"
+            }
+          }
+        }
+      ],
+      "ops": [
+        {
+          "op": "provider.patch",
+          "provider_id": "openrouter",
+          "patch": {
+            "aliases": {
+              "openai/gpt-4o-mini": "llama-3.3-70b"
+            }
+          }
+        },
+        {
+          "op": "route.set",
+          "served_name": "anthropic/claude-sonnet-4.5",
+          "policy": "failover",
+          "limits": {
+            "rpm": 3
+          }
+        },
+        {
+          "op": "route.set",
+          "served_name": "llama-3.3-70b",
+          "policy": "failover",
+          "limits": {
+            "rpm": 3
+          }
+        }
+      ],
+      "results": [
+        {
+          "index": 0,
+          "op": "provider.patch",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "op": "route.set",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "op": "route.set",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
+  ]
+}

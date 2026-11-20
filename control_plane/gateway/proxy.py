@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
@@ -298,9 +299,13 @@ class _StreamAccounting:
     a substring scan per chunk rather than a parse.
     """
 
-    def __init__(self, started: float) -> None:
+    def __init__(self, started: float, on_tokens: Callable[[int], None] | None = None) -> None:
         self.started = started
         self.usage = _Usage()
+        # Tokens already handed to ``on_tokens`` as they streamed, so the
+        # settle step can add only what the final count says on top.
+        self.live = 0
+        self._on_tokens = on_tokens
         self._tail = b""
         self._first_token_at: float | None = None
         self._last_token_at: float | None = None
@@ -326,6 +331,13 @@ class _StreamAccounting:
                 self._gaps.append((now - self._last_token_at, count))
             self._last_token_at = now
             self.usage.tokens += count
+            if self._on_tokens is not None:
+                # Live throughput only; never allowed to break the stream.
+                try:
+                    self._on_tokens(count)
+                    self.live += count
+                except Exception:
+                    log.debug("live token count failed", exc_info=True)
         self._tail = window[-len(_SSE_TOKEN_MARKER) :]
 
     def finish(self, now: float) -> _Usage:
@@ -864,7 +876,7 @@ class UpstreamProxy:
         if not count_tokens:
             accounting = _NoAccounting(started)
         elif streaming:
-            accounting = _StreamAccounting(started)
+            accounting = _StreamAccounting(started, on_tokens=target_stats.note_tokens)
         else:
             accounting = _BodyAccounting(started)
         finished = False
@@ -894,6 +906,7 @@ class UpstreamProxy:
                     duration_s=duration,
                     decode_s=usage.decode_s,
                     ttft_s=usage.ttft_s,
+                    already_counted=getattr(accounting, "live", 0),
                 )
             # The numbers above are folded into an EWMA and are unrecoverable
             # from here on. This is the one moment they exist as themselves.
@@ -1262,7 +1275,7 @@ class UpstreamProxy:
             # buffering the body to look for one costs a megabyte to learn nothing.
             accounting = _NoAccounting(started)
         elif streaming:
-            accounting = _StreamAccounting(started)
+            accounting = _StreamAccounting(started, on_tokens=target_stats.note_tokens)
         else:
             accounting = _BodyAccounting(started)
         finished = False
@@ -1292,6 +1305,7 @@ class UpstreamProxy:
                     duration_s=duration,
                     decode_s=usage.decode_s,
                     ttft_s=usage.ttft_s,
+                    already_counted=getattr(accounting, "live", 0),
                 )
             # Mirrors forward(): the one moment these numbers exist as
             # themselves, before they are folded into an EWMA. Without this a

@@ -52,11 +52,12 @@ export function ServingBlock({
   const totals = requestTotals(h)
 
   return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <div style={{ marginBottom: 'var(--space-16)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 'var(--space-8)' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)' }}>
           <Lamp signal={degraded ? 'warn' : serving ? 'live' : 'fault'} label={dep.state} />
           <button
+            type="button"
             className="ghost mono"
             onClick={() => selection.openSheet({ kind: 'dep', id: dep.served_name })}
             title="Open the deployment, with its targets and routing"
@@ -67,7 +68,7 @@ export function ServingBlock({
         <span className="unit">{dep.state}</span>
       </div>
 
-      <div className="unit" style={{ margin: '2px 0 8px' }}>
+      <div className="unit" style={{ margin: 'var(--space-2) 0 var(--space-8)' }}>
         {planShortFromDegrees(dep.plan)} · {dep.runtime} ·{' '}
         {dep.context_length.toLocaleString()} ctx · {dep.max_concurrent_seqs} seqs · up{' '}
         {dep.started_at != null ? relativeTime(dep.started_at) : '—'}
@@ -80,7 +81,7 @@ export function ServingBlock({
         <Cell value={fmt(depFrame?.queue_depth ?? null, 0)} unit="queued now" />
       </div>
 
-      <div className="chartgrid" style={{ marginTop: 10 }}>
+      <div className="chartgrid" style={{ marginTop: 'var(--space-10)' }}>
         <Chart title="Throughput" unit="tok/s" points={tps} note={note(tps.length)} />
         <Chart
           title={fromLive ? 'Time to first token' : 'Time to first token, p50'}
@@ -98,7 +99,7 @@ export function ServingBlock({
 
       {totals ? (
         <>
-          <div className="row" style={{ marginTop: 8 }}>
+          <div className="row" style={{ marginTop: 'var(--space-8)' }}>
             <span>requests</span>
             <span className="mono">
               {fmt(totals.n, 0)} · {fmt(totals.ok, 0)} ok · {fmt(totals.failed, 0)} failed ·{' '}
