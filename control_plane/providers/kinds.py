@@ -87,6 +87,15 @@ class KindSpec:
     #: whose credential is a key. A sign-in kind is never added by a key and
     #: never has an ``api_key_ref``.
     sign_in: str = ""
+    #: An authenticated GET, relative to the base URL, whose answer proves the
+    #: key works ("Test key"). "" means this kind has no key check: no key at
+    #: all, an unknown upstream, or a sign-in with its own refresh path. Never
+    #: a public endpoint -- OpenRouter's /models answers 200 to anyone, which
+    #: would report a dead key as passing.
+    key_probe_path: str = ""
+    #: Whether the probe's answer carries the key's expiry
+    #: (``data.expires_at``, OpenRouter's GET /key).
+    key_probe_reports_expiry: bool = False
 
 
 _SPECS: dict[ProviderKind, KindSpec] = {
@@ -99,6 +108,8 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         pricing=PricingUnit.PER_TOKEN_USD,
         meters_cost=True,
         supports_backend_routing=True,
+        key_probe_path="key",
+        key_probe_reports_expiry=True,
     ),
     ProviderKind.OPENAI: KindSpec(
         kind=ProviderKind.OPENAI,
@@ -107,6 +118,7 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         models_path="models",
         auth=AuthStyle.BEARER,
         pricing=PricingUnit.NONE,
+        key_probe_path="models",
     ),
     ProviderKind.ANTHROPIC: KindSpec(
         kind=ProviderKind.ANTHROPIC,
@@ -117,6 +129,7 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         pricing=PricingUnit.NONE,
         extra_headers={"anthropic-version": "2023-06-01"},
         supports_stream_usage=False,
+        key_probe_path="models",
         forwardable=False,
         unsupported_reason=(
             "the Anthropic Messages API is not OpenAI-compatible and this build "
@@ -131,6 +144,7 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         models_path="models",
         auth=AuthStyle.BEARER,
         pricing=PricingUnit.PER_MTOK_USD,
+        key_probe_path="models",
     ),
     ProviderKind.GROQ: KindSpec(
         kind=ProviderKind.GROQ,
@@ -139,6 +153,7 @@ _SPECS: dict[ProviderKind, KindSpec] = {
         models_path="models",
         auth=AuthStyle.BEARER,
         pricing=PricingUnit.NONE,
+        key_probe_path="models",
     ),
     ProviderKind.OLLAMA: KindSpec(
         kind=ProviderKind.OLLAMA,

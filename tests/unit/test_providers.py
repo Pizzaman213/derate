@@ -131,6 +131,7 @@ class Upstream:
         self.model_responses: list[httpx.Response] = []
         self.chat_responses: list[httpx.Response] = []
         self.endpoints_responses: list[httpx.Response] = []
+        self.key_responses: list[httpx.Response] = []
         self.requests: list[httpx.Request] = []
         self.auth_headers: list[str | None] = []
 
@@ -142,6 +143,10 @@ class Upstream:
             if self.endpoints_responses:
                 return self.endpoints_responses.pop(0)
             return httpx.Response(200, json=self.endpoints)
+        if request.method == "GET" and path.endswith("/key"):
+            if self.key_responses:
+                return self.key_responses.pop(0)
+            return httpx.Response(200, json={"data": {"label": "t", "expires_at": None}})
         if request.method == "GET" and path.endswith("/models"):
             if self.model_responses:
                 return self.model_responses.pop(0)
@@ -3030,7 +3035,7 @@ def test_a_rejected_key_never_expires(tmp_path):
     from control_plane.providers.runtime import ProviderRuntime
 
     runtime = ProviderRuntime(provider_id="openrouter")
-    runtime.note_auth_failure(0.0, 401, "OPENROUTER_API_KEY", "invalid key")
+    runtime.note_auth_failure(0.0, 401, "OPENROUTER_API_KEY", "invalid key", credential=None)
 
     runtime.half_open(1e9)
     assert runtime.healthy is False
@@ -3298,3 +3303,277 @@ def test_a_numeric_literal_base_url_is_refused_over_http(tmp_path, host):
     assert reply.status_code == 400, reply.text
     assert "dotted-quad" in reply.json()["error"]["message"]
     assert providers.get("box").base_url == "http://box.local/v1"
+
+
+# -- a refused key, a new key, and the key check ------------------------------
+
+NEW_KEY = "sk-or-v1-" + "b" * 40
+
+
+def _refused() -> httpx.Response:
+    return httpx.Response(401, json={"error": {"message": "API key expired."}})
+
+
+def _latch(service: ProviderService, upstream: Upstream, model: str = "openai/gpt-4o-mini") -> None:
+    upstream.chat_responses.append(_refused())
+    with pytest.raises(UpstreamError):
+        run(collect(service.forward("openrouter", model, {"messages": []})))
+    assert service._entry("openrouter").runtime.auth_rejected
+
+
+def _add_pasted(service: ProviderService, key: str = REAL_KEY) -> Provider:
+    """A key pasted into Settings, stored in secrets.json under a minted ref."""
+    service.add({"provider_id": "openrouter", "kind": ProviderKind.OPENROUTER, "api_key": key, "priority": 10})
+    return enable_all(service, "openrouter")
+
+
+def _iso(ts: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _expiring(ts: float) -> httpx.Response:
+    return httpx.Response(200, json={"data": {"label": "t", "expires_at": _iso(ts)}})
+
+
+class KeyEvents:
+    """Records the key-warning edges the service reports."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def key_warning(self, provider_id: str, detail: str, severity: str) -> None:
+        self.calls.append(("key_warning", provider_id, severity, detail))
+
+    def key_warning_cleared(self, provider_id: str) -> None:
+        self.calls.append(("key_warning_cleared", provider_id))
+
+    def budget_reached(self, *args, **kwargs) -> None:
+        pass
+
+    def budget_cleared(self, *args, **kwargs) -> None:
+        pass
+
+
+def test_a_different_key_releases_a_refused_one(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    _latch(service, upstream)
+
+    service.update("openrouter", {"api_key": NEW_KEY})
+    assert service._entry("openrouter").runtime.admission_block(clock()) is None
+    assert all(t.admitting for t in service.route_targets())
+    run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
+    assert upstream.auth_headers[-1] == f"Bearer {NEW_KEY}"
+
+
+def test_the_same_refused_key_pasted_again_stays_refused(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    _latch(service, upstream)
+
+    service.update("openrouter", {"api_key": REAL_KEY})
+    # Routing is where a latched provider is kept out (forward itself lets an
+    # unhealthy provider be tried); it must still be out.
+    assert service._entry("openrouter").runtime.admission_block(clock())
+    assert not any(t.admitting for t in service.route_targets())
+    assert service.health("openrouter")[0] is False
+
+
+def test_a_key_edited_into_secrets_json_by_hand_is_picked_up_by_refresh(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, env={}, now=clock)
+    _add_pasted(service)
+    _latch(service, upstream)
+
+    service.secrets.put(minted_ref("openrouter"), NEW_KEY)
+    run(service.refresh_async("openrouter"))
+    assert service._entry("openrouter").runtime.admission_block(clock()) is None
+
+
+def test_a_new_key_leaves_a_models_rate_limit_cooldown_alone(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    upstream.chat_responses.append(
+        httpx.Response(429, headers={"retry-after": "60"}, json={"error": {"message": "slow down"}})
+    )
+    with pytest.raises(UpstreamError):
+        run(collect(service.forward("openrouter", "openai/gpt-4o-mini", {"messages": []})))
+    _latch(service, upstream, model="anthropic/claude-sonnet-4.5")
+
+    service.update("openrouter", {"api_key": NEW_KEY})
+    runtime = service._entry("openrouter").runtime
+    assert runtime.auth_rejected is False
+    assert runtime.rate_limited(clock(), "openai/gpt-4o-mini") is True
+
+
+def test_a_public_model_list_does_not_vouch_for_a_refused_key(tmp_path):
+    """OpenRouter's /models answers anyone; its 200 says nothing about the key."""
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+    _latch(service, upstream)
+
+    run(service.refresh_async("openrouter"))
+    healthy, last_error = service.health("openrouter")
+    assert healthy is False
+    assert "authentication rejected" in last_error
+
+
+def test_an_environment_key_says_a_restart_is_needed_and_a_pasted_one_does_not(tmp_path):
+    upstream = Upstream()
+    service = make_service(tmp_path / "env", upstream)
+    add_openrouter(service)
+    _latch(service, upstream)
+    assert "needs a restart" in service.health("openrouter")[1]
+
+    upstream = Upstream()
+    service = make_service(tmp_path / "file", upstream, env={})
+    _add_pasted(service)
+    _latch(service, upstream)
+    assert "needs a restart" not in service.health("openrouter")[1]
+
+
+def test_a_key_check_reports_the_expiry_and_warns_inside_the_window(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    upstream.key_responses.append(_expiring(clock() + 3 * 86400))
+
+    run(service.check_key_async("openrouter"))
+    health = service.key_health("openrouter")
+    assert health["key_check"]["state"] == "ok"
+    assert health["key_expires_at"] == pytest.approx(clock() + 3 * 86400, abs=1)
+    assert "in 3 days" in health["key_warning"]
+    assert KEY_REF in health["key_warning"]
+
+    service.update("openrouter", {"key_expiry_warn_days": 2})
+    assert service.key_health("openrouter")["key_warning"] is None
+
+
+def test_an_expired_key_warns_even_with_the_early_warning_off(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    service.update("openrouter", {"key_expiry_warn_days": 0})
+    upstream.key_responses.append(_expiring(clock() - 60))
+
+    run(service.check_key_async("openrouter"))
+    assert "expired at" in service.key_health("openrouter")["key_warning"]
+
+
+def test_a_refused_key_check_latches_and_a_passing_one_releases(tmp_path):
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+    upstream.key_responses.append(_refused())
+
+    run(service.check_key_async("openrouter"))
+    runtime = service._entry("openrouter").runtime
+    assert runtime.auth_rejected is True
+    assert service.key_health("openrouter")["key_check"]["state"] == "rejected"
+    assert service.key_health("openrouter")["key_warning"] == runtime.last_error
+
+    # Renewed upstream, same key: the next check passing is the way back.
+    run(service.check_key_async("openrouter"))
+    assert runtime.auth_rejected is False
+    assert service.key_health("openrouter")["key_warning"] is None
+
+
+def test_an_unreachable_key_check_is_inconclusive_and_leaves_health_alone(tmp_path):
+    upstream = Upstream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/key"):
+            raise httpx.ConnectError("down", request=request)
+        return upstream.handler(request)
+
+    service = make_service(tmp_path, upstream, handler=handler)
+    add_openrouter(service)
+
+    run(service.check_key_async("openrouter"))
+    check = service.key_health("openrouter")["key_check"]
+    assert check["state"] == "inconclusive"
+    assert "ConnectError" in check["detail"]
+    assert service.health("openrouter")[0] is True
+
+
+def test_a_new_key_forgets_the_old_keys_check_and_expiry(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    upstream.key_responses.append(_expiring(clock() + 3 * 86400))
+    run(service.check_key_async("openrouter"))
+    assert service.key_health("openrouter")["key_check"] is not None
+
+    service.update("openrouter", {"api_key": NEW_KEY})
+    health = service.key_health("openrouter")
+    assert health["key_check"] is None
+    assert health["key_expires_at"] is None
+    assert health["key_warning"] is None
+
+
+@pytest.mark.parametrize("days", [-1, 366, 1.5, True, "7"])
+def test_key_expiry_warn_days_must_be_a_whole_number_in_range(tmp_path, days):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    with pytest.raises(ValueError, match="key_expiry_warn_days"):
+        service.update("openrouter", {"key_expiry_warn_days": days})
+
+
+def test_key_expiry_warn_days_survives_a_restart(tmp_path):
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update("openrouter", {"key_expiry_warn_days": 2})
+    run(service.aclose())
+
+    reloaded = make_service(tmp_path)
+    assert reloaded._entry("openrouter").runtime.key_expiry_warn_days == 2
+
+
+def test_a_refusal_raises_one_fault_alert_and_a_new_key_clears_it(tmp_path):
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+    events = KeyEvents()
+    service.attach_events(events)
+
+    _latch(service, upstream)
+    raised = [c for c in events.calls if c[0] == "key_warning"]
+    assert len(raised) == 1 and raised[0][2] == "fault"
+
+    service.update("openrouter", {"api_key": NEW_KEY})
+    assert [c for c in events.calls if c[0] == "key_warning_cleared"] == [
+        ("key_warning_cleared", "openrouter")
+    ]
+    assert len([c for c in events.calls if c[0] == "key_warning"]) == 1
+
+
+def test_an_expiring_key_warns_and_turns_into_a_fault_once_expired(tmp_path):
+    clock = Clock()
+    upstream = Upstream()
+    service = make_service(tmp_path, upstream, now=clock)
+    add_openrouter(service)
+    events = KeyEvents()
+    service.attach_events(events)
+    expires = clock() + 2 * 86400
+    upstream.key_responses.extend([_expiring(expires), _expiring(expires)])
+
+    run(service.check_key_async("openrouter"))
+    assert [(c[0], c[2]) for c in events.calls] == [("key_warning", "warn")]
+
+    clock.advance(3 * 86400)
+    run(service.check_key_async("openrouter"))
+    assert [c[0] for c in events.calls[1:]] == ["key_warning_cleared", "key_warning"]
+    assert events.calls[-1][2] == "fault"

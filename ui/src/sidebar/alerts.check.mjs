@@ -126,8 +126,11 @@ check(alertRows({ alerts: [] }, NOW).length === 0, 'an empty set is no rows')
 check(alertRows({}, NOW).length === 0, 'a malformed report is no rows, not a throw')
 
 console.log('\n--- every kind has a heading ---')
-for (const kind of ['node_down', 'cap_reached', 'oom']) {
-  check(typeof kindTitle(kind) === 'string' && kindTitle(kind).length > 0, `${kind} is titled`)
+for (const kind of ['node_down', 'cap_reached', 'oom', 'key_warning']) {
+  check(
+    typeof kindTitle(kind) === 'string' && kindTitle(kind).length > 0 && kindTitle(kind) !== kind,
+    `${kind} is titled`,
+  )
 }
 
 console.log(`\nalerts.check\n  ${passed}/${passed + failed} checks passed`)

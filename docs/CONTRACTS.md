@@ -657,7 +657,7 @@ the canonical value.
 
 ## HTTP surface
 
-### Coordinator gateway (135 routes)
+### Coordinator gateway (136 routes)
 
 | Method | Path |
 |---|---|
@@ -756,6 +756,7 @@ the canonical value.
 | DELETE | `/api/providers/{provider_id}` |
 | PATCH | `/api/providers/{provider_id}` |
 | GET | `/api/providers/{provider_id}/backends` |
+| POST | `/api/providers/{provider_id}/key-check` |
 | GET | `/api/providers/{provider_id}/logo` |
 | GET | `/api/providers/{provider_id}/models` |
 | POST | `/api/providers/{provider_id}/pull` |

@@ -428,6 +428,30 @@ def test_provider_key_state_is_null_rather_than_missing_on_a_silent_port():
         provider = client.get("/api/providers").json()[0]
     assert provider["key_state"] is None
     assert provider["key_source"] is None
+    for field in ("key_check", "key_expires_at", "key_expiry_warn_days", "key_warning"):
+        assert provider[field] is None, field
+
+
+def test_a_refused_key_check_reaches_http_with_its_warning(tmp_path):
+    import httpx
+
+    from tests.unit.test_providers import Upstream, add_openrouter, make_service
+
+    upstream = Upstream()
+    upstream.key_responses.append(
+        httpx.Response(401, json={"error": {"message": "API key expired."}})
+    )
+    service = make_service(tmp_path, upstream)
+    add_openrouter(service)
+    with TestClient(create_app(build_deps(providers=service))) as client:
+        checked = client.post("/api/providers/openrouter/key-check")
+        missing = client.post("/api/providers/nope/key-check")
+    assert checked.status_code == 200, checked.text
+    body = checked.json()
+    assert body["key_check"]["state"] == "rejected"
+    assert "API key expired." in body["key_warning"]
+    assert body["healthy"] is False
+    assert missing.status_code == 404
 
 
 def test_provider_key_state_reaches_http_and_carries_no_key_material():

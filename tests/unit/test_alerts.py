@@ -184,6 +184,18 @@ def test_raising_the_cap_clears_the_alert():
     assert b.current() == []
 
 
+def test_a_key_warning_opens_at_its_own_severity_and_clears():
+    b, _c = book()
+    b.on_gateway_event({"type": "key_warning", "provider_id": "openrouter",
+                        "detail": "x", "severity": "fault", "ts": 1.0})
+    [alert] = b.current()
+    assert (alert.kind, alert.severity, alert.subject, alert.detail) == (
+        A.KEY_WARNING, "fault", "openrouter", "x"
+    )
+    b.on_gateway_event({"type": "key_warning_cleared", "provider_id": "openrouter"})
+    assert b.current() == []
+
+
 # -- what a restart re-announces --------------------------------------------
 
 

@@ -118,6 +118,8 @@ def kinds_public() -> list[dict]:
                 "forwardable": spec.forwardable,
                 "unsupported_reason": spec.unsupported_reason or None,
                 "supports_backend_routing": spec.supports_backend_routing,
+                # Whether "Test key" has an authenticated call to make here.
+                "supports_key_check": bool(spec.key_probe_path),
                 # Added by signing in, never by a key: the UI renders the
                 # sign-in control in place of the key field.
                 "sign_in": spec.sign_in or None,

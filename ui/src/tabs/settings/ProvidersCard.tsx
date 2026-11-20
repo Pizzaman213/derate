@@ -15,6 +15,8 @@ import {
   type KeyMode,
 } from './keyfield'
 import { KeyField } from './KeyField'
+import { environmentKeyNote, keyCheckNote, keyCheckTone, parseWarnDays } from './keycheck'
+import { Icon } from '../../components/Icon'
 import { ProviderSignIn } from './ProviderSignIn'
 import { ProviderBackupPanel } from './ProviderBackupPanel'
 import { Select, type SelectOption } from '../../components/Select'
@@ -85,6 +87,12 @@ export function ProvidersCard() {
   // Bumped when a first sign-in is acknowledged, so the add form's sign-in
   // starts over from its first step for the next one.
   const [signInRun, setSignInRun] = useState(0)
+  // A row's own failure -- a refused Test key or warn-days value -- shown on
+  // that row, verbatim, rather than at the foot of the card.
+  const [rowNotice, setRowNotice] = useState<{ id: string; message: string } | null>(null)
+  // The warn-days field while it is being typed in; absent means "show what
+  // the server has".
+  const [warnDraft, setWarnDraft] = useState<Record<string, string>>({})
 
   const list = providers.data ?? []
   const specs = kinds.data ?? []
@@ -179,6 +187,56 @@ export function ProvidersCard() {
     }
   }
 
+  const testKey = async (p: Provider) => {
+    const id = p.provider_id
+    setBusy(`check:${id}`)
+    setRowNotice(null)
+    try {
+      await backend.checkProviderKey(id)
+      invalidate()
+    } catch (e) {
+      setRowNotice({ id, message: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  // Switching a provider off keeps its key, models and settings; it only stops
+  // routing to it. Switching it on re-checks the key on the server side.
+  const toggleEnabled = async (p: Provider) => {
+    const id = p.provider_id
+    setBusy(`enable:${id}`)
+    setRowNotice(null)
+    try {
+      await backend.patchProvider(id, { enabled: !p.enabled })
+      invalidate()
+    } catch (e) {
+      setRowNotice({ id, message: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const saveWarnDays = async (p: Provider) => {
+    const id = p.provider_id
+    const draft = warnDraft[id]
+    if (draft === undefined) return
+    const n = parseWarnDays(draft)
+    if (n === null) {
+      setRowNotice({ id, message: 'warn days must be a whole number from 0 to 365' })
+      return
+    }
+    if (n === p.key_expiry_warn_days) return
+    setRowNotice(null)
+    try {
+      await backend.patchProvider(id, { key_expiry_warn_days: n })
+      setWarnDraft(({ [id]: _, ...rest }) => rest)
+      invalidate()
+    } catch (e) {
+      setRowNotice({ id, message: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
   const add = async () => {
     setBusy('__add__')
     setError(null)
@@ -211,7 +269,10 @@ export function ProvidersCard() {
         provider. Keys are resolved at request time and are never displayed, logged, or included
         in exports. Each row says whether its reference resolves and which of the environment and
         secrets.json answered — the whole of what can be shown about a key — and Set key gives one
-        to a provider that already exists, or replaces the one it has.
+        to a provider that already exists, or replaces the one it has. Test key asks the provider
+        whether the key works right now; it also runs at startup and with every catalogue refresh.
+        OpenRouter reports when a key expires, and the row warns that many days ahead — 7 unless
+        you change it.
       </div>
       <div style={{ overflowX: 'auto' }}>
         <table>
@@ -232,7 +293,9 @@ export function ProvidersCard() {
               const modelStatesOpen = modelRows[p.provider_id]
                 ?? p.models.some((m) => m.admitting === false)
               const state =
-                p.healthy === false ? (
+                !p.enabled ? (
+                  <span style={{ color: 'var(--ink-muted)' }}>disabled</span>
+                ) : p.healthy === false ? (
                   <>
                     <span style={{ color: 'var(--fault)' }}>unreachable</span>
                     <div className="unit">
@@ -270,6 +333,9 @@ export function ProvidersCard() {
 
               const editing = keyRow === p.provider_id
               const signIn = specs.find((s) => s.kind === p.kind)?.sign_in ?? null
+              const checkable = !signIn && !!specs.find((s) => s.kind === p.kind)?.supports_key_check
+              const envNote = signIn ? null : environmentKeyNote(p.key_source, p.api_key_ref)
+              const checkTone = keyCheckTone(p.key_check)
               const showingBackup = backupRow === p.provider_id
               const served = p.model_count ?? p.models.length
               const rotatesTo = mintedRef(p.provider_id)
@@ -297,6 +363,51 @@ export function ProvidersCard() {
                       >
                         {keyStateNote(p.key_state, p.key_source)}
                       </div>
+                      {checkable ? (
+                        <div
+                          style={{
+                            color:
+                              checkTone === 'ok'
+                                ? 'var(--live)'
+                                : checkTone === 'fault'
+                                  ? 'var(--fault)'
+                                  : 'var(--ink-muted)',
+                          }}
+                        >
+                          {keyCheckNote(p.key_check, Date.now() / 1000)}
+                        </div>
+                      ) : null}
+                      {/* The server's sentence, verbatim: the sidebar alert
+                          carries the same one. */}
+                      {p.key_warning ? (
+                        <div style={{ color: 'var(--warn)' }}>
+                          <Icon name="alert-triangle" size={12} decorative /> {p.key_warning}
+                        </div>
+                      ) : null}
+                      {envNote ? <div style={{ color: 'var(--ink-muted)' }}>{envNote}</div> : null}
+                      {p.key_expires_at != null ? (
+                        <label>
+                          warn{' '}
+                          <input
+                            type="number"
+                            min={0}
+                            max={365}
+                            step={1}
+                            style={{ width: 'var(--space-66)' }}
+                            aria-label={`Days before ${p.display_name}'s key expires to warn`}
+                            value={warnDraft[p.provider_id] ?? String(p.key_expiry_warn_days ?? 7)}
+                            onChange={(e) => {
+                              const text = e.target.value
+                              setWarnDraft((d) => ({ ...d, [p.provider_id]: text }))
+                            }}
+                            onBlur={() => void saveWarnDays(p)}
+                          />{' '}
+                          days before expiry
+                        </label>
+                      ) : null}
+                      {rowNotice?.id === p.provider_id ? (
+                        <div style={{ color: 'var(--fault)', whiteSpace: 'pre-wrap' }}>{rowNotice.message}</div>
+                      ) : null}
                     </td>
                     {/* Served, out of published -- a figure, and no longer a
                         way in. This cell used to open a flat list of every
@@ -329,6 +440,25 @@ export function ProvidersCard() {
                     </td>
                     <td className="unit">{p.last_refreshed ? relativeTime(p.last_refreshed) : '—'}</td>
                     <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      <button
+                        type="button"
+                        style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
+                        aria-pressed={p.enabled}
+                        onClick={() => void toggleEnabled(p)}
+                        disabled={busy === `enable:${p.provider_id}`}
+                      >
+                        {busy === `enable:${p.provider_id}` ? 'Saving…' : p.enabled ? 'Disable' : 'Enable'}
+                      </button>
+                      {checkable && p.key_state === 'set' ? (
+                        <button
+                          type="button"
+                          style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}
+                          onClick={() => void testKey(p)}
+                          disabled={busy === `check:${p.provider_id}`}
+                        >
+                          {busy === `check:${p.provider_id}` ? 'Testing…' : 'Test key'}
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         style={{ padding: 'var(--space-3) var(--space-9)', marginRight: 'var(--space-6)' }}

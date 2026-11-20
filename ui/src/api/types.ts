@@ -235,6 +235,9 @@ export interface ProviderKindSpec {
    *  asked which ones (`GET /api/providers/{id}/backends`), and told to pin
    *  one (`PATCH ... {backend_pins}`). True only for OpenRouter. */
   supports_backend_routing: boolean
+  /** Whether the kind has an authenticated call that proves a key works
+   *  (`POST /api/providers/{id}/key-check`, "Test key"). */
+  supports_key_check: boolean
   /** Set when this build cannot talk to the kind at all. The server's own
    *  sentence; render it verbatim and do not offer the kind. */
   unsupported_reason: string | null
@@ -1342,6 +1345,22 @@ export interface Provider {
    *  field that could carry one. `null` whenever `key_state` is `missing` --
    *  and for a port that knows the state without knowing the source. */
   key_source: 'environment' | 'secrets.json' | 'oauth' | null
+  /** What the last key check found, for the key that resolves NOW: a check
+   *  made with an earlier key reads as null ("not checked yet"). `detail` is
+   *  the upstream's own sentence on a refusal or an inconclusive check. */
+  key_check: {
+    state: 'ok' | 'rejected' | 'inconclusive'
+    checked_at: number
+    detail: string | null
+  } | null
+  /** When the upstream says this key expires (epoch seconds; OpenRouter
+   *  only), or null when it did not say. */
+  key_expires_at: number | null
+  /** Days ahead of `key_expires_at` the row warns. 0 turns that off. */
+  key_expiry_warn_days: number | null
+  /** The server's one warning sentence for this key -- refused, expired or
+   *  about to expire -- shared with the sidebar alert. Render verbatim. */
+  key_warning: string | null
   /** The account a sign-in kind is signed in as (its email), or null for a
    *  key-based kind. An identity, never a token. */
   sign_in_account: string | null
@@ -1434,6 +1453,9 @@ export interface ProviderSpec {
    *  a key at a time; `null` clears one. A finite number >= 0 or the patch is
    *  a 400. Read back as each model's `price_per_minute_usd`. PATCH only. */
   audio_prices?: Record<string, number | null>
+  /** Days ahead of a reported key expiry to warn, 0..365; 0 turns the early
+   *  warning off. A whole number or the patch is a 400. PATCH only. */
+  key_expiry_warn_days?: number
 }
 
 /** `PATCH /api/providers/{id}` body (providers/service.py `update`). */
@@ -1452,6 +1474,7 @@ export type ProviderPatch = Partial<
     | 'backend_pins'
     | 'backend_fallbacks'
     | 'audio_prices'
+    | 'key_expiry_warn_days'
   >
 >
 
@@ -1550,7 +1573,7 @@ export interface SpeculativeCounters {
  *  is a separate surface from `/api/history/events`. */
 export interface Alert {
   key: string
-  kind: 'node_down' | 'cap_reached' | 'oom'
+  kind: 'node_down' | 'cap_reached' | 'oom' | 'key_warning'
   /** The `Lamp` vocabulary, deliberately: a severity that did not map onto
    *  something drawable would be a third spelling of the same idea. */
   severity: 'warn' | 'fault'

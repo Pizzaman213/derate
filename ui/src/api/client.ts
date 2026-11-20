@@ -415,6 +415,8 @@ export interface Backend {
    *  without `supports_backend_routing`. */
   providerBackends(providerId: string, upstreamId: string): Promise<ProviderBackendOption[]>
   refreshProvider(providerId: string): Promise<Provider>
+  /** Ask the upstream whether the provider's key works right now. */
+  checkProviderKey(providerId: string): Promise<Provider>
   /** Returns an unsubscribe. `onState` reports stream health so the UI can grey
    *  live values during a gap instead of freezing or zeroing them. */
   subscribe(
@@ -1463,6 +1465,10 @@ export const httpBackend: Backend = {
     }),
   refreshProvider: (providerId) =>
     req<Provider>(`/api/providers/${encodeURIComponent(providerId)}/refresh`, {
+      method: 'POST',
+    }),
+  checkProviderKey: (providerId) =>
+    req<Provider>(`/api/providers/${encodeURIComponent(providerId)}/key-check`, {
       method: 'POST',
     }),
 

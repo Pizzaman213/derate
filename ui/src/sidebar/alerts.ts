@@ -28,6 +28,7 @@ const KIND_TITLE: Record<Alert['kind'], string> = {
   node_down: 'node down',
   cap_reached: 'cap reached',
   oom: 'out of memory',
+  key_warning: 'provider key',
 }
 
 export function kindTitle(kind: Alert['kind']): string {
