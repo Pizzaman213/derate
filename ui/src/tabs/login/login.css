@@ -1,0 +1,16 @@
+/* Sign-in. Drawn before the frame like first run, so it borrows setup.css's
+   page, header and field (.setup, .setup-head, .setup-main, .setup-field) and
+   adds only the form's own rhythm. Every value is a token. */
+
+.login-form { display: grid; gap: var(--space-16); max-width: 40ch; margin-top: var(--space-24); }
+.login-form label { display: grid; gap: var(--space-8); }
+.login-title { display: flex; align-items: center; gap: var(--space-8); }
+.login-wait { color: var(--ink); font-weight: 500; }
+
+/* The account forms (first admin, sign-in) sit in the middle of the page;
+   the wizard's later steps keep setup.css's left-aligned column. */
+.setup-auth { max-width: 44ch; margin: 0 auto; text-align: center; }
+.setup-auth .setup-lede { margin-left: auto; margin-right: auto; }
+.setup-auth .login-title { justify-content: center; }
+.setup-auth .login-form { max-width: none; text-align: left; }
+.setup-auth .setup-warn { text-align: left; }

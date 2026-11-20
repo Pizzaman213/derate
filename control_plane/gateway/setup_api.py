@@ -24,22 +24,104 @@ set this cluster up yet*, which nothing else could answer.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
-from fastapi import APIRouter
-from starlette.responses import JSONResponse
+from fastapi import APIRouter, Request
+from starlette.responses import JSONResponse, Response
 
+from control_plane.auth.service import AdminExists
+from control_plane.contracts.auth import AuditAction, InvalidCredentials, LoginLocked
 from control_plane.version import build_id
 
-from . import errors, serialize, setup_state
+from . import authz, errors, serialize, setup_state
+from .auth_api import admin_dict, bad_request, json_object, set_session_cookie, string_fields
 from .deps import GatewayContext
 
 log = logging.getLogger("gateway.setup")
+
+#: The default key minted at setup. A year: long enough to wire a first client
+#: in without it lapsing, and one of the expiries every key is limited to.
+DEFAULT_KEY_NAME = "default"
+DEFAULT_KEY_EXPIRY_DAYS = 365
 
 
 def create_router(ctx: GatewayContext) -> APIRouter:
     router = APIRouter()
     store = setup_state.SetupStore()
+
+    def _create_first_admin(auth, username: str, email: str, password: str, context: dict):
+        # Two first-admin posts racing both pass the guard's admin_exists();
+        # create_first_admin decides inside one BEGIN IMMEDIATE, so only one
+        # of them -- in this process or any other on the same auth.db -- wins.
+        try:
+            return auth.create_first_admin(username, password, email=email, **context)
+        except AdminExists:
+            return None
+
+    @router.post("/api/setup/admin")
+    async def setup_admin(request: Request) -> Response:
+        """The first admin, and with it everything needed to use the cluster.
+
+        Open only while no admin exists (``authz.AuthGuard`` answers 410
+        ``setup_closed`` after). Creates the admin, their personal admin key
+        (whose secret is discarded -- UI chat runs as it), and a normal key
+        named ``default`` in the default org, and signs the admin in. The
+        default key's secret comes back once, as ``secret_once``, here and
+        nowhere else.
+        """
+        body = await json_object(request)
+        if isinstance(body, Response):
+            return body
+        fields = string_fields(body, "username", "email", "password")
+        if isinstance(fields, Response):
+            return fields
+        username, email, password = fields
+        stores = ctx.auth_stores
+        auth, keys = stores.auth, stores.keys
+        context = authz.request_context(request)
+        try:
+            admin = await asyncio.to_thread(
+                _create_first_admin, auth, username, email, password, context
+            )
+        except ValueError as exc:
+            return bad_request(str(exc))
+        if admin is None:
+            return authz.setup_closed()
+        org = keys.get_org(keys.default_org_id())
+        admin_key = authz.mint_admin_key(stores, admin.username)
+        minted = keys.create_key(
+            name=DEFAULT_KEY_NAME,
+            org_id=org.org_id,
+            created_by=admin.username,
+            expiry_days=DEFAULT_KEY_EXPIRY_DAYS,
+        )
+        for key in (admin_key, minted.key):
+            authz.audit_request(
+                request,
+                AuditAction.KEY_CREATED,
+                "key",
+                key.key_id,
+                after=authz.key_dict(key),
+                actor=admin.username,
+            )
+        payload = {
+            "admin": admin_dict(admin),
+            "org": authz.org_dict(org),
+            "key": authz.key_dict(minted.key),
+            "secret_once": minted.secret_once,
+        }
+        try:
+            session, cookie = await asyncio.to_thread(
+                auth.login, admin.username, password, **context
+            )
+        except (LoginLocked, InvalidCredentials):
+            # The admin and both keys are committed and the secret exists
+            # nowhere else: answer it, unsigned in. The wizard says "sign in".
+            return JSONResponse({**payload, "signed_in": False})
+        response = JSONResponse({**payload, "signed_in": True})
+        set_session_cookie(response, request, cookie)
+        return response
 
     def _states() -> list:
         """Every node the roster knows, healthy or not.
@@ -152,7 +234,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
 
     @router.post("/api/setup/complete")
-    async def setup_complete() -> JSONResponse:
+    async def setup_complete(request: Request) -> JSONResponse:
         """Remember that the wizard was finished, so it is not offered again.
 
         Deliberately survives a cluster that is still empty afterwards: someone
@@ -169,16 +251,20 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             # it is worth a real error rather than a silent success: a wizard
             # that says "done" and reappears on every reload is a bug report,
             # while one that says it could not write names the actual problem.
+            # The OSError text names paths on this machine, so it goes to
+            # node.log and the answer is a fixed sentence.
             log.warning("could not record setup completion: %s", exc)
             return errors.error_response(
                 500,
                 "Setup finished, but this coordinator could not record that it "
-                "did: %s. Everything you configured is saved; only the "
-                "reminder to set up is. Check that the data directory is "
-                "writable." % errors.detail(exc),
+                "did; check that the data directory is writable (details in node.log).",
                 "setup_error",
                 "setup_not_recorded",
             )
+        authz.audit_request(
+            request, AuditAction.SETTINGS_CHANGED, "setup", "complete",
+            after={"setup_completed": True},
+        )
         return JSONResponse({"completed": True})
 
     return router
