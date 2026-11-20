@@ -207,22 +207,21 @@ def test_setup_is_open_before_the_first_admin(tmp_path, monkeypatch):
     assert r.json()["secret_once"].startswith("drt_")
 
 
-def test_setup_from_another_host_is_refused_and_recorded(tmp_path, monkeypatch):
+def test_setup_from_another_host_is_open_until_the_first_admin(tmp_path, monkeypatch):
+    """Docker Desktop's gateway (192.168.65.1) and a LAN browser are not
+    loopback, and both are how an operator reaches their own coordinator.
+    Setup answers them; once an admin exists it is closed to everyone."""
     monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
     app = create_app()
-    remote = TestClient(app, client=("10.0.0.9", 50000))
-    assert remote.get("/api/auth/state").json()["setup_local_only"] is True
+    remote = TestClient(app, client=("192.168.65.1", 50000))
+    assert remote.get("/api/auth/state").json()["setup_local_only"] is False
     r = remote.post("/api/setup/admin", json=ADMIN)
-    assert r.status_code == 403
-    assert r.json()["error"]["code"] == "setup_local_only"
-    assert r.headers["x-request-id"].startswith("r-")
-    # Nothing was created: the coordinator's own setup still works.
+    assert r.status_code == 200, r.text
+    assert r.json()["secret_once"].startswith("drt_")
+    late = TestClient(app, client=("10.0.0.9", 50000))
+    assert late.post("/api/setup/admin", json=ADMIN).status_code == 410
     local = TestClient(app, client=LOOPBACK)
-    assert local.post("/api/setup/admin", json=ADMIN).status_code == 200
-    app.state.ctx.secevents.flush()
-    entries, _ = app.state.ctx.auth_stores.auth.audit_page(action="setup_refused")
-    rows = list(entries)
-    assert len(rows) == 1 and rows[0].ip == "10.0.0.9"
+    assert local.post("/api/setup/admin", json=ADMIN).status_code == 410
 
 
 def test_the_node_shell_socket_wants_a_session(tmp_path, monkeypatch):
