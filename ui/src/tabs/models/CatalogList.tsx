@@ -1,4 +1,5 @@
 import { Lamp } from '../../components/Lamp'
+import { Icon } from '../../components/Icon'
 import { Verbatim } from '../../components/Verbatim'
 import { gbytes } from '../../format'
 import { BandHeading, useBandCollapse } from './BandSection'
@@ -7,7 +8,7 @@ import type { Band, Group, ModelRow } from './rows'
 
 /** The list: fit-banded sections, one row per model.
  *
- *  Rows are real `<button>`s rather than `role="button"` divs with hand-rolled
+ *  Rows are real `<button type="button">`s rather than `role="button"` divs with hand-rolled
  *  key handling. That was two bugs waiting -- Enter and Space were reimplemented
  *  per call site, and the focus ring `base.css` gives every native control was
  *  never reaching them.
@@ -124,7 +125,7 @@ function Row({
         : LAMP[b]
   const cells = compact ? (
     <>
-      <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)', minWidth: 0 }}>
         {lamp.label ? <Lamp {...lamp} hollow={lamp.signal === 'idle'} /> : null}
         <span className="mono" style={{ wordBreak: 'break-all' }}>
           {row.label}
@@ -142,7 +143,7 @@ function Row({
   ) : (
     <>
       <span
-        style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}
+        style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-8)', minWidth: 0 }}
       >
         {lamp.label ? <Lamp {...lamp} hollow={lamp.signal === 'idle'} /> : null}
         <span className="mono" style={{ wordBreak: 'break-all' }}>
@@ -163,9 +164,12 @@ function Row({
           ? live.state
           : row.checking
             ? 'checking…'
-            : row.remoteOnly
-              ? 'details ▸'
-              : 'quantizations ▸'}
+            : (
+                <>
+                  {row.remoteOnly ? 'details' : 'quantizations'}{' '}
+                  <Icon name="chevron-right" size={12} decorative className="icon-inline" />
+                </>
+              )}
       </span>
     </>
   )
@@ -183,7 +187,7 @@ function Row({
         aria-current={current ? 'true' : undefined}
         style={{
           gridTemplateColumns: compact ? COLUMNS_COMPACT : COLUMNS,
-          rowGap: 2,
+          rowGap: 'var(--space-2)',
           width: '100%',
           textAlign: 'left',
           // Only the three sides a button adds and a row does not. `border: 0`
@@ -203,7 +207,7 @@ function Row({
       {/* The refusal, in the gate's own words, under the row it refused. Only
           for a refusal: a "fits" sentence repeats what the lamp already said. */}
       {(row.verdict === 'wont_fit' || row.verdict === null) && row.reason ? (
-        <div style={{ padding: '0 var(--s1) 8px' }}>
+        <div style={{ padding: '0 var(--space-12) var(--space-8)' }}>
           <Verbatim text={row.reason} size="unit" />
           {/* The refusal is about ONE set of weights -- the checkpoint as it
               ships. Most refused models are published at several schemes, and

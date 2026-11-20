@@ -146,9 +146,8 @@ interface Props {
   note: string
 }
 
-/** The order the sections come out in. Same order and the same reasoning as
- *  `MODALITY_ORDER` in tabs/cluster/layout.ts, which groups the floor's entry
- *  plates: text is what nearly every cluster is, so it goes first, and a
+/** The order the sections come out in: text is what nearly every cluster
+ *  is, so it goes first, and a
  *  reader looking for the unusual one finds it by scanning down rather than
  *  by finding it interleaved. `transcription` sorts last because it was the
  *  latest modality let into this picker, not because it is filtered -- see
@@ -175,7 +174,7 @@ export function ModelList({ rows, selected, onSelect, loading, error, note }: Pr
   return (
     <div className="chatlist">
       <h2 className="label">Models</h2>
-      <hr style={{ margin: '6px 0 var(--s-2)' }} />
+      <hr style={{ margin: 'var(--space-6) 0 var(--space-8)' }} />
 
       {error ? (
         <div className="unit" style={{ color: 'var(--fault)', whiteSpace: 'pre-wrap' }}>

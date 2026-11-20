@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Icon } from '../../components/Icon'
 import { useQuantTable } from '../../state/resources'
 
 /** The quantization table, as the gateway reports it.
@@ -19,10 +20,10 @@ export function QuantTableCard() {
 
   return (
     <div className="card2">
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-10)' }}>
         <h3 style={{ flex: 1 }}>Quantization reference</h3>
-        <button className="ghost" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-          {open ? 'Hide' : 'Show'} <span className="mono">{open ? '–' : '+'}</span>
+        <button type="button" className="ghost" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+          {open ? 'Hide' : 'Show'} <Icon name={open ? 'minus' : 'plus'} size={12} decorative className="icon-inline" />
         </button>
       </div>
       <div className="unit">
@@ -39,11 +40,11 @@ export function QuantTableCard() {
           {table.error.message}
         </p>
       ) : !table.data ? (
-        <p className="unit" style={{ marginTop: 8 }}>
+        <p className="unit" style={{ marginTop: 'var(--space-8)' }}>
           {table.loading ? 'Loading…' : 'The table could not be read.'}
         </p>
       ) : (
-        <div style={{ overflowX: 'auto', marginTop: 10 }}>
+        <div style={{ overflowX: 'auto', marginTop: 'var(--space-10)' }}>
           <table>
             <thead>
               <tr>

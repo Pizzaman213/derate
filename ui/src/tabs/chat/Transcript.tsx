@@ -1,49 +1,14 @@
-import { useEffect, useRef, useState, type UIEvent } from 'react'
-import type { ChatRole, ChatTurnMeta, Modality, SpeechResult } from '../../api/types'
+import { Fragment, useEffect, useRef, useState, type UIEvent } from 'react'
+import { plainClick, useRouter } from '../../state/router'
+import type { Modality } from '../../api/types'
+import { Disclosure } from '../../components/Panel'
 import { Verbatim } from '../../components/Verbatim'
-import { copyToClipboard } from '../../components/clipboard'
 import { fmt } from '../../format'
 import { Clip } from './Clip'
-import { MessageBody } from './markdown'
-import { metaLine } from './meta'
+import { Markdown } from './Markdown'
+import { reasoningVerdict, turnFigures } from './stats'
 import { tagInk, tagStyle, tagsFor } from './tags'
-
-export interface Turn {
-  key: number
-  role: ChatRole
-  content: string
-  /** A model's "thinking" text, kept apart from `content` so it can render
-   *  collapsed. Empty string when the turn carried none -- same convention as
-   *  `content` itself, which is empty before the first delta arrives. */
-  reasoning: string
-  /** Set when the turn finished normally, or was stopped. */
-  meta: ChatTurnMeta | null
-  /** The gateway's own sentence when it refused. Rendered verbatim. */
-  error: string | null
-  /** Known from the response headers, so an errored turn still names the row
-   *  that recorded it. */
-  requestId: string | null
-  /** The answer, when the model this turn went to answers in audio rather
-   *  than in text. Mutually exclusive with `content` in practice -- a speech
-   *  reply has no tokens and a chat reply has no clip -- but kept as a
-   *  separate field rather than a tagged union, because the turn's identity
-   *  is the request and not the media type of what came back. */
-  audio: SpeechResult | null
-  /** Images attached to a user turn. Object URLs, revoked when the turn
-   *  leaves the transcript (see `ChatTab`'s cleanup). */
-  images: { url: string; name: string }[] | null
-  /** The model this turn was SENT to, recorded at send time on both halves of
-   *  the exchange. The answer also carries `meta.model` -- what actually
-   *  served -- and that one wins where both exist; this is what a question has
-   *  instead, and what an answer has before the first byte comes back. */
-  model: string | null
-  /** Which endpoint this turn's send actually went to. Edit and Regenerate
-   *  only make sense for a plain chat turn -- resending a transcription's
-   *  audio file or a speech reply's spoken line as chat text is not the same
-   *  request, so those are hidden per-turn rather than inferred from the
-   *  picker's CURRENT modality, which may have moved on since this turn sent. */
-  kind: 'chat' | 'speech' | 'transcription'
-}
+import type { Turn } from './turn'
 
 /** The model a block is about: what served it, else what it was sent to. The
  *  two are the same string in every case seen so far, and the order matters
@@ -53,29 +18,88 @@ function destination(turn: Turn): string | null {
   return turn.meta?.model ?? turn.model
 }
 
-function reasoningLabel(turn: Turn): string {
-  const ms = turn.meta?.reasoningMs
-  return ms == null ? 'Reasoning' : `Reasoning · ${fmt(ms / 1000, 1)} s`
-}
-
-/** A small text button that reports its own copy outcome, same pattern
- *  `CodeBlock` in `markdown.tsx` uses for a code fence. Kept local rather than
- *  shared -- the two only share the clipboard call, not any layout. */
-function CopyButton({ text }: { text: string }) {
-  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle')
-  const timer = useRef<number | undefined>(undefined)
-  const copy = async () => {
-    const result = await copyToClipboard(text)
-    setState(result)
-    window.clearTimeout(timer.current)
-    timer.current = window.setTimeout(() => setState('idle'), 2000)
+/** The block under an answer that makes this a control-plane surface rather
+ *  than a chat window: what served it, the id of the row that recorded it, why
+ *  it stopped, what it cost in time and tokens, and whether reasoning came
+ *  back and how.
+ *
+ *  Missing figures print as an em dash, never as zero, and a token count that
+ *  came from counting delta frames says so — the gateway makes the same
+ *  distinction on its own records and it is not ours to quietly drop. */
+function TurnMeta({ turn }: { turn: Turn }) {
+  const { navigate, linkTo } = useRouter()
+  const m = turn.meta
+  const id = turn.requestId ?? m?.requestId ?? '—'
+  const idNode =
+    id === '—' ? (
+      id
+    ) : (
+      <a
+        href={linkTo({ dest: 'usage', sub: 'requests', request: id })}
+        onClick={(e) => {
+          if (!plainClick(e)) return
+          e.preventDefault()
+          navigate({ dest: 'usage', sub: 'requests', request: id })
+        }}
+      >
+        {id}
+      </a>
+    )
+  const join = (parts: (string | null | undefined | typeof ID)[]) =>
+    parts
+      .filter((p) => p)
+      .map((p, i) => (
+        <Fragment key={i}>
+          {i > 0 ? ' · ' : null}
+          {p === ID ? idNode : p}
+        </Fragment>
+      ))
+  if (!m) return <div className="turnmeta unit mono">{idNode}</div>
+  const head = join([
+    m.model,
+    ID,
+    m.stopped ? 'stopped' : m.finishReason ? `finish ${m.finishReason}` : null,
+  ])
+  // Nothing token-denominated exists on this turn, so none of it is printed.
+  //
+  // Both audio endpoints land here: a speech turn's real figures are duration
+  // and sample rate and `Clip` renders them, and a transcription turn has no
+  // rate at all -- the gateway deliberately counts no tokens over a binary
+  // body either way. The test is on the figures rather than on the modality
+  // so that it stays true for whatever the fourth endpoint turns out to be.
+  //
+  // This is the dash rule, not an exception to it: an unmeasured figure is a
+  // dash, and a figure that does not exist for this kind of request is not a
+  // row at all. `ttft — ms · — s · — tok` reads as three failed measurements
+  // rather than as a request that was never going to have them.
+  if (m.ttftMs === null && m.elapsedMs === null && m.completionTokens === null) {
+    return <div className="turnmeta unit mono"><div>{head}</div></div>
   }
+  const f = turnFigures(m)
+  const reasoned = m.reasoningSource !== null
+  const figures = join([
+    `ttft ${fmt(f.ttftMs)} ms`,
+    reasoned ? `think ${fmt(f.thinkMs == null ? null : f.thinkMs / 1000, 1)} s` : null,
+    `gen ${fmt(f.genMs == null ? null : f.genMs / 1000, 1)} s`,
+    `${fmt(f.tokPerS, 1)} tok/s`,
+    `in ${fmt(f.promptTokens)}`,
+    `out ${fmt(f.completionTokens)}${f.estimated && f.completionTokens !== null ? ' (est.)' : ''}`,
+    reasoned
+      ? `think ${fmt(f.reasoningTokens)}${f.reasoningEstimated && f.reasoningTokens !== null ? ' (est.)' : ''} tok`
+      : null,
+  ])
+  const verdict = turn.setup ? reasoningVerdict(turn, turn.setup) : null
   return (
-    <button type="button" className="turnaction" onClick={() => void copy()}>
-      {state === 'copied' ? 'Copied' : state === 'failed' ? 'Select to copy' : 'Copy'}
-    </button>
+    <div className="turnmeta unit mono">
+      <div>{head}</div>
+      <div>{figures}</div>
+      {verdict ? <div>{verdict}</div> : null}
+    </div>
   )
 }
+
+/** Where the request id sits in a meta line; rendered as a link to it. */
+const ID = Symbol('request id')
 
 interface Props {
   turns: Turn[]
@@ -87,25 +111,13 @@ interface Props {
    *  transcript promises -- because everything else about a turn is the same
    *  shape whatever came back. */
   mode?: Modality
-  /** A turn's own `kind` decides whether Edit/Regenerate show at all; this
-   *  disables every action while any turn is in flight, so a resend cannot
-   *  race the one already running. */
-  busy?: boolean
-  onEdit?: (key: number, text: string) => void
-  onRegenerate?: (key: number) => void
-  onDelete?: (key: number) => void
 }
 
-export function Transcript({
-  turns,
-  streamingKey,
-  model,
-  mode = 'text',
-  busy = false,
-  onEdit,
-  onRegenerate,
-  onDelete,
-}: Props) {
+export function Transcript({ turns, streamingKey, model, mode = 'text' }: Props) {
+  // A thinking block someone has opened or closed stays that way; until then
+  // it follows the stream -- open while the model is still thinking, closed
+  // once the answer starts, so the answer is what is on screen.
+  const [pinned, setPinned] = useState<Map<number, boolean>>(() => new Map())
   // Only one of the three streams, and only one of the three is waiting for a
   // token. Naming the wrong thing is not cosmetic here: "waiting for the
   // first token" in front of a request that produces no tokens reads as a
@@ -122,11 +134,6 @@ export function Transcript({
   // pattern as DeploymentLog's followRef, and for the same reason.
   const followRef = useRef(true)
 
-  // Only one turn editable at a time -- a second Edit click on another turn
-  // simply moves the same inline box rather than opening a second one.
-  const [editingKey, setEditingKey] = useState<number | null>(null)
-  const [draft, setDraft] = useState('')
-
   useEffect(() => {
     const box = boxRef.current
     if (!box || !followRef.current) return
@@ -136,18 +143,6 @@ export function Transcript({
   const onScroll = (e: UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget
     followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
-  }
-
-  const startEdit = (turn: Turn) => {
-    setEditingKey(turn.key)
-    setDraft(turn.content)
-  }
-  const cancelEdit = () => setEditingKey(null)
-  const saveEdit = () => {
-    if (editingKey === null) return
-    const text = draft.trim()
-    setEditingKey(null)
-    if (text) onEdit?.(editingKey, text)
   }
 
   if (turns.length === 0) {
@@ -178,9 +173,6 @@ export function Transcript({
         const streaming = turn.key === streamingKey
         const dest = destination(turn)
         const slot = dest === null ? undefined : tags.get(dest)
-        const editable = turn.kind === 'chat' && turn.audio === null
-        const editing = editingKey === turn.key
-
         return (
           <div
             key={turn.key}
@@ -196,111 +188,83 @@ export function Transcript({
               {turn.role === 'user'
                 ? dest === null
                   ? 'you'
-                  : `you → ${dest}`
+                  : `you \u2192 ${dest}`
                 : (dest ?? model ?? 'assistant')}
             </div>
 
-            {turn.images && turn.images.length > 0 ? (
-              <div className="turnimages">
-                {turn.images.map((img) => (
-                  <img key={img.url} src={img.url} alt={img.name} />
-                ))}
-              </div>
+            {turn.reasoning !== '' ? (
+              <ThinkingBlock
+                turn={turn}
+                streaming={streaming}
+                open={pinned.get(turn.key) ?? (streaming && turn.content === '')}
+                onToggle={(open) => setPinned((prev) => new Map(prev).set(turn.key, open))}
+              />
             ) : null}
 
-            {turn.reasoning ? (
-              <details className="reasoning">
-                <summary className="unit">{reasoningLabel(turn)}</summary>
-                <MessageBody text={turn.reasoning} />
-              </details>
-            ) : null}
-
-            {editing ? (
-              <div className="turnedit">
-                <textarea
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  rows={3}
-                  autoFocus
-                />
-                <div style={{ display: 'flex', gap: 'var(--s-2)' }}>
-                  <button type="button" onClick={saveEdit} disabled={draft.trim() === ''}>
-                    Save &amp; resend
-                  </button>
-                  <button type="button" onClick={cancelEdit}>
-                    Cancel
-                  </button>
+            {turn.content ? (
+              turn.role === 'user' ? (
+                <p style={{ margin: 'var(--space-4) 0 0', whiteSpace: 'pre-wrap' }}>{turn.content}</p>
+              ) : (
+                <div className="md" aria-live={streaming ? 'polite' : undefined}>
+                  <Markdown text={turn.content} />
                 </div>
-              </div>
-            ) : (
-              <>
-                {turn.content ? (
-                  <MessageBody text={turn.content} live={streaming} />
-                ) : null}
+              )
+            ) : null}
 
-                {streaming && !turn.content && !turn.audio ? (
-                  <p className="unit" style={{ margin: '4px 0 0' }} aria-live="polite">
-                    {/* A speech model does not stream, so "the first token" is
-                        not the thing being waited for and never arrives. It is
-                        one whole file at the end. */}
-                    {waiting}
-                  </p>
-                ) : null}
-              </>
-            )}
+            {streaming && !turn.content && !turn.audio ? (
+              <p className="unit" style={{ margin: 'var(--space-4) 0 0' }} aria-live="polite">
+                {/* A speech model does not stream, so "the first token" is
+                    not the thing being waited for and never arrives. It is
+                    one whole file at the end. */}
+                {turn.reasoning !== '' ? 'thinking…' : waiting}
+              </p>
+            ) : null}
 
             {turn.audio ? <Clip clip={turn.audio} /> : null}
 
             {turn.error ? (
-              <div style={{ marginTop: 6, color: 'var(--fault)' }}>
+              <div style={{ marginTop: 'var(--space-6)', color: 'var(--fault)' }}>
                 <Verbatim text={turn.error} />
               </div>
             ) : null}
 
             {turn.role === 'assistant' && (turn.meta || turn.error || turn.audio) ? (
-              <div className="unit mono" style={{ marginTop: 6 }}>
-                {metaLine(turn.meta, turn.requestId)}
-              </div>
-            ) : null}
-
-            {!editing && !streaming ? (
-              <div className="turnactions">
-                {turn.role === 'assistant' && turn.content ? (
-                  <CopyButton text={turn.content} />
-                ) : null}
-                {turn.role === 'user' && editable ? (
-                  <button
-                    type="button"
-                    className="turnaction"
-                    disabled={busy}
-                    onClick={() => startEdit(turn)}
-                  >
-                    Edit
-                  </button>
-                ) : null}
-                {turn.role === 'assistant' && editable ? (
-                  <button
-                    type="button"
-                    className="turnaction"
-                    disabled={busy}
-                    onClick={() => onRegenerate?.(turn.key)}
-                  >
-                    Regenerate
-                  </button>
-                ) : null}
-                <button
-                  type="button"
-                  className="turnaction"
-                  disabled={busy}
-                  onClick={() => onDelete?.(turn.key)}
-                >
-                  Delete
-                </button>
-              </div>
+              <TurnMeta turn={turn} />
             ) : null}
           </div>
         )
       })}
+    </div>
+  )
+}
+
+/** The model's reasoning, collapsed under one line that says how much of it
+ *  there was. Plain text: it is a working, not an answer, and rendering it as
+ *  markdown would dress it as one. */
+function ThinkingBlock({
+  turn,
+  streaming,
+  open,
+  onToggle,
+}: {
+  turn: Turn
+  streaming: boolean
+  open: boolean
+  onToggle: (open: boolean) => void
+}) {
+  const m = turn.meta
+  let summary = streaming && turn.content === '' ? 'Thinking…' : 'Thinking'
+  if (m) {
+    const f = turnFigures(m)
+    summary = `Thinking · ${fmt(f.reasoningTokens)} tok${
+      f.reasoningEstimated && f.reasoningTokens !== null ? ' (est.)' : ''
+    } · ${fmt(f.thinkMs == null ? null : f.thinkMs / 1000, 1)} s`
+  }
+  return (
+    <div style={{ marginTop: 'var(--space-4)' }}>
+      <Disclosure summary={summary} open={open} onToggle={() => onToggle(!open)}>
+        <div className="think">{turn.reasoning.trimEnd()}</div>
+      </Disclosure>
     </div>
   )
 }

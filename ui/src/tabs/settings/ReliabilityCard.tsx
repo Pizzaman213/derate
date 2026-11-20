@@ -47,12 +47,12 @@ export function ReliabilityCard() {
         <span>Auto-restart crashed deployments</span>
       </label>
       {data ? (
-        <div className="unit" style={{ marginLeft: 24, marginTop: -3 }}>
+        <div className="unit" style={{ marginLeft: 'var(--space-24)', marginTop: 'calc(-1 * var(--space-3))' }}>
           {SOURCE_LABEL[data.sources.auto_restart_crashed_deployments]}
         </div>
       ) : null}
       {error ? (
-        <div className="label" style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}>
+        <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}>
           {error}
         </div>
       ) : null}

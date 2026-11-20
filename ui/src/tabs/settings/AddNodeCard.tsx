@@ -124,23 +124,23 @@ export function AddNodeCard() {
   return (
     <div className="card2">
       <h3>Add a node</h3>
-      <div className="unit" style={{ marginBottom: 12 }}>
+      <div className="unit" style={{ marginBottom: 'var(--space-12)' }}>
         One command per machine. Every node runs the same image and decides its own
         role: the first becomes the coordinator, the rest join it.
       </div>
 
       <div className="sub">The first node</div>
-      <div className="unit" style={{ marginTop: 6 }}>
+      <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
         Run this on a machine that has no cluster yet. It has nothing to fetch from,
         so it takes the script from the repository.
       </div>
       <Copyable text={firstNodeCommand(minted)} />
 
-      <div className="sub" style={{ marginTop: 16 }}>Add to this cluster</div>
+      <div className="sub" style={{ marginTop: 'var(--space-16)' }}>Add to this cluster</div>
 
       {minted && !expired ? (
         <>
-          <div className="unit" style={{ marginTop: 6 }}>
+          <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
             Run this on the new machine. It installs, joins, and is admitted — there
             is nothing to click afterwards.
           </div>
@@ -149,9 +149,9 @@ export function AddNodeCard() {
             style={{
               display: 'flex',
               alignItems: 'baseline',
-              gap: 8,
+              gap: 'var(--space-8)',
               flexWrap: 'wrap',
-              marginTop: 8,
+              marginTop: 'var(--space-8)',
             }}
           >
             <span className="pill mono">{minted.token_id}</span>
@@ -162,14 +162,16 @@ export function AddNodeCard() {
                 : `${minted.uses_remaining} machine${minted.uses_remaining === 1 ? '' : 's'}`}
             </span>
             <button
-              style={{ padding: '3px 9px', marginLeft: 'auto' }}
+              type="button"
+              style={{ padding: 'var(--space-3) var(--space-9)', marginLeft: 'auto' }}
               onClick={() => void revoke(minted.token_id)}
               disabled={busy === minted.token_id}
             >
               {busy === minted.token_id ? 'Revoking…' : 'Revoke'}
             </button>
             <button
-              style={{ padding: '3px 9px' }}
+              type="button"
+              style={{ padding: 'var(--space-3) var(--space-9)' }}
               onClick={() => void mint()}
               disabled={busy === 'mint'}
             >
@@ -179,13 +181,13 @@ export function AddNodeCard() {
         </>
       ) : (
         <>
-          <div className="unit" style={{ marginTop: 6 }}>
+          <div className="unit" style={{ marginTop: 'var(--space-6)' }}>
             {expired
               ? 'That command has expired. Generate another — it costs nothing.'
               : 'Generates a command with a one-hour token in it. The token admits one machine and is spent when it does.'}
           </div>
-          <div style={{ marginTop: 8 }}>
-            <button onClick={() => void mint()} disabled={busy === 'mint'}>
+          <div style={{ marginTop: 'var(--space-8)' }}>
+            <button type="button" onClick={() => void mint()} disabled={busy === 'mint'}>
               {busy === 'mint' ? 'Generating…' : 'Generate join command'}
             </button>
           </div>
@@ -193,11 +195,11 @@ export function AddNodeCard() {
       )}
 
       {elsewhere.length > 0 ? (
-        <div style={{ marginTop: 12, display: 'grid', gap: 6 }}>
+        <div style={{ marginTop: 'var(--space-12)', display: 'grid', gap: 'var(--space-6)' }}>
           {elsewhere.map((row) => (
             <div
               key={row.token_id}
-              style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}
+              style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-8)', flexWrap: 'wrap' }}
             >
               <span className="pill mono">{row.token_id}</span>
               <span className="unit">
@@ -205,7 +207,8 @@ export function AddNodeCard() {
                 cannot be shown again
               </span>
               <button
-                style={{ padding: '3px 8px', marginLeft: 'auto' }}
+                type="button"
+                style={{ padding: 'var(--space-3) var(--space-8)', marginLeft: 'auto' }}
                 onClick={() => void revoke(row.token_id)}
                 disabled={busy === row.token_id}
               >
@@ -217,8 +220,8 @@ export function AddNodeCard() {
       ) : null}
 
       {minted || arrived.length > 0 || found.length > 0 ? (
-        <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid var(--rule)' }}>
-          <div className="label" style={{ marginBottom: 8 }}>
+        <div style={{ marginTop: 'var(--space-14)', paddingTop: 'var(--space-10)', borderTop: '1px solid var(--rule)' }}>
+          <div className="label" style={{ marginBottom: 'var(--space-8)' }}>
             {arrived.length === 0 && found.length === 0
               ? 'Waiting for nodes…'
               : 'Since you generated that command'}
@@ -230,9 +233,9 @@ export function AddNodeCard() {
               style={{
                 display: 'flex',
                 alignItems: 'baseline',
-                gap: 8,
+                gap: 'var(--space-8)',
                 flexWrap: 'wrap',
-                padding: '3px 0',
+                padding: 'var(--space-3) 0',
               }}
             >
               <span className="pill" style={{ color: 'var(--live)' }}>
@@ -255,9 +258,9 @@ export function AddNodeCard() {
               style={{
                 display: 'flex',
                 alignItems: 'baseline',
-                gap: 8,
+                gap: 'var(--space-8)',
                 flexWrap: 'wrap',
-                padding: '3px 0',
+                padding: 'var(--space-3) 0',
               }}
             >
               <span className="pill">discovered</span>
@@ -269,7 +272,8 @@ export function AddNodeCard() {
                 <span className="unit">{c.ineligible_reason}</span>
               ) : null}
               <button
-                style={{ padding: '3px 8px', marginLeft: 'auto' }}
+                type="button"
+                style={{ padding: 'var(--space-3) var(--space-8)', marginLeft: 'auto' }}
                 onClick={() => void admit(c.node_id)}
                 /* Not gated on c.eligible. The reason above says the device
                    class could not be confirmed, and serialize._eligibility is
@@ -299,7 +303,7 @@ export function AddNodeCard() {
       {error ? (
         <div
           className="label"
-          style={{ color: 'var(--fault)', marginTop: 8, whiteSpace: 'pre-wrap' }}
+          style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}
         >
           {error}
         </div>
