@@ -52,18 +52,14 @@ def _audit(client, cookie, action):
     return [e for e in entries if e["action"] == action]
 
 
-# -- 2.1: setup Host check ---------------------------------------------------
+# -- 2.1: setup answers whatever Host the browser used -----------------------
 
 
-def test_setup_from_loopback_naming_a_foreign_host_is_refused(app):
-    """A DNS-rebinding page reaches the gateway from loopback but names its
-    own host; setup must not answer it."""
+def test_setup_answers_a_lan_hostname(app):
+    """First-run setup is open to any client, so a browser on the LAN using
+    the coordinator's own name gets the form, not a refusal."""
     client = _client(app)
-    r = client.post("/api/setup/admin", json=ADMIN, headers={"host": "evil.example:8088"})
-    assert r.status_code == 403
-    assert r.json()["error"]["code"] == "setup_local_only"
-    assert client.get("/api/auth/state").json()["admin_exists"] is False
-    r = client.post("/api/setup/admin", json=ADMIN, headers={"host": "127.0.0.1:8088"})
+    r = client.post("/api/setup/admin", json=ADMIN, headers={"host": "spark-01.lan:8088"})
     assert r.status_code == 200, r.text
 
 
@@ -73,15 +69,6 @@ def test_setup_accepts_the_public_origin_host(tmp_path, monkeypatch):
     client = _client(create_app())
     r = client.post("/api/setup/admin", json=ADMIN, headers={"host": "derate.example"})
     assert r.status_code == 200, r.text
-
-
-def test_setup_host_allowed():
-    assert authz.setup_host_allowed("localhost", None)
-    assert authz.setup_host_allowed("127.0.0.1", "")
-    assert authz.setup_host_allowed("::1", "")
-    assert authz.setup_host_allowed("Box.Example", "https://box.example:8443")
-    assert not authz.setup_host_allowed("evil.example", "https://box.example")
-    assert not authz.setup_host_allowed("evil.example", None)
 
 
 # -- 2.3: username-scope hold is a delay -------------------------------------

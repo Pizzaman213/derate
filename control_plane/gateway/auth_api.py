@@ -268,8 +268,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "admin_exists": exists,
                 "authenticated": session is not None,
                 "username": session.username if session else None,
-                # Setup answers only on loopback; the UI shows the tunnel instead.
-                "setup_local_only": not exists and not authz.is_loopback(authz.client_ip(request)),
+                # Always false: setup is open to any client until the first
+                # admin exists. Kept so a UI that still reads it shows the form.
+                "setup_local_only": False,
             }
         )
 

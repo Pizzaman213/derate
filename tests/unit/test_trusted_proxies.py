@@ -101,9 +101,11 @@ def _proxied_app(tmp_path, monkeypatch):
     return served, recorder
 
 
-def test_a_trusted_lan_client_cannot_forge_loopback_into_setup(tmp_path, monkeypatch):
+def test_a_trusted_lan_client_cannot_forge_loopback_in_the_access_log(tmp_path, monkeypatch):
     """GA-1: a client inside the trusted CIDR naming 127.0.0.1 in
-    X-Forwarded-For is still the LAN host it is, and setup refuses it."""
+    X-Forwarded-For is still the LAN host it is. Setup no longer cares --
+    it is open to any client until the first admin exists -- but the
+    access log must name the real client, not the forged loopback."""
     app, recorder = _proxied_app(tmp_path, monkeypatch)
     client = TestClient(app, client=("10.0.0.5", 4242))
     r = client.post(
@@ -111,8 +113,7 @@ def test_a_trusted_lan_client_cannot_forge_loopback_into_setup(tmp_path, monkeyp
         headers={"X-Forwarded-For": "127.0.0.1, 10.0.0.7", "Host": "localhost"},
         json={"username": "root", "email": "r@x.io", "password": "correct-horse-battery-1"},
     )
-    assert r.status_code == 403, r.text
-    assert r.json()["error"]["code"] == "setup_local_only"
+    assert r.status_code == 200, r.text
     row = next(x for x in recorder.rows if x.path == "/api/setup/admin")
     assert row.client_ip == "10.0.0.5"
     assert row.peer_ip == "10.0.0.5"
@@ -128,17 +129,16 @@ def test_a_trusted_proxy_names_the_client_and_the_peer_is_kept(tmp_path, monkeyp
     assert row.peer_ip == "10.0.0.5"
 
 
-def test_setup_needs_a_loopback_peer_even_when_the_client_is_loopback(tmp_path, monkeypatch):
-    """A trusted non-loopback proxy forwarding a loopback client is still
-    the network, not the operator's own machine."""
+def test_setup_through_a_trusted_proxy_is_open_until_the_first_admin(tmp_path, monkeypatch):
+    """Setup no longer asks for a loopback peer: through a trusted proxy it
+    answers like anywhere else, once, and is closed for good after."""
     app, _ = _proxied_app(tmp_path, monkeypatch)
     client = TestClient(app, client=("10.0.0.5", 4242))
-    r = client.post(
-        "/api/setup/admin",
-        headers={"X-Forwarded-For": "127.0.0.1", "Host": "localhost"},
-        json={"username": "root", "email": "r@x.io", "password": "correct-horse-battery-1"},
-    )
-    assert r.status_code == 403, r.text
+    body = {"username": "root", "email": "r@x.io", "password": "correct-horse-battery-1"}
+    r = client.post("/api/setup/admin", headers={"X-Forwarded-For": "127.0.0.1", "Host": "localhost"}, json=body)
+    assert r.status_code == 200, r.text
+    again = client.post("/api/setup/admin", headers={"X-Forwarded-For": "127.0.0.1", "Host": "localhost"}, json=body)
+    assert again.status_code == 410, again.text
 
 
 def test_ignored_forwarded_for_is_warned_once_per_peer(tmp_path, monkeypatch, caplog):
