@@ -11,7 +11,7 @@ Everything here is entered through `../ChatTab.tsx`, which owns the turns, the
 abort controller and the send. This folder owns the picker, the composer, the
 transcript, and three verifiers: `rows.check.mjs` and `voices.check.mjs` hold
 the picker and the voice controls to a live gateway, and `tags.check.mjs` is
-hermetic -- it holds the transcript's colours to `styles/tokens.css`.
+hermetic -- it holds the transcript's colours to `.omp/design/tokens/tokens.flat.json`.
 
 ## Layout
 
@@ -336,7 +336,7 @@ Outside the tab, this folder reaches `api/types.ts` for `Modality`,
 `components/Verbatim` for anything the server wrote -- `Verbatim` for a
 sentence, `VerbatimList` for `library.skipped` -- `format` for `fmt`, which is
 what puts an em dash rather than a zero in every figure `metaLine` prints,
-`state/backend` for the client, and `styles/tokens.css` for `--tag-1`..`--tag-4`
+`state/backend` for the client, and `.omp/design/tokens/tokens.json` for `--tag-1`..`--tag-4`
 and `--ink-muted`. `styles/derate.css` owns `.chatlist`, `.chatgroup`,
 `.chatgrouphead`, `.chattop`, `.chathead`, `.chatstats`, `.chatlog`, `.turn`,
 `.think`, `.turnmeta`, `.md`, `.composer`, `.speechrow`, `.clip` and `.cliprow`.

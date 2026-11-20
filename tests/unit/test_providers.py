@@ -2496,6 +2496,33 @@ def test_an_audio_rate_only_for_a_published_model(tmp_path):
     with pytest.raises(ValueError, match="does not publish"):
         service.update("openrouter", {"audio_prices": {"nope/model": 0.01}})
 
+def test_audio_prices_over_http_read_back_and_refuse_bad_values(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from control_plane.gateway import create_app
+    from tests.unit.test_gateway import build_deps
+
+    service = make_service(tmp_path)
+    add_openrouter(service)
+    service.update("openrouter", {"enabled_models": [SONNET]})
+    with TestClient(create_app(build_deps(providers=service))) as client:
+        ok = client.patch("/api/providers/openrouter", json={"audio_prices": {SONNET: 0.006}})
+        negative = client.patch("/api/providers/openrouter", json={"audio_prices": {SONNET: -1}})
+        text = client.patch("/api/providers/openrouter", json={"audio_prices": {SONNET: "x"}})
+        audit = client.get("/api/audit", params={"action": "provider_updated"}).json()
+    assert ok.status_code == 200, ok.text
+    row = next(m for m in ok.json()["models"] if m["upstream_id"] == SONNET)
+    assert row["price_per_minute_usd"] == pytest.approx(0.006)
+    assert negative.status_code == 400 and text.status_code == 400
+    assert service.find_model("openrouter", SONNET).price_per_minute_usd == pytest.approx(0.006)
+    rows = audit["entries"]
+    changed = [r for r in rows if r["action"] == "provider_updated"]
+    assert len(changed) == 1
+    after = next(m for m in changed[0]["after"]["models"] if m["upstream_id"] == SONNET)
+    before = next(m for m in changed[0]["before"]["models"] if m["upstream_id"] == SONNET)
+    assert (before["price_per_minute_usd"], after["price_per_minute_usd"]) == (None, 0.006)
+
+
 
 def test_a_dry_run_pin_changes_nothing(tmp_path):
     service = make_service(tmp_path)

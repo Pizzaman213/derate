@@ -1,3 +1,5 @@
+import { tokens } from '../../../../.omp/design/tokens/tokens.ts'
+
 // uPlot draws to a canvas and so needs literal colours, but this product is
 // themed entirely with custom properties that move under both
 // `prefers-color-scheme` and the header's own theme switch. Terminal.tsx
@@ -26,14 +28,17 @@ export interface ChartTheme {
   gap: string
 }
 
+// design-pack: computed-color — uPlot paints into a canvas, where var() does
+// not resolve, so the light-theme values from tokens.ts are the fallback and
+// alpha() derives the bands from whatever --ink resolves to at runtime.
 const FALLBACK: ChartTheme = {
-  ink: '#1A1917',
-  muted: '#5C5851',
-  rule: '#C9C2B4',
-  panel: '#EDE9E0',
-  band: 'rgba(26, 25, 23, 0.13)',
-  bandEdge: 'rgba(26, 25, 23, 0.30)',
-  gap: 'rgba(127, 92, 20, 0.12)',
+  ink: tokens.light.ink,
+  muted: tokens.light['ink-muted'],
+  rule: tokens.light.rule,
+  panel: tokens.light.panel,
+  band: alpha(tokens.light.ink, 0.13)!,
+  bandEdge: alpha(tokens.light.ink, 0.3)!,
+  gap: alpha(tokens.light.warn, 0.12)!,
 }
 
 /** `#RRGGBB` -> `rgba(...)`. Returns null for anything else, so a token that
@@ -53,7 +58,7 @@ export function readChartTheme(): ChartTheme {
     style.getPropertyValue(name).trim() || fallback
 
   const ink = token('--ink', FALLBACK.ink)
-  const warn = token('--warn', '#7F5C14')
+  const warn = token('--warn', tokens.light.warn)
   return {
     ink,
     muted: token('--ink-muted', FALLBACK.muted),

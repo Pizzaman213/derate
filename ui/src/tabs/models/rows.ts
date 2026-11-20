@@ -76,6 +76,27 @@ export function runners(deployments: readonly DeploymentDTO[]): DeploymentDTO[] 
   return deployments.filter((d) => !TERMINAL.has(d.state))
 }
 
+/** What one node is running now, or -- if nothing is -- the last thing that
+ *  was, so its error and its log stay reachable instead of the machine just
+ *  reading "Nothing.".
+ *
+ *  `deployments` is unfiltered and its order is the ledger's own insertion
+ *  order (newest terminal rows are the ones kept, see `GET /api/deployments`),
+ *  so the last match is the most recent one. Shared by `NodeInspector` and the
+ *  Settings instance picker so the two surfaces cannot silently disagree about
+ *  what "here" means for the same node. */
+export function runningOrPrevious(
+  deployments: readonly DeploymentDTO[],
+  nodeId: string,
+): { here: DeploymentDTO[]; previous: DeploymentDTO | undefined } {
+  const here = runners(deployments).filter((d) => d.node_ids.includes(nodeId))
+  const previous =
+    here.length === 0
+      ? [...deployments].reverse().find((d) => TERMINAL.has(d.state) && d.node_ids.includes(nodeId))
+      : undefined
+  return { here, previous }
+}
+
 /** The three row shapes now arrive from `GET /api/models` and are declared
  *  with the rest of the wire in `api/types.ts`. Re-exported here so that every
  *  existing `import { type RowProvider } from './rows'` keeps working —
@@ -97,46 +118,6 @@ export type Band =
   | 'wont'
   | 'elsewhere'
   | 'unserved'
-
-/** The deployments still holding a machine.
- *
- *  `/api/deployments` is a ledger, not a roster -- it keeps every attempt,
- *  and three tries at one model that all failed are three rows with the same
- *  served name and the same node. A failed or stopped row holds no machine,
- *  so anything that counts what is running (the cluster graph, the dashboard,
- *  the sheets) filters through this rather than spelling the set again.
- *
- *  `TERMINAL` is this module's: the Models screen already decides what "over"
- *  means for a row, and a second list would put two screens at odds about
- *  whether a model is running.
- *
- *  Live duplicates are NOT collapsed. Two deployments of one served name that
- *  are both up are two runners -- the ledger was the duplication, not the
- *  cluster. */
-export function runners(deployments: readonly DeploymentDTO[]): DeploymentDTO[] {
-  return deployments.filter((d) => !TERMINAL.has(d.state))
-}
-
-/** What one node is running now, or -- if nothing is -- the last thing that
- *  was, so its error and its log stay reachable instead of the machine just
- *  reading "Nothing.".
- *
- *  `deployments` is unfiltered and its order is the ledger's own insertion
- *  order (newest terminal rows are the ones kept, see `GET /api/deployments`),
- *  so the last match is the most recent one. Shared by `NodeInspector` and the
- *  Settings instance picker so the two surfaces cannot silently disagree about
- *  what "here" means for the same node. */
-export function runningOrPrevious(
-  deployments: readonly DeploymentDTO[],
-  nodeId: string,
-): { here: DeploymentDTO[]; previous: DeploymentDTO | undefined } {
-  const here = runners(deployments).filter((d) => d.node_ids.includes(nodeId))
-  const previous =
-    here.length === 0
-      ? [...deployments].reverse().find((d) => TERMINAL.has(d.state) && d.node_ids.includes(nodeId))
-      : undefined
-  return { here, previous }
-}
 
 /** One model, with the facts kept apart instead of pre-joined into a string.
  *

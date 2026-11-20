@@ -24,22 +24,7 @@ export interface TurnFigures {
   stopped: boolean
 }
 
-/** `ChatTurnMeta` as the client fills it, with the fields this build's
- *  `api/types.ts` still declares optional resolved to `null`. */
-function complete(m: ChatTurnMeta) {
-  return {
-    ...m,
-    firstContentMs: m.firstContentMs ?? null,
-    promptTokens: m.promptTokens ?? null,
-    reasoningTokens: m.reasoningTokens ?? null,
-    reasoningEstimated: m.reasoningEstimated ?? false,
-    reasoningSource: m.reasoningSource ?? null,
-    finishReason: m.finishReason ?? null,
-  }
-}
-
-export function turnFigures(meta: ChatTurnMeta): TurnFigures {
-  const m = complete(meta)
+export function turnFigures(m: ChatTurnMeta): TurnFigures {
   const thinkMs =
     m.reasoningSource === null || m.ttftMs === null
       ? null
@@ -94,7 +79,7 @@ const sum = (xs: (number | null)[]): number | null => {
 export function sessionFigures(turns: Turn[]): SessionFigures {
   const metas = turns
     .filter((t) => t.role === 'assistant' && t.meta !== null)
-    .map((t) => complete(t.meta as ChatTurnMeta))
+    .map((t) => t.meta as ChatTurnMeta)
   const ttfts = metas.map((m) => m.ttftMs).filter((x): x is number => x !== null)
   let rateTokens = 0
   let rateSeconds = 0

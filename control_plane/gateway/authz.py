@@ -6,9 +6,14 @@ place that decides otherwise, and it decides by path, never by route:
 * ``/api/**`` needs a ``derate_session`` cookie naming a live admin session,
   except :data:`OPEN_ROUTES` -- the calls that have to work before there is
   a session, logout included so an expired cookie can always be cleared --
-  and ``POST /api/setup/admin``, which is open exactly until the first admin
-  exists, and then only to a loopback peer (403 ``setup_local_only``
-  otherwise); it answers 410 ``setup_closed`` forever after.
+  and ``POST /api/setup/admin``, which is open to any client exactly until
+  the first admin exists and answers 410 ``setup_closed`` forever after.
+  First-run setup used to be loopback-only; it is not any more, because
+  "loopback" is a fact about the network path, not about the operator --
+  under Docker Desktop the operator's own browser arrives from the VM's
+  gateway (192.168.65.1) and was refused on their own machine. Whoever
+  reaches a fresh coordinator first can claim it, so set it up before
+  exposing it.
 * ``/v1/**`` needs ``Authorization: Bearer drt_...``. Never a query-string
   key: it would land in every access log between the client and here.
 * Everything else (the built UI, ``/healthz``, ``/install.sh``) passes.
@@ -32,7 +37,6 @@ import ipaddress
 import logging
 import threading
 import time
-from urllib.parse import urlsplit
 from dataclasses import asdict, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -59,9 +63,10 @@ from control_plane.contracts.auth import (
 from control_plane.contracts.auth import AuditAction
 from control_plane.keys import format as key_format
 
-from .csrf import is_cross_site_write
+from .csrf import is_cross_site_write, trusted_origins
 from .errors import error_response
 from control_plane.redaction import Redactor, printable
+from control_plane.telemetry.records import AccessRecord
 
 log = logging.getLogger("gateway.authz")
 access_log = logging.getLogger("gateway.access")
@@ -81,8 +86,8 @@ OPEN_ROUTES = frozenset(
         ("POST", "/api/auth/logout"),
     }
 )
-#: Open until the first admin exists, and only to a loopback peer;
-#: 410 ``setup_closed`` afterwards.
+#: Open to any client until the first admin exists; 410 ``setup_closed``
+#: afterwards.
 SETUP_ROUTE = ("POST", "/api/setup/admin")
 
 #: Sent with every /v1 401, as RFC 6750 asks.
@@ -237,18 +242,6 @@ def setup_closed() -> Response:
         "Setup is closed: an admin already exists. Sign in instead.",
         "invalid_request_error",
         AuthErrorCode.SETUP_CLOSED.value,
-    )
-
-
-def setup_local_only(port: int) -> Response:
-    return error_response(
-        403,
-        "the first admin can only be created from the coordinator itself: open the "
-        "setup page on that machine, or run "
-        f"`ssh -L {port}:127.0.0.1:{port} <coordinator>` and use "
-        f"http://127.0.0.1:{port}/setup through the tunnel",
-        "invalid_request_error",
-        AuthErrorCode.SETUP_LOCAL_ONLY.value,
     )
 
 
@@ -444,21 +437,12 @@ def _query_of(scope) -> str:
     return query[:200]
 
 
-def trusted_origins(settings) -> tuple[str, ...]:
-    """``DERATE_ALLOWED_ORIGINS`` plus ``DERATE_PUBLIC_ORIGIN`` when set."""
-    public = getattr(settings, "public_origin", "")
-    return tuple(settings.allowed_origins) + ((public,) if public else ())
-
-
 def _emit_access(scope, state: dict, *, method: str, path: str, query: str,
                  status: int | None, duration_ms: float) -> None:
     """The durable twin of the ``gateway.access`` line: an ``access`` row on
     the telemetry sink, which ``DERATE_TELEMETRY=0`` does not switch off.
     Never raises."""
     try:
-        # Imported here: AccessRecord ships with the telemetry branch, and
-        # without it the access row is skipped rather than the gateway failing.
-        from control_plane.telemetry.records import AccessRecord
         ctx = scope["app"].state.ctx
         sink = getattr(ctx, "sink", None)
         if sink is None or not hasattr(sink, "access"):
@@ -939,15 +923,6 @@ def _cross_site_refusal(request: Request) -> Response | None:
     )
 
 
-def setup_host_allowed(host: str, public_origin: str | None) -> bool:
-    """Whether first-admin setup may answer a request that named *host*:
-    a loopback literal, ``localhost``, or ``DERATE_PUBLIC_ORIGIN``'s host."""
-    host = host.lower()
-    if host == "localhost" or is_loopback(host):
-        return True
-    return bool(public_origin) and host == (urlsplit(public_origin).hostname or "").lower()
-
-
 def _is_cors_preflight(request: Request) -> bool:
     """A real CORS preflight, which carries no credential by specification:
     ``OPTIONS`` with ``Access-Control-Request-Method``, and only when
@@ -981,25 +956,10 @@ def _refusal(request: Request) -> Response | None:
             # missing cookie could be reported as the problem.
             auth = stores.auth
             if route == SETUP_ROUTE:
+                # Open to any client until the first admin exists (see the
+                # module docstring), then closed for good.
                 if auth.admin_exists():
                     return setup_closed()
-                # Both the socket peer and the resolved client: a trusted
-                # proxy on another machine forwarding "127.0.0.1" is the
-                # network, not the operator's own shell.
-                state = request.scope.get("state") or {}
-                peer = state.get("peer_ip", peer_ip(request))
-                if not (is_loopback(peer) and is_loopback(client_ip(request))):
-                    _note(request, AuditAction.SETUP_REFUSED, actor="-", detail={"path": path})
-                    return setup_local_only(request.app.state.ctx.settings.port)
-                host = request.url.hostname or ""
-                if not setup_host_allowed(host, request.app.state.ctx.settings.public_origin):
-                    # A loopback peer naming a foreign host is a DNS-rebinding
-                    # page in a browser on this machine, not the operator.
-                    _note(
-                        request, AuditAction.SETUP_REFUSED, actor="-",
-                        detail={"path": path, "host": host},
-                    )
-                    return setup_local_only(request.app.state.ctx.settings.port)
                 return None
             session = current_session(stores, request)
             if session is None:

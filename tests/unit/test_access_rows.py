@@ -18,13 +18,7 @@ from fastapi.testclient import TestClient
 from control_plane import forensics
 from control_plane.gateway import create_app
 from control_plane.telemetry.archive import Archive
-_records = pytest.importorskip(
-    "control_plane.telemetry.records",
-    reason="needs KIND_ACCESS/AccessRecord from the registry-telemetry branch",
-)
-if not hasattr(_records, "KIND_ACCESS"):
-    pytest.skip("needs KIND_ACCESS from the registry-telemetry branch", allow_module_level=True)
-KIND_ACCESS, AccessRecord = _records.KIND_ACCESS, _records.AccessRecord
+from control_plane.telemetry.records import KIND_ACCESS, AccessRecord
 
 pytestmark = pytest.mark.raw_http
 

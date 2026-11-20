@@ -1,17 +1,27 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Copyable } from '../components/Copyable'
+import { Icon } from '../components/Icon'
+import { useAuth } from '../state/auth'
 import { useBackend } from '../state/backend'
-import { useRouter } from '../state/router'
+import { plainClick, useRouter } from '../state/router'
+import type { Route } from '../state/routes'
 import {
   LAUNCH_PHASES,
   LAUNCH_PHASE_LABEL,
   type LaunchPhase,
 } from '../state/launchPhase'
+import { AdminStep } from './setup/AdminStep'
 import { Qr } from './setup/Qr'
 import './setup/setup.css'
+import { doneReading, splitLaunchFailure, type DoneReading } from './setup/done'
 import type {
   CapacityRow,
+  ChatTurnMeta,
   DeploymentDTO,
   Enrollment,
+  NodeStateDTO,
+  Provider,
+  ServedModel,
   SetupStatus,
 } from '../api/types'
 
@@ -134,7 +144,72 @@ function rowsOf(report: {
   return { rows: [], basis: null }
 }
 
+/** The admin step, then the wizard.
+ *
+ *  Split in two because of what the gateway answers before the first admin
+ *  exists: 401 to every /api route but `GET /api/auth/state` and
+ *  `POST /api/setup/admin`. The wizard prefetches `/api/setup` and
+ *  `/api/capacity` on mount, so it is not mounted at all until the admin step
+ *  is done and its session cookie is in hand -- deferral by construction, not
+ *  by a flag each effect has to remember to read. With an admin and a session
+ *  already there (setup re-run from its URL) the admin step is skipped. */
 export function SetupTab() {
+  const { state } = useAuth()
+  // The name this run created, for the ledger. Null on a re-run.
+  const [admin, setAdmin] = useState<string | null>(null)
+  // True from the moment the key is minted until "I saved it". Holds the admin
+  // step on screen even if something re-reads the auth state meanwhile, which
+  // would otherwise swap in the wizard and unmount the only copy of the secret.
+  const [revealing, setRevealing] = useState(false)
+
+  if (state === null) return null
+
+  // The coordinator creates the first admin for a loopback caller only; from
+  // anywhere else the form would 403, so say how to get onto loopback.
+  if (state.setup_local_only) {
+    const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80')
+    const tunnel = `ssh -L ${port}:127.0.0.1:${port} ${window.location.hostname}`
+    return (
+      <div className="setup">
+        <Head crumb="create the admin" />
+        <main className="setup-main">
+          <h1>Create the admin from the coordinator itself.</h1>
+          <p className="setup-lede">
+            The first admin can only be created from the machine this coordinator runs on, so
+            nobody else on the network can claim it first. Open this page on that machine, or
+            tunnel to it and open it through the tunnel:
+          </p>
+          <Copyable text={tunnel} />
+          <p className="setup-note" style={{ margin: 'var(--space-8) 0 0' }}>
+            Then open <span className="mono">{`http://127.0.0.1:${port}/setup`}</span> on this
+            computer.
+          </p>
+        </main>
+      </div>
+    )
+  }
+
+  if (!state.admin_exists || !state.authenticated || revealing) {
+    return (
+      <div className="setup">
+        <Head crumb="create the admin" />
+        <main className="setup-main">
+          <AdminStep
+            onMinted={(name) => {
+              setAdmin(name)
+              setRevealing(true)
+            }}
+            onSaved={() => setRevealing(false)}
+          />
+        </main>
+      </div>
+    )
+  }
+
+  return <SetupWizard admin={admin} />
+}
+
+function SetupWizard({ admin }: { admin: string | null }) {
   const { backend } = useBackend()
   const { navigate } = useRouter()
 
@@ -248,7 +323,7 @@ export function SetupTab() {
             that request failed. The coordinator may still be starting.
           </p>
           <p className="setup-warn setup-fault">{loadError}</p>
-          <button className="btn primary" onClick={() => window.location.reload()}>
+          <button type="button" className="btn primary" onClick={() => window.location.reload()}>
             Try again
           </button>
         </main>
@@ -274,7 +349,7 @@ export function SetupTab() {
     <div className="setup">
       <Head crumb={crumb} />
       <main className="setup-main">
-        <Ledger chose={chose} status={status} onBack={goTo} />
+        <Ledger admin={admin} chose={chose} status={status} onBack={goTo} />
 
         {step === 'machine' && (
           <MachineStep
@@ -323,6 +398,7 @@ export function SetupTab() {
             chose={chose}
             status={status}
             onFinish={() => navigate({ dest: 'dash' }, { replace: true })}
+            onBack={goTo}
           />
         )}
       </main>
@@ -333,23 +409,7 @@ export function SetupTab() {
 function Head({ crumb }: { crumb: string }) {
   return (
     <header className="setup-head">
-      <svg width="30" height="23" viewBox="0 0 64 50" aria-label="derate">
-        <path
-          d="M26 25 V39 H56"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="6"
-          strokeLinecap="square"
-          opacity=".32"
-        />
-        <path
-          d="M8 25 H26 V11 H56"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="6"
-          strokeLinecap="square"
-        />
-      </svg>
+      <Icon name="derate-mark" label="derate" size={24} className="brand-mark" />
       <span className="setup-wordmark">derate</span>
       <span className="setup-where setup-note mono">{crumb}</span>
     </header>
@@ -357,15 +417,20 @@ function Head({ crumb }: { crumb: string }) {
 }
 
 function Ledger({
+  admin,
   chose,
   status,
   onBack,
 }: {
+  admin: string | null
   chose: Choices
   status: SetupStatus
   onBack: (step: StepId) => void
 }) {
-  const rows: [string, string, StepId][] = []
+  // The admin row has no "Change": the account exists and the admin step is
+  // closed for good (410 `setup_closed`); passwords change under Settings.
+  const rows: [string, string, StepId | null][] = []
+  if (admin) rows.push(['Admin', admin, null])
   if (chose.machine) rows.push(['This machine', chose.machine, 'machine'])
   if (status.provider_routing && chose.key) {
     rows.push([
@@ -393,16 +458,18 @@ function Ledger({
     <div className="setup-ledger">
       {rows.map(([what, detail, step]) => (
         <div className="setup-done" key={what}>
-          <span className="setup-tick" aria-hidden="true">
-            ✓
+          <span className="setup-tick">
+            <Icon name="check" decorative />
           </span>
           <span className="setup-what">
             <span className="label">{what}</span>
             <span className="setup-detail"> — {detail}</span>
           </span>
-          <button className="btn" onClick={() => onBack(step)}>
-            Change
-          </button>
+          {step && (
+            <button type="button" className="btn" onClick={() => onBack(step)}>
+              Change
+            </button>
+          )}
         </div>
       ))}
     </div>
@@ -432,7 +499,7 @@ function MachineStep({
           roster is itself, so there is nothing to show you here.
         </p>
         <div className="setup-row">
-          <button className="btn primary" onClick={onSkip}>
+          <button type="button" className="btn primary" onClick={onSkip}>
             Carry on
           </button>
         </div>
@@ -478,12 +545,13 @@ function MachineStep({
 
       <div className="setup-row">
         <button
+          type="button"
           className="btn primary"
           onClick={() => onUse(`${p.gpu_name || p.hostname}${memory > 0 ? `, ${gib(memory)}` : ''}`)}
         >
           Use this machine
         </button>
-        <button className="setup-skip" onClick={onSkip}>
+        <button type="button" className="setup-skip" onClick={onSkip}>
           I only want cloud models
         </button>
       </div>
@@ -535,7 +603,7 @@ function CloudStep({ onDone }: { onDone: (outcome: 'added' | 'skipped') => void 
         </div>
       </div>
 
-      <label className="label" htmlFor="setup-key" style={{ display: 'block', marginBottom: 'var(--s-2)' }}>
+      <label className="label" htmlFor="setup-key" style={{ display: 'block', marginBottom: 'var(--space-8)' }}>
         OpenRouter key
       </label>
       <input
@@ -547,17 +615,17 @@ function CloudStep({ onDone }: { onDone: (outcome: 'added' | 'skipped') => void 
         value={key}
         onChange={(e) => setKey(e.target.value)}
       />
-      <p className="setup-note" style={{ margin: 'var(--s-2) 0 var(--s-5)' }}>
+      <p className="setup-note" style={{ margin: 'var(--space-8) 0 var(--space-24)' }}>
         Stored on the coordinator and never shown again, not even to you.
       </p>
 
       {error && <p className="setup-warn setup-fault">{error}</p>}
 
       <div className="setup-row">
-        <button className="btn primary" onClick={() => void add()} disabled={busy || !key.trim()}>
+        <button type="button" className="btn primary" onClick={() => void add()} disabled={busy || !key.trim()}>
           {busy ? 'Adding…' : 'Add key'}
         </button>
-        <button className="setup-skip" onClick={() => onDone('skipped')}>
+        <button type="button" className="setup-skip" onClick={() => onDone('skipped')}>
           Skip — local only
         </button>
       </div>
@@ -631,7 +699,7 @@ function ModelStep({
         deployment={launching.deployment}
         error={launching.error}
         onBack={() => setLaunching(null)}
-        onContinue={() => onDone({ row: launching.row, launched: true })}
+        onContinue={(launched) => onDone({ row: launching.row, launched })}
       />
     )
   }
@@ -641,7 +709,7 @@ function ModelStep({
       <div className="setup-step">
         <h1>Could not work out what runs here.</h1>
         <p className="setup-warn setup-fault">{answer.message}</p>
-        <button className="btn primary" onClick={() => onDone(null)}>
+        <button type="button" className="btn primary" onClick={() => onDone(null)}>
           Skip for now
         </button>
       </div>
@@ -665,7 +733,7 @@ function ModelStep({
               unreachable from this machine. Nothing is stuck on your side, and you can
               come back to this from the Models screen.
             </p>
-            <button className="setup-skip" onClick={() => onDone(null)}>
+            <button type="button" className="setup-skip" onClick={() => onDone(null)}>
               Skip &mdash; I will pick one later
             </button>
           </>
@@ -705,6 +773,7 @@ function ModelStep({
       <div className="setup-picks">
         {rows.map((row) => (
           <button
+            type="button"
             key={row.model_id}
             className="setup-pick"
             disabled={!row.fits || !servable}
@@ -740,17 +809,17 @@ function ModelStep({
       </div>
 
       <div className="setup-row">
-        <button className="setup-skip" onClick={() => onDone(null)}>
+        <button type="button" className="setup-skip" onClick={() => onDone(null)}>
           Skip &mdash; I will pick one later
         </button>
       </div>
-      <p className="setup-note" style={{ marginTop: 'var(--s-3)' }}>
+      <p className="setup-note" style={{ marginTop: 'var(--space-12)' }}>
         {basis === 'live'
           ? 'Measured against the memory this machine can hand out right now. '
           : basis === 'static'
             ? 'Measured against this machine\u2019s stated memory ceiling; no live reading yet. '
             : ''}
-        Speeds are a memory-bandwidth estimate at each row\u2019s own context, not a
+        Speeds are a memory-bandwidth estimate at each row&rsquo;s own context, not a
         benchmark.
       </p>
     </div>
@@ -802,7 +871,8 @@ function LaunchProgress({
   deployment: DeploymentDTO | null
   error: string | null
   onBack: () => void
-  onContinue: () => void
+  /** `launched` is true only from the Continue that appears once it serves. */
+  onContinue: (launched: boolean) => void
 }) {
   const { backend } = useBackend()
   const [elapsed, setElapsed] = useState(0)
@@ -953,18 +1023,27 @@ function LaunchProgress({
   const clock = (n: number) => `${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}`
 
   if (error || phase === 'failed') {
+    // derate's own sentence first, the launcher's dump folded under it: the
+    // cause used to be the last of twenty lines. Both parts verbatim.
+    const { head, output } = splitLaunchFailure(error ?? failure ?? 'The launcher reported a failure.')
     return (
       <div className="setup-step">
         <h1>{row.label} did not start.</h1>
         {/* Verbatim. A refusal from the fit gate or the launcher names what to
             change, and this screen is not entitled to summarise it. */}
-        <p className="setup-warn setup-fault">{error ?? failure ?? 'The launcher reported a failure.'}</p>
+        <p className="setup-warn setup-fault">{head}</p>
+        {output !== null && (
+          <details className="setup-details">
+            <summary>launcher output</summary>
+            <pre className="setup-log mono">{output}</pre>
+          </details>
+        )}
         <div className="setup-row">
-          <button className="btn primary" onClick={onBack}>
+          <button type="button" className="btn primary" onClick={onBack}>
             Pick something else
           </button>
-          <button className="setup-skip" onClick={onContinue}>
-            Carry on anyway
+          <button type="button" className="setup-skip" onClick={() => onContinue(false)}>
+            Carry on without it
           </button>
         </div>
       </div>
@@ -1028,8 +1107,8 @@ function LaunchProgress({
             const state = done || i < at ? 'done' : i === at ? 'now' : 'todo'
             return (
               <li key={p} className={`setup-phase is-${state}`}>
-                <span className="mark" aria-hidden="true">
-                  {state === 'done' ? '✓' : state === 'now' ? '●' : '○'}
+                <span className="mark">
+                  <Icon name={state === 'done' ? 'check-circle' : state === 'now' ? 'circle-dot' : 'circle'} size={12} decorative />
                 </span>
                 <span className={state === 'now' && !done ? 'dotting' : undefined}>
                   {PHASE_LABEL[p]}
@@ -1064,7 +1143,7 @@ function LaunchProgress({
       {/* Said plainly rather than left as a mystery. Somebody watching a number
           that is not a percentage deserves to know why it is not one. */}
       {!done && (
-        <p className="setup-note" style={{ marginBottom: 'var(--s-5)' }}>
+        <p className="setup-note" style={{ marginBottom: 'var(--space-24)' }}>
           The size shown is what has actually landed in this machine&rsquo;s model cache.
           There is no percentage for the download because nothing reports its final
           size before it finishes &mdash; the runtime fetches its own weights. The bar
@@ -1076,11 +1155,11 @@ function LaunchProgress({
       {failure && !done && <p className="setup-warn">{failure}</p>}
 
       <div className="setup-row">
-        <button className="btn primary" onClick={onContinue}>
+        <button type="button" className="btn primary" onClick={() => onContinue(done)}>
           {done ? 'Continue' : 'Continue while it loads'}
         </button>
         {!done && (
-          <button className="setup-skip" onClick={onBack}>
+          <button type="button" className="setup-skip" onClick={onBack}>
             Pick something else instead
           </button>
         )}
@@ -1110,6 +1189,42 @@ function MachinesStep({ onDone }: { onDone: (outcome: 'joined' | 'skipped') => v
     }
   }, [backend])
 
+  // Whether somebody actually ran the command, read off the cluster rather than
+  // taken on their word. The first answer is the baseline; any node after it
+  // that was not in it has joined. A failed poll is retried, never reported --
+  // the join command above is the thing on this screen that matters.
+  const [joined, setJoined] = useState<NodeStateDTO[]>([])
+  useEffect(() => {
+    let live = true
+    let timer = 0
+    let baseline: Set<string> | null = null
+    const poll = async () => {
+      try {
+        const cluster = await backend.cluster()
+        if (!live) return
+        if (baseline === null) baseline = new Set(cluster.nodes.map((n) => n.profile.node_id))
+        else {
+          const seen = baseline
+          const fresh = cluster.nodes.filter((n) => !seen.has(n.profile.node_id))
+          setJoined((prev) =>
+            prev.length === fresh.length &&
+            prev.every((n, i) => n.profile.node_id === fresh[i]?.profile.node_id)
+              ? prev
+              : fresh,
+          )
+        }
+      } catch {
+        // Next poll is three seconds away.
+      }
+      if (live) timer = window.setTimeout(poll, 3000)
+    }
+    void poll()
+    return () => {
+      live = false
+      window.clearTimeout(timer)
+    }
+  }, [backend])
+
   return (
     <div className="setup-step">
       <h1>Add another machine?</h1>
@@ -1118,7 +1233,7 @@ function MachinesStep({ onDone }: { onDone: (outcome: 'joined' | 'skipped') => v
         Raspberry Pi. Models run wherever they fit, and you keep using the same address.
       </p>
 
-      <p className="label" style={{ marginBottom: 'var(--s-2)' }}>
+      <p className="label" style={{ marginBottom: 'var(--space-8)' }}>
         Run this on the other machine
       </p>
 
@@ -1128,6 +1243,7 @@ function MachinesStep({ onDone }: { onDone: (outcome: 'joined' | 'skipped') => v
         <div className="setup-cmd">
           <code>{enrollment ? enrollment.command : 'composing the command…'}</code>
           <button
+            type="button"
             className="btn"
             disabled={!enrollment}
             onClick={() => {
@@ -1142,37 +1258,58 @@ function MachinesStep({ onDone }: { onDone: (outcome: 'joined' | 'skipped') => v
         </div>
       )}
 
-      <p className="setup-note" style={{ marginBottom: 'var(--s-5)' }}>
+      <p className="setup-note" style={{ marginBottom: 'var(--space-24)' }}>
         This is the only step that needs a terminal, and only on the machine being added.
         Nothing to install on this one. The token in that line expires
         {enrollment ? ` in ${Math.round(enrollment.expires_in_s / 60)} minutes` : ' shortly'}.
       </p>
 
+      {joined.length > 0 && (
+        <p className="setup-note" role="status">
+          {joined.map((n) => n.label ?? n.profile.node_id).join(', ')} joined.
+        </p>
+      )}
+
       <div className="setup-row">
-        <button className="btn primary" onClick={() => onDone('joined')}>
-          A machine joined
-        </button>
-        <button className="setup-skip" onClick={() => onDone('skipped')}>
-          Skip — just this machine
-        </button>
+        {joined.length > 0 ? (
+          <button type="button" className="btn primary" onClick={() => onDone('joined')}>
+            Continue
+          </button>
+        ) : (
+          <button type="button" className="setup-skip" onClick={() => onDone('skipped')}>
+            Skip — just this machine
+          </button>
+        )}
       </div>
     </div>
   )
 }
 
+/** The test prompt, prefilled. Short on purpose: the point is a reply, fast. */
+const TEST_PROMPT = 'Say hello in five words.'
+
 function DoneStep({
   chose,
   status,
   onFinish,
+  onBack,
 }: {
   chose: Choices
   status: SetupStatus
   onFinish: () => void
+  onBack: (step: StepId) => void
 }) {
   const { backend } = useBackend()
   const [endpoint, setEndpoint] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [recordError, setRecordError] = useState<string | null>(null)
+  // What is actually running, polled. `chose.model.launched` is only what the
+  // model step was told, and a launch that died after Continue left it true.
+  // Null until the first deployments answer, so "nothing yet" is never said
+  // before anybody looked.
+  const [deployments, setDeployments] = useState<DeploymentDTO[] | null>(null)
+  const [served, setServed] = useState<ServedModel[]>([])
+  const [providers, setProviders] = useState<Provider[] | null>(null)
 
   useEffect(() => {
     let live = true
@@ -1194,31 +1331,105 @@ function DoneStep({
     backend.completeSetup().catch((err) => setRecordError(String((err as Error)?.message ?? err)))
   }, [backend])
 
-  const spill = status.provider_routing && chose.key === 'added'
+  useEffect(() => {
+    // Every three seconds, each source on its own: one that fails keeps its
+    // last answer rather than blanking the others.
+    let live = true
+    let timer = 0
+    const poll = async () => {
+      const [deps, models, provs] = await Promise.all([
+        backend.deployments().catch(() => null),
+        backend.models().catch(() => null),
+        status.provider_routing ? backend.providers().catch(() => null) : Promise.resolve(null),
+      ])
+      if (!live) return
+      if (deps) setDeployments(deps)
+      if (models) setServed(models)
+      if (provs) setProviders(provs)
+      timer = window.setTimeout(() => void poll(), 3000)
+    }
+    void poll()
+    return () => {
+      live = false
+      window.clearTimeout(timer)
+    }
+  }, [backend, status.provider_routing])
+
+  const reading: DoneReading | null = deployments ? doneReading(chose, deployments, served) : null
+  const named =
+    reading && (reading.kind === 'serving' || reading.kind === 'loading') ? reading.model : null
+
+  const title =
+    reading === null
+      ? 'Checking what is running…'
+      : reading.kind === 'serving'
+        ? `${reading.model} is answering.`
+        : reading.kind === 'loading'
+          ? `${reading.model} is still loading.`
+          : reading.kind === 'failed'
+            ? `${reading.model} did not start.`
+            : 'derate is up, with nothing to answer yet.'
+  const lede =
+    reading?.kind === 'serving'
+      ? 'Send it something below, then use the address from any app.'
+      : reading?.kind === 'loading'
+        ? 'You can send a test request as soon as it is ready; the address below works now.'
+        : reading?.kind === 'nothing'
+          ? 'Add a model on the Models screen, or serve one from a provider.'
+          : null
+  // Only what runs on these machines: a provider-served name is the Cloud
+  // line's to report, and claiming it here is the lie this screen used to tell.
+  const machineOn = (reading?.kind === 'serving' && reading.local) || reading?.kind === 'loading'
+  const machineSays =
+    reading === null
+      ? 'checking…'
+      : reading.kind === 'serving' && reading.local
+        ? `${reading.model} is answering`
+        : reading.kind === 'loading'
+          ? `loading ${reading.model}`
+          : reading.kind === 'failed'
+            ? `${reading.model} did not start`
+            : 'no model running yet'
+
+  const enabled = (providers ?? []).filter((p) => p.enabled)
+  const providerModels = enabled.reduce((n, p) => n + (p.model_count ?? p.models.length), 0)
+
+  const curl =
+    `curl ${endpoint ?? `${window.location.origin}/v1`}/chat/completions ` +
+    `-H "Authorization: Bearer $DERATE_API_KEY" -H "content-type: application/json" ` +
+    `-d '{"model":"${named ?? '<model>'}","messages":[{"role":"user","content":"Hello"}]}'`
 
   return (
     <div className="setup-step">
-      <h1>{chose.model?.launched ? `${chose.model.row.label} is starting.` : 'derate is up.'}</h1>
-      <p className="setup-lede">
-        {chose.model?.launched
-          ? 'It is loading now. This is the address your other apps will use to reach it.'
-          : 'Nothing is running yet. This is the address to use once something is.'}
-      </p>
+      <h1>{title}</h1>
+      {lede && <p className="setup-lede">{lede}</p>}
+      {reading?.kind === 'failed' && (
+        <>
+          {/* The first line of the launcher's own record, verbatim. */}
+          <p className="setup-warn setup-fault">{reading.why}</p>
+          <button type="button" className="btn primary" onClick={() => onBack('model')}>
+            Pick another model
+          </button>
+        </>
+      )}
 
       {recordError && <p className="setup-warn">{recordError}</p>}
 
-      <p className="label" style={{ margin: 'var(--s-6) 0 var(--s-2)' }}>
+      {reading?.kind === 'serving' && <TestRequest model={reading.model} served={served} />}
+
+      <p className="label" style={{ margin: 'var(--space-32) 0 var(--space-8)' }}>
         Use it from your phone or any other app
       </p>
       <div className="setup-handoff">
         {endpoint && <Qr text={endpoint} label={`QR code for ${endpoint}`} />}
         <div>
-          <p className="setup-note" style={{ margin: '0 0 var(--s-3)' }}>
+          <p className="setup-note" style={{ margin: '0 0 var(--space-12)' }}>
             Scan to open derate on your phone. Nothing to type, no IP address to copy.
           </p>
           <div className="setup-endpoint" style={{ margin: 0 }}>
             <code>{endpoint ?? 'finding this coordinator’s address…'}</code>
             <button
+              type="button"
               className="btn"
               disabled={!endpoint}
               onClick={() => {
@@ -1231,39 +1442,161 @@ function DoneStep({
               {copied ? 'Copied' : 'Copy'}
             </button>
           </div>
-          {chose.model && (
-            <p className="setup-note" style={{ margin: 'var(--s-2) 0 0' }}>
-              Model name <span className="mono">{chose.model.row.model_id}</span>. No other
-              settings.
-            </p>
-          )}
         </div>
       </div>
 
-      <div className="setup-box" style={{ margin: 'var(--s-6) 0 var(--s-5)' }}>
+      <div style={{ marginTop: 'var(--space-16)' }}>
+        <Copyable text={curl} />
+        <p className="setup-note" style={{ margin: 'var(--space-8) 0 0' }}>
+          Every request needs a key. The default key was shown once when the admin was
+          created; mint another on the Keys screen.
+        </p>
+      </div>
+
+      <div className="setup-box" style={{ margin: 'var(--space-32) 0 var(--space-24)' }}>
         <div className="setup-line">
-          <span className={`setup-dot ${chose.model?.launched ? 'on' : 'off'}`} />
+          <span className={`setup-dot ${machineOn ? 'on' : 'off'}`} />
           <span className="setup-who">Your machine</span>
-          <span className="setup-says">
-            {chose.model?.launched ? 'starting a model now' : 'no model running yet'}
-          </span>
+          <span className="setup-says">{machineSays}</span>
         </div>
         {status.provider_routing && (
           <div className="setup-line">
-            <span className={`setup-dot ${spill ? 'on' : 'off'}`} />
+            <span className={`setup-dot ${providerModels > 0 ? 'on' : 'off'}`} />
             <span className="setup-who">Cloud</span>
             <span className="setup-says">
-              {spill
-                ? 'standing by, takes over only when your machine is full'
-                : 'not connected — add a key in Settings to handle overflow'}
+              {providers === null ? (
+                'checking…'
+              ) : enabled.length === 0 ? (
+                'not connected — add a key in Settings to handle overflow'
+              ) : providerModels > 0 ? (
+                `connected — serving ${providerModels} ${providerModels === 1 ? 'model' : 'models'}`
+              ) : (
+                <>
+                  connected, but no model is switched on yet — choose one on{' '}
+                  <RouteLink to={{ dest: 'models' }}>Models</RouteLink>
+                </>
+              )}
             </span>
           </div>
         )}
       </div>
 
-      <button className="btn primary" onClick={onFinish}>
+      <button type="button" className="btn primary" onClick={onFinish}>
         Open the dashboard
       </button>
+    </div>
+  )
+}
+
+/** An in-app link: a real `<a href>` (a new tab works) that navigates in place
+ *  on a plain click. */
+function RouteLink({ to, children }: { to: Partial<Route>; children: ReactNode }) {
+  const { linkTo, navigate } = useRouter()
+  return (
+    <a
+      href={linkTo(to)}
+      onClick={(e) => {
+        if (!plainClick(e)) return
+        e.preventDefault()
+        navigate(to)
+      }}
+    >
+      {children}
+    </a>
+  )
+}
+
+/** One request through `/api/chat/completions`, from the done screen, so the
+ *  first thing somebody sees work is a reply -- and the row it left behind. */
+function TestRequest({ model, served }: { model: string; served: ServedModel[] }) {
+  const { backend } = useBackend()
+  const [pick, setPick] = useState(model)
+  const [prompt, setPrompt] = useState(TEST_PROMPT)
+  const [reply, setReply] = useState('')
+  const [requestId, setRequestId] = useState<string | null>(null)
+  const [meta, setMeta] = useState<ChatTurnMeta | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const abort = useRef<AbortController | null>(null)
+
+  useEffect(() => () => abort.current?.abort(), [])
+
+  // Chat models only: a speech or embedding row would refuse a chat body.
+  const options = served.filter((m) => (m.modality ?? 'text') === 'text').map((m) => m.id)
+  if (!options.includes(pick)) options.unshift(pick)
+
+  const send = async () => {
+    const ac = new AbortController()
+    abort.current = ac
+    setBusy(true)
+    setReply('')
+    setRequestId(null)
+    setMeta(null)
+    setError(null)
+    try {
+      const m = await backend.chatStream({
+        model: pick,
+        messages: [{ role: 'user', content: prompt }],
+        onDelta: (text) => setReply((r) => r + text),
+        // The id lands with the headers, so a request that goes on to fail
+        // still names the row that recorded it.
+        onOpen: (id) => setRequestId(id),
+        signal: ac.signal,
+      })
+      setMeta(m)
+      if (m.requestId) setRequestId(m.requestId)
+    } catch (err) {
+      // Verbatim: the gateway's refusal names what went wrong.
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 'var(--space-24)' }}>
+      <p className="label" style={{ marginBottom: 'var(--space-8)' }}>
+        Send a test request
+      </p>
+      <form
+        className="setup-row"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (!busy) void send()
+        }}
+      >
+        <select aria-label="Model" value={pick} onChange={(e) => setPick(e.target.value)}>
+          {options.map((id) => (
+            <option key={id} value={id}>
+              {id}
+            </option>
+          ))}
+        </select>
+        <input
+          aria-label="Message"
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          style={{ flex: 1 }}
+        />
+        <button type="submit" className="btn primary" disabled={busy || !prompt.trim()}>
+          Send
+        </button>
+      </form>
+      {error && <p className="setup-warn setup-fault">{error}</p>}
+      {reply && <p className="setup-reply">{reply}</p>}
+      {requestId && !busy && (
+        <p className="setup-note mono">
+          {[
+            requestId,
+            meta?.ttftMs != null ? `ttft ${Math.round(meta.ttftMs)} ms` : null,
+            meta?.elapsedMs != null ? `${(meta.elapsedMs / 1000).toFixed(1)} s` : null,
+          ]
+            .filter(Boolean)
+            .join(' · ')}
+          {' · '}
+          <RouteLink to={{ dest: 'usage', sub: 'requests', request: requestId }}>See this request</RouteLink>
+        </p>
+      )}
     </div>
   )
 }

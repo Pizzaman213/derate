@@ -135,9 +135,9 @@ reclaim downloaded weights. Without it the node reports no model cache and
 nothing breaks; it can only no longer see or delete what the runtime downloaded.
 
 One thing to know before you put this on a shared network: everything on `/api`
-needs an admin session and everything on `/v1` a `drt_` key, but the first
-admin can only be created from the coordinator itself (see
-[the first visit](first-run.md)), so do that before you leave the machine.
+needs an admin session and everything on `/v1` a `drt_` key, but until the first
+admin exists, anyone who can reach the coordinator can create it (see
+[the first visit](first-run.md)), so do that first.
 
 ## 3. Machine two
 

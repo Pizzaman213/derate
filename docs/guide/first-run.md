@@ -10,18 +10,12 @@ the address the installer printed.
 ## Open it
 
 Use the `ui:` line the installer printed — for example `http://192.168.1.10:8080`
-— but **for the very first visit, open it on the coordinator itself**, as
-`http://127.0.0.1:8080`, or from your laptop through a tunnel:
+— from any browser that can reach it. The first visit creates the first admin,
+and that works from any address: `POST /api/setup/admin` is open to every
+client until an admin exists, and answers `410 setup_closed` to everyone after.
 
-```
-ssh -L 8080:127.0.0.1:8080 <coordinator>
-```
-
-then `http://127.0.0.1:8080`. The first admin can only be created from the
-coordinator's loopback address (`POST /api/setup/admin` answers `403`
-`setup_local_only` from anywhere else, and the page shows the tunnel command
-instead of the form), so nobody else on the network can claim a fresh install
-before you do. After the admin exists, any address works.
+That means **whoever reaches a fresh coordinator first can claim it**, so create
+the admin before you put the machine on a network you do not trust.
 
 The redirect to the walkthrough happens once, and only if you landed on the
 dashboard. A person who typed a URL, followed a link or clicked a tab has said
