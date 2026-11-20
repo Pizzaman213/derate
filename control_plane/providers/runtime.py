@@ -15,7 +15,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .config import BACKOFF_MAX_S, BACKOFF_MIN_S, RETRY_AFTER_MAX_S, RETRY_JITTER_S
+from .config import (
+    BACKOFF_MAX_S,
+    BACKOFF_MIN_S,
+    KEY_EXPIRY_WARN_DAYS_DEFAULT,
+    RETRY_AFTER_MAX_S,
+    RETRY_JITTER_S,
+)
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +72,22 @@ class DaySpend:
     metered_requests: int = 0
 
 
+@dataclass(frozen=True)
+class KeyCheck:
+    """What the last key check found. Kept in memory only.
+
+    ``credential`` is a fingerprint of the key that was checked, so a check
+    made with a different key stops counting without any reset code. It is
+    never serialized.
+    """
+
+    state: str  # "ok" | "rejected" | "inconclusive"
+    checked_at: float
+    credential: str | None
+    detail: str | None = None
+    expires_at: float | None = None
+
+
 @dataclass
 class ProviderRuntime:
     """Mutable state for one provider. Persisted only in part; see the store."""
@@ -85,8 +107,16 @@ class ProviderRuntime:
     #: Set when the upstream rejected our credentials, and the one kind of
     #: unhealthy that does NOT expire. A bad key is not transient: retrying it
     #: on a timer burns quota and can get an account locked, so this latches
-    #: until a successful request or an operator edit clears it.
+    #: until a successful request or key check, a sign-in, or a credential
+    #: that differs from the one refused (`rejected_credential`).
     auth_rejected: bool = False
+    #: Fingerprint of the key the upstream refused. The same key never
+    #: releases the latch; a different one does. In memory only.
+    rejected_credential: str | None = None
+    #: The last key check, in memory only. See `KeyCheck`.
+    key_check: KeyCheck | None = None
+    #: Days ahead of a reported key expiry to warn. Persisted by the store.
+    key_expiry_warn_days: int = KEY_EXPIRY_WARN_DAYS_DEFAULT
     daily_budget_usd: float | None = None
     aliases: dict[str, str] = field(default_factory=dict)
     spend: dict[str, DaySpend] = field(default_factory=dict)
@@ -160,6 +190,7 @@ class ProviderRuntime:
         self.failure_backoff_until = 0.0
         self.consecutive_failures = 0
         self.auth_rejected = False
+        self.rejected_credential = None
 
     def _back_off(self, now: float) -> float:
         """Exponential wait for a provider we could not reach or that broke.
@@ -234,16 +265,29 @@ class ProviderRuntime:
         )
 
     def note_auth_failure(
-        self, now: float, status: int, api_key_ref: str, message: str, *, sign_in: bool = False
+        self,
+        now: float,
+        status: int,
+        api_key_ref: str,
+        message: str,
+        *,
+        credential: str | None,
+        sign_in: bool = False,
+        from_environment: bool = False,
     ) -> None:
         """401 or 403. Unhealthy immediately; retrying a bad key just burns time.
 
+        ``credential`` is the fingerprint of the refused key: the latch is
+        released by a different one and never by the same one again.
         ``sign_in`` names a credential that came from signing in, where
         ``api_key_ref`` is a label rather than a reference and "check the key
         behind it" would send the operator looking for a key that never existed.
+        ``from_environment`` says the key is read from the coordinator's
+        environment, where a new value needs a restart.
         """
         self.healthy = False
         self.auth_rejected = True
+        self.rejected_credential = credential
         if sign_in:
             self.last_error = f"authentication rejected ({status}) for {api_key_ref}: {message}"
         else:
@@ -251,6 +295,12 @@ class ProviderRuntime:
                 f"authentication rejected ({status}); check the key behind "
                 f"api_key_ref {api_key_ref!r}: {message}"
             )
+            if from_environment:
+                self.last_error += (
+                    "; it is read from the coordinator's environment, so a new value "
+                    "there needs a restart -- or paste a key in Settings → Providers, "
+                    "which takes effect at once"
+                )
         log.warning("provider %s auth rejected (%s)", self.provider_id, status)
 
     def note_transport_error(self, now: float, message: str) -> None:

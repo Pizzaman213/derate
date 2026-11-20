@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import hmac
 import ipaddress
@@ -26,6 +27,7 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -52,6 +54,8 @@ from .config import (
     CONNECT_TIMEOUT_S,
     DISCOVERY_TIMEOUT_S,
     ERROR_BODY_LIMIT_BYTES,
+    KEY_CHECK_STARTUP_DELAY_S,
+    KEY_EXPIRY_WARN_DAYS_MAX,
     OAUTH_FILE,
     PROVIDER_REFRESH_S,
     READ_TIMEOUT_S,
@@ -81,7 +85,7 @@ from .kinds import ChatWire, KindSpec, auth_headers, join_url, native_base, spec
 from .oauth_store import OAuthStore, SignInRecord
 from .responses_adapter import ResponsesToChat, chat_to_responses
 from .anthropic_adapter import MessagesToChat, chat_to_messages
-from .runtime import ProviderRuntime, jittered_delay, parse_retry_after, utc_day
+from .runtime import KeyCheck, ProviderRuntime, jittered_delay, parse_retry_after, utc_day
 from .secrets import (
     MINTED_REF_RE,
     OPERATOR_REF_RE,
@@ -288,6 +292,22 @@ def parse_daily_budget(value) -> float | None:
     return number
 
 
+def parse_key_expiry_warn_days(value) -> int:
+    """Days ahead of a reported key expiry to warn; 0 turns the early warning off.
+
+    A whole number only: a float or a numeric string is refused rather than
+    rounded, so the window on screen is the one that was typed.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not (
+        0 <= value <= KEY_EXPIRY_WARN_DAYS_MAX
+    ):
+        raise ValueError(
+            f"key_expiry_warn_days must be a whole number from 0 to "
+            f"{KEY_EXPIRY_WARN_DAYS_MAX}, got {value!r}"
+        )
+    return value
+
+
 #: Endpoints whose request body has a `stream` field. Everything else -- today
 #: that means /v1/audio/speech and /v1/audio/transcriptions -- must not have one
 #: added, because a strict upstream rejects an unknown field outright.
@@ -398,6 +418,7 @@ class ProviderService:
         now: Callable[[], float] = time.time,
         refresh_interval_s: float = PROVIDER_REFRESH_S,
         events: Any = None,
+        key_check_delay_s: float = KEY_CHECK_STARTUP_DELAY_S,
     ) -> None:
         root = Path(data_path) if data_path is not None else data_dir()
         # Optional, and degrades: a service constructed without one accounts
@@ -406,6 +427,10 @@ class ProviderService:
         #: provider_id -> the budget sentence last reported, so a CROSSING is
         #: emitted once and a standing condition is not re-emitted per request.
         self._budget_state: dict[str, str | None] = {}
+        #: provider_id -> the key-warning TAG last reported ("rejected",
+        #: "expired", "expiring" or None). The tag, never the sentence: the
+        #: sentence counts down a day at a time and is not a crossing.
+        self._key_warning_state: dict[str, str | None] = {}
         self.redactor = Redactor()
         self.secrets = secrets or SecretStore(root / "secrets.json", redactor=self.redactor)
         # Share one redactor so a value resolved anywhere is scrubbed everywhere.
@@ -433,6 +458,8 @@ class ProviderService:
         self._clients: dict[int, httpx.AsyncClient] = {}
         self._entries: dict[str, _Entry] = {}
         self._refresh_task: asyncio.Task | None = None
+        self._key_check_task: asyncio.Task | None = None
+        self._key_check_delay_s = key_check_delay_s
         self._spend_dirty = False
         self._spend_persisted_at = 0.0
         self._install_redacting_filter()
@@ -582,6 +609,38 @@ class ProviderService:
         ref = self._usable_ref(entry)
         return bool(ref) and self.secrets.has(ref)
 
+    def _credential_fingerprint(self, entry: _Entry) -> str | None:
+        """A sha256 of the key value, or None for a sign-in or an absent key.
+
+        Only the value is hashed, never the reference: moving the same refused
+        key to another name must not release the latch. Held in memory only.
+        """
+        if entry.spec.sign_in:
+            return None
+        ref = self._usable_ref(entry)
+        value = self.secrets.get(ref) if ref else None
+        if value is None:
+            return None
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def _key_from_environment(self, entry: _Entry) -> bool:
+        """Whether the key is read from the coordinator's environment, where a
+        new value takes effect only after a restart."""
+        if entry.spec.sign_in:
+            return False
+        ref = self._usable_ref(entry)
+        return bool(ref) and self.secrets.env_ref(ref) is not None
+
+    def _note_auth_failure(self, entry: _Entry, now: float, status: int, message: str) -> None:
+        """The one way a 401/403 is recorded: latch, remember which key, warn."""
+        entry.runtime.note_auth_failure(
+            now, status, self._credential_label(entry), message,
+            credential=self._credential_fingerprint(entry),
+            sign_in=bool(entry.spec.sign_in),
+            from_environment=self._key_from_environment(entry),
+        )
+        self._check_key_warning(entry)
+
     def _check_key(self, entry: _Entry) -> bool:
         """Resolve the credential. Disable on a miss, re-enable on a return.
 
@@ -590,6 +649,7 @@ class ProviderService:
         """
         if not entry.spec.sign_in and not entry.spec.requires_key and not entry.provider.api_key_ref:
             entry.runtime.clear_missing_key()
+            self._check_key_warning(entry)
             return True
         label = self._credential_label(entry)
         if self._credential_present(entry):
@@ -605,6 +665,20 @@ class ProviderService:
                         entry.provider.provider_id,
                         label,
                     )
+            if (
+                entry.runtime.auth_rejected
+                and not entry.spec.sign_in
+                and self._credential_fingerprint(entry) != entry.runtime.rejected_credential
+            ):
+                # A refused key latches; a DIFFERENT key is the operator's
+                # answer to it, whether pasted (update) or edited into
+                # secrets.json by hand (picked up by refresh).
+                entry.runtime.note_success(self._now())
+                log.info(
+                    "provider %s: credential changed since it was refused; admitting again",
+                    entry.provider.provider_id,
+                )
+            self._check_key_warning(entry)
             return True
         if entry.provider.enabled:
             entry.auto_disabled = True
@@ -617,6 +691,7 @@ class ProviderService:
             entry.provider.provider_id,
             label,
         )
+        self._check_key_warning(entry)
         return False
 
     def _store_key(self, ref: str, value: str) -> None:
@@ -694,6 +769,33 @@ class ProviderService:
         if self.secrets.has(ref):
             return {"key_state": "set", "key_source": "secrets.json"}
         return {"key_state": "missing", "key_source": None}
+
+    def key_health(self, provider_id: str) -> dict:
+        """What the last key check found, and the warning the row shows.
+
+        Never a value. A check made with a different key than the one now
+        resolved does not count, so a fresh paste reads as "not checked yet"
+        rather than inheriting the old key's verdict or expiry.
+        """
+        entry = self._entry(provider_id)
+        check = self._current_key_check(entry)
+        _tag, warning = self._key_warning(entry, self._now())
+        return {
+            "key_check": None if check is None else {
+                "state": check.state,
+                "checked_at": check.checked_at,
+                "detail": check.detail,
+            },
+            "key_expires_at": check.expires_at if check is not None else None,
+            "key_expiry_warn_days": entry.runtime.key_expiry_warn_days,
+            "key_warning": warning,
+        }
+
+    def _current_key_check(self, entry: _Entry) -> KeyCheck | None:
+        check = entry.runtime.key_check
+        if check is None or check.credential != self._credential_fingerprint(entry):
+            return None
+        return check
 
     def sign_in_account(self, provider_id: str) -> str | None:
         """The account a sign-in provider is signed in as, or None.
@@ -775,7 +877,7 @@ class ProviderService:
                 record.saved_at = now
                 self.oauth.put(record)
                 message = "ChatGPT sign-in expired; sign in again from Settings → Providers"
-                entry.runtime.note_auth_failure(now, 401, _SIGN_IN_REF, message, sign_in=True)
+                self._note_auth_failure(entry, now, 401, message)
                 self._check_key(entry)
                 self._persist()
                 log.warning("provider %s: ChatGPT sign-in refused at refresh", provider_id)
@@ -880,7 +982,7 @@ class ProviderService:
                     self.oauth.put(replace(record, needs_reauth=True, access_token="",
                                            refresh_token="", saved_at=self._now()))
                     message = "Claude subscription sign-in expired; sign in again from Settings → Providers"
-                    entry.runtime.note_auth_failure(self._now(), 401, self._credential_label(entry), message, sign_in=True)
+                    self._note_auth_failure(entry, self._now(), 401, message)
                     self._check_key(entry)
                     self._persist()
                     raise self._upstream_error(pid, 401, message)
@@ -1565,7 +1667,8 @@ class ProviderService:
         return f"{base}-{n}"
 
     def update(self, provider_id: str, patch: dict) -> Provider:
-        """Enable, disable, reprioritize, rename, set a budget, set aliases."""
+        """Enable, disable, reprioritize, rename, set a budget, set aliases,
+        set the key-expiry warning window."""
         entry = self._entry(provider_id)
         held = entry.provider.api_key_ref
         self._apply_patch(entry, patch)
@@ -1579,6 +1682,7 @@ class ProviderService:
         # it off by hand stays off.
         if entry.provider.enabled or entry.auto_disabled:
             self._check_key(entry)
+        self._check_key_warning(entry)
         self._persist()
         return self.get(provider_id)
 
@@ -1614,6 +1718,10 @@ class ProviderService:
             entry.runtime.daily_budget_usd = parse_daily_budget(patch["daily_budget_usd"])
             # The other crossing direction: the spend did not move, the cap did.
             self._check_budget(entry)
+        if "key_expiry_warn_days" in patch:
+            entry.runtime.key_expiry_warn_days = parse_key_expiry_warn_days(
+                patch["key_expiry_warn_days"]
+            )
         if "base_url" in patch:
             base_url = str(patch["base_url"]).strip()
             if looks_like_secret(base_url):
@@ -1691,6 +1799,11 @@ class ProviderService:
                 if attempt.provider_id == provider_id:
                     del self._claude_sign_ins[attempt_id]
             self._persist()
+            if self._key_warning_state.pop(provider_id, None) is not None and self._events is not None:
+                try:
+                    self._events.key_warning_cleared(provider_id)
+                except Exception:  # pragma: no cover - reporting may not break removal
+                    log.debug("could not clear a key warning", exc_info=True)
             log.info("removed provider %s", provider_id)
 
     def _apply_aliases(self, entry: _Entry) -> None:
@@ -1968,10 +2081,10 @@ class ProviderService:
         if response.status_code >= 400:
             message = self._error_message(response.status_code, response.content)
             if response.status_code in (401, 403):
-                entry.runtime.note_auth_failure(
-                    now, response.status_code, self._credential_label(entry), message,
-                    sign_in=bool(entry.spec.sign_in),
-                )
+                self._note_auth_failure(entry, now, response.status_code, message)
+                if entry.spec.key_probe_path and entry.spec.key_probe_path == entry.spec.models_path:
+                    # The model list IS this kind's key check.
+                    self._record_key_check(entry, now, "rejected", message)
             else:
                 self._note_refresh_failure(
                     entry, now, f"model list returned {response.status_code}: {message}"
@@ -2003,8 +2116,9 @@ class ProviderService:
                 entry.capture_catalogue_prices()
                 entry.reindex()
                 entry.runtime.last_refreshed = now
-                entry.runtime.healthy = True
-                entry.runtime.last_error = None
+                if not entry.runtime.auth_rejected:
+                    entry.runtime.healthy = True
+                    entry.runtime.last_error = None
                 self._persist()
                 log.info(
                     "provider %s has no models yet; nothing pulled onto it",
@@ -2022,8 +2136,13 @@ class ProviderService:
         self._apply_pin_prices(entry)
         entry.reindex()
         entry.runtime.last_refreshed = now
-        entry.runtime.healthy = True
-        entry.runtime.last_error = None
+        if entry.spec.key_probe_path and entry.spec.key_probe_path == entry.spec.models_path:
+            self._record_key_check(entry, now, "ok", None)
+        # A refused key stays refused: a public model list (OpenRouter's)
+        # answers anyone, so its 200 says nothing about the key.
+        if not entry.runtime.auth_rejected:
+            entry.runtime.healthy = True
+            entry.runtime.last_error = None
         self._persist()
         log.info("provider %s refreshed: %d model(s)", provider_id, len(models))
         return self.get(provider_id)
@@ -2054,10 +2173,7 @@ class ProviderService:
                 if response.status_code != 200:
                     detail = self._error_message(response.status_code, response.content)
                     if response.status_code in (401, 403):
-                        entry.runtime.note_auth_failure(
-                            now, response.status_code, self._credential_label(entry),
-                            detail, sign_in=True,
-                        )
+                        self._note_auth_failure(entry, now, response.status_code, detail)
                     raise self._upstream_error(pid, response.status_code, f"Claude model list returned {response.status_code}: {detail}")
                 payload = _json_object(response.content)
                 data = payload.get("data")
@@ -2096,8 +2212,9 @@ class ProviderService:
         entry.capture_catalogue_prices()
         entry.reindex()
         entry.runtime.last_refreshed = now
-        entry.runtime.healthy = True
-        entry.runtime.last_error = None
+        if not entry.runtime.auth_rejected:
+            entry.runtime.healthy = True
+            entry.runtime.last_error = None
         self._persist()
         return self.get(pid)
 
@@ -2119,8 +2236,111 @@ class ProviderService:
                 continue
             try:
                 await self.refresh_async(provider_id)
+                # A kind whose key check is a separate call runs it here too,
+                # whether or not anything is latched: one GET every cycle is
+                # how a key renewed upstream comes back without a button.
+                if entry.spec.key_probe_path and entry.spec.key_probe_path != entry.spec.models_path:
+                    await self.check_key_async(provider_id)
             except ProviderError as exc:
                 log.warning("refresh of %s failed: %s", provider_id, exc)
+
+    async def check_all_keys_async(self) -> None:
+        """Test every enabled provider's key that has a check. Startup runs it."""
+        for provider_id in list(self._entries):
+            entry = self._entries.get(provider_id)
+            if entry is None or not entry.provider.enabled or not entry.spec.key_probe_path:
+                continue
+            try:
+                await self.check_key_async(provider_id)
+            except ProviderError as exc:
+                log.warning("key check of %s failed: %s", provider_id, exc)
+
+    async def check_key_async(
+        self, provider_id: str, *, client: httpx.AsyncClient | None = None
+    ) -> Provider:
+        """Ask the upstream whether the key works right now ("Test key").
+
+        An authenticated GET (`KindSpec.key_probe_path`). A 401/403 latches
+        exactly as a refused request does; a 2xx releases a latch, which is
+        how a key renewed upstream without changing comes back; anything else
+        is inconclusive and leaves health alone.
+        """
+        entry = self._entry(provider_id)
+        now = self._now()
+        if not entry.spec.key_probe_path or not self._check_key(entry):
+            self._persist()
+            return self.get(provider_id)
+        try:
+            key = self.resolve_key(provider_id)
+        except MissingKeyError:
+            self._check_key(entry)
+            self._persist()
+            return self.get(provider_id)
+        url = join_url(entry.provider.base_url, entry.spec.key_probe_path)
+        headers = auth_headers(entry.spec, key)
+        headers["Accept"] = "application/json"
+        try:
+            response = await (client or self._client()).get(
+                url, headers=headers, timeout=DISCOVERY_TIMEOUT_S
+            )
+        except httpx.HTTPError as exc:
+            self._record_key_check(
+                entry, now, "inconclusive", f"could not reach {url}: {type(exc).__name__}"
+            )
+        else:
+            status = response.status_code
+            if status in (401, 403):
+                message = self._error_message(status, response.content)
+                self._note_auth_failure(entry, now, status, message)
+                self._record_key_check(entry, now, "rejected", message)
+            elif status >= 400:
+                message = self._error_message(status, response.content)
+                self._record_key_check(
+                    entry, now, "inconclusive", f"key check returned {status}: {message}"
+                )
+            else:
+                self._record_key_check(entry, now, "ok", None, self._key_expiry(entry, response))
+        self._persist()
+        return self.get(provider_id)
+
+    def _key_expiry(self, entry: _Entry, response: httpx.Response) -> float | None:
+        """``data.expires_at`` from the key check, as epoch seconds, or None."""
+        if not entry.spec.key_probe_reports_expiry:
+            return None
+        try:
+            data = response.json().get("data")
+        except (ValueError, AttributeError):
+            return None
+        raw = data.get("expires_at") if isinstance(data, dict) else None
+        if raw is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            log.warning(
+                "provider %s: unreadable expires_at %r",
+                entry.provider.provider_id, str(raw)[:40],
+            )
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    def _record_key_check(
+        self,
+        entry: _Entry,
+        now: float,
+        state: str,
+        detail: str | None,
+        expires_at: float | None = None,
+    ) -> None:
+        entry.runtime.key_check = KeyCheck(
+            state, now, self._credential_fingerprint(entry), detail, expires_at
+        )
+        if state == "ok" and entry.runtime.auth_rejected:
+            entry.runtime.note_success(now)
+            log.info("provider %s: key check passed; admitting again", entry.provider.provider_id)
+        self._check_key_warning(entry)
 
     # -- backend routing -----------------------------------------------------
 
@@ -2572,10 +2792,7 @@ class ProviderService:
                         retry_after_s=seconds,
                     )
                 if status in (401, 403):
-                    runtime.note_auth_failure(
-                        now, status, self._credential_label(entry), message,
-                        sign_in=bool(entry.spec.sign_in),
-                    )
+                    self._note_auth_failure(entry, now, status, message)
                     raise UpstreamError(
                         entry.provider.provider_id, status, message,
                         body=self.redactor.scrub(raw.decode("utf-8", "replace")),
@@ -2745,10 +2962,7 @@ class ProviderService:
         if status == 429:
             return runtime.note_rate_limit(now, upstream_id, None, message)
         if status in (401, 403):
-            runtime.note_auth_failure(
-                now, status, self._credential_label(entry), message,
-                sign_in=bool(entry.spec.sign_in),
-            )
+            self._note_auth_failure(entry, now, status, message)
         elif status >= 500:
             runtime.note_server_error(now, status, message)
         return None
@@ -2897,6 +3111,64 @@ class ProviderService:
         except Exception:  # pragma: no cover - reporting may not break serving
             log.debug("could not report a budget crossing", exc_info=True)
 
+    def _key_warning(self, entry: _Entry, now: float) -> tuple[str | None, str | None]:
+        """``(tag, sentence)`` for this provider's key, or ``(None, None)``.
+
+        The only author of the warning text: the provider row, the payload and
+        the sidebar alert all carry this sentence.
+        """
+        runtime = entry.runtime
+        if runtime.auth_rejected:
+            return "rejected", runtime.last_error or "authentication rejected"
+        check = self._current_key_check(entry)
+        if check is None or check.expires_at is None:
+            return None, None
+        ref = entry.provider.api_key_ref
+        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(check.expires_at))
+        remaining = check.expires_at - now
+        if remaining <= 0:
+            return "expired", (
+                f"the key behind {ref!r} expired at {when} UTC; "
+                "replace it in Settings → Providers"
+            )
+        warn_days = runtime.key_expiry_warn_days
+        if warn_days > 0 and remaining <= warn_days * 86400:
+            days = math.ceil(remaining / 86400)
+            return "expiring", (
+                f"the key behind {ref!r} expires at {when} UTC, in {days} "
+                f"day{'' if days == 1 else 's'}; replace it in Settings → Providers "
+                "before then"
+            )
+        return None, None
+
+    def _check_key_warning(self, entry: _Entry) -> None:
+        """Emit when the key warning CHANGES, and only then. Same edge rule as
+        `_check_budget`, compared on the tag because the sentence counts down.
+
+        Clearing before re-raising is deliberate: `AlertBook.open` keeps the
+        severity of a standing alert, so "expiring" turning "expired" would
+        otherwise stay a warning.
+        """
+        if self._events is None:
+            return
+        provider_id = entry.provider.provider_id
+        try:
+            tag, sentence = self._key_warning(entry, self._now())
+            previous = self._key_warning_state.get(provider_id)
+            if tag == previous:
+                return
+            self._key_warning_state[provider_id] = tag
+            if previous is not None:
+                self._events.key_warning_cleared(provider_id)
+            if tag is not None:
+                self._events.key_warning(
+                    provider_id,
+                    detail=sentence,
+                    severity="fault" if tag in ("rejected", "expired") else "warn",
+                )
+        except Exception:  # pragma: no cover - reporting may not break serving
+            log.debug("could not report a key warning", exc_info=True)
+
     def _record_usage(
         self,
         entry: _Entry,
@@ -2958,9 +3230,25 @@ class ProviderService:
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
-        """Begin the periodic model refresh. Safe to call twice."""
+        """Begin the periodic model refresh and the startup key check. Safe to call twice."""
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(self._refresh_loop())
+        if self._key_check_task is None or self._key_check_task.done():
+            self._key_check_task = asyncio.create_task(self._startup_key_check())
+
+    async def _startup_key_check(self) -> None:
+        """Test every key once, shortly after startup.
+
+        The delay is why a coordinator opened and closed again at once (every
+        gateway test) sends nothing upstream.
+        """
+        try:
+            await asyncio.sleep(self._key_check_delay_s)
+            await self.check_all_keys_async()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - a key check must never break startup
+            log.exception("startup key check failed")
 
     async def _refresh_loop(self) -> None:
         while True:
@@ -2982,6 +3270,13 @@ class ProviderService:
             except (asyncio.CancelledError, Exception):
                 pass
             self._refresh_task = None
+        if self._key_check_task is not None:
+            self._key_check_task.cancel()
+            try:
+                await self._key_check_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._key_check_task = None
         for client in list(self._clients.values()):
             if not client.is_closed:
                 await client.aclose()

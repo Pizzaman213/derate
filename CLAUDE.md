@@ -948,6 +948,32 @@ already do.
 
 Dont commit to git or ask unless I ask`s
 
+## Pull requests
+
+**A PR that changes the UI carries pictures of it.** Anything under `ui/`
+that renders differently -- a new control, a changed screen, a new state --
+gets one image per changed screen or state in the PR description before it is
+merged, taken from a running build of THIS branch (a throwaway coordinator on
+18xxx, never the live :8088). Crop or navigate to the part that changed; a
+full-page shot of the dashboard for a change in Settings → Providers shows the
+reviewer nothing. Show each state the change adds (an error row, a warning, a
+disabled row), not only the happy one. `npm run screens` captures every
+destination; for a pane or state it does not reach, drive Playwright the way
+`src/shell/screens.check.mjs` does.
+
+Attach them with
+
+```bash
+.github/scripts/pr_screens.sh <pr-number> shot1.png shot2.png
+```
+
+which commits the images to the orphan `pr-screens` branch -- never the PR's
+own branch, so merging carries no binaries into `dev` -- and replaces the
+`Screenshots` section of the PR description with SHA-pinned links. Re-run it
+after a UI change to the branch; it replaces the section rather than adding
+another. A PR with no UI change says `No UI change.` in that section
+(`.github/pull_request_template.md`).
+
 ## Design pack
 
 The design pack -- tokens, icons, component registry, specs, UI guardrail

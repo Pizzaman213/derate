@@ -699,11 +699,14 @@ def provider_payload(
     behaves exactly like a port that does not account: the nine spend keys
     are all ``None``, never ``0``.
 
-    *key* is this provider's ``key_status()`` -- whether its reference
-    resolves and which of the environment and secrets.json answered. State and
-    provenance only; it carries no key material and could not, since neither
-    field is ever a value. Absent leaves both ``None``, which reads as "this
-    port cannot say", not as "there is no key".
+    *key* is this provider's ``key_status()`` merged with its ``key_health()``
+    -- whether its reference resolves, which of the environment and
+    secrets.json answered, what the last key check found (``key_check``:
+    state, time, detail), the expiry the upstream reported, the warning
+    window, and the one warning sentence the row and the sidebar alert share.
+    None of it is key material and none of it could be. Absent leaves every
+    field ``None``, which reads as "this port cannot say", not as "there is no
+    key".
 
     *sign_in_account* is the account a sign-in provider is signed in as -- an
     email address, not a credential -- and ``None`` for every key-based kind.
@@ -740,6 +743,10 @@ def provider_payload(
     # only one of them survives a round trip through JSON.
     payload["key_state"] = (key or {}).get("key_state")
     payload["key_source"] = (key or {}).get("key_source")
+    payload["key_check"] = (key or {}).get("key_check")
+    payload["key_expires_at"] = (key or {}).get("key_expires_at")
+    payload["key_expiry_warn_days"] = (key or {}).get("key_expiry_warn_days")
+    payload["key_warning"] = (key or {}).get("key_warning")
     payload["sign_in_account"] = sign_in_account
     return payload
 

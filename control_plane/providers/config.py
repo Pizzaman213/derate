@@ -69,6 +69,15 @@ REAUTH_ERROR_CODES = frozenset(
 # Model lists refresh on add, on demand, and on this timer.
 PROVIDER_REFRESH_S = 6 * 3600
 
+# OpenRouter reports when a key expires; the row warns this many days ahead
+# unless the operator sets a different window on the provider. 0 turns the
+# early warning off (an expired or refused key still warns).
+KEY_EXPIRY_WARN_DAYS_DEFAULT = 7
+KEY_EXPIRY_WARN_DAYS_MAX = 365
+# The startup key check waits this long so a coordinator that is opened and
+# closed again (every gateway test) sends nothing upstream.
+KEY_CHECK_STARTUP_DELAY_S = 30.0
+
 # How often the background scan re-probes the roster for a runtime nobody
 # has adopted yet (control_plane/providers/autoadopt.py). Short enough that
 # "auto" feels immediate -- detect_runtime's own timeout is 1.5s per probe

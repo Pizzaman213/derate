@@ -2821,26 +2821,36 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return provider
 
     def _key_state(provider_id: str) -> dict | None:
-        """Whether this provider's credential resolves, and from where.
+        """Whether this provider's credential resolves, from where, and what
+        the last key check found.
 
         Optional like every other port method reached through ``getattr`` in
-        this module: a store that never grew ``key_status`` leaves the two
-        fields null, and the listing they ride on still answers. Null is not
-        "no key" -- the UI says so in as many words, because a Settings screen
-        that reports a missing key on a working provider is worse than one
-        that admits it does not know.
+        this module: a store that never grew ``key_status`` or ``key_health``
+        leaves those fields null, and the listing they ride on still answers.
+        Null is not "no key" -- the UI says so in as many words, because a
+        Settings screen that reports a missing key on a working provider is
+        worse than one that admits it does not know.
 
         Nothing here is key material and nothing here could be: the result is
-        a state word and the name of a place, never a value.
+        a state word, the name of a place, a check verdict and an expiry time,
+        never a value.
         """
         status = getattr(ctx.deps.providers, "key_status", None)
-        if not callable(status):
+        health = getattr(ctx.deps.providers, "key_health", None)
+        if not callable(status) and not callable(health):
             return None
-        try:
-            return status(provider_id)
-        except Exception:
-            log.exception("provider key status failed")
-            return None
+        result: dict = {}
+        if callable(status):
+            try:
+                result.update(status(provider_id))
+            except Exception:
+                log.exception("provider key status failed")
+        if callable(health):
+            try:
+                result.update(health(provider_id))
+            except Exception:
+                log.exception("provider key health failed")
+        return result
 
     def _sign_in_account(provider_id: str) -> str | None:
         """The account a sign-in provider is signed in as. Optional like ``_key_state``."""
@@ -3017,6 +3027,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, f"Could not update provider. {errors.detail(exc, _redactor())}",
                 "invalid_request_error", "provider_update_failed",
             )
+        if "api_key" in patch or "api_key_ref" in patch:
+            # Say whether the new key works in the same answer, rather than
+            # leaving the row on "not checked yet" until somebody presses.
+            check_key_async = getattr(ctx.deps.providers, "check_key_async", None)
+            if callable(check_key_async):
+                try:
+                    provider = await check_key_async(provider_id)
+                except Exception:
+                    log.exception("key check after key change failed")
         ctx.router.rebuild(force_scores=True)
         audit_request(
             request, AuditAction.PROVIDER_UPDATED, "provider", provider_id,
@@ -3618,6 +3637,37 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 502, f"Refresh failed. {errors.detail(exc, _redactor())}",
                 "server_error", "refresh_failed",
+            )
+        ctx.router.rebuild(force_scores=True)
+        spend = ui_detail.provider_spend(ctx.deps.providers)
+        return JSONResponse(
+            serialize.provider_payload(
+                _served_view(ctx.deps.providers, provider),
+                spend.get(provider.provider_id),
+                _key_state(provider.provider_id),
+                sign_in_account=_sign_in_account(provider.provider_id),
+                pins=_backend_pins(provider.provider_id),
+            )
+        )
+
+    @router.post("/api/providers/{provider_id}/key-check")
+    async def check_provider_key(provider_id: str) -> Response:
+        """Ask the upstream whether this provider's key works right now."""
+        check = getattr(ctx.deps.providers, "check_key_async", None)
+        if not callable(check):
+            return _not_implemented("Provider key check", "provider store")
+        try:
+            provider = await check(provider_id)
+        except UnknownProviderError:
+            return errors.error_response(
+                404, f"No provider '{provider_id}'.",
+                "invalid_request_error", "provider_not_found",
+            )
+        except Exception as exc:
+            log.exception("provider key check failed")
+            return errors.error_response(
+                502, f"Key check failed. {errors.detail(exc, _redactor())}",
+                "server_error", "key_check_failed",
             )
         ctx.router.rebuild(force_scores=True)
         spend = ui_detail.provider_spend(ctx.deps.providers)

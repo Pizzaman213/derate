@@ -21,7 +21,12 @@ from pathlib import Path
 
 from ..contracts.modality import Modality
 from ..contracts.providers import Provider, ProviderKind, ProviderModel
-from .config import PROVIDERS_FILE, data_dir
+from .config import (
+    KEY_EXPIRY_WARN_DAYS_DEFAULT,
+    KEY_EXPIRY_WARN_DAYS_MAX,
+    PROVIDERS_FILE,
+    data_dir,
+)
 from .runtime import DaySpend, ProviderRuntime
 from .secrets import Redactor
 
@@ -103,6 +108,16 @@ def _pin_prices(value: object) -> dict[str, tuple[float | None, float | None]]:
     return out
 
 
+def _warn_days(value: object) -> int:
+    """The persisted expiry-warning window, or the default for a record that
+    predates it or holds something out of range."""
+    if isinstance(value, int) and not isinstance(value, bool) and (
+        0 <= value <= KEY_EXPIRY_WARN_DAYS_MAX
+    ):
+        return value
+    return KEY_EXPIRY_WARN_DAYS_DEFAULT
+
+
 def provider_to_dict(provider: Provider, runtime: ProviderRuntime | None = None) -> dict:
     """The persisted shape. ``api_key_ref`` is a name; there is no key field at all."""
     record = {
@@ -120,6 +135,7 @@ def provider_to_dict(provider: Provider, runtime: ProviderRuntime | None = None)
     }
     if runtime is not None:
         record["daily_budget_usd"] = runtime.daily_budget_usd
+        record["key_expiry_warn_days"] = runtime.key_expiry_warn_days
         record["aliases"] = dict(runtime.aliases)
         record["backend_pins"] = dict(runtime.backend_pins)
         record["backend_fallbacks"] = dict(runtime.backend_fallbacks)
@@ -170,6 +186,7 @@ def provider_from_dict(raw: dict) -> tuple[Provider, ProviderRuntime]:
         last_error=None,
         last_refreshed=provider.last_refreshed,
         daily_budget_usd=_opt_float(raw.get("daily_budget_usd")),
+        key_expiry_warn_days=_warn_days(raw.get("key_expiry_warn_days")),
         aliases={str(k): str(v) for k, v in (raw.get("aliases") or {}).items()},
         enabled_models=_enabled_models(raw.get("enabled_models")),
         backend_pins={str(k): str(v) for k, v in (raw.get("backend_pins") or {}).items()},

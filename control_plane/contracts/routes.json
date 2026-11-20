@@ -573,6 +573,12 @@
     },
     {
       "methods": [
+        "POST"
+      ],
+      "path": "/api/providers/{provider_id}/key-check"
+    },
+    {
+      "methods": [
         "GET"
       ],
       "path": "/api/providers/{provider_id}/logo"

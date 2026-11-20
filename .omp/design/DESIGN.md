@@ -335,6 +335,25 @@ auth, budget and transport failures remain on the provider row.
 Disclosure supports keyboard toggle and `aria-expanded`. Long model IDs and
 errors wrap without clipping. Uses existing semantic tokens and table styles.
 
+**Key check:** a key-based row whose kind reports `supports_key_check` carries
+one line under the key state -- `key not checked yet`, `key check passed 3m
+ago` (`--live`), `key check rejected …` (`--fault`) or `key check inconclusive
+…: <detail>` (`--ink-muted`) -- and a **Test key** button first in the actions
+cell while a key is set. `key_warning` (refused, expired, or inside the warn
+window) renders verbatim in `--warn` behind a decorative 12px
+`alert-triangle`; the sidebar alert carries the same sentence. A key read from
+the coordinator's environment adds a muted note that a new value there needs a
+restart and that Replace key takes effect at once. When the upstream reports
+an expiry (`key_expires_at`, OpenRouter), a `warn [n] days before expiry`
+number input (0–365, width `--space-66`) patches `key_expiry_warn_days` on
+blur. A refused Test key or warn-days value shows on its own row in `--fault`,
+pre-wrapped.
+
+**Enable / Disable:** the first action on every row toggles `enabled` with
+`PATCH {enabled}` (`aria-pressed` carries the state). A disabled provider's
+State cell reads `disabled` in `--ink-muted`; its key, models and settings are
+kept, and enabling it re-resolves the key on the server.
+
 ### RateLimitsSub
 
 `tabs/requests/RateLimitsSub.tsx`: Usage's Rate limits tab. `?dep=` selects

@@ -60,11 +60,14 @@ from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
-#: The three kinds. Not an enum: these travel as strings on a JSON payload and
+#: The four kinds. Not an enum: these travel as strings on a JSON payload and
 #: `contracts/` is frozen, so a string here is one fact rather than two.
 NODE_DOWN = "node_down"
 CAP_REACHED = "cap_reached"
 OOM = "oom"
+#: A provider key that was refused, has expired or is about to. Edge-triggered
+#: by `ProviderService._check_key_warning`, which also picks the severity.
+KEY_WARNING = "key_warning"
 
 #: Deliberately the UI's own `Lamp` signal vocabulary rather than a new one --
 #: a severity that did not map onto something drawable would be a third
@@ -317,11 +320,34 @@ class AlertBook:
             log.debug("alert tap failed on a registry event", exc_info=True)
 
     def on_gateway_event(self, event: Any) -> None:
-        """The gateway bus: `budget_reached` opens, `budget_cleared` closes."""
+        """The gateway bus: `budget_reached` opens, `budget_cleared` closes;
+        `key_warning` opens, `key_warning_cleared` closes.
+
+        A key warning carries its own severity (a refused or expired key is a
+        fault, one about to expire a warning). `open` keeps the severity of an
+        alert already standing, so the service clears before it re-raises at a
+        different one.
+        """
         try:
             kind = _get(event, "type") or _get(event, "kind")
             provider_id = _get(event, "provider_id")
             if not provider_id:
+                return
+            if kind == "key_warning":
+                self.open(
+                    Alert(
+                        key=f"{KEY_WARNING}:{provider_id}",
+                        kind=KEY_WARNING,
+                        severity=_get(event, "severity") or SEVERITY_WARN,
+                        subject=provider_id,
+                        subject_kind="provider",
+                        detail=_get(event, "detail") or "provider key needs attention",
+                        since=_get(event, "ts"),
+                    )
+                )
+                return
+            if kind == "key_warning_cleared":
+                self.close(f"{KEY_WARNING}:{provider_id}")
                 return
             day = _get(event, "day") or utc_day(self._clock())
             key = "%s:%s:%s" % (CAP_REACHED, provider_id, day)

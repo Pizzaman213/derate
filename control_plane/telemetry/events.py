@@ -47,6 +47,10 @@ ROUTING_SOURCE_FAILED = "routing_source_failed"
 #: nothing could say when a cap was reached -- only that it currently was.
 BUDGET_REACHED = "budget_reached"
 BUDGET_CLEARED = "budget_cleared"
+#: A provider key refused, expired or about to expire, and that condition
+#: ending. Edge-triggered by `ProviderService._check_key_warning`.
+KEY_WARNING = "key_warning"
+KEY_WARNING_CLEARED = "key_warning_cleared"
 STARTUP_DEGRADED = "startup_degraded"
 RESTART_ATTEMPTED = "restart_attempted"
 RESTART_EXHAUSTED = "restart_exhausted"
@@ -136,6 +140,14 @@ class GatewayEvents:
 
     def budget_cleared(self, provider_id: str, day: str) -> None:
         self.emit(BUDGET_CLEARED, provider_id=provider_id, day=day)
+
+    def key_warning(self, provider_id: str, detail: str, severity: str) -> None:
+        """A provider key needs attention. `detail` is the service's own
+        sentence, the same one the provider row shows."""
+        self.emit(KEY_WARNING, provider_id=provider_id, detail=detail, severity=severity)
+
+    def key_warning_cleared(self, provider_id: str) -> None:
+        self.emit(KEY_WARNING_CLEARED, provider_id=provider_id)
 
     def retry_refused(self, served_name: str, snapshot: dict[str, Any]) -> None:
         self.emit(RETRY_REFUSED, served_name=served_name, **snapshot)
