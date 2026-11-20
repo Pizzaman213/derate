@@ -57,6 +57,13 @@ def load_config(name: str) -> dict:
     return json.loads((DATA / f"{name}.config.json").read_text())
 
 
+@pytest.fixture(autouse=True)
+def _model_dirs(tmp_path_factory, monkeypatch):
+    """Local models are confined to allowed roots (R3); pytest's temp tree is
+    one here, so the local-directory and local-GGUF tests read their fixtures."""
+    monkeypatch.setenv("DERATE_MODEL_DIRS", str(tmp_path_factory.getbasetemp()))
+
+
 @pytest.fixture
 def resolver(tmp_path) -> ModelResolver:
     """A resolver with a cache of its own, so tests never share state."""
@@ -2302,3 +2309,15 @@ class TestHeaderProbeBudget:
         probed = self._count_probes(monkeypatch, resolver)
         resolver._gguf_file_variants("acme/Widget-7B-GGUF")
         assert len(probed) == 4
+
+
+def test_a_non_hub_id_is_not_tested_against_the_working_directory(resolver):
+    """R3r: an existing CWD path and a nonsense id get the same answer."""
+    from control_plane.resolver.types import ModelNotFound
+
+    messages = []
+    for model_id in ("tests/unit/conftest.py", "tests/unit/conftest.py/x", "org/x:tag"):
+        with pytest.raises(ModelNotFound) as caught:
+            resolver.resolve_full(model_id)
+        messages.append(str(caught.value))
+    assert len(set(messages)) == 1, messages

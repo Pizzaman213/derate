@@ -34,20 +34,46 @@ log = logging.getLogger(__name__)
 SUBPROTOCOL = "derate-shell"
 
 
+#: Ceiling, in seconds, of the per-peer pause before a wrong key is answered.
+KEY_FAILURE_MAX_DELAY_S = 8.0
+
+
 def install(app, node_agent) -> None:
     """Register the route on the agent app."""
+
+    # peer -> consecutive key failures. A wrong key is answered after
+    # min(2**n, 8) s, so guessing the key costs time per attempt; a right key
+    # clears it. Bounded like the agent's own refusal fold.
+    failures: dict[str, int] = {}
 
     @app.websocket("/agent/shell")
     async def agent_shell(websocket: WebSocket) -> None:
         key = subprotocol_key(websocket)
+        peer = websocket.client.host if websocket.client else "-"
+        origin = websocket.headers.get("origin")
+        key_failed = False
         try:
-            shell.check_origin(websocket.headers.get("origin"))
-            shell.check_key(key)
+            shell.check_origin(origin)
+            try:
+                shell.check_key(key)
+            except shell.ShellRefused:
+                key_failed = True
+                raise
+            failures.pop(peer, None)
             if not node_agent.claim_shell():
                 raise shell.ShellRefused(
                     1008, "A shell session is already open on this node."
                 )
         except shell.ShellRefused as exc:
+            # Every refusal is recorded with the peer, as on every other
+            # credentialed agent route (R-3): this one is a root prompt.
+            node_agent.note_refused(peer, "WS", "/agent/shell")
+            if key_failed:
+                n = failures.get(peer, 0)
+                if len(failures) >= 1024:
+                    failures.clear()
+                failures[peer] = n + 1
+                await asyncio.sleep(min(2.0**n, KEY_FAILURE_MAX_DELAY_S))
             # Refused during the handshake, before accept: Starlette turns a
             # close-before-accept into an HTTP status, which a caller can act
             # on. A socket that opens and immediately shuts cannot say why.
@@ -60,7 +86,9 @@ def install(app, node_agent) -> None:
         session = None
         try:
             session = shell.open_session()
-            node_agent.note_shell_opened(host=shell.host_reachable())
+            node_agent.note_shell_opened(
+                host=shell.host_reachable(), peer=peer, origin=origin
+            )
             await _run(websocket, session)
         except WebSocketDisconnect:
             pass

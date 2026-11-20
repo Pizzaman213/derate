@@ -19,6 +19,19 @@ class JoinRejected(RegistryError):
         self.reason = reason
 
 
+class MembersNotMigrated(RegistryError):
+    """The cluster token cannot be rotated while a member still depends on it.
+
+    A member that has not re-joined since per-member agent tokens existed (or
+    was admitted and has not collected its token yet) presents the cluster
+    token on its next join; rotating it now would lock that member out.
+    """
+
+    def __init__(self, node_ids: list[str]) -> None:
+        super().__init__(", ".join(node_ids))
+        self.node_ids = list(node_ids)
+
+
 class BridgeNetworkError(RegistryError):
     """Container is on a bridge network. mDNS cannot work. Fail loudly."""
 

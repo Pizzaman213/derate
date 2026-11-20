@@ -140,6 +140,7 @@ def to_dict(res: Resolution) -> dict[str, Any]:
         "param_breakdown": dict(res.param_breakdown),
         "speculators": [opt.as_dict() for opt in res.speculators],
         "resolved_at": res.resolved_at,
+        "remote_code": res.remote_code,
     }
 
 
@@ -178,6 +179,7 @@ def from_dict(data: dict[str, Any]) -> Resolution:
             SpeculativeOption.from_dict(opt) for opt in data.get("speculators", [])
         ),
         resolved_at=data.get("resolved_at", 0.0),
+        remote_code=bool(data.get("remote_code", False)),
     )
 
 
@@ -280,4 +282,5 @@ def _as_hit(res: Resolution) -> Resolution:
         speculators=tuple(res.speculators),
         resolved_at=res.resolved_at,
         from_cache=True,
+        remote_code=res.remote_code,
     )

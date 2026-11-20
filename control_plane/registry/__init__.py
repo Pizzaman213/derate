@@ -21,6 +21,7 @@ from .enrollment import EnrollmentStore, EnrollmentToken
 from .errors import (
     BridgeNetworkError,
     JoinRejected,
+    MembersNotMigrated,
     NodeNotFound,
     ProbeFailed,
     RegistryError,
@@ -56,6 +57,7 @@ __all__ = [
     "HostMemory",
     "HttpAgentClient",
     "JoinRejected",
+    "MembersNotMigrated",
     "NodeAgent",
     "NodeNotFound",
     "NodeRuntime",

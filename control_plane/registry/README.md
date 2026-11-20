@@ -113,19 +113,54 @@ means nvidia-smi could not be asked, `[]` that the GPU is idle.
 this module imports on a machine with no web framework — a convention with its own
 cost, documented under `shell_route.py`.
 
-The surface is reads — `/agent/profile`, `/agent/telemetry`, `/agent/health`,
-`/agent/journal`, `/agent/processes`, `/agent/storage`, `/agent/models/cache` — plus
-three routes gated on the cluster token, each for its own reason.
+The open surface is two reads — `/agent/profile` and `/agent/health`.
+`registry.probe_remote` and reach call them on nodes that hold no token yet, so
+they must stay open; neither carries `build` unless the caller presents the
+token. Everything else is gated on `X-Derate-Token`, and the token is this node's
+own **agent token**: random, minted by the coordinator when the node becomes a
+member (`Registry._mint_agent_token`), kept in the roster (`registry.json`, 0600)
+on the coordinator and in `cluster.json` (0600) on the worker, and presented only
+to that node (`Registry.agent_token`) — never the cluster token, which admits
+non-members and nothing else. Workers no longer hold the cluster token once they
+have their own, so one compromised worker holds a credential for itself and no
+other machine. A member from before per-member tokens still accepts
+`identity.agent_token(cluster_token, node_id)` until its first re-join hands it
+its own; that derived value opens nothing afterwards.
+`/agent/telemetry`, `/agent/storage` and `/agent/models/cache` are an inventory of
+the machine (capacity, what this product wrote, which models are cached) that no
+other LAN host needs. `GET /agent/journal` is the node's whole log stream, and
+reading after `since` is the ack that lets the node trim below it, so a bare
+caller could both tail the logs and erase every row the coordinator has not
+collected; `Journal.read` clamps `since` to the last sequence number ever written
+so even a token holder cannot acknowledge rows that do not exist yet.
+`GET /agent/processes` is the command line of everything on the GPU.
 `POST /agent/processes/{pid}/kill` changes the machine, and what it may touch is
 bounded in `procs.py` rather than at the route.
 `DELETE /agent/models/cache/{folder}` deletes hundreds of gigabytes, its token
 checked before the folder is looked at so an uncredentialled caller cannot learn
 what is cached from which refusal comes back. `POST /agent/reach` makes *this*
 machine dial an address the caller chooses, so uncredentialled it would be a port
-scanner inside the operator's network. (The module docstring still calls the kill
-"the only mutating route on this surface"; the cache delete arrived later.)
+scanner inside the operator's network. A worker admitted by the UI click holds no
+token, so every gated route answers it 403.
 
-`profile_payload` carries `build`, deliberately not part of `NodeProfile` — the
+The token is compared as bytes (`hmac.compare_digest`), so a non-ASCII header is
+a 403, not a 500. A refusal is a `WARNING "agent refused <method> <path> from
+<peer>"` and an `agent_refused` journal event, both at most once a minute per
+peer with the count of the minute before, so a flood can fill neither the
+journal's size cap nor `node.log`; `/agent/shell` refusals are recorded the same
+way (method `WS`). Every kill and cache delete is journalled too
+(`process_killed`, `cache_deleted`, with the peer that asked), as is a journal
+read whose cursor ran past anything this node wrote (`journal_cursor_clamped`), a
+token-gated read from any address but the coordinator this node joined
+(`agent_read`, once a minute per peer and path; `NodeAgent.set_coordinator`), and
+an opened shell (`shell_opened`, with `peer` and `origin`): they reach the
+coordinator's `archive.events` under source `agent` or `shell`, which
+`python3 -m control_plane.forensics` reads. `/agent/processes` shows each
+command line with the value of `--api-key` replaced by `***`.
+The app serves no `/openapi.json`: the schema would say whether `/agent/shell` is
+installed.
+
+`profile_payload` carries `build` for a token holder, deliberately not part of `NodeProfile` — the
 profile is hardware and the software reading it is a different fact. A node whose
 image predates a probe improvement reports hardware its coordinator would have
 identified, and until this field existed the two were indistinguishable from
@@ -147,13 +182,15 @@ route exists before a key does. Load the persisted node id, probe the hardware,
 recover credentials, then resolve the role — the profile is what we advertise and
 what we join with.
 
-`recover_credentials` reads back the permanent token a worker adopted earlier.
-Nothing ever did, which made `adopt_cluster_token`'s write dead: a container
-restarted with a spent `ej_` enrollment token still in its environment presented
-the spent one and was 403'd out of a cluster it was already a member of, and a
-native install restarted without the variable joined tokenless and then refused
-every credentialled request. It uses `read_identity`, never
-`load_or_create_identity` — a worker must not mint a cluster identity.
+`recover_credentials` reads back the agent token a worker adopted earlier
+(`config.agent_token`), and — on a worker from before per-member tokens — the
+cluster token it kept, as `token` when the environment names none, which is what
+the coordinator's one-time migration accepts. A member re-joins on its own token
+and nothing else, so a worker that did not read it back would lock itself out.
+It uses `read_identity`, never `load_or_create_identity` — a worker must not
+mint a cluster identity. `worker_agent_credential` is what the worker's agent
+accepts: the token just delivered, else the held one, else (unmigrated only) the
+value derived from the cluster token.
 
 `NodeRuntime` holds what the container is running. `_announce_loop` runs in both
 roles and only ever re-joins, so it adds no election. `_announce_trigger` fires on
@@ -180,15 +217,99 @@ first boot the join races this node's own agent app, so the coordinator's
 probe-back lands before `/agent/*` is listening and even a perfectly configured
 node 403s once.
 
-`join_with_held_credentials` presents both credentials this machine may hold and
-lets the far end settle it. `install.sh` bakes the enrollment token into the
-container environment permanently, so after the first hour it is the wrong one —
-but a *fresh* one carried here to re-home the machine is the right one and the
-stored token is the wrong cluster's. Nothing on this side can tell those apart, so
-the deliberate one is tried first. `rejoin_until_admitted` backs off
+`join_with_held_credentials` presents this member's own agent token first — the
+only credential a member's re-join is accepted on — and falls back to
+`DERATE_TOKEN`: a *fresh* enrollment token carried here to re-home the machine
+onto another cluster, or a pre-upgrade cluster token for the one-time migration.
+`adopt_credentials` persists the `agent_token` of an acked member answer and
+rewrites `cluster.json` as `{cluster_id, agent_token}`
+(`identity.save_agent_credential`: mkstemp, fsync, replace, 0600), dropping any
+cluster token a pre-upgrade worker kept there. `rejoin_until_admitted` backs off
 `REJOIN_INTERVAL_S` (15 s, jittered by 5 s) on "not yet" and
 `REJOIN_WRONG_TOKEN_INTERVAL_S` (60 s) on a rejection — much more likely a foreign
 cluster on the subnet than a typo about to fix itself.
+
+No token ever crosses the wire. `post_join` sends
+`{"profile", "agent_url", "proof": {"nonce", "ts", "mac"}}` where `mac` is
+HMAC-SHA256 keyed by the token over `node_id\nagent_url\nnonce\nts`
+(`joinproof.py`); a tokenless join omits `proof`. The coordinator refuses — with
+the same `invalid cluster token` sentence — a proof older or newer than
+`JOIN_PROOF_SKEW_S` (120 s), a nonce it has already seen, or a MAC that matches
+neither the cluster token nor any live enrollment token for *that* node id and
+agent URL. Whoever answers the POST, a rogue mDNS "coordinator" included, gets
+nothing it can replay. `resolve_role` and `reannounce` also skip any
+coordinator whose advertised `cluster_id` is not ours when we know ours, and a
+browse keeps the *first* record per `node_id` so a later advertiser cannot
+displace one already seen.
+
+The answer has to prove itself the same way. Every response to a verified proof
+carries `ack` = `joinproof.ack(token, node_id, agent_url, nonce, ts, body)` — an
+HMAC under the token the proof matched, over `"ack\n" + node_id`, the joiner's
+own nonce and time, and the canonical JSON of every other field of the response
+(sorted keys) — and a member's response carries its `agent_token`. Because the
+ack covers the body, an on-path host cannot swap the `agent_token` (or any
+field) inside an acknowledged answer. No response carries the cluster token.
+`post_join` checks it against the proof it sent before returning anything: a
+proof-bearing join answered without a valid `ack` logs `ignoring a join response
+without a valid ack` and raises `JoinRejected`, so boot, rejoin and re-announce
+all treat an impostor as "not this one" and nothing it sent — an agent token, a
+coordinator address, a cluster id — is adopted. A tokenless join
+has nothing to prove with, so its response is stripped of every credential: a
+tokenless join adopts nothing, ever. This is what stops a rogue advertiser
+answered during a routine coordinator restart from writing its own token into
+`cluster.json`.
+
+The coordinator binds a join to the machine that sent it. `POST /api/nodes/join`
+refuses an `agent_url` whose host is not a peer address (`net.is_peer_address`:
+no loopback, link-local/metadata, multicast or unspecified — `agent_url is not a
+peer address`) or is not the requesting address (`agent_url must name the
+requesting address`); a loopback requester is a worker on this very machine and
+may name any address the machine holds. `handle_join` then refuses a
+credentialed join whose probed `profile.address` is not that host (`profile
+address does not match the requester`) and any join naming the coordinator's own
+id (`the coordinator's own row is not joinable`), logs every member whose
+`agent_url` or address moves, counts every tokenless probe against
+`MAX_JOIN_CANDIDATES`, and probes back on its own eight-connection pool
+(`JOIN_PROBE_CONNECTIONS`, `JOIN_PROBE_TIMEOUT_S`) so a burst of joins naming dead
+addresses cannot starve the heartbeats. Each join that changes something is a
+`node_joined` audit row (actor = the node id, `before.agent_url` when one was on
+file, `after` = status, agent URL, address, credential source — `none`,
+`cluster_token`, `enrollment`, `agent_token` or `migration` — enrollment token
+id); a waiting candidate's routine re-poll is not.
+
+A **member** re-joins on its own agent token and nothing else: for an id that is
+a member with a delivered token, neither the cluster token nor an enrollment
+token is tried (`node_id is a member: re-join with its own agent token, or remove
+it before re-enrolling`), so one worker cannot move another member's row to
+itself. Two one-shot exceptions, both bound to the host already on file: a member
+from before per-member tokens migrates on the cluster token (source
+`migration`), and a member admitted by a click or a manual add collects its
+minted token on the credential that made it a candidate. Until every member has
+its own token, `POST /api/cluster/token/rotate` (admin, `current_password`)
+answers 409 `members_not_migrated` naming them; afterwards it replaces the
+cluster token, writes `cluster_token_rotated` (`after.members`, never the token)
+and returns `{"rotated": true}` — the new token is never in a response. A
+waiting candidate cannot be displaced by another host claiming its id (`a
+candidate with this name is already waiting from another address`); the
+`node_admitted` row names the admitted record's agent URL, address, source and
+first-seen time; and the open route answers one address
+`JOIN_PER_ADDRESS_PER_MIN` (30) times a minute, then 429 `rate_limited` with
+`Retry-After: 60` and a folded `join_rejected` row (`detail.reason = "rate"`).
+
+Every agent call is bounded as a whole: `HttpAgentClient` streams the body,
+refuses one past `max_bytes` (256 KiB by default; a journal page gets
+`SHIP_MAX_BYTES * 2 + 64 KiB`) and the whole exchange past `timeout * 2`, and
+the health and telemetry rounds and each collector drain wrap every node in
+`asyncio.wait_for`, so a member answering a byte at a time holds nothing up.
+
+A profile's `address` must be an IP literal or a hostname (`net.valid_host`):
+`profile_from_dict` refuses anything else, so the join route answers 400
+`invalid_join_body` and a probe-back that lies is a rejection, and
+`SparkrunAdapter.hosts_for` refuses to launch onto one — it is the last argument
+of an `ssh` command line, where `-oProxyCommand=…` would be code execution. Its
+`node_id` must already be in `probe.slugify_hostname` form and at most
+`NODE_ID_MAX_LEN` (63) characters, or the same `invalid node_id` refusal: an id
+with a `/` is a candidate nobody can dismiss, one with a newline forges a log line.
 
 ## `probe.py`
 
@@ -701,8 +822,9 @@ placed under one of them would be counted as weights and deleted with them.
 **An election, and failover.** First one wins and the role is sticky for the process
 lifetime. A worker whose coordinator has gone waits rather than promoting itself,
 which is why the announce loop only ever re-joins and cannot split a subnet. The
-coordinator is *replaceable* instead, via the cluster token — a different property,
-and the one `identity.banner` tells the operator to preserve.
+coordinator is *replaceable* instead, via its data directory -- `cluster.json` and
+`registry.json`, which holds every member's agent token -- a different property, and
+the one `identity.banner` tells the operator to preserve.
 
 **A periodic re-announcement.** Two triggers only: our profile changed, or nobody
 has polled us in `REANNOUNCE_UNPOLLED_S`. A timer on top of them would be constant

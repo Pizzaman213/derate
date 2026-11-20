@@ -34,7 +34,13 @@ from . import gguf_names, imageprobe, quant_detect, support
 from . import speculators as spec_detect
 from .cache import ShapeCache
 from .config_map import Mapped, map_config, vision_config
-from .hf import HubClient, ModelInfo, count_safetensors_params, safetensors_header
+from .hf import (
+    HubClient,
+    ModelInfo,
+    count_safetensors_params,
+    is_hub_id,
+    safetensors_header,
+)
 from .params import ParamBreakdown, analytic_breakdown, reconcile
 from .types import (
     QuantVariant,
@@ -49,6 +55,66 @@ from .types import (
 )
 
 log = logging.getLogger("resolver.probe")
+
+#: The one error text for a local path that may not be read. It deliberately
+#: does not echo the path: a model id doubles as a filesystem path, and naming
+#: what was or was not found there makes the resolver an existence oracle (R3).
+_LOCAL_REFUSED = (
+    "local models are read only from the HuggingFace cache, the data "
+    "directory or DERATE_MODEL_DIRS"
+)
+
+
+def local_model_roots() -> list[Path]:
+    """Where a local model directory or ``.gguf`` may live: the HF cache, the
+    data directory, and each entry of ``DERATE_MODEL_DIRS`` (colon-separated)."""
+    from control_plane.paths import data_dir
+    from control_plane.registry.modelcache import cache_dir
+
+    roots: list[Path] = []
+    hf = cache_dir()
+    if hf is not None:
+        roots.append(hf)
+    roots.append(data_dir())
+    for entry in os.environ.get("DERATE_MODEL_DIRS", "").split(":"):
+        if entry.strip():
+            roots.append(Path(entry.strip()).expanduser())
+    return [r.resolve() for r in roots]
+
+
+def _local_model_path(model_id: str) -> Path | None:
+    """The confined on-disk path ``model_id`` names, or None when it is a hub id.
+
+    An id that is spelled as a path (absolute, ``~``, ``.``, or a ``.gguf``
+    name) and resolves outside every root raises ``ModelNotFound`` before the
+    filesystem is asked whether it exists. A relative ``owner/name`` that
+    happens to exist under the working directory is treated as a hub id, and
+    any other id is never tested against the working directory at all: that
+    test answered differently for a path that exists, an existence oracle.
+    """
+    candidate = Path(model_id).expanduser()
+    looks_local = model_id.startswith(("/", "~", ".")) or (
+        candidate.suffix.lower() == ".gguf"
+    )
+    if not looks_local:
+        return None
+    resolved = candidate.resolve()
+    if not any(resolved.is_relative_to(root) for root in local_model_roots()):
+        raise ModelNotFound(_LOCAL_REFUSED)
+    return resolved
+
+
+def _remote_code_sources(
+    config: dict[str, Any], info: ModelInfo | None, files: tuple[str, ...]
+) -> list[str]:
+    """What in a repo ``--trust-remote-code`` would execute (R2)."""
+    found: list[str] = []
+    if config.get("auto_map"):
+        found.append("auto_map")
+    names = files or (info.siblings if info is not None else ())
+    found.extend(sorted(n for n in names if n.endswith(".py")))
+    return found
+
 
 #: Above this, the hub's parameter tally is not believed. It has been seen to
 #: count storage elements rather than logical weights on exotic 4-bit packings,
@@ -137,21 +203,33 @@ class ModelResolver:
         """Resolve a model id, a local directory, or a local ``.gguf`` file."""
         started = time.perf_counter()
 
-        local = Path(model_id).expanduser()
-        if local.is_dir() and (local / "config.json").is_file():
-            return self._resolve_local_dir(local, dtype, started)
-
         is_remote_gguf = model_id.startswith("hf://")
-        if is_remote_gguf or local.suffix.lower() == ".gguf":
+        if not is_remote_gguf:
+            local = _local_model_path(model_id)
+            if local is not None:
+                if local.is_dir() and (local / "config.json").is_file():
+                    return self._resolve_local_dir(local, dtype, started)
+                if local.suffix.lower() == ".gguf":
+                    # A local file needs no network, is exempt from the offline
+                    # gate, and -- like ``_resolve_local_dir`` -- is never
+                    # cached: caching a path on disk would go stale the moment
+                    # that file was replaced or deleted.
+                    return self._resolve_gguf_cached(
+                        str(local), dtype, revision, started,
+                        refresh=refresh, needs_network=False,
+                    )
+                raise ModelNotFound(_LOCAL_REFUSED)
+        if is_remote_gguf:
             # An ``hf://`` reference reads the file over the network, so it is
-            # gated and cached exactly like a hub config resolution below. A
-            # local file needs no network, is exempt from the offline gate,
-            # and -- like ``_resolve_local_dir`` -- is never cached: caching a
-            # path on disk would go stale the moment that file was replaced or
-            # deleted, and every read is already as cheap as a cache hit.
+            # gated and cached exactly like a hub config resolution below.
             return self._resolve_gguf_cached(
                 model_id, dtype, revision, started,
-                refresh=refresh, needs_network=is_remote_gguf,
+                refresh=refresh, needs_network=True,
+            )
+        if not is_hub_id(model_id):
+            raise ModelNotFound(
+                "not a HuggingFace model id (expected owner/name) and not a "
+                "model directory under an allowed root"
             )
 
         if not refresh:
@@ -246,6 +324,7 @@ class ModelResolver:
             revision="local",
             measured_total=measured,
             weight_bytes=weight_bytes,
+            files=tuple(p.name for p in path.glob("*.py")),
         )
         res.elapsed_ms = (time.perf_counter() - started) * 1000.0
         return res
@@ -262,6 +341,7 @@ class ModelResolver:
         revision: str,
         measured_total: int | None = None,
         weight_bytes: int | None = None,
+        files: tuple[str, ...] = (),
     ) -> Resolution:
         warnings: list[str] = []
         try:
@@ -271,6 +351,13 @@ class ModelResolver:
                 f"cannot read a shape out of {model_id!r}: {exc}"
             ) from exc
         warnings.extend(mapped.warnings)
+
+        remote_code = _remote_code_sources(config, info, files)
+        if remote_code:
+            warnings.append(
+                "this repository ships Python that --trust-remote-code would "
+                f"execute: {', '.join(remote_code)}"
+            )
 
         if info is None and not model_id.startswith("/"):
             warnings.append(
@@ -339,6 +426,7 @@ class ModelResolver:
             param_breakdown=breakdown.as_dict(),
             speculators=speculators,
             resolved_at=time.time(),
+            remote_code=bool(remote_code),
         )
 
     def _detect_quant(
@@ -517,15 +605,17 @@ class ModelResolver:
                 raise ModelNotFound(f"expected hf://owner/repo/file.gguf, got {path!r}")
             repo = "/".join(parts[:2])
             filename = "/".join(parts[2:])
+            if not is_hub_id(repo) or ".." in parts[2:] or "" in parts[2:]:
+                raise ModelNotFound("expected hf://owner/repo/file.gguf")
             reader = gguf_mod.RangeReader(
                 lambda start, length: self.client.read_range(repo, filename, start, length)
             )
             header = gguf_mod.read_header(reader)
             name = f"{repo}/{filename}"
         else:
-            local = Path(path).expanduser()
-            if not local.is_file():
-                raise ModelNotFound(f"no GGUF file at {path!r}")
+            local = _local_model_path(path)
+            if local is None or not local.is_file():
+                raise ModelNotFound(_LOCAL_REFUSED)
             header = gguf_mod.read_gguf_file(str(local))
             name = str(local)
 

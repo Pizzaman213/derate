@@ -16,6 +16,8 @@ implies "nothing happened" would be the same lie in a new place.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import time
 from typing import Any
@@ -23,10 +25,11 @@ from typing import Any
 from . import config
 from .archive import Archive
 from .hist import Hist
-from .retention import STEP_1H, STEP_1M
+from .records import REQUEST_RECORD_FIELDS
+from .retention import _HISTS, STEP_1D, STEP_1H, STEP_1M, _Group
 
 RAW = "raw"
-STEP_NAMES = {RAW: 0, "1m": STEP_1M, "1h": STEP_1H}
+STEP_NAMES = {RAW: 0, "1m": STEP_1M, "1h": STEP_1H, "1d": STEP_1D}
 
 
 def resolve_window(
@@ -222,34 +225,50 @@ def requests(
                 )
             ]
         else:
-            rows = []
+            # The v2 rollup is keyed finer (node, provider, key, org, context
+            # bucket, status); this answer keeps its v1 shape by summing
+            # across those, merging histograms exactly.
+            merged: dict[tuple, dict[str, Any]] = {}
             for r in archive.conn.execute(
                 "SELECT bucket, served_name, target_id, n, ok, failed, tokens, "
                 "prompt_tokens, cost_usd, ttft_hist, duration_hist "
                 "FROM rollup_requests WHERE step = ? AND bucket >= ? AND bucket < ?"
-                + filters
-                + " ORDER BY bucket DESC LIMIT ?",
-                (STEP_NAMES[chosen], frm, to, *args, limit),
+                + filters,
+                (STEP_NAMES[chosen], frm, to, *args),
             ):
-                entry = {
-                    k: r[k]
-                    for k in (
-                        "bucket",
-                        "served_name",
-                        "target_id",
-                        "n",
-                        "ok",
-                        "failed",
-                        "tokens",
-                        "prompt_tokens",
-                        "cost_usd",
-                    )
-                }
-                entry["ts"] = r["bucket"]
+                key = (r["bucket"], r["served_name"], r["target_id"])
+                entry = merged.get(key)
+                if entry is None:
+                    entry = merged[key] = {
+                        "bucket": r["bucket"],
+                        "served_name": r["served_name"],
+                        "target_id": r["target_id"],
+                        "n": 0,
+                        "ok": 0,
+                        "failed": 0,
+                        "tokens": 0,
+                        "prompt_tokens": 0,
+                        "cost_usd": 0.0,
+                        "_ttft": Hist(),
+                        "_duration": Hist(),
+                    }
+                for k in ("n", "ok", "failed", "tokens", "prompt_tokens"):
+                    entry[k] += int(r[k] or 0)
+                entry["cost_usd"] += float(r["cost_usd"] or 0.0)
+                entry["_ttft"].merge(Hist.from_blob(r["ttft_hist"]))
+                entry["_duration"].merge(Hist.from_blob(r["duration_hist"]))
+            ordered = sorted(
+                merged.values(),
+                key=lambda e: (e["bucket"], e["served_name"], e["target_id"]),
+                reverse=True,
+            )[:limit]
+            rows = []
+            for entry in ordered:
+                entry["ts"] = entry["bucket"]
                 # Percentiles, not the buckets that produced them. The blob is
                 # an implementation detail and would dwarf the response.
-                entry["ttft"] = Hist.from_blob(r["ttft_hist"]).summary()
-                entry["duration"] = Hist.from_blob(r["duration_hist"]).summary()
+                entry["ttft"] = entry.pop("_ttft").summary()
+                entry["duration"] = entry.pop("_duration").summary()
                 rows.append(entry)
 
     # Both branches read newest-first so the LIMIT drops the far end rather
@@ -376,3 +395,322 @@ def _expand(row: dict[str, Any]) -> dict[str, Any]:
             merged.update({k: v for k, v in row.items() if v not in (None, "")})
             return merged
     return row
+
+
+# -- usage: the per-key / per-org stats API -----------------------------------
+
+#: USAGE_GROUP_BY member -> rollup column.
+_GROUP_COLUMN = {
+    "key_id": "key_id",
+    "org_id": "org_id",
+    "model": "served_name",
+    "node": "node_id",
+    "provider": "provider_id",
+    "status": "status",
+    "context_bucket": "context_bucket",
+}
+
+#: Histogram -> the name it is reported under.
+_LATENCY_NAMES = {
+    "ttft": "ttft_ms",
+    "duration": "latency_ms",
+    "queue": "queue_ms",
+    "tpot": "tpot_ms",
+    "tps": "tokens_per_s",
+}
+
+
+def usage(
+    archive: Archive,
+    *,
+    start: float,
+    end: float,
+    bucket: str,
+    group_by: list[str] | tuple[str, ...] = (),
+    key_ids: list[str] | None = None,
+    org_ids: list[str] | None = None,
+    models: list[str] | None = None,
+) -> dict[str, Any]:
+    """Usage per time bucket and group, read from the request rollups.
+
+    ``bucket`` is one of USAGE_BUCKETS; ``group_by`` members come from
+    USAGE_GROUP_BY (``model`` is the served name). A bucket with no requests
+    is absent, never a zero row. Every optional measure is None when no row
+    in the group reported it -- an average or rate is over the rows that did.
+    Raw rows younger than the roll lag (about two minutes) are not counted yet.
+
+    A 1h or 1d rollup is written only once its bucket has closed, so the
+    current hour or day exists only as 1m rollups. Those are folded into the
+    coarse bucket they belong to; without them a key's "last 30 days" read 0
+    until midnight UTC.
+    """
+    if bucket not in STEP_NAMES or bucket == RAW:
+        raise ValueError(f"bucket must be one of 1m, 1h, 1d, not {bucket!r}")
+    unknown = [g for g in group_by if g not in _GROUP_COLUMN]
+    if unknown:
+        raise ValueError(f"cannot group by {', '.join(unknown)}")
+    step = STEP_NAMES[bucket]
+    filters = ""
+    filter_args: list[Any] = []
+    for column, values in (("key_id", key_ids), ("org_id", org_ids), ("served_name", models)):
+        if values is not None:
+            if not values:
+                filters += " AND 0"
+                continue
+            filters += f" AND {column} IN ({', '.join('?' * len(values))})"
+            filter_args.extend(values)
+    sql = "SELECT * FROM rollup_requests WHERE step = ? AND bucket >= ? AND bucket < ?"
+    queries = [(sql + filters, [step, _floor_to(start, step), end, *filter_args])]
+    fine = STEP_NAMES["1m"]
+
+    groups: dict[tuple, Any] = {}
+    with archive.lock:
+        if step != fine:
+            # Everything past the last closed coarse bucket. Unfiltered on
+            # purpose: a rolled bucket is rolled for every key at once.
+            last = archive.conn.execute(
+                "SELECT MAX(bucket) AS b FROM rollup_requests WHERE step = ?", (step,)
+            ).fetchone()["b"]
+            tail = _floor_to(start, fine) if last is None else max(last + step, _floor_to(start, fine))
+            queries.append((sql + filters, [fine, tail, end, *filter_args]))
+        for q, q_args in queries:
+            for r in archive.conn.execute(q, q_args):
+                key = (_floor_to(r["bucket"], step), *(r[_GROUP_COLUMN[g]] for g in group_by))
+                g = groups.get(key)
+                if g is None:
+                    g = groups[key] = _Group()
+                g.add_rollup(r)
+
+    rows = []
+    for key in sorted(groups, key=lambda k: tuple(str(x) for x in k)):
+        entry: dict[str, Any] = {"bucket": key[0]}
+        entry["group"] = {name: key[i + 1] for i, name in enumerate(group_by)}
+        entry.update(_usage_measures(groups[key]))
+        rows.append(entry)
+    out = _envelope(archive, bucket, start, end)
+    out["bucket"] = bucket
+    out["group_by"] = list(group_by)
+    out["rows"] = rows
+    return out
+
+
+def _floor_to(ts: float, step: int) -> float:
+    return float(int(ts // step) * step)
+
+
+def _ratio(num, den) -> float | None:
+    if num is None or not den:
+        return None
+    return num / den
+
+
+def _usage_measures(g) -> dict[str, Any]:
+    n = g.n
+    drafts = g.spec["spec_drafts"]
+    positions = g.spec_positions
+    latency = {}
+    for name, _col in _HISTS:
+        h = g.hists[name]
+        latency[_LATENCY_NAMES[name]] = (
+            None
+            if not h.count
+            else {
+                "n": h.count,
+                "avg": h.mean(),
+                "p50": h.pct(0.50),
+                "p95": h.pct(0.95),
+                "p99": h.pct(0.99),
+            }
+        )
+    if n and g.unpriced_n == n:
+        basis = "unpriced"
+    elif g.estimated_usd is not None:
+        basis = "estimated"
+    elif g.metered_usd is not None:
+        basis = "metered"
+    else:
+        basis = None
+    return {
+        "requests": n,
+        "ok": g.ok,
+        "failed": g.failed,
+        "errors": dict(g.errors),
+        "error_rate": _ratio(g.failed, n),
+        "fallback_rate": _ratio(g.fallback, n),
+        "cancel_rate": _ratio(g.cancelled, n),
+        "tokens_in": g.prompt_tokens,
+        "tokens_out": g.completion_tokens,
+        "reasoning_tokens": g.opt["reasoning_tokens"],
+        "cache_read_tokens": g.opt["cache_read_tokens"],
+        "cache_write_tokens": g.opt["cache_write_tokens"],
+        "cache_hit_rate": _ratio(g.opt["cache_read_tokens"], g.cache_prompt_tokens),
+        "cache_errors": dict(g.cache_errors),
+        "avg_prompt_tokens": _ratio(g.prompt_tokens, n),
+        "avg_output_tokens": _ratio(g.completion_tokens, n),
+        "spec_drafts": drafts,
+        "spec_draft_tokens": g.spec["spec_draft_tokens"],
+        "spec_accepted_tokens": g.spec["spec_accepted_tokens"],
+        "spec_acceptance_rate": _ratio(
+            g.spec["spec_accepted_tokens"], g.spec["spec_draft_tokens"]
+        ),
+        "spec_accepted_per_position": positions,
+        "spec_acceptance_per_position": (
+            None if positions is None or not drafts else [p / drafts for p in positions]
+        ),
+        "spec_errors": dict(g.spec_errors),
+        **latency,
+        "cost_usd": g.cost_usd if basis not in (None, "unpriced") else None,
+        "metered_usd": g.metered_usd,
+        "estimated_usd": g.estimated_usd,
+        "unpriced_requests": g.unpriced_n,
+        "cost_basis": basis,
+    }
+
+
+_JSON_REQUEST_COLS = ("attempt_chain", "spec_accepted_per_position")
+
+
+def requests_list(
+    archive: Archive,
+    *,
+    start: float,
+    end: float,
+    request_id: str | None = None,
+    key_id: str | None = None,
+    model: str | None = None,
+    status: int | str | None = None,
+    error: str | None = None,
+    target_id: str | None = None,
+    provider_id: str | None = None,
+    retried: bool = False,
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    """One row per client request, newest first, paged.
+
+    Each row is the request's final attempt (highest ``attempt_no``) with
+    ``attempts`` replaced by the true attempt count. ``model`` matches the
+    served name; ``error`` matches error_class or error_code; ``status`` is
+    an int, ``"ok"`` (2xx/3xx) or ``"failed"``; ``target_id`` and
+    ``provider_id`` match the final attempt's target and provider; ``retried``
+    keeps requests that took more than one attempt. Reaches back only as far
+    as the raw window.
+    """
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), config.QUERY_MAX_ROWS))
+    inner = "ts >= ? AND ts < ?"
+    args: list[Any] = [start, end]
+    if request_id:
+        inner += " AND request_id = ?"
+        args.append(request_id)
+    where = "1=1"
+    if key_id:
+        where += " AND r.key_id = ?"
+        args.append(key_id)
+    if model:
+        where += " AND r.served_name = ?"
+        args.append(model)
+    if status == "ok":
+        where += " AND r.status BETWEEN 200 AND 399"
+    elif status == "failed":
+        where += " AND (r.status IS NULL OR r.status < 200 OR r.status >= 400)"
+    elif status is not None:
+        where += " AND r.status = ?"
+        args.append(int(status))
+    if error:
+        where += " AND (r.error_class = ? OR r.error_code = ?)"
+        args.extend((error, error))
+    if target_id:
+        where += " AND r.target_id = ?"
+        args.append(target_id)
+    if provider_id:
+        where += " AND r.provider_id = ?"
+        args.append(provider_id)
+    if retried:
+        where += " AND final.n_attempts > 1"
+    body = (
+        "FROM requests r JOIN ("
+        "SELECT request_id, MAX(attempt_no) AS attempt_no, COUNT(*) AS n_attempts "
+        f"FROM requests WHERE {inner} GROUP BY request_id) final "
+        "ON r.request_id = final.request_id AND r.attempt_no = final.attempt_no "
+        f"WHERE {where}"
+    )
+    cols = ", ".join(
+        "final.n_attempts AS attempts" if c == "attempts" else f"r.{c}"
+        for c in REQUEST_RECORD_FIELDS
+    )
+    with archive.lock:
+        total = archive.conn.execute(f"SELECT COUNT(*) AS n {body}", args).fetchone()["n"]
+        rows = [
+            dict(r)
+            for r in archive.conn.execute(
+                f"SELECT {cols} {body} ORDER BY r.ts DESC, r.request_id LIMIT ? OFFSET ?",
+                (*args, page_size, (page - 1) * page_size),
+            )
+        ]
+    for row in rows:
+        for col in _JSON_REQUEST_COLS:
+            if isinstance(row.get(col), str):
+                try:
+                    row[col] = json.loads(row[col])
+                except ValueError:
+                    pass
+    return {"rows": rows, "total": int(total), "page": page, "page_size": page_size}
+
+
+#: A spreadsheet runs a cell that starts with one of these as a formula, and
+#: `model_requested` and `user_agent` are whatever the client sent.
+_FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        value = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, str) and value.startswith(_FORMULA_LEADS):
+        return "'" + value
+    return value
+
+
+def requests_csv(rows: list[dict[str, Any]]) -> str:
+    """Raw request rows as CSV, columns in REQUEST_RECORD_FIELDS order."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(REQUEST_RECORD_FIELDS)
+    for row in rows:
+        writer.writerow([_cell(row.get(c)) for c in REQUEST_RECORD_FIELDS])
+    return buf.getvalue()
+
+
+def usage_csv(result: dict[str, Any]) -> str:
+    """A usage() answer as CSV: one line per bucket and group.
+
+    Group columns come first, then every scalar measure; latency objects are
+    flattened to ``<name>_<stat>``; maps and lists are JSON cells.
+    """
+    rows = result.get("rows") or []
+    group_by = list(result.get("group_by") or [])
+    flat_rows = []
+    for row in rows:
+        flat: dict[str, Any] = {"bucket": row["bucket"]}
+        for g in group_by:
+            flat[g] = row["group"].get(g)
+        for k, v in row.items():
+            if k in ("bucket", "group"):
+                continue
+            if k in _LATENCY_NAMES.values():
+                for stat in ("n", "avg", "p50", "p95", "p99"):
+                    flat[f"{k}_{stat}"] = None if v is None else v[stat]
+            else:
+                flat[k] = v
+        flat_rows.append(flat)
+    header: list[str] = ["bucket", *group_by]
+    if flat_rows:
+        header += [k for k in flat_rows[0] if k not in header]
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    for flat in flat_rows:
+        writer.writerow([_cell(flat.get(c)) for c in header])
+    return buf.getvalue()

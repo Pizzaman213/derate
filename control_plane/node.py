@@ -47,7 +47,6 @@ from typing import Callable
 import uvicorn
 
 from control_plane import logfiles
-from control_plane import logfiles
 from control_plane.registry import NodeRuntime, RegistryConfig, start_node
 from control_plane.registry.config import ROLE_COORDINATOR
 
@@ -152,7 +151,17 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
 
 
 def _make_server(app, *, host: str, port: int) -> uvicorn.Server:
-    config = uvicorn.Config(app, host=host, port=port, log_config=None)
+    from control_plane.gateway.settings import uvicorn_proxy_kwargs
+
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_config=None,
+        # No "server: uvicorn": the version banner tells a scanner what to try.
+        server_header=False,
+        **uvicorn_proxy_kwargs(),
+    )
     return uvicorn.Server(config)
 
 
@@ -242,6 +251,8 @@ def main() -> None:
         level=os.environ.get("DERATE_LOG_LEVEL", "INFO"),
         format=logfiles.LOG_FORMAT,
     )
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(logfiles.UTCFormatter(logfiles.LOG_FORMAT))
     logging.getLogger().setLevel(os.environ.get("DERATE_LOG_LEVEL", "INFO"))
     # Before asyncio.run, so a failure to start a node is in the file rather
     # than only on a stderr that systemd or `docker run -d` swallowed.

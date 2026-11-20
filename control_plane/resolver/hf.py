@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any
 from urllib.parse import quote
@@ -18,6 +19,19 @@ import requests
 from .types import MetadataUnavailable, ModelNotFound
 
 DEFAULT_ENDPOINT = "https://huggingface.co"
+
+_HUB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+")
+
+
+def is_hub_id(s: str) -> bool:
+    """``owner/name`` as the hub spells it, with no ``..`` segment (R4).
+
+    Checked before any URL is built from an id, so ``quote(..., safe='/')``
+    never carries a traversal segment to the hub.
+    """
+    return bool(_HUB_ID.fullmatch(s)) and ".." not in s.split("/")
+
+
 DEFAULT_TIMEOUT = float(os.environ.get("DERATE_HF_TIMEOUT", "8.0"))
 _USER_AGENT = "derate-resolver/1.0"
 
@@ -160,6 +174,21 @@ class HubClient:
             file_sizes=file_sizes,
         )
 
+    def is_gated(self, model_id: str) -> bool:
+        """Whether the hub asks for an accepted licence before a download.
+
+        The hub's ``gated`` field is ``false`` or the gating mode (``"auto"``,
+        ``"manual"``); some records carry a ``gated`` tag instead.
+        """
+        url = f"{self.endpoint}/api/models/{quote(model_id, safe='/')}"
+        resp = self._get(url)
+        self._raise_for(resp, model_id, "model info")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise MetadataUnavailable(f"model info for {model_id!r} was not JSON") from exc
+        return bool(data.get("gated")) or "gated" in (data.get("tags") or ())
+
     def file_json(
         self, model_id: str, filename: str, revision: str = "main"
     ) -> dict[str, Any] | None:
@@ -189,15 +218,29 @@ class HubClient:
     def read_range(
         self, model_id: str, filename: str, start: int, length: int, revision: str = "main"
     ) -> bytes:
-        """Byte range from a repo file. Used to read headers, never weights."""
+        """Byte range from a repo file. Used to read headers, never weights.
+
+        Streams and reads at most ``length`` bytes, so a server that ignores
+        the Range header cannot make this buffer a whole weight file.
+        """
+        if length > 64 << 20:
+            raise ValueError(f"range read of {length} bytes exceeds 64 MiB")
         url = (
             f"{self.endpoint}/{quote(model_id, safe='/')}"
             f"/resolve/{quote(revision, safe='')}/{quote(filename, safe='/')}"
         )
-        headers = {"Range": f"bytes={start}-{start + length - 1}"}
-        resp = self._get(url, headers=headers, allow_redirects=True)
-        self._raise_for(resp, model_id, filename)
-        return resp.content
+        # identity, and the raw bytes read undecoded: a mirror answering with
+        # Content-Encoding would otherwise inflate a bomb before the cap (R-5).
+        headers = {
+            "Range": f"bytes={start}-{start + length - 1}",
+            "Accept-Encoding": "identity",
+        }
+        resp = self._get(url, headers=headers, allow_redirects=True, stream=True)
+        try:
+            self._raise_for(resp, model_id, filename)
+            return resp.raw.read(length, decode_content=False)
+        finally:
+            resp.close()
 
     def search(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
         url = f"{self.endpoint}/api/models"
