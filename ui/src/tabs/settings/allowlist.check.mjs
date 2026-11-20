@@ -19,6 +19,8 @@
 // Needs a coordinator: :8088 by default, or whatever DERATE_CHECK_ORIGIN names.
 // Every assertion is about a fact the gateway reports.
 
+// The session and the API key, for /api and /v1 respectively.
+await import('../../check/auth.mjs')
 const ORIGIN = process.env.DERATE_CHECK_ORIGIN ?? 'http://localhost:8088'
 const get = async (p) => (await fetch(`${ORIGIN}${p}`)).json()
 

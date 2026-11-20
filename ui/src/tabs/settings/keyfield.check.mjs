@@ -1,6 +1,6 @@
 // requires: python -- reads looks_like_secret out of the server's own module
 // Verifier for keyfield.ts. There is no UI test runner here, so the rule is
-// the same as rows.check.mjs and layout.check.mjs: esbuild-bundle the module
+// the same as rows.check.mjs: esbuild-bundle the module
 // and exercise it, because a green tsc says nothing about what the predicate
 // answers.
 //
@@ -95,7 +95,10 @@ const python = JSON.parse(
         '  "minted": {i: minted_ref(i) for i in ["openrouter", "lan-ollama-2", "x"*90, "", "a.b_c"]},',
         '  "key_states": sorted(set(re.findall(r\'"key_state": "([a-z_]+)"\', status))),',
         '  "key_sources": sorted(set(re.findall(r\'"key_source": "([a-z.]+)"\', status))),',
-        '  "key_kinds": [k["kind"] for k in kinds_public() if k["requires_key"]],',
+        // A sign-in kind requires a credential but never shows the key field,
+        // so it has no hint to check (keyPlaceholder answers '' for it).
+        '  "key_kinds": [k["kind"] for k in kinds_public() if k["requires_key"] and not k.get("sign_in")],',
+        '  "sign_in_kinds": [k["kind"] for k in kinds_public() if k.get("sign_in")],',
         '}))',
       ].join('\n'),
     ],
@@ -181,6 +184,10 @@ for (const kind of python.key_kinds) {
   // this file is what establishes the two still agree. So a hint that passes
   // here is one the coordinator would also read as a key.
   check(`${kind}'s hint reads as key material`, looksLikeSecret(completed(hint)), true)
+}
+// ...and a sign-in kind gets none: the add form renders ProviderSignIn there.
+for (const kind of python.sign_in_kinds) {
+  check(`${kind} is added by signing in and has no key hint`, keyPlaceholder(kind), '')
 }
 
 // Named rather than derived, because it is the requirement and not a port: the
