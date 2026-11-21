@@ -14,6 +14,7 @@ agents and `RULES.md` automatically when started in the repo root.
 | `design/icons/svg/*.svg` + `icons.json` | the icon set, one file per name, and its metadata | — |
 | `design/icons/build.mjs` | svgo in place → `icons.svg` sprite + generated `components/icons.ts` (data for `ui/src/components/Icon.tsx`) | `npm run icons:build` |
 | `design/icons/lint.mjs` | the icon spec enforced: viewBox, padding, stroke, currentColor, metadata, duplicates, staleness | `npm run icons:lint` |
+| `design/logos/*` | third-party brand marks (inference engines), upstream artwork in its own colours; not icons, not linted by the icon spec | — |
 | `design/DESIGN.md` | the design system: principles, colour/type/space/motion, a spec per component, how to add things | — |
 | `design/components/registry.json` | every component the pack knows: props, variants, states, tokens, icons, spec anchor | — |
 | `charts/` | the six chart types the app mounts, one file each; see `charts/README.md` | `cd charts && npm run charts:test` |

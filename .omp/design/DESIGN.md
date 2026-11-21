@@ -301,9 +301,13 @@ Not shared components: classes in `derate.css` under `/* Models tab */`,
 drawn only by `ui/src/tabs/models/`. Quant cards, hub cards and worth-trying
 tiles are `--tile-bg/border/border-hover`; list rows and suggestions hover in
 `--row-hover` and select in `--row-selected` with an inset `--ink` rule.
-Engine initials sit on `--logo-tile` in `--logo-ink`, both pinned light/dark
-in every theme because a brand mark is drawn for a light ground (pair in
-`pairs.json`). **States:** default, hover, selected (`aria-current` /
+Engine marks sit on `--logo-tile`: each engine's own logo from
+`design/logos/` (vLLM, SGLang, llama.cpp, Ollama — upstream assets, kept in
+their brand colours, so they are not icons and not under the icon spec); an
+engine with no mark (derate's TTS server) shows initials in `--logo-ink`.
+Both tokens are pinned light/dark in every theme because a brand mark is
+drawn for a light ground (pair in `pairs.json`). **States:** default, hover,
+selected (`aria-current` /
 `aria-pressed`), focus-visible; disabled n/a.
 
 ### Copyable

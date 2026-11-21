@@ -11,6 +11,10 @@ import { LinkState, ParallelismPicker } from './ParallelismPicker'
 import { ProviderPicker } from './ProviderPicker'
 import { SpeculativeField } from './SpeculativeField'
 import type { ModelSession } from './useModelSession'
+import llamacppLogo from '../../../../.omp/design/logos/llamacpp.png'
+import ollamaLogo from '../../../../.omp/design/logos/ollama.svg'
+import sglangLogo from '../../../../.omp/design/logos/sglang.png'
+import vllmLogo from '../../../../.omp/design/logos/vllm.svg'
 import {
   ApiFields,
   CommandPreviewBlock,
@@ -32,16 +36,19 @@ const TARGET_OPTIONS: SelectOption<'throughput' | 'latency'>[] = [
 ]
 
 /** What each engine is for, said once. Fixed copy, not a verdict: whether one
- *  can serve THIS model is the verdict box's answer after you pick it. */
-const ENGINE: Record<Runtime, { tile: string; note: string }> = {
-  vllm: { tile: 'vL', note: 'The default. Widest model and speculative-decoding support.' },
+ *  can serve THIS model is the verdict box's answer after you pick it.
+ *  `logo` is the project's own mark from `.omp/design/logos/`; the TTS server
+ *  is derate's own and has none, so it keeps its initials. */
+const ENGINE: Record<Runtime, { tile: string; logo?: string; note: string }> = {
+  vllm: { tile: 'vL', logo: vllmLogo, note: 'The default. Widest model and speculative-decoding support.' },
   sglang: {
     tile: 'SG',
+    logo: sglangLogo,
     note: 'Radix prefix cache; strong when many requests share a long prompt. No speculative decoding here.',
   },
   tts: { tile: 'TT', note: 'derate’s own speech server, one checkpoint, one process.' },
-  llamacpp: { tile: 'LC', note: 'GGUF on a machine with no GPU.' },
-  ollama: { tile: 'OL', note: 'Pull a GGUF onto a provider machine; the gateway routes to it.' },
+  llamacpp: { tile: 'LC', logo: llamacppLogo, note: 'GGUF on a machine with no GPU.' },
+  ollama: { tile: 'OL', logo: ollamaLogo, note: 'Pull a GGUF onto a provider machine; the gateway routes to it.' },
 }
 
 /** The KV cache widths the gate prices AND the pinned engine accepts. */
@@ -158,7 +165,7 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
                     onChange={() => s.setRuntime(o.value)}
                   />
                   <span className="mdl-tile" aria-hidden="true">
-                    {ENGINE[o.value].tile}
+                    {ENGINE[o.value].logo ? <img src={ENGINE[o.value].logo} alt="" /> : ENGINE[o.value].tile}
                   </span>
                   <span className="mdl-engine-text">
                     <span className="label">{rt?.display_name ?? o.label}</span>

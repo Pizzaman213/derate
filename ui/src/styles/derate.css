@@ -2739,6 +2739,11 @@ main:has(> section:not([hidden]) > .mdl-tab) {
   font-size: var(--size-badge);
   font-weight: 500;
 }
+.mdl-tile img {
+  width: 70%;
+  height: 70%;
+  object-fit: contain;
+}
 .mdl-engine-text {
   display: grid;
   gap: var(--space-1);
