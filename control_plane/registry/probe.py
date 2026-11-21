@@ -43,6 +43,11 @@ MEMORY_BANDWIDTH_GBPS: dict[str, float] = {
     "h100": 3350.0,
     "a100": 2039.0,
     "4090": 1008.0,
+    # Before "3090": the first substring match wins, and the Ti's 21 Gbps
+    # GDDR6X (nvidia-smi: 10501 MHz max memory clock x 2 x 384-bit / 8 =
+    # 1008 GB/s) was being read as the plain 3090's 936 -- every decode
+    # prediction for it 7% slow.
+    "3090 ti": 1008.0,
     "3090": 936.0,
     "a6000": 768.0,
 }
@@ -327,7 +332,33 @@ def _probe_cpu(
     )
 
 
-def probe_local(
+#: `platform.machine()` spellings, in the names container registries use.
+_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+
+
+def local_arch(machine: str | None = None) -> str:
+    """This machine's architecture as an image platform ("amd64", "arm64"),
+    or "" for one this table does not name -- read off the kernel, never
+    inferred from the GPU."""
+    import platform
+
+    m = (machine if machine is not None else platform.machine()).lower()
+    return _ARCH.get(m, "")
+
+
+def probe_local(*args, **kwargs) -> NodeProfile:
+    """`_probe_local`, with the architecture stamped on whichever branch
+    answered. One place rather than five constructors, and it never raises."""
+    import dataclasses
+
+    profile = _probe_local(*args, **kwargs)
+    try:
+        return dataclasses.replace(profile, arch=local_arch())
+    except Exception:  # pragma: no cover - a probe never raises
+        return profile
+
+
+def _probe_local(
     node_id: str | None = None,
     hostname: str | None = None,
     address: str | None = None,

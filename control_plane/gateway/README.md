@@ -440,6 +440,93 @@ endpoint answerable on a fresh install with nothing configured. Each row reports
 the numbers it was judged at, because with a derived context one figure at the
 top of the table no longer describes every row in it.
 
+## Models tab routes (second pass)
+
+Everything the Models tab's mockup contract needed, all gated, all registered
+above the `StaticFiles` mount.
+
+- **`GET /api/runtimes`** (`capacity_api.py`) -- one row per `flags.RUNTIMES`
+  entry: `display_name`, `memory_pool`, `formats` (`gguf` for a host-pool
+  runtime, else `safetensors`), `image` and `image_present` (`imageprobe` on the
+  COORDINATOR only, cached 60 s), `supports` booleans read off the
+  `RuntimeSpec`, `kv_dtypes`, `engine_options` (the spec's
+  `engine_options_supported`), the two vLLM parser lists, `nccl_tunables` and
+  the pinned vLLM `version`.
+- **`POST /api/plan/command`** -- the `/api/plan` body, run through
+  `_plan_and_fit` and then `DeploymentManager.preview_launch`, which shares the
+  launch's refusal block. Returns `argv`, `recipe`, the derived
+  `gpu_memory_utilization`, `kv_cache_memory_bytes`, `nccl_env` and `notes`.
+  Starts nothing; refusals are the launch's 400s.
+- **`POST /api/plan/concurrency`** -- the plan body plus `contexts` (1..4, each
+  >= 512 and within `native_window`) and `max_users` (1..256, default 64). Per
+  context it plans at `concurrency=1`, takes `wall = (usable_per_node - (total -
+  kv_cache)) // kv_per_seq`, and prices users 1, 2, 4, ... plus the wall with
+  `fit.calculator.bandwidth_ceiling_tps`. `basis` is `live` when any context had
+  a live fit. The `caveat` string is part of the response, not UI copy.
+  `compute` is the newest `measurements.matching_compute` record for the
+  plan's GPU and the vllm image (null on mixed GPUs or none stored); each series
+  carries `prompt_tokens = context` and each point `ttft_floor_s =
+  users * fit.calculator.prefill_floor_seconds(...)` up to the wall, null past
+  it. `ttft_caveat` is literal and says it is a floor.
+- **`POST /api/plan/candidates`** -- the plan body without `parallelism`; the
+  best alternative per `kind` (at most 5), each re-planned at the pick's context
+  and concurrency. A refused shape carries `verdict: null` and its `error`.
+  `recommended_kind` is the plain plan's pick.
+- **`POST /api/compute/measure`** / **`GET /api/compute`** -- times bf16
+  8192^3 matmuls in the serving image on the coordinator's own GPU
+  (`computeprobe.py`), stored under `data_dir()/measurements/compute/` keyed
+  `gpu_name|image|dtype`. 409 `measurement_running` while one runs, 503
+  `measurement_failed` with the probe's message.
+- **`/api/profiles`** (GET `?model_id=`, POST, PATCH/DELETE `/{id}`) and
+  **`/api/pins`** (GET, PUT) in `ui_api.py`, over `profiles_store.py`:
+  `data_dir()/profiles.json`, settings_store's envelope and atomic 0600 write.
+  A profile's `request` is limited to launch keys plus `target` and 16 KiB;
+  `is_default` is exclusive per model; at most 200 pins. Audited
+  `PROFILE_CHANGED`. Records carry `kind` (`saved`/`run`), `deployment_id` and
+  `last_result`. Every operator launch that answers 201 writes a `run` via
+  `record_run` (newest 10 unstarred runs per model kept); boot relaunches and
+  benchmark copies write none. A finished benchmark's headline is copied onto
+  every profile with the same setup (`attach_result`, ignoring `served_name`
+  and `lifecycle`). A run's `request` cannot be patched.
+- **`/api/downloads`** (POST, `/{id}/pause`, `/{id}/resume`, DELETE) -- hub
+  prefetch through `deploy/prefetch.py`, 202 on start, audited
+  `DOWNLOAD_CHANGED`. `/api/activity` appends these jobs to `downloads` with
+  `kind: "hub"`, `download_id` and `paused`; provider pulls gain
+  `kind: "provider"`. Hub rows also carry `rate_bps`/`eta_s` over the last five
+  ticks (null until two samples, while paused, or without a total).
+- **`/api/benchmarks`** (GET `?model_id=`, GET/DELETE `/{id}`, POST) --
+  `bench.py::BenchRunner` launches a throwaway `bench-…` copy through the same
+  `_create_deployment` the route uses, sweeps the `users` list against it,
+  and stops it in a `finally` (success, failure or cancel). One run at a time:
+  a second POST is 409 `benchmark_running`. Records live under
+  `data_dir()/measurements/bench/`. Audited `BENCHMARK_CHANGED`.
+- **`PATCH /api/deployments/{id}`** accepts a partial `lifecycle` beside
+  `serving` (`manager.set_lifecycle`); **DELETE** clears `start_at_boot` before
+  stopping, so an operator's stop survives the next boot.
+- **`GET /api/models/search`** takes `author` and `task` (`pipeline_tag`), each
+  `^[A-Za-z0-9._-]{1,64}$` or 400, both in the cache key. `sort` is
+  `downloads|trending|updated|likes` (else 400), mapped to the hub's own key and
+  in the cache key; rows carry `trending_score` and ISO `last_modified`.
+  **`/api/models/detail`** gains `hub` (`downloads`, `likes`, `last_modified`,
+  `license`, `gated`, `pipeline_tag`) from `resolver.hub_stats`, cached 30
+  minutes including the null, and null on any failure -- never an error.
+
+`/api/plan` and the launch both parse `engine_options` (`_parse_engine_options`:
+unknown key is a 400, every value range-checked, `env` names must be in
+`NCCL_TUNABLES`) and launch parses `lifecycle` (`_parse_lifecycle`). Plan answers
+gain `native_window` and `original_window`; every deployment payload gains
+`engine_options`, `lifecycle`, `original_window` and `relaunch_request` --
+`deploy/relaunch.py::launch_request_from`, the same builder a crash relaunch
+and `idle.py::boot_relaunch` use.
+
+`idle.py`: `IdleMonitor` ticks every 30 s and stops a READY deployment whose
+`lifecycle.idle_unload_s` has passed since its last request (or its start) with
+nothing outstanding, reason `idle for N minutes`. `boot_relaunch` runs once at
+startup and relaunches the newest record of each served name that asked for
+`start_at_boot`, only when it is terminal and nothing live has that name.
+Priority is not enforced by the server; it only orders the UI's stop
+suggestions.
+
 ## `proxy.py`
 
 Covered above -- §1a is this file's connection ownership and §1b its `reopen`

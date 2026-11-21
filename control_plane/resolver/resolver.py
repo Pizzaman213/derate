@@ -788,7 +788,15 @@ class ModelResolver:
         """
         return sorted({v.dtype for v in self.quant_variants(model_id)})
 
-    def search_models(self, query: str, limit: int = 40) -> list[dict]:
+    def search_models(
+        self,
+        query: str,
+        limit: int = 40,
+        *,
+        author: str | None = None,
+        pipeline_tag: str | None = None,
+        sort: str = "downloads",
+    ) -> list[dict]:
         """Hub search hits, trimmed, and deliberately unresolved.
 
         Resolving here would be one network round trip per row per keystroke.
@@ -803,7 +811,10 @@ class ModelResolver:
             raise MetadataUnavailable(
                 "the resolver is offline; the hub cannot be searched"
             )
-        hits = self.client.search(query, limit=limit)
+        filters = {
+            k: v for k, v in (("author", author), ("pipeline_tag", pipeline_tag)) if v
+        }
+        hits = self.client.search(query, limit=limit, sort=sort, **filters)
         out: list[dict] = []
         for hit in hits:
             model_id = str(hit.get("id") or hit.get("modelId") or "")
@@ -817,6 +828,7 @@ class ModelResolver:
                     "likes": hit.get("likes"),
                     "pipeline_tag": hit.get("pipeline_tag"),
                     "last_modified": hit.get("lastModified"),
+                    "trending_score": hit.get("trendingScore"),
                     "gated": hit.get("gated"),
                     "tags": tags[:12],
                     # A guess from the name, offered as one. Cheap, and it is
@@ -829,6 +841,24 @@ class ModelResolver:
                 }
             )
         return out
+
+    def hub_stats(self, model_id: str) -> dict | None:
+        """Downloads, likes, licence and the rest of the hub's own record.
+
+        None when offline or for a local path; the hub's errors propagate and
+        the caller degrades them to null.
+        """
+        if self.offline or model_id.startswith(("/", ".", "hf://")):
+            return None
+        info = self.client.model_info(model_id)
+        return {
+            "downloads": info.downloads,
+            "likes": info.likes,
+            "last_modified": info.last_modified,
+            "license": info.license,
+            "gated": info.gated,
+            "pipeline_tag": info.pipeline_tag,
+        }
 
     def quant_variants(self, model_id: str) -> list[QuantVariant]:
         """Every obtainable set of weights, with what it costs and where it is.

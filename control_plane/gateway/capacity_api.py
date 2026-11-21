@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import functools
+import re
 from dataclasses import replace
 from typing import Any
 
@@ -24,6 +26,7 @@ from fastapi import APIRouter
 from starlette.responses import JSONResponse, Response
 
 from control_plane.contracts import DEFAULT_GUARDRAIL
+from control_plane.fit.constants import KV_ELEM_BYTES
 
 from . import errors, serialize
 from .deps import GatewayContext
@@ -48,6 +51,15 @@ _VARIANTS_TTL_S = 600.0
 #: answers. The client debounces too; this stops several browsers undoing that.
 _SEARCH_TIMEOUT_S = 6.0
 _SEARCH_TTL_S = 60.0
+#: Owner names and pipeline tags as the hub spells them.
+_HUB_FILTER_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+#: The screen's sort names, mapped to the hub's own `sort=` keys.
+_SEARCH_SORTS = {
+    "downloads": "downloads", "trending": "trendingScore",
+    "updated": "lastModified", "likes": "likes",
+}
+_HUB_STATS_TTL_S = 1800.0
+_IMAGE_PRESENT_TTL_S = 60.0
 
 #: How many explicitly-named models one `/api/capacity?models=` may answer.
 #:
@@ -495,7 +507,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return JSONResponse(payload)
 
     @router.get("/api/models/search")
-    async def model_search(q: str = "", limit: int = 40) -> Response:
+    async def model_search(
+        q: str = "", limit: int = 40, author: str = "", task: str = "",
+        sort: str = "downloads",
+    ) -> Response:
         """Models from three places at once, local first, none of them resolved.
 
         Deployments and provider catalogues are already in memory and answer
@@ -510,6 +525,27 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         """
         query = (q or "").strip()
         limit = max(1, min(int(limit or 40), 50))
+        author = (author or "").strip()
+        task = (task or "").strip()
+        for label, value in (("author", author), ("task", task)):
+            if value and not _HUB_FILTER_RE.fullmatch(value):
+                return errors.error_response(
+                    400,
+                    f"{label} must be 1 to 64 letters, digits, '.', '_' or '-'.",
+                    "invalid_request_error",
+                    "invalid_request",
+                )
+        hub_sort = _SEARCH_SORTS.get(sort or "downloads")
+        if hub_sort is None:
+            return errors.error_response(
+                400,
+                f"sort must be one of {', '.join(_SEARCH_SORTS)}.",
+                "invalid_request_error",
+                "invalid_request",
+            )
+        filters = {
+            k: v for k, v in (("author", author), ("pipeline_tag", task)) if v
+        }
         sources: dict[str, dict] = {}
         results: list[dict] = []
         notes: list[str] = []
@@ -544,21 +580,22 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             sources["providers"] = {"ok": False, "note": str(exc)}
 
         search = getattr(ctx.deps.resolver, "search_models", None)
-        if not query:
-            sources["huggingface"] = {
-                "ok": True, "note": "type to search the hub",
-            }
-        elif not callable(search):
+        # An empty query is a browse: the hub's own top models by `sort`. The
+        # client only asks with an empty box on the Hugging Face view, and the
+        # answer is cached like any other.
+        if not callable(search):
             sources["huggingface"] = {
                 "ok": False, "note": "this resolver cannot search the hub",
             }
         else:
-            cache_key = f"{query}\u0000{limit}"
+            cache_key = f"{query}\u0000{limit}\u0000{author}\u0000{task}\u0000{hub_sort}"
             hits = _search_cache.get(cache_key)
             if hits is None:
                 try:
                     hits = await asyncio.wait_for(
-                        asyncio.to_thread(search, query, limit),
+                        asyncio.to_thread(
+                            functools.partial(search, query, limit, sort=hub_sort, **filters)
+                        ),
                         timeout=_SEARCH_TIMEOUT_S,
                     )
                     _search_cache.put(cache_key, hits)
@@ -669,7 +706,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         body = serialize.resolution_payload(resolution)
         body["nodes"] = _quant_node_check(ctx, resolution)
+        body["hub"] = await _hub_stats(ctx, model_id)
         return JSONResponse(body)
+
+    @router.get("/api/runtimes")
+    async def runtimes() -> Response:
+        """Every runtime this build can launch, and what each one takes."""
+        return JSONResponse(await asyncio.to_thread(_runtimes_payload))
 
     @router.get("/api/models/variants")
     async def model_variants(
@@ -1077,6 +1120,103 @@ _search_cache = _TTLCache(_SEARCH_TTL_S, limit=128)
 _HEADS_TTL_S = 30 * 60.0
 _HEADS_TIMEOUT_S = 60.0
 _heads_cache = _TTLCache(_HEADS_TTL_S, limit=64)
+_hub_stats_cache = _TTLCache(_HUB_STATS_TTL_S, limit=256)
+_image_present_cache = _TTLCache(_IMAGE_PRESENT_TTL_S, limit=16)
+
+
+async def _hub_stats(ctx: GatewayContext, model_id: str) -> dict | None:
+    """The hub's popularity record for one model, or None -- never an error.
+
+    Cached for 30 minutes, the null answer included (wrapped, because the
+    cache's miss is None), so a hub that refused does not cost a round trip
+    on every detail view.
+    """
+    hit = _hub_stats_cache.get(model_id)
+    if hit is not None:
+        return hit[0]
+    fn = getattr(ctx.deps.resolver, "hub_stats", None)
+    stats: dict | None = None
+    if callable(fn):
+        try:
+            stats = await asyncio.wait_for(
+                asyncio.to_thread(fn, model_id), timeout=_DETAIL_TIMEOUT_S
+            )
+        except Exception as exc:
+            log.info("hub stats unavailable for %s: %s", model_id, exc)
+            stats = None
+    _hub_stats_cache.put(model_id, (stats,))
+    return stats
+
+
+_RUNTIME_DISPLAY = {
+    "vllm": "vLLM", "sglang": "SGLang", "tts": "TTS server", "llamacpp": "llama.cpp",
+}
+#: The pinned vLLM build, as its own image reports it.
+_VLLM_VERSION = "0.28.1rc1.dev462+g9ca97b28b"
+
+
+def _image_present(image: str) -> bool:
+    """Whether the image is on THIS machine (the coordinator). Never pulls."""
+    hit = _image_present_cache.get(image)
+    if hit is not None:
+        return hit[0]
+    from control_plane.resolver import imageprobe
+
+    try:
+        present = imageprobe.image_id(image) is not None
+    except Exception:
+        present = False
+    _image_present_cache.put(image, (present,))
+    return present
+
+
+def _runtimes_payload() -> list[dict]:
+    from control_plane.deploy import flags
+    from control_plane.deploy.recipes import container_image
+
+    reasoning = sorted(getattr(flags, "VLLM_REASONING_PARSERS", ()) or ())
+    tools = sorted(getattr(flags, "VLLM_TOOL_CALL_PARSERS", ()) or ())
+    out: list[dict] = []
+    for name, spec in flags.RUNTIMES.items():
+        image = container_image(spec)
+        is_vllm = name == "vllm"
+        supported = getattr(spec, "engine_options_supported", None)
+        if supported is None:
+            supported = frozenset({"env"})
+        out.append({
+            "name": name,
+            "display_name": _RUNTIME_DISPLAY.get(name, name),
+            "memory_pool": spec.memory_pool,
+            "formats": ["gguf"] if spec.memory_pool == "host" else ["safetensors"],
+            "image": image,
+            "image_present": _image_present(image),
+            "supports": {
+                "speculative": spec.speculative_config_arg is not None,
+                "graph_capture": spec.enforce_eager_arg is not None
+                or spec.cudagraph_capture_sizes_arg is not None,
+                "kv_dtype": spec.kv_cache_dtype_arg is not None,
+                "quantization": spec.quantization_arg is not None,
+                "expert_parallel": spec.expert_parallel_arg is not None,
+                "shards": bool(spec.shards),
+            },
+            "kv_dtypes": sorted(flags.VLLM_KV_CACHE_DTYPES) if is_vllm else [],
+            # Bytes per cache element the fit gate charges for each listed
+            # dtype. Only names the gate prices: one it does not (auto, nvfp4,
+            # turboquant_*) is absent rather than shown at the fallback width.
+            "kv_dtype_bytes": {
+                name: KV_ELEM_BYTES[name]
+                for name in sorted(flags.VLLM_KV_CACHE_DTYPES)
+                if name in KV_ELEM_BYTES
+            } if is_vllm else {},
+            "engine_options": sorted(supported),
+            "reasoning_parsers": reasoning if is_vllm else [],
+            "tool_call_parsers": tools if is_vllm else [],
+            "nccl_tunables": sorted(flags.NCCL_TUNABLES),
+            "version": _VLLM_VERSION if is_vllm else None,
+        })
+    return out
+
+
 #: Enumerations that FAILED, so a retry is cheap.
 #:
 #: ``_variant_cache`` is only ever written on success, which meant a model

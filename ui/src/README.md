@@ -55,8 +55,9 @@ that.
 
 The router is outermost because the address bar is the question, and `useRouter`
 is the other hook that throws on absence — the one with the most call sites
-below it: `AppShell`, `Header`, `ModelsTab`, `ServePanel`, `SetupTab`,
-`placement.ts` and `selection.tsx` all call it.
+below it: `AppShell`, `Header`, `ModelsTab`, the Models tab's `useModelSession`,
+`VerdictBox` and `ModelToolbar`, `SetupTab`, `placement.ts` and `selection.tsx`
+all call it.
 
 `SelectionProvider` is deliberately not here. `shell/AppShell.tsx` mounts it,
 because which node, link, deployment and sheet are open is shell state that

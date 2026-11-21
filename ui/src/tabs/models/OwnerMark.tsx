@@ -6,7 +6,7 @@ import { avatarUrl, ownerAccent, ownerInitials, subscribeAvatars } from './owner
  *  One component for both sizes, because the decision it makes — is there an
  *  avatar to draw, and what colour is the tile behind it — is the same on a
  *  44px card and on an 18px list row, and it was previously written out inside
- *  `ModelCard`.
+ *  the old card grid's `ModelCard`.
  *
  *  **`variant` picks a CSS class pair rather than emitting inline sizes.** The
  *  card keeps `.mcard-avatar`/`.mcard-initials` exactly as they were, so the

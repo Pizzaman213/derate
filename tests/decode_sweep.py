@@ -385,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
              "choose the fullest machine, and a sweep wants the emptiest.",
     )
     ap.add_argument("--context", type=int, default=8192, help="context to launch at")
-    ap.add_argument("--workload", default="prose", help="prompt set from spec_data/")
+    ap.add_argument("--workload", default="prose", help="prompt set from control_plane/bench_data/")
     ap.add_argument("--tokens", type=int, default=200, help="max_tokens per request")
     ap.add_argument(
         "--prompt-tokens", type=int, default=0,

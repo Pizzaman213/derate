@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import fields, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from enum import Enum
 from collections.abc import Mapping
 from typing import Any
@@ -32,6 +32,8 @@ from control_plane.contracts import (
 # each holding their own "***" is two things to change on the day it stops
 # being one. Imported here rather than referenced through `config.` because
 # this module's own callers reach for `serialize.REDACTED`.
+from control_plane.contracts.deployment import EngineOptions, Lifecycle
+from control_plane.deploy import relaunch
 from control_plane.providers.config import REDACTED
 # Re-exported: these read a NodeState, which the registry owns, and the
 # registry's own payloads have to apply the same rule. Callers here reach
@@ -651,6 +653,18 @@ def deployment_payload(deployment: Deployment, *, error_chars: int | None = None
         "trust_remote_code": bool(getattr(deployment, "trust_remote_code", False)),
         "image": getattr(deployment, "image", "") or "",
         "image_id": getattr(deployment, "image_id", "") or "",
+        "engine_options": relaunch.engine_options_wire(
+            getattr(deployment, "engine_options", EngineOptions())
+        ),
+        "lifecycle": asdict(getattr(deployment, "lifecycle", Lifecycle())),
+        "original_window": getattr(deployment, "original_window", None),
+        # The launch body that reproduces this deployment, for "roll back"
+        # and "serve again": one builder, the same one a crash relaunch uses.
+        "relaunch_request": (
+            relaunch.launch_request_from(deployment)
+            if deployment.shape and deployment.plan
+            else None
+        ),
     }
 
 

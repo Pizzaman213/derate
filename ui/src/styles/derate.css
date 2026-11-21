@@ -38,8 +38,8 @@
        `--live-solid`/`--warn-solid`/`--fault-solid` with `--on-signal` text
        (nothing in this file sets one directly -- those are inline, per
        instance, in the component that fills a `.dot`); running *text* stays
-       on the plain `--live`/`--warn`/`--fault` trio, as `.verdict.bad` and
-       `.swapbar` already do below. */
+       on the plain `--live`/`--warn`/`--fault` trio, as `.mdl-sig-fault` and
+       `.mdl-error` already do below. */
 
 .ghost {
   border: none;
@@ -300,17 +300,6 @@ h3 {
   padding: var(--space-5) var(--space-8);
 }
 
-/* Why the runtime picker above is on the value it is on, when this screen
- * chose that value rather than the reader. A `.fld` is a column, so this sits
- * directly under the control it explains; bounded so a sentence cannot stretch
- * the toolbar it lives in, and `text-wrap: balance` because two ragged lines
- * under a narrow control read worse than two even ones. */
-.sp-runtime-note {
-  margin: 4px 0 0;
-  max-width: 34ch;
-  text-wrap: balance;
-}
-
 .big {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
@@ -383,51 +372,6 @@ h3 {
   padding: var(--space-3) 0;
 }
 
-.verdict {
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  padding: var(--space-12);
-  margin-bottom: var(--space-13);
-  font-size: var(--size-label);
-  display: none;
-  background: var(--panel);
-}
-.verdict.on {
-  display: block;
-}
-.verdict.bad {
-  border-color: var(--fault);
-}
-.vhead {
-  font-weight: 500;
-  margin-bottom: var(--space-7);
-}
-/* The Verdict card's mode tabs, drawn onto its own top edge rather than as a
- * control floating above it -- a filing-cabinet tab, not a settings toggle.
- * Negative margins cancel .verdict's own padding and lift the row 1px past
- * its border, so the tab sits ON that line; the active tab's bottom border
- * then matches the card's background rather than the rule, erasing the seam
- * so it reads as fused with the card rather than resting on top of it. */
-.verdict-modetabs {
-  display: flex;
-  gap: var(--space-4);
-  margin: calc(-1 * var(--space-12) - var(--space-1)) calc(-1 * var(--space-12)) 0;
-  padding: 0 var(--space-12);
-}
-.verdict-modetabs button {
-  border: 1px solid var(--rule);
-  border-radius: var(--radius) var(--radius) 0 0;
-  padding: var(--space-5) var(--space-12);
-  background: var(--panel-recessed);
-  color: var(--ink-muted);
-  font-size: var(--size-label);
-}
-.verdict-modetabs button[aria-pressed='true'] {
-  background: var(--panel);
-  color: var(--ink);
-  font-weight: 500;
-  border-bottom-color: var(--panel);
-}
 .budget {
   display: flex;
   height: 20px;
@@ -861,20 +805,6 @@ svg text.m {
   background: var(--fill);
   color: var(--on-fill);
   border-color: var(--fill);
-}
-.swapbar {
-  display: none;
-  align-items: center;
-  gap: var(--space-10);
-  padding: var(--space-9) var(--space-12);
-  margin-bottom: var(--space-12);
-  font-size: var(--size-label);
-  border: 1px solid var(--warn);
-  border-radius: var(--radius);
-  background: var(--panel);
-}
-.swapbar.on {
-  display: flex;
 }
 .subs {
   display: flex;
@@ -1543,108 +1473,12 @@ svg text.m {
   font-size: var(--size-unit);
 }
 
-/* ── Model cards ────────────────────────────────────────────────────────────
+/* ── Publisher marks ─────────────────────────────────────────────────────────
  *
- * The picker's browse view. Geometry follows Unsloth Studio's hub card --
- * 204x128, avatar left, name at two lines, numbers on the bottom edge -- which
- * is what makes a few hundred models scannable rather than exhausting.
- * Written from that behaviour; their stylesheet is AGPL-3.0-only and none of
- * it is copied.
- *
- * `--accent` is set per card in JS: the publisher's own logo colour when the
- * avatar could be read, a hashed palette hue otherwise. It is the one
- * decorative colour in this codebase and it is confined to these rules. The
- * status dots on the card still use the three signal colours, and nothing
- * here reassigns them.
+ * `OwnerMark variant="card"` draws these: the publisher's avatar, or an
+ * accent tile with their monogram. The accent is set per mark in JS and is
+ * confined to the tile.
  */
-
-.mgrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(204px, 1fr));
-  gap: var(--space-12);
-  padding: var(--space-12) 0 var(--space-16);
-}
-
-.mcard {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  height: 128px;
-  padding: var(--space-12) var(--space-12) var(--space-11);
-  text-align: left;
-  overflow: hidden;
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  background: var(--panel);
-  cursor: pointer;
-  isolation: isolate;
-}
-
-.mcard:hover {
-  border-color: var(--rule-strong);
-}
-.mcard:focus-visible {
-  outline: var(--focus);
-  outline-offset: 2px;
-}
-
-.mcard-top {
-  display: flex;
-  /* The mark reads as the card's anchor, so it sits on the middle of the name
-     block rather than on the first line of it: at one line of title the avatar
-     is the taller of the two and used to overhang the owner, and at two it sat
-     high against a block half again its height. Centred, the same card reads
-     the same at either length. The dots are the exception -- they belong on
-     the title's own line, so they opt out below. */
-  align-items: center;
-  gap: var(--space-10);
-  min-width: 0;
-}
-
-/* The publisher's mark, and the aura behind it.
- *
- * The aura used to be an ellipse dropped at a position hashed from the model
- * id -- deterministic, but unrelated to anything on the card, which is why it
- * read as a smudge rather than as light. It is anchored to the mark instead:
- * one core immediately behind the image, spilling a rim of the publisher's own
- * colour around an otherwise flat tile, falling off into the wash that is the
- * card's background. A grid still does not look stamped, because `--accent` is
- * the avatar's own dominant colour and so differs card to card; it just varies
- * in hue now instead of in position.
- *
- * The wrapper exists because `.mcard-avatar` clips (`overflow: hidden`) and
- * the aura has to bleed well past it. `.mcard` clips it again at the card
- * edge, which is what keeps it inside the tile. */
-.mcard-mark {
-  position: relative;
-  flex: 0 0 auto;
-  display: flex;
-}
-.mcard-mark::before {
-  content: '';
-  position: absolute;
-  /* The mark is 44x44, so this is a 236x176 field centred on it. */
-  inset: calc(-1 * var(--space-66)) calc(-1 * var(--space-96));
-  z-index: var(--z-below);
-  pointer-events: none;
-  background:
-    radial-gradient(
-      40px 40px at 50% 50%,
-      color-mix(in srgb, var(--accent) 52%, transparent),
-      transparent 100%
-    ),
-    radial-gradient(
-      50% 50% at 50% 50%,
-      color-mix(in srgb, var(--accent) 22%, transparent),
-      transparent 72%
-    );
-  opacity: 0.85;
-  transition: opacity var(--dur) var(--ease);
-}
-.mcard:hover .mcard-mark::before {
-  opacity: 1;
-}
-
 .mcard-avatar {
   position: relative;
   flex: 0 0 auto;
@@ -1675,278 +1509,12 @@ svg text.m {
   color: var(--on-accent);
 }
 
-.mcard-id {
-  min-width: 0;
-  flex: 1 1 auto;
-  display: block;
-}
-.mcard-name {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  font-size: var(--size-title-sm);
-  line-height: 16px;
-  font-weight: 600;
-  color: var(--ink);
-  overflow-wrap: anywhere;
-}
-.mcard-owner {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  min-width: 0;
-  margin-top: var(--space-2);
-  font-size: var(--size-caption);
-  line-height: 15px;
-  color: var(--ink-muted);
-}
-.mcard-owner-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.mcard-verified {
-  flex: 0 0 auto;
-  font-size: var(--size-badge);
-  line-height: 1;
-  color: var(--accent);
-}
-
-.mcard-dots {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex: 0 0 auto;
-  /* Not centred with the rest of the row: a signal lamp belongs beside the
-     name it is about, which is the row's first line. */
-  align-self: flex-start;
-  margin-top: var(--space-3);
-}
-.mcard-glyph {
-  font-size: var(--size-micro);
-  line-height: 1;
-  color: var(--warn);
-}
-
-.mcard-foot {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: var(--space-8);
-  margin-top: auto;
-  padding-top: var(--space-10);
-  min-width: 0;
-}
-.mcard-stats {
-  display: flex;
-  align-items: center;
-  gap: var(--space-9);
-  min-width: 0;
-  font-family: var(--font-mono);
-  font-size: var(--size-mono-unit);
-  font-variant-numeric: tabular-nums;
-  color: var(--ink-muted);
-}
-.mcard-stat {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-3);
-  white-space: nowrap;
-}
-
-/* ── Toolbar controls ─────────────────────────────────────────────────────── */
-
-/* The pill search field and pill dropdowns Studio uses across the hub. Applied
- * only inside the models toolbar so nothing else in the app changes shape. */
-.mbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-8);
-  padding: var(--space-12) 0 var(--space-8);
-}
-.mbar-search {
-  position: relative;
-  flex: 1 1 220px;
-  min-width: 180px;
-}
-.mbar-search input {
-  width: 100%;
-  height: 34px;
-  padding: 0 var(--space-34) 0 var(--space-30);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  background: var(--panel-recessed);
-}
-.mbar-search .mbar-icon {
-  position: absolute;
-  left: var(--space-12);
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--ink-muted);
-  font-size: var(--size-label);
-  pointer-events: none;
-}
-.mbar-search .mbar-clear {
-  position: absolute;
-  right: var(--space-6);
-  top: 50%;
-  transform: translateY(-50%);
-  border: 0;
-  border-radius: var(--radius);
-  padding: var(--space-2) var(--space-7);
-  color: var(--ink-muted);
-}
-.mbar select,
-.mbar .ddtrigger {
-  height: 34px;
-  border-radius: var(--radius);
-  padding: 0 var(--space-8);
-  background: var(--panel-recessed);
-}
-
-/* The provider allowlist: a flat list of what one provider publishes, with a
- * toggle each. Deliberately reuses `.mbar-search` above, whose comment scopes
- * it to the models toolbar -- this is the second place in the app where you
- * search a long list of model names, and giving it a second look-alike field
- * would be a difference that means nothing. The scroll lives here rather than
- * on the row so the search box stays put while the list moves under it. */
-.pmodels {
-  padding: var(--space-8) 0;
-}
-.pmodels-list {
-  max-height: 320px;
-  overflow-y: auto;
-  margin-top: var(--space-8);
-  padding-right: var(--space-8);
-}
-.pmodels-list .sw {
-  padding: var(--space-4) 0;
-}
-
-/* Cards-or-rows, the same two-position toggle Studio uses for models-or-datasets. */
-.mview {
-  display: inline-flex;
-  align-items: center;
-  height: 34px;
-  padding: var(--space-3);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  background: var(--panel-recessed);
-  flex: 0 0 auto;
-}
-.mview button {
-  border: 0;
-  border-radius: var(--radius);
-  height: 26px;
-  padding: 0 var(--space-11);
-  color: var(--ink-muted);
-  background: transparent;
-}
-.mview button[aria-pressed='true'] {
-  background: var(--fill);
-  color: var(--on-fill);
-}
-
-/* ── Models: master / detail split ──────────────────────────────────────────
+/* ── Pick-one rows ───────────────────────────────────────────────────────────
  *
- * Studio's hub is a split: a narrow master pane of one-card-per-row on the
- * left, the model itself on the right. It is the right shape for this screen
- * because choosing a model is comparison work -- you read a fit verdict, go
- * back, read the next one -- and a modal that covers the list makes you hold
- * the previous answer in your head. The list stays put and the right pane
- * changes under it.
- *
- * The app's own right sidebar collapses on this destination (AppShell), which
- * is where the width for the detail pane comes from.
+ * A tick or a radio, a label, and facts beside it. `ProviderPicker` and the
+ * speculative head list draw their rows with this; the selected one carries
+ * the same wash selection uses everywhere else.
  */
-
-/* One column until a model is open, then master and detail. The list is the
- * whole screen while you are still choosing; the narrow master pane only earns
- * its narrowness once there is something beside it worth the room. */
-.msplit {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: var(--space-12);
-  align-items: start;
-}
-.msplit.detail {
-  grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
-}
-
-/* The master pane's rows stack onto two lines, so the row rule has to clear
- * both rather than sitting between them. */
-.msplit.detail .deprow {
-  align-items: start;
-  padding: var(--space-8) 0;
-}
-
-.msplit-list,
-.msplit-detail {
-  min-width: 0;
-}
-
-/* Each pane scrolls on its own, so reading a long ladder never scrolls the
- * list out from under the thing being compared. Only in the split: full width,
- * the list is the page and capping it would strand a scrollbar inside another
- * one. */
-.msplit.detail .msplit-list .mpanel,
-.msplit-detail-body {
-  max-height: calc(100vh - 300px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-width: thin;
-}
-
-/* One card per row in the master pane: at 300px the auto-fill grid would place
- * one anyway, but saying so keeps the card from stretching oddly at 360px. */
-.mgrid.split {
-  grid-template-columns: 1fr;
-  gap: var(--space-8);
-}
-.mgrid.split .mcard {
-  height: auto;
-  min-height: 104px;
-}
-
-/* The selected row, in both views. Same wash the deployments strip uses for
- * selection, so it reads as the same idea. */
-.mcard[aria-current='true'] {
-  border-color: var(--rule-strong);
-  background: var(--panel-sunk);
-}
-.deprow[aria-current='true'] {
-  background: var(--panel-sunk);
-}
-
-/* Below the split's own breakpoint the panes stack: the list first, the detail
- * under it, which is the phone shape and needs no separate design. */
-@media (max-width: 1100px) {
-  .msplit.detail {
-    grid-template-columns: 1fr;
-  }
-  .msplit.detail .msplit-list .mpanel,
-  .msplit-detail-body {
-    max-height: none;
-  }
-}
-
-/* ── Models: the machine board ──────────────────────────────────────────────
- *
- * Six facts per machine, one row each, in cluster order. A grid rather than a
- * `<table>` because two of the cells are two lines tall (a figure over its
- * proportion bar; a name over its id) and a row can carry a full-width note
- * underneath -- the registry's sentence for a machine it will not vouch for.
- *
- * It scrolls sideways rather than reflowing. The detail pane is already the
- * narrow half of a split, and a board that collapsed its columns at this width
- * would drop exactly the figures somebody opened it to compare.
- */
-.nboard-scroll {
-  overflow-x: auto;
-}
-.nboard-head,
 .nboard-row {
   display: grid;
   grid-template-columns:
@@ -1955,25 +1523,12 @@ svg text.m {
   gap: var(--space-12);
   align-items: start;
   min-width: 640px;
-}
-.nboard-head {
-  font-size: var(--size-micro);
-  font-weight: 500;
-  color: var(--ink-muted);
-  letter-spacing: 0.04em;
-  padding-bottom: var(--space-6);
-  border-bottom: 1px solid var(--rule);
-}
-.nboard-row {
   padding: var(--space-9) 0;
   border-bottom: 1px solid var(--rule);
 }
 .nboard-row:last-child {
   border-bottom: none;
 }
-/* The ticked machines carry the same wash selection uses everywhere else, so
- * "this one is in the deployment" reads as the same idea as "this one is
- * selected" rather than a second vocabulary. */
 .nboard-row.on {
   background: var(--panel-sunk);
 }
@@ -1986,10 +1541,1665 @@ svg text.m {
 .nboard-row > input[type='checkbox']:disabled + label {
   cursor: default;
 }
-/* Indented under the machine it is about, clear of the tick column. */
-.nboard-note {
+
+/* ── Models tab ──────────────────────────────────────────────────────────────
+ *
+ * A toolbar over a resizable split: the list on the left (four views of one
+ * merged list), one model's detail on the right. Every class is `mdl-`
+ * prefixed. Grid column widths below are layout, not tokens.
+ */
+
+.mdl-tab {
+  display: grid;
+  gap: var(--space-12);
+}
+/* The panes already run to the window's bottom edge (`--mdl-chrome`), so on
+   this tab <main> is sized by them. Its shell-wide min-height assumes a 55px
+   header that is ~62px now, which added a 7px page scroll under two panes
+   that each scroll themselves. */
+main:has(> section:not([hidden]) > .mdl-tab) {
+  min-height: 0;
+}
+/* The detail pane is a SHARE of the split (`--mdl-side`, a percentage), so a
+   zoomed-out or very wide window widens both panes instead of stretching only
+   the list. The floors are the same ones SplitHandle clamps to. */
+.mdl-split {
+  display: grid;
+  grid-template-columns: minmax(440px, 1fr) 10px clamp(420px, var(--mdl-side), calc(100% - 450px));
+  align-items: stretch;
+}
+/* Nothing open: the list is the page. */
+.mdl-split-solo {
+  grid-template-columns: minmax(0, 1fr);
+}
+.mdl-split > .card2 {
+  margin: 0;
+  min-width: 0;
+}
+/* To the bottom of the window: `--mdl-chrome` is the page's height outside the
+   panes (what sits above the split plus <main>'s gutter below it), measured by
+   ModelsTab. */
+.mdl-pane {
+  height: calc(100dvh - var(--mdl-chrome));
+  min-height: 50vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+/* The seam: a hairline that thickens under the pointer or focus. */
+.mdl-handle {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+}
+.mdl-handle::before {
+  content: '';
+  position: absolute;
+  top: var(--space-24);
+  bottom: var(--space-24);
+  left: 50%;
+  width: 1px;
+  background: var(--rule);
+  transition: background var(--dur-fast);
+}
+.mdl-handle:hover::before,
+.mdl-handle:focus-visible::before {
+  width: var(--space-2);
+  background: var(--rule-strong);
+}
+@media (max-width: 1100px) {
+  .mdl-split {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-12);
+  }
+  .mdl-handle {
+    display: none;
+  }
+  .mdl-pane {
+    height: auto;
+    max-height: 92vh;
+  }
+}
+
+/* Toolbar: one bordered bar whose children stretch to its height, so the
+ * controls share one centre at every width. */
+.mdl-toolbar {
+  display: grid;
+  gap: var(--space-8);
+}
+.mdl-search {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-6);
+  height: calc(var(--control-h) + var(--space-6));
+  padding: var(--space-2);
+  background: var(--panel-raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+.mdl-search > * {
+  height: auto;
+}
+.mdl-search-box {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  padding: 0 var(--space-6);
+}
+.mdl-search-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink-muted);
+}
+.mdl-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: var(--size-label);
+  padding: 0;
+}
+.mdl-search-input:focus {
+  outline: none;
+}
+.mdl-search-input::placeholder {
+  color: var(--input-placeholder);
+}
+.mdl-search-clear,
+.mdl-filter-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2);
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  cursor: pointer;
+}
+.mdl-search-clear:hover,
+.mdl-filter-remove:hover {
+  color: var(--ink);
+}
+.mdl-search-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+  white-space: nowrap;
+  font-size: var(--size-unit);
+}
+.mdl-search-btn[aria-pressed='true'],
+.mdl-search-btn[aria-expanded='true'] {
+  background: var(--toggle-on-bg);
+  color: var(--toggle-on-fg);
+  border-color: var(--toggle-on-bg);
+}
+.mdl-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--space-16);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-sm);
+  background: var(--toggle-on-bg);
+  color: var(--toggle-on-fg);
+  font-size: var(--size-badge);
+  font-weight: 500;
+  line-height: var(--space-16);
+}
+.mdl-search-btn[aria-pressed='true'] .mdl-badge,
+.mdl-search-btn[aria-expanded='true'] .mdl-badge {
+  background: var(--toggle-on-fg);
+  color: var(--toggle-on-bg);
+}
+
+/* Suggestions: under the input, over the list. */
+.mdl-suggest {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: var(--popover-z);
+  margin-top: var(--space-4);
+  background: var(--panel-raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  box-shadow: var(--popover-shadow);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.mdl-suggest-section {
+  padding: var(--space-4) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.mdl-suggest-title {
+  padding: var(--space-4) var(--space-10);
+  font-size: var(--size-micro);
+  font-weight: 500;
+  color: var(--ink-muted);
+}
+/* Mark, lamp and name packed to the left, the note pushed to the right.
+   `space-between` used to spread four children evenly once the mark and the
+   lamp were added, which floated the name into the middle of the row. */
+.mdl-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+  padding: var(--space-6) var(--space-10);
+  cursor: pointer;
+}
+.mdl-suggest-item[aria-selected='true'],
+.mdl-suggest-item:hover {
+  background: var(--row-hover);
+}
+.mdl-suggest-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--size-mono-label);
+  color: var(--ink);
+}
+.mdl-suggest-note {
+  flex: none;
+  margin-left: auto;
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+}
+.mdl-suggest-foot {
+  padding: var(--space-6) var(--space-10);
+  font-size: var(--size-micro);
+  color: var(--ink-muted);
+}
+.mdl-suggest mark,
+.mdl-row mark {
+  background: none;
+  color: var(--ink);
+  font-weight: 500;
+  text-decoration: underline;
+}
+
+/* Filter chips, link note. */
+.mdl-filters,
+.mdl-linknote {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+}
+.mdl-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-6);
+  border: 1px solid var(--chip-border);
+  border-radius: var(--chip-radius);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
+  font-size: var(--size-mono-label);
+}
+.mdl-linknote {
+  color: var(--ink-muted);
+}
+/* The filter dropdown: a panel of categories under the "fits: on: quant:"
+   button, right-aligned to it because the button sits at the bar's right. */
+.mdl-fmenu {
+  position: relative;
+  display: flex;
+}
+.mdl-fmenu > .mdl-search-btn {
+  width: 100%;
+}
+.mdl-fmenu-panel {
+  position: absolute;
+  top: calc(100% + var(--space-4));
+  right: 0;
+  z-index: 6;
+  width: max-content;
+  max-width: 92vw;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: var(--space-6);
+  background: var(--panel-raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-raised);
+}
+.mdl-fmenu-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--space-10) var(--space-12);
+  width: min(820px, 88vw);
+}
+.mdl-fmenu-group {
+  display: grid;
+  align-content: start;
+  gap: var(--space-1);
+}
+/* The token on one line, its note under it: a long kind
+   (task:automatic-speech-recognition) or a machine's free memory never has to
+   share a line, so neither is cut off or runs into the next column. */
+.mdl-fmenu-item {
+  display: grid;
+  grid-template-columns: var(--space-14) minmax(0, 1fr);
+  align-items: center;
+  column-gap: var(--space-6);
+  width: 100%;
+  padding: var(--space-4) var(--space-6);
+  border: none;
+  border-radius: var(--radius);
+  background: none;
+  text-align: left;
+  font-size: var(--size-unit);
+}
+.mdl-fmenu-item:hover,
+.mdl-fmenu-item:focus-visible {
+  background: var(--hover);
+}
+.mdl-fmenu-item[aria-checked='true'] .mdl-fmenu-token {
+  font-weight: 500;
+}
+.mdl-fmenu-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.mdl-fmenu-token {
+  font-size: var(--size-mono-label);
+  overflow-wrap: anywhere;
+}
+.mdl-fmenu-note {
+  grid-column: 2;
+  color: var(--ink-muted);
+}
+
+/* The row list. */
+.mdl-list {
+  display: grid;
+  gap: var(--space-8);
+}
+.mdl-row-grid {
+  display: grid;
+  grid-template-columns: 108px minmax(0, 1fr) 64px 84px 104px 84px;
+  align-items: center;
+  column-gap: var(--space-8);
+}
+.mdl-thead {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  padding: var(--space-6);
+  background: var(--panel-recessed);
+  border-bottom: 1px solid var(--rule-strong);
+  font-size: var(--size-micro);
+  font-weight: 500;
+  color: var(--table-header-fg);
+}
+.mdl-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.mdl-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-8);
+  padding: var(--space-12) var(--space-6) var(--space-6);
+  font-size: var(--size-micro);
+  font-weight: 500;
+  color: var(--ink-muted);
+}
+.mdl-group-toggle {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.mdl-group-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  font-size: var(--size-micro);
+  font-weight: 500;
+  color: var(--ink-muted);
+}
+.mdl-row {
+  width: 100%;
+  min-height: 0;
+  height: auto;
+  padding: var(--space-8) var(--space-6);
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-weight: 400;
+  cursor: pointer;
+  transition: background var(--dur-fast);
+}
+.mdl-row:hover {
+  background: var(--row-hover);
+}
+.mdl-row[aria-current='true'] {
+  background: var(--row-selected);
+  box-shadow: inset var(--space-2) 0 0 var(--ink);
+}
+.mdl-cell-verdict {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  min-width: 0;
+  white-space: nowrap;
+}
+.mdl-cell-model {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.mdl-cell-name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  min-width: 0;
+}
+.mdl-ellipsis {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The id wraps rather than ellipsising: `Qwen/Q…` is every Qwen model, and
+ * at the split's default width the column is narrower than most ids. */
+.mdl-id {
+  min-width: 0;
+  font-size: var(--size-mono-label);
+  overflow-wrap: anywhere;
+}
+.mdl-facts {
+  color: var(--ink-muted);
+}
+.mdl-hubgroup {
+  margin-top: var(--space-8);
+  border-top: 1px dashed var(--rule-strong);
+}
+.mdl-wont {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin: 0;
+}
+.mdl-textbtn {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.mdl-fatal {
+  font-weight: 400;
+  color: var(--fault);
+  white-space: pre-wrap;
+}
+
+/* Hub cards and worth-trying tiles. */
+.mdl-hub {
+  display: grid;
+  gap: var(--space-12);
+}
+.mdl-hub-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-12);
+}
+.mdl-chips {
+  margin: 0;
+}
+/* A publisher mark inside a chip: sized to the chip's 12px label rather than
+   the 18px list tile, centred on it, and spaced off it, so "Unsloth quants"
+   stands as tall as "Original repos" beside it. */
+.mdl-chips button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+.mdl-chips .omark {
+  width: var(--space-14);
+  height: var(--space-14);
+  vertical-align: middle;
+}
+.mdl-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+.mdl-hub-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-10);
+}
+.mdl-hub-card,
+.mdl-worth-tile {
+  display: grid;
+  align-content: start;
+  gap: var(--space-8);
+  height: auto;
+  min-width: 0;
+  padding: var(--space-12);
+  background: var(--tile-bg);
+  border: 1px solid var(--tile-border);
+  border-radius: var(--radius);
+  color: var(--ink);
+  text-align: left;
+  font-weight: 400;
+  cursor: pointer;
+  transition: border-color var(--dur-fast);
+}
+.mdl-hub-card:hover,
+.mdl-worth-tile:hover {
+  border-color: var(--tile-border-hover);
+}
+.mdl-hub-card[aria-current='true'] {
+  border-color: var(--accent);
+}
+.mdl-hub-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-10);
+  min-width: 0;
+}
+.mdl-hub-card-name {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.mdl-hub-card-repo {
+  font-size: var(--size-title-sm);
+  font-weight: 500;
+}
+.mdl-pills {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+.mdl-pill {
+  padding: var(--space-1) var(--space-6);
+  border: 1px solid var(--pill-border);
+  border-radius: var(--radius-sm);
+  color: var(--pill-fg);
+  font-size: var(--size-badge);
+}
+.mdl-hub-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-8);
+  padding-top: var(--space-8);
+  border-top: 1px solid var(--rule);
+}
+.mdl-hub-card-verdict {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  min-width: 0;
+}
+.mdl-worth {
+  display: grid;
+  gap: var(--space-8);
+  margin-top: var(--space-16);
+}
+.mdl-worth-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-8);
+}
+.mdl-worth-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-8);
+}
+
+/* Downloads. */
+.mdl-downloads {
+  display: grid;
+  gap: var(--space-10);
+}
+.mdl-dl-row {
+  display: grid;
+  gap: var(--space-4);
+  padding-bottom: var(--space-8);
+  border-bottom: 1px solid var(--rule);
+}
+.mdl-dl-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-12);
+  min-width: 0;
+}
+.mdl-dl-status {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-6);
+  min-width: 0;
+}
+.mdl-fault {
+  color: var(--fault);
+  border-left: var(--space-2) solid var(--fault);
+  padding-left: var(--space-6);
+}
+.mdl-bar {
+  height: var(--space-6);
+  background: var(--bar-track);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.mdl-bar-fill {
+  height: 100%;
+  background: var(--bar-fill);
+}
+.mdl-bar-fault {
+  background: var(--fault);
+}
+.mdl-dl-pull {
+  margin-top: var(--space-6);
+}
+
+/* The detail pane. */
+/* A column, not a grid: the footer's `margin-top: auto` only pins it to the
+   bottom of the pane in flex layout. As a grid with `align-content: start`
+   a short tab (History, Benchmarks) left the footer floating mid-pane. */
+.mdl-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-12);
+  min-height: 100%;
+}
+.mdl-detail > .subs {
+  margin: 0;
+}
+.mdl-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-12);
+  min-width: 0;
+}
+.mdl-head-text {
+  display: grid;
+  gap: var(--space-4);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.mdl-head-id {
+  margin: 0;
+  font-size: var(--size-title);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+/* A segmented control: where to serve, file format. */
+.mdl-seg {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+.mdl-seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  border: 0;
+  padding: var(--space-3) var(--space-10);
+  font-size: var(--size-unit);
+  color: var(--ink-muted);
+}
+.mdl-seg button[aria-pressed='true'] {
+  background: var(--toggle-on-bg);
+  color: var(--toggle-on-fg);
+}
+.mdl-dest {
+  justify-self: start;
+}
+
+/* The verdict. */
+.mdl-verdict {
+  display: grid;
+  gap: var(--space-10);
+  padding: var(--space-14);
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+.mdl-verdict[aria-busy='true'] {
+  opacity: var(--opacity-72);
+}
+.mdl-verdict-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-10);
+  min-width: 0;
+}
+.mdl-word {
+  font-size: var(--size-readout-sm);
+  font-weight: 500;
+}
+.mdl-sig-live {
+  color: var(--live);
+}
+.mdl-sig-warn {
+  color: var(--warn);
+}
+.mdl-sig-fault {
+  color: var(--fault);
+}
+.mdl-sig-idle {
+  color: var(--ink-muted);
+}
+.mdl-where {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--size-label);
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+}
+.mdl-figure {
+  font-size: var(--size-mono-label);
+  white-space: nowrap;
+}
+.mdl-primary {
+  background: var(--fill);
+  color: var(--on-fill);
+  border-color: var(--fill);
+  font-weight: 500;
+}
+.mdl-primary:hover {
+  background: var(--fill);
+  opacity: var(--opacity-85);
+}
+.mdl-say {
+  display: grid;
+  gap: var(--space-4);
+  margin: 0;
+}
+.mdl-fixes {
+  margin: 0;
+  font-weight: 400;
+  color: var(--ink-muted);
+}
+.mdl-refusal {
+  padding-left: var(--space-10);
+  border-left: var(--space-2) solid var(--fault);
+}
+.mdl-gates {
+  display: grid;
+  gap: var(--space-12);
+}
+.mdl-caveats {
+  display: grid;
+  gap: var(--space-6);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mdl-caveats li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-8);
+}
+.mdl-caveat-icon {
+  display: inline-flex;
+  color: var(--warn);
+  padding-top: var(--space-1);
+}
+.mdl-error {
+  margin: 0;
+  font-weight: 400;
+  color: var(--fault);
+  white-space: pre-wrap;
+}
+.mdl-pulled {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-6);
+  margin: 0;
+}
+
+/* Where it runs: one bar per machine. */
+.mdl-nodes {
+  display: grid;
+  gap: var(--space-8);
+  padding-top: var(--space-10);
+  border-top: 1px solid var(--rule);
+}
+.mdl-nodes-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+}
+.mdl-nodes-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+  margin-left: auto;
+}
+.mdl-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-14);
+}
+.mdl-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+.mdl-swatch {
+  display: inline-block;
+  width: var(--space-10);
+  height: var(--space-10);
+  border-radius: var(--radius-sm);
+}
+.mdl-swatch-used {
+  background: var(--rule-strong);
+}
+.mdl-swatch-model {
+  background: var(--bar-fill);
+}
+.mdl-swatch-other {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--rule-strong) 0 var(--space-2),
+    transparent var(--space-2) var(--space-4)
+  );
+  box-shadow: inset 0 0 0 1px var(--rule);
+}
+.mdl-node {
+  display: grid;
+  grid-template-columns: 18px minmax(96px, 150px) minmax(0, 1fr) 96px;
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-node-name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  min-width: 0;
+  cursor: pointer;
+}
+.mdl-node-name .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--size-mono-label);
+}
+.mdl-node > .unit {
+  text-align: right;
+  white-space: nowrap;
+}
+.mdl-nbar {
+  display: flex;
+  height: var(--space-18);
+  background: var(--bar-track);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px var(--bar-keyline);
+}
+/* Every segment is a flex row so its label is centred on the bar's height;
+   `display: block` here used to win over the segment classes and drop the
+   text onto the line's baseline, below the middle. */
+.mdl-nbar i {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  min-width: 0;
+  overflow: hidden;
+  font-style: normal;
+}
+.mdl-nbar i span {
+  padding: 0 var(--space-6);
+  font-size: var(--size-badge);
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A hairline in the panel colour between segments, so two models in near
+   shades still read as two. */
+.mdl-nbar-used {
+  background: var(--rule-strong);
+  box-shadow: inset -1px 0 0 var(--panel);
+}
+.mdl-nbar-used.alt {
+  background: var(--rule);
+}
+/* Memory in use that no deployment here accounts for: hatched, not a shade,
+   because it is not a model and must not read as one. */
+.mdl-nbar-used.other {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--rule-strong) 0 var(--space-2),
+    transparent var(--space-2) var(--space-4)
+  );
+}
+.mdl-nbar-model {
+  background: var(--bar-fill);
+  color: var(--on-fill);
+}
+.mdl-nbar-model.over {
+  background: var(--fault-solid);
+  color: var(--on-signal);
+}
+.mdl-node-note {
   grid-column: 2 / -1;
-  margin: var(--space-5) 0 0;
+}
+.mdl-why-body {
+  display: grid;
+  gap: var(--space-8);
+  margin-top: var(--space-8);
+}
+.mdl-terms {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+.mdl-terms > div {
+  display: grid;
+  grid-template-columns: 160px 96px 1fr;
+  align-items: baseline;
+  gap: var(--space-8);
+}
+.mdl-terms dd {
+  margin: 0;
+}
+.mdl-terms .limiting dt {
+  color: var(--ink);
+  font-weight: 500;
+}
+.mdl-budget {
+  display: grid;
+  gap: var(--space-2);
+}
+
+/* Quantization. */
+.mdl-quant {
+  display: grid;
+  gap: var(--space-10);
+}
+.mdl-quant-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-10);
+}
+.mdl-quant-head .mdl-seg {
+  margin-left: auto;
+}
+/* Wraps rather than scrolling sideways: a scrolled strip hid its last tiers
+   past the pane's edge ("1-bi…") with nothing to say there were more. */
+.mdl-tiers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--rule);
+}
+.mdl-tiers button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+  flex: 0 0 auto;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: var(--space-6) var(--space-10);
+  font-size: var(--size-label);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+.mdl-tiers button[aria-selected='true'] {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+.mdl-picks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--space-8);
+}
+.mdl-pick {
+  display: grid;
+  align-content: start;
+  gap: var(--space-4);
+  padding: var(--space-12);
+  text-align: left;
+  font-weight: 400;
+  background: var(--tile-bg);
+  border: 1px solid var(--tile-border);
+  border-radius: var(--radius);
+}
+.mdl-pick:hover {
+  border-color: var(--tile-border-hover);
+  background: var(--tile-bg);
+}
+.mdl-pick[aria-pressed='true'] {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.mdl-pick-title {
+  font-size: var(--size-badge);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--ink-muted);
+}
+.mdl-pick-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+  font-size: var(--size-mono-label);
+}
+.mdl-pick-fit,
+.mdl-qrow-fit,
+.mdl-repo-fit {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+.mdl-qlist {
+  display: grid;
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+.mdl-qrow {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 72px minmax(120px, auto);
+  align-items: center;
+  gap: var(--space-8);
+  padding: var(--space-8) var(--space-10);
+  border-bottom: 1px solid var(--rule);
+  cursor: pointer;
+}
+.mdl-qrow:last-child {
+  border-bottom: 0;
+}
+.mdl-qrow:hover {
+  background: var(--row-hover);
+}
+.mdl-qrow:has(input:checked) {
+  background: var(--row-selected);
+}
+.mdl-qrow.unloadable {
+  opacity: var(--opacity-55);
+}
+.mdl-qrow-main {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.mdl-qrow-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-6);
+}
+.mdl-weights-note {
+  margin: 0;
+}
+
+/* Live: the engine's own figures and log. */
+.mdl-live {
+  display: grid;
+  gap: var(--space-8);
+}
+.mdl-live-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: var(--space-8);
+}
+.mdl-live-cell {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-8) var(--space-10);
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+.mdl-live-value {
+  font-size: var(--size-body);
+}
+.mdl-live-bar {
+  display: block;
+  height: var(--space-4);
+  background: var(--bar-track);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.mdl-live-bar i {
+  display: block;
+  height: 100%;
+  background: var(--bar-fill);
+}
+.mdl-live-caption {
+  margin: 0;
+}
+.mdl-logs {
+  display: grid;
+  gap: var(--space-6);
+}
+.mdl-logs-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-10);
+}
+.mdl-logs-head .mdl-check {
+  margin-left: auto;
+}
+.mdl-logbox {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: var(--space-8) var(--space-10);
+  background: var(--panel-sunk);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: var(--size-mono-unit);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mdl-logbox .warn {
+  color: var(--warn);
+}
+.mdl-failure {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-failure > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.mdl-failure-body {
+  display: grid;
+  gap: var(--space-2);
+}
+
+/* Advanced. */
+.mdl-adv {
+  display: grid;
+  gap: var(--space-4);
+}
+.mdl-adv > div {
+  padding-bottom: var(--space-6);
+  border-bottom: 1px solid var(--rule);
+}
+.mdl-engines {
+  display: grid;
+  gap: var(--space-4);
+  margin-bottom: var(--space-10);
+}
+.mdl-engine-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-10);
+  padding: var(--space-6) 0;
+  cursor: pointer;
+}
+.mdl-tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: var(--space-30);
+  height: var(--space-30);
+  border-radius: var(--radius);
+  background: var(--logo-tile);
+  color: var(--logo-ink);
+  font-family: var(--font-mono);
+  font-size: var(--size-badge);
+  font-weight: 500;
+}
+.mdl-tile img {
+  width: 70%;
+  height: 70%;
+  object-fit: contain;
+}
+.mdl-engine-text {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.mdl-engine-because {
+  padding: 0 0 var(--space-6) var(--space-66);
+}
+.mdl-fld-inline {
+  max-width: 240px;
+}
+.mdl-stack {
+  display: grid;
+  gap: var(--space-8);
+}
+.mdl-stack p {
+  margin: 0;
+}
+.mdl-radios {
+  display: grid;
+  gap: var(--space-4);
+}
+.mdl-shapes,
+.mdl-kvgrid {
+  display: grid;
+  gap: var(--space-4);
+}
+.mdl-shape {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+}
+.mdl-shape-word {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+.mdl-kvgrid > label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) var(--space-48) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-subdetails > summary {
+  cursor: pointer;
+}
+.mdl-ctx {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+  margin-bottom: var(--space-8);
+}
+.mdl-numfld input {
+  width: 104px;
+}
+.mdl-chips-inline {
+  margin: 0;
+  align-items: center;
+}
+.mdl-link {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+}
+.mdl-cmd {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+}
+.mdl-flag {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-6);
+}
+
+/* History. */
+.mdl-history {
+  display: grid;
+  gap: var(--space-10);
+}
+.mdl-hrow {
+  display: grid;
+  gap: var(--space-4);
+  padding-bottom: var(--space-10);
+  border-bottom: 1px solid var(--rule);
+}
+.mdl-hrow-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+}
+.mdl-hrow-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+  margin-left: auto;
+}
+.mdl-hrow-error {
+  padding: var(--space-6) var(--space-10);
+  border-left: var(--space-2) solid var(--fault);
+  background: var(--panel-sunk);
+}
+.mdl-events {
+  display: grid;
+  gap: var(--space-4);
+  padding-left: var(--space-16);
+}
+.mdl-event {
+  display: grid;
+  grid-template-columns: 84px 160px minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-8);
+}
+
+/* Hugging Face. */
+.mdl-hubtab {
+  display: grid;
+  gap: var(--space-8);
+}
+.mdl-hubtab > p {
+  margin: 0;
+}
+.mdl-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: var(--space-8);
+  margin: 0;
+}
+.mdl-stats > div {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.mdl-stats dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.mdl-extlink {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  color: var(--ink);
+}
+.mdl-repos {
+  display: grid;
+  gap: var(--space-2);
+}
+.mdl-repo {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-10);
+  padding: var(--space-6) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.mdl-repo-main {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.mdl-repo-main a {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.mdl-runtime {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-8);
+  padding: var(--space-3) 0;
+}
+.mdl-runtime-name {
+  width: 58px;
+  flex: 0 0 auto;
+}
+
+/* Served elsewhere. */
+.mdl-provider {
+  padding: var(--space-4) 0;
+}
+.mdl-provider-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-provider-name {
+  flex: 1 1 auto;
+}
+.mdl-provider-sub {
+  padding-left: var(--space-20);
+}
+
+/* The footer sticks to the pane's bottom edge while the tab scrolls. The
+ * negative margins cancel `.card2`'s padding so it spans the pane. */
+.mdl-foot {
+  position: sticky;
+  bottom: calc(-1 * var(--space-15));
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  gap: var(--space-10);
+  margin: auto calc(-1 * var(--space-17)) calc(-1 * var(--space-15));
+  padding: var(--space-10) var(--space-17);
+  background: var(--panel-recessed);
+  border-top: 1px solid var(--rule);
+}
+.mdl-foot-summary {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ServeTab: the users chart and the hub download controls. */
+.mdl-users {
+  display: grid;
+  gap: var(--space-10);
+}
+.mdl-users-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-10);
+}
+.mdl-users-head .mdl-seg {
+  margin-left: auto;
+}
+/* "Context per user" and its chips, read as part of the chart rather than a
+   control bolted under it: no box, the chart's small type, centred under the
+   plot like an axis caption, the chosen one underlined the way the precision
+   tabs mark theirs. */
+.mdl-users-ctx {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-8);
+  margin-top: calc(-1 * var(--space-6));
+  font-size: var(--size-micro);
+  color: var(--ink-muted);
+}
+.mdl-users-ctx > .unit:first-child {
+  font-size: inherit;
+  cursor: help;
+}
+.mdl-users-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.mdl-users-chips button {
+  padding: var(--space-1) var(--space-4);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  font-size: inherit;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+.mdl-users-chips button:hover {
+  color: var(--ink);
+}
+.mdl-users-chips button[aria-checked='true'] {
+  color: var(--ink);
+  font-weight: 500;
+  border-bottom-color: var(--ink);
+}
+.mdl-users-measure {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-10);
+}
+.mdl-dl-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-10);
+}
+.mdl-dl-actions button,
+.mdl-foot > button {
+  white-space: nowrap;
+}
+
+/* DetailTabs: Profiles and Benchmarks tabs. */
+.mdl-profiles,
+.mdl-bench {
+  display: grid;
+  gap: var(--space-10);
+}
+.mdl-bench > p {
+  margin: 0;
+}
+.mdl-profiles-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-bench-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.mdl-bench-table th,
+.mdl-bench-table td {
+  padding: var(--space-4) var(--space-6);
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+  vertical-align: baseline;
+}
+.mdl-bench-table th {
+  color: var(--ink-muted);
+  font-size: var(--size-unit);
+  font-weight: 500;
+}
+.mdl-bench-compare {
+  display: grid;
+  gap: var(--space-6);
+}
+.mdl-bench-bar-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) auto;
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-bench-bar {
+  display: block;
+  height: var(--space-8);
+  border-radius: var(--radius-sm);
+  background: var(--panel-sunk);
+  overflow: hidden;
+}
+.mdl-bench-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--fill);
+}
+
+/* Session: the Advanced tab's profile bar, engine facts and command preview. */
+.mdl-pbar {
+  display: grid;
+  gap: var(--space-4);
+}
+.mdl-pbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-pbar-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+.mdl-pbar-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+  margin-left: auto;
+}
+.mdl-rt-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+.mdl-drafter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+.mdl-drafter > .mono {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.mdl-sampling {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-8);
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.mdl-preview {
+  display: grid;
+  gap: var(--space-4);
+}
+.mdl-recipe {
+  white-space: pre;
+  overflow-x: auto;
+  margin: var(--space-4) 0 0;
+}
+
+/* ListPane-2: pins, the Profiles view, the add-a-provider dialog. */
+.mdl-row-wrap {
+  position: relative;
+}
+.mdl-pin {
+  position: absolute;
+  top: 50%;
+  right: var(--space-4);
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  height: auto;
+  padding: var(--space-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--panel-raised);
+  color: var(--ink-muted);
+  opacity: 0;
+  transition: opacity var(--dur-fast);
+}
+.mdl-row-wrap:hover .mdl-pin,
+.mdl-pin:focus-visible,
+.mdl-pin[aria-pressed='true'] {
+  opacity: 1;
+}
+.mdl-pin[aria-pressed='true'] {
+  color: var(--ink);
+}
+.mdl-proflist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mdl-proflist-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+  padding: var(--space-8) var(--space-6);
+  border-bottom: 1px solid var(--rule);
+}
+.mdl-proflist-main {
+  display: grid;
+  gap: var(--space-3);
+  flex: 1;
+  min-width: 0;
+}
+.mdl-proflist-name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  min-width: 0;
+  font-weight: 500;
+}
+.mdl-provider-add-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-8);
 }
 
 /* ── The node terminal ───────────────────────────────────────────────────────

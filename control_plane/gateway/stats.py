@@ -37,11 +37,14 @@ class TargetStats:
     ttft_ms: float | None = None
     mean_duration_s: float | None = None
     last_completed_at: float | None = None
+    # When the latest request was admitted; the idle-unload clock reads it.
+    last_begin_at: float | None = None
     # (timestamp, tokens) for a short rolling throughput window
     _recent: deque[tuple[float, int]] = field(default_factory=lambda: deque(maxlen=512))
 
     def begin(self) -> None:
         self.outstanding += 1
+        self.last_begin_at = time.time()
 
     def note_tokens(self, tokens: int, now: float | None = None) -> None:
         """Tokens seen leaving the target while it is still streaming.

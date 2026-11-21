@@ -1,54 +1,56 @@
-# tabs/models
-
-The model surface: what this cluster could run, what each quantization of it
-costs, and the only place in the product where anything is launched. Every
-verdict on these screens is read off the wire and rendered as the fit gate
-wrote it — nothing here computes a fit, sizes a cache, or ranks a machine,
-because a second copy of that arithmetic in the browser is a second answer, and
-the one that disagrees with the gate is the one that costs somebody an
-out-of-memory kill.
-
-One flat list, not five source tabs. Provenance is a *set* of facets and the
-band is the verdict, so `openai/gpt-oss-120b` is one row that says it is
-curated, cached and serving rather than three rows each saying a third of it.
-
 ## Layout
 
 | File | Lines | What it owns |
 |---|---|---|
-| `rows.ts` | 933 | the row model: facets, bands, the joins, sorting, search |
-| `ModelInspector.tsx` | 648 | one model — where it would run, what you can get it as |
-| `ServePanel.tsx` | 503 | "run it here": plan, fit gate, machines, sparkrun |
-| `Verdict.tsx` | 536 | the dry run and the refusal in one box, both budgets shown |
-| `QuantLadder.tsx` | 1048 | one quantization already chosen, the rest a click away |
-| `ladder.ts` | 62 | the ladder's two pure derivations, out where a verifier can reach them |
-| `board.ts` | 287 | the machine board's arithmetic, with no DOM in it |
-| `NodeBoard.tsx` | 230 | the board itself: the facts you need to overrule the planner |
-| `CatalogList.tsx` | 275 | the fit-banded row list; rows are real `<button>`s |
-| `CardGrid.tsx` | 96 | the card view, with one avatar subscription for the whole grid |
-| `ModelCard.tsx` | 171 | one model as a card, written from Unsloth Studio's behaviour |
-| `BandSection.tsx` | 84 | the band heading, and the one band that draws collapsed |
-| `owner.ts` | 221 | publisher accent, initials, and the avatar lookup through the coordinator |
-| `dominant.ts` | 101 | the accent taken from the avatar's own pixels |
-| `support.ts` | 131 | the red dot: whether any runtime here loads the format at all |
-| `RouteCard.tsx` | 211 | serving by routing to somebody else's hardware |
+| `rows.ts` | 1034 | the row model: facets, bands, the joins, sorting, search |
+| `useModelList.ts` | 446 | the list's data: registry, capacity, hub search, auto-check, the four views |
+| `query.ts` | 234 | the search box: Hugging Face links, typed filters, suggestions |
+| `ModelToolbar.tsx` | 355 | view select, search combobox, filter chips, sort, Downloads, Provider |
+| `ModelRows.tsx` | 352 | the fit-banded row list (fits, cluster and providers views), caption, empty note |
+| `HubCards.tsx` | 133 | the Hugging Face view: task chips and cards |
+| `WorthTrying.tsx` | 57 | undownloaded models that fit now, above the fits view |
+| `DownloadsPanel.tsx` | 103 | launches and pulls in flight, read-only, plus the pull form |
+| `SplitHandle.tsx` | 94 | the resizable split between list and detail |
+| `useModelSession.ts` | 815 | the ONE owner of everything the plan request and the launch request share |
+| `ModelPane.tsx` | 300 | one model: header, Serve / Advanced / History / Hugging Face, sticky footer |
+| `VerdictBox.tsx` | 328 | the verdict word, where, per-node GiB, the primary button, both budgets |
+| `NodeBars.tsx` | 295 | "Where it runs": per-machine memory bars, the split select, Why X? |
+| `QuantSection.tsx` | 244 | Recommended picks, precision tiers, format filter; selecting re-plans |
+| `LivePanel.tsx` | 143 | a running deployment's engine metrics and log tail |
+| `AdvancedTab.tsx` | 527 | engine, speed, memory, context, parallelism, API name, custom flags |
+| `HistoryTab.tsx` | 130 | this model's deployments, their events, "Serve again with these settings" |
+| `HubTab.tsx` | 223 | hub stats, the repos on the hub, About, the quantization table |
+| `gates.ts` | 118 | launch permissions: `gatesOf`, `canServeWith`, `claimFor`, `refusalCode` |
+| `verdictView.ts` | 89 | the words a verdict is drawn with: `bandWord`, `planWord`, `formatParams`, `gib` |
+| `quantPicks.ts` | 180 | tiers, formats and picks over server-judged ladder rows |
+| `ladder.ts` | 81 | the ladder's two pure derivations, out where a verifier can reach them |
+| `board.ts` | 332 | the machine board's arithmetic, with no DOM in it |
+| `owner.ts` | 230 | publisher accent, initials, and the avatar lookup through the coordinator |
+| `OwnerMark.tsx` | 70 | the publisher mark, drawn from `owner.ts` |
+| `dominant.ts` | 103 | the accent taken from the avatar's own pixels |
+| `support.ts` | 125 | the red dot: whether any runtime here loads the format at all |
+| `RouteCard.tsx` | 212 | serving by routing to somebody else's hardware |
 | `BackendPicker.tsx` | 121 | pinning OpenRouter's backend host (and its fallback) for one model |
-| `PullCard.tsx` | 205 | putting a model on a server derate does not launch |
+| `PullCard.tsx` | 204 | putting a model on a server derate does not launch |
 | `pullTargets.ts` | 42 | which providers can be told to fetch weights, from the server's kind table |
 | `ProviderPicker.tsx` | 94 | which machine a pull lands on |
-| `ollamaTarget.ts` | 102 | `hf.co/<repo>:<tag>`, and the ladder partition that goes with it |
-| `UnchosenBanner.tsx` | 104 | a provider serving its whole catalogue, and the one click that ends it |
+| `ollamaTarget.ts` | 129 | `hf.co/<repo>:<tag>`, and the ladder partition that goes with it |
+| `UnchosenBanner.tsx` | 105 | a provider serving its whole catalogue, and the one click that ends it |
 | `CapabilityChips.tsx` | 104 | MoE, MLA, GQA, sliding window, vision, MTP, context — as tags |
 | `ParamBreakdownTable.tsx` | 82 | where the parameters are, and why two totals differ |
-| `QuantTableCard.tsx` | 85 | the quantization table exactly as the gateway reports it |
-| `DegreeFields.tsx` | 102 | TP and PP, owned as a set; `null` means the planner picks |
-| `SpeculativeField.tsx` | 95 | which speculative method to serve with; `null` means one token per step |
-| `CustomServes.tsx` | 58 | replaying a hand-written launch command |
-| `InstalledModelsCard.tsx` | 49 | what is already on the cluster's disks, read-only |
-| `rows.check.mjs` | 726 | the browser-side fold against the live coordinator's real payloads |
-| `registry.check.mjs` | 213 | `GET /api/models`, the fold that moved to the server, and the boundary |
-| `serve.check.mjs` | 122 | launch permissions, including branches a live cluster cannot reach |
-| `ollamaTarget.check.mjs` | 118 | the target string and the ladder partition |
+| `QuantTableCard.tsx` | 86 | the quantization table exactly as the gateway reports it |
+| `DegreeFields.tsx` | 114 | TP, PP and EP, owned as a set; `null` means the planner picks |
+| `speculative.ts` | 180 | the speculative field's pure decisions |
+| `SpeculativeField.tsx` | 697 | which speculative method to serve with; `null` means one token per step |
+| `CustomServes.tsx` | 59 | replaying a hand-written launch command |
+| `rows.check.mjs` | 931 | the browser-side fold against the live coordinator's real payloads |
+| `registry.check.mjs` | 215 | `GET /api/models`, the fold that moved to the server, and the boundary |
+| `serve.check.mjs` | 123 | launch permissions from `gates.ts`, including branches a live cluster cannot reach |
+| `query.check.mjs` | 55 | link parsing, typed filters, suggestion sections |
+| `quantPicks.check.mjs` | 310 | tiers, picks and the default variant against a trimmed live ladder |
+| `verdictView.check.mjs` | 35 | every `planWord` rule, every band, `formatParams` |
+| `speculative.check.mjs` | 205 | the speculative field's decisions |
+| `ollamaTarget.check.mjs` | 150 | the target string and the ladder partition |
 
 ## `rows.ts`
 
@@ -59,14 +61,17 @@ which is why it could never badge fit, sort by size, or say what was on disk.
 
 `Facet` is where a model was found and `FACET_ORDER` is the order the six are
 canonicalised into: `running`, `ondisk`, `catalog`, `provider`, `offered`,
-`hub`. `Band` is the verdict — `running`, `fits`, `degraded`, `unchecked`,
-`wont`, `elsewhere`, `unserved` — and `band()` reads reality before prediction:
+`hub`. `Band` is the verdict — `running`, `fits`, `degraded`, `notnow`,
+`unchecked`, `wont`, `elsewhere`, `unserved` — and `band()` reads reality before prediction:
 on this cluster `openai/gpt-oss-120b` is serving right now and the capacity walk
 at 8192/1 refuses it, because the live budget already has that deployment's own
 memory taken out of it. Filing a model that is answering requests under "Needs
 more memory" would be flatly false. `TERMINAL` (`failed`, `stopped`) is exported
 so `board.ts` shares one definition of "over": a stopped deployment holds no
-machine.
+machine. `notnow` ("Fits after freeing a node") is a live `wont_fit` whose
+static verdict fits, read through `CapacityIndex.staticRow`; it sits right after
+`degraded`. `ModelRow` also carries `staticVerdict`, `needBytes`, `fitContext`
+and `fitSeqs` off the same capacity row `withFit` picks.
 
 `capacityIndex(...reports)` is variadic because verdicts arrive from two places
 — the 20s cluster-wide poll and the targeted batches the auto-check fires — and
@@ -102,8 +107,8 @@ the server's now mirrors, and `rows.check.mjs` is the only caller left for five
 of them — `hubRows` is the exception, because `withHubHits` still runs it on the
 live path. `providerRowsFor` is exported for the detail pane, which needs the
 answer for a model the list never produced a row for. `deploymentSignal` is
-exported for the same reason `TERMINAL` is — `CatalogList` must not disagree with
-the ladder about what `degraded` looks like — and `BAND_TITLE` is the one place a
+exported for the same reason `TERMINAL` is — `ModelRows` must not disagree with
+`HistoryTab` about what `degraded` looks like — and `BAND_TITLE` is the one place a
 band's heading text is written.
 
 `isCollapsibleBand` is pure and lives here rather than in a component so the
@@ -117,52 +122,132 @@ byte count in one comparison as though they were one quantity. `bytesOnDisk`
 survives only as the tie-break among rows that have no measured parameter count
 at all.
 
-## `ModelInspector.tsx`
+## `useModelList.ts`
 
-One model, in two panes (`Serve`, `About`) held in component state rather than
-the URL — the URL names the screen and its subject, and which of two views of
-one subject you are reading is neither. It fetches `modelDetail` and
-`modelVariants` itself rather than taking them from `state/resources.ts`, because
-`useResource` refires on every `revision` bump and an open model would re-run its
-hub calls after every launch, admit and settings change. The two loads are shown
-separately: detail is one resolve and usually cached, the ladder is a search plus
-a repository read per GGUF repo and takes seconds.
+The list's data, moved out of `ModelsTab.tsx` unchanged in behaviour: the
+registry, providers, kinds, catalogues and storage hooks; the debounced capacity
+numbers; the hub search; `decorate`; the auto-check batch; `problems` and
+`fatal`. `useModelList(query, sort, view, showWont, hubFilters?)` returns the
+decorated rows, the view's `groups`, `pinnedGroup`, `hubOnlyGroup`, per-view
+`counts`, `worthTrying`, `wontCount`, `pins` (a set, from `GET /api/pins`),
+`profiles` (every profile, `GET /api/profiles`) and the payloads the panes need.
+`machinesPhrase` and `AUTO_CHECK` are exported beside it.
 
-`target`, `runtime` and `providerId` are owned here, not in the ladder, because
-the plan call above and the launch below have to agree about them — two copies
-would let the verdict describe one shape while Serve started another. Storage and
-cluster are polled once here and handed to both halves for the same reason a
-second `useStorage` would be a second cluster-wide disk walk every 30s.
+The query goes through `parseQuery` first. Only its `words` reach the hub search
+and `matches` — the hub never gets the raw text, so `fits` is not searched for on
+Hugging Face — and the typed filters are applied with `rowPasses`. `ListView` is
+`fits | cluster | hub | providers | profiles`; `derate.models.view` stores one, and an old
+`cards`/`rows` value falls back to `fits`. In the fits view a query pulls hub-only
+rows out into `hubOnlyGroup` ("On Hugging Face"), so a search never mixes
+"checked against your nodes, not downloaded" into the bands for what is here.
+Pinned rows (every view but hub) leave their band for `pinnedGroup`, drawn first
+under "Pinned"; each row's pin toggle (`aria-pressed`, a sibling of the row
+button) `PUT`s the whole list. On the hub view, `HubCards`' Source (Original
+repos / Unsloth quants = `author=unsloth`) and task chips become the search's
+`author`/`task` (`hubFilters`), and search even with an empty box. The
+`profiles` view is `ProfilesList`: Load opens the model and hands the request to
+the pane as `initialRequest`, which the session applies once its ladder lands.
+The toolbar's Provider button opens `components/ProviderAddDialog`.
+`AUTO_CHECK` keys on the visible groups of the current view.
 
-`routeTargets` assembles both provider surfaces — the filtered listing knows
-health and admission for what is served, the catalogue knows what is merely
-published — and counts a provider in both once, on the served side. A `seq` ref
+## `query.ts`
+
+The search box, as data. `parseHfLink` accepts `huggingface.co/<owner>/<repo>`
+and `hf.co/<owner>/<repo>:<QUANT>` and rejects the `models`, `datasets` and
+`spaces` paths. `parseQuery` splits typed filters (`fits`, `pinned`, `on:`, `quant:`,
+`task:`) from words; an unknown `key:value` stays a word and an empty `key:` is
+dropped. `pinned` needs the pin set, passed as `rowPasses(row, f, { pins })`.
+`suggest` returns sections and no closures — "From this link", "Finish
+the filter", "Filters", "Models matching" — so the toolbar renders and applies
+them and `query.check.mjs` asserts them without a DOM.
+
+## `ModelToolbar.tsx`, `ModelRows.tsx`, `HubCards.tsx`, `WorthTrying.tsx`
+
+The list pane. The toolbar is one bar: view select with counts, the search
+combobox (`#mdl-suggest` listbox, ↑↓/Enter/Tab/Esc), Clear, the syntax help
+toggle, Sort, Downloads with its badge, Provider. Filter chips sit under it and
+each one rewrites the query without its token.
+
+`ModelRows` is the row list. Rows are real `<button>`s rather than
+`role="button"` divs with hand-rolled key handling — that was two bugs waiting,
+since Enter and Space were reimplemented per call site and the focus ring
+`base.css` gives every native control never reached them. Every fact on a row is
+read, not derived: the lamp is the fit gate's verdict and a row with no verdict
+draws a hollow lamp. A `checking` row keeps the shape "unchecked" draws and
+changes only the word — it is a state, not a fourth verdict. `rowFacts` prints an
+offer's price as "not priced" when either side is null, never as `$0`. Exactly
+one band collapses (`isCollapsibleBand`: `unserved`), and a query forces it open
+without touching what the person clicked — a needle that matched inside a
+collapsed band has to show what it matched. The count is on the heading, because
+a band that does not say its size reads as a short one. `ListCaption` and
+`emptyNote` live here too.
+
+`ModelRows`, `HubCards` and `WorthTrying` each call `useAvatars()` **once for the
+list, never once per row or card**: avatars and their colours resolve
+asynchronously, and a hundred cards each holding their own state would re-render
+the whole grid a hundred times as a batch lands.
+
+## `DownloadsPanel.tsx`
+
+From `/api/activity`: launches with a `phase` (the shard-counting fraction is the
+only progress bar, and only where one exists) and pulls not yet done. Hub
+prefetch rows (`kind: "hub"`, started by "Download only" in `ServeActions`) show
+`completed/total` and Pause/Resume and Cancel; Cancel confirms and never deletes
+what is on disk. Provider rows stay read-only. `useDownloadsBadge` is the
+toolbar's count. `PullCard` sits under it, as "Pull onto a provider".
+
+## `SplitHandle.tsx`
+
+A `role="separator"` between the panes, keyboard-operable, width clamped to
+420..1200 and stored under `derate.models.side`. Below 1100px the split collapses
+to one column and the handle is hidden.
+
+## `useModelSession.ts`
+
+The one owner of everything the plan request and the launch request share —
+detail and ladder fetch, runtime pick, provider, route targets and destination,
+the selected variant, kv dtype, forced quant, eager/cudagraph, custom command,
+custom flags, served name, trust remote code, gates, this model's deployments,
+`serve()` and `stop()`. Two copies of any of these would let the verdict describe
+one shape while Serve started another; that is why nothing in the panes keeps its
+own.
+
+It fetches `modelDetail` and `modelVariants` itself rather than through
+`state/resources.ts`, because `useResource` refires on every `revision` bump and
+an open model would re-run its hub calls after every launch, admit and settings
+change. The two loads are reported separately: detail is one resolve and usually
+cached, the ladder is a search plus a repository read per GGUF repo. A `seq` ref
 is bumped on every model change so a response for a model the pane no longer
-shows cannot land. The runtime follows the model once on arrival, not at render:
-a speech checkpoint is *refused* on vllm rather than merely slow, so the default
-must move, and picking vllm afterwards to read its refusal has to keep working.
+shows cannot land. `routeTargets` assembles both provider surfaces and counts a
+provider in both once, on the served side. The runtime follows the model once on
+arrival, not at render: a speech checkpoint is *refused* on vllm rather than
+merely slow, so the default must move, and picking vllm afterwards to read its
+refusal has to keep working.
 
-## `ServePanel.tsx`
-
-"Run it here", and since 2026-09-07 the only plan surface in the product. The
-dashboard's planner bar answered the same question from a screen that had not
-chosen a model; this one carries the question in the URL, and the machine board
-stands where that bar had a checkbox popover, because choosing between machines
-needs the figures a popover hides.
+**The variant is the subject.** `subjectId = launchId(variant)` is sent as
+`model_id` to BOTH `/api/plan` and the launch, so the verdict on screen is the
+verdict for the file that would be started. `dtype` (forced quant) only applies
+to the base repo's safetensors and is cleared otherwise; `kv_dtype` and `dtype`
+go in BOTH requests, because a width the gate priced and the launch dropped
+serves a fraction of the approved context in silence.
 
 The plan effect debounces at 450 ms and short-circuits under a provider runtime:
 `POST /api/plan` asks whether a model fits on a machine in *this* cluster, and a
 verdict about the wrong memory pool would arrive looking exactly like one that
 meant something. `context`, `concurrency`, `node_ids` and `parallelism` are all
 **spread, never sent as null** — absence is the contract for "the coordinator
-picks", and an explicit null is a different request. `launch()` then sends
+picks", and an explicit null is a different request. The launch then sends
 `result.context` and `result.concurrency`, the numbers the verdict was actually
-taken at, not what the boxes show.
+taken at, not what the boxes show. Custom flags become `extra_args`; `extra_args`
+and `custom_command` are never both sent.
 
-`granted` is cleared on every replan so an override cannot outlive the
-measurement that justified it, and the launch spreads one key per gate the
-backend itself published rather than a fixed set of names. On success it
-navigates to `{dest: 'cluster', dep: dep.served_name}` — `served_name`, never
+`granted` and the 409-derived `extraGates` are cleared on every replan so an
+override cannot outlive the measurement that justified it, and the launch spreads
+one key per gate the backend itself published. A 409 whose `refusalCode` names a
+param becomes a gate; a 400 stays an error line. Under a pulling runtime `serve()`
+takes the pull branch (`ollamaRef`, `pullToProvider`) and reads `pulled` rather
+than a deployment — a pull never becomes a Deployment. On success it navigates to
+`{dest: 'cluster', dep: dep.served_name}` — `served_name`, never
 `deployment_id`, because `?dep=` is matched against the served name and an id
 there does not fail, it falls through to `defaultDep()` and silently selects
 somebody else's deployment.
@@ -171,84 +256,153 @@ The stale-node effect drops a ticked machine that has left the cluster, and its
 `every` short-circuit is not an optimisation: without it a fresh array is written
 on every 5s cluster poll, which refires the plan effect forever.
 
-## `Verdict.tsx`
+## `ModelPane.tsx`
 
-The dry run and the refusal in one card. It renders **both** fit results — one
-against the static ceiling, one against what the machine can hand out right now —
-and lets the backend's `serve` decision say which governs the button. A gateway
-that predates `serve` omits the field, and treating that absence as a refusal
-would red-flag every model on an older coordinator, so `legacy` falls back to the
-static verdict.
+One model, mounted from `ModelsTab.tsx` and from `shell/Sheet.tsx`, keyed on the
+model id so its local state resets. The tab (Serve, Advanced, History, Hugging
+Face) is component state rather than the URL — the URL names the screen and its
+subject, and which view of one subject you are reading is neither. With route
+targets, a segmented group above the tabs chooses This cluster or a provider; a
+provider destination makes the Serve body `RouteCard` plus `BackendPicker`. A
+model nothing local can resolve but a provider serves gets `ProviderFacts` and
+the resolver's sentence under "no local verdict". The sticky footer carries Stop
+(confirmed) and a one-line summary of what Serve would send.
 
-`gates` are the permissions, and `canServe` appears only once every one of them
-is ticked. `claimFor` writes the checkbox label in the operator's first person —
+## `VerdictBox.tsx`
+
+The dry run and the refusal in one box. The word comes from `planWord`; the
+fit gate's sentence, the decode range, the speculative range and any measured
+decode figure (beside the range, never in place of it) render through
+`Verbatim`. Fix links ("use N context", "stop <name>") never launch on their own.
+Each gate renders the server's reason verbatim with a checkbox labelled by
+`claimFor`, and the primary button appears only once `canServe`. "Where it runs"
+(`NodeBars`) and the Why disclosure keep **both** budgets on screen — against
+idle hardware and against what is free now — because the operator has to see
+which one governs.
+
+## `NodeBars.tsx`
+
+Which machines this model would be served on, and the facts you need in order to
+disagree with the planner about it. The planner does not choose machines on live
+memory, cached weights or what is running, and every one of those is knowledge a
+person has. Rows are in cluster order, not an order this file invented. Ticking
+uses `board.ts::toggle`, which sorts before handback; unticking the last machine
+is impossible, because "plan on nothing" is a 400 rather than "the planner
+picks". An ineligible machine renders the registry's own sentence through
+`Verbatim`. The split select lists `result.alternatives` as the planner sent them.
+
+## `QuantSection.tsx`
+
+One quantization already chosen, the rest a click away: a forty-row table asks a
+question most people cannot answer. Recommended cards come from
+`recommendedPicks`, then one tab per precision tier, filtered by format.
+Selecting a variant re-plans through `useModelSession`. Rows outside
+`partitionForRuntime(...).servable` are drawn faded and stay selectable, so the
+refusal can be read in the verdict box.
+
+## `LivePanel.tsx`
+
+A running deployment: the metrics stream's `load` block (kv cache, running,
+waiting, decode) and the deployment's log tail, re-polled only while the source
+is `buffer`. The `FailureBanner` for the newest failed deployment lives here.
+
+## `AdvancedTab.tsx`
+
+Profile bar, Engine, Speed, Memory, Context, Multimodal, Parallelism, API,
+Lifecycle, Custom flags, and the command preview, as disclosures (the sections
+live in `AdvancedSections.tsx`). Engine rows come from `useRuntimes`
+(`/api/runtimes`) and are disabled only when the variant's format is not in the
+runtime's `formats`; otherwise picking one shows that runtime's refusal in the
+verdict box. Typed knobs travel as `engine_options`: parsers, prefix caching,
+tokens per scheduler step, async scheduling, multimodal limits, text only,
+YaRN (offered when the context passes `original_window`), sampling defaults and
+NCCL env rows. The GPU share is read-only: the figure `/api/plan/command`
+derives. The preview is fetched 600 ms after the plan settles and only while
+this tab is mounted (`wantPreview`). Lifecycle edits on a running deployment
+PATCH it at once; otherwise they ride the launch request. "Create a key for this
+model" mints a key restricted to the served name and shows it in `RevealModal`.
+Parallelism offers Measure for an unmeasured pair. It mints its `DegreeFields`
+`idPrefix` with `useId`: the pane is mounted in the Models tab *and* the sheet
+while `AppShell` keeps every destination mounted, so a hardcoded id would focus
+the other pane's field.
+
+## `ProfilesTab.tsx`, `ProfilesList.tsx`
+
+Saved profiles (`/api/profiles`, shared across browsers and admins) beside this
+model's previous runs (each deployment's `relaunch_request`). Load and Serve
+only `applyRequest` and switch tab -- neither launches. `ProfilesList` is the
+list pane's Profiles view.
+
+## `BenchmarksTab.tsx`
+
+Runs `/api/benchmarks` with `currentRequest()` after a confirm: a temporary copy
+launches, is measured at each user count and is stopped. Ticking two rows shows
+compare bars; failed records show `error` through Verbatim.
+
+## `UsersChart.tsx`, `usersChart.ts`
+
+"How many users" on the Serve tab, from `/api/plan/concurrency`: By quant (one
+request per recommended pick) or By context. A `multi-line` pack chart with a
+dashed wall marker per series and the newest matching benchmark as points. The
+line is a bandwidth CEILING per user; at one user it equals the card's tok/s.
+The server's `caveat` renders through Verbatim. Hidden for a provider runtime or
+when no series has room for a user.
+
+## `launchRequest.ts`, `profiles.ts`, `folders.ts`
+
+Pure, React-free, each with a `.check.mjs`. `buildLaunchRequest` is the one
+launch-body builder (spread, never null; custom command excludes derived
+flags) and `knobsFromRequest` is its inverse, round-tripped by the check.
+`profiles.ts` has `changedKeys` ("Changed: …"), `profileSummary` (chips) and
+`preloadChoice` (starred default, else the last run's `relaunch_request`, else
+planner defaults). `folderFor(repo)` is the hub cache folder name the Serve
+tab's "Delete from disk" passes to `deleteCachedModel`.
+
+## `HistoryTab.tsx`
+
+This model's deployments, their events from `/api/history` (a STOPPED event's
+`reason`, e.g. `idle for 15 minutes`, is shown), and "Roll back to this", which
+applies the deployment's `relaunch_request` and moves to the Serve tab -- it
+never launches.
+
+## `HubTab.tsx`
+
+Stats from `detail.hub` (downloads, likes, updated, license, task), falling back
+to the search row when the hub answered nothing; the repos on the hub
+(`repoGroups`, with Use), the About body and `QuantTableCard`.
+
+## `gates.ts`
+
+Launch permissions in one place. `gatesOf(serve)` reads the published gates;
+`canServeWith` lets the backend's `serve` decision govern, and a gateway that
+predates `serve` falls back to the fit result rather than treating absence as a
+refusal. `claimFor` writes the checkbox label in the operator's first person —
 "Serve anyway. I am overriding the live fit gate, which measured N GB allocatable
 and refused" — because it is a claim they are making, not a message they are
-dismissing; the server's own sentence renders verbatim directly above it either
-way. Its final fallback return matters as much as the two named `param` branches
-(`allow_over_live_memory`, `allow_mixed_hardware`): a gateway that adds a third
-gate tomorrow still gets a blocking control here — "Launch anyway. I have read
-the reason above and am overriding it." — instead of this client launching past a
-permission it did not recognise.
+dismissing. Its final fallback ("Launch anyway. I have read the reason above and
+am overriding it.") matters as much as the named branches: a gateway that adds a
+gate tomorrow still gets a blocking control. `tabs/cluster/blocks/ModelBlock.tsx`
+imports `claimFor` from here.
 
-`NoVerdict` covers an unwired fit port: the plan is real and shown, the absence
-of a verdict is stated, and Serve is withheld. The six-term `SegmentBar` marks
-`shown.limiting_term`, and the breakdown is taken from the live result because it
-is identical under both budgets.
+`refusalCode` maps a 409 to the field that reopens it: the cluster launch refuses
+with `live_memory_insufficient` / `allow_over_live_memory`, the pull with
+`pull_over_memory` / `allow_over_memory`. An unrecognised code returns null on
+purpose — a checkbox that sends a field the gateway ignores is a button that does
+nothing twice.
 
-## `QuantLadder.tsx`
+## `verdictView.ts`
 
-One quantization already chosen, with the rest a click away. A repository can
-publish forty variants and a forty-row table asks a question most people cannot
-answer, so the card opens on `ladder.recommended` — the gateway's largest variant
-that both fits and can be served — falling back to the best servable row, then to
-the top of the ranking, because "here is the closest thing, and here is why you
-cannot run it" is an answer and an empty card is not.
+`bandWord` (a list band) and `planWord` (the detail's plan) as label plus signal,
+first matching rule wins; `formatParams` and `gib`. Pure so
+`verdictView.check.mjs` can hold one fixture per rule.
 
-The rest split in two, and the split is the point. Most of what a hub search
-turns up for a popular model is GGUF and there is no llama.cpp runtime here: for
-Qwen3-30B-A3B, thirty-seven of forty-two. The gateway ranks on fit before
-servability — `capacity_api.py::_rank_key` sorts on fit tier then size and never
-consults `launchable` — so a 30 GB GGUF that fits outranks the smaller
-safetensors row that is the only thing vLLM can start.
-`partitionForRuntime` fixes what is seen without touching the ordering — rank
-order is preserved exactly inside each group — and re-sorting in the browser
-would be the second answer that misleads.
+## `quantPicks.ts`
 
-**Where the launchable rows land is a snapshot, not a property.** This passage
-used to record them at 29, 30, 31 and 39; today they are at 1, 38, 39, 40 and
-41. It moves with the hub listing and with every change to the fit arithmetic,
-because the fit tier is the outer sort key — the KV-margin commits of
-2026-09-10 were enough to shift one launchable row to the top. `rows.check.mjs`
-therefore prints the positions as evidence and asserts only what does not move:
-that the partition preserves the gateway's order and never becomes a second
-ordering. An assertion on the magnitude was there until 2026-09-11 and was
-inverted — fixing `_rank_key` would have broken it. Serve is **absent** on a row that
-cannot be served rather than present and dead: a disabled button reads as "not
-right now" when the truth is "not by this route at all".
-
-Per-row state is keyed on `variantKey`, never `repo_id`, because one GGUF
-repository publishes many quantizations and a repo-keyed state lights "Serving…"
-on every sibling of the row that was clicked. A launch sends the variant's own
-`repo_id` and *that row's* `context`/`max_seqs`, since on the default path the
-gate chose one per variant. With nothing ticked it falls back to `sized_on.nodes`
-— the machines the verdict was taken on — rather than to "the planner picks".
-
-`refusalCode` maps a 409 to the field that reopens it, and it has to: the cluster
-launch refuses with `live_memory_insufficient` / `allow_over_live_memory`, the
-pull refuses with `pull_over_memory` / `allow_over_memory`, and matching only the
-first left a real pull refusal rendering as a bare red line with the way past it
-unreachable. An unrecognised code returns null on purpose — a checkbox that sends
-a field the gateway ignores is a button that does nothing twice. 409 gets the
-override path and 400 does not, because an unchanged retry succeeds once memory
-frees.
-
-`Served` reads the deployment record rather than printing one word, and reads
-`pulled` instead when the runtime pulls — a pull never becomes a Deployment, so
-looking for one left the chip reading "starting…" forever with nothing to explain
-it. `OnDisk` distinguishes partial from present, because here there *is* a
-measured size to check against: `Qwen/Qwen3-30B-A3B` on this cluster is 2 MB of
-metadata and no weights.
+Selection over server-judged ladder rows, with no fit arithmetic. `tierOf` — a
+llama.cpp `Q<n>` name wins over measured bits, because the name is what the
+publisher calls it — `formatOf`, `isUnslothDynamic`, `recommendedPicks`,
+`defaultVariant` and `repoGroups`. Everything reads `partitionForRuntime`'s
+servable list and keeps the gateway's rank order.
 
 ## `ladder.ts`
 
@@ -288,74 +442,6 @@ every link as unknown and fall back to a conservative pipeline, which is invisib
 otherwise and changes the plan. `linkMeasured` requires the wire's flag **and** a
 figure, and is the one definition the Links rail and the wiring editor use too. `toggle` sorts before handback so two
 tick orders produce one request body, one answer and one server-side memo key.
-
-## `NodeBoard.tsx`
-
-The board itself: which machines this model would be served on, and the facts you
-need in order to disagree with the planner about it. It exists because the
-planner does not choose machines — live memory, whether the weights are already
-on disk here, and what is already running here never enter `_nodes_for`, and
-every one of those is knowledge a person has and the planner does not.
-
-Rows are in cluster order, not an order this file invented. Columns are
-allocatable-now against the ceiling, weights, link and what is running.
-Unticking the last machine hands the choice back to the planner rather than
-meaning "plan on nothing", which the gateway can only answer with a 400. An
-ineligible machine renders the registry's own sentence through `Verbatim`.
-
-## `CatalogList.tsx`
-
-The fit-banded row list. Rows are real `<button>`s rather than `role="button"`
-divs with hand-rolled key handling — that was two bugs waiting, since Enter and
-Space were reimplemented per call site and the focus ring `base.css` gives every
-native control never reached them.
-
-Every fact on a row is read, not derived: the lamp is the fit gate's verdict, the
-sentence under a refusal is the fit gate's own, and a row with no verdict draws a
-hollow lamp. A `checking` row keeps the shape "unchecked" draws and changes only
-the word — it is a state, not a fourth verdict. `Facts` prints an offer's price
-as "not priced" when either side is null, never as `$0`, because the wire keeps
-"never published a price" and "free" apart. `Numbers` draws a size only where one
-was measured. `compact` restacks the row for a 360px master pane, where four
-columns do not fit.
-
-## `CardGrid.tsx`
-
-The card view. **One subscription for the whole grid, not one per card**:
-avatars and their extracted colours resolve asynchronously, and a hundred cards
-each holding their own state would re-render the whole grid a hundred times as
-they land. Here a batch landing is one `useReducer` bump that React reconciles
-down to the cards that changed. Sections keep the same fit banding the row view
-uses, through the shared `BandSection` helpers — a wall of cards with no band is
-the thing this screen was supposed to stop being.
-
-## `ModelCard.tsx`
-
-One model as a card, with the geometry of Unsloth Studio's hub card — a fixed
-tile, the publisher's mark large enough to recognise without reading, the name at
-two lines, the numbers on the bottom edge. Written from that behaviour;
-`studio/**` is AGPL-3.0-only and none of it is copied.
-
-Three things are said with colour and nothing else: the accent, which identifies
-the publisher and means nothing more, and the status dots, which are the app's
-own `Lamp` at `size={6}` doing its usual job. There is no colour for "popular" or
-"new". Every dot has a sentence behind it, and that sentence is also the card's
-`aria-label`, so it is not mouse-only. The on-device dot says what is cached and
-how much, and deliberately does **not** promise the first launch will skip the
-pull — there is no expected size for a base repository to check against.
-
-A bare repo id (`gpt2`) has no publisher, which is different from a publisher we
-could not identify, so the owner line is omitted rather than drawn as an em dash.
-
-## `BandSection.tsx`
-
-`BandHeading` and `useBandCollapse`, shared by the row list and the card grid
-rather than written twice: two copies of "which band hides itself" is one too
-many, and the two views must not disagree about whether four hundred models are
-on the screen. `expandAll` is the search — a needle that matched inside a
-collapsed band has to show what it matched — and it forces the band open without
-touching what the person clicked, so clearing the search puts it back. The count
-is on the heading, because a band that does not say its size reads as a short one.
 
 ## `owner.ts`
 
@@ -516,7 +602,7 @@ must cost a chip that failed to appear, never a button that refuses to work.
 
 ## `ProviderPicker.tsx`
 
-What `NodeBoard` is for a cluster launch, this is for a pull: the same shape of
+What `NodeBars` is for a cluster launch, this is for a pull: the same shape of
 choice against a different set of machines. It reads facts and sizes nothing.
 
 **Deliberately no free-memory column**, though the pull is gated on exactly that
@@ -542,9 +628,12 @@ multi-part repository at manifest resolution with "Ollama does not yet support
 pulling sharded GGUF via the registry". `variantKey` is `repo_id::gguf_file ??
 label`, because `Q8_0`, `Q6_K` and `Q5_K_M` all live in one repository.
 
-`partitionForRuntime` splits on `launchable` under vllm and sglang and on
-`runnableOnOllama` under ollama, preserving the gateway's rank order in both
-branches. It is not a second answer to the gateway's question: `launchable`
+`partitionForRuntime` splits on `runnableOnOllama` under ollama and, on the
+cluster, on `launchable` AND the runtime's file format (llamacpp: GGUF only;
+vllm, sglang, tts: no GGUF), preserving the gateway's rank order in every
+branch. The format half is needed because the gateway's `launchable` became
+runtime-blind when llamacpp arrived, and a GGUF default opened every model on a
+vllm refusal. It is not a second answer to the gateway's question: `launchable`
 mirrors what `POST /api/deployments` will decide, and under ollama that endpoint
 is never called.
 
@@ -616,7 +705,8 @@ untouched field displays the planner's answer in muted type.
 
 Nothing here checks legality. Head divisibility, layer counts and the bandwidth
 thresholds are the planner's arithmetic. `idPrefix` exists because
-`ModelInspector` is mounted from the Models tab *and* the sheet while `AppShell`
+thresholds are the planner's arithmetic. `idPrefix` exists because
+`ModelPane` is mounted from the Models tab *and* the sheet while `AppShell`
 keeps every destination mounted, so with one hardcoded id clicking "TP" in one
 would focus the other's field.
 
@@ -625,17 +715,8 @@ would focus the other's field.
 `CustomServesCard` replays a hand-written launch command from a previous launch
 — a quantization choice, a memory knob, anything the standard recipe does not
 cover — so it is not retyped. Backed by `state/customServes.ts` and empty until
-the first launch that used one. Clicking an entry only *seeds* the Verdict
-card's field on the model it names; nothing here launches anything.
-
-## `InstalledModelsCard.tsx`
-
-What is already on the cluster's disks, read-only. The same `/api/storage` report
-Settings → Storage draws, taken as a prop rather than polled again — a second
-`useStorage` would be a second cluster-wide disk walk every 30s for a payload
-this tab already has. The per-node tables are `components/CacheTable`, so the two
-screens cannot render the same cache differently. Deleting a cached model stays a
-Settings → Storage action; this only says what is there.
+the first launch that used one. Clicking an entry only *seeds* the custom
+command field (Advanced › Custom flags) on the model it names; nothing here launches anything.
 
 ## `rows.check.mjs`
 
@@ -683,17 +764,23 @@ on a `last_error` that correctly names the reference that failed to resolve.
 
 ## `serve.check.mjs`
 
-Hermetic — nothing is bundled and esbuild is not involved. It covers the
-derivation of launch permissions from `serve` and whether the Serve button may
-appear, both pure functions of wire data, and both with branches a live cluster
-cannot currently reach: a gateway that predates `serve.overrides`, two gates at
-once (the button stays away until *both* are ticked), a gate that is needed while
-the fit itself passes — the case `allowed: false` could never express, and the
-reason `overrides` exists — and a hard refusal that offers no way through. The
-four-line derivation is restated here rather than imported because it lives inside
-components that pull in React; the branches are what matter. This was
-`tabs/dashboard/planner.check.mjs`, and it lost its other half with the dashboard's
-planner bar.
+Hermetic. It loads `gates.ts` and covers the derivation of launch permissions
+from `serve` and whether the Serve button may appear, both pure functions of wire
+data, and both with branches a live cluster cannot reach: a gateway that predates
+`serve` (a `fits` fit serves, a `wont_fit` one does not), two gates at once (the
+button stays away until *both* are ticked), a gate that is needed while the fit
+itself passes — the reason `overrides` exists — and a hard refusal that offers no
+way through. This was `tabs/dashboard/planner.check.mjs`; it used to restate the
+derivation inline because it lived inside React components, until `gates.ts`
+pulled it out.
+
+## `query.check.mjs`, `quantPicks.check.mjs`, `verdictView.check.mjs`
+
+Hermetic, bundled through `harness.mjs` `load()`. `query.check.mjs` pins link
+parsing, typed filters and suggestion order (local rows before hub-only ones).
+`quantPicks.check.mjs` runs on a fixture trimmed by hand from a live
+`/api/models/variants` reply. `verdictView.check.mjs` has one fixture per
+`planWord` rule and every band through `bandWord`.
 
 ## `ollamaTarget.check.mjs`
 
@@ -709,11 +796,14 @@ because the split is on the verb, not the engine name.
 
 ## The seam with `ModelsTab` and the shell
 
-`tabs/ModelsTab.tsx` is the screen. It polls once through `state/resources.ts`
+`tabs/ModelsTab.tsx` is the screen: `ModelToolbar`, `DownloadsPanel` when
+toggled, and the split — the list pane (`UnchosenBanner`, `CustomServesCard`,
+then `HubCards` or `ModelRows` plus `WorthTrying`) beside `ModelPane`. Its data
+comes from `useModelList`, which polls once through `state/resources.ts`
 (`useModelRegistry`, `useCapacity`, `useStorage`, `useProviders`,
-`useProviderKinds`, `useProviderCatalogues`, `useQuantTable`) and hands the
-payloads down, because `useResource` does not deduplicate — every call is its own
-interval and its own request.
+`useProviderKinds`, `useProviderCatalogues`) and hands the payloads down, because
+`useResource` does not deduplicate — every call is its own interval and its own
+request.
 
 ```ts
 const rows = decorate(
@@ -723,18 +813,14 @@ const rows = decorate(
   checking,
 )
 // A hub row is kept whatever the box now says: the gateway already narrowed
-// those hits to the needle IT was given, and re-filtering would blank the hub's
-// whole contribution for 450ms on every keystroke. Format is its own pass.
-let kept = q ? rows.filter(r => r.where.includes('hub') || matches(r, q)) : rows
-if (format !== 'all') kept = kept.filter(r => matchesFormat(r, format))
-const groups = groupRows(kept, sort)
+// those hits to the needle IT was given. Typed filters are their own pass.
 ```
 
-`CatalogList` and `CardGrid` take those groups. `ModelInspector` is mounted from
-two places — the Models tab's detail pane and `shell/Sheet.tsx` — which is why
-`DegreeFields` takes an `idPrefix`. `AUTO_CHECK` in `ModelsTab` is 10: each
-verdict-less row is a hub round trip on a cold cache, so about a screenful gets a
-real answer and everything below keeps saying "not checked", which is true.
+`ModelPane` is mounted from two places — the Models tab's detail pane and
+`shell/Sheet.tsx` — which is why ids inside it are scoped. `AUTO_CHECK` is 10:
+each verdict-less row is a hub round trip on a cold cache, so about a screenful
+gets a real answer and everything below keeps saying "not checked", which is true.
+
 
 Placement (`?on=`), context and concurrency live in the URL via
 `state/placement.ts` and `state/routes.ts`; `state/runtime.ts` owns
@@ -768,7 +854,7 @@ is the rung the capacity walk stepped *down* to. Reading it as a fact about the
 repository put a red "llama.cpp format" dot on the one model on this cluster that
 both fits and can be served.
 
-**Serve is absent, not disabled, where it cannot work.** In the ladder, on the
+**Serve is absent, not disabled, where it cannot work.** In the verdict box, on the
 board's unselectable rows, on the degree fields under a runtime that does not
 shard. A disabled control reads as "not right now"; the truth in each of these
 cases is "not by this route at all", and offering the control anyway means
@@ -780,10 +866,9 @@ an explicit `null` is a *different* request. Every launch then sends back what t
 verdict was actually taken at — `result.context`, `variant.max_seqs`,
 `sized_on.nodes` — never what a field happens to display.
 
-**Overrides never outlive the measurement.** `granted` is wiped on every replan
-in `ServePanel`; `refusal` and `override` are cleared on every attempt in
-`QuantLadder`. A tick granted against one live-memory reading must not ride along
-with the next plan.
+**Overrides never outlive the measurement.** `granted` and the 409-derived
+gates are wiped on every replan in `useModelSession`. A tick granted against one
+live-memory reading must not ride along with the next plan.
 
 **409 is not 400.** A live-memory refusal is legal and an unchanged retry
 succeeds once memory frees, so it gets the override path. A static refusal is a
@@ -791,7 +876,7 @@ succeeds once memory frees, so it gets the override path. A static refusal is a
 
 **The fit gate's sentence is rendered verbatim or withheld.** `Verbatim` is used
 for every refusal, every ineligibility reason and every resolver error here.
-Under a provider runtime the ladder withholds it entirely rather than
+Under a provider runtime the verdict box withholds it entirely rather than
 paraphrasing: the promise the verbatim rule makes is that the numbers in the
 sentence are the numbers the gate used, and printing a sentence about this
 cluster's memory beside a button that starts something elsewhere breaks it.
@@ -824,19 +909,19 @@ from it.
 - **A ticked machine that leaves the cluster.** Dropped from the selection; if
   none survive, the choice goes back to the planner rather than planning against
   a name nothing answers to.
-- **A model id nothing local can resolve.** `ModelInspector` renders the
-  resolver's own sentence under "no local verdict" and omits `ServePanel`
-  entirely when a provider serves it — there is nothing here to plan.
+- **A model id nothing local can resolve.** `ModelPane` renders the
+  resolver's own sentence under "no local verdict" and shows no plan
+  when a provider serves it — there is nothing here to plan.
 - **A 409 with a code this screen has no override for.** Rendered as an error,
   not as a checkbox that sends a field the gateway ignores.
-- **A launch that dies before a deployment record exists.** The post-Serve chip
-  says "starting…" for the second or two of real gap; under a pulling runtime it
+- **A launch that dies before a deployment record exists.** The pane
+  shows no Running state for the second or two of real gap; under a pulling runtime it
   reads the accepted pull reply instead, because a pull never becomes a
   Deployment and waiting for one would hang forever.
 
 ## Deliberately not built
 
-**A ranking of machines.** `board.ts` and `NodeBoard.tsx` both say so. Nothing
+**A ranking of machines.** `board.ts` and `NodeBars.tsx` both say so. Nothing
 server-side ranks either — `Planner._nodes_for` takes the alphabetical prefix of
 the strongest homogeneous group — so a score computed in the browser would be a
 second answer with no arithmetic behind it. The board joins facts and lets the fit

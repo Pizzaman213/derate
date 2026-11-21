@@ -1,6 +1,6 @@
 /** The variant table's pure derivations, out here so they can be checked.
  *
- *  `QuantLadder.tsx` is a component module: `rows.check.mjs` bundles plain TS
+ *  `QuantSection.tsx` is a component module: `rows.check.mjs` bundles plain TS
  *  and cannot reach into it. These two functions are where the table decides
  *  what a verdict LOOKS like, which is exactly the judgement that wants a
  *  verifier -- the wire is asserted elsewhere, and a green `tsc` says nothing

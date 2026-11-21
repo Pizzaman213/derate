@@ -24,6 +24,10 @@ export type PackChartProps = {
   height: number
   /** Type options: orientation, showValues, showTotals, valueFormat, emptyMessage, … */
   options?: Record<string, unknown>
+  /** A click on a datum. Held in a ref: a new closure never redraws. */
+  onClick?: (datum: Record<string, unknown>, index: number) => void
+  /** Hover over a datum, null on leave. Held in a ref like `onClick`. */
+  onHover?: (datum: Record<string, unknown> | null, index: number) => void
 } & ({ type: PackBarType; data: readonly PackRow[] } | { type: 'multi-line'; data: readonly PackTrendRow[] } | { type: 'pie' | 'donut'; data: readonly PackPieRow[] })
 
 // The only place the pack is imported. Dynamic, so d3 and zod land in their
@@ -40,11 +44,18 @@ const LOADERS: Record<PackChartType, () => Promise<unknown>> = {
 
 /** Mounts one chart-pack type by id. Paint, keyboard, legend and the hidden
  *  table are all the pack's; this owns only the lifecycle. */
-export function PackChart({ type, title, data, height, options }: PackChartProps) {
+export function PackChart({ type, title, data, height, options, onClick, onHover }: PackChartProps) {
   const host = useRef<HTMLDivElement>(null)
   const handle = useRef<ChartHandle | null>(null)
-  const latest = useRef({ data, options: { ...options, title, height } })
-  latest.current = { data, options: { ...options, title, height } }
+  const cb = useRef({ onClick, onHover })
+  cb.current = { onClick, onHover }
+  // Stable wrappers, so the callbacks never enter `key` nor force a redraw.
+  const wrappers = useRef({
+    onClick: (d: unknown, i: number) => cb.current.onClick?.(d as Record<string, unknown>, i),
+    onHover: (d: unknown, i: number) => cb.current.onHover?.(d as Record<string, unknown> | null, i),
+  })
+  const latest = useRef({ data, options: { ...options, title, height, ...wrappers.current } })
+  latest.current = { data, options: { ...options, title, height, ...wrappers.current } }
   const [ready, setReady] = useState(false)
   const [failed, setFailed] = useState<string | null>(null)
 

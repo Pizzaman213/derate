@@ -219,7 +219,9 @@ export function endLabels(items: Array<{ key: string; text: string; full: string
 export interface LineRow { x: XValue; y: number | null; series?: string }
 export interface LineOptions { gaps: Gaps; xType: XType; points: 'auto' | 'always' | 'never'; xTitle?: string; yTitle?: string }
 
-export function drawLines(ctx: DrawContext<LineRow[], LineOptions>, cfg: { curve: CurveFactory; area: boolean; endLabels: boolean }): DrawResult {
+export function drawLines(ctx: DrawContext<LineRow[], LineOptions>, cfg: { curve: CurveFactory; area: boolean; endLabels: boolean; dashed?: string[]; pointsOnly?: string[]; verticalMarkers?: Array<{ x: number; series: string; label: string }> }): DrawResult {
+  const dashedSet = new Set(cfg.dashed ?? [])
+  const dotsSet = new Set(cfg.pointsOnly ?? [])
   const { theme, fmt, options: o } = ctx
   const x = xModel(ctx.data.map((r) => r.x), o.xType, fmt)
   const { series, duplicates } = groupSeries(ctx.data, x, (r) => r.x, (r) => r.series ?? '', (r) => r.y)
@@ -264,7 +266,8 @@ export function drawLines(ctx: DrawContext<LineRow[], LineOptions>, cfg: { curve
     const sk = multi ? s.name : undefined
     const pts = s.ts.map((t, i) => ({ x: f.px(x.value(t)), y: s.ys[i] === null ? null : f.py(s.ys[i]) }))
     if (cfg.area) marks.push({ type: 'path', key: `area:${s.name}`, d: bandPath(pts.map((p) => ({ x: p.x, y0: p.y === null ? null : base, y1: p.y })), cfg.curve), fill: color, fillOpacity: 0.22, stroke: 'none', pattern: multi ? s.index : undefined, series: sk, inert: true })
-    marks.push({ type: 'path', key: `line:${s.name}`, d: linePath(pts, cfg.curve), fill: 'none', stroke: color, strokeWidth: 2, linecap: 'round', linejoin: 'round', series: sk, inert: true })
+    const dots = dotsSet.has(s.name)
+    if (!dots) marks.push({ type: 'path', key: `line:${s.name}`, d: linePath(pts, cfg.curve), fill: 'none', stroke: color, strokeWidth: 2, linecap: 'round', linejoin: 'round', dash: dashedSet.has(s.name) ? '6 4' : undefined, series: sk, inert: true })
     s.ts.forEach((t, i) => {
       const y = s.ys[i]
       const p = pts[i]!
@@ -272,8 +275,8 @@ export function drawLines(ctx: DrawContext<LineRow[], LineOptions>, cfg: { curve
       const filled = s.raw[i] === null ? (o.gaps === 'zero' ? ' (missing, drawn as zero)' : ' (interpolated)') : ''
       const when = x.label(t)
       marks.push(pointMark({
-        key: `p:${s.name}:${t}`, cx: p.x, cy: p.y, color, surface: theme.surface, series: sk, show,
-        isolated: isolated(s.ys, i),
+        key: `p:${s.name}:${t}`, cx: p.x, cy: p.y, color, surface: theme.surface, series: sk, show: show || dots,
+        isolated: dots || isolated(s.ys, i),
         datum: { x: x.value(t), y, ...(multi ? { series: s.name } : {}) },
         label: `${multi || s.name ? `${s.name}, ` : ''}${when}: ${fmt.value(y)}${filled}`,
         title: when,
@@ -291,6 +294,34 @@ export function drawLines(ctx: DrawContext<LineRow[], LineOptions>, cfg: { curve
       }
     }
   }
+  // Vertical markers: a dashed rule at x in the named series' colour, labelled at the top of the plot.
+  // Labels are placed left to right, each on the first row where it clears the one before it, so two
+  // markers a few users apart stack instead of printing over each other; one that would run past the
+  // plot's right edge is drawn leftwards from its rule.
+  const vms: Array<{ vm: { x: number; series: string; label: string }; s: (typeof visible)[number]; px: number }> = []
+  for (const vm of cfg.verticalMarkers ?? []) {
+    const s = visible.find((v) => v.name === vm.series)
+    if (!s) continue
+    const px = f.px(vm.x)
+    if (!Number.isFinite(px) || px < f.plot.x - 0.5 || px > f.plot.x + f.plot.width + 0.5) continue
+    vms.push({ vm, s, px })
+  }
+  vms.sort((a, b) => a.px - b.px)
+  const rowEnds: number[] = []
+  for (const { vm, s, px } of vms) {
+    const color = theme.cat(s.index)
+    const sk = multi ? s.name : undefined
+    marks.push({ type: 'line', key: `vm:${s.name}:${vm.x}`, x1: px, x2: px, y1: f.plot.y, y2: f.plot.y + f.plot.height, stroke: color, strokeWidth: 1.5, dash: '4 3', series: sk, inert: true })
+    if (!vm.label) continue
+    // Measured at the label's size; +6% for the 600 weight the measure does not model.
+    const w = ctx.measure(vm.label, SIZES.tick) * 1.06
+    const leftwards = px + 4 + w > f.plot.x + f.plot.width
+    const left = leftwards ? px - 4 - w : px + 4
+    let row = rowEnds.findIndex((end) => end + 6 <= left)
+    if (row < 0) row = rowEnds.length
+    rowEnds[row] = left + w
+    marks.push({ type: 'text', layer: 'labels', key: `vml:${s.name}:${vm.x}`, x: leftwards ? px - 4 : px + 4, y: f.plot.y + 2 + row * lineH, text: vm.label, anchor: leftwards ? 'end' : 'start', baseline: 'hanging', size: SIZES.tick, weight: 600, fill: color, series: sk })
+  }
   const placed = wantEnd ? endLabels(ends, f.plot, lineH) : null
   for (const l of placed ?? []) {
     marks.push({ type: 'text', layer: 'labels', key: `end:${l.key}`, x: f.plot.x + f.plot.width + 6, y: l.y, text: l.text, full: l.text !== l.full ? l.full : undefined, anchor: 'start', baseline: 'central', size: SIZES.tick, weight: 600, fill: l.color, series: l.key })
@@ -298,7 +329,7 @@ export function drawLines(ctx: DrawContext<LineRow[], LineOptions>, cfg: { curve
   return {
     marks,
     ...zoomResult(f, o.zoom, x),
-    legend: multi ? { items: series.map((s) => ({ key: s.name, label: s.name, color: theme.cat(s.index), shape: cfg.area ? 'square' : 'line', pattern: cfg.area ? s.index : undefined })) } : undefined,
+    legend: multi ? { items: series.map((s) => ({ key: s.name, label: s.name, color: theme.cat(s.index), shape: cfg.area ? 'square' : dotsSet.has(s.name) ? 'circle' : dashedSet.has(s.name) ? 'dash' : 'line', pattern: cfg.area ? s.index : undefined })) } : undefined,
     note: notes([[duplicates, 'duplicate dates summed'], gapNote(missing, o.gaps)]),
   }
 }

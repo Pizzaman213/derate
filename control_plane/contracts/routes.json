@@ -95,6 +95,30 @@
       "methods": [
         "GET"
       ],
+      "path": "/api/benchmarks"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/benchmarks"
+    },
+    {
+      "methods": [
+        "DELETE"
+      ],
+      "path": "/api/benchmarks/{bench_id}"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/benchmarks/{bench_id}"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
       "path": "/api/capacity"
     },
     {
@@ -149,6 +173,18 @@
       "methods": [
         "GET"
       ],
+      "path": "/api/compute"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/compute/measure"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
       "path": "/api/deployments"
     },
     {
@@ -180,6 +216,30 @@
         "GET"
       ],
       "path": "/api/deployments/{deployment_id}/logs"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/downloads"
+    },
+    {
+      "methods": [
+        "DELETE"
+      ],
+      "path": "/api/downloads/{download_id}"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/downloads/{download_id}/pause"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/downloads/{download_id}/resume"
     },
     {
       "methods": [
@@ -501,9 +561,39 @@
     },
     {
       "methods": [
+        "GET"
+      ],
+      "path": "/api/pins"
+    },
+    {
+      "methods": [
+        "PUT"
+      ],
+      "path": "/api/pins"
+    },
+    {
+      "methods": [
         "POST"
       ],
       "path": "/api/plan"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/plan/candidates"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/plan/command"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/plan/concurrency"
     },
     {
       "methods": [
@@ -528,6 +618,30 @@
         "PUT"
       ],
       "path": "/api/pricing/{model:path}"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/profiles"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/profiles"
+    },
+    {
+      "methods": [
+        "DELETE"
+      ],
+      "path": "/api/profiles/{profile_id}"
+    },
+    {
+      "methods": [
+        "PATCH"
+      ],
+      "path": "/api/profiles/{profile_id}"
     },
     {
       "methods": [
@@ -636,6 +750,12 @@
         "PUT"
       ],
       "path": "/api/routing/{served_name}"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/runtimes"
     },
     {
       "methods": [

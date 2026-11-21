@@ -5,6 +5,9 @@ import { useDismiss } from './useDismiss'
 export interface SelectOption<T extends string> {
   value: T
   label: string
+  /** Shown but not choosable; `title` says why. */
+  disabled?: boolean
+  title?: string
 }
 
 interface Props<T extends string> {
@@ -73,6 +76,7 @@ export function Select<T extends string>({
 
   const commit = (index: number) => {
     const opt = index >= 0 && index < options.length ? options[index] : undefined
+    if (opt?.disabled) return
     if (opt && opt.value !== value) onChange(opt.value)
     close()
     triggerRef.current?.focus()
@@ -173,8 +177,9 @@ export function Select<T extends string>({
               id={`${listId}-opt-${i}`}
               role="option"
               aria-selected={o.value === value}
-              className={['ddopt', i === activeIndex ? 'active' : ''].filter(Boolean).join(' ')}
-              title={o.label}
+              aria-disabled={o.disabled || undefined}
+              className={['ddopt', i === activeIndex ? 'active' : '', o.disabled ? 'off' : ''].filter(Boolean).join(' ')}
+              title={o.title ?? o.label}
               onMouseEnter={() => setActiveIndex(i)}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => commit(i)}

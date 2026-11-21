@@ -118,6 +118,15 @@ class GatewayContext:
     # audit rows (gateway/secevents.py). Built here, writing through
     # whatever auth_stores holds at the time of the event.
     secevents: "object" = None
+    # The in-process launcher internal_api.create_router installs:
+    # `await ctx.launcher(payload, actor=..., request=None) -> (status, body)`,
+    # the same path POST /api/deployments takes. None until a router exists.
+    launcher: "object" = None
+    # The benchmark runner (gateway/bench.py), built by create_router.
+    bench: "object" = None
+    # Saved and auto-recorded run profiles (gateway/profiles_store.py). Set by
+    # app.py; the launch path records runs into it when present.
+    profiles: "object" = None
 
     def __post_init__(self) -> None:
         from control_plane.telemetry import NULL_SINK

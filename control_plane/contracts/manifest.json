@@ -189,6 +189,9 @@
         "SESSIONS_REVOKED": "sessions_revoked",
         "NODE_JOINED": "node_joined",
         "PROVIDER_SIGNED_IN": "provider_signed_in",
+        "PROFILE_CHANGED": "profile_changed",
+        "DOWNLOAD_CHANGED": "download_changed",
+        "BENCHMARK_CHANGED": "benchmark_changed",
         "LOGIN_LOCKED": "login_locked",
         "KEY_REFUSED": "key_refused",
         "SESSION_REFUSED": "session_refused",
@@ -528,6 +531,40 @@
           "type": "str",
           "optional": true,
           "default": ""
+        },
+        {
+          "name": "engine_options",
+          "type": "EngineOptions",
+          "optional": true,
+          "default": {
+            "reasoning_parser": null,
+            "tool_call_parser": null,
+            "prefix_caching": null,
+            "max_num_batched_tokens": null,
+            "async_scheduling": false,
+            "limit_mm_per_prompt": [],
+            "mm_processor_cache_gb": null,
+            "language_model_only": false,
+            "rope_factor": null,
+            "generation_overrides": [],
+            "env": []
+          }
+        },
+        {
+          "name": "lifecycle",
+          "type": "Lifecycle",
+          "optional": true,
+          "default": {
+            "idle_unload_s": null,
+            "priority": "normal",
+            "start_at_boot": false
+          }
+        },
+        {
+          "name": "original_window",
+          "type": "int | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -575,6 +612,78 @@
         "CPU": "cpu",
         "UNKNOWN": "unknown"
       }
+    },
+    "EngineOptions": {
+      "kind": "dataclass",
+      "module": "control_plane.contracts.deployment",
+      "fields": [
+        {
+          "name": "reasoning_parser",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "tool_call_parser",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "prefix_caching",
+          "type": "bool | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "max_num_batched_tokens",
+          "type": "int | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "async_scheduling",
+          "type": "bool",
+          "optional": true,
+          "default": false
+        },
+        {
+          "name": "limit_mm_per_prompt",
+          "type": "tuple[tuple[str, int], ...]",
+          "optional": true,
+          "default": []
+        },
+        {
+          "name": "mm_processor_cache_gb",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "language_model_only",
+          "type": "bool",
+          "optional": true,
+          "default": false
+        },
+        {
+          "name": "rope_factor",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "generation_overrides",
+          "type": "tuple[tuple[str, float], ...]",
+          "optional": true,
+          "default": []
+        },
+        {
+          "name": "env",
+          "type": "tuple[tuple[str, str], ...]",
+          "optional": true,
+          "default": []
+        }
+      ]
     },
     "FallbackReason": {
       "kind": "enum",
@@ -649,6 +758,18 @@
           "type": "SpeculativeSpec | None",
           "optional": true,
           "default": null
+        },
+        {
+          "name": "chunk_tokens",
+          "type": "int | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "extra_replicated_bytes",
+          "type": "int",
+          "optional": true,
+          "default": 0
         }
       ]
     },
@@ -797,6 +918,30 @@
         "DISABLED": "disabled",
         "EXPIRED": "expired"
       }
+    },
+    "Lifecycle": {
+      "kind": "dataclass",
+      "module": "control_plane.contracts.deployment",
+      "fields": [
+        {
+          "name": "idle_unload_s",
+          "type": "int | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "priority",
+          "type": "str",
+          "optional": true,
+          "default": "normal"
+        },
+        {
+          "name": "start_at_boot",
+          "type": "bool",
+          "optional": true,
+          "default": false
+        }
+      ]
     },
     "LimitDecision": {
       "kind": "dataclass",
@@ -1267,6 +1412,12 @@
           "name": "driver_version",
           "type": "str",
           "optional": false
+        },
+        {
+          "name": "arch",
+          "type": "str",
+          "optional": true,
+          "default": ""
         }
       ]
     },
@@ -3214,6 +3365,11 @@
       "default": null,
       "owner": "control_plane/deploy/flags.py",
       "note": ""
+    },
+    "DERATE_VLLM_IMAGE_AMD64": {
+      "default": null,
+      "owner": "control_plane/deploy/flags.py",
+      "note": "the vllm image for an x86 (amd64) machine; DERATE_VLLM_IMAGE is the arm64 one the DGX Sparks run"
     }
   }
 }

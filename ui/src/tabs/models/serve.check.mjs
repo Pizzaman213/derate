@@ -12,11 +12,12 @@
 // passes while the fit already allowed the launch.
 //
 // This was tabs/dashboard/planner.check.mjs. It lost its other half with the
-// dashboard's planner bar: `modelGroups` was that bar's model picker, and the
-// Serve panel has no picker -- it is already on one model's URL. Nothing is
-// bundled any more, so esbuild is no longer involved.
+// dashboard's planner bar: `modelGroups` was that bar's model picker. It
+// bundles `gates.ts` through the harness, so the logic checked here is the
+// logic the screen runs.
 
 import assert from 'node:assert/strict'
+import { load } from '../../check/harness.mjs'
 
 let checks = 0
 const ok = (label, fn) => {
@@ -27,26 +28,26 @@ const ok = (label, fn) => {
 
 // ── The serve-gate derivation ────────────────────────────────────────────────
 //
-// Mirrors ServePanel's `gates` memo and Verdict's `canServe`. Kept here rather
-// than imported because both live inside components that pull in React; the
-// logic is four lines and the branches are what matter.
+// `gates.ts` is the one copy: `useModelSession` derives the gates with it and
+// `VerdictBox` decides whether Serve appears with it.
 
-const gatesOf = (serve) =>
-  serve?.overrides ??
-  (serve?.override_required
-    ? [{ param: serve.override_param ?? 'allow_over_live_memory', reason: serve.reason }]
-    : [])
-
-const canServeWith = (serve, gates, granted) => {
-  const fitPassed = serve == null ? true : serve.allowed === true
-  const refusedOutright = !fitPassed && gates.length === 0
-  return !refusedOutright && gates.every((g) => granted[g.param] === true)
-}
+const G = await load(import.meta.url, './gates.ts')
+const gatesOf = G.gatesOf
+const canServeWith = (serve, gates, granted, fit = null) =>
+  G.canServeWith(serve, fit, gates, granted)
 
 console.log('serve gates')
 
 ok('a gateway that predates `serve` offers no gates', () => {
   assert.deepEqual(gatesOf(undefined), [])
+})
+
+ok('with no `serve`, the static fit decides: fits serves, wont_fit does not', () => {
+  assert.equal(canServeWith(undefined, [], {}, { verdict: 'fits' }), true)
+  assert.equal(canServeWith(undefined, [], {}, { verdict: 'fits_degraded' }), true)
+  assert.equal(canServeWith(undefined, [], {}, { verdict: 'wont_fit' }), false)
+  // No fit port at all is not a pass either: nothing said it fits.
+  assert.equal(canServeWith(undefined, [], {}, null), false)
 })
 
 ok('a passing fit with no overrides serves immediately (today’s behaviour)', () => {

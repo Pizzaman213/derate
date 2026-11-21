@@ -30,8 +30,9 @@ export function OverrideGate({
   launchLabel = 'Serve anyway',
 }: {
   /** The gate's own refusal, verbatim. Never paraphrased -- it names the
-   *  numbers it used, and a rewrite would drop them. */
-  reason: string
+   *  numbers it used, and a rewrite would drop them. Null when the caller has
+   *  already printed that exact sentence, so it is not shown twice. */
+  reason: string | null
   /** What ticking the box means, in the first person, naming the measurement
    *  being overridden. */
   sentence: string
@@ -44,12 +45,14 @@ export function OverrideGate({
 }) {
   return (
     <div style={{ display: 'grid', gap: 'var(--space-8)' }}>
-      <p
-        className="label"
-        style={{ margin: 0, fontWeight: 400, color: 'var(--fault)', whiteSpace: 'pre-wrap' }}
-      >
-        {reason}
-      </p>
+      {reason ? (
+        <p
+          className="label"
+          style={{ margin: 0, fontWeight: 400, color: 'var(--fault)', whiteSpace: 'pre-wrap' }}
+        >
+          {reason}
+        </p>
+      ) : null}
       <label style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'flex-start', cursor: 'pointer' }}>
         <input
           type="checkbox"

@@ -3,6 +3,7 @@
   "pairs": [
     { "fg": ["ink", "ink-secondary", "ink-muted", "live", "warn", "fault", "info", "tag-1", "tag-2", "tag-3", "tag-4"], "bg": ["panel", "panel-raised"], "min": 4.5, "hc-min": 7, "kind": "text" },
     { "fg": ["ink", "ink-muted"], "bg": ["panel-recessed", "panel-sunk"], "min": 4.5, "hc-min": 7, "kind": "text" },
+    { "fg": ["logo-ink"], "bg": ["logo-tile"], "min": 4.5, "hc-min": 7, "kind": "text", "note": "engine initials on the pinned-light logo tile" },
     { "fg": ["on-fill", "on-fill-dim"], "bg": ["fill"], "min": 4.5, "hc-min": 7, "kind": "text" },
     { "fg": ["on-signal"], "bg": ["live-solid", "fault-solid", "info-solid"], "min": 3, "hc-min": 3, "kind": "mark" },
     { "fg": ["edge", "focus", "select-on-panel", "live-solid", "fault-solid", "info-solid", "flow", "stream", "batch", "limit"], "bg": ["panel"], "min": 3, "hc-min": 3, "kind": "ui" },

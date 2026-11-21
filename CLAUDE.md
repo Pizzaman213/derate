@@ -410,7 +410,7 @@ verdict.
 
 **Acceptance is measured, not assumed, and the range stays.**
 `python3 -m tests.spec_sweep` launches, drives three prompt sets from
-`tests/spec_data/`, and reads vLLM's own `vllm:spec_decode_*` counters through
+`control_plane/bench_data/`, and reads vLLM's own `vllm:spec_decode_*` counters through
 `control_plane/metrics_scrape.py`. The image exports
 `num_accepted_tokens_per_pos`, which is CUMULATIVE acceptance per draft
 position (vLLM's own dashboard divides it by `num_drafts`) -- so one launch at
@@ -551,6 +551,40 @@ fabric, and NCCL already picks a protocol by size -- forcing the small-message
 one would help a ~5.6 KB decode all-reduce and hurt the multi-MB prefill.
 `tests/nccl_sweep.py` is what turns that into a number; put a value in
 `flags.py` only with a row from it behind you.
+
+**Engine options are typed, rendered and refused like `kv_dtype`.**
+`EngineOptions` (parsers, prefix caching, batched tokens, async scheduling,
+multimodal limits, text only, YaRN, sampling defaults, NCCL env) is parsed by
+`_parse_engine_options` inside `_plan_and_fit`, so `/api/plan` and the launch
+judge the same object, and an unknown key is a 400 rather than ignored. The
+ones that move memory move it in the gate: `language_model_only` shrinks the
+shape before planning, `rope_factor` stretches `native_window`,
+`max_num_batched_tokens` is the activation chunk, the processor cache is
+replicated bytes. A field the runtime's template has no flag for is REFUSED by
+`flags.engine_options_refusal`, never dropped -- the verdict was computed with
+it. Parser names are checked against lists read off the pinned image, and the
+JSON-valued flags go through the same whole-string grammar and YAML double
+quoting as `--speculative-config`. `extra_args` stays the escape hatch; a
+custom command with any engine option set is refused.
+
+**The users chart is a bandwidth ceiling, and `users=1` equals the card's
+number.** `fit/calculator.py::bandwidth_ceiling_tps` is `predict_decode_tps`
+called with the per-sequence cache read times `users` -- not a parallel
+formula -- so at one user it is the Verdict card's tok/s exactly, and a test
+pins that. The wall is the KV budget over one sequence's cache. Past a few
+users decode is compute-bound and nothing here models that, which is why the
+response carries its own `caveat` and the chart is labelled an estimate. Do not
+multiply the ceiling into an aggregate throughput claim beyond the wall.
+
+**Prefetch runs on the coordinator because sparkrun downloads there.**
+sparkrun pulls on the coordinator host into the coordinator's hub cache and
+then distributes, and it always calls `snapshot_download`, which skips complete
+blobs -- so `deploy/prefetch.py` downloads into `huggingface_hub`'s own
+`HF_HUB_CACHE` in the coordinator's environment and the next launch's download
+is a no-op. If that is not the folder `modelcache.cache_dir()` measures, start
+refuses and names `DERATE_HF_CACHE` rather than filling a cache nothing reads.
+Pause signals the worker's process group; resume respawns and the hub library
+continues `.incomplete` blobs; cancel never deletes weights.
 
 **Read the library, not the binding.** `torch.cuda.nccl.version()` reports
 **2.29.7** inside the pinned image and every `libnccl.so.2` on its disk is

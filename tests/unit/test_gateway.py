@@ -180,9 +180,10 @@ class FakeDeployments:
 
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
-        modality=Modality.TEXT, extra_args=(), custom_command=(), revision=None,
-        speculative_tokens=0,
+        modality=Modality.TEXT, served_name=None, extra_args=(), custom_command=(),
+        revision=None, speculative_tokens=0,
         enforce_eager=False, cudagraph_capture_sizes=None, kv_dtype=None,
+        engine_options=None, original_window=None, lifecycle=None,
     ):
         if extra_args and custom_command:
             raise ValueError(
@@ -192,7 +193,7 @@ class FakeDeployments:
             )
         dep = make_deployment(
             f"d-new-{len(self.launched) + 1}",
-            shape.model_id,
+            served_name or shape.model_id,
             backend_url=None,
             state=DeploymentState.LAUNCHING,
             context_length=ctx,
@@ -206,14 +207,22 @@ class FakeDeployments:
             kv_dtype=kv_dtype,
         )
         dep.speculative_tokens = speculative_tokens
+        if lifecycle is not None:
+            dep.lifecycle = lifecycle
         self.launched.append(dep)
         self.deployments.append(dep)
         return dep
 
-    def stop(self, deployment_id):
+    def stop(self, deployment_id, *, reason=None):
         for d in self.deployments:
             if d.deployment_id == deployment_id:
                 d.state = DeploymentState.STOPPING
+
+    def set_lifecycle(self, deployment_id, lifecycle):
+        dep = self.get(deployment_id)
+        if dep is not None:
+            dep.lifecycle = lifecycle
+        return dep
 
     def list(self):
         return list(self.deployments)
@@ -3911,6 +3920,27 @@ def test_engines_are_summed_across_the_cluster_not_averaged(monkeypatch):
     assert hub.snapshot()["cluster"]["cache_hit_pct"] == 10.9
 
 
+def test_each_deployment_carries_its_own_prefix_cache_hit_rate(monkeypatch):
+    from control_plane.metrics_scrape import PrefixCache
+
+    a = make_deployment("d-a", "llama-3.3-70b", backend_url="http://a/v1")
+    b = make_deployment("d-b", "llama-3.3-70b", backend_url="http://b/v1")
+    readings = {
+        "http://a/v1": PrefixCache(queries=0.0, hits=0.0),
+        "http://b/v1": PrefixCache(queries=0.0, hits=0.0),
+    }
+    hub = _hub_with([a, b], monkeypatch, readings)
+    asyncio.run(hub._sample_prefix_cache())
+    assert all(d["prefix_cache_hit_pct"] is None for d in hub.snapshot()["deployments"])
+
+    readings["http://a/v1"] = PrefixCache(queries=1000.0, hits=100.0)
+    readings["http://b/v1"] = PrefixCache(queries=10.0, hits=10.0)
+    asyncio.run(hub._sample_prefix_cache())
+    by_id = {d["deployment_id"]: d for d in hub.snapshot()["deployments"]}
+    assert by_id["d-a"]["prefix_cache_hit_pct"] == 10.0
+    assert by_id["d-b"]["prefix_cache_hit_pct"] == 100.0
+
+
 # -- what the engine counted about its own speculation ----------------------
 #
 # The fit gate states a floor and a ceiling for speculative decoding and says
@@ -6198,6 +6228,31 @@ def test_launch_with_a_kv_dtype_reaches_the_deployment_manager():
     assert reply.json()["kv_dtype"] == "fp8", "and the record says so"
 
 
+def test_an_operator_launch_records_one_run_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    deployments = FakeDeployments()
+    app = create_app(build_deps(deployments=deployments))
+    with TestClient(app) as client:
+        reply = client.post(
+            "/api/deployments", json={"model_id": "meta-llama/Llama-3.3-70B-Instruct"})
+        assert reply.status_code == 201, reply.text
+        runs = client.get("/api/profiles").json()["profiles"]
+    assert len(runs) == 1 and runs[0]["kind"] == "run"
+    assert runs[0]["deployment_id"] == reply.json()["deployment_id"]
+    assert runs[0]["model_id"] == "meta-llama/Llama-3.3-70B-Instruct"
+
+
+def test_a_launch_without_a_request_records_no_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    app = create_app(build_deps(deployments=FakeDeployments()))
+    with TestClient(app):
+        ctx = app.state.ctx
+        status, _ = asyncio.run(ctx.launcher(
+            {"model_id": "meta-llama/Llama-3.3-70B-Instruct"}, actor="test"))
+        assert status == 201
+        assert ctx.profiles.list() == []
+
+
 def test_the_default_width_is_not_forwarded_and_changes_nothing():
     """`settings.default_kv_dtype` is fp16, which means "the model's own" and
     renders no flag. It must not be sent: a port that predates the field --
@@ -6627,6 +6682,44 @@ def test_a_machine_with_no_memory_cannot_be_named_as_a_serving_node():
     body = response.json()
     assert body["error"]["code"] == "node_has_no_memory"
     assert body["unusable_node_ids"] == ["unprobed"]
+
+
+def _arch_cluster():
+    """A Spark (arm64) and an RTX box (amd64), planned by the real planner."""
+    spark = dataclasses.replace(NODE_PROFILES["spark-01"], arch="arm64")
+    rtx = dataclasses.replace(NODE_PROFILES["ws-3090"], arch="amd64")
+    deps = build_deps(registry=FakeRegistry([node_state(spark), node_state(rtx)]))
+    deps.planner = Planner()
+    return deps, spark, rtx
+
+
+def test_machines_of_two_architectures_cannot_be_one_deployment():
+    """One deployment runs one container image, and an image is built for one
+    architecture -- whatever each machine could run on its own."""
+    deps, spark, rtx = _arch_cluster()
+    with TestClient(create_app(deps)) as client:
+        response = client.post(
+            "/api/plan", json={**PLACEMENT_BODY, "node_ids": [spark.node_id, rtx.node_id]}
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "mixed_architecture"
+
+
+def test_a_runtime_with_no_image_for_a_machine_refuses_it_named_and_skips_it_otherwise():
+    """sglang's image is arm64-only: naming the amd64 box is a refusal that
+    says so, and the planner's own pick leaves that box out rather than
+    planning a launch that would die at `exec format error`."""
+    deps, spark, rtx = _arch_cluster()
+    body = {**PLACEMENT_BODY, "model_id": "Qwen/Qwen3-8B", "runtime": "sglang"}
+    with TestClient(create_app(deps)) as client:
+        named = client.post("/api/plan", json={**body, "node_ids": [rtx.node_id]})
+        picked = client.post("/api/plan", json=body)
+    assert named.status_code == 400
+    assert named.json()["error"]["code"] == "no_image_for_architecture"
+    assert named.json()["unusable_node_ids"] == [rtx.node_id]
+    assert picked.status_code == 200, picked.text
+    assert rtx.node_id not in picked.json()["plan"]["node_ids"]
+
 
 
 def _catalogue_providers(tmp_path, *, count=4):

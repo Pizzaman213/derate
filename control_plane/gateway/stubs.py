@@ -21,6 +21,8 @@ from control_plane.contracts import (
     Deployment,
     DeploymentState,
     LinkMeasurement,
+    EngineOptions,
+    Lifecycle,
     Modality,
     ModelShape,
     ParallelismKind,
@@ -275,12 +277,13 @@ class StubDeployments:
 
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
-        modality=Modality.TEXT, extra_args=(), custom_command=(), revision=None,
-        speculative_tokens=0, speculative=None,
+        modality=Modality.TEXT, served_name=None, extra_args=(), custom_command=(),
+        revision=None, speculative_tokens=0, speculative=None,
+        engine_options=EngineOptions(), original_window=None, lifecycle=Lifecycle(),
     ) -> Deployment:
         dep = _deployment(
             f"d-{len(self._deployments) + 1}",
-            shape.model_id.split("/")[-1].lower(),
+            served_name or shape.model_id.split("/")[-1].lower(),
             shape,
             plan,
             fit,
@@ -294,13 +297,22 @@ class StubDeployments:
         # back -- the cluster editor's flag chips and relaunch need them.
         dep.extra_args = tuple(extra_args)
         dep.custom_command = tuple(custom_command)
+        dep.engine_options = engine_options
+        dep.original_window = original_window
+        dep.lifecycle = lifecycle
         self._deployments.append(dep)
         return dep
 
-    def stop(self, deployment_id: str) -> None:
+    def stop(self, deployment_id: str, *, reason: str | None = None) -> None:
         for dep in self._deployments:
             if dep.deployment_id == deployment_id:
                 dep.state = DeploymentState.STOPPING
+
+    def set_lifecycle(self, deployment_id: str, lifecycle: Lifecycle) -> Deployment | None:
+        dep = self.get(deployment_id)
+        if dep is not None:
+            dep.lifecycle = lifecycle
+        return dep
 
     def list(self) -> list[Deployment]:
         return list(self._deployments)

@@ -19,7 +19,7 @@ interface Props {
    *  what will launch. */
   recommended: ParallelismPlan | null
   overruled: boolean
-  /** Prefix for this instance's element ids. `ModelInspector` is mounted from
+  /** Prefix for this instance's element ids. `ModelPane` is mounted from
    *  two places -- the Models tab and the sheet -- and `AppShell` keeps every
    *  destination mounted at once, so more than one of these can be in the DOM
    *  together; with one hardcoded id, clicking "TP" in one would focus the
