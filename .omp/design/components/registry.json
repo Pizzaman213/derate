@@ -1808,13 +1808,28 @@
     {
       "name": "NodeBoard",
       "kind": "screen",
-      "path": "ui/src/tabs/models/NodeBoard.tsx",
+      "path": "ui/src/tabs/models/NodeBars.tsx",
       "tokens": [
+        "bar-fill",
+        "bar-keyline",
+        "bar-track",
+        "fault-solid",
+        "ink",
+        "on-fill",
+        "on-signal",
+        "panel",
+        "radius-sm",
+        "rule",
+        "rule-strong",
+        "size-badge",
+        "size-mono-label",
+        "space-10",
+        "space-14",
+        "space-18",
         "space-2",
-        "space-3",
+        "space-4",
         "space-6",
-        "space-8",
-        "warn"
+        "space-8"
       ],
       "icons": []
     },

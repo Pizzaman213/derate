@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from control_plane.contracts.deployment import EngineOptions
+from control_plane.contracts.hardware import DeviceClass, NodeProfile
 from control_plane.contracts.quant import BYTES_PER_PARAM
 
 #: The launcher's name on PATH, and the fallback when nothing overrides it.
@@ -350,10 +351,11 @@ class RuntimeSpec:
     #: node says is free RAM right now.
     #:
     #: It is a claim about what `registry.allocatable_bytes` can ANSWER for,
-    #: not about what the runtime prefers. That function branches on device
-    #: class -- host memory for `DeviceClass.CPU`, a GPU figure for everything
-    #: else -- so a host-pool runtime is placeable exactly where a host answer
-    #: exists. Everywhere else the gate would size it against the wrong pool.
+    #: not about what the runtime prefers. That function takes this value as
+    #: its `pool`: `"host"` answers from MemAvailable on a machine whose host
+    #: RAM is its own pool (CPU, DISCRETE) and 0 on a unified one, so a
+    #: host-pool runtime is placeable exactly where a host answer exists.
+    #: Everywhere else the gate would size it against the wrong pool.
     #:
     #: This is the field that used to be implicit in `addressable_memory <= 0`.
     #: While every runtime needed a GPU, "has no GPU memory" and "cannot serve"
@@ -422,15 +424,19 @@ VLLM_KV_CACHE_DTYPES: frozenset[str] = frozenset({
     "int4_per_token_head", "int8_per_token_head", "fp8_per_token_head",
 })
 
-#: derate's KV vocabulary (`fit/kv.py::KV_ELEM_BYTES`) is not vLLM's, because
-#: one names a WIDTH the gate prices and the other names a KERNEL the engine
-#: runs. These are the only ones where the two mean the same thing.
+#: derate's KV vocabulary (`fit/kv.py`) is not vLLM's, because one names a
+#: WIDTH the gate prices and the other names a KERNEL the engine runs. These
+#: are the names where the two mean the same thing: the plain widths, and the
+#: packed kernels whose page `fit/kv.py::per_layer_per_token_bytes` sizes with
+#: the image's own formula (`fit/constants.py`, `KV_PER_TOKEN_HEAD_BITS` and
+#: below).
 #:
 #: Everything mapping to None is "the model's own dtype" -- the gate's default,
 #: and the case where passing no flag is exactly right. `int8`/`fp32` are
 #: deliberately ABSENT rather than mapped: the gate can price them and this
 #: image cannot serve them, and that gap is a refusal, not a silent
-#: substitution.
+#: substitution. So is `fp8_inc`, which is Intel Gaudi's kernel and loads on
+#: no GPU derate places on.
 _KV_DTYPE_TO_VLLM: dict[str, str | None] = {
     "": None, "auto": None, "model": None, "none": None,
     "fp16": None, "float16": None, "half": None,
@@ -438,6 +444,17 @@ _KV_DTYPE_TO_VLLM: dict[str, str | None] = {
     "fp8": "fp8", "float8": "fp8",
     "fp8_e4m3": "fp8_e4m3",
     "fp8_e5m2": "fp8_e5m2",
+    "int8_per_token_head": "int8_per_token_head",
+    "fp8_per_token_head": "fp8_per_token_head",
+    "int4_per_token_head": "int4_per_token_head",
+    "nvfp4": "nvfp4",
+    "nvfp4_4over6": "nvfp4_4over6",
+    "turboquant_k8v4": "turboquant_k8v4",
+    "turboquant_4bit_nc": "turboquant_4bit_nc",
+    "turboquant_k3v4_nc": "turboquant_k3v4_nc",
+    "turboquant_3bit_nc": "turboquant_3bit_nc",
+    "fp8_ds_mla": "fp8_ds_mla",
+    "nvfp4_ds_mla": "nvfp4_ds_mla",
 }
 
 
@@ -1064,6 +1081,20 @@ RUNTIMES: dict[str, RuntimeSpec] = {
             "scitrera/dgx-spark-sglang:0.5.9-t5"
             "@sha256:a055011be7feb2e43ad8dbc365e3903f869c63b992864691f7edf83015bb941d"
         ),
+        # x86 machines run upstream SGLang, which publishes amd64 (the scitrera
+        # build above is a DGX Spark one). Digest-pinned 2026-11-21; verified on
+        # an RTX 3090 Ti (sm_86): Qwen3-0.6B loaded and answered. Its
+        # ENTRYPOINT is NVIDIA's wrapper, cleared like every image sparkrun
+        # execs a serve command into.
+        arch_images=(
+            (
+                "amd64",
+                "DERATE_SGLANG_IMAGE_AMD64",
+                "lmsysorg/sglang:v0.5.23-runtime"
+                "@sha256:3ce6da3e5ea0fee2dac6a23b528cb294fedd31ca74a55a4511f709c5e01e8652",
+                (("entrypoint", ""),),
+            ),
+        ),
         max_seqs_key="max_running_requests",
         command_template=_SGLANG_COMMAND,
         custom_command_prefix=_SGLANG_CUSTOM_PREFIX,
@@ -1136,6 +1167,14 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         default_image_env="DERATE_TTS_IMAGE",
         default_image="ghcr.io/pizzaman213/derate/tts:latest",
         default_image_arch="arm64",
+        # There is no published amd64 tts image: docker/tts.Dockerfile built
+        # ON an x86 machine from upstream vllm/vllm-openai:v0.31.0, tagged
+        # locally (see the Dockerfile header). Verified on an RTX 3090 Ti with
+        # Audio8/Audio8-TTS-Preview-0.6b. The base's ENTRYPOINT is `vllm serve`,
+        # which would swallow sparkrun's `sleep infinity`, so it is cleared.
+        arch_images=(
+            ("amd64", "DERATE_TTS_IMAGE_AMD64", "derate/tts:amd64", (("entrypoint", ""),)),
+        ),
         max_seqs_key="max_num_seqs",
         command_template=_TTS_COMMAND,
         custom_command_prefix=_TTS_CUSTOM_PREFIX,
@@ -1387,88 +1426,152 @@ def graph_capture_refusal(
 #: question is asked before a launch rather than discovered by one.
 def placement_refusal(
     runtime: str,
-    node_id: str,
-    addressable_memory: int,
+    profile: NodeProfile,
     live_budget: int | None,
 ) -> str | None:
     """Why this runtime cannot be placed on this machine, or None.
 
-    One function because there are two directions and six call sites, and for
-    most of this project's life there was only one direction: every runtime
+    *live_budget* is `registry.allocatable_or_none(node_id, pool=...)` for the
+    runtime's own `memory_pool`; it is read only for a host-pool runtime.
+
+    One function because there are two directions and several call sites, and
+    for most of this project's life there was only one direction: every runtime
     needed a GPU, so `addressable_memory <= 0` answered the whole question and
     the answer was spelled out by hand wherever it was needed. A CPU runtime
     splits that into a pair, and a pair spelled out by hand in six places is a
     pair that disagrees within a month.
 
-    The three cases:
+    The cases:
 
     * a GPU runtime on a machine with no GPU memory -- the original refusal,
       unchanged, still the common one;
-    * a host runtime on a machine that HAS a GPU. The reason is an accounting
-      one and not a preference, which matters because a preference is not
-      grounds for a refusal in this project. llama.cpp would RUN on such a
-      machine -- slowly, on its CPU, and nothing would break. What derate
-      cannot do is BUDGET it: `registry.allocatable_bytes` returns host memory
-      only for `DeviceClass.CPU`, and a GPU figure for everything else, so the
-      fit gate would compare a host-RAM demand against a GPU number. That is
-      wrong in both directions -- it can approve a launch that exhausts RAM
-      and refuse one that would have fitted.
+    * a host runtime on a machine whose host RAM is not a pool of its own --
+      GB10 and APPLE, where the GPU and the operating system spend the same
+      bytes, and UNKNOWN, where nothing identified the machine. The reason is
+      an accounting one and not a preference, which matters because a
+      preference is not grounds for a refusal in this project: llama.cpp would
+      RUN on a Spark's CPU and nothing would break. What derate cannot do is
+      BUDGET it there. `registry.allocatable_bytes` budgets a unified pool as
+      GPU memory, so a host-RAM server would be sized against bytes the GPU is
+      counting on too -- able to approve a launch that exhausts RAM.
 
-      Two things follow. The refusal is about THIS BUILD rather than about
-      llama.cpp, so it names what would have to change. And it is wider than
-      it strictly needs to be: on a discrete-GPU box VRAM and host RAM are
-      separate pools and a host-pool runtime there is perfectly budgetable --
-      it is refused anyway, because `allocatable_bytes` has no branch that
-      would answer for it. Narrowing that is a change to that function, not to
-      this one;
-    * a host runtime on a CPU machine nothing has sampled. A GPU node with no
-      sample falls back to its nameplate, because a nameplate describes a real
-      device. A CPU node has no nameplate -- `addressable_memory` is 0 and
-      always will be -- so there is nothing to fall back TO, and the honest
-      answer is to say the measurement is missing rather than invent a budget.
-      This is the one place in derate where a missing live reading refuses
-      instead of degrading, and it does so because degrading would mean
-      fabricating.
+      A DISCRETE box is NOT refused, and used to be. Its VRAM and its host RAM
+      are separate pools, so `allocatable_bytes(pool="host")` answers for it
+      from MemAvailable exactly as it does for a CPU node, and the gate sizes
+      the launch against host RAM -- never against the card;
+    * a host runtime on a machine nothing has measured host memory on. A GPU
+      node with no sample falls back to its nameplate, because a nameplate
+      describes a real device. Host RAM has no nameplate here, so there is
+      nothing to fall back TO, and the honest answer is to say the
+      measurement is missing rather than invent a budget. This is the one
+      place in derate where a missing live reading refuses instead of
+      degrading, and it does so because degrading would mean fabricating.
     """
+    from control_plane.registry.telemetry import HOST_POOL_CLASSES
+
     spec = RUNTIMES.get(runtime)
     if spec is None:
         return None
+    node_id = profile.node_id
     if spec.memory_pool == "host":
-        if addressable_memory > 0:
+        if profile.device_class not in HOST_POOL_CLASSES:
             others = ", ".join(
                 name for name, other in RUNTIMES.items() if other.memory_pool == "gpu"
             )
+            if profile.device_class.unified_memory:
+                why = (
+                    f"'{node_id}' has unified memory: its GPU and its operating "
+                    f"system spend one pool, and derate budgets that pool as GPU "
+                    f"memory. The {runtime} runtime serves from host RAM, so the "
+                    f"fit gate would size it against bytes the GPU is counting "
+                    f"on too -- a budget that can approve a launch that exhausts "
+                    f"RAM."
+                )
+            else:
+                why = (
+                    f"Nothing identified what kind of machine '{node_id}' is, so "
+                    f"derate cannot tell whether its host RAM is a pool of its "
+                    f"own, and the {runtime} runtime is budgeted against exactly "
+                    f"that."
+                )
             return (
-                f"the {runtime} runtime serves from host RAM, and derate only "
-                f"measures host RAM on a machine with no GPU. On '{node_id}' the "
-                f"fit gate would size this launch against GPU memory the server "
-                f"never touches -- a budget for the wrong pool, which can approve "
-                f"a launch that exhausts RAM as easily as refuse one that would "
-                f"have fitted. Serve it on a machine with no GPU, or use one of "
-                f"the GPU runtimes here ({others})."
+                f"{why} Serve it on a machine whose host RAM is its own pool -- "
+                f"one with a discrete GPU or none -- or use one of the GPU "
+                f"runtimes here ({others})."
             )
         if live_budget is None:
+            stale_agent = (
+                " A discrete-GPU machine's agent has to be a build that reports "
+                "host memory; an older one sends none."
+                if profile.device_class is DeviceClass.DISCRETE
+                else ""
+            )
             return (
-                f"Nothing has measured how much memory '{node_id}' has free, "
-                f"and {runtime} is budgeted against that reading rather than "
-                f"against a specification -- a machine with no GPU has no "
-                f"memory figure to fall back on. Wait for it to report, or "
-                f"check that its agent is running."
+                f"Nothing has measured how much host memory '{node_id}' has "
+                f"free, and {runtime} is budgeted against that reading rather "
+                f"than against a specification -- host RAM has no figure here "
+                f"to fall back on. Wait for it to report, or check that its "
+                f"agent is running.{stale_agent}"
             )
         if live_budget <= 0:
             return (
-                f"'{node_id}' reports no free memory to serve from right now. "
-                f"It is a cluster member; it cannot carry this launch until "
-                f"something on it releases memory."
+                f"'{node_id}' reports no free host memory to serve from right "
+                f"now. It is a cluster member; it cannot carry this launch "
+                f"until something on it releases memory."
             )
         return None
-    if addressable_memory <= 0:
+    if profile.addressable_memory <= 0:
         return (
             f"The machine '{node_id}' reports no addressable GPU memory, so "
             f"{runtime} cannot be placed on it. It can still be a cluster "
             f"member; it cannot be a serving node for this runtime."
         )
     return None
+
+
+def budget_profile(runtime: str, profile: NodeProfile) -> NodeProfile:
+    """*profile* as the planner and the fit gate must see it for *runtime*.
+
+    Unchanged for a GPU-pool runtime. For a host-pool runtime on a DISCRETE
+    box it is the box with its card taken out -- what
+    `registry/probe.py::_probe_cpu` writes for a machine with no GPU: no
+    addressable memory, no GPU name or count.
+
+    That is what the launch actually is. llamacpp's recipe clears `--gpus`, so
+    the card is not in the container, and every term the gate and the planner
+    read off the GPU would be about hardware the server never touches: the
+    static ceiling would be VRAM, the "no number of these holds it" remedy
+    would name a GPU, and a decode rate would be predicted at the card's
+    ~1 TB/s. With the card taken out, the live budget
+    (`allocatable_bytes(pool="host")`) is the only memory figure in force and
+    the gate says it serves from host memory, exactly as it does on a CPU
+    node. Identity, address and architecture are kept: the image and the link
+    lookup still need them.
+
+    The bandwidth, on a discrete box and on a CPU node alike, is the agent's
+    measured `host_memory_bandwidth_gbps`, so `predict_decode_tps` and the
+    routing fallback price a host-RAM decode at what host RAM moves. Unmeasured
+    is 0.0, which both read as "no figure": no prediction, a neutral score.
+    """
+    spec = RUNTIMES.get(runtime)
+    if spec is None or spec.memory_pool != "host":
+        return profile
+    host = profile.host_memory_bandwidth_gbps or 0.0
+    if profile.device_class is DeviceClass.CPU:
+        return dataclasses.replace(profile, memory_bandwidth_gbps=host)
+    if profile.device_class is not DeviceClass.DISCRETE:
+        return profile
+    return dataclasses.replace(
+        profile,
+        device_class=DeviceClass.CPU,
+        gpu_name="",
+        gpu_count=0,
+        total_memory=0,
+        addressable_memory=0,
+        memory_bandwidth_gbps=host,
+        compute_capability="",
+        driver_version="",
+    )
 
 
 def image_for_arch(

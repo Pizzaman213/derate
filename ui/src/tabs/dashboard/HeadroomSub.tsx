@@ -71,6 +71,13 @@ export function HeadroomSub({ context, concurrency }: { context: number; concurr
             </p>
             <Best label="right now" side={cap.live} fallback={cap.unavailable_reason} />
             <Best label="on idle hardware" side={cap.static ?? null} fallback={null} muted />
+            {cap.host_pool || cap.host_pool_unavailable_reason ? (
+              <Best
+                label={cap.host_pool ? `in host RAM (${cap.host_pool.runtimes.join(', ')})` : 'in host RAM'}
+                side={cap.host_pool ?? null}
+                fallback={cap.host_pool_unavailable_reason ?? null}
+              />
+            ) : null}
             <CapacityTable rows={cap.live?.rows ?? cap.static?.rows ?? []} />
             {cap.unresolved.length > 0 ? (
               <div style={{ marginTop: 'var(--space-10)', display: 'grid', gap: 'var(--space-6)' }}>

@@ -308,6 +308,22 @@ something a cache can be stored in; a model whose weights are mxfp4 still caches
 in bf16 or fp8. An unrecognised dtype falls back to `KV_FALLBACK_DTYPE` (bf16),
 over-estimating on purpose — the alternative is a gate that lets an OOM through.
 
+**The packed layouts are priced from the image's own page formulas, not from a
+width.** `int8/fp8/int4_per_token_head`, `nvfp4`, `nvfp4_4over6`, the four
+`turboquant_*` presets and the two `*_ds_mla` blobs have no bytes-per-element:
+each stores scales beside its data (two fp32 per head per token, one fp8 per
+16 elements, an fp16 norm and a scale/zero pair), and TurboQuant keeps the
+first and last two layers of a non-hybrid model at the model's own width.
+`per_layer_per_token_bytes` applies the formulas in `constants.py`; for the
+Llama-3.3-70B geometry they equal, byte for byte, what each backend's
+`customize_spec` returns inside the pinned image, and
+`tests/unit/test_integration_kv.py` pins those numbers. `kv_dtype_refusal`
+refuses a layout for the attention geometry it was not built for (`*_ds_mla`
+without MLA; nvfp4 or TurboQuant with it) and TurboQuant beside sliding-window
+layers, where the image pads the wide layers' pages in a way nothing here
+derives. Whether the GPU can run a kernel (nvfp4 needs Blackwell) is not
+checked here.
+
 ## `stub.py`
 
 `StubFit` is the day-0 `FitPort`: FITS below `STUB_LIMIT` (100 GiB), WONT_FIT
@@ -362,8 +378,9 @@ fit on the box while it was taken.
 `KV_FALLBACK_DTYPE` and `QUANT_SUGGESTION_ORDER` are local outright.
 
 `KV_ELEM_BYTES` is deliberately not `BYTES_PER_PARAM`: sub-byte weight
-quantization schemes do not apply to the cache, and runtimes cache in fp8 at the
-smallest. `QUANT_SUGGESTION_ORDER` is the twelve schemes this package is willing
+quantization schemes do not apply to the cache, and a plain cache width is fp8
+at the smallest; the sub-byte caches are the packed layouts above, which carry
+their own scales. `QUANT_SUGGESTION_ORDER` is the twelve schemes this package is willing
 to suggest, best quality first, and it is also the default ladder
 `largest_runnable` walks.
 

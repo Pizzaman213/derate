@@ -69,6 +69,8 @@ PROFILE_DIFF_FIELDS = (
     "hostname",
     "address",
     "arch",
+    "infiniband",
+    "host_memory_bandwidth_gbps",
 )
 
 

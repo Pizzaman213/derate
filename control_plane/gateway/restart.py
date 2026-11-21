@@ -33,6 +33,8 @@ from control_plane.contracts import Deployment, EngineOptions, Lifecycle, Verdic
 from control_plane.deploy.relaunch import launch_request_from
 from control_plane.contracts.auth import AuditAction
 
+from control_plane.deploy.flags import runtime_spec
+
 from .deps import GatewayContext
 from .internal_api import (
     _data_parallel_refusal,
@@ -109,11 +111,13 @@ async def _attempt_relaunch(
         return "error", None, "the fit calculator is not wired"
 
     runtime = deployment.runtime
-    supported_by = getattr(ctx.deps.resolver, "supported_by", None)
-    if callable(supported_by):
-        ok, reason = await asyncio.to_thread(supported_by, out.shape, runtime)
-        if not ok:
-            return "runtime_unsupported", None, reason
+    # Judged by `_plan_and_fit` against the image each placed machine runs;
+    # `supported_by` asked again without the machines would answer for the
+    # default image instead.
+    if not out.runtime_supported:
+        return "runtime_unsupported", None, (
+            out.runtime_unsupported_reason or f"{runtime} cannot load this model"
+        )
 
     dp_problem = _data_parallel_refusal(
         out.plan.tensor_parallel,
@@ -135,10 +139,22 @@ async def _attempt_relaunch(
     if sharding_problem:
         return "sharding_unsupported", None, sharding_problem
 
-    if fit.verdict is Verdict.WONT_FIT:
+    # A host-pool runtime (llamacpp) has a static budget of 0 by design, so
+    # the static verdict says nothing: with no live reading there is no
+    # budget at all (refused as unmeasured, as the deployments POST does),
+    # and with one the live verdict alone governs.
+    live = out.fit_live
+    if runtime_spec(runtime).memory_pool == "host":
+        if live is None:
+            return "wont_fit", None, (
+                f"{runtime} serves from host memory, and there is no live "
+                f"reading of host memory on "
+                f"{', '.join(out.plan.node_ids) or 'these machines'}"
+            )
+        fit = live
+    elif fit.verdict is Verdict.WONT_FIT:
         return "wont_fit", None, fit.reason
 
-    live = out.fit_live
     if live is not None and live.verdict is Verdict.WONT_FIT:
         return "wont_fit", None, live.reason
     gating_fit = live if live is not None else fit

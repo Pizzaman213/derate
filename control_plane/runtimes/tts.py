@@ -75,9 +75,11 @@ from starlette.concurrency import run_in_threadpool
 
 log = logging.getLogger("derate.tts")
 
-#: What ``model.generate`` is asked for when the request names nothing and the
-#: window leaves room for it. 512 frames at ~21.5 frames/s is about 24 seconds
-#: of speech, which is the checkpoint's own generation_config default.
+#: What ``model.generate`` is asked for when the request names nothing. 512
+#: frames at ~21.5 frames/s is about 24 seconds of speech, which is the
+#: checkpoint's own generation_config default. Whatever a request asks for is
+#: clamped to the window (`SpeechEngine.frame_limit`), because that is the
+#: length the fit gate priced the codec's decode buffers at.
 DEFAULT_MAX_NEW_TOKENS = 512
 
 #: L16: the longest `input` /v1/audio/speech accepts. One request holds the
@@ -755,6 +757,19 @@ class SpeechEngine:
         for note in self.voices.skipped:
             log.warning("voice skipped -- %s", note)
 
+    def frame_limit(self, requested: int | None) -> int:
+        """The frames one request may generate: what it asked for, or the
+        default, and never more than the window.
+
+        Not cosmetic. The checkpoint does not stop on its own -- every request
+        measured ran to its limit -- and the codec decodes the whole clip in
+        one call, holding ~5 MB per frame (`resolver/support.py::
+        TTS_WORKING_SETS`). The fit gate charges that for a clip as long as the
+        window and the allocator is capped at the gate's figure, so an
+        unclamped `max_new_tokens` is an out-of-memory error in the codec.
+        """
+        return max(1, min(requested or DEFAULT_MAX_NEW_TOKENS, self.window))
+
     # -- synthesis --------------------------------------------------------
 
     def synthesize(
@@ -787,7 +802,7 @@ class SpeechEngine:
             with torch.inference_mode():
                 codes = self.model.generate(
                     **batch,
-                    max_new_tokens=max_new_tokens or DEFAULT_MAX_NEW_TOKENS,
+                    max_new_tokens=self.frame_limit(max_new_tokens),
                     temperature=temperature,
                     top_p=top_p,
                     do_sample=True,

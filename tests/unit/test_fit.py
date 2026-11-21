@@ -669,6 +669,174 @@ def test_logits_are_charged_per_emitted_token_not_per_context():
     assert doubled - long == GPT_OSS_120B.vocab_size * 16 * 4
 
 
+# --------------------------------------------------------------------------
+# the tts runtime's codec working set
+# --------------------------------------------------------------------------
+
+#: Audio8/Audio8-TTS-Preview-0.6b as the resolver reads it, and the weight
+#: index it measures.
+AUDIO8_TTS = ModelShape(
+    model_id="Audio8/Audio8-TTS-Preview-0.6b",
+    num_layers=24,
+    hidden_size=896,
+    num_attention_heads=14,
+    num_kv_heads=2,
+    vocab_size=155776,
+    total_params=601159424,
+    dtype="bf16",
+    head_dim=64,
+)
+AUDIO8_WEIGHT_BYTES = 1_202_342_528
+
+#: Peak RESERVED bytes per synthesis by generated frames, measured 2026-11-21 on
+#: an RTX 3090 (derate/tts:amd64, SpeechEngine as served). Load alone reserves
+#: 1,933,574,144. The allocator cap is a fraction of this card's torch total.
+AUDIO8_PEAK_RESERVED = {
+    64: 2_239_758_336,
+    128: 2_487_222_272,
+    256: 3_227_516_928,
+    512: 4_422_893_568,
+    768: 5_557_452_800,
+    1024: 6_759_120_896,
+}
+RTX_3090_TORCH_TOTAL = 25_283_526_656  # 23.55 GiB
+
+
+def _priced_tts_shape() -> ModelShape:
+    from control_plane.resolver.support import speech_working_set
+
+    found = speech_working_set(("ArkttsModel",))
+    assert found is not None
+    return dataclasses.replace(
+        AUDIO8_TTS,
+        codec_resident_bytes=found.resident_bytes,
+        codec_bytes_per_frame=found.bytes_per_frame,
+    )
+
+
+def test_the_tts_breakdown_charges_the_codec_in_activations():
+    shape = _priced_tts_shape()
+    plain = activation_bytes(AUDIO8_TTS, max_seqs=1, context=512)
+    priced = activation_bytes(shape, max_seqs=1, context=512)
+    assert priced - plain == shape.codec_resident_bytes + 512 * shape.codec_bytes_per_frame
+    # One clip at a time under the server's lock: concurrency does not
+    # multiply it, the window does.
+    assert activation_bytes(shape, 8, 512) - activation_bytes(AUDIO8_TTS, 8, 512) == (
+        priced - plain
+    )
+    breakdown, warnings = memory_breakdown(
+        shape, make_plan(), 512, 1, "fp16", weight_bytes=AUDIO8_WEIGHT_BYTES
+    )
+    assert breakdown.activations == int(priced)
+    assert any("speech codec" in w for w in warnings)
+
+
+@pytest.mark.parametrize("frames", sorted(AUDIO8_PEAK_RESERVED))
+def test_the_tts_allocator_cap_covers_the_measured_peak(fit, frames):
+    """The launch caps the server's allocator at `utilization_for` of the
+    gate's total. With the codec unpriced that was 2.35 GiB on this card and
+    every synthesis died in the codec at 4.4 GB."""
+    from control_plane.deploy.utilization import utilization_for
+
+    peak = AUDIO8_PEAK_RESERVED[frames]
+    req = dataclasses.replace(
+        request(_priced_tts_shape(), context=frames, seqs=1, kv_dtype="fp16"),
+        weight_bytes=AUDIO8_WEIGHT_BYTES,
+    )
+    for node, device_total in (
+        (WS_3090, RTX_3090_TORCH_TOTAL),
+        (SPARK_01, SPARK_01.total_memory),
+    ):
+        result = fit.check(req, [node])
+        assert result.ok, result.reason
+        share = utilization_for(
+            needed_bytes=result.breakdown.total, device_total_bytes=device_total
+        )
+        assert share * device_total >= peak, (node.node_id, share)
+
+
+def test_a_tts_refusal_offers_a_shorter_window(fit):
+    small = dataclasses.replace(WS_3090, addressable_memory=6 * GIB)
+    req = dataclasses.replace(
+        request(_priced_tts_shape(), context=2048, seqs=1, kv_dtype="fp16"),
+        weight_bytes=AUDIO8_WEIGHT_BYTES,
+    )
+    result = fit.check(req, [small])
+    assert result.verdict is Verdict.WONT_FIT
+    assert result.max_context_that_fits and result.max_context_that_fits < 2048
+    assert f"lower context to {result.max_context_that_fits} frames" in result.reason
+
+
+def test_the_planner_floor_charges_the_same_codec_as_the_gate():
+    """`fit_bridge.min_nodes_required` sizes the activations the gate does.
+    Without the codec there, the planner would place a tts launch on a machine
+    the gate then refuses for the codec it left out."""
+    from control_plane.planner import fit_bridge
+
+    shape = _priced_tts_shape()
+    for frames in (64, 512, 2048):
+        bridge = fit_bridge.activation_bytes(shape, 1, frames) - fit_bridge.activation_bytes(
+            AUDIO8_TTS, 1, frames
+        )
+        assert bridge == shape.codec_working_set(frames) > 0
+        assert bridge == activation_bytes(shape, 1, frames) - activation_bytes(
+            AUDIO8_TTS, 1, frames
+        )
+
+
+def test_every_architecture_the_tts_runtime_loads_has_a_measured_working_set():
+    """A tts launch is charged its codec from `TTS_WORKING_SETS`. A name the
+    runtime loads with no row there is a launch priced at its weights alone,
+    capped there by the derived allocator share, and killed by the codec."""
+    from control_plane.resolver.support import (
+        RUNTIMES as SUPPORT_RUNTIMES,
+        speech_working_set,
+    )
+
+    loads = SUPPORT_RUNTIMES["tts"].architectures
+    assert loads
+    for name in loads:
+        found = speech_working_set((name,))
+        assert found is not None and found.resident_bytes > 0 and found.bytes_per_frame > 0, name
+
+
+def test_the_breakdown_charges_turboquant_as_the_busiest_stage_holds_it():
+    """`kv_cache` is the busiest rank's cache. Divided evenly, a four-stage
+    pipeline spreads TurboQuant's four wide boundary layers one per stage,
+    while the first and last stages each hold two."""
+    from control_plane.fit import kv as fit_kv
+
+    tq, plan = "turboquant_k8v4", make_plan(pp=4)
+    breakdown, _ = memory_breakdown(LLAMA_3_3_70B, plan, 8192, 2, tq)
+    per_rank = fit_kv.kv_cache_bytes_per_rank(LLAMA_3_3_70B, plan, 8192, 2, tq)
+    assert breakdown.kv_cache == int(per_rank)
+    assert per_rank > fit_kv.kv_cache_bytes(LLAMA_3_3_70B, 8192, 2, tq) / kv_divisor(
+        LLAMA_3_3_70B, plan
+    )
+
+
+def test_fp8_is_offered_only_where_it_is_narrower_than_the_chosen_width(fit):
+    """The KV refusal prices its fp8 remedy against the width actually chosen.
+    Under a packed 4-bit layout fp8 is nearly twice as wide; offering it as a
+    fix sends the operator to a cache that holds less."""
+
+    def reason(kv_dtype: str) -> str:
+        result = fit.check(
+            request(QWEN3_30B_A3B, context=131072, seqs=16, kv_dtype=kv_dtype), ONE_SPARK
+        )
+        assert result.verdict is Verdict.WONT_FIT
+        assert "KV cache is the problem" in result.reason
+        return result.reason
+
+    assert "quantize the KV cache to fp8 (96.0 GiB, still short)" in reason("auto")
+    # 8 bits plus a scale pair per head: fp8 is narrower, and priced from it.
+    assert "quantize the KV cache to fp8 (96.0 GiB, still short)" in reason(
+        "int8_per_token_head"
+    )
+    for packed in ("int4_per_token_head", "turboquant_3bit_nc"):
+        assert "fp8" not in reason(packed), packed
+
+
 def test_fp8_kv_cache_halves_a_bf16_cache():
     bf16 = kv_cache_bytes(LLAMA_3_3_70B, 8192, 16, "bf16")
     fp8 = kv_cache_bytes(LLAMA_3_3_70B, 8192, 16, "fp8")

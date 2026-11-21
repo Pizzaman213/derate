@@ -14,6 +14,7 @@ import os
 import struct
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1370,10 +1371,13 @@ class TestRuntimeSupport:
     def test_ggml_architecture_names_are_understood(self):
         assert build_verdict(("qwen2",), "bf16").for_runtime("vllm").ok
 
-    def test_nvfp4_needs_blackwell(self):
+    def test_nvfp4_runs_emulated_below_blackwell_and_says_so(self):
+        """It was "Blackwell only; no pre-Blackwell kernel" until a 3090
+        (sm_86) loaded nvidia/Qwen3-8B-NVFP4 and RedHatAI/Qwen3-8B-NVFP4 under
+        vLLM 0.31.0 through Marlin weight-only FP4, and both answered."""
         ok, problems = check_nodes("nvfp4", [WS_3090])
-        assert not ok and "sm_8.6" in problems[0]
-        assert check_nodes("nvfp4", list(GB10_PROFILES))[0]
+        assert ok and "emulated" in problems[0]
+        assert check_nodes("nvfp4", list(GB10_PROFILES)) == (True, [])
 
     def test_mxfp4_runs_emulated_below_blackwell_and_says_so(self):
         ok, problems = check_nodes("mxfp4", [WS_3090])
@@ -1392,9 +1396,28 @@ class TestRuntimeSupport:
     def test_supported_on_checks_the_nodes_too(self, resolver):
         shape = ModelShape(
             model_id="x/y", num_layers=4, hidden_size=64, num_attention_heads=4,
-            num_kv_heads=4, vocab_size=100, total_params=1_000_000, dtype="nvfp4",
+            num_kv_heads=4, vocab_size=100, total_params=1_000_000, dtype="awq_int4",
         )
-        assert not resolver.supported_on(shape, "vllm", [WS_3090])[0]
+        volta = replace(WS_3090, compute_capability="7.0")
+        assert not resolver.supported_on(shape, "vllm", [volta])[0]
+
+    @pytest.mark.parametrize("config, sidecar, method", [
+        # ModelOpt NVFP4 is `modelopt_fp4` (vLLM's floor sm_75), not
+        # `modelopt` (sm_80): read wrong, a T4 is refused a checkpoint it loads.
+        ({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}, None,
+         "modelopt_fp4"),
+        ({}, {"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "NVFP4"}},
+         "modelopt_fp4"),
+        ({}, {"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "FP8"}},
+         "modelopt"),
+        ({"quantization_config": {"quant_method": "compressed_tensors"}}, None,
+         "compressed-tensors"),
+        ({"torch_dtype": "bfloat16"}, None, ""),
+    ])
+    def test_the_vllm_loader_is_named_the_way_vllm_names_it(self, config, sidecar, method):
+        from control_plane.resolver.quant_detect import vllm_quant_method
+
+        assert vllm_quant_method(config, sidecar) == method
 
     def test_sharding_notes_flag_indivisible_kv_heads(self):
         notes = sharding_notes(LLAMA_3_3_70B, 3)
@@ -1420,6 +1443,47 @@ class TestCache:
         assert hit.weight_bytes == res.weight_bytes
         assert hit.support.for_runtime("vllm").reason == res.support.for_runtime("vllm").reason
         assert hit.from_cache
+
+    def test_the_vllm_loader_name_survives_a_cache_hit(self, tmp_path):
+        """`quant_method` is what the silicon gate looks up in the probed
+        image's per-method floors. A hit that dropped it -- from memory or
+        from disk -- would send a cached checkpoint to the static table."""
+        config = {
+            **load_config("llama-3.3-70b"),
+            "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        }
+        hub = TestWeightIndexArbitration()
+        info = hub._info("acme/Widget-NVFP4", None, {"model.safetensors": 1000})
+        directory = tmp_path / "cache"
+        resolver = ModelResolver(
+            client=TestWeightIndexArbitration.FakeClient(config, info),
+            cache=ShapeCache(directory=directory),
+        )
+
+        first = resolver.resolve_full("acme/Widget-NVFP4")
+        assert (first.shape.dtype, first.quant_method) == ("nvfp4", "modelopt_fp4")
+        warm = resolver.resolve_full("acme/Widget-NVFP4")
+        assert warm.from_cache and warm.quant_method == "modelopt_fp4"
+        cold = ModelResolver(
+            client=TestWeightIndexArbitration.FakeClient(config, info),
+            cache=ShapeCache(directory=directory), offline=True,
+        ).resolve_full("acme/Widget-NVFP4")
+        assert cold.from_cache and cold.quant_method == "modelopt_fp4"
+
+    def test_an_entry_written_before_the_loader_name_is_resolved_again(
+        self, tmp_path, resolver, monkeypatch
+    ):
+        """Schema 7 had no `quant_method`; served, it decodes to "" and the
+        silicon gate falls back to the static table for every cached
+        quantized checkpoint. It has to miss."""
+        from control_plane.resolver import cache as cache_module
+
+        res = offline(resolver, "llama-3.3-70b", "m")
+        current = cache_module.SCHEMA_VERSION
+        monkeypatch.setattr(cache_module, "SCHEMA_VERSION", 7)
+        ShapeCache(directory=tmp_path / "c").put("m", "main", None, res)
+        monkeypatch.setattr(cache_module, "SCHEMA_VERSION", current)
+        assert ShapeCache(directory=tmp_path / "c").get("m", "main", None) is None
 
     def test_expired_entries_are_ignored(self, tmp_path, resolver):
         res = offline(resolver, "llama-3.3-70b", "llama")

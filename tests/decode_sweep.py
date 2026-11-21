@@ -474,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
                 stop(args.base, started["deployment_id"])
 
     if not args.no_save and found:
-        version = runtime_version(args.base, found[0].model_id)
+        version = runtime_version(args.base, node)
         written = 0
         for m in found:
             if measurements.save_decode(record_for(m, node, version)) is not None:

@@ -130,7 +130,12 @@ the world. That server calls exactly `processor(...)`, `generate() -> codes`
 and `decode_audio(codes)`, so a name belongs here once somebody has run that
 checkpoint through that server — never because the model card says TTS. It
 holds `ArkttsModel`, verified on a GB10 against
-`Audio8/Audio8-TTS-Preview-0.6b`.
+`Audio8/Audio8-TTS-Preview-0.6b`. It is the key set of `TTS_WORKING_SETS`,
+so a name goes in together with that run's measured allocator footprint (the
+resident codec and its decode bytes per frame), which the gateway charges in
+the fit gate's `activations` for a tts launch. A name with no measurement
+cannot be listed, so the runtime never loads an architecture the gate has
+to guess the price of.
 
 `AUDIO_ARCHITECTURES` decides the route rather than the loading. Loadable and
 answerable on `/v1/chat/completions` are separate claims, and keeping them
@@ -447,9 +452,11 @@ written by an older build still reports the current answer.
 key this codebase prices with, `label` is what the publisher called it, and
 rendering "q4_k_m" for a file named "UD-Q4_K_XL" would paraphrase a string
 somebody else chose. `file_bytes` is a measurement or it is `None`, never a
-table estimate. `QuantRequirement.check(compute_capability)` is the silicon
-question, and it returns a sentence either way — NVFP4 needs Blackwell outright,
-MXFP4 runs emulated below it.
+table estimate. `QuantRequirement.check(compute_capability)` is the static
+silicon question and the fallback; `support.silicon_check` asks the image the
+machine runs (its probed per-method floors and KV-dtype kernels) first. Both
+return a sentence either way -- NVFP4 runs emulated (Marlin, weight-only)
+below Blackwell, MXFP4 runs emulated below it too.
 
 ## `gguf_names.py`
 

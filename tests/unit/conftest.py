@@ -59,6 +59,23 @@ def _derate_data_dir(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_port_preflight(monkeypatch):
+    # Every DeploymentManager dials each plan node before a launch
+    # (manager._preflight_port). The suite's nodes are fixture addresses
+    # on somebody's LAN, so the real SYN would time out -- and refuse -- on
+    # every launch test. Answered "closed" (free, and reachable) here; a test
+    # about the check passes its own `port_reach_fn`, and one about the real
+    # function asks for this fixture by name, which yields it.
+    import control_plane.deploy.manager as manager
+
+    real = manager.port_reachable
+    monkeypatch.setattr(
+        manager, "port_reachable", lambda host, port: (manager.PORT_CLOSED, "")
+    )
+    yield real
+
+
+@pytest.fixture(autouse=True)
 def _derate_auth(request):
     _raw["on"] = request.node.get_closest_marker("raw_http") is not None
     _creds.clear()

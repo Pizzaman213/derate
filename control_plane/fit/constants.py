@@ -87,6 +87,57 @@ KV_ELEM_BYTES: dict[str, float] = {
 # bytes over-estimates; the alternative is a gate that lets an OOM through.
 KV_FALLBACK_DTYPE = "bf16"
 
+# Packed KV cache layouts: the vLLM kernels whose cache is not "one element of
+# width w per K and V value", priced from the formulas the pinned image itself
+# sizes its pages with -- vLLM 0.28.1rc1.dev486 in
+# ghcr.io/pizzaman213/derate/vllm-audio, read off each attention backend's
+# `customize_spec` (`v1/attention/backends/{triton_attn,flashinfer,
+# turboquant_attn}.py`, `MLACommonBackend` in `layers/attention/
+# mla_attention.py`), `utils/torch_utils.py::nvfp4_kv_cache_full_dim` and
+# `layers/quantization/turboquant/config.py`. A different image is a different
+# table; `fit/kv.py::per_layer_per_token_bytes` is where they are applied.
+#
+# Per-token-head: each head's K and V data at this many bits, followed inline
+# by one fp32 scale for K and one for V.
+KV_PER_TOKEN_HEAD_BITS: dict[str, int] = {
+    "int8_per_token_head": 8,
+    "fp8_per_token_head": 8,
+    "int4_per_token_head": 4,
+}
+KV_PER_TOKEN_HEAD_SCALE_BYTES: int = 8
+
+# NVFP4: K and V each packed as fp4 data plus one fp8 block scale per
+# KV_NVFP4_BLOCK elements (`head_size // 2 + head_size // 16` bytes per side).
+KV_NVFP4_DTYPES: frozenset[str] = frozenset({"nvfp4", "nvfp4_4over6"})
+KV_NVFP4_BLOCK: int = 16
+
+# TurboQuant: (key bits, value bits) per preset. An 8-bit key is stored as
+# fp8 with no overhead; a narrower one is Lloyd-Max indices plus a 2-byte fp16
+# norm. A value is uniform-quantized plus a 2-byte scale and a 2-byte zero. K
+# and V share one slot per head, rounded up to an even byte count.
+KV_TURBOQUANT_BITS: dict[str, tuple[int, int]] = {
+    "turboquant_k8v4": (8, 4),
+    "turboquant_4bit_nc": (4, 4),
+    "turboquant_k3v4_nc": (3, 4),
+    "turboquant_3bit_nc": (3, 3),
+}
+KV_TURBOQUANT_KEY_NORM_BYTES: int = 2
+KV_TURBOQUANT_VALUE_META_BYTES: int = 4
+# On a model with no recurrent layers the image keeps this many layers at EACH
+# end at the model's own width (`get_boundary_skip_layers`, "boundary
+# protection"); a hybrid keeps none. derate prices every model as one with no
+# recurrent layers, so a hybrid is charged the wide layers it does not keep --
+# an over-count, in the refusing direction.
+KV_TURBOQUANT_BOUNDARY_LAYERS: int = 2
+
+# DeepSeek sparse-MLA layouts: latent, RoPE and scales in one opaque blob of
+# this many bytes per token per layer (`mla_attention.py`, "not derivable
+# from head_size").
+KV_DS_MLA_BYTES: dict[str, int] = {
+    "fp8_ds_mla": 656,
+    "nvfp4_ds_mla": 352,
+}
+
 # Quantizations we are willing to suggest, best quality first.
 QUANT_SUGGESTION_ORDER: tuple[str, ...] = (
     "fp32",

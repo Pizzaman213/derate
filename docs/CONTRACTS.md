@@ -335,6 +335,8 @@ Every value that crosses the wire as a string.
 | `vision_params` | `int` | yes |
 | `routed_expert_params` | `int` | yes |
 | `is_encoder_decoder` | `bool` | yes |
+| `codec_resident_bytes` | `int` | yes |
+| `codec_bytes_per_frame` | `int` | yes |
 
 ### `NodeProfile`
 
@@ -354,6 +356,8 @@ Every value that crosses the wire as a string.
 | `compute_capability` | `str` | no |
 | `driver_version` | `str` | no |
 | `arch` | `str` | yes |
+| `infiniband` | `bool | None` | yes |
+| `host_memory_bandwidth_gbps` | `float | None` | yes |
 
 ### `NodeState`
 
@@ -937,6 +941,7 @@ default. A blank default means absence is itself the answer.
 | `DERATE_RESOLVER_TTL` | `24 * 3600` | `control_plane/resolver/cache.py` — seconds; a pinned commit sha never expires whatever this says |
 | `DERATE_ROLE` | `auto` | `control_plane/registry/config.py` — auto | coordinator | worker; auto becomes coordinator when none is found |
 | `DERATE_SGLANG_IMAGE` |  | `control_plane/deploy/flags.py` |
+| `DERATE_SGLANG_IMAGE_AMD64` |  | `control_plane/deploy/flags.py` — the sglang image for an x86 (amd64) machine; DERATE_SGLANG_IMAGE is the arm64 one the DGX Sparks run |
 | `DERATE_SHELL` | `0` | `control_plane/registry/shell_config.py` — off unless explicitly enabled |
 | `DERATE_SHELL_BINARY` | `DEFAULT_SHELL` | `control_plane/registry/shell_config.py` |
 | `DERATE_SHELL_IDLE_S` | `1800` | `control_plane/registry/shell_config.py` |
@@ -957,6 +962,7 @@ default. A blank default means absence is itself the answer.
 | `DERATE_TTS_API_KEY` |  | `control_plane/runtimes/tts.py` — set by the recipe: the bearer the tts runtime requires on /v1; unset means the runtime answers unauthenticated |
 | `DERATE_TTS_DEFAULT_VOICES` | `1` | `control_plane/runtimes/tts.py` — 0 leaves an empty voice directory empty instead of fetching a starter library |
 | `DERATE_TTS_IMAGE` |  | `control_plane/deploy/flags.py` |
+| `DERATE_TTS_IMAGE_AMD64` |  | `control_plane/deploy/flags.py` — the tts image for an x86 (amd64) machine; there is no published one, build docker/tts.Dockerfile on that machine (see its header) |
 | `DERATE_TTS_VOICE_DIR` |  | `control_plane/runtimes/tts.py` — read inside the model container, not on the node |
 | `DERATE_UI_DIR` |  | `control_plane/gateway/settings.py` — the built UI to serve; absent means the API answers and no screen does |
 | `DERATE_VLLM_IMAGE` |  | `control_plane/deploy/flags.py` |

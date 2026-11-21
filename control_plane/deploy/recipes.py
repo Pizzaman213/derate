@@ -23,7 +23,7 @@ import unicodedata
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from control_plane.contracts import (
     EngineOptions,
@@ -440,6 +440,29 @@ def _custom_serve_command(
     )
 
 
+def fabric_on_every_node(profiles: Sequence[Any]) -> bool:
+    """Whether every one of *profiles* may be handed `/dev/infiniband`.
+
+    Only an explicit False counts against it: None is an agent older than
+    the field, and keeps the device the way every launch did before."""
+    return all(getattr(p, "infiniband", None) is not False for p in profiles)
+
+
+def tcp_fabric_note(profiles: Sequence[Any]) -> str | None:
+    """The plan's sentence for a multi-node plan whose recipe clears the
+    device, or None when it keeps it. Same predicate as `synthesize`, so the
+    screen and the launch cannot disagree about which link NCCL runs on."""
+    if len(profiles) <= 1 or fabric_on_every_node(profiles):
+        return None
+    missing = sorted(p.node_id for p in profiles if getattr(p, "infiniband", None) is False)
+    return (
+        f"{', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no "
+        "InfiniBand device, so this launch runs without one on every machine "
+        "and NCCL talks over TCP sockets on the ordinary network, which is "
+        "slower than RoCE."
+    )
+
+
 def synthesize(
     shape: ModelShape,
     plan: ParallelismPlan,
@@ -467,8 +490,13 @@ def synthesize(
     trust_remote_code: bool = False,
     engine_options: EngineOptions = EngineOptions(),
     original_window: int | None = None,
+    infiniband: bool = True,
 ) -> RecipeSpec:
-    """Build the recipe for one deployment. Pure: touches no filesystem."""
+    """Build the recipe for one deployment. Pure: touches no filesystem.
+
+    *infiniband* is whether every machine in the plan may be handed
+    `/dev/infiniband` -- `fabric_on_every_node` over their profiles. The
+    caller passes it because this function does not see the registry."""
     # M-22: shape.model_id and served_name both flow from an API request
     # (served_name may also just be default_served_name(shape), i.e. still
     # derived from model_id) and both land verbatim in the YAML body below,
@@ -707,6 +735,23 @@ def synthesize(
     executor = image_executor_config(spec, img)
     if executor:
         lines += ["  %s: %s\n" % (k, json.dumps(v)) for k, v in executor]
+    # sparkrun's rootless branch adds `--device /dev/infiniband` to EVERY
+    # launch ("TODO: confirm existence" in its launcher.py), and `docker run`
+    # refuses a device that is not there -- "error gathering device
+    # information" -- before the container exists. A Spark has the device; the
+    # 3090 does not, so every launch there was created and destroyed without
+    # starting, and sparkrun reported it as "Container died unexpectedly".
+    # One machine runs no cross-node collective, so it never needs the fabric:
+    # cleared here (the recipe outranks sparkrun's adjustments) for any plan on
+    # one node. A multi-node plan keeps it only when every machine in it may
+    # have the device (`infiniband`, from `fabric_on_every_node`) -- NCCL over
+    # RoCE needs it. The recipe is one `executor_config` for every host, so a
+    # single machine without the device clears it everywhere, and NCCL then
+    # runs TCP sockets on every rank, which is consistent rather than a mix;
+    # the plan says so on screen (`tcp_fabric_note`). Unknown (an agent older
+    # than the field) keeps the device, which is what every launch did before.
+    if len(plan.node_ids) <= 1 or not infiniband:
+        lines.append("  devices: []\n")
 
     lines += ["\n", "command: |\n"]
     pins = {

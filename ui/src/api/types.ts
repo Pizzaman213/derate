@@ -750,6 +750,11 @@ export interface MemoryReport {
   memory_severity?: 'ok' | 'warning' | 'critical' | null
   sampled_at?: number
   allocatable?: number | null
+  /** What a host-pool runtime (llamacpp) is budgeted against on this machine:
+   *  MemAvailable less the CPU reserve. Null on a unified-memory or
+   *  unidentified machine, where host RAM is not a pool of its own, and when
+   *  nothing has measured it. Optional: an older coordinator omits it. */
+  host_allocatable?: number | null
   static_ceiling?: number | null
   addressable?: number | null
   pool_used?: number | null
@@ -914,6 +919,13 @@ export interface PlanResponse {
    *  YaRN is on -- and the model's trained one. Absent on an older gateway. */
   native_window?: number | null
   original_window?: number | null
+  /** Cache bytes per token at each `--kv-cache-dtype` the gate prices for
+   *  THIS model, over its 16-bit rate (`fit/kv.py`). Includes the packed
+   *  layouts, whose scales and boundary layers depend on the model. Absent
+   *  per name when the gate does not price it, this build cannot render it
+   *  as a flag, or this attention geometry refuses it (`internal_api.py::
+   *  _kv_dtype_ratios`); `auto` is never listed. Absent on an older gateway. */
+  kv_dtype_ratios?: Record<string, number>
 }
 
 export interface LaunchRequest {
@@ -1943,6 +1955,17 @@ export interface CapacitySide {
   best: CapacityRow | null
 }
 
+/** `CapacityReport.host_pool`: one machine, live only. */
+export interface CapacityHostPool extends CapacitySide {
+  /** The host-pool runtimes this answers for, e.g. `["llamacpp"]`. */
+  runtimes: string[]
+  node_id: string
+  /** The KV width the rows were priced at: the requested one if the runtime
+   *  can be told it, else fp16. */
+  kv_dtype: string
+  allocatable_per_node: number
+}
+
 export interface CapacityReport {
   probed_node: string
   /** The context every row was taken at, or null when the gate chose one per
@@ -1981,6 +2004,17 @@ export interface CapacityReport {
    *  from addressable memory, which is 0 on a machine with no GPU on purpose,
    *  so the whole side would read 0.0 GiB beside rows that say "fits". */
   static?: CapacitySide | null
+  /** The same walk for the runtimes that serve from HOST RAM (llamacpp),
+   *  beside the GPU sides and never instead of them: on a discrete box host
+   *  RAM is a pool of its own. Sized on `probed_node` against its live host
+   *  budget with the card taken out -- what that launch's own gate uses.
+   *  Null when the machine's host RAM is not its own pool (GB10, Apple,
+   *  unknown), when nothing measured it, or for `basis=static`; absent from a
+   *  coordinator older than the field. */
+  host_pool?: CapacityHostPool | null
+  /** Why `host_pool` is null on a machine that would qualify -- the launch
+   *  gate's own sentence. Null otherwise. */
+  host_pool_unavailable_reason?: string | null
 }
 
 export interface MemoryReportList {
@@ -3488,13 +3522,19 @@ export interface RuntimeInfo {
     shards: boolean
   }
   kv_dtypes: string[]
-  /** Bytes per cached element for each of `kv_dtypes` (`fit/kv.py`). */
+  /** Bytes per cached element for the PLAIN widths among `kv_dtypes` only
+   *  (`fit/kv.py`); a packed layout's cost depends on the model and is in
+   *  `/api/plan`'s `kv_dtype_ratios` instead. */
   kv_dtype_bytes: Record<string, number>
   engine_options: string[]
   reasoning_parsers: string[]
   tool_call_parsers: string[]
   nccl_tunables: string[]
   version: string | null
+  /** Per CPU architecture, the version the image that architecture runs
+   *  reported when probed, or null when nothing has probed it. Measurements
+   *  are keyed by the measured machine's entry, never by `version`. */
+  image_versions: Record<string, string | null>
 }
 
 /** `POST /api/plan/command`. */

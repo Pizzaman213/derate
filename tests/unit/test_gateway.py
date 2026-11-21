@@ -5248,7 +5248,7 @@ def test_create_deployment_refuses_an_unsupported_runtime():
     """M-11: resolver.supported_by is consulted when the port exposes it."""
 
     class UnsupportingResolver(StubResolver):
-        def supported_by(self, shape, runtime):
+        def supported_by(self, shape, runtime, image=None):
             return False, f"{runtime} has no adapter for this architecture"
 
     deployments = FakeDeployments()
@@ -5278,7 +5278,7 @@ def test_plan_reflects_an_unsupported_runtime_before_any_launch_is_attempted():
     """
 
     class UnsupportingResolver(StubResolver):
-        def supported_by(self, shape, runtime):
+        def supported_by(self, shape, runtime, image=None):
             return False, f"{runtime} has no adapter for this architecture"
 
     deps = build_deps()
@@ -5327,6 +5327,54 @@ def test_create_deployment_refuses_a_sharded_plan_on_a_runtime_that_cannot_shard
     assert reply.json()["error"]["code"] == "runtime_cannot_shard"
     assert "cannot shard" in reply.json()["error"]["message"]
     assert deployments.launched == []
+
+
+def test_a_tts_plan_charges_the_measured_codec_and_no_other_runtime_does():
+    """The tts server's codec is its biggest allocation; the gateway puts the
+    measured working set on the shape so the gate charges it in
+    `activations`. Only for the runtime that drives that codec."""
+    from control_plane.resolver.support import TTS_WORKING_SETS, build_verdict
+    from control_plane.resolver.types import ParamSource, QuantSource, Resolution
+
+    shape = MODEL_SHAPES["llama-3.3-70b"]
+    resolution = Resolution(
+        shape=shape,
+        revision="main",
+        param_source=ParamSource.SAFETENSORS_HEADERS,
+        quant_source=QuantSource.QUANT_CONFIG,
+        support=build_verdict(("ArkttsModel",), shape.dtype),
+        warnings=[],
+        architectures=("ArkttsModel",),
+    )
+
+    class Resolver(StubResolver):
+        def resolve_full(self, model_id, dtype=None):
+            return resolution
+
+    seen = []
+
+    class RecordingFit(StubFit):
+        def check(self, req, nodes):
+            seen.append(req)
+            return fits()
+
+    deps = build_deps()
+    deps.resolver = Resolver()
+    deps.fit = RecordingFit()
+    measured = TTS_WORKING_SETS["ArkttsModel"]
+    body = {"model_id": "Audio8/Audio8-TTS-Preview-0.6b"}
+    with TestClient(create_app(deps)) as client:
+        tts = client.post("/api/plan", json={**body, "runtime": "tts"})
+        assert tts.status_code == 200, tts.text
+        priced = seen[-1].shape
+        vllm = client.post("/api/plan", json={**body, "runtime": "vllm"})
+        assert vllm.status_code == 200, vllm.text
+    assert (priced.codec_resident_bytes, priced.codec_bytes_per_frame) == (
+        measured.resident_bytes,
+        measured.bytes_per_frame,
+    )
+    assert tts.json()["shape"]["codec_bytes_per_frame"] == measured.bytes_per_frame
+    assert seen[-1].shape.codec_working_set(4096) == 0
 
 
 def test_create_deployment_maps_a_launch_value_error_to_400():
@@ -6430,7 +6478,7 @@ def test_a_gguf_model_is_refused_at_launch_by_the_runtime_support_gate():
                 support=build_verdict(("LlamaForCausalLM",), gguf_shape.dtype),
             )
 
-        def supported_by(self, shape, runtime):
+        def supported_by(self, shape, runtime, image=None):
             return build_verdict(
                 ("LlamaForCausalLM",), shape.dtype
             ).for_runtime(runtime).as_tuple()
@@ -6705,10 +6753,16 @@ def test_machines_of_two_architectures_cannot_be_one_deployment():
     assert response.json()["error"]["code"] == "mixed_architecture"
 
 
-def test_a_runtime_with_no_image_for_a_machine_refuses_it_named_and_skips_it_otherwise():
-    """sglang's image is arm64-only: naming the amd64 box is a refusal that
-    says so, and the planner's own pick leaves that box out rather than
-    planning a launch that would die at `exec format error`."""
+def test_a_runtime_with_no_image_for_a_machine_refuses_it_named_and_skips_it_otherwise(monkeypatch):
+    """A runtime with no image for a machine's architecture: naming the amd64
+    box is a refusal that says so, and the planner's own pick leaves that box
+    out rather than planning a launch that would die at `exec format error`.
+    Every shipped runtime has an amd64 image now, so the premise is set here."""
+    from control_plane.deploy import flags
+
+    monkeypatch.setitem(
+        flags.RUNTIMES, "sglang", dataclasses.replace(flags.RUNTIMES["sglang"], arch_images=())
+    )
     deps, spark, rtx = _arch_cluster()
     body = {**PLACEMENT_BODY, "model_id": "Qwen/Qwen3-8B", "runtime": "sglang"}
     with TestClient(create_app(deps)) as client:
@@ -6719,6 +6773,256 @@ def test_a_runtime_with_no_image_for_a_machine_refuses_it_named_and_skips_it_oth
     assert named.json()["unusable_node_ids"] == [rtx.node_id]
     assert picked.status_code == 200, picked.text
     assert rtx.node_id not in picked.json()["plan"]["node_ids"]
+
+
+def test_a_plan_across_a_machine_without_infiniband_says_the_link_is_tcp():
+    """The recipe drops /dev/infiniband for every host when one lacks it, so
+    NCCL runs over TCP. The screen has to say so -- a plan that reads like
+    RoCE and runs over the management LAN is the surprise nobody can see."""
+    def warnings_for(b_ib):
+        a = NODE_PROFILES["spark-01"]
+        b = dataclasses.replace(NODE_PROFILES["spark-02"], infiniband=b_ib)
+        deps = build_deps(registry=FakeRegistry([node_state(a), node_state(b)]))
+        deps.planner = Planner()
+        with TestClient(create_app(deps)) as client:
+            response = client.post("/api/plan", json={
+                **PLACEMENT_BODY,
+                "node_ids": [a.node_id, b.node_id],
+                "parallelism": {"tensor_parallel": 2},
+            })
+        assert response.status_code == 200, response.text
+        assert len(response.json()["plan"]["node_ids"]) == 2
+        return response.json()["placement"]["warnings"]
+
+    assert any("spark-02" in w and "TCP" in w for w in warnings_for(False))
+    assert not any("TCP" in w for w in warnings_for(None))
+
+
+def _vllm_image_probes(monkeypatch, *, arm64: dict, amd64: dict):
+    """Probes of the image each architecture runs: the default (arm64) one,
+    and the amd64 one asked on an amd64 machine. Returns both image names,
+    read off `image_for_arch` as the gateway does."""
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.resolver import imageprobe, support
+
+    for var in ("DERATE_VLLM_IMAGE", "DERATE_VLLM_IMAGE_AMD64"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(support, "_PROBED", {})
+    monkeypatch.setattr(support, "_PROBED_IMAGES", {})
+    spec = RUNTIMES["vllm"]
+    arm, amd = image_for_arch(spec, "arm64"), image_for_arch(spec, "amd64")
+    support.record_probe(imageprobe.ImageProbe(
+        runtime="vllm", image=arm, image_id="sha256:arm", version="0.28.1", **arm64,
+    ))
+    support.record_image_probe(imageprobe.ImageProbe(
+        runtime="vllm", image=amd, image_id="sha256:amd", version="0.31.0", **amd64,
+    ))
+    return arm, amd
+
+
+_LLAMA = frozenset({"LlamaForCausalLM"})
+
+
+@pytest.mark.parametrize("loads_on", ["amd64", "arm64"])
+def test_an_architecture_is_judged_by_the_image_the_machine_runs(monkeypatch, loads_on):
+    """The 3090 runs vLLM 0.31.0 and the Spark 0.28.1, and their registries
+    differ by four architectures. Both were judged by the Spark's: a model
+    only 0.31 loads was refused on the machine that could serve it, and one
+    only 0.28 loads was offered to the machine that could not."""
+    from control_plane.resolver import StubResolver as FixtureResolver
+
+    arm, amd = _vllm_image_probes(
+        monkeypatch,
+        arm64={"architectures": _LLAMA if loads_on == "arm64" else frozenset({"X"})},
+        amd64={"architectures": _LLAMA if loads_on == "amd64" else frozenset({"X"})},
+    )
+    deps, spark, rtx = _arch_cluster()
+    deps.resolver = FixtureResolver()  # knows the fixtures' architectures
+    good, bad = (rtx, spark) if loads_on == "amd64" else (spark, rtx)
+    with TestClient(create_app(deps)) as client:
+        on_good = client.post("/api/plan", json={**PLACEMENT_BODY, "node_ids": [good.node_id]})
+        on_bad = client.post("/api/plan", json={**PLACEMENT_BODY, "node_ids": [bad.node_id]})
+        picked = client.post("/api/plan", json=PLACEMENT_BODY)
+        launched = client.post(
+            "/api/deployments", json={**PLACEMENT_BODY, "node_ids": [good.node_id]}
+        )
+
+    assert on_good.status_code == 200, on_good.text
+    assert "registry" not in (on_good.json()["serve"]["reason"] or "")
+    assert on_bad.status_code == 400
+    assert on_bad.json()["error"]["code"] == "runtime_unsupported_on_machine"
+    assert on_bad.json()["unusable_node_ids"] == [bad.node_id]
+    assert (arm if bad is spark else amd) in on_bad.json()["error"]["message"]
+    assert bad.node_id not in (picked.json().get("plan") or {}).get("node_ids", [])
+    # The launch takes the plan's verdict: the default image's registry does
+    # not get a second say about a machine that does not run it.
+    assert launched.json().get("error", {}).get("code") != "runtime_unsupported"
+
+
+def test_a_quantization_below_its_vllm_floor_is_refused_on_that_gpu(monkeypatch):
+    """`fp_quant` is vLLM's own sm_100 minimum, read off the image. The Spark
+    is sm_121 and loads it; the 3090 is sm_86 and would die at load."""
+    from control_plane.resolver import StubResolver
+
+    floors = {"architectures": _LLAMA, "quant_min_capability": {"fp_quant": 100}}
+    _arm, amd = _vllm_image_probes(monkeypatch, arm64=floors, amd64=floors)
+
+    class FpQuantResolver(StubResolver):
+        def resolve_full(self, model_id, dtype=None):
+            return dataclasses.replace(
+                super().resolve_full(model_id, dtype), quant_method="fp_quant"
+            )
+
+    deps, spark, rtx = _arch_cluster()
+    deps.resolver = FpQuantResolver()
+    with TestClient(create_app(deps)) as client:
+        on_rtx = client.post("/api/plan", json={**PLACEMENT_BODY, "node_ids": [rtx.node_id]})
+        on_spark = client.post("/api/plan", json={**PLACEMENT_BODY, "node_ids": [spark.node_id]})
+        picked = client.post("/api/plan", json=PLACEMENT_BODY)
+
+    assert on_rtx.status_code == 400
+    error = on_rtx.json()["error"]
+    assert error["code"] == "unsupported_on_this_gpu"
+    assert "sm_86" in error["message"] and "sm_100" in error["message"]
+    assert amd in error["message"]
+    assert on_spark.status_code == 200, on_spark.text
+    assert picked.status_code == 200, picked.text
+    assert rtx.node_id not in picked.json()["plan"]["node_ids"]
+
+
+def test_left_to_the_planner_a_gpu_below_the_floor_is_left_out_and_named(monkeypatch):
+    """Unnamed machines are the planner's choice, and one whose GPU cannot
+    load the weights is dropped before planning -- with the reason on the
+    plan, so "why is my 3090 idle" has an answer."""
+    from control_plane.resolver import StubResolver
+
+    floors = {"architectures": _LLAMA, "quant_min_capability": {"fp_quant": 100}}
+    _vllm_image_probes(monkeypatch, arm64=floors, amd64=floors)
+
+    class FpQuantResolver(StubResolver):
+        def resolve_full(self, model_id, dtype=None):
+            return dataclasses.replace(
+                super().resolve_full(model_id, dtype), quant_method="fp_quant"
+            )
+
+    deps, spark, rtx = _arch_cluster()
+    deps.resolver = FpQuantResolver()
+    with TestClient(create_app(deps)) as client:
+        picked = client.post("/api/plan", json=PLACEMENT_BODY)
+
+    assert picked.status_code == 200, picked.text
+    assert rtx.node_id not in picked.json()["plan"]["node_ids"]
+    left_out = [w for w in picked.json()["placement"]["warnings"] if rtx.node_id in w]
+    assert left_out and "sm_86" in left_out[0] and "left it out" in left_out[0]
+    assert spark.node_id not in left_out[0]
+
+
+def test_nvfp4_weights_on_an_ampere_gpu_pass_with_an_emulation_warning(monkeypatch):
+    """Measured: NVFP4 checkpoints load and answer on a 3090 through Marlin.
+    With no probe to say otherwise the static table decides, and it said "no
+    pre-Blackwell kernel" -- a refusal of something that runs."""
+    from control_plane.resolver import StubResolver as FixtureResolver
+    from control_plane.resolver import support
+
+    monkeypatch.setattr(support, "_PROBED", {})
+    monkeypatch.setattr(support, "_PROBED_IMAGES", {})
+    deps, _spark, rtx = _arch_cluster()
+    deps.resolver = FixtureResolver()  # applies the forced dtype to the shape
+    with TestClient(create_app(deps)) as client:
+        response = client.post(
+            "/api/plan", json={**PLACEMENT_BODY, "dtype": "nvfp4", "node_ids": [rtx.node_id]}
+        )
+    assert response.status_code == 200, response.text
+    assert any(
+        rtx.node_id in w and "emulated" in w
+        for w in response.json()["placement"]["warnings"]
+    )
+
+
+def test_a_kv_width_is_refused_where_the_image_has_no_kernel_for_it(monkeypatch):
+    """vLLM's own attention selector has no backend for an nvfp4 KV cache at
+    any capability -- FlashInfer refuses it even on Blackwell -- so the engine
+    would not start on either machine. fp8 has one at sm_86."""
+    every = ["7.5", "8.0", "8.6", "8.9", "9.0", "10.0", "12.0", "12.1"]
+    kv = {
+        "architectures": _LLAMA,
+        "kv_capabilities": {"auto": tuple(every), "fp8": tuple(every), "nvfp4": ()},
+    }
+    arm, amd = _vllm_image_probes(monkeypatch, arm64=kv, amd64=kv)
+    deps, spark, rtx = _arch_cluster()
+    with TestClient(create_app(deps)) as client:
+        def plan(kv_dtype, node):
+            return client.post("/api/plan", json={
+                **PLACEMENT_BODY, "kv_dtype": kv_dtype, "node_ids": [node.node_id],
+            })
+
+        nvfp4_rtx, nvfp4_spark = plan("nvfp4", rtx), plan("nvfp4", spark)
+        fp8_rtx = plan("fp8", rtx)
+
+    for response, image in ((nvfp4_rtx, amd), (nvfp4_spark, arm)):
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "unsupported_on_this_gpu"
+        assert image in response.json()["error"]["message"]
+        assert "nvfp4" in response.json()["error"]["message"]
+    assert fp8_rtx.status_code == 200, fp8_rtx.text
+
+
+def test_a_kv_width_the_image_does_not_list_is_refused_and_a_null_map_is_not(monkeypatch):
+    """The probe asks about every dtype the image's own `CacheDType` names,
+    so a width missing from a non-null map is one that image does not accept
+    at all. Only a null map -- the probe could not ask -- is "unknown". The
+    model's own dtype is never refused."""
+    every = ["7.5", "8.0", "8.6", "8.9", "9.0", "10.0", "12.0", "12.1"]
+    listed = {"architectures": _LLAMA, "kv_capabilities": {"auto": tuple(every)}}
+    unknown = {"architectures": _LLAMA, "kv_capabilities": None}
+    arm, amd = _vllm_image_probes(monkeypatch, arm64=unknown, amd64=listed)
+    deps, spark, rtx = _arch_cluster()
+    with TestClient(create_app(deps)) as client:
+        def plan(node, **extra):
+            return client.post("/api/plan", json={
+                **PLACEMENT_BODY, "node_ids": [node.node_id], **extra,
+            })
+
+        fp8_rtx, fp8_spark, own_rtx = plan(rtx, kv_dtype="fp8"), plan(spark, kv_dtype="fp8"), plan(rtx)
+
+    assert fp8_rtx.status_code == 400, fp8_rtx.text
+    assert fp8_rtx.json()["error"]["code"] == "unsupported_on_this_gpu"
+    assert amd in fp8_rtx.json()["error"]["message"]
+    assert "fp8" in fp8_rtx.json()["error"]["message"]
+    assert fp8_spark.status_code == 200, fp8_spark.text
+    assert own_rtx.status_code == 200, own_rtx.text
+
+
+def test_the_plan_prices_each_kv_width_for_this_model_and_refuses_the_wrong_geometry():
+    """`kv_dtype_ratios` is what the KV picker prints beside each width: this
+    model's cache at it over its 16-bit cache, scales and TurboQuant's wide
+    boundary layers included, because a packed layout has no model-free
+    figure. A layout for the other attention geometry is absent from it, and
+    asked for, is refused by the plan and the launch alike."""
+    from control_plane.fit import kv as fit_kv
+    from tests.fixtures import LLAMA_3_3_70B
+
+    with TestClient(create_app(build_deps())) as client:
+        plan = client.post("/api/plan", json=PLACEMENT_BODY)
+        refused = client.post("/api/plan", json={**PLACEMENT_BODY, "kv_dtype": "fp8_ds_mla"})
+        launch = client.post("/api/deployments", json={**PLACEMENT_BODY, "kv_dtype": "fp8_ds_mla"})
+
+    assert plan.status_code == 200, plan.text
+    assert plan.json()["shape"]["num_layers"] == LLAMA_3_3_70B.num_layers
+    ratios = plan.json()["kv_dtype_ratios"]
+    wide = fit_kv.kv_bytes_per_token(LLAMA_3_3_70B, "bf16")
+    for name in ("fp8", "int8_per_token_head", "nvfp4", "turboquant_k8v4"):
+        assert ratios[name] == fit_kv.kv_bytes_per_token(LLAMA_3_3_70B, name) / wide, name
+    assert ratios["fp8"] == 0.5
+    # Four boundary layers kept at 16 bits: above the packed page's own ratio.
+    assert ratios["turboquant_k8v4"] > fit_kv.per_layer_per_token_bytes(
+        LLAMA_3_3_70B, "turboquant_k8v4"
+    ) / fit_kv.per_layer_per_token_bytes(LLAMA_3_3_70B, "bf16")
+    assert "fp8_ds_mla" not in ratios and "auto" not in ratios
+
+    for response in (refused, launch):
+        assert response.status_code == 400, response.text
+        assert "multi-head latent attention" in response.json()["error"]["message"]
 
 
 
@@ -7458,3 +7762,39 @@ def test_no_cap_leaves_the_remote_admitting():
     )
     assert config.targets[0].admitting is True
     assert reply.status_code == 200, reply.text
+
+
+def test_an_unprobed_amd64_image_is_not_judged_by_the_arm64_default_probe(monkeypatch):
+    """A named image with no probe of its own is unknown: the default
+    (arm64) image's registry and KV list are not evidence about it. Borrowing
+    them refused the 3090 for what only the Spark's image lacks."""
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.resolver import StubResolver as FixtureResolver
+    from control_plane.resolver import imageprobe, support
+
+    for var in ("DERATE_VLLM_IMAGE", "DERATE_VLLM_IMAGE_AMD64"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(support, "_PROBED", {})
+    monkeypatch.setattr(support, "_PROBED_IMAGES", {})
+    spec = RUNTIMES["vllm"]
+    arm, amd = image_for_arch(spec, "arm64"), image_for_arch(spec, "amd64")
+    assert arm != amd
+    support.record_probe(imageprobe.ImageProbe(
+        runtime="vllm", image=arm, image_id="sha256:arm", version="0.28.1",
+        architectures=frozenset({"X"}),
+        kv_capabilities={"auto": ("8.6", "12.1")},
+    ))
+    assert support.probe_for("vllm", amd) is None
+    assert support.probe_for("vllm", arm) is not None
+    deps, spark, rtx = _arch_cluster()
+    deps.resolver = FixtureResolver()
+    with TestClient(create_app(deps)) as client:
+        def plan(node, **extra):
+            return client.post("/api/plan", json={
+                **PLACEMENT_BODY, "node_ids": [node.node_id], **extra,
+            })
+
+        on_rtx, fp8_rtx, on_spark = plan(rtx), plan(rtx, kv_dtype="fp8"), plan(spark)
+    assert on_rtx.status_code == 200, on_rtx.text
+    assert fp8_rtx.status_code == 200, fp8_rtx.text
+    assert on_spark.status_code == 400, on_spark.text

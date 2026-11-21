@@ -36,7 +36,7 @@ import { defaultVariant } from './quantPicks'
 import type { RouteTargetFacts } from './RouteCard'
 import {
   buildLaunchRequest,
-  engineOptionsOf,
+  buildPlanRequest,
   knobsFromRequest,
   type FlagRow,
   type LaunchInputs,
@@ -98,6 +98,11 @@ export interface ModelSession {
 
   // ── The verdict ───────────────────────────────────────────────────────────
   result: PlanResponse | null
+  /** The last `kv_dtype_ratios` a plan answered for this model id. Kept across
+   *  a plan error -- a refused width nulls `result`, and blanking every packed
+   *  row would read as "refused" -- and dropped only when the model changes.
+   *  Null until a plan for this id has answered. */
+  kvRatios: Record<string, number> | null
   checking: boolean
   error: string | null
   gates: ServeRequirement[]
@@ -429,6 +434,8 @@ export function useModelSession(p: {
 
   // ── Launch knobs ──────────────────────────────────────────────────────────
   const [result, setResult] = useState<PlanResponse | null>(null)
+  const [keptRatios, setKeptRatios] = useState<{ id: string; ratios: Record<string, number> } | null>(null)
+  const kvRatios = keptRatios?.id === subjectId ? keptRatios.ratios : null
   const [checking, setChecking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [launching, setLaunching] = useState(false)
@@ -555,34 +562,37 @@ export function useModelSession(p: {
   )
 
   // ── The plan ──────────────────────────────────────────────────────────────
-  // Keyed on its JSON so a fresh-but-equal object does not refire the plan.
-  const engineJson = usingCustomCommand
-    ? ''
-    : JSON.stringify(engineOptionsOf({ engineOptions, envRows }) ?? null)
-  const planBody = useMemo<PlanRequest>(() => {
-    const engine = engineJson ? (JSON.parse(engineJson) as EngineOptions | null) : null
-    return {
-      model_id: subjectId,
+  // Built by the same function launch is, so the card judges the runtime and
+  // sizing the button will send. Context and concurrency stay absent when
+  // unset ("the planner picks"); a custom command suppresses kv_dtype, dtype,
+  // speculation and engine options exactly as it does on launch. Keyed on
+  // its JSON so a fresh-but-equal object does not refire the plan.
+  const planJson = JSON.stringify(
+    buildPlanRequest({
+      modelId: subjectId,
       target,
-      // Spread, never sent as null: absence is the contract for "the
-      // planner picks", and an explicit null is a different request.
-      ...(context ? { context } : {}),
-      ...(concurrency ? { concurrency } : {}),
-      ...(nodeIds ? { node_ids: nodeIds } : {}),
-      ...(degrees ? { parallelism: degrees } : {}),
-      // Same rule: absent means one token per step. Sent, the fit gate
-      // charges the draft's weights and its extra cache.
-      ...(speculative ? { speculative } : {}),
-      // Sent here AND on launch, deliberately -- see the state above.
-      // Suppressed under a custom command, which replaces every
-      // plan-derived flag and so could not carry either.
-      ...(kvDtype && !usingCustomCommand ? { kv_dtype: kvDtype } : {}),
-      ...(sentQuant && !usingCustomCommand ? { dtype: sentQuant } : {}),
-      // Several engine options size the fit (YaRN, text only, batched
-      // tokens, the processor cache), so the plan sees what launch sends.
-      ...(engine ? { engine_options: engine } : {}),
-    }
-  }, [subjectId, target, context, concurrency, nodeIds, degrees, speculative, kvDtype, sentQuant, usingCustomCommand, engineJson])
+      runtime,
+      context: context ?? 0,
+      concurrency: concurrency ?? 0,
+      nodeIds,
+      degrees,
+      speculative,
+      customCommand,
+      customCommandText,
+      flags: [],
+      servedName: '',
+      enforceEager: false,
+      cudagraphCaptureSizes: null,
+      kvDtype,
+      forcedQuant: sentQuant,
+      speculativeTokens: 0,
+      trustRemoteCode: false,
+      engineOptions,
+      envRows,
+      lifecycle: null,
+    }),
+  )
+  const planBody = useMemo<PlanRequest>(() => JSON.parse(planJson) as PlanRequest, [planJson])
 
   const noLocalVerdict = detailError != null && servedBy.length > 0
   const planSeq = useRef(0)
@@ -605,12 +615,14 @@ export function useModelSession(p: {
     setChecking(true)
     setGranted({})
     setExtraGates([])
+    const planFor = subjectId
     const id = window.setTimeout(() => {
       backend
         .plan(planBody)
         .then((r) => {
           if (planSeq.current !== mine) return
           setResult(r)
+          if (r.kv_dtype_ratios) setKeptRatios({ id: planFor, ratios: r.kv_dtype_ratios })
           setError(null)
         })
         .catch((e: unknown) => {
@@ -623,7 +635,7 @@ export function useModelSession(p: {
         })
     }, 450)
     return () => window.clearTimeout(id)
-  }, [backend, planBody, runtime, noLocalVerdict])
+  }, [backend, planBody, runtime, noLocalVerdict, subjectId])
 
   // The command derate would run, only while the Advanced tab is showing it.
   // Fetched after the plan settles, so a refusal reads the same as the
@@ -634,7 +646,7 @@ export function useModelSession(p: {
     if (!wantPreview || !result || checking || !servesOnCluster(runtime)) return
     const id = window.setTimeout(() => {
       backend
-        .planCommand({ ...planBody, runtime })
+        .planCommand(planBody)
         .then((r) => {
           if (previewSeq.current !== mine) return
           setCommandPreview(r)
@@ -977,6 +989,7 @@ export function useModelSession(p: {
     setDestination,
     routing,
     result,
+    kvRatios,
     checking,
     error,
     gates,

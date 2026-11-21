@@ -20,7 +20,7 @@ from .speculators import (
     NGRAM_MAX_TOKENS,
     SpeculativeOption,
 )
-from .support import build_verdict
+from .support import build_verdict, evaluate_runtime
 from .types import ModelNotFound, ParamSource, QuantSource, Resolution
 
 #: The one speculative option a stub with no config.json can honestly offer.
@@ -104,9 +104,11 @@ class StubResolver:
     def resolve_gguf(self, path: str) -> ModelShape:
         raise ModelNotFound("the day-0 stub resolver does not read GGUF files")
 
-    def supported_by(self, shape: ModelShape, runtime: str) -> tuple[bool, str]:
+    def supported_by(
+        self, shape: ModelShape, runtime: str, image: str | None = None
+    ) -> tuple[bool, str]:
         architectures = _FIXTURE_ARCHITECTURES.get(shape.model_id, ())
-        return build_verdict(architectures, shape.dtype).for_runtime(runtime).as_tuple()
+        return evaluate_runtime(runtime, architectures, shape.dtype, image=image).as_tuple()
 
     def available_quants(self, model_id: str) -> list[str]:
         return [self.resolve(model_id).dtype]

@@ -44,6 +44,7 @@
 | `SpeculativeField.tsx` | 697 | which speculative method to serve with; `null` means one token per step |
 | `CustomServes.tsx` | 59 | replaying a hand-written launch command |
 | `rows.check.mjs` | 931 | the browser-side fold against the live coordinator's real payloads |
+| `board.check.mjs` | 73 | which machines `board.ts` offers per runtime, the pool it draws, and `placement_refusal`'s sentences, with no coordinator |
 | `registry.check.mjs` | 215 | `GET /api/models`, the fold that moved to the server, and the boundary |
 | `serve.check.mjs` | 123 | launch permissions from `gates.ts`, including branches a live cluster cannot reach |
 | `query.check.mjs` | 55 | link parsing, typed filters, suggestion sections |

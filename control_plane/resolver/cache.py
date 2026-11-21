@@ -69,7 +69,14 @@ from .types import (
 #: rank, which is exactly the over-count the field was added to end. Unlike
 #: the three above this one errs toward refusing rather than inviting, but a
 #: cached MoE checkpoint would still be told it needs nodes it does not.
-SCHEMA_VERSION = 7
+#:
+#: 8 adds `quant_method`, vLLM's name for the checkpoint's loader. It decodes
+#: to "" on an older entry, which sends the silicon gate to the static table:
+#: a `fp_quant` checkpoint (vLLM's floor sm_100) would be judged by its dtype
+#: and offered to an sm_86 machine. The same entries also carry a copy of the
+#: `nvfp4` QuantRequirement saying "no pre-Blackwell kernel", which stopped
+#: being true the day NVFP4 ran on a 3090.
+SCHEMA_VERSION = 8
 
 DEFAULT_TTL_SECONDS = float(os.environ.get("DERATE_RESOLVER_TTL", 24 * 3600))
 
@@ -141,6 +148,7 @@ def to_dict(res: Resolution) -> dict[str, Any]:
         "speculators": [opt.as_dict() for opt in res.speculators],
         "resolved_at": res.resolved_at,
         "remote_code": res.remote_code,
+        "quant_method": res.quant_method,
     }
 
 
@@ -180,6 +188,7 @@ def from_dict(data: dict[str, Any]) -> Resolution:
         ),
         resolved_at=data.get("resolved_at", 0.0),
         remote_code=bool(data.get("remote_code", False)),
+        quant_method=str(data.get("quant_method", "")),
     )
 
 
@@ -283,4 +292,5 @@ def _as_hit(res: Resolution) -> Resolution:
         resolved_at=res.resolved_at,
         from_cache=True,
         remote_code=res.remote_code,
+        quant_method=res.quant_method,
     )

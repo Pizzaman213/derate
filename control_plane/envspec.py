@@ -108,7 +108,13 @@ _DECLARED = (
        "the vllm image for an x86 (amd64) machine; DERATE_VLLM_IMAGE is the "
        "arm64 one the DGX Sparks run"),
     _v("DERATE_SGLANG_IMAGE", None, "control_plane/deploy/flags.py", ""),
+    _v("DERATE_SGLANG_IMAGE_AMD64", None, "control_plane/deploy/flags.py",
+       "the sglang image for an x86 (amd64) machine; DERATE_SGLANG_IMAGE is "
+       "the arm64 one the DGX Sparks run"),
     _v("DERATE_TTS_IMAGE", None, "control_plane/deploy/flags.py", ""),
+    _v("DERATE_TTS_IMAGE_AMD64", None, "control_plane/deploy/flags.py",
+       "the tts image for an x86 (amd64) machine; there is no published one, "
+       "build docker/tts.Dockerfile on that machine (see its header)"),
     _v("DERATE_LLAMACPP_IMAGE", None, "control_plane/deploy/flags.py",
        "the CPU runtime's image; the default is a CPU build, so a CUDA "
        "llama.cpp tag has to be named here to be used"),

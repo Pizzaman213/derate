@@ -103,31 +103,36 @@ def _get(url: str, api_key: str | None) -> urllib.request.Request:
 
 def _models(
     origin: str, timeout: float, api_key: str | None = None
-) -> tuple[list[str] | None, str | None]:
-    """What the port says it serves, or None when it would not say.
+) -> tuple[list[str] | None, int | None]:
+    """What the port says it serves, and the HTTP status it said it with.
 
-    None is "nothing learned", which is not the same as "wrong model": a
+    Names None is "nothing learned", which is not the same as "wrong model": a
     runtime behind a proxy that does not speak the OpenAI model list has
     always been probed on liveness alone, and this must not start refusing
-    it. Only a port that names something ELSE is a mismatch.
+    it. Only a port that names something ELSE is a mismatch -- or one that
+    refuses the key, which `probe` judges from the status. The status is None
+    when nothing answered at all.
     """
     url = origin + MODELS_PATH
     try:
         with urllib.request.urlopen(_get(url, api_key), timeout=timeout) as response:
-            if not 200 <= response.status < 300:
-                return None, "%s returned HTTP %d" % (url, response.status)
+            status = response.status
+            if not 200 <= status < 300:
+                return None, status
             body = response.read(_MAX_BODY)
     except urllib.error.HTTPError as exc:
-        return None, "%s returned HTTP %d" % (url, exc.code)
-    except urllib.error.URLError as exc:
-        return None, "%s unreachable: %s" % (url, exc.reason)
-    except OSError as exc:
-        return None, "%s unreachable: %s" % (url, exc)
+        return None, exc.code
+    except (urllib.error.URLError, OSError):
+        return None, None
     try:
         names = _names(json.loads(body))
     except (ValueError, TypeError):
-        return None, None
-    return (names or None), None
+        return None, status
+    return (names or None), status
+
+
+# What a server answers a bearer it does not accept with.
+_KEY_REFUSED = (401, 403)
 
 
 def probe(
@@ -152,7 +157,12 @@ def probe(
     A port that answers but names nothing we can read falls back to the
     liveness probe. It is the pre-existing situation, not a new fault, and
     refusing it would kill deployments behind proxies that never spoke this
-    dialect.
+    dialect. The exception is a port that answers 401 or 403 to `api_key`:
+    every engine derate launches is started with that key (and a runtime that
+    checks no key answers 200 to any), so a refusal is a stranger's server
+    and is a mismatch. Without `api_key` the same answer stays "nothing
+    learned" -- a pre-key deployment, or reap's and autoadopt's keyless
+    probes, which have no key to be refused.
 
     `health_path`, when given, REPLACES the first liveness path rather than
     adding one: every runtime's own `RuntimeSpec.health_path` is `"/health"`
@@ -165,7 +175,21 @@ def probe(
     """
     origin = backend_origin(backend_url)
     if expect_model:
-        names, _ = _models(origin, timeout, api_key)
+        names, status = _models(origin, timeout, api_key)
+        if api_key and status in _KEY_REFUSED:
+            # Every engine derate launches is started with this deployment's
+            # key, so a port that refuses it is somebody else's server. Not
+            # "nothing learned": `/health` ignores keys, and falling through to
+            # it is how a stranger's vLLM on the 3090 went READY for a launch
+            # whose own engine never bound (2026-11-21).
+            return False, (
+                "%s%s answered HTTP %d to this deployment's key -- %s, and it "
+                "refuses the key every engine derate launches is started "
+                "with. Stop that server, or stop this deployment: while it "
+                "stands, requests for %s reach a server that is not serving "
+                "them."
+                % (origin, MODELS_PATH, status, _MISMATCH_MARK, expect_model)
+            )
         if names is not None:
             if serves(names, expect_model):
                 return True, None

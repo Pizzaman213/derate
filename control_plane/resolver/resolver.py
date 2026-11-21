@@ -18,7 +18,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from control_plane.contracts import ModelShape, NodeProfile
 from control_plane.contracts.quant import (
@@ -121,6 +121,10 @@ def _remote_code_sources(
 #: and being 40 percent wrong about a 70B model is not a rounding error.
 _TALLY_DISAGREEMENT_LIMIT = 0.15
 
+#: How often the per-architecture images are re-asked on their own machines.
+#: A pass that hits the image-id cache is one `docker image inspect` over SSH.
+ARCH_PROBE_INTERVAL_S = 300.0
+
 
 class ModelResolver:
     """Implements ``ResolverPort``. Safe to share; the cache is thread safe enough."""
@@ -132,6 +136,8 @@ class ModelResolver:
         *,
         offline: bool = False,
         runtime_images: dict[str, str] | None = None,
+        arch_images: dict[tuple[str, str], str] | None = None,
+        arch_hosts: Callable[[str], list[str]] | None = None,
     ) -> None:
         self.client = client or HubClient()
         self.cache = cache if cache is not None else ShapeCache()
@@ -141,6 +147,13 @@ class ModelResolver:
         # from its static lists, which is the state on any machine without
         # docker -- see `start` and `imageprobe`.
         self.runtime_images = dict(runtime_images or {})
+        # {(runtime, arch): image} for the images a machine of another
+        # architecture runs, and arch -> the docker hosts (`ssh://addr`) of
+        # healthy machines of that architecture to ask them on. The
+        # coordinator cannot start an image built for an architecture it is
+        # not, so these are probed THERE -- on whichever one holds the image.
+        self.arch_images = dict(arch_images or {})
+        self.arch_hosts = arch_hosts
 
     # ---- startup -------------------------------------------------------
 
@@ -156,11 +169,16 @@ class ModelResolver:
         Until it lands, the static tables answer. That is the same result as
         a machine with no docker, which is why nothing here waits on it.
         """
-        if not self.runtime_images:
+        if not self.runtime_images and not self.arch_images:
             return
         threading.Thread(
             target=self._probe_runtime_images, name="derate-imageprobe", daemon=True
         ).start()
+        if self.arch_images and self.arch_hosts is not None:
+            threading.Thread(
+                target=self._probe_arch_images_forever, name="derate-imageprobe-arch",
+                daemon=True,
+            ).start()
 
     def _probe_runtime_images(self) -> None:
         cache_dir = self.cache.directory.parent / "runtimes"
@@ -184,6 +202,68 @@ class ModelResolver:
                 len(found.architectures),
                 found.provenance,
             )
+
+    def _probe_arch_image(self, runtime: str, arch: str, image: str, cache_dir):
+        """One image of another architecture: the coordinator's own copy from
+        the cache first (it holds one so sparkrun can ship it, and cannot run
+        it), then each healthy machine of that architecture until one has it.
+        A machine that just joined has nothing until its first launch, and
+        any other machine of its architecture can answer for it: the cache is
+        keyed by the image's layers, not by where it was asked.
+
+        Only an answer that landed in that SHARED entry is returned: a remote
+        daemon's answer reaches it only when the coordinator's own copy has the
+        same layers (`imageprobe.probe`). An unconfirmed one stays cached for
+        its host alone, and is not adopted here -- `support` keys probes by
+        image, so adopting it would let one machine say what the image loads
+        on every machine of its architecture. The static table answers instead."""
+        found = imageprobe.probe(runtime, image, cache_dir=cache_dir, run=False)
+        if found is not None:
+            return found, "the coordinator's cache"
+        for host in self.arch_hosts(arch) if self.arch_hosts else []:
+            if imageprobe.probe(runtime, image, cache_dir=cache_dir, host=host) is None:
+                continue
+            found = imageprobe.probe(runtime, image, cache_dir=cache_dir, run=False)
+            if found is not None:
+                return found, host
+            log.info(
+                "runtime probe: %s (%s) answered on %s, but the coordinator holds "
+                "no copy with the same layers to confirm it; not adopted for %s",
+                runtime, image, host, arch,
+            )
+        return None, None
+
+    def _probe_arch_images_once(self) -> None:
+        """Ask each per-architecture image on a machine of that architecture.
+
+        Every pass, not once: the machine may join after startup, the image
+        may be pulled or rebuilt later, and a pass that hits the cache costs
+        one `docker image inspect` per place asked."""
+        cache_dir = self.cache.directory.parent / "runtimes"
+        for (runtime, arch), image in self.arch_images.items():
+            try:
+                found, where = self._probe_arch_image(runtime, arch, image, cache_dir)
+            except Exception:  # pragma: no cover - probe is best effort
+                log.exception("runtime probe of %s on %s failed", image, arch)
+                continue
+            if found is None:
+                log.info(
+                    "runtime probe: %s (%s) not readable here or on any %s machine",
+                    runtime, image, arch,
+                )
+                continue
+            known = support.probed_image(runtime, image)
+            support.record_image_probe(found)
+            if known is None or known.image_id != found.image_id:
+                log.info(
+                    "runtime probe: %s on %s loads %d architectures, per %s (asked %s)",
+                    runtime, arch, len(found.architectures), found.provenance, where,
+                )
+
+    def _probe_arch_images_forever(self) -> None:
+        while True:
+            self._probe_arch_images_once()
+            time.sleep(ARCH_PROBE_INTERVAL_S)
 
     # ---- ResolverPort --------------------------------------------------
 
@@ -365,7 +445,7 @@ class ModelResolver:
                 "from the config rather than from the weight index"
             )
 
-        dtype, quant_source, quant_warnings = self._detect_quant(
+        dtype, quant_source, quant_warnings, quant_method = self._detect_quant(
             config, model_id, info, dtype_override, revision
         )
         warnings.extend(quant_warnings)
@@ -427,6 +507,7 @@ class ModelResolver:
             speculators=speculators,
             resolved_at=time.time(),
             remote_code=bool(remote_code),
+            quant_method=quant_method,
         )
 
     def _detect_quant(
@@ -436,7 +517,9 @@ class ModelResolver:
         info: ModelInfo | None,
         override: str | None,
         revision: str,
-    ) -> tuple[str, QuantSource, list[str]]:
+    ) -> tuple[str, QuantSource, list[str], str]:
+        """`quant_detect.detect`'s answer, plus vLLM's name for the loader
+        (`quant_detect.vllm_quant_method`), read off the same files."""
         sidecar = None
         needs_sidecar = not isinstance(config.get("quantization_config"), dict)
         if needs_sidecar and info is not None and info.has_file("hf_quant_config.json"):
@@ -446,9 +529,10 @@ class ModelResolver:
                 )
             except ResolverError:
                 sidecar = None
-        return quant_detect.detect(
+        dtype, source, warnings = quant_detect.detect(
             config, model_id, override=override, hf_quant_config=sidecar
         )
+        return dtype, source, warnings, quant_detect.vllm_quant_method(config, sidecar)
 
     def _measure_params(
         self,
@@ -625,14 +709,23 @@ class ModelResolver:
 
     # ---- support ---------------------------------------------------------
 
-    def supported_by(self, shape: ModelShape, runtime: str) -> tuple[bool, str]:
+    def supported_by(
+        self, shape: ModelShape, runtime: str, image: str | None = None
+    ) -> tuple[bool, str]:
         """Whether a runtime can load this shape, architecture and quant both.
 
         ``ModelShape`` carries no architecture field, so the architecture comes
         from the cached resolution for this model id when there is one.
+
+        *image* is the image the placed machines run; its own probe answers
+        when there is one (`support.evaluate_runtime`). Without it the default
+        image's probe answers; an image nothing has asked is unknown and the
+        static table answers (`support.probe_for`).
         """
         architectures = self._architectures_for(shape)
-        return support.evaluate_runtime(runtime, architectures, shape.dtype).as_tuple()
+        return support.evaluate_runtime(
+            runtime, architectures, shape.dtype, image=image
+        ).as_tuple()
 
     def supported_on(
         self, shape: ModelShape, runtime: str, nodes: list[NodeProfile]

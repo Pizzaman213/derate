@@ -14,9 +14,18 @@
 #         --platform linux/arm64 \
 #         -t ghcr.io/pizzaman213/derate/tts:latest --push .
 #
-# arm64 is the platform that matters -- a DGX Spark is a GB10 -- and unlike
-# the node image there is no reason to build amd64 unless somebody is serving
-# speech off a workstation, hence no default multi-arch build.
+# arm64 is the platform the Sparks need -- a DGX Spark is a GB10. An x86
+# machine (an RTX box joined to the cluster) runs an amd64 build of the same
+# file on upstream vLLM, built ON that machine and tagged for
+# DERATE_TTS_IMAGE_AMD64 (flags.py's default for amd64):
+#
+#     docker build -f docker/tts.Dockerfile \
+#         --build-arg BASE=vllm/vllm-openai:v0.31.0 -t derate/tts:amd64 .
+#
+# Upstream's ENTRYPOINT is `vllm serve`; the runtime spec clears it.
+# Copy the result to the coordinator once (`docker -H ssh://<x86 box> save
+# derate/tts:amd64 | docker load`) and sparkrun ships it to every other x86
+# machine at launch.
 
 # The vLLM image this project already pins for the vllm runtime, and already
 # pulls onto every node that has served a model. It is arm64, it carries a

@@ -5,7 +5,11 @@ Strength, in strict order of preference (architecture 4.5):
 1. Measured sustained decode tok/s for this target, once at least
    ``measured_strength_min_requests`` requests have completed.
 2. The fit calculator's ``predicted_decode_tps`` for this shape on this node's profile.
-3. ``memory_bandwidth_gbps * gpu_count`` as a last resort.
+3. ``memory_bandwidth_gbps * gpu_count`` as a last resort, read off the node
+   as the deployment's runtime sees it (`flags.budget_profile`): a host-pool
+   runtime (llamacpp) runs with the card cleared, so it is scored on the
+   node's measured host memory bandwidth, and falls to the neutral default
+   when the agent measured none.
 
 Never compute strength from a spec sheet once measured throughput exists.
 """
@@ -15,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from control_plane.contracts import Deployment, NodeProfile, TargetKind
+from control_plane.deploy.flags import budget_profile
 
 from .settings import GatewaySettings
 from .stats import StatsRegistry
@@ -53,11 +58,11 @@ def local_strength(
         return StrengthScore(float(predicted), SOURCE_PREDICTED)
 
     node_ids = list(deployment.plan.node_ids) if deployment.plan else []
-    bandwidth = sum(
-        profiles[n].memory_bandwidth_gbps * max(1, profiles[n].gpu_count)
-        for n in node_ids
-        if n in profiles
-    )
+    # The node as this runtime runs on it, the same view the planner and the
+    # fit gate were given: never the GPU's bandwidth for a launch whose recipe
+    # cleared the GPU.
+    seen = [budget_profile(deployment.runtime, profiles[n]) for n in node_ids if n in profiles]
+    bandwidth = sum(p.memory_bandwidth_gbps * max(1, p.gpu_count) for p in seen)
     if bandwidth > 0:
         return StrengthScore(bandwidth, SOURCE_BANDWIDTH)
 

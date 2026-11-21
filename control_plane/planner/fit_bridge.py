@@ -133,11 +133,13 @@ def kv_total_bytes(
     return per_layer_per_token * shape.num_layers * context * batch
 
 
-def activation_bytes(shape: ModelShape, batch: int) -> float:
-    """Logits buffer plus compute scratch. Replicated on every node."""
+def activation_bytes(shape: ModelShape, batch: int, context: int = 0) -> float:
+    """Logits buffer plus compute scratch, plus a speech codec's working set
+    at *context* frames (`ModelShape.codec_working_set`). Replicated on every
+    node."""
     logits = shape.vocab_size * batch * 4
     scratch = _ACTIVATION_CHUNK_TOKENS * shape.hidden_size * 4 * 6
-    return logits + scratch
+    return logits + scratch + shape.codec_working_set(context)
 
 
 def min_nodes_required(
@@ -178,7 +180,7 @@ def min_nodes_required(
     # Dividing experts would make it optimistic, which is the one direction a
     # floor may not move.
     kv = kv_total_bytes(shape, kv_dtype, context, max_seqs)
-    activations = activation_bytes(shape, max_seqs)
+    activations = activation_bytes(shape, max_seqs, context)
     layers = max(1, shape.num_layers)
 
     for n in range(1, MAX_NODES_CONSIDERED + 1):

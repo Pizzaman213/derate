@@ -1955,6 +1955,111 @@ def test_discrete_card_does_not_pay_for_host_memory():
     assert allocatable_bytes(profile, sample) == profile.usable_memory() - 8 * GIB
 
 
+def test_a_discrete_sample_carries_host_ram_and_leaves_vram_alone(monkeypatch):
+    """A discrete box now reports its host RAM, which is what llamacpp is
+    budgeted against there. Everything a GPU runtime reads stays the card's:
+    the memory figures are VRAM, and no host byte is billed to the pool."""
+    profile = probe_local(address="10.0.0.50", rows=RTX3090_ROWS)
+    fake_host_memory(monkeypatch, total=62 * GIB, available=40 * GIB, swap_used=GIB)
+    sample = run(read_telemetry(profile, now=5.0, rows=[["8192", "24576", "210.5", "68", "22"]]))
+
+    assert sample.host_memory_total == 62 * GIB
+    assert sample.host_memory_available == 40 * GIB
+    assert sample.swap_used == GIB
+    assert sample.memory_used == 8192 * 1024**2 and sample.memory_total == 24576 * 1024**2
+    assert sample.host_memory_used == 0, "VRAM has no operating system in it"
+    assert allocatable_bytes(profile, sample) == profile.usable_memory() - 8192 * 1024**2
+
+
+def test_a_discrete_box_has_a_host_pool_budget_beside_its_gpu_one():
+    """The narrowing in one place: `pool="host"` on a discrete box is
+    MemAvailable less the CPU reserve, and `pool="gpu"` is what it always was.
+    Asking for one must never answer with the other -- a llamacpp launch sized
+    against the card's 21 GiB, or a vllm one against 40 GiB of RAM."""
+    profile = probe_local(address="10.0.0.50", rows=RTX3090_ROWS)
+    sample = TelemetrySample(
+        ts=1.0, memory_used=8 * GIB, memory_total=24 * GIB,
+        power_watts=210.0, temperature_c=68.0, utilization_pct=22.0,
+        gpu_memory_used=8 * GIB,
+        host_memory_total=62 * GIB, host_memory_available=40 * GIB,
+    )
+    gpu = profile.usable_memory() - 8 * GIB
+
+    assert allocatable_bytes(profile, sample, pool="host") == 40 * GIB - cpu_host_reserve(40 * GIB)
+    assert allocatable_bytes_or_none(profile, sample, pool="host") == 40 * GIB - cpu_host_reserve(40 * GIB)
+    assert allocatable_bytes(profile, sample) == gpu
+    assert allocatable_bytes(profile, sample, pool="gpu") == gpu
+
+    # No host reading is absence, never "full" and never the card's nameplate:
+    # an agent from before discrete boxes read host RAM sends 0.
+    assert allocatable_bytes_or_none(profile, None, pool="host") is None
+    no_host = dataclasses.replace(sample, host_memory_total=0, host_memory_available=0)
+    assert allocatable_bytes_or_none(profile, no_host, pool="host") is None
+    assert allocatable_bytes(profile, None, pool="host") == 0
+
+
+def test_a_unified_machine_has_no_host_pool_to_budget():
+    """On GB10 the server and the GPU would spend one pool, budgeted as GPU
+    memory, so the host-pool answer is 0 however much MemAvailable says --
+    `placement_refusal` refuses the pairing before this is ever a budget."""
+    profile = probe_local(address="10.0.0.11", rows=GB10_ROWS)
+    sample = TelemetrySample(
+        ts=1.0, memory_used=20 * GIB, memory_total=121 * GIB,
+        power_watts=0.0, temperature_c=0.0, utilization_pct=0.0,
+        host_memory_total=121 * GIB, host_memory_available=100 * GIB,
+    )
+    assert allocatable_bytes(profile, sample, pool="host") == 0
+    assert allocatable_bytes(profile, sample) > 0, "its GPU budget is untouched"
+
+
+def test_the_registry_answers_the_host_pool_for_a_discrete_member(tmp_path):
+    """What the gateway actually calls: `allocatable_or_none(pool="host")`,
+    and the board's bar reads the same figure off the memory report."""
+    profile = probe_local(address="10.0.0.50", rows=RTX3090_ROWS)
+    registry = make_registry(tmp_path, local=profile)
+    node_id = profile.node_id
+    assert registry.allocatable_or_none(node_id, pool="host") is None
+    assert registry.memory_report(node_id)["host_allocatable"] is None
+
+    registry.apply_sample(
+        node_id,
+        TelemetrySample(
+            ts=time.time(), memory_used=8 * GIB, memory_total=24 * GIB,
+            power_watts=210.0, temperature_c=68.0, utilization_pct=22.0,
+            gpu_memory_used=8 * GIB,
+            host_memory_total=62 * GIB, host_memory_available=40 * GIB,
+        ),
+    )
+    host = 40 * GIB - cpu_host_reserve(40 * GIB)
+    assert registry.allocatable_or_none(node_id, pool="host") == host
+    assert registry.allocatable_or_none(node_id) == profile.usable_memory() - 8 * GIB
+    report = registry.memory_report(node_id)
+    assert report["host_allocatable"] == host
+    assert report["allocatable"] == profile.usable_memory() - 8 * GIB
+
+
+def test_available_memory_answers_the_pool_it_is_asked_for(tmp_path):
+    """`livefit.allocatable_map` falls back to `available_memory` for a
+    registry without `_or_none`, passing the runtime's pool. Asked for host,
+    it must answer host RAM -- never the card's headroom under another name."""
+    profile = probe_local(address="10.0.0.50", rows=RTX3090_ROWS)
+    registry = make_registry(tmp_path, local=profile)
+    node_id = profile.node_id
+    registry.apply_sample(
+        node_id,
+        TelemetrySample(
+            ts=time.time(), memory_used=8 * GIB, memory_total=24 * GIB,
+            power_watts=210.0, temperature_c=68.0, utilization_pct=22.0,
+            gpu_memory_used=8 * GIB,
+            host_memory_total=62 * GIB, host_memory_available=40 * GIB,
+        ),
+    )
+    assert registry.available_memory(node_id, pool="host") == 40 * GIB - cpu_host_reserve(
+        40 * GIB
+    )
+    assert registry.available_memory(node_id) == profile.usable_memory() - 8 * GIB
+
+
 def test_gb10_allocatable_is_bounded_by_the_shared_pool():
     """Acceptance for this fix: the static ceiling is not what you can launch.
 
@@ -2990,6 +3095,31 @@ def test_an_unchanged_profile_reports_no_change(tmp_path):
     run(registry.add_node("10.0.0.12"))
 
     assert run(registry.refresh_profile("spark-02")) is False
+
+
+def test_a_refresh_may_not_move_the_address_off_its_agent_host(tmp_path):
+    """The address is what the coordinator SSHes to (launches, the per-
+    architecture image probe), so an agent reporting some other machine's
+    address must not steer it there -- the rule handle_join already applies.
+    The rest of the profile still lands."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+
+    client.serve(
+        "http://10.0.0.12:8081",
+        dataclasses.replace(SPARK_02, address="10.0.0.99", driver_version="999.0"),
+    )
+    assert run(registry.refresh_profile("spark-02")) is True
+    profile = registry.get_node("spark-02").profile
+    assert profile.address == SPARK_02.address
+    assert profile.driver_version == "999.0"
+
+    # Moving it TO the host its agent answers from is believed.
+    client.serve("http://10.0.0.12:8081", dataclasses.replace(SPARK_02, address="10.0.0.12"))
+    assert run(registry.refresh_profile("spark-02")) is True
+    assert registry.get_node("spark-02").profile.address == "10.0.0.12"
 
 
 def test_the_heartbeat_records_the_build_a_node_reports(tmp_path):

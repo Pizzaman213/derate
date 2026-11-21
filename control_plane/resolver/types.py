@@ -216,6 +216,12 @@ class Resolution:
     #: The repository ships Python (``auto_map`` in config.json, or a ``.py``
     #: file) that ``--trust-remote-code`` would execute inside the container.
     remote_code: bool = False
+    #: vLLM's name for the loader this checkpoint's packing needs
+    #: (`modelopt_fp4`, `compressed-tensors`, ...), from
+    #: `quant_detect.vllm_quant_method`; "" for an unquantized checkpoint, a
+    #: GGUF, or one nobody read. The silicon gate looks it up in the probed
+    #: image's minimum capabilities, and "" falls back to `QUANT_INFO`.
+    quant_method: str = ""
     elapsed_ms: float = 0.0
 
     @property

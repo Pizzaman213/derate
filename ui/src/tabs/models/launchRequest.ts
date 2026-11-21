@@ -18,6 +18,7 @@ import type {
   LaunchRequest,
   Lifecycle,
   ParallelismRequest,
+  PlanRequest,
   QuantVariant,
   SpeculativeRequest,
 } from '../../api/types'
@@ -111,6 +112,30 @@ export function engineOptionsOf(k: Pick<SessionKnobs, 'engineOptions' | 'envRows
   delete out.env
   if (Object.keys(env).length) out.env = env
   return Object.keys(out).length ? out : null
+}
+
+/** What the plan is asked, from the same inputs launch is built from.
+ *  `POST /api/plan` and `/api/plan/command` read `runtime`, so it is always
+ *  sent: without it the server plans vllm whatever engine is picked, and the
+ *  card judges a different launch than the one the button sends. Every
+ *  sizing key is the launch's own expression, so the two cannot drift.
+ *  Context and concurrency stay absent when unset -- "the planner picks". */
+export function buildPlanRequest(s: Omit<LaunchInputs, 'grants'>): PlanRequest {
+  const l = buildLaunchRequest({ ...s, grants: [] })
+  return {
+    model_id: l.model_id,
+    target: l.target,
+    runtime: l.runtime,
+    ...(s.context ? { context: s.context } : {}),
+    ...(s.concurrency ? { concurrency: s.concurrency } : {}),
+    ...(l.node_ids ? { node_ids: l.node_ids } : {}),
+    ...(l.parallelism ? { parallelism: l.parallelism } : {}),
+    ...(l.kv_dtype ? { kv_dtype: l.kv_dtype } : {}),
+    ...(l.dtype ? { dtype: l.dtype } : {}),
+    ...(l.speculative ? { speculative: l.speculative } : {}),
+    ...(l.speculative_tokens ? { speculative_tokens: l.speculative_tokens } : {}),
+    ...(l.engine_options ? { engine_options: l.engine_options } : {}),
+  }
 }
 
 export function buildLaunchRequest(s: LaunchInputs): LaunchRequest {

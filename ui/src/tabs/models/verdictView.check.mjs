@@ -19,6 +19,12 @@ check(is(M.planWord({ ...base, result: plan({ verdict: 'fits' }, { verdict: 'won
 check(is(M.planWord({ ...base, result: plan({ verdict: 'fits' }, { verdict: 'fits_degraded' }) }), 'Slow', 'warn'), 'degraded live is Slow')
 check(is(M.planWord({ ...base, result: plan({ verdict: 'fits_degraded' }) }), 'Slow', 'warn'), 'degraded static with no live is Slow')
 check(is(M.planWord({ ...base, result: plan({ verdict: 'fits' }, { verdict: 'fits' }) }), 'Fits', 'live'), 'otherwise Fits')
+// A host-pool runtime has no static ceiling: its static refusal is against 0
+// by design, so the live verdict is the word whenever there is one.
+check(is(M.planWord({ ...base, hostPool: true, result: plan({ verdict: 'wont_fit' }, { verdict: 'fits_degraded' }) }), 'Slow', 'warn'), 'host pool: live degraded is Slow, not the static refusal')
+check(is(M.planWord({ ...base, hostPool: true, result: plan({ verdict: 'wont_fit' }, { verdict: 'fits' }) }), 'Fits', 'live'), 'host pool: live fits is Fits')
+check(is(M.planWord({ ...base, hostPool: true, result: plan({ verdict: 'wont_fit' }, { verdict: 'wont_fit' }) }), 'Not now', 'warn'), 'host pool: live refusal is Not now')
+check(is(M.planWord({ ...base, hostPool: true, result: plan({ verdict: 'wont_fit' }) }), 'Won’t fit', 'fault'), 'host pool with no live reading keeps the static refusal')
 
 const BANDS = [
   ['running', false, 'Running', 'live'], ['fits', false, 'Fits', 'live'], ['degraded', false, 'Slow', 'warn'],

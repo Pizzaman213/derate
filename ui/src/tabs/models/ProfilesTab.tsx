@@ -4,6 +4,7 @@ import { Lamp } from '../../components/Lamp'
 import { Verbatim } from '../../components/Verbatim'
 import { useBackend } from '../../state/backend'
 import { useBenchmarks, useProfiles } from '../../state/resources'
+import { memoryPool, type Runtime } from '../../state/runtime'
 import { benchResult } from './BenchmarksTab'
 import { lastResultLine, planBodyFrom, profilePill, profileSummary, type ProfilePill } from './profiles'
 import { planWord, type Word } from './verdictView'
@@ -212,7 +213,16 @@ function useFitsNow(req: LaunchRequest): (Word & { wont: boolean }) | null {
       hit = {
         at: Date.now(),
         word: backend.plan(body).then(
-          (result) => planWord({ running: false, routing: false, providerRuntime: false, variant: null, result, checking: false }),
+          (result) =>
+            planWord({
+              running: false,
+              routing: false,
+              providerRuntime: false,
+              variant: null,
+              result,
+              checking: false,
+              hostPool: memoryPool((JSON.parse(key) as LaunchRequest).runtime as Runtime) === 'host',
+            }),
           () => ({ label: 'Not checked', signal: 'idle' as const }),
         ),
       }

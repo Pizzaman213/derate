@@ -533,3 +533,34 @@ def test_a_default_voice_row_with_an_unsafe_name_or_url_is_skipped(speaker, src)
 def test_the_revision_flag_reaches_the_config():
     args = tts.build_parser().parse_args(["--model", "x/y", "--revision", "a" * 40])
     assert tts.config_from_args(args).revision == "a" * 40
+
+
+def test_generation_is_clamped_to_the_window_the_gate_priced():
+    """The fit gate charges the codec's decode buffers for a clip as long as
+    the window, and the allocator is capped at that figure. A request for
+    more frames than the window would decode past it and run out of memory
+    in the codec, so the server never asks generate() for more."""
+    torch = pytest.importorskip("torch")
+
+    asked: list[int] = []
+
+    class Model:
+        def generate(self, *, max_new_tokens, **_):
+            asked.append(max_new_tokens)
+            return torch.zeros(1, 10, max_new_tokens)
+
+        def decode_audio(self, codes):
+            return torch.zeros(1, 4), torch.tensor([4])
+
+    engine = tts.SpeechEngine(
+        tts.ServerConfig(model="x/y", served_model_name="y", max_model_len=300)
+    )
+    engine.model = Model()
+    engine.processor = lambda **_: {"input_ids": torch.zeros(1, 3, dtype=torch.long)}
+    for requested in (None, 100, 300, 5000):
+        engine.synthesize("hello", None, max_new_tokens=requested)
+    assert asked == [300, 100, 300, 300]
+
+    engine.window = 2048
+    assert engine.frame_limit(None) == tts.DEFAULT_MAX_NEW_TOKENS
+    assert engine.frame_limit(1500) == 1500

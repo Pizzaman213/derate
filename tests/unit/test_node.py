@@ -156,6 +156,38 @@ class TestCompositionSmoke:
         assert deps.settings.cluster_id == "c-real-9f3a"  # the fixture's real id
         assert deps.settings.cluster_id != "c-local"
 
+    def test_each_architectures_image_is_asked_on_a_healthy_machine_of_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The coordinator cannot start an image built for an architecture it
+        is not. The resolver is handed each runtime's image per architecture
+        and the docker hosts to ask it on: every healthy machine of that
+        architecture, at the address a launch already SSHes to, and nothing a
+        roster entry could smuggle into an argv."""
+        from control_plane.deploy.flags import RUNTIMES, image_for_arch
+
+        config = _coordinator_config(tmp_path)
+        runtime, registry = _local_runtime(config)
+        deps = node.build_gateway_deps(runtime, config)
+
+        for name in ("vllm", "sglang"):
+            assert deps.resolver.arch_images[(name, "amd64")] == image_for_arch(
+                RUNTIMES[name], "amd64"
+            )
+
+        def member(node_id, arch, address):
+            return SimpleNamespace(
+                profile=SimpleNamespace(node_id=node_id, arch=arch, address=address)
+            )
+
+        monkeypatch.setattr(registry, "healthy_nodes", lambda: [
+            member("rtx", "amd64", "192.168.0.69"),
+            member("spark", "arm64", "10.0.0.2"),
+            member("odd", "amd64", "x;reboot"),
+        ])
+        assert deps.resolver.arch_hosts("amd64") == ["ssh://192.168.0.69"]
+        assert deps.resolver.arch_hosts("arm64") == ["ssh://10.0.0.2"]
+
 
 # ---------------------------------------------------------------------------
 # (b) the real gateway, booted

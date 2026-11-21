@@ -104,6 +104,16 @@ the caller cannot tell a measurement from a nameplate, and the fit gate goes on 
 narrate it as "allocatable right now". `None` lets the live path drop the node so
 the gate falls back to the ceiling *and says that is what it did*.
 
+Both take the runtime's `memory_pool` as `pool`. `"gpu"` is the answer above.
+`"host"` (llamacpp) is MemAvailable less `cpu_host_reserve`, and only where host
+RAM is a pool of its own (`HOST_POOL_CLASSES`: CPU and DISCRETE); a unified part
+answers 0 and `flags.placement_refusal` refuses the pairing. That is why a
+discrete sample now carries `host_memory_*` and `swap_used` too -- read beside the
+VRAM figures, never folded into them -- and why `_or_none` treats a sample with no
+host reading as absence under `pool="host"`: an agent from before the discrete read
+sends 0, which is "not measured", not "full". `memory_report` carries the same
+figure as `host_allocatable` for the node board.
+
 `read_gpu_processes` and `read_compute_apps` are three-valued on purpose: `None`
 means nvidia-smi could not be asked, `[]` that the GPU is idle.
 

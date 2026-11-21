@@ -209,7 +209,11 @@ QUANT_INFO: dict[str, QuantInfo] = {
         "and pre-Hopper runtimes upcast the weights to bf16, which quadruples them",
     ),
     "nvfp4": QuantInfo(
-        "nvfp4", 4.5, "block-float", 10.0, False, "Blackwell only; no pre-Blackwell kernel",
+        "nvfp4", 4.5, "block-float", 10.0, True,
+        "native FP4 tensor cores from Blackwell; below that vLLM runs the weights "
+        "through Marlin as weight-only FP4 -- measured on an RTX 3090 (sm_86) "
+        "under vLLM 0.31.0, where nvidia/Qwen3-8B-NVFP4 (modelopt) and "
+        "RedHatAI/Qwen3-8B-NVFP4 (compressed-tensors) both loaded and answered",
     ),
     "awq_int4": QuantInfo("awq_int4", 4.5, "int", 7.5, False, "Marlin and GEMM kernels from Turing"),
     "gptq_int4": QuantInfo("gptq_int4", 4.5, "int", 7.5, False, "Marlin and GEMM kernels from Turing"),

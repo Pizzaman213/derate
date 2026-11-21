@@ -360,6 +360,118 @@ def port_is_free(port: int) -> bool:
     return True
 
 
+#: How long a firewall preflight waits for a SYN to be answered. A LAN answers
+#: in milliseconds either way -- a listener's SYN-ACK or a closed port's RST --
+#: so two seconds of silence is a packet something dropped.
+PORT_PREFLIGHT_TIMEOUT_S = 2.0
+
+#: How many ports past the adapter's base the firewall sentence opens, at
+#: least. The manager hands ports out upward from the base, one per live
+#: deployment; a port checked beyond the span widens the sentence to it.
+PORT_PREFLIGHT_SPAN = 100
+
+#: What one preflight SYN found on a plan node's port. A SYN-ACK is a server
+#: already holding the port on that machine; an RST is a free port the packet
+#: reached; silence is a firewall dropping it.
+PORT_LISTENING = "listening"
+PORT_CLOSED = "closed"
+PORT_DROPPED = "dropped"
+
+
+def port_reachable(
+    host: str, port: int, timeout: float = PORT_PREFLIGHT_TIMEOUT_S
+) -> tuple[str | None, str]:
+    """What a TCP SYN from this machine to *host*:*port* finds.
+
+    ``PORT_CLOSED`` on a refusal: the RST proves the packet arrived and that
+    nothing holds the port there, which is what a launch needs.
+    ``PORT_LISTENING`` when the connection was accepted: a server is already
+    on that port on that machine, so an engine launched onto it cannot bind,
+    and the one already there answers for it. ``PORT_DROPPED`` only on a
+    TIMEOUT, which is a firewall dropping the packet. ``None`` for everything
+    else (a name that does not resolve, no route, a host that answers
+    unreachable): not this check's question, so the launch goes on.
+
+    The second value is the local address the attempt left from -- the
+    address the far machine's firewall sees -- or "" when unknown.
+    """
+    try:
+        family, kind, proto, _, addr = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )[0]
+    except OSError as exc:
+        logger.info("port preflight: cannot resolve %s: %s", host, exc)
+        return None, ""
+    with socket.socket(family, kind, proto) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect(addr)
+        except ConnectionRefusedError:
+            return PORT_CLOSED, _local_address(sock)
+        except (socket.timeout, TimeoutError):
+            return PORT_DROPPED, _local_address(sock)
+        except OSError as exc:
+            logger.info("port preflight: %s:%d not checked: %s", host, port, exc)
+            return None, ""
+        return PORT_LISTENING, _local_address(sock)
+
+
+def _local_address(sock: socket.socket) -> str:
+    try:
+        ip = sock.getsockname()[0]
+    except OSError:
+        return ""
+    return "" if ip in ("0.0.0.0", "::") else ip
+
+
+class PortUnreachable(ValueError):
+    """A plan node drops the coordinator's packets on the model's port.
+
+    A ValueError because it is refused before any record exists, like every
+    other synchronous launch refusal, and the gateway answers those 400 with
+    the sentence verbatim. Without it the engine came up healthy on the node
+    and derate waited the whole launch timeout for an answer that could
+    never arrive -- after a download that could take most of it."""
+
+    def __init__(self, node_id: str, host: str, port: int, coordinator: str, ports: str) -> None:
+        source = coordinator or "<coordinator ip>"
+        super().__init__(
+            f"{node_id} ({host}) drops TCP port {port} from "
+            f"{coordinator or 'this coordinator'}: a connection attempt went "
+            f"unanswered for {PORT_PREFLIGHT_TIMEOUT_S:g}s, so the engine would "
+            f"start there and derate could never reach it. Open the model ports "
+            f"on {node_id} -- for ufw, `sudo ufw allow from {source} to any port "
+            f"{ports} proto tcp` -- and launch again."
+        )
+        self.node_id = node_id
+        self.host = host
+        self.port = port
+        self.coordinator = coordinator
+
+
+class PortsTaken(ValueError):
+    """Every port a launch could take already has a server on a plan node.
+
+    A ValueError for the reason PortUnreachable is one: refused before any
+    record exists, answered 400 with the sentence verbatim. The alternative
+    is the failure this replaces -- an engine started onto a held port cannot
+    bind, and the server already there answered the ready probe for it."""
+
+    def __init__(self, holders: dict[str, str], tried: list[int]) -> None:
+        where = ", ".join("%s (%s)" % (node, host) for node, host in holders.items())
+        super().__init__(
+            f"No free model port on {where}: each of the {len(tried)} ports "
+            f"derate tried between {min(tried)} and {max(tried)} already has a "
+            f"server listening there that this control plane did not start -- "
+            f"another engine, or a deployment a restart forgot. An engine "
+            f"launched onto a held port cannot bind it, and the server already "
+            f"there would answer for it. Stop what holds those ports on "
+            f"{', '.join(holders)} and launch again."
+        )
+        self.holders = dict(holders)
+        self.tried = list(tried)
+
+
 class DuplicateDeployment(RuntimeError):
     """A node in this plan is already running this model, or the cluster is
     already serving this name.
@@ -492,6 +604,7 @@ class DeploymentManager:
         id_factory: Callable[[], str] | None = None,
         probe_fn: Callable[..., tuple[bool, str | None]] = probe,
         port_free_fn: Callable[[int], bool] = port_is_free,
+        port_reach_fn: Callable[[str, int], tuple[str | None, str]] | None = None,
         autostart: bool = True,
     ) -> None:
         state_dir = Path(state_dir) if state_dir is not None else data_dir()
@@ -530,9 +643,17 @@ class DeploymentManager:
         # is probed without one rather than raising TypeError on every call.
         self._probe_accepts_api_key = _accepts_kwarg(probe_fn, "api_key")
         self._port_free = port_free_fn
+        # None reads the module's `port_reachable` at each launch rather than
+        # binding it here, so the suite can swap the one function for every
+        # manager it builds (tests/unit/conftest.py) and no test dials a LAN.
+        self._port_reach = port_reach_fn
 
         self._lock = threading.RLock()
         self._records: dict[str, _Record] = {}
+        #: Ports a launch has checked through the firewall preflight and not
+        #: yet recorded. `_allocate_port` skips them, so a concurrent launch
+        #: cannot be handed the port another one is about to take.
+        self._reserved_ports: set[int] = set()
         self._stop_event = threading.Event()
         self._watch_thread: threading.Thread | None = None
         self._workers: list[threading.Thread] = []
@@ -607,58 +728,69 @@ class DeploymentManager:
             speculative_tokens=speculative_tokens,
             engine_options=engine_options,
         )
+        # Before any record, and so before any download: a node that drops
+        # the coordinator's packets on the model port serves nobody however
+        # healthy its engine comes up, and a node already serving something
+        # on it would answer for an engine that cannot bind.
+        # The port checked is the port launched on: it comes back reserved,
+        # and stays so until the record holds it (or the launch is refused),
+        # so a concurrent launch can neither preflight it too nor be handed it
+        # unchecked.
+        port = self._reserve_checked_port(plan)
+        try:
+            with self._lock:
+                conflict = self._find_conflict(name, shape.model_id, plan.node_ids)
+                if conflict is not None:
+                    existing, clash = conflict
+                    raise DuplicateDeployment(existing, clash=clash)
 
-        with self._lock:
-            conflict = self._find_conflict(name, shape.model_id, plan.node_ids)
-            if conflict is not None:
-                existing, clash = conflict
-                raise DuplicateDeployment(existing, clash=clash)
-
-            deployment = Deployment(
-                deployment_id=self._id_factory(),
-                served_name=name,
-                shape=shape,
-                plan=plan,
-                fit=fit,
-                runtime=runtime,
-                state=S.PLANNED,
-                backend_url=None,
-                context_length=ctx,
-                max_concurrent_seqs=max_seqs,
-                started_at=None,
-                last_error=None,
-                modality=modality,
-                extra_args=tuple(extra_args),
-                custom_command=tuple(custom_command),
-                speculative=speculative,
-                enforce_eager=enforce_eager,
-                cudagraph_capture_sizes=(
-                    tuple(cudagraph_capture_sizes) if cudagraph_capture_sizes else None
-                ),
-                kv_dtype=kv_dtype or None,
-                quantization=quantization or None,
-                # Only a commit sha is a pin; "main", "local", "inline" are not.
-                revision=revision if revision and _SHA.fullmatch(revision) else None,
-                speculative_tokens=speculative_tokens,
-                trust_remote_code=bool(trust_remote_code),
-                # The reference this launch will run (env override included);
-                # its local id is filled in once the launch has pulled it.
-                image=_image_for(runtime, _plan_arch(self.registry, plan.node_ids)),
-                engine_options=engine_options,
-                lifecycle=lifecycle,
-                original_window=original_window,
-            )
-            port = self._allocate_port()
-            # H3: the engine listens on 0.0.0.0 on the host network; this key
-            # is the only thing that lets a caller in, and the gateway is the
-            # only holder. Kept in the persisted handle -- never on the
-            # Deployment contract, so no serializer can reach it.
-            record = _Record(
-                deployment=deployment,
-                handle={"port": port, "runtime_api_key": secrets.token_hex(32)},
-            )
-            self._records[deployment.deployment_id] = record
-            self._transition(record, S.LAUNCHING)
+                deployment = Deployment(
+                    deployment_id=self._id_factory(),
+                    served_name=name,
+                    shape=shape,
+                    plan=plan,
+                    fit=fit,
+                    runtime=runtime,
+                    state=S.PLANNED,
+                    backend_url=None,
+                    context_length=ctx,
+                    max_concurrent_seqs=max_seqs,
+                    started_at=None,
+                    last_error=None,
+                    modality=modality,
+                    extra_args=tuple(extra_args),
+                    custom_command=tuple(custom_command),
+                    speculative=speculative,
+                    enforce_eager=enforce_eager,
+                    cudagraph_capture_sizes=(
+                        tuple(cudagraph_capture_sizes) if cudagraph_capture_sizes else None
+                    ),
+                    kv_dtype=kv_dtype or None,
+                    quantization=quantization or None,
+                    # Only a commit sha is a pin; "main", "local", "inline" are not.
+                    revision=revision if revision and _SHA.fullmatch(revision) else None,
+                    speculative_tokens=speculative_tokens,
+                    trust_remote_code=bool(trust_remote_code),
+                    # The reference this launch will run (env override included);
+                    # its local id is filled in once the launch has pulled it.
+                    image=_image_for(runtime, _plan_arch(self.registry, plan.node_ids)),
+                    engine_options=engine_options,
+                    lifecycle=lifecycle,
+                    original_window=original_window,
+                )
+                # H3: the engine listens on 0.0.0.0 on the host network; this key
+                # is the only thing that lets a caller in, and the gateway is the
+                # only holder. Kept in the persisted handle -- never on the
+                # Deployment contract, so no serializer can reach it.
+                record = _Record(
+                    deployment=deployment,
+                    handle={"port": port, "runtime_api_key": secrets.token_hex(32)},
+                )
+                self._records[deployment.deployment_id] = record
+                self._transition(record, S.LAUNCHING)
+        finally:
+            with self._lock:
+                self._reserved_ports.discard(port)
 
         worker = threading.Thread(
             target=self._launch_worker,
@@ -2989,17 +3121,20 @@ class DeploymentManager:
         return (name_clash, "served_name") if name_clash is not None else None
 
     # How far past the base port to look before giving up and handing one out
-    # anyway. A bound rather than an open loop: the caller is holding the
-    # manager lock, and a machine where two hundred consecutive ports are
-    # occupied has a problem this function is not going to solve.
+    # anyway, and how many ports a launch preflights before refusing because
+    # a plan node already holds every one. A bound rather than an open loop: a
+    # machine where two hundred consecutive ports are occupied has a problem
+    # this function is not going to solve.
     _PORT_SEARCH = 200
 
-    def _allocate_port(self) -> int:
+    def _allocate_port(self, exclude: set[int] | frozenset[int] = frozenset()) -> int:
+        """The next port to try. *exclude* is ports a plan node was found
+        already serving on, which nothing local can see."""
         taken = {
             r.handle.get("port")
             for r in self._records.values()
             if r.deployment.state not in TERMINAL
-        }
+        } | self._reserved_ports | set(exclude)
         base = self.adapter.base_port
         port = base
         while port in taken:
@@ -3015,14 +3150,98 @@ class DeploymentManager:
                 return port
             port += 1
         # Nothing free in the window. Hand out the counter's answer rather
-        # than refusing the launch: this check is an improvement on a guess,
-        # not a gate, and the identity probe is what actually protects the
-        # deployment.
+        # than refusing the launch: this bind sees only this machine, and the
+        # preflight (`_reserve_checked_port`) is what asks the plan's nodes.
         logger.warning(
             "no free port between %d and %d; falling back to %d",
             first, first + self._PORT_SEARCH, first,
         )
         return first
+
+    def _reserve_checked_port(self, plan: ParallelismPlan) -> int:
+        """A port no plan node is already serving on, reserved, or a refusal.
+
+        `_allocate_port` sees this control plane's records and THIS machine's
+        binds, and a plan usually places somewhere else: on 2026-11-21 it
+        handed out 8103 on the 3090 while a stranger's vLLM held it there, the
+        engine could not bind, and the stranger answered the ready probe. A
+        port a plan node accepts a connection on is released and the next one
+        tried, up to `_PORT_SEARCH`; all of them held is `PortsTaken`.
+
+        The returned port is in `_reserved_ports`; the caller discards it once
+        the record holds it or the launch is refused. Every other exit --
+        `PortUnreachable` included -- releases it here.
+        """
+        held: set[int] = set()
+        holders: dict[str, str] = {}
+        for _ in range(self._PORT_SEARCH):
+            with self._lock:
+                port = self._allocate_port(exclude=held)
+                self._reserved_ports.add(port)
+            try:
+                holder = self._preflight_port(plan, port)
+            except BaseException:
+                with self._lock:
+                    self._reserved_ports.discard(port)
+                raise
+            if holder is None:
+                return port
+            with self._lock:
+                self._reserved_ports.discard(port)
+            node_id, host = holder
+            logger.info(
+                "port %d already has a listener on %s (%s); trying the next", port, node_id, host
+            )
+            held.add(port)
+            holders.setdefault(node_id, host)
+        raise PortsTaken(holders, sorted(held))
+
+    def _preflight_port(self, plan: ParallelismPlan, port: int) -> tuple[str, str] | None:
+        """Dial *port* on every plan node: raise PortUnreachable when one's
+        firewall drops it, and return `(node_id, host)` of the first node
+        where a server already accepts on it; None when the port is usable.
+
+        One SYN per node from this process, which is where every request to
+        the engine will come from. A refusal proves the path and that the
+        port is free; anything else (DNS, no route) is not this check's to
+        judge, so it is logged and the launch goes on.
+        """
+        reach = self._port_reach or port_reachable
+        base = getattr(self.adapter, "base_port", port)
+        # At least the span, and always far enough to cover the port actually
+        # checked: `_allocate_port` searches past the span when ports are busy.
+        ports = "%d:%d" % (base, max(base + PORT_PREFLIGHT_SPAN - 1, port))
+        for node_id in plan.node_ids:
+            try:
+                state = self.registry.get_node(node_id) if self.registry else None
+            except Exception:
+                state = None
+            host = state.profile.address if state is not None else ""
+            if not host:
+                continue
+            try:
+                answer, source = reach(host, port)
+            except Exception:
+                logger.warning("port preflight to %s:%d failed", host, port, exc_info=True)
+                continue
+            if answer == PORT_DROPPED:
+                raise PortUnreachable(
+                    node_id, host, port, source or self._coordinator_address(), ports
+                )
+            if answer == PORT_LISTENING:
+                return node_id, host
+        return None
+
+    def _coordinator_address(self) -> str:
+        """This coordinator's own address as the registry knows it, or ""."""
+        local = getattr(self.registry, "local_node_id", None)
+        if not local:
+            return ""
+        try:
+            state = self.registry.get_node(local)
+        except Exception:
+            return ""
+        return state.profile.address if state is not None else ""
 
     def _evidence(self, record: _Record) -> tuple[S, str | None]:
         """What state does the world say this persisted record is in?"""

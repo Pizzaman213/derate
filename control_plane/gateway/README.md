@@ -440,6 +440,17 @@ endpoint answerable on a fresh install with nothing configured. Each row reports
 the numbers it was judged at, because with a derived context one figure at the
 top of the table no longer describes every row in it.
 
+`host_pool` is the same walk for the runtimes that serve from host RAM
+(llamacpp), BESIDE the GPU sides rather than instead of them: on a discrete box
+VRAM and host RAM are separate pools, and counting only the card never said
+what llamacpp could serve there. It is sized on `probed_node` exactly as that
+launch's own gate sizes it -- `allocatable_bytes(pool="host")` through
+`livefit.allocatable_map(pool="host")`, against `flags.budget_profile` (the box
+with its card taken out) -- and it is live only, because host RAM has no static
+ceiling here. Null on GB10/Apple/unknown machines, where a host-pool launch is
+refused; `host_pool_unavailable_reason` carries `placement_refusal`'s sentence
+for a machine that would qualify but has no host reading.
+
 ## Models tab routes (second pass)
 
 Everything the Models tab's mockup contract needed, all gated, all registered
@@ -451,7 +462,11 @@ above the `StaticFiles` mount.
   COORDINATOR only, cached 60 s), `supports` booleans read off the
   `RuntimeSpec`, `kv_dtypes`, `engine_options` (the spec's
   `engine_options_supported`), the two vLLM parser lists, `nccl_tunables` and
-  the pinned vLLM `version`.
+  the pinned vLLM `version`, and `image_versions`: per architecture, the
+  version the image that architecture runs reported when probed (null when
+  nothing probed it). Measurements are keyed by the MEASURED machine's entry
+  (`measurements.image_version`), never by the default image's version -- a
+  3090 on vLLM 0.31 filed under the Spark's 0.28.1 would answer a Spark lookup.
 - **`POST /api/plan/command`** -- the `/api/plan` body, run through
   `_plan_and_fit` and then `DeploymentManager.preview_launch`, which shares the
   launch's refusal block. Returns `argv`, `recipe`, the derived

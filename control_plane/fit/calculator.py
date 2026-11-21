@@ -48,9 +48,10 @@ from .constants import (
 )
 from .kv import (
     is_known_kv_dtype,
+    is_packed_kv_dtype,
     kv_bytes_per_token,
     kv_cache_bytes,
-    kv_divisor,
+    kv_cache_bytes_per_rank,
     kv_elem_bytes,
     stage_fraction,
 )
@@ -398,20 +399,35 @@ def speculative_kv_bytes_per_rank(
     """
     if spec is None:
         return 0.0
-    divisor = kv_divisor(shape, plan)
+    # Both terms are charged as the busiest rank holds them, through
+    # `kv_cache_bytes_per_rank`: TurboQuant's wide boundary layers sit at both
+    # ends of the model, so dividing a whole-model figure by the pipeline
+    # divisor under-charged the stage that holds two of them.
     drafted = 0.0
     k = max(0, int(spec.num_speculative_tokens))
     if k > 0:
-        drafted = kv_bytes_per_token(shape, kv_dtype) * k * max(0, int(max_seqs))
+        # k positions per sequence at the full-attention rate; k is far below
+        # any sliding window, so every layer caches all k.
+        drafted = kv_cache_bytes_per_rank(shape, plan, k, max_seqs, kv_dtype)
     own = 0.0
     ratio = max(0.0, float(getattr(spec, "draft_kv_ratio", 0.0) or 0.0))
     if ratio > 0:
-        # The target's whole cache at this context, scaled by the head's share.
-        # Sharded by the target's divisor: tensor parallel splits the draft
-        # alongside the model, and a head is built to the target's attention
-        # geometry, which is what lets one ratio answer for both.
-        own = kv_cache_bytes(shape, context, max_seqs, kv_dtype) * ratio
-    return (drafted + own) / divisor
+        # The target's cache at this context on the busiest rank, scaled by
+        # the head's share. Sharded alongside the target: tensor parallel
+        # splits the draft with the model, and a head is built to the
+        # target's attention geometry, which is what lets one ratio answer
+        # for both.
+        #
+        # A packed width is the exception. TurboQuant keeps a fixed number of
+        # boundary layers at full width whatever the depth, so a 5-layer head
+        # may be 4/5 wide while 5/80 of the target's packed cache carries
+        # 5/80 of its boundary overhead -- and the other packed layouts carry
+        # per-layer overheads a ratio does not scale either. Nothing here
+        # knows the head's own geometry, so it is charged at the model's own
+        # (unpacked) width: an upper bound, never an under-charge.
+        own_dtype = "auto" if is_packed_kv_dtype(kv_dtype) else kv_dtype
+        own = kv_cache_bytes_per_rank(shape, plan, context, max_seqs, own_dtype) * ratio
+    return drafted + own
 
 
 def _candidate_shards(n: int, shape: ModelShape) -> list[ParallelismPlan]:
@@ -594,17 +610,24 @@ def activation_bytes(
     context: int,
     chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
 ) -> float:
-    """Logits buffer plus compute scratch.
+    """Logits buffer plus compute scratch, plus a speech codec's working set.
 
     The logits term is charged for tokens actually emitted per step, one per
     sequence in flight, not for the full context. It still dominates on a large
     vocabulary: GPT-OSS's 201k vocab is 12.9 MB per emitted token in fp32.
+
+    The codec term is 0 except on a tts launch, where it is the measured
+    resident codec plus its decode buffers for a clip as long as the window
+    (``ModelShape.codec_working_set``). It is the largest thing that server
+    allocates -- 4.4 GB reserved at the default 512 frames on a 0.6B
+    checkpoint whose weights are 1.2 GB -- and it is charged here so the
+    refusals, the derived context and the launch's allocator cap all see it.
     """
     batch = max(1, int(max_seqs))
     chunk = min(max(1, int(chunk_tokens)), max(1, int(context)))
     logits = shape.vocab_size * batch * 4
     scratch = chunk * shape.hidden_size * 4 * 6
-    return float(logits + scratch)
+    return float(logits + scratch + shape.codec_working_set(context))
 
 
 def comm_buffer_bytes(plan: ParallelismPlan) -> float:
@@ -690,6 +713,13 @@ def memory_breakdown(
             "cross-attention cache over the encoder's own output is not "
             "modeled"
         )
+    if shape.codec_resident_bytes or shape.codec_bytes_per_frame:
+        warnings.append(
+            f"activations include {_gib(shape.codec_working_set(context))} for "
+            f"the speech codec: {_gib(shape.codec_resident_bytes)} resident, "
+            f"plus decode buffers for a clip as long as the {context}-frame "
+            f"window; a smaller context lowers it"
+        )
 
     spec_weights = speculative_weight_bytes_per_rank(plan, speculative)
     spec_kv = speculative_kv_bytes_per_rank(
@@ -711,10 +741,10 @@ def memory_breakdown(
                 f"PP={plan.pipeline_parallel}"
             )
 
-    kv_total = kv_cache_bytes(shape, context, max_seqs, kv_dtype)
+    kv_per_rank = kv_cache_bytes_per_rank(shape, plan, context, max_seqs, kv_dtype)
     breakdown = MemoryBreakdown(
         weights=int(weight_bytes_per_rank(shape, plan, weight_bytes) + spec_weights),
-        kv_cache=int(kv_total / kv_divisor(shape, plan) + spec_kv),
+        kv_cache=int(kv_per_rank + spec_kv),
         activations=int(activation_bytes(shape, max_seqs, context, chunk_tokens)),
         comm_buffers=int(comm_buffer_bytes(plan)),
         replicated=int(replicated_bytes_per_rank(shape)) + int(extra_replicated_bytes),
@@ -1423,7 +1453,7 @@ class FitCalculator:
             )
 
         return "combined", self._combined_reason(
-            req, breakdown, usable, node, over, basis
+            req, breakdown, usable, node, over, basis, max_ctx=max_ctx
         )
 
     def _nodes_phrase(
@@ -1673,8 +1703,7 @@ class FitCalculator:
         basis: str = "static",
     ) -> str:
         shape, plan = req.shape, req.plan
-        divisor = kv_divisor(shape, plan)
-        per_seq = kv_cache_bytes(shape, req.context_length, 1, req.kv_dtype) / divisor
+        per_seq = kv_cache_bytes_per_rank(shape, plan, req.context_length, 1, req.kv_dtype)
         kv_budget = usable - (breakdown.total - breakdown.kv_cache)
 
         fixes: list[str] = []
@@ -1686,9 +1715,12 @@ class FitCalculator:
         )
         if seqs >= 1:
             fixes.append(f"reduce concurrency to {seqs} sequences")
-        elem = kv_elem_bytes(req.kv_dtype, shape)
-        if elem > 1.0:
-            kv_fp8 = breakdown.kv_cache * (1.0 / elem)
+        # Against the width actually chosen, which may be packed: fp8 is only
+        # suggested when it is narrower for THIS model.
+        chosen = kv_bytes_per_token(shape, req.kv_dtype)
+        fp8_ratio = kv_bytes_per_token(shape, "fp8") / chosen if chosen else 1.0
+        if fp8_ratio < 1.0:
+            kv_fp8 = breakdown.kv_cache * fp8_ratio
             if (breakdown.total - breakdown.kv_cache) + kv_fp8 <= usable:
                 fixes.append(
                     f"quantize the KV cache to fp8 ({_gib(kv_fp8)}, which fits)"
@@ -1723,6 +1755,8 @@ class FitCalculator:
         node: NodeProfile,
         over: int,
         basis: str = "static",
+        *,
+        max_ctx: int = 0,
     ) -> str:
         named = [
             ("weights", breakdown.weights),
@@ -1749,6 +1783,10 @@ class FitCalculator:
             lead = "no single term dominates"
 
         fixes = [self._nodes_phrase(req, node, usable if basis == "live" else None)]
+        # A speech codec decodes a clip as long as the window, so its share of
+        # `activations` shrinks with the context and not with concurrency.
+        if req.shape.codec_bytes_per_frame and 0 < max_ctx < req.context_length:
+            fixes.append(f"lower context to {max_ctx} frames")
         seqs = self._largest_max_seqs(
             req.shape, req.plan, usable, req.context_length, req.kv_dtype,
             req.max_concurrent_seqs - 1, req.weight_bytes,
