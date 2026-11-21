@@ -731,3 +731,176 @@ def preference_for(
     if record is None:
         return "balanced"
     return "bulk" if record.prefill_share >= PREFILL_DOMINANT_SHARE else "balanced"
+
+
+# Benchmarks: a throwaway copy of a launch request, measured at N users
+# ==========================================================================
+
+BENCH_SUBDIR = "measurements/bench"
+
+#: A bench id is minted here (`b-` + hex) and is the filename; anything else
+#: is refused before it reaches a path.
+_BENCH_ID = re.compile(r"^b-[0-9a-f]{12}$")
+
+
+def bench_records_dir() -> Path:
+    return data_dir() / BENCH_SUBDIR
+
+
+@dataclass
+class BenchRecord:
+    """One benchmark run of a launch request (`gateway/bench.py`).
+
+    Mutable on purpose, unlike the records above: it is written as the run
+    moves through launching -> measuring -> done, so a reader polling it sees
+    where the run is. `points` is one row per user count.
+    """
+
+    bench_id: str
+    model_id: str
+    request: dict
+    served_name: str
+    runtime: str | None = None
+    node_ids: list[str] = field(default_factory=list)
+    gpu_name: str | None = None
+    runtime_version: str | None = None
+    workload: str = "prose"
+    users: list[int] = field(default_factory=list)
+    #: launching | measuring | done | failed | cancelled
+    state: str = "launching"
+    error: str | None = None
+    started_at: float = 0.0
+    finished_at: float | None = None
+    #: [{users, ttft_ms_p50, tps_each_mean, tps_total, requests, errors}]
+    points: list[dict] = field(default_factory=list)
+    spec_mean_acceptance: float | None = None
+    deployment_id: str | None = None
+
+
+def save_bench(record: BenchRecord, *, directory: Path | None = None) -> Path | None:
+    if not _BENCH_ID.match(record.bench_id):
+        raise ValueError(f"{record.bench_id!r} is not a bench id")
+    target = directory or bench_records_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / f"{record.bench_id}.json"
+        path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True))
+        return path
+    except OSError:
+        log.warning("could not write the benchmark record", exc_info=True)
+        return None
+
+
+def _read_bench(path: Path) -> BenchRecord | None:
+    try:
+        raw = json.loads(path.read_text())
+        known = BenchRecord.__dataclass_fields__
+        return BenchRecord(**{k: v for k, v in raw.items() if k in known})
+    except (OSError, ValueError, TypeError):
+        log.warning("skipping unreadable benchmark %s", path, exc_info=True)
+        return None
+
+
+def load_bench_all(*, directory: Path | None = None) -> list[BenchRecord]:
+    """Every readable benchmark, newest first. A corrupt file is skipped."""
+    target = directory or bench_records_dir()
+    if not target.is_dir():
+        return []
+    out = [r for p in target.glob("b-*.json") if (r := _read_bench(p))]
+    out.sort(key=lambda r: r.started_at, reverse=True)
+    return out
+
+
+def load_bench(bench_id: str, *, directory: Path | None = None) -> BenchRecord | None:
+    if not _BENCH_ID.match(bench_id or ""):
+        return None
+    path = (directory or bench_records_dir()) / f"{bench_id}.json"
+    return _read_bench(path) if path.is_file() else None
+
+
+def delete_bench(bench_id: str, *, directory: Path | None = None) -> bool:
+    if not _BENCH_ID.match(bench_id or ""):
+        return False
+    path = (directory or bench_records_dir()) / f"{bench_id}.json"
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+COMPUTE_SUBDIR = "measurements/compute"
+
+
+def compute_records_dir() -> Path:
+    return data_dir() / COMPUTE_SUBDIR
+
+
+@dataclass(frozen=True)
+class ComputeRecord:
+    """A measured dense matmul rate on one GPU, inside one serving image.
+
+    Written by ``computeprobe.run_compute`` and read by the first-token floor.
+    Keyed by GPU and image like the other records and for the same reason: a
+    different part or a different torch build is a different number, and a
+    mismatch MISSES rather than approximating.
+    """
+
+    gpu_name: str
+    image: str
+    dtype: str
+    tflops: float
+    node_id: str
+    measured_at: float
+
+    def key(self) -> str:
+        return "|".join((self.gpu_name, self.image, self.dtype))
+
+    def filename(self) -> str:
+        parts = (self.gpu_name, self.image, self.dtype)
+        return _UNSAFE.sub("-", "__".join(parts)).strip("-")[:180] + ".json"
+
+
+def save_compute(record: ComputeRecord, *, directory: Path | None = None) -> Path | None:
+    """Write one compute record; last writer wins within a key."""
+    target = directory or compute_records_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / record.filename()
+        path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True))
+        return path
+    except OSError:
+        log.warning("could not write the compute measurement", exc_info=True)
+        return None
+
+
+def load_compute_all(*, directory: Path | None = None) -> list[ComputeRecord]:
+    """Every readable compute record. A corrupt file is skipped, never raised."""
+    target = directory or compute_records_dir()
+    if not target.is_dir():
+        return []
+    out: list[ComputeRecord] = []
+    for path in sorted(target.glob("*.json")):
+        try:
+            out.append(ComputeRecord(**json.loads(path.read_text())))
+        except (OSError, ValueError, TypeError):
+            log.warning("skipping unreadable compute measurement %s", path, exc_info=True)
+    return out
+
+
+def matching_compute(
+    gpu_name: str | None,
+    *,
+    image: str,
+    dtype: str = "bf16",
+    directory: Path | None = None,
+) -> ComputeRecord | None:
+    """The newest record for exactly this GPU, image and dtype, or None."""
+    if not gpu_name:
+        return None
+    hits = [
+        r
+        for r in load_compute_all(directory=directory)
+        if r.gpu_name == gpu_name and r.image == image and r.dtype == dtype
+    ]
+    return max(hits, key=lambda r: r.measured_at) if hits else None

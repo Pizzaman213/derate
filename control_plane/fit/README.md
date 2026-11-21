@@ -174,6 +174,26 @@ not to be. `gateway/strength.py` keeps routing on `predicted_decode_tps`, the
 base figure — routing on a ceiling would prefer a deployment for a speedup
 nobody measured.
 
+### Engine options that move the budget
+
+`FitRequest.chunk_tokens` (from `max_num_batched_tokens`) replaces the
+calculator's `ACTIVATION_CHUNK_TOKENS` when set, and
+`FitRequest.extra_replicated_bytes` (the multimodal processor cache, per rank)
+is added to `replicated` inside `memory_breakdown`, so `total`, the verdict and
+`max_context_that_fits` stay one figure; the fit warns that it comes out of the
+same pool on GB10. `language_model_only` and YaRN's `rope_factor` act upstream
+in the gateway's `_plan_and_fit` (a shape without its vision tower; a window
+stretched by the factor), so the calculator only ever sees their result.
+
+### `bandwidth_ceiling_tps` is `predict_decode_tps` with more caches
+
+`bandwidth_ceiling_tps(shape, bw, kv_read_bytes, users)` calls
+`predict_decode_tps` with the per-sequence cache read multiplied by `users`, so
+at one user it IS the Verdict card's number -- by construction, and pinned by a
+test. `/api/plan/concurrency` draws the users chart with it. It is per user and
+a ceiling: past a few users decode turns compute-bound, which nothing here
+models.
+
 ## `capacity.py`
 
 `largest_runnable(shapes, nodes, ...)` returns one `CapacityRow` per shape and

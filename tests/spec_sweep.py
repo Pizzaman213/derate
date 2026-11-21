@@ -22,7 +22,7 @@ rather than assumed.
 
 **Three workloads, never blended.** Acceptance is a property of the traffic, not
 of the model: ngram accepts most of what it drafts when the answer repeats the
-question and nearly none of it on open prose. `tests/spec_data/README.md` says
+question and nearly none of it on open prose. `control_plane/bench_data/README.md` says
 what each set is for and why they are hand-written rather than generated.
 
 **Nothing here assumes an acceptance rate.** Every figure printed is either read
@@ -48,7 +48,7 @@ from urllib import error, parse, request
 from control_plane import head_scan, measurements, metrics_scrape
 from control_plane.fit.calculator import speculative_best_k, speculative_overhead
 
-DATA = Path(__file__).parent / "spec_data"
+DATA = Path(__file__).resolve().parents[1] / "control_plane" / "bench_data"
 DEFAULT_BASE = "http://localhost:8088"
 
 #: A launch that is still coming up is normal for minutes -- image pull, weight

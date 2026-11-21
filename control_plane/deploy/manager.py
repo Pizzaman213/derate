@@ -37,7 +37,11 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
 
 from control_plane import measurements
-from control_plane.contracts.deployment import check_speculative_tokens
+from control_plane.contracts.deployment import (
+    EngineOptions,
+    Lifecycle,
+    check_speculative_tokens,
+)
 from control_plane.contracts import (
     Deployment,
     DeploymentOrigin,
@@ -68,15 +72,18 @@ from .progress import (
 )
 from .flags import (
     graph_capture_refusal,
+    image_for_arch,
     kv_cache_dtype_refusal,
     llamacpp_model_refusal,
     quantization_refusal,
+    engine_options_refusal,
+    engine_options_set_fields,
     nccl_env_refusal,
     parse_nccl_env,
     runtime_spec,
     speculative_refusal,
 )
-from .recipes import check_extra_args_safe, check_recipe_identifiers, container_image
+from .recipes import check_extra_args_safe, check_recipe_identifiers
 from .sparkrun import LaunchError, SparkrunAdapter, default_served_name, is_oom
 from .utilization import utilization_for
 from .store import TERMINAL_RECORDS_KEPT, DeploymentStore, safe_deployment_id
@@ -89,13 +96,32 @@ from control_plane.redaction import REDACTED
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
-def _image_for(runtime: str) -> str:
-    """The image reference a launch on *runtime* will run, or "" for a
-    runtime this build has no spec for (the adapter refuses those itself)."""
+def _image_for(runtime: str, arch: str = "") -> str:
+    """The image reference a launch on *runtime* will run on a machine of
+    *arch*, or "" for a runtime this build has no spec for (the adapter
+    refuses those itself) or no image for that architecture (the plan path
+    refuses those first, `flags.arch_refusal`)."""
     try:
-        return container_image(runtime_spec(runtime))
+        return image_for_arch(runtime_spec(runtime), arch) or ""
     except ValueError:
         return ""
+
+
+def _plan_arch(registry, node_ids) -> str:
+    """The one architecture the plan's machines share, or "" when unknown.
+    The plan path has already refused a set that mixes them."""
+    if registry is None:
+        return ""
+    arches = set()
+    for node_id in node_ids:
+        try:
+            state = registry.get_node(node_id)
+        except Exception:
+            state = None
+        arch = getattr(getattr(state, "profile", None), "arch", "") if state else ""
+        if arch:
+            arches.add(arch)
+    return arches.pop() if len(arches) == 1 else ""
 
 
 def _scrub_key(record: "_Record", text: str) -> str:
@@ -535,6 +561,9 @@ class DeploymentManager:
         revision: str | None = None,
         speculative_tokens: int = 0,
         trust_remote_code: bool = False,
+        engine_options: EngineOptions = EngineOptions(),
+        original_window: int | None = None,
+        lifecycle: Lifecycle = Lifecycle(),
     ) -> Deployment:
         """Refuse, render, run, then watch for readiness.
 
@@ -563,6 +592,105 @@ class DeploymentManager:
         if callable(preflight):
             preflight()
         name = served_name or default_served_name(shape)
+        self._refuse(
+            shape,
+            plan,
+            runtime,
+            name=name,
+            extra_args=extra_args,
+            custom_command=custom_command,
+            speculative=speculative,
+            enforce_eager=enforce_eager,
+            cudagraph_capture_sizes=cudagraph_capture_sizes,
+            kv_dtype=kv_dtype,
+            quantization=quantization,
+            speculative_tokens=speculative_tokens,
+            engine_options=engine_options,
+        )
+
+        with self._lock:
+            conflict = self._find_conflict(name, shape.model_id, plan.node_ids)
+            if conflict is not None:
+                existing, clash = conflict
+                raise DuplicateDeployment(existing, clash=clash)
+
+            deployment = Deployment(
+                deployment_id=self._id_factory(),
+                served_name=name,
+                shape=shape,
+                plan=plan,
+                fit=fit,
+                runtime=runtime,
+                state=S.PLANNED,
+                backend_url=None,
+                context_length=ctx,
+                max_concurrent_seqs=max_seqs,
+                started_at=None,
+                last_error=None,
+                modality=modality,
+                extra_args=tuple(extra_args),
+                custom_command=tuple(custom_command),
+                speculative=speculative,
+                enforce_eager=enforce_eager,
+                cudagraph_capture_sizes=(
+                    tuple(cudagraph_capture_sizes) if cudagraph_capture_sizes else None
+                ),
+                kv_dtype=kv_dtype or None,
+                quantization=quantization or None,
+                # Only a commit sha is a pin; "main", "local", "inline" are not.
+                revision=revision if revision and _SHA.fullmatch(revision) else None,
+                speculative_tokens=speculative_tokens,
+                trust_remote_code=bool(trust_remote_code),
+                # The reference this launch will run (env override included);
+                # its local id is filled in once the launch has pulled it.
+                image=_image_for(runtime, _plan_arch(self.registry, plan.node_ids)),
+                engine_options=engine_options,
+                lifecycle=lifecycle,
+                original_window=original_window,
+            )
+            port = self._allocate_port()
+            # H3: the engine listens on 0.0.0.0 on the host network; this key
+            # is the only thing that lets a caller in, and the gateway is the
+            # only holder. Kept in the persisted handle -- never on the
+            # Deployment contract, so no serializer can reach it.
+            record = _Record(
+                deployment=deployment,
+                handle={"port": port, "runtime_api_key": secrets.token_hex(32)},
+            )
+            self._records[deployment.deployment_id] = record
+            self._transition(record, S.LAUNCHING)
+
+        worker = threading.Thread(
+            target=self._launch_worker,
+            args=(record, port),
+            name="derate-launch-%s" % deployment.deployment_id,
+            daemon=True,
+        )
+        self._workers.append(worker)
+        worker.start()
+        self.start()
+        return deployment
+
+    def _refuse(
+        self,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        runtime: str,
+        *,
+        name: str,
+        extra_args: tuple[str, ...] = (),
+        custom_command: tuple[str, ...] = (),
+        speculative: SpeculativeSpec | None = None,
+        enforce_eager: bool = False,
+        cudagraph_capture_sizes: tuple[int, ...] | None = None,
+        kv_dtype: str | None = None,
+        quantization: str | None = None,
+        speculative_tokens: int = 0,
+        engine_options: EngineOptions = EngineOptions(),
+    ) -> None:
+        """Every synchronous launch refusal, raised as ValueError before any
+        record exists. Shared by `launch` and the command preview so both
+        refuse the same requests with the same words."""
         # M-22: run the same model_id/served_name safety check synthesize()
         # runs, but here -- synchronously, before any record or launch
         # worker thread exists. Without this, a hostile (or merely
@@ -659,8 +787,17 @@ class DeploymentManager:
         # run the defaults -- the same silent-drop failure the kv_dtype
         # refusal exists for.
         world = max(1, plan.tensor_parallel * plan.pipeline_parallel * plan.data_parallel)
-        nccl_env = self._nccl_env_for(plan, name)
+        nccl_env = self._nccl_env_for(plan, name, dict(engine_options.env))
         refusal = nccl_env_refusal(runtime, nccl_env, world_size=world)
+        if refusal is not None:
+            raise ValueError(refusal)
+        # Typed engine options: refused, never dropped, for kv_dtype's reason.
+        if custom_command and engine_options_set_fields(engine_options):
+            raise ValueError(
+                "engine options and a custom command can't be combined: the "
+                "custom command replaces every derived flag."
+            )
+        refusal = engine_options_refusal(engine_options, runtime, world_size=world)
         if refusal is not None:
             raise ValueError(refusal)
         if kv_dtype and custom_command:
@@ -682,67 +819,127 @@ class DeploymentManager:
                 "speculative decoding is only supported on the vllm runtime here."
             )
 
-        with self._lock:
-            conflict = self._find_conflict(name, shape.model_id, plan.node_ids)
-            if conflict is not None:
-                existing, clash = conflict
-                raise DuplicateDeployment(existing, clash=clash)
+    def preview_launch(
+        self,
+        shape: ModelShape,
+        plan: ParallelismPlan,
+        fit: FitResult,
+        runtime: str,
+        ctx: int,
+        max_seqs: int,
+        *,
+        served_name: str | None = None,
+        modality: Modality = Modality.TEXT,
+        extra_args: tuple[str, ...] = (),
+        custom_command: tuple[str, ...] = (),
+        speculative: SpeculativeSpec | None = None,
+        enforce_eager: bool = False,
+        cudagraph_capture_sizes: tuple[int, ...] | None = None,
+        kv_dtype: str | None = None,
+        quantization: str | None = None,
+        revision: str | None = None,
+        speculative_tokens: int = 0,
+        trust_remote_code: bool = False,
+        engine_options: EngineOptions = EngineOptions(),
+        original_window: int | None = None,
+    ) -> dict:
+        """What `launch` would run, rendered and refused exactly as it would
+        be, with nothing started and nothing stored.
 
-            deployment = Deployment(
-                deployment_id=self._id_factory(),
-                served_name=name,
-                shape=shape,
-                plan=plan,
-                fit=fit,
-                runtime=runtime,
-                state=S.PLANNED,
-                backend_url=None,
-                context_length=ctx,
-                max_concurrent_seqs=max_seqs,
-                started_at=None,
-                last_error=None,
-                modality=modality,
-                extra_args=tuple(extra_args),
-                custom_command=tuple(custom_command),
-                speculative=speculative,
-                enforce_eager=enforce_eager,
-                cudagraph_capture_sizes=(
-                    tuple(cudagraph_capture_sizes) if cudagraph_capture_sizes else None
-                ),
-                kv_dtype=kv_dtype or None,
-                quantization=quantization or None,
-                # Only a commit sha is a pin; "main", "local", "inline" are not.
-                revision=revision if revision and _SHA.fullmatch(revision) else None,
-                speculative_tokens=speculative_tokens,
-                trust_remote_code=bool(trust_remote_code),
-                # The reference this launch will run (env override included);
-                # its local id is filled in once the launch has pulled it.
-                image=_image_for(runtime),
-            )
-            port = self._allocate_port()
-            # H3: the engine listens on 0.0.0.0 on the host network; this key
-            # is the only thing that lets a caller in, and the gateway is the
-            # only holder. Kept in the persisted handle -- never on the
-            # Deployment contract, so no serializer can reach it.
-            record = _Record(
-                deployment=deployment,
-                handle={"port": port, "runtime_api_key": secrets.token_hex(32)},
-            )
-            self._records[deployment.deployment_id] = record
-            self._transition(record, S.LAUNCHING)
-
-        worker = threading.Thread(
-            target=self._launch_worker,
-            args=(record, port),
-            name="derate-launch-%s" % deployment.deployment_id,
-            daemon=True,
+        The port and the per-deployment API key are the only parts that
+        differ: both are chosen at launch, so the preview names a fixed port
+        and omits the key, and says so in `notes`.
+        """
+        name = served_name or default_served_name(shape)
+        self._refuse(
+            shape,
+            plan,
+            runtime,
+            name=name,
+            extra_args=extra_args,
+            custom_command=custom_command,
+            speculative=speculative,
+            enforce_eager=enforce_eager,
+            cudagraph_capture_sizes=cudagraph_capture_sizes,
+            kv_dtype=kv_dtype,
+            quantization=quantization,
+            speculative_tokens=speculative_tokens,
+            engine_options=engine_options,
         )
-        self._workers.append(worker)
-        worker.start()
-        self.start()
-        return deployment
+        deployment = Deployment(
+            deployment_id="preview",
+            served_name=name,
+            shape=shape,
+            plan=plan,
+            fit=fit,
+            runtime=runtime,
+            state=S.PLANNED,
+            backend_url=None,
+            context_length=ctx,
+            max_concurrent_seqs=max_seqs,
+            started_at=None,
+            last_error=None,
+            modality=modality,
+            extra_args=tuple(extra_args),
+            custom_command=tuple(custom_command),
+            speculative=speculative,
+            enforce_eager=enforce_eager,
+            cudagraph_capture_sizes=(
+                tuple(cudagraph_capture_sizes) if cudagraph_capture_sizes else None
+            ),
+            kv_dtype=kv_dtype or None,
+            quantization=quantization or None,
+            speculative_tokens=speculative_tokens,
+            trust_remote_code=bool(trust_remote_code),
+            engine_options=engine_options,
+            original_window=original_window,
+        )
+        record = _Record(deployment=deployment)
+        share = self._launch_utilization(record)
+        kv_bytes = self._launch_kv_cache_bytes(record)
+        nccl_env = self._nccl_env_for(plan, name, dict(engine_options.env))
+        port = 8000
+        common = dict(
+            served_name=name,
+            port=port,
+            gpu_memory_utilization=share,
+            kv_cache_memory_bytes=kv_bytes,
+            speculative=speculative,
+            extra_args=tuple(extra_args),
+            enforce_eager=enforce_eager,
+            cudagraph_capture_sizes=deployment.cudagraph_capture_sizes,
+            kv_dtype=kv_dtype or None,
+            quantization=quantization or None,
+            nccl_env=nccl_env,
+            speculative_tokens=speculative_tokens,
+            trust_remote_code=bool(trust_remote_code),
+            engine_options=engine_options,
+            original_window=original_window,
+        )
+        recipe = self.adapter.recipe_for(
+            plan, shape, runtime, ctx, max_seqs,
+            custom_command=tuple(custom_command),
+            runtime_api_key=None,
+            revision=revision,
+            image=_image_for(runtime, _plan_arch(self.registry, plan.node_ids)) or None,
+            **common,
+        )
+        argv = self.adapter.render_command(
+            plan, shape, runtime, ctx, max_seqs, recipe=recipe, **common
+        )
+        return {
+            "argv": list(argv),
+            "recipe": recipe.content,
+            "gpu_memory_utilization": share,
+            "kv_cache_memory_bytes": kv_bytes,
+            "nccl_env": dict(nccl_env),
+            "notes": [
+                "The launch adds a per-deployment API key and picks the port; "
+                "both are omitted here."
+            ],
+        }
 
-    def stop(self, deployment_id: str) -> None:
+    def stop(self, deployment_id: str, *, reason: str | None = None) -> None:
         """Tear down through sparkrun and wait for confirmation.
 
         A stop that does not confirm inside the budget escalates: the record
@@ -850,7 +1047,7 @@ class DeploymentManager:
         with self._lock:
             if left_behind:
                 record.deployment.last_error = left_behind
-            self._transition(record, S.STOPPED)
+            self._transition(record, S.STOPPED, reason=reason)
         # An orderly stop, not a crash: nothing about this deployment's log is
         # a question anybody will ask once it is confirmed down.
         self._delete_serving_log(deployment_id)
@@ -1008,6 +1205,23 @@ class DeploymentManager:
             self.store.save(deployment, record.handle)
             return deployment
 
+    def set_lifecycle(self, deployment_id: str, lifecycle: Lifecycle) -> Deployment | None:
+        """Replace the deployment's lifecycle settings and persist them.
+
+        Same shape as ``set_serving``: not a state transition. Returns the
+        updated record, or ``None`` if there is no such deployment.
+        """
+        with self._lock:
+            record = self._records.get(deployment_id)
+            if record is None:
+                return None
+            deployment = record.deployment
+            if deployment.lifecycle == lifecycle:
+                return deployment
+            deployment.lifecycle = lifecycle
+            self.store.save(deployment, record.handle)
+            return deployment
+
     def handles(self) -> dict[str, dict]:
         """The sparkrun handle behind each record, for callers that must match
         a running process back to a deployment.
@@ -1162,7 +1376,11 @@ class DeploymentManager:
         ).start()
 
     @staticmethod
-    def _nccl_env_for(plan: ParallelismPlan, served_name: str | None = None) -> dict[str, str]:
+    def _nccl_env_for(
+        plan: ParallelismPlan,
+        served_name: str | None = None,
+        override: dict[str, str] | None = None,
+    ) -> dict[str, str]:
         """NCCL settings for this launch, or an empty dict.
 
         Read from `DERATE_NCCL_ENV` per launch rather than cached, so a value
@@ -1218,7 +1436,12 @@ class DeploymentManager:
         # The operator's own setting wins outright. It is the escape hatch for
         # a value measured since, or one this box needs for a reason no sweep
         # captured.
-        merged = {**measured, **parse_nccl_env(os.environ.get("DERATE_NCCL_ENV"))}
+        # The request's own `engine_options.env` wins over both.
+        merged = {
+            **measured,
+            **parse_nccl_env(os.environ.get("DERATE_NCCL_ENV")),
+            **(override or {}),
+        }
         return merged
 
     def _snapshot_serving_log(self, record: _Record) -> None:
@@ -1962,10 +2185,23 @@ class DeploymentManager:
                 # Off the record for the same reason, and more so: this is the
                 # width the WEIGHTS were priced at.
                 quantization=deployment.quantization,
+                # The image picked for these machines' architecture when the
+                # record was made. Only when it is not the runtime's default --
+                # the same rule as the fields below, so an adapter (or a test
+                # double) that predates the field is called as before.
+                **(
+                    {"image": deployment.image}
+                    if deployment.image and deployment.image != _image_for(deployment.runtime)
+                    else {}
+                ),
                 # Recomputed here rather than stored: these are an operator's
                 # current tuning, not a property of the deployment, and a
                 # relaunch should pick up a value measured since.
-                nccl_env=self._nccl_env_for(deployment.plan, deployment.served_name),
+                nccl_env=self._nccl_env_for(
+                    deployment.plan,
+                    deployment.served_name,
+                    dict(deployment.engine_options.env),
+                ),
                 # Everything before the container exists is inside this call:
                 # the image pull and the weights. Read it as it is printed or
                 # it is not readable at all -- the output is in a pipe until
@@ -1980,6 +2216,16 @@ class DeploymentManager:
                 # Only when opted in, so an adapter that predates the field
                 # (and every launch that never asked) is called as before.
                 **({"trust_remote_code": True} if deployment.trust_remote_code else {}),
+                # Same rule: only a launch that asked passes these, so a test
+                # adapter that predates the fields is called as before.
+                **(
+                    {
+                        "engine_options": deployment.engine_options,
+                        "original_window": deployment.original_window,
+                    }
+                    if deployment.engine_options != EngineOptions()
+                    else {}
+                ),
             )
         except LaunchError as exc:
             self._fail_launch(record, exc)

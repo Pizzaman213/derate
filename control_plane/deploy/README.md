@@ -376,6 +376,48 @@ TP=2 passes the fit gate
 commits two machines, starts one server, and sits in `LAUNCHING` until the health
 timeout with nothing on screen naming the cause.
 
+**Engine options** (`EngineOptions` in `contracts/deployment.py`) are typed
+knobs rendered here, never through `extra_args`. `RuntimeSpec.
+engine_options_supported` is every field for vllm and only `env` elsewhere;
+`engine_options_refusal` names the first set field the runtime cannot take
+(`"{field} is a vLLM option; {runtime} launches do not take it."`) and runs
+`nccl_env_refusal` over a non-empty `env`. `render_engine_options` emits, in
+order, `--reasoning-parser`, `--enable-auto-tool-choice --tool-call-parser`,
+`--[no-]enable-prefix-caching`, `--max-num-batched-tokens`,
+`--async-scheduling`, `--limit-mm-per-prompt`, `--mm-processor-cache-gb`,
+`--language-model-only`, `--hf-overrides` (YaRN, under `HF_ROPE_KEY =
+"rope_parameters"` because the image's transformers is v5) and
+`--override-generation-config`. Parser names are checked against
+`VLLM_REASONING_PARSERS` / `VLLM_TOOL_CALL_PARSERS`, read off the pinned image.
+The JSON-valued flags copy `speculative_config`'s discipline: composed with
+`json.dumps`, validated whole-string against `_ENGINE_JSON_SAFE`, carried as
+recipe defaults (`engine_options_recipe`). A custom command with any engine
+option set is refused -- it replaces every derived flag.
+
+Other second-pass pieces in this package:
+
+- `relaunch.py::launch_request_from(dep)` -- the `POST /api/deployments` body
+  that reproduces a record, absent keys omitted. `restart.py`'s crash relaunch
+  uses it (it used to send four keys and drop `kv_dtype`, `dtype`,
+  `speculative`, `served_name`, `enforce_eager` and `trust_remote_code`).
+- `manager.preview_launch` -- the launch's refusal block (`_refuse`), derived
+  utilization, kv bytes and NCCL env, and the rendered recipe/argv for a
+  throwaway record that is never stored. Backs `/api/plan/command`.
+- `manager.set_lifecycle` and `stop(..., reason=)` -- the reason rides the
+  STOPPED `state_changed` event.
+- `store.py` encodes `engine_options`, `lifecycle` and `original_window`; a
+  record written before they existed decodes to the defaults.
+- `_nccl_env_for(..., override=)` merges `engine_options.env` over
+  `DERATE_NCCL_ENV`; the request wins.
+- `prefetch.py` / `prefetch_worker.py` -- weight download without a launch. It
+  runs on the coordinator into `huggingface_hub`'s `HF_HUB_CACHE`, because that
+  is where sparkrun downloads before distributing; a mismatch with
+  `modelcache.cache_dir()` refuses with a sentence naming `DERATE_HF_CACHE`.
+  One worker process per job in its own session: pause is SIGTERM to the group
+  (SIGKILL after 5 s), resume a respawn that continues `.incomplete` blobs,
+  cancel never deletes blobs. Progress is the cache folder's `blobs/` bytes.
+  Process-local, not persisted.
+
 ## `stub.py`
 
 `StubDeploymentManager` fakes the lifecycle with timers: `LAUNCHING` for

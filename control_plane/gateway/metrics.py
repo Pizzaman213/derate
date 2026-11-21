@@ -50,6 +50,8 @@ class MetricsHub:
         self._cache_task: asyncio.Task | None = None
         self._cache_prev: dict[str, metrics_scrape.PrefixCache] = {}
         self._cache_hit_pct: float | None = None
+        # The same window per engine, so a row can say its own hit rate.
+        self._prefix_hit: dict[str, float] = {}
         # Per deployment, and only for the ones actually speculating. A model
         # with no draft head never appears here at all -- see _spec_window.
         self._spec_prev: dict[str, metrics_scrape.SpecDecode] = {}
@@ -149,6 +151,7 @@ class MetricsHub:
         spec_frame: dict[str, dict[str, Any]] = {}
         seen_load: dict[str, metrics_scrape.EngineLoad] = {}
         load_frame: dict[str, dict[str, Any]] = {}
+        prefix_hit: dict[str, float] = {}
 
         for (deployment_id, _), body in zip(targets, bodies):
             if not isinstance(body, str):
@@ -168,6 +171,10 @@ class MetricsHub:
                 window = metrics_scrape.cache_delta(previous, reading)
                 queries += window.queries
                 hits += window.hits
+                if window.queries > 0:
+                    prefix_hit[deployment_id] = round(
+                        window.hits / window.queries * 100.0, 1
+                    )
 
             load = metrics_scrape.engine_load(body)
             seen_load[deployment_id] = load
@@ -202,6 +209,7 @@ class MetricsHub:
         self._spec = spec_frame
         self._load_prev = seen_load
         self._load = load_frame
+        self._prefix_hit = prefix_hit
         self._cache_hit_pct = (
             round(hits / queries * 100.0, 1) if queries > 0.0 else None
         )
@@ -419,6 +427,9 @@ class MetricsHub:
                         # arithmetic. Carrying both is the point -- until now
                         # nothing in the product could compare them.
                         "load": self._load.get(dep.deployment_id),
+                        # This engine's prefix-cache hits over the last scrape
+                        # window; null when it asked nothing in it.
+                        "prefix_cache_hit_pct": self._prefix_hit.get(dep.deployment_id),
                     }
                 )
         except Exception:
@@ -472,6 +483,7 @@ class MetricsHub:
                                 # has no KV cache we can see and no preemptions
                                 # we could count. Null, never absent.
                                 "load": None,
+                                "prefix_cache_hit_pct": None,
                             }
                         )
         except Exception:

@@ -35,6 +35,8 @@ dependencies = [
     # The ChatGPT sign-in's ID-token check, and its RS256/ES256 backend.
     "PyJWT[crypto]==2.15.1",
     "cryptography==50.0.0",
+    # Weight prefetch; requirements.txt says why it is named.
+    "huggingface-hub==1.8.0",
     # The cluster launcher; requirements.txt says why it is pinned.
     "sparkrun==0.2.40",
 ]

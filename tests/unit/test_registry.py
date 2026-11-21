@@ -302,6 +302,9 @@ def test_unknown_card_returns_zero_bandwidth_not_a_guess():
     "name,expected",
     [
         ("NVIDIA GeForce RTX 3090", 936.0),
+        # Not the plain 3090's figure: first match wins, and this one is
+        # the card on this estate (nvidia-smi max memory clock 10501 MHz).
+        ("NVIDIA GeForce RTX 3090 Ti", 1008.0),
         ("NVIDIA GeForce RTX 4090", 1008.0),
         ("NVIDIA RTX A6000", 768.0),
         ("NVIDIA H100 PCIe", 3350.0),
@@ -3280,6 +3283,31 @@ def test_a_member_that_moved_is_rerouted_by_its_own_reannouncement(tmp_path):
     assert registry.agent_url("spark-02") == "http://10.0.0.55:8081"
     assert registry.get_node("spark-02").profile.address == "10.0.0.55"
     assert registry.get_node("spark-02").healthy
+
+
+def test_a_member_marked_down_that_comes_back_by_re_joining_is_announced_recovered(tmp_path):
+    """Found live: a node reinstalled within a health round re-joined on its
+    own token, which set it healthy directly -- so `node_recovered` never
+    fired and the "node down" alert stayed up over a node answering 200s."""
+    client = FakeClient()
+    client.serve("http://10.0.0.12:8081", SPARK_02)
+    registry = make_registry(tmp_path, client=client, local=SPARK_01)
+    run(registry.add_node("10.0.0.12"))
+    seen: list[str] = []
+    registry.events.add_tap(lambda e: seen.append(e.get("type")))
+
+    client.kill("http://10.0.0.12:8081")
+    for _ in range(HEARTBEAT_MISSES_UNHEALTHY):
+        run(registry.health_round())
+    assert not registry.get_node("spark-02").healthy
+
+    client.revive("http://10.0.0.12:8081")
+    own = registry.agent_token("spark-02")
+    run(registry.handle_join(join_proof(registry, own, SPARK_02, "http://10.0.0.12:8081"), SPARK_02, "http://10.0.0.12:8081"))
+
+    assert registry.get_node("spark-02").healthy
+    assert seen.count("node_lost") == 1 and seen.count("node_recovered") == 1
+
 
 
 # ---------------------------------------------------------------------------

@@ -100,7 +100,7 @@ export function runningOrPrevious(
 /** The three row shapes now arrive from `GET /api/models` and are declared
  *  with the rest of the wire in `api/types.ts`. Re-exported here so that every
  *  existing `import { type RowProvider } from './rows'` keeps working —
- *  `ModelInspector`, `support.ts` and `rows.check.mjs` among them. */
+ *  `useModelSession`, `support.ts` and `rows.check.mjs` among them. */
 export type { RowDeployment, RowOffer, RowProvider } from '../../api/types'
 
 /** The band a row draws under inside its source.
@@ -114,6 +114,7 @@ export type Band =
   | 'running'
   | 'fits'
   | 'degraded'
+  | 'notnow'
   | 'unchecked'
   | 'wont'
   | 'elsewhere'
@@ -182,6 +183,10 @@ export interface ModelRow {
   // ── Hub facts that were on the type and rendered nowhere. ─────────────────
   downloads: number | null
   likes: number | null
+  /** The hub's trending score; null when the listing omitted it. */
+  trendingScore: number | null
+  /** ISO time the hub last saw a commit; null when unknown. */
+  lastModified: string | null
   gated: boolean | string | null
   tags: string[]
   pipelineTag: string | null
@@ -207,6 +212,17 @@ export interface ModelRow {
    *  rather than four hundred -- while the model stays findable by search and
    *  one click from being served. */
   unservedOnly: boolean
+
+  // ── The static side and the sizing of the row the verdict came from. ─────
+  /** The same model against the idle-hardware ceiling, when the report carried
+   *  a static side. Read only to tell "this hardware cannot hold it" from "it
+   *  is full right now" -- the live verdict above still governs the band. */
+  staticVerdict: Verdict | 'error' | null
+  /** Bytes per node the verdict's row was sized at (`CapacityRow.total`). */
+  needBytes: number | null
+  /** What that row was judged at. */
+  fitContext: number | null
+  fitSeqs: number | null
 }
 
 const EMPTY = {
@@ -228,6 +244,8 @@ const EMPTY = {
   offers: [] as RowOffer[],
   downloads: null,
   likes: null,
+  trendingScore: null,
+  lastModified: null,
   gated: null,
   tags: [] as string[],
   pipelineTag: null,
@@ -235,12 +253,19 @@ const EMPTY = {
   detail: '',
   remoteOnly: false,
   unservedOnly: false,
+  staticVerdict: null,
+  needBytes: null,
+  fitContext: null,
+  fitSeqs: null,
 } satisfies Omit<ModelRow, 'key' | 'model_id' | 'label' | 'where' | 'servedNames'>
 
 // ── Joins ────────────────────────────────────────────────────────────────────
 
 export interface CapacityIndex {
   row(modelId: string): CapacityRow | null
+  /** The same model's row on the report's static side, when it had one.
+   *  Later reports win, exactly as for `row`. */
+  staticRow(modelId: string): CapacityRow | null
   /** The basis of the first report that had one -- what the caption is about. */
   basis: 'live' | 'static' | null
   /** The basis of the report THIS model's verdict came from, so a row never
@@ -267,6 +292,7 @@ export function capacityIndex(
   ...reports: (CapacityReport | null | undefined)[]
 ): CapacityIndex {
   const byId = new Map<string, CapacityRow>()
+  const staticById = new Map<string, CapacityRow>()
   const basisById = new Map<string, 'live' | 'static'>()
   const unresolved = new Map<string, string>()
   let basis: 'live' | 'static' | null = null
@@ -282,6 +308,7 @@ export function capacityIndex(
       // A model that resolved in a later report is no longer unresolved.
       unresolved.delete(r.model_id)
     }
+    for (const r of report.static?.rows ?? []) staticById.set(r.model_id, r)
     for (const u of report.unresolved ?? []) {
       // ...and one that has a verdict is not overwritten by a stale refusal.
       if (!byId.has(u.model_id)) unresolved.set(u.model_id, u.reason)
@@ -290,6 +317,7 @@ export function capacityIndex(
 
   return {
     row: (id) => byId.get(id) ?? null,
+    staticRow: (id) => staticById.get(id) ?? null,
     basis,
     basisOf: (id) => basisById.get(id) ?? null,
     unresolved: (id) => unresolved.get(id) ?? null,
@@ -361,6 +389,7 @@ export function cacheIndex(report: StorageReport | null | undefined): CacheIndex
 
 function withFit(row: ModelRow, cap: CapacityIndex, cache: CacheIndex): ModelRow {
   const c = cap.row(row.model_id)
+  const s = cap.staticRow(row.model_id)
   const cachedOn = cache.nodes(row.model_id)
   return {
     ...row,
@@ -380,8 +409,12 @@ function withFit(row: ModelRow, cap: CapacityIndex, cache: CacheIndex): ModelRow
           nativeDtype: c.native_dtype,
           requantized: c.requantized,
           warnings: c.warnings,
+          staticVerdict: s?.verdict ?? null,
+          needBytes: c.total,
+          fitContext: c.context,
+          fitSeqs: c.max_seqs,
         }
-      : { reason: cap.unresolved(row.model_id) }),
+      : { reason: cap.unresolved(row.model_id), staticVerdict: s?.verdict ?? null }),
   }
 }
 
@@ -436,6 +469,8 @@ export function hubRows(hits: ModelSearchResponse | null | undefined): ModelRow[
       ...base(h.model_id, h.model_id, 'hub'),
       downloads: h.downloads ?? null,
       likes: h.likes ?? null,
+      trendingScore: h.trending_score ?? null,
+      lastModified: h.last_modified ?? null,
       gated: h.gated ?? null,
       tags: h.tags ?? [],
       pipelineTag: h.pipeline_tag ?? null,
@@ -640,6 +675,8 @@ export function withHubHits(
       where: prev.where.includes('hub') ? prev.where : [...prev.where, 'hub'],
       downloads: prev.downloads ?? h.downloads,
       likes: prev.likes ?? h.likes,
+      trendingScore: prev.trendingScore ?? h.trendingScore,
+      lastModified: prev.lastModified ?? h.lastModified,
       gated: prev.gated ?? h.gated,
       tags: prev.tags.length ? prev.tags : h.tags,
       pipelineTag: prev.pipelineTag ?? h.pipelineTag,
@@ -677,6 +714,8 @@ export function mergeRows(lists: ModelRow[][]): ModelRow[] {
         // "whichever contributor had them".
         downloads: prev.downloads ?? row.downloads,
         likes: prev.likes ?? row.likes,
+        trendingScore: prev.trendingScore ?? row.trendingScore,
+        lastModified: prev.lastModified ?? row.lastModified,
         gated: prev.gated ?? row.gated,
         tags: prev.tags.length ? prev.tags : row.tags,
         pipelineTag: prev.pipelineTag ?? row.pipelineTag,
@@ -738,6 +777,13 @@ export function band(row: ModelRow): Band {
   // after, so a stray answer from a batch cannot lift a price-sheet row up
   // among the models this cluster actually runs.
   if (row.unservedOnly) return 'unserved'
+  // Refused against what is free now, held by the hardware when idle: the
+  // remedy is to free a node, not to buy one, so it is not "Needs more memory".
+  if (
+    row.verdict === 'wont_fit' &&
+    (row.staticVerdict === 'fits' || row.staticVerdict === 'fits_degraded')
+  )
+    return 'notnow'
   switch (row.verdict) {
     case 'fits':
       return 'fits'
@@ -752,9 +798,8 @@ export function band(row: ModelRow): Band {
   }
 }
 
-/** Deployment state as a lamp signal. The rule `QuantLadder` already applies,
- *  exported so the list and the ladder cannot disagree about what `degraded`
- *  looks like. */
+/** Deployment state as a lamp signal. Exported so the list, the history tab
+ *  and the cluster screen cannot disagree about what `degraded` looks like. */
 export function deploymentSignal(state: DeploymentState): 'live' | 'warn' | 'fault' {
   if (state === 'ready') return 'live'
   if (TERMINAL.has(state)) return 'fault'
@@ -765,9 +810,10 @@ export const BAND_TITLE: Record<Band, string> = {
   running: 'Running here',
   fits: 'Fits here',
   degraded: 'Loads, but decode is slow',
-  unchecked: 'Not checked',
-  wont: 'Needs more memory',
-  elsewhere: 'Runs on a provider, not here',
+  notnow: 'Fits after freeing a node',
+  unchecked: 'On disk, not checked',
+  wont: 'Too big for this cluster',
+  elsewhere: 'On a provider',
   unserved: 'Not served',
 }
 
@@ -782,6 +828,7 @@ const BAND_ORDER: Band[] = [
   'running',
   'fits',
   'degraded',
+  'notnow',
   'unchecked',
   'wont',
   'elsewhere',
@@ -823,7 +870,7 @@ export function bandSubtitle(group: Group): string | null {
 
 /** The descriptive half of a catalogue row, in order, as plain strings.
  *
- *  Out here rather than inside `CatalogList.tsx` for the reason `ladder.ts`
+ *  Out here rather than inside `ModelRows.tsx` for the reason `ladder.ts`
  *  and `speculative.ts` are: `rows.check.mjs` bundles with esbuild's
  *  `platform: 'neutral'` and cannot import a module that pulls in React, so a
  *  decision left in the component is a decision nothing can check. This one
@@ -839,7 +886,7 @@ export function rowFacts(row: ModelRow): string[] {
   // asks whether anybody published the model at that scheme, so "requantized
   // to q2_k" can name a build that does not exist. The real offer is the
   // variant ladder on the model's own page, where every row is a repository
-  // that was sized; `CatalogList` links there. So this says what it is.
+  // that was sized; the model pane's quantization section is it. So this says what it is.
   if (row.requantized && row.dtype) parts.push(`would fit at ${row.dtype}`)
   if (row.quantHint) parts.push(row.quantHint)
   if (row.pipelineTag) parts.push(row.pipelineTag)
@@ -876,58 +923,60 @@ export function rowFacts(row: ModelRow): string[] {
   return parts
 }
 
-export type Sort = 'fit' | 'size' | 'downloads' | 'name'
+export type Sort = 'fit' | 'trending' | 'downloads' | 'fastest' | 'smallest' | 'updated'
 
 export const SORTS: { id: Sort; label: string }[] = [
-  { id: 'fit', label: 'fit' },
-  { id: 'size', label: 'size' },
-  { id: 'downloads', label: 'downloads' },
-  { id: 'name', label: 'name' },
+  { id: 'fit', label: 'Best fit' },
+  { id: 'trending', label: 'Trending' },
+  { id: 'downloads', label: 'Most downloads' },
+  { id: 'fastest', label: 'Fastest' },
+  { id: 'smallest', label: 'Smallest' },
+  { id: 'updated', label: 'Recently updated' },
 ]
+
+/** Nulls last; otherwise descending (or ascending when `asc`). */
+function byKey(a: number | null, b: number | null, asc = false): number {
+  if (a == null && b == null) return 0
+  if (a == null) return 1
+  if (b == null) return -1
+  return asc ? a - b : b - a
+}
+
+function time(iso: string | null): number | null {
+  if (!iso) return null
+  const t = Date.parse(iso)
+  return Number.isNaN(t) ? null : t
+}
 
 /** Sort within a band. Never across one -- the band is the answer, and a sort
  *  that reorders a "will not fit" above a "fits" would be a second opinion on
  *  the question the fit gate already settled. */
 function compare(a: ModelRow, b: ModelRow, sort: Sort): number {
+  let c = 0
   switch (sort) {
-    case 'size': {
-      // Largest first: at equal fit, more parameters is the better model, and
-      // it is the same tie-break the variant ladder uses.
-      //
-      // Parameters are compared against parameters ONLY. This used to fall
-      // back to `bytesOnDisk`, which put a 120e9-parameter count and a 195e9
-      // byte count in one comparison as though they were one quantity --
-      // invisible while each source was its own list, obvious the moment forty
-      // cached repos and four curated models share a band. On-disk size breaks
-      // ties only among rows that have no measured parameter count.
-      const av = a.total_params ?? -1
-      const bv = b.total_params ?? -1
-      if (av !== bv) return bv - av
-      if (av < 0) {
-        const ab = a.bytesOnDisk ?? -1
-        const bb = b.bytesOnDisk ?? -1
-        if (ab !== bb) return bb - ab
-      }
+    case 'fastest':
+      c = byKey(a.predicted_decode_tps, b.predicted_decode_tps)
       break
-    }
-    case 'downloads': {
-      const av = a.downloads ?? -1
-      const bv = b.downloads ?? -1
-      if (av !== bv) return bv - av
+    case 'smallest':
+      // Parameters against parameters only; never a byte count.
+      c = byKey(a.total_params, b.total_params, true)
       break
-    }
-    case 'fit': {
+    case 'trending':
+      c = byKey(a.trendingScore, b.trendingScore)
+      break
+    case 'updated':
+      c = byKey(time(a.lastModified), time(b.lastModified))
+      break
+    case 'downloads':
+      c = byKey(a.downloads, b.downloads)
+      break
+    case 'fit':
       // Already banded; inside a band, something on disk beats something that
       // has to be pulled first.
-      const av = a.cachedOn.length ? 0 : 1
-      const bv = b.cachedOn.length ? 0 : 1
-      if (av !== bv) return av - bv
-      break
-    }
-    case 'name':
+      c = (a.cachedOn.length ? 0 : 1) - (b.cachedOn.length ? 0 : 1)
       break
   }
-  return a.label.localeCompare(b.label)
+  return c || a.label.localeCompare(b.label)
 }
 
 export interface Group {
@@ -996,34 +1045,4 @@ export function matches(row: ModelRow, needle: string): boolean {
         o.served_name.toLowerCase().includes(n),
     )
   )
-}
-
-// ── Format ───────────────────────────────────────────────────────────────────
-
-/** Studio's format dropdown, in derate's terms.
- *
- *  Theirs offers GGUF and Checkpoint because llama.cpp makes both real. Here
- *  GGUF is the format nothing loads, so the filter earns its place for the
- *  opposite reason: it is how somebody looks at only the rows a runtime here
- *  could actually take, or only the ones it could not. */
-export type Format = 'all' | 'checkpoint' | 'gguf'
-
-export const FORMATS: { id: Format; label: string }[] = [
-  { id: 'all', label: 'all formats' },
-  { id: 'checkpoint', label: 'checkpoint' },
-  { id: 'gguf', label: 'GGUF' },
-]
-
-/** Whether a row is GGUF, from the only signals a listing carries: the tags
- *  the hub returned and the name the publisher chose. A guess, and it drives a
- *  filter rather than a verdict. */
-export function isGguf(row: ModelRow): boolean {
-  if (row.tags.some((t) => t.toLowerCase() === 'gguf')) return true
-  const hay = `${row.model_id} ${row.quantHint ?? ''} ${row.dtype ?? ''}`.toLowerCase()
-  return hay.includes('gguf')
-}
-
-export function matchesFormat(row: ModelRow, format: Format): boolean {
-  if (format === 'all') return true
-  return format === 'gguf' ? isGguf(row) : !isGguf(row)
 }

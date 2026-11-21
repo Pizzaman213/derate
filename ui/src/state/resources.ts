@@ -1,4 +1,5 @@
 import type { ProviderCatalogueModel } from '../api/types'
+import { useEffect, useState } from 'react'
 import { useKeyedResource, useResource } from './backend'
 
 // Poll intervals. Structure changes slowly; discovery is the one thing a person
@@ -196,3 +197,35 @@ export const useModelRegistry = () => useResource((b) => b.modelRegistry(), 1000
 // refires on every `revision` bump, so an open model would re-run its hub calls
 // after every launch, admit and settings change. They are user-driven and live
 // in the tab's own state, debounced.
+
+// ── Models tab, second pass ──────────────────────────────────────────────────
+
+// The runtime table is compiled into the server, plus whether each image is
+// on the coordinator. Fetched once per session, effectively.
+export const useRuntimes = () => useResource((b) => b.runtimes(), 3_600_000)
+
+// Profiles and pins are shared across browsers and admins, so they are polled
+// -- lazily: a second admin's save showing up within half a minute is enough,
+// and every mutation here calls `invalidate()` for the browser that made it.
+export const useProfiles = (modelId: string | null) =>
+  useKeyedResource(
+    modelId ?? '',
+    (b) => b.profiles(modelId ?? undefined).then((r) => r.profiles),
+    30000,
+  )
+export const usePins = () => useResource((b) => b.pins().then((r) => r.pins), 30000)
+
+/** Benchmark records for one model, newest first. Polled every 3 s while any
+ *  of them is launching or measuring -- a run moves through its states in
+ *  minutes and the screen should follow it -- and lazily otherwise. */
+export function useBenchmarks(modelId: string | null) {
+  const [fast, setFast] = useState(false)
+  const res = useKeyedResource(
+    modelId ?? '',
+    (b) => b.benchmarks(modelId ?? undefined).then((r) => r.benchmarks),
+    fast ? 3000 : 30000,
+  )
+  const running = (res.data ?? []).some((r) => r.state === 'launching' || r.state === 'measuring')
+  useEffect(() => setFast(running), [running])
+  return res
+}

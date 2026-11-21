@@ -5,7 +5,7 @@ import { remainingLabel } from '../format'
 /** The rail's "what is happening" rows, as data.
  *
  *  Split from `ActivitySection.tsx` the way `tabs/models/rows.ts` is split from
- *  `CatalogList.tsx`, and for the same reason: the rules below are the part
+ *  `ModelRows.tsx`, and for the same reason: the rules below are the part
  *  that can be wrong in a way types cannot catch, and `activity.check.mjs`
  *  pins every one of them.
  */

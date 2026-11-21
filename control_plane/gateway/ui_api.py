@@ -38,6 +38,7 @@ from .settings_store import (
     SettingsStore,
     resolve,
 )
+from .profiles_store import ProfileError, ProfileNotFound, ProfileStore
 
 log = logging.getLogger("gateway.ui_api")
 
@@ -52,10 +53,17 @@ def _accounts_for_spend(providers: Any) -> bool:
     return callable(getattr(providers, "spend_today", None))
 
 
-def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> APIRouter:
+def create_router(
+    ctx: GatewayContext,
+    store: SettingsStore | None = None,
+    profiles: ProfileStore | None = None,
+) -> APIRouter:
     router = APIRouter()
     settings = ctx.settings
     store = store or SettingsStore()
+    profiles = profiles or ctx.profiles or ProfileStore()
+    if ctx.profiles is None:
+        ctx.profiles = profiles
 
     def _env_values() -> dict[str, Any]:
         """What the environment asked for.
@@ -174,5 +182,88 @@ def create_router(ctx: GatewayContext, store: SettingsStore | None = None) -> AP
             after={k: after_view.get(k) for k in changed},
         )
         return JSONResponse(after_view)
+
+    # -- profiles and pins ---------------------------------------------------
+
+    def _bad(message: str) -> Response:
+        return errors.error_response(400, message, "invalid_request_error", "invalid_request")
+
+    def _not_found() -> Response:
+        return errors.error_response(
+            404, "No profile has that id.", "invalid_request_error", "profile_not_found"
+        )
+
+    async def _body(request: Request) -> tuple[Any, Response | None]:
+        try:
+            return await read_json_object(request), None
+        except BodyTooLarge:
+            return None, payload_too_large()
+        except Exception:
+            return None, errors.error_response(
+                400, "Body must be a JSON object.", "invalid_request_error", "invalid_json"
+            )
+
+    def _actor(request: Request) -> str:
+        session = request.scope.get("state", {}).get("session")
+        return session.username if session is not None else "-"
+
+    @router.get("/api/profiles")
+    async def list_profiles(model_id: str | None = None) -> JSONResponse:
+        return JSONResponse({"profiles": profiles.list(model_id)})
+
+    @router.post("/api/profiles")
+    async def create_profile(request: Request) -> Response:
+        body, err = await _body(request)
+        if err is not None:
+            return err
+        try:
+            profile = profiles.create(body, actor=_actor(request))
+        except ProfileError as exc:
+            return _bad(str(exc))
+        audit_request(request, AuditAction.PROFILE_CHANGED, "profile",
+                      profile["profile_id"], before=None, after=profile)
+        return JSONResponse(profile, status_code=201)
+
+    @router.patch("/api/profiles/{profile_id}")
+    async def patch_profile(profile_id: str, request: Request) -> Response:
+        body, err = await _body(request)
+        if err is not None:
+            return err
+        try:
+            before, after = profiles.patch(profile_id, body)
+        except ProfileNotFound:
+            return _not_found()
+        except ProfileError as exc:
+            return _bad(str(exc))
+        audit_request(request, AuditAction.PROFILE_CHANGED, "profile", profile_id,
+                      before=before, after=after)
+        return JSONResponse(after)
+
+    @router.delete("/api/profiles/{profile_id}")
+    async def delete_profile(profile_id: str, request: Request) -> Response:
+        try:
+            before = profiles.delete(profile_id)
+        except ProfileNotFound:
+            return _not_found()
+        audit_request(request, AuditAction.PROFILE_CHANGED, "profile", profile_id,
+                      before=before, after=None)
+        return Response(status_code=204)
+
+    @router.get("/api/pins")
+    async def get_pins() -> JSONResponse:
+        return JSONResponse({"pins": profiles.pins()})
+
+    @router.put("/api/pins")
+    async def put_pins(request: Request) -> Response:
+        body, err = await _body(request)
+        if err is not None:
+            return err
+        try:
+            before, after = profiles.set_pins(body.get("pins") if isinstance(body, dict) else None)
+        except ProfileError as exc:
+            return _bad(str(exc))
+        audit_request(request, AuditAction.PROFILE_CHANGED, "pins", "pins",
+                      before={"pins": before}, after={"pins": after})
+        return JSONResponse({"pins": after})
 
     return router

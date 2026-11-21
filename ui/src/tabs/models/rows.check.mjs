@@ -34,7 +34,7 @@ const R = await bundle('rows')
 const S = await bundle('support')
 const O = await bundle('owner')
 const B = await bundle('board')
-// The variant table's own derivations. They live outside `QuantLadder.tsx`
+// The variant table's own derivations. They live outside `QuantSection.tsx`
 // precisely so this file can reach them: what a verdict LOOKS like is a
 // judgement, and a green `tsc` says nothing about it.
 const L = await bundle('ladder')
@@ -368,9 +368,25 @@ for (const srt of R.SORTS.map(x => x.id)) {
   const flat = gs.flatMap(g => g.rows)
   check(flat.length === merged.length, `sort=${srt}: banding loses no row`)
   check(gs.every(g => g.title), `sort=${srt}: every band has a title`)
-  const order = ['running','fits','degraded','unchecked','wont','elsewhere']
+  const order = ['running','fits','degraded','notnow','unchecked','wont','elsewhere']
   const seq = gs.map(g => order.indexOf(g.band))
   check(seq.every((v, i) => i === 0 || v > seq[i - 1]), `sort=${srt}: no sort crosses a band`)
+}
+check(JSON.stringify(R.SORTS.map(s => s.label)) === JSON.stringify(['Best fit', 'Trending', 'Most downloads', 'Fastest', 'Smallest', 'Recently updated']),
+  'the six sorts, labelled')
+check(R.BAND_TITLE.unchecked === 'On disk, not checked' && R.BAND_TITLE.wont === 'Too big for this cluster' && R.BAND_TITLE.elsewhere === 'On a provider',
+  'band titles read as the mockup')
+{
+  // Nulls last within a band, whatever direction the sort runs.
+  const mk = (id, o) => ({ ...merged[0], key: id, model_id: id, label: id, deployments: [], unservedOnly: false, remoteOnly: false, verdict: 'fits', staticVerdict: null, ...o })
+  const a = mk('a', { trendingScore: 5, lastModified: '2026-01-01T00:00:00Z', total_params: 8e9, predicted_decode_tps: 10 })
+  const b = mk('b', { trendingScore: 50, lastModified: '2026-06-01T00:00:00Z', total_params: 1e9, predicted_decode_tps: 90 })
+  const c = mk('c', { trendingScore: null, lastModified: null, total_params: null, predicted_decode_tps: null })
+  const ids = (srt) => R.groupRows([c, a, b], srt).flatMap(g => g.rows).map(r => r.model_id).join('')
+  check(ids('trending') === 'bac', 'trending: highest first, unknown last')
+  check(ids('updated') === 'bac', 'recently updated: newest first, unknown last')
+  check(ids('smallest') === 'bac', 'smallest: fewest parameters first, unknown last')
+  check(ids('fastest') === 'bac', 'fastest: predicted tok/s first, unknown last')
 }
 
 // The gateway post-filters hub hits on model_id, which is what lets the tab
@@ -534,7 +550,7 @@ const board = B.buildBoard({
   chosen: null,
 })
 for (const r of board.rows) {
-  console.log(`  ${r.nodeId}: selectable=${r.selectable} alloc=${r.allocatable} ceil=${r.ceiling} cached=${r.cached} running=[${r.occupants}]`)
+  console.log(`  ${r.nodeId}: selectable=${r.selectable} alloc=${r.allocatable} ceil=${r.ceiling} cached=${r.cached} running=[${r.occupants.map((o) => o.served_name)}]`)
 }
 check(board.rows.length === clusterNodes.length, 'every machine in the cluster gets a row')
 
@@ -771,6 +787,23 @@ check(neighbour.rows.find((r) => r.nodeId === 'a').selectable === true,
   'a machine running a different model is still offered')
 check(neighbour.rows.find((r) => r.nodeId === 'a').occupants.length === 1,
   'and is still reported as occupied, which is a different question')
+{
+  const GB = 1024 ** 3
+  const sized = synth(three, [], null, {
+    deployments: [{ ...DEP('d-1', 'other/model', 'a'), fit: { breakdown: { total: 4 * GB } } }, DEP('d-2', 'p/q', 'a')],
+  })
+  const occ = sized.rows.find((r) => r.nodeId === 'a').occupants
+  check(occ.length === 2 && occ[0].served_name === 'd-1' && occ[0].model_id === 'other/model' && occ[0].bytes === 4 * GB,
+    'an occupant carries its served name, repository and the per-node bytes its verdict sized')
+  check(occ[1].bytes === null, 'and an occupant with no verdict carries null bytes, not a guess')
+  const segs = B.usedSegments({ occupants: occ }, 10 * GB)
+  check(segs.length === 2 && segs[0].title === 'd-1' && segs[0].bytes === 4 * GB,
+    'the bar draws one named segment per occupant with known bytes')
+  check(segs[1].other && segs[1].title === 'other use on this node' && segs[1].bytes === 6 * GB,
+    'and the rest of the reading as "other use on this node"')
+  check(B.usedSegments({ occupants: occ }, 4.2 * GB).length === 1, 'a remainder under half a GiB is not drawn')
+  check(B.usedSegments({ occupants: occ }, 2 * GB)[0].bytes === 2 * GB, 'segments never exceed the measured use')
+}
 
 // History occupies no GPU. `/api/deployments` lists stopped and failed records
 // too, and the manager relaunches straight over them.
@@ -903,7 +936,7 @@ const bandOrder = R.groupRows(
 check(bandOrder[bandOrder.length - 1] === 'unserved',
   'the not-served band sorts below every band that says something about this hardware')
 check(R.isCollapsibleBand('unserved') &&
-  ['running', 'fits', 'degraded', 'unchecked', 'wont', 'elsewhere'].every((b) => !R.isCollapsibleBand(b)),
+  ['running', 'fits', 'degraded', 'notnow', 'unchecked', 'wont', 'elsewhere'].every((b) => !R.isCollapsibleBand(b)),
   'exactly one band hides itself, and it is the one with no local verdict in it')
 check(R.bandSubtitle({ title: 'Not served', band: 'unserved', rows: [soloRow] }) === 'from OpenRouter',
   'the band names who publishes them rather than counting them')

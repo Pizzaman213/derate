@@ -25,8 +25,9 @@ const SUBS: { id: Sub; label: string }[] = [
  *  what would still fit, and what is running right now with where its load lands.
  *
  *  Planning is not here. The bar that used to sit above these tabs, always
- *  visible, was a second copy of `tabs/models/ServePanel.tsx`: the same
- *  `POST /api/plan`, the same `Verdict` box. The copy on the model's own URL
+ *  visible, was a second copy of the model pane's plan (now
+ *  `tabs/models/useModelSession.ts`): the same `POST /api/plan`, the same
+ *  verdict box. The copy on the model's own URL
  *  is the better one, because it carries the question in the URL (`?ctx=`,
  *  `?seq=`, the degrees) and this one held it in component state, so a plan
  *  asked here could not be linked to. One plan surface, on the screen that

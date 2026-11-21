@@ -9,7 +9,7 @@ import { useBackend } from '../../state/backend'
 import { Verbatim } from '../../components/Verbatim'
 import { relativeTime } from '../../format'
 import type { SpecRef } from '../../state/routes'
-import { Select, type SelectOption } from '../../components/Select'
+import type { SelectOption } from '../../components/Select'
 import { ownerOf } from './owner'
 import { OwnerMark, useAvatars } from './OwnerMark'
 import {
@@ -341,28 +341,42 @@ function Advanced({
   if (value && !known && !choices.some((c) => c.value === value)) {
     choices.push({ value, label: `${value} — not offered by this model` })
   }
+  const chosenNote = options.find((o) => o.method === value)?.note ?? null
 
   return (
     <details style={{ marginTop: 'var(--space-8)' }}>
       <summary className="unit" style={{ cursor: 'pointer' }}>
         Change head
       </summary>
-      <div className="fld" style={{ maxWidth: 320, marginTop: 'var(--space-8)' }}>
-        <label htmlFor="sp-spec">Method</label>
-        <Select
-          id="sp-spec"
-          value={value}
-          options={choices}
-          onChange={(next) => {
-            // Both halves come from one place, and they are independent: a
-            // mode is not a request. See `methodChoice`, and the two times
-            // this control destroyed itself before it was.
-            const { spec, external: mode } = methodChoice(next, options)
-            setExternalMode(mode)
-            onChoose(spec)
-          }}
-        />
+      <div className="chips mdl-specchips" role="radiogroup" aria-label="Method" style={{ marginTop: 'var(--space-8)' }}>
+        {choices.map((c) => {
+          const option = options.find((o) => (o.launchable ? o.method : `${o.method}:blocked`) === c.value)
+          const blocked = option != null && !option.launchable
+          const n = option ? (scan.found?.heads ?? []).filter((h) => h.method === option.method).length : 0
+          return (
+            <button
+              key={c.value || 'off'}
+              type="button"
+              role="radio"
+              aria-checked={value === c.value || (blocked && value === option.method)}
+              aria-disabled={blocked || undefined}
+              title={blocked ? option.note : undefined}
+              onClick={() => {
+                // Both halves come from one place, and they are independent: a
+                // mode is not a request. See `methodChoice`, and the two times
+                // this control destroyed itself before it was.
+                const { spec, external: mode } = methodChoice(c.value, options)
+                setExternalMode(mode)
+                onChoose(spec)
+              }}
+            >
+              {c.label}
+              {n > 0 ? ` · ${n}` : ''}
+            </button>
+          )
+        })}
       </div>
+      {chosenNote ? <Verbatim text={chosenNote} size="unit" /> : null}
       {external ? (
         <HeadField
           value={chosen?.model ?? ''}

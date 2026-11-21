@@ -243,7 +243,7 @@ matches it against `served_name`, so a `deployment_id` there does not fail
 loudly -- it matches nothing, falls through to `defaultDep()`, and silently
 selects somebody else's deployment. That is worse than a 404, because the
 screen looks like it worked. `POST /api/deployments` returns a `DeploymentDTO`
-carrying both, and `ServePanel.launch()` navigates with `dep.served_name` for
+carrying both, and `useModelSession`'s `serve()` navigates with `dep.served_name` for
 exactly this reason.
 
 `state/routes.ts` is the scheme -- `parse` and `href`, pure, no React.

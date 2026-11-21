@@ -29,7 +29,8 @@ import logging
 from dataclasses import dataclass, field
 from functools import partial
 
-from control_plane.contracts import Deployment, Verdict
+from control_plane.contracts import Deployment, EngineOptions, Lifecycle, Verdict
+from control_plane.deploy.relaunch import launch_request_from
 from control_plane.contracts.auth import AuditAction
 
 from .deps import GatewayContext
@@ -77,8 +78,10 @@ async def _attempt_relaunch(
 ) -> tuple[str, Deployment | None, str | None]:
     """One restart attempt. Mirrors internal_api.py's create_deployment route
     (resolve -> plan -> fit -> shard check -> launch) against a payload
-    reconstructed from the crashed record, minus everything that route asks a
-    human for: no dtype override, no forced node/degree placement (so the
+    reconstructed from the crashed record by `deploy/relaunch.py` -- every
+    launch option the operator chose (kv width, dtype, speculative, engine
+    options) survives the crash -- minus what only a human may re-grant: no
+    forced node/degree placement (so the
     planner re-picks from currently-healthy nodes rather than the possibly-dead
     one that caused the crash), no live-memory or mixed-hardware override --
     if the fresh fit needs one of those, this attempt fails and the budget
@@ -89,12 +92,13 @@ async def _attempt_relaunch(
     "launched", "conflict" (someone already relaunched it -- not a failure),
     "wont_fit", "runtime_unsupported", "sharding_unsupported", or "error".
     """
-    payload = {
-        "model_id": deployment.shape.model_id,
-        "context": deployment.context_length,
-        "concurrency": deployment.max_concurrent_seqs,
-        "runtime": deployment.runtime,
-    }
+    # Everything the operator chose rides along -- kv width, forced dtype,
+    # speculative, engine options... -- through the one builder the UI's
+    # "roll back" uses too. Placement is the exception, for the reason above:
+    # the planner re-picks from the nodes that are healthy now.
+    payload = launch_request_from(deployment)
+    payload.pop("node_ids", None)
+    payload.pop("parallelism", None)
     try:
         out = await _plan_and_fit(ctx, payload)
     except Exception as exc:
@@ -140,11 +144,9 @@ async def _attempt_relaunch(
     gating_fit = live if live is not None else fit
 
     try:
-        # No served_name kwarg: DeploymentPort does not guarantee one (only
-        # modality/extra_args/custom_command are part of the contract), and
-        # it is redundant here anyway -- served_name is never
-        # operator-supplied, only ever default_served_name(shape), so
-        # passing the same shape through re-derives the identical name.
+        # The served name the crashed copy answered to, so a custom name
+        # (a second copy of one model) survives the crash rather than being
+        # re-derived from the model id.
         new_deployment = await asyncio.to_thread(
             partial(
                 ctx.deps.deployments.launch,
@@ -155,12 +157,27 @@ async def _attempt_relaunch(
                 out.context_length,
                 out.concurrency,
                 modality=out.modality,
+                served_name=deployment.served_name,
                 extra_args=deployment.extra_args,
                 custom_command=deployment.custom_command,
                 # The sha the human approved, not whatever the re-resolve
                 # found on `main` just now (M7).
                 revision=deployment.revision or out.revision,
                 speculative_tokens=getattr(deployment, "speculative_tokens", 0),
+                # Spread, never sent as defaults, so a port that predates a
+                # field keeps working for every launch that never used it.
+                **({"speculative": out.speculative} if out.speculative else {}),
+                **({"kv_dtype": deployment.kv_dtype} if deployment.kv_dtype else {}),
+                **({"quantization": out.quantization} if out.quantization else {}),
+                **({"enforce_eager": True} if deployment.enforce_eager else {}),
+                **({"cudagraph_capture_sizes": deployment.cudagraph_capture_sizes}
+                   if deployment.cudagraph_capture_sizes else {}),
+                **({"trust_remote_code": True} if deployment.trust_remote_code else {}),
+                **({"engine_options": out.engine_options,
+                    "original_window": deployment.original_window}
+                   if out.engine_options != EngineOptions() else {}),
+                **({"lifecycle": deployment.lifecycle}
+                   if deployment.lifecycle != Lifecycle() else {}),
             )
         )
     except Exception as exc:
@@ -227,6 +244,9 @@ class RestartCoordinator:
         if to != "failed":
             return
         if event.get("reason") == OPERATOR_STOP_REASON:
+            return
+        bench = getattr(self._ctx, "bench", None)
+        if bench is not None and bench.owns(served_name):
             return
         if not self._ctx.settings.auto_restart_crashed_deployments:
             return

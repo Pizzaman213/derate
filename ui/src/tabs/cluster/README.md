@@ -117,7 +117,7 @@ lowest `node_id` only.
   policy changed, then `route.clear` for removed names and for a policy handed
   back to `auto` with no limit. It never emits launches or stops.
 - `launches(doc, plans, snapshot?)` — one `LaunchRequest` per draft model,
-  built as `ServePanel` builds one, plus `node_ids` and `speculative_tokens`;
+  built as `tabs/models/useModelSession.ts` builds one, plus `node_ids` and `speculative_tokens`;
   given the snapshot, then one per pending relaunch (`relaunchesOf`). `stops(doc)`
   — removals, then relaunches. `flagGroups` reads `--flag value` as one flag.
 - `removeServedName(doc, snapshot, name)` and `removalSentence` — the whole

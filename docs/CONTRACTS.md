@@ -19,7 +19,7 @@ Every value that crosses the wire as a string.
 
 | Type | Values | Defined in |
 |---|---|---|
-| `AuditAction` | `login`, `login_failed`, `logout`, `password_changed`, `admin_added`, `admin_removed`, `setup_admin_created`, `org_created`, `org_updated`, `org_deleted`, `key_created`, `key_updated`, `key_disabled`, `key_enabled`, `key_rotated`, `key_deleted`, `limit_changed`, `limit_raised`, `cycle_reset`, `pricing_changed`, `api_write`, `shell_opened`, `shell_closed`, `provider_created`, `provider_updated`, `provider_deleted`, `settings_changed`, `enrollment_minted`, `enrollment_revoked`, `deployment_launched`, `deployment_stopped`, `node_removed`, `node_admitted`, `node_process_killed`, `routing_changed`, `storage_deleted`, `sessions_revoked`, `node_joined`, `provider_signed_in`, `login_locked`, `key_refused`, `session_refused`, `setup_refused`, `join_rejected`, `cross_origin_refused`, `session_ip_changed`, `audit_chain_broken`, `agent_refused`, `cluster_token_rotated`, `node_runtime_model_changed` | `control_plane.contracts.auth` |
+| `AuditAction` | `login`, `login_failed`, `logout`, `password_changed`, `admin_added`, `admin_removed`, `setup_admin_created`, `org_created`, `org_updated`, `org_deleted`, `key_created`, `key_updated`, `key_disabled`, `key_enabled`, `key_rotated`, `key_deleted`, `limit_changed`, `limit_raised`, `cycle_reset`, `pricing_changed`, `api_write`, `shell_opened`, `shell_closed`, `provider_created`, `provider_updated`, `provider_deleted`, `settings_changed`, `enrollment_minted`, `enrollment_revoked`, `deployment_launched`, `deployment_stopped`, `node_removed`, `node_admitted`, `node_process_killed`, `routing_changed`, `storage_deleted`, `sessions_revoked`, `node_joined`, `provider_signed_in`, `profile_changed`, `download_changed`, `benchmark_changed`, `login_locked`, `key_refused`, `session_refused`, `setup_refused`, `join_rejected`, `cross_origin_refused`, `session_ip_changed`, `audit_chain_broken`, `agent_refused`, `cluster_token_rotated`, `node_runtime_model_changed` | `control_plane.contracts.auth` |
 | `AuthErrorCode` | `missing_api_key`, `invalid_api_key`, `api_key_disabled`, `api_key_expired`, `session_required`, `invalid_credentials`, `login_locked`, `setup_closed`, `auth_unavailable`, `limit_exceeded`, `max_output_tokens_exceeded`, `max_prompt_tokens_exceeded`, `limit_exceeds_org`, `allowlist_exceeds_org`, `model_not_allowed`, `setup_local_only` | `control_plane.contracts.auth` |
 | `ContextBucket` | `0-8k`, `8-32k`, `32-128k`, `128k+` | `control_plane.contracts.telemetry` |
 | `CostBasis` | `metered`, `estimated`, `unpriced` | `control_plane.contracts.telemetry` |
@@ -144,6 +144,27 @@ Every value that crosses the wire as a string.
 | `speculative_tokens` | `int` | yes |
 | `trust_remote_code` | `bool` | yes |
 | `image_id` | `str` | yes |
+| `engine_options` | `EngineOptions` | yes |
+| `lifecycle` | `Lifecycle` | yes |
+| `original_window` | `int | None` | yes |
+
+### `EngineOptions`
+
+`control_plane.contracts.deployment`
+
+| Field | Type | Optional |
+|---|---|---|
+| `reasoning_parser` | `str | None` | yes |
+| `tool_call_parser` | `str | None` | yes |
+| `prefix_caching` | `bool | None` | yes |
+| `max_num_batched_tokens` | `int | None` | yes |
+| `async_scheduling` | `bool` | yes |
+| `limit_mm_per_prompt` | `tuple[tuple[str, int], ...]` | yes |
+| `mm_processor_cache_gb` | `float | None` | yes |
+| `language_model_only` | `bool` | yes |
+| `rope_factor` | `float | None` | yes |
+| `generation_overrides` | `tuple[tuple[str, float], ...]` | yes |
+| `env` | `tuple[tuple[str, str], ...]` | yes |
 
 ### `FitRequest`
 
@@ -159,6 +180,8 @@ Every value that crosses the wire as a string.
 | `weight_bytes` | `int | None` | yes |
 | `native_window` | `int | None` | yes |
 | `speculative` | `SpeculativeSpec | None` | yes |
+| `chunk_tokens` | `int | None` | yes |
+| `extra_replicated_bytes` | `int` | yes |
 
 ### `FitResult`
 
@@ -192,6 +215,16 @@ Every value that crosses the wire as a string.
 | `command` | `str | None` | no |
 | `user` | `str | None` | no |
 | `gpu_memory` | `int` | no |
+
+### `Lifecycle`
+
+`control_plane.contracts.deployment`
+
+| Field | Type | Optional |
+|---|---|---|
+| `idle_unload_s` | `int | None` | yes |
+| `priority` | `str` | yes |
+| `start_at_boot` | `bool` | yes |
 
 ### `LimitDecision`
 
@@ -320,6 +353,7 @@ Every value that crosses the wire as a string.
 | `memory_bandwidth_gbps` | `float` | no |
 | `compute_capability` | `str` | no |
 | `driver_version` | `str` | no |
+| `arch` | `str` | yes |
 
 ### `NodeState`
 
@@ -657,7 +691,7 @@ the canonical value.
 
 ## HTTP surface
 
-### Coordinator gateway (136 routes)
+### Coordinator gateway (156 routes)
 
 | Method | Path |
 |---|---|
@@ -676,6 +710,10 @@ the canonical value.
 | DELETE | `/api/auth/sessions` |
 | GET | `/api/auth/sessions` |
 | GET | `/api/auth/state` |
+| GET | `/api/benchmarks` |
+| POST | `/api/benchmarks` |
+| DELETE | `/api/benchmarks/{bench_id}` |
+| GET | `/api/benchmarks/{bench_id}` |
 | GET | `/api/capacity` |
 | GET | `/api/catalog` |
 | POST | `/api/chat/completions` |
@@ -685,12 +723,18 @@ the canonical value.
 | GET | `/api/chat/voices` |
 | GET | `/api/cluster` |
 | POST | `/api/cluster/token/rotate` |
+| GET | `/api/compute` |
+| POST | `/api/compute/measure` |
 | GET | `/api/deployments` |
 | POST | `/api/deployments` |
 | DELETE | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}` |
 | PATCH | `/api/deployments/{deployment_id}` |
 | GET | `/api/deployments/{deployment_id}/logs` |
+| POST | `/api/downloads` |
+| DELETE | `/api/downloads/{download_id}` |
+| POST | `/api/downloads/{download_id}/pause` |
+| POST | `/api/downloads/{download_id}/resume` |
 | GET | `/api/enroll` |
 | POST | `/api/enroll` |
 | DELETE | `/api/enroll/{token_id}` |
@@ -744,11 +788,20 @@ the canonical value.
 | PATCH | `/api/orgs/{org_id}` |
 | POST | `/api/orgs/{org_id}/keys/disable` |
 | GET | `/api/orgs/{org_id}/limits` |
+| GET | `/api/pins` |
+| PUT | `/api/pins` |
 | POST | `/api/plan` |
+| POST | `/api/plan/candidates` |
+| POST | `/api/plan/command` |
+| POST | `/api/plan/concurrency` |
 | GET | `/api/pricing` |
 | DELETE | `/api/pricing/{model:path}` |
 | GET | `/api/pricing/{model:path}` |
 | PUT | `/api/pricing/{model:path}` |
+| GET | `/api/profiles` |
+| POST | `/api/profiles` |
+| DELETE | `/api/profiles/{profile_id}` |
+| PATCH | `/api/profiles/{profile_id}` |
 | GET | `/api/providers` |
 | POST | `/api/providers` |
 | GET | `/api/providers/kinds` |
@@ -767,6 +820,7 @@ the canonical value.
 | GET | `/api/routing` |
 | DELETE | `/api/routing/{served_name}` |
 | PUT | `/api/routing/{served_name}` |
+| GET | `/api/runtimes` |
 | GET | `/api/settings` |
 | PATCH | `/api/settings` |
 | GET | `/api/setup` |
@@ -906,3 +960,4 @@ default. A blank default means absence is itself the answer.
 | `DERATE_TTS_VOICE_DIR` |  | `control_plane/runtimes/tts.py` — read inside the model container, not on the node |
 | `DERATE_UI_DIR` |  | `control_plane/gateway/settings.py` — the built UI to serve; absent means the API answers and no screen does |
 | `DERATE_VLLM_IMAGE` |  | `control_plane/deploy/flags.py` |
+| `DERATE_VLLM_IMAGE_AMD64` |  | `control_plane/deploy/flags.py` — the vllm image for an x86 (amd64) machine; DERATE_VLLM_IMAGE is the arm64 one the DGX Sparks run |

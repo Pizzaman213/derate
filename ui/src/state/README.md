@@ -122,7 +122,7 @@ holds is a *selection*, toggled by clicking around, and this is an argument to a
 request. They share a mechanism and nothing else.
 
 The `nodeIds` array is rebuilt from a joined key so its identity is stable
-across a poll that did not change the URL. `ServePanel`'s debounced plan effect
+across a poll that did not change the URL. `useModelSession`'s debounced plan effect
 has both `nodeIds` and `degrees` in its dependency array; a new array every
 render would refire it forever.
 
@@ -372,7 +372,7 @@ disagree.
 One launch's custom command, remembered in `localStorage` under
 `derate.models.customServes`, so a quantization flag or a memory knob can be
 replayed onto a model without retyping it. `recordCustomServe` is called once,
-from `ServePanel`, and only after `backend.launch` has resolved -- a launch the
+from `useModelSession`'s `serve()`, and only after `backend.launch` has resolved -- a launch the
 backend rejected taught nothing worth replaying.
 
 Client-side only, and safe to be: picking an entry seeds the Serve field, so the

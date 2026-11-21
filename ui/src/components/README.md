@@ -130,17 +130,20 @@ The fill clamps with `Math.max(0, Math.min(1, value))`, and the bar is
 
 `OverrideGate({ reason, sentence, checked, onChange, onLaunch, launching,
 launchLabel = 'Serve anyway' })`. Two surfaces reach a refusal from opposite
-directions. `tabs/models/ServePanel.tsx` learns about it before anything is sent:
-it builds a `gates` list from `serve.overrides`, falling back to one gate
-synthesised from `serve.override_required` for a gateway that predates the list,
-and hands the list to `tabs/models/Verdict.tsx` — which is the module that
-imports this component. ServePanel itself never does.
-`tabs/models/QuantLadder.tsx` learns about it from a 409 after trying, and there
-are two of those: `live_memory_insufficient` reopens on `allow_over_live_memory`,
-`pull_over_memory` on `allow_over_memory`. Matching only the first left a real
-pull refusal rendering as a bare red line with the way past it unreachable. So
-this component takes no verdict and no plan — only the two strings and the
-callbacks — and each caller builds the sentence from what it actually knows.
+directions. `tabs/models/useModelSession.ts` learns about it before anything is
+sent: `gatesOf` (`tabs/models/gates.ts`) builds a `gates` list from
+`serve.overrides`, falling back to one gate synthesised from
+`serve.override_required` for a gateway that predates the list, and
+`tabs/models/VerdictBox.tsx` — the module that imports this component — draws
+them. The same session also learns about a refusal from a 409 after trying, and
+there are two of those: `live_memory_insufficient` reopens on
+`allow_over_live_memory`, `pull_over_memory` on `allow_over_memory`
+(`gates.ts::refusalCode`). Matching only the first left a real pull refusal
+rendering as a bare red line with the way past it unreachable; a mapped 409 now
+joins the same `gates` list. `tabs/cluster/blocks/ModelBlock.tsx` is the second
+importer. So this component takes no verdict and no plan — only the two strings
+and the callbacks — and each caller builds the sentence from what it actually
+knows.
 
 **The checkbox label is the claim, not "I understand".** A box whose text does
 not name the measurement it is waiving can be ticked without reading it, which
@@ -149,16 +152,14 @@ is the failure the gate exists to prevent. `reason` renders in `--fault` with
 drop them.
 
 `onLaunch` is optional because one launch can need several permissions.
-`Verdict.tsx` maps over its `gates` array rendering one claim and one checkbox
-each and passes no `onLaunch`, so no gate draws a button. The button is not a
-footer under the stack — it is the sibling branch. `canServe` is
-`gates.every((g) => granted[g.param] === true)`, and the moment the last box is
-ticked the stack is replaced by one button labelled `Serve anyway`: one launch,
+`VerdictBox.tsx` maps over its `gates` array rendering one claim and one checkbox
+each and passes no `onLaunch`, so no gate draws a button; the box's own primary
+button appears once `canServe` (`gates.ts::canServeWith`) is true — one launch,
 one button, however many permissions it took. While boxes are outstanding and
 there is more than one, a `<n> of <m> agreed` line sits under them, because
-otherwise ticking the first box appears to do nothing. Where the gate does own
-the button — `QuantLadder.tsx` is the caller that passes `onLaunch` — it renders
-only once `checked`, so the override is always a second, deliberate act.
+otherwise ticking the first box appears to do nothing. Where a caller does hand
+the gate the button through `onLaunch`, it renders only once `checked`, so the
+override is always a second, deliberate act.
 
 ## `CacheTable.tsx`
 
@@ -174,8 +175,9 @@ is a ranking of what is worth deleting, and against a 894 GB total every bar but
 the first would be invisible.
 
 The read/write split is carried by optional props rather than a flag.
-`tabs/models/InstalledModelsCard.tsx` passes `node` alone and the actions column
-is not rendered at all — the read-only case has no delete button to disable.
+No caller passes `node` alone any more (the Models tab's read-only installed
+card was replaced by its "On this cluster" view); the read-only case still
+renders no actions column rather than a disabled delete.
 `tabs/storage/ModelCacheCard.tsx` passes all four. `inUse` is
 `servedFolders?.has(m.folder) ?? false`, and a repo that is serving shows the
 word `serving` in `--live` instead of a greyed button: marked, not merely
@@ -223,9 +225,9 @@ full width, `--ink-muted`, with a `+`/`–` glyph marked `aria-hidden` — and s
 a real `<button>` carrying `aria-expanded`, so it is focusable and announced
 without inventing a keyboard contract. `open` and `onToggle` are the caller's
 state, never internal, so a screen decides what starts expanded and a URL could
-drive it. Three modules import it: `sidebar/PlanSection.tsx`, which uses it for
-the plan's reason — the most important expansion in the product —
-`tabs/models/QuantLadder.tsx` and `tabs/models/ServePanel.tsx`.
+drive it. `sidebar/PlanSection.tsx` uses it for the plan's reason — the most
+important expansion in the product — and `tabs/models/AdvancedTab.tsx` for its
+Engine, Speed, Memory, Context, Parallelism, API and Custom flags groups.
 
 `Section` has no importer today. The five sidebar sections each write their own
 `<section>` and `<h2>`.
@@ -335,31 +337,23 @@ Every consumer is a screen module, and it imports by path — there is no
 |---|---|---|
 | `Verbatim` | 22 | every surface that renders a server sentence |
 | `Lamp` | 16 | roster, routing, activity, model cards, the node page |
-| `Select` | 8 | appearance, serve panel, models toolbar (x2), voice fields (x2), provider kind, pull provider, backend picker, routing policy |
-| `Readout` | 8 | dashboard aggregates and strip, roster, node board, filesystems, the verdict, the node inspector |
-| `Bars` | 7 | the verdict, the node board, the roster, activity, two storage cards, the deployment inspector |
-| `Panel` | 3 | plan section, quantization ladder, serve panel — `Disclosure` only |
-| `OverrideGate` | 2 | `tabs/models/Verdict.tsx`, `tabs/models/QuantLadder.tsx` |
-| `CacheTable` | 2 | `tabs/models/InstalledModelsCard.tsx`, `tabs/storage/ModelCacheCard.tsx` |
+| `Select` | 9 | appearance, models toolbar, advanced tab, node bars, voice fields, providers card, pull provider, speculative field, routing policy |
+| `Readout` | 7 | dashboard aggregates and strip, roster, filesystems, chat stats, the node inspector |
+| `Bars` | 8 | the roster, activity, two storage cards, the deployment inspector, containers, key detail, spend overview |
+| `Panel` | 5 | plan section, models advanced tab, chat transcript, key create, providers card |
+| `OverrideGate` | 2 | `tabs/models/VerdictBox.tsx`, `tabs/cluster/blocks/ModelBlock.tsx` |
+| `CacheTable` | 1 | `tabs/storage/ModelCacheCard.tsx` |
 | `Combobox` | 2 | `tabs/settings/KeyField.tsx`, `tabs/settings/ProviderBackupPanel.tsx` (x2) |
 | `Copyable` | 1 | `tabs/settings/AddNodeCard.tsx` |
 | `Popover` | 0 | — |
 
 The call pattern that matters is the one where the two lines come from two
-different verdicts, in `tabs/models/Verdict.tsx`:
-
-```tsx
-<Verbatim text={(live ?? fit!).reason} size="label" />
-<SegmentBar
-  segments={segments}
-  usable={(live ?? fit)?.usable_per_node ?? null}
-  ceiling={live ? fit?.usable_per_node ?? null : null}
-/>
-```
-
-The live allocatable figure is the line the verdict used; the static ceiling
-sits behind it, and passes `null` when there was no live reading at all, so it
-is never drawn twice.
+different verdicts. It used to be one `SegmentBar` in the Models tab's old
+verdict card; today `tabs/models/VerdictBox.tsx` keeps the two apart in its
+"Why" disclosure — `Against idle hardware` with the static `fit.reason` and
+`Against what is free now` with `fit_live.reason`, each through `Verbatim` —
+and draws the per-node figure from `fit_live ?? fit`, so neither budget is
+drawn twice and neither is hidden.
 
 `CacheTable.tsx` is the only file here that composes its neighbours — it takes
 `ProportionBar` and `Verbatim` — which is why a change to either shows up on

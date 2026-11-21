@@ -54,6 +54,11 @@ class NodeProfile:
     memory_bandwidth_gbps: float
     compute_capability: str
     driver_version: str
+    #: The machine's CPU architecture in container-image terms: "amd64",
+    #: "arm64", or "" when the agent is a build from before it reported one.
+    #: An image is built for one, and a launch has to run the image for the
+    #: machine it lands on -- the DGX Spark images here are arm64-only.
+    arch: str = ""
 
     def usable_memory(self, guardrail: float = DEFAULT_GUARDRAIL) -> int:
         return int(self.addressable_memory * guardrail)

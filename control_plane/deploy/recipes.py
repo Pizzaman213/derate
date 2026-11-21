@@ -20,21 +20,32 @@ import json
 import os
 import re
 import unicodedata
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from control_plane.contracts import ModelShape, ParallelismPlan, SpeculativeSpec
+from control_plane.contracts import (
+    EngineOptions,
+    ModelShape,
+    ParallelismPlan,
+    SpeculativeSpec,
+)
 from control_plane.fsutil import harden_fd
 
 from .flags import (
     RuntimeSpec,
     cache_env_for,
+    engine_options_recipe,
+    engine_options_refusal,
+    engine_options_set_fields,
     llamacpp_model_spec,
     render_cudagraph_capture_sizes,
     render_kv_cache_dtype,
     render_quantization,
     render_speculative_config,
+    image_executor_config,
+    image_for_arch,
     runtime_spec,
 )
 
@@ -270,9 +281,10 @@ class RecipeSpec:
 
 
 def container_image(spec: RuntimeSpec, env: dict[str, str] | None = None) -> str:
-    """Container image for *spec*, overridable per-runtime by env var."""
-    env = os.environ if env is None else env
-    return env.get(spec.default_image_env) or spec.default_image
+    """Container image for *spec* when the machine's architecture is not
+    known, overridable per-runtime by env var. `flags.image_for_arch` is the
+    one rule; this is its "no arch" answer, which is always the default."""
+    return image_for_arch(spec, "", env) or spec.default_image
 
 
 def _serve_command(
@@ -290,6 +302,7 @@ def _serve_command(
     api_key: bool = False,
     trust_remote_code: bool = False,
     speculative_tokens: int = 0,
+    engine_options_fragment: str = "",
 ) -> str:
     """The command template, with conditional flags baked in.
 
@@ -350,6 +363,10 @@ def _serve_command(
             " \\\n    --speculative-config "
             "'{\"method\": \"mtp\", \"num_speculative_tokens\": %d}'" % speculative_tokens
         )
+    # Typed engine options (flags.engine_options_recipe): allowlisted names,
+    # numbers, and JSON placeholders whose values ride the defaults block.
+    if engine_options_fragment:
+        command += " \\\n    %s" % engine_options_fragment
     if extra_args:
         command += " \\\n    %s" % " ".join(extra_args)
     return _append_pins(
@@ -448,6 +465,8 @@ def synthesize(
     revision: str | None = None,
     speculative_tokens: int = 0,
     trust_remote_code: bool = False,
+    engine_options: EngineOptions = EngineOptions(),
+    original_window: int | None = None,
 ) -> RecipeSpec:
     """Build the recipe for one deployment. Pure: touches no filesystem."""
     # M-22: shape.model_id and served_name both flow from an API request
@@ -486,6 +505,11 @@ def synthesize(
             "enforce_eager and cudagraph_capture_sizes are mutually exclusive: "
             "enforce_eager disables CUDA graph capture entirely, leaving "
             "nothing for a trimmed capture list to apply to"
+        )
+    if custom_command and engine_options_set_fields(engine_options):
+        raise ValueError(
+            "engine options and a custom command can't be combined: the "
+            "custom command replaces every derived flag."
         )
 
     spec = runtime_spec(runtime)
@@ -581,6 +605,17 @@ def synthesize(
         defaults.append(("revision", json.dumps(revision)))
     if runtime_api_key and spec.api_key_arg:
         defaults.append(("api_key", json.dumps(runtime_api_key)))
+    engine_fragment = ""
+    if not custom_command:
+        refusal = engine_options_refusal(
+            dataclasses.replace(engine_options, env=()), runtime
+        )
+        if refusal is not None:
+            raise ValueError(refusal)
+        engine_fragment, engine_defaults = engine_options_recipe(
+            engine_options, original_window=original_window
+        )
+        defaults += engine_defaults
 
     lines = [
         RECIPE_HEADER,
@@ -667,10 +702,11 @@ def synthesize(
         "  privileged: false\n",
         "  cap_add: [IPC_LOCK]\n",
     ]
-    if spec.executor_config:
-        lines += [
-            "  %s: %s\n" % (k, json.dumps(v)) for k, v in spec.executor_config
-        ]
+    # The runtime's own entries, plus whatever the per-architecture image this
+    # launch runs needs (upstream vLLM's cleared ENTRYPOINT on an x86 box).
+    executor = image_executor_config(spec, img)
+    if executor:
+        lines += ["  %s: %s\n" % (k, json.dumps(v)) for k, v in executor]
 
     lines += ["\n", "command: |\n"]
     pins = {
@@ -692,6 +728,7 @@ def synthesize(
             enforce_eager=enforce_eager,
             cudagraph_capture_sizes=cudagraph_capture_sizes_rendered,
             speculative_tokens=speculative_tokens,
+            engine_options_fragment=engine_fragment,
             **pins,
         )
     )

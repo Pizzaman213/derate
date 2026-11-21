@@ -5911,12 +5911,17 @@ def test_sparkrun_inherits_only_allowlisted_environment(monkeypatch):
     }
     seen = {}
 
-    def fake_run(argv, **kw):
-        seen.update(kw["env"])
-        return subprocess.CompletedProcess(argv, 0, "sparkrun, version 0.2.40", "")
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, argv, **kw):
+            seen.update(kw["env"])
+
+        def communicate(self, timeout=None):
+            return "sparkrun, version 0.2.40", ""
 
     monkeypatch.setattr(os, "environ", dict(environ))
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
     monkeypatch.setattr(shutil, "which", lambda name: "/bin/sparkrun")
     SparkrunAdapter().version()
     assert "DERATE_TOKEN" not in seen and "DERATE_SECRET_OPENAI" not in seen

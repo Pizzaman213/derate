@@ -604,8 +604,8 @@ build.
 **The warnings are the product, exactly as the fit gate's refusals are.**
 `Resolution.warnings` is not diagnostics — it is the record of which numbers
 were read and which were inferred. They reach the screen as
-`result.resolver_warnings` and `ui/src/tabs/models/Verdict.tsx` draws them
-through `VerbatimList`, unmodified. The arbitration warning — "the hub counts
+`result.resolver_warnings` and `ui/src/tabs/models/VerdictBox.tsx` draws them
+through `Verbatim` (one per caveat), unmodified. The arbitration warning — "the hub counts
 NB parameters where the config describes NB; N GiB of shards at <dtype> back the
 config, which was used" — is the whole argument for a number somebody is about
 to launch against, and summarising it deletes the argument.

@@ -910,6 +910,10 @@ export interface PlanResponse {
   /** What this verdict was taken with, echoed for the same reason `context`
    *  and `concurrency` are. Null means one token per step. */
   speculative?: SpeculativeSpec | null
+  /** The window the verdict was clamped to -- stretched by `rope_factor` when
+   *  YaRN is on -- and the model's trained one. Absent on an older gateway. */
+  native_window?: number | null
+  original_window?: number | null
 }
 
 export interface LaunchRequest {
@@ -974,6 +978,17 @@ export interface LaunchRequest {
    *  to say so. Omit for the coordinator's configured default. Mutually
    *  exclusive with `custom_command`. */
   kv_dtype?: string
+  /** The name clients will pass as `model` at `/v1`. Omitted, the coordinator
+   *  picks one; sent blank, it is a 400 naming the field. */
+  served_name?: string
+  /** The weight scheme the verdict priced; the same value `PlanRequest.dtype`
+   *  carried. */
+  dtype?: string
+  /** Typed engine knobs. Sent only when non-empty; never beside
+   *  `custom_command`. */
+  engine_options?: EngineOptions
+  /** Idle unload, priority, start at boot. Never affects the fit. */
+  lifecycle?: Partial<Lifecycle>
 }
 
 export interface SpeculativeRequest {
@@ -1057,6 +1072,11 @@ export interface PlanRequest {
   /** Multi-token-prediction draft tokens (1-8). The fit then includes the
    *  checkpoint's MTP module; a checkpoint without one is refused. */
   speculative_tokens?: number
+  /** The same object `LaunchRequest.engine_options` carries; several of its
+   *  fields change sizing, so plan and launch must carry the same value. */
+  engine_options?: EngineOptions
+  /** Read by `/api/plan/command`, whose refusals are per runtime. */
+  runtime?: string
 }
 
 /** Which endpoint family a served model answers on. Mirrors
@@ -1130,6 +1150,9 @@ export interface DeploymentDTO {
    *  gateway that predates it, or `null`: read either as the model's own
    *  dtype, which is what every deployment launched before it got. */
   kv_dtype?: string | null
+  /** The weight scheme the gate priced AND the engine was told. Absent from a
+   *  gateway that predates it, or `null`: the checkpoint's own packing. */
+  quantization?: string | null
   /** Whether this deployment is offered on the API.
    *
    *  `false` takes it off `/v1/models`, out of routing, off the chat picker
@@ -1154,6 +1177,13 @@ export interface DeploymentDTO {
   /** The image reference launched and its local id ("" when unknown). */
   image?: string
   image_id?: string
+  /** The `POST /api/deployments` body that reproduces this deployment.
+   *  Absent on an older gateway. */
+  relaunch_request?: LaunchRequest
+  lifecycle?: Lifecycle
+  engine_options?: EngineOptions
+  /** The model's trained window when YaRN stretched it, else null. */
+  original_window?: number | null
 }
 
 // ── Routing: GET /api/routing, PUT /api/routing/{served_name} ────────────────
@@ -1616,6 +1646,24 @@ export interface MetricsDeploymentFrame {
   ttft_ms: number | null
   queue_depth: number | null
   speculative: SpeculativeCounters | null
+  /** The engine's own account of its memory and its rate, scraped from its
+   *  `/metrics` (`gateway/metrics.py::_load_window`). `decode_tps` is
+   *  MEASURED, unlike the fit gate's prediction; it and `generated_tokens`
+   *  and `preemptions` are null on the first sight of an engine, because one
+   *  read of a counter is a lifetime total, not a window. Null when the engine
+   *  could not be scraped; absent from a gateway that predates it. */
+  load?: {
+    kv_cache_usage: number | null
+    requests_running: number | null
+    requests_waiting: number | null
+    preemptions: number | null
+    decode_tps: number | null
+    generated_tokens: number | null
+  } | null
+  /** This deployment's own prefix-cache hit rate over the metrics window,
+   *  percent. Null with no queries in the window, and always null on a
+   *  remote target. */
+  prefix_cache_hit_pct?: number | null
 }
 
 /** The same counters for a model a PROVIDER serves, off the same registry and
@@ -2246,6 +2294,9 @@ export interface ModelDetail {
   from_cache: boolean
   resolved_at: number
   elapsed_ms: number
+  /** Hub statistics, or null when the hub could not be asked. Absent on an
+   *  older gateway. */
+  hub?: HubStats | null
 }
 
 /** One obtainable set of weights. `repo_id` is what a launch would use. */
@@ -2363,9 +2414,10 @@ export interface ModelHit {
   downloads?: number | null
   likes?: number | null
   pipeline_tag?: string | null
-  /** Unix seconds from the hub listing. On the wire since the search endpoint
-   *  shipped (`resolver.py` selects it); it was simply missing from this type. */
-  last_modified?: number | null
+  /** ISO-8601 as the hub sends it. */
+  last_modified?: string | null
+  /** The hub's own trending score; null when the listing omitted it. */
+  trending_score?: number | null
   gated?: boolean | string | null
   tags?: string[]
   /** Guessed from the name and offered as a guess. */
@@ -2800,7 +2852,8 @@ export interface ShellStatus {
  *  happened to refresh. */
 export interface DownloadActivity {
   pull_id: string
-  provider_id: string
+  /** null on a Hugging Face prefetch (`kind: 'hub'`). */
+  provider_id: string | null
   /** The provider's display name, already resolved server-side. */
   provider: string
   model: string
@@ -2814,6 +2867,17 @@ export interface DownloadActivity {
   status: string
   error: string | null
   done: boolean
+  /** `hub` is a coordinator-side weight prefetch, `provider` a pull onto a
+   *  provider. Absent on an older gateway: read it as `provider`. */
+  kind?: 'hub' | 'provider'
+  /** Hub rows only: the id the pause/resume/cancel routes take. */
+  download_id?: string
+  paused?: boolean
+  /** Hub rows only: bytes/s over the last few samples, and seconds left at
+   *  that rate. Null until two samples exist, while paused, or without a
+   *  total. Always null on a provider row. */
+  rate_bps?: number | null
+  eta_s?: number | null
 }
 
 /** A model that is starting but not yet serving.
@@ -3003,6 +3067,9 @@ export type AuditAction =
   | 'sessions_revoked'
   | 'node_joined'
   | 'provider_signed_in'
+  | 'profile_changed'
+  | 'download_changed'
+  | 'benchmark_changed'
   | 'login_locked'
   | 'key_refused'
   | 'session_refused'
@@ -3368,4 +3435,251 @@ export interface LocalPrice {
   output_usd_per_mtok: number | null
   set_by: string
   set_at: number
+}
+
+// ── Models tab, second pass ──────────────────────────────────────────────────
+
+/** Typed engine knobs on the wire. Every key optional; an absent key is the
+ *  engine's own default. The three maps are JSON objects here and tuples on
+ *  the server. Mirrors `contracts/deployment.py::EngineOptions`. */
+export interface EngineOptions {
+  reasoning_parser?: string | null
+  /** Rendering also adds `--enable-auto-tool-choice`. */
+  tool_call_parser?: string | null
+  /** null is the engine default, which is different from `false`. */
+  prefix_caching?: boolean | null
+  max_num_batched_tokens?: number | null
+  async_scheduling?: boolean
+  limit_mm_per_prompt?: Partial<Record<'image' | 'video' | 'audio', number>>
+  mm_processor_cache_gb?: number | null
+  language_model_only?: boolean
+  /** YaRN; above 1.0, at most 8.0. */
+  rope_factor?: number | null
+  generation_overrides?: Partial<Record<'temperature' | 'top_p' | 'top_k', number>>
+  /** NCCL variables only; names checked against `nccl_tunables`. */
+  env?: Record<string, string>
+}
+
+export type LifecyclePriority = 'low' | 'normal' | 'high' | 'pinned'
+
+/** Mirrors `contracts/deployment.py::Lifecycle`. Priority only orders the
+ *  UI's stop suggestions; the server does not enforce it. */
+export interface Lifecycle {
+  idle_unload_s: number | null
+  priority: LifecyclePriority
+  start_at_boot: boolean
+}
+
+/** `GET /api/runtimes`, one row per runtime in `flags.RUNTIMES`. */
+export interface RuntimeInfo {
+  name: string
+  display_name: string
+  memory_pool: 'gpu' | 'host'
+  formats: string[]
+  image: string
+  /** Whether the image is on the COORDINATOR, which is all it can see. */
+  image_present: boolean
+  supports: {
+    speculative: boolean
+    graph_capture: boolean
+    kv_dtype: boolean
+    quantization: boolean
+    expert_parallel: boolean
+    shards: boolean
+  }
+  kv_dtypes: string[]
+  /** Bytes per cached element for each of `kv_dtypes` (`fit/kv.py`). */
+  kv_dtype_bytes: Record<string, number>
+  engine_options: string[]
+  reasoning_parsers: string[]
+  tool_call_parsers: string[]
+  nccl_tunables: string[]
+  version: string | null
+}
+
+/** `POST /api/plan/command`. */
+export interface CommandPreview {
+  argv: string[]
+  recipe: string
+  gpu_memory_utilization: number | null
+  kv_cache_memory_bytes: number | null
+  nccl_env: Record<string, string>
+  notes: string[]
+}
+
+/** `POST /api/plan/concurrency`: the `/api/plan` body plus the curve's axes. */
+export interface ConcurrencyRequest extends PlanRequest {
+  /** 1..4 entries, each 512..native_window. */
+  contexts: number[]
+  /** 1..256, default 64. */
+  max_users?: number
+}
+
+export interface ConcurrencyPoint {
+  users: number
+  ceiling_tps_each: number
+  ceiling_tps_total: number
+  /** Past the KV wall: these users wait for a slot. */
+  queued: boolean
+  /** Seconds before the first token, as a FLOOR: every user sends a prompt of
+   *  `prompt_tokens` at once and only the weights' matmuls are counted, on
+   *  compute measured here. Null past the wall or with no compute record. */
+  ttft_floor_s: number | null
+}
+
+export interface ConcurrencySeries {
+  context: number
+  wall_users: number
+  /** The prompt length the first-token floor assumes: the series' context. */
+  prompt_tokens: number
+  points: ConcurrencyPoint[]
+}
+
+export interface ConcurrencyResponse {
+  series: ConcurrencySeries[]
+  bandwidth_gbps: number
+  basis: 'live' | 'static'
+  /** Render verbatim. */
+  caveat: string
+  /** The measured matmul rate the first-token floor used; null when this
+   *  plan's GPU has no record for this image. */
+  compute: { tflops: number; gpu_name: string; measured_at: number } | null
+  /** Render verbatim. */
+  ttft_caveat: string
+}
+
+/** `POST /api/compute/measure` and `GET /api/compute`. */
+export interface ComputeRecord {
+  gpu_name: string
+  image: string
+  dtype: string
+  tflops: number
+  node_id: string
+  measured_at: number
+}
+
+export interface PlanDegrees {
+  tensor_parallel: number
+  pipeline_parallel: number
+  expert_parallel: number
+  data_parallel: number
+}
+
+/** `POST /api/plan/candidates`: the best plan of each kind, each re-judged. */
+export interface PlanCandidate {
+  kind: string
+  degrees: PlanDegrees
+  node_ids: string[]
+  /** Null when this shape was refused; `error` then says why (verbatim). */
+  verdict: Verdict | null
+  per_node_bytes: number | null
+  reason: string | null
+  error: string | null
+}
+
+export interface CandidatesResponse {
+  candidates: PlanCandidate[]
+  recommended_kind: string
+}
+
+/** A finished benchmark's headline, copied onto every profile with the same
+ *  setup. */
+export interface ProfileResult {
+  bench_id: string
+  finished_at: number
+  spec_mean_acceptance: number | null
+  tps_each_1: number | null
+  ttft_ms_1: number | null
+}
+
+/** A saved launch setup, stored on the server and shared across admins. */
+export interface Profile {
+  profile_id: string
+  model_id: string
+  name: string
+  request: LaunchRequest
+  is_default: boolean
+  created_at: number
+  updated_at: number
+  created_by: string | null
+  /** `run` is written by the server on every operator launch. */
+  kind: 'saved' | 'run'
+  deployment_id: string | null
+  last_result: ProfileResult | null
+}
+
+export interface ProfileCreate {
+  model_id: string
+  name: string
+  request: LaunchRequest
+  is_default?: boolean
+}
+
+export interface ProfilePatch {
+  name?: string
+  request?: LaunchRequest
+  is_default?: boolean
+}
+
+/** `ModelDetail.hub`. */
+export interface HubStats {
+  downloads: number | null
+  likes: number | null
+  last_modified: string | null
+  license: string | null
+  gated: boolean | null
+  pipeline_tag: string | null
+}
+
+/** `POST /api/downloads` and its pause/resume replies. */
+export interface HubDownload {
+  download_id: string
+  repo_id: string
+  revision: string | null
+  patterns: string[]
+  total: number | null
+  completed: number
+  status: 'running' | 'paused' | 'done' | 'error'
+  error: string | null
+  started_at: number
+  finished_at: number | null
+}
+
+export type BenchWorkload = 'prose' | 'code_edit' | 'extraction'
+export type BenchState = 'launching' | 'measuring' | 'done' | 'failed' | 'cancelled'
+
+export interface BenchPoint {
+  users: number
+  ttft_ms_p50: number | null
+  tps_each_mean: number | null
+  tps_total: number | null
+  requests: number
+  errors: number
+}
+
+/** A benchmark run on a throwaway copy of a launch request. */
+export interface BenchRecord {
+  bench_id: string
+  model_id: string
+  request: LaunchRequest
+  served_name: string | null
+  runtime: string
+  node_ids: string[]
+  gpu_name: string | null
+  runtime_version: string | null
+  workload: BenchWorkload
+  users: number[]
+  state: BenchState
+  error: string | null
+  started_at: number
+  finished_at: number | null
+  points: BenchPoint[]
+  spec_mean_acceptance: number | null
+}
+
+export interface BenchRequest {
+  request: LaunchRequest
+  workload?: BenchWorkload
+  /** 1..4 unique values, each 1..64. Default [1, 4, 8, 16]. */
+  users?: number[]
 }

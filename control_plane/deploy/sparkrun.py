@@ -32,6 +32,7 @@ from control_plane.contracts import (
     ModelShape,
     ParallelismPlan,
     RegistryPort,
+    EngineOptions,
     SpeculativeSpec,
 )
 
@@ -391,6 +392,9 @@ class SparkrunAdapter:
         revision: str | None = None,
         speculative_tokens: int = 0,
         trust_remote_code: bool = False,
+        engine_options: EngineOptions = EngineOptions(),
+        original_window: int | None = None,
+        image: str | None = None,
     ) -> RecipeSpec:
         return synthesize(
             shape,
@@ -432,6 +436,12 @@ class SparkrunAdapter:
             revision=revision,
             speculative_tokens=speculative_tokens,
             trust_remote_code=trust_remote_code,
+            engine_options=engine_options,
+            original_window=original_window,
+            # The deployment's own image, picked for the architecture of the
+            # machines it lands on (manager._image_for). None is the runtime's
+            # default, which is what every launch ran before there was a choice.
+            image=image,
         )
 
     def render_command(
@@ -456,6 +466,8 @@ class SparkrunAdapter:
         nccl_env: Mapping[str, str] | None = None,
         speculative_tokens: int = 0,
         trust_remote_code: bool = False,
+        engine_options: EngineOptions = EngineOptions(),
+        original_window: int | None = None,
     ) -> list[str]:
         """The exact argv that will run. Pure: no subprocess, no filesystem.
 
@@ -477,6 +489,8 @@ class SparkrunAdapter:
             nccl_env=nccl_env,
             speculative_tokens=speculative_tokens,
             trust_remote_code=trust_remote_code,
+            engine_options=engine_options,
+            original_window=original_window,
         )
 
         values: dict[str, Any] = {
@@ -544,6 +558,9 @@ class SparkrunAdapter:
         revision: str | None = None,
         speculative_tokens: int = 0,
         trust_remote_code: bool = False,
+        engine_options: EngineOptions = EngineOptions(),
+        original_window: int | None = None,
+        image: str | None = None,
     ) -> LaunchResult:
         """Run the invocation and parse the handle back out.
 
@@ -575,6 +592,9 @@ class SparkrunAdapter:
             revision=revision,
             speculative_tokens=speculative_tokens,
             trust_remote_code=trust_remote_code,
+            engine_options=engine_options,
+            original_window=original_window,
+            image=image,
         )
         materialize(recipe)
         argv = self.render_command(

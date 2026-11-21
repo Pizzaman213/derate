@@ -282,7 +282,7 @@ onboarding/model-surface/cluster item; this file is the flat checklist.
       exist. That string now reads `would fit at q2_k` -- what it is, an
       arithmetic result. The real offer is the variant ladder on the model's
       own page, where every row is a repository that was SIZED (the item
-      below), and a refused row in `CatalogList` now carries a link to it.
+      below), and a refused row in the model list (`ModelRows`) now carries a link to it.
       Deliberately a link and not the ladder itself: enumerating it costs a
       hub search plus a resolve per candidate, which is the denial-of-service
       `MAX_CATALOG_MODELS` exists to prevent. It is announced rather than run.

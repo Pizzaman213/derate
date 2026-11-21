@@ -43,6 +43,43 @@ class DeploymentOrigin(str, Enum):
     ADOPTED = "adopted"
 
 
+@dataclass(frozen=True)
+class EngineOptions:
+    """Typed engine knobs a launch renders into the serve command.
+
+    Every field defaults to "the engine's own default"; the three maps are
+    tuples of pairs so the record stays frozen and hashable (the wire form
+    uses JSON objects, converted at parse time). Rendered and refused by
+    deploy/flags.py::render_engine_options / engine_options_refusal.
+    """
+
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    prefix_caching: bool | None = None
+    max_num_batched_tokens: int | None = None
+    async_scheduling: bool = False
+    limit_mm_per_prompt: tuple[tuple[str, int], ...] = ()
+    mm_processor_cache_gb: float | None = None
+    language_model_only: bool = False
+    rope_factor: float | None = None
+    generation_overrides: tuple[tuple[str, float], ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class Lifecycle:
+    """What happens to a deployment around its serving life.
+
+    ``idle_unload_s`` stops it after that long without a request; ``priority``
+    only orders the UI's stop suggestions; ``start_at_boot`` relaunches it
+    when the coordinator starts.
+    """
+
+    idle_unload_s: int | None = None
+    priority: str = "normal"
+    start_at_boot: bool = False
+
+
 @dataclass
 class Deployment:
     deployment_id: str
@@ -171,6 +208,14 @@ class Deployment:
     # None meaning the runtime's pinned default, resolved at launch -- the launch
     # path records the resolved reference there, env override included.)
     image_id: str = ""
+    # Typed engine knobs (see EngineOptions). Defaults for every record
+    # written before this field existed.
+    engine_options: EngineOptions = EngineOptions()
+    # Idle unload / priority / start-at-boot. Not a fit-gate input.
+    lifecycle: Lifecycle = Lifecycle()
+    # The model's trained window when YaRN (engine_options.rope_factor)
+    # stretched it; None otherwise.
+    original_window: int | None = None
 
 
 #: Upper bound on Deployment.speculative_tokens.

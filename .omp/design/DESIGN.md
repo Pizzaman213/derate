@@ -80,7 +80,7 @@ kept because every component already spends them.
 | border default (decorative) | `--rule` | `#C9C2B4` | `#423D37` | `#6B6B6B` |
 | border strong (decorative) | `--rule-strong` | `#B4AC9A` | `#5A544C` | `#000000` |
 | border perceivable (controls, keylines) | `--edge` | `#82796B` | `#7C746A` | `#000000` |
-| accent | `--accent` (= `--flow`; `ModelCard` overrides it per publisher — the one runtime-set token) | `#4A6FA5` | `#7FA3D4` | `#003E9C` |
+| accent | `--accent` (= `--flow`; a selected quant card or hub card borders in it) | `#4A6FA5` | `#7FA3D4` | `#003E9C` |
 | success / warning / danger / info (text) | `--live` `--warn` `--fault` `--info` | `#2F6E3A` `#7F5C14` `#9A3327` `#3E6194` | `#72C182` `#D6A64A` `#E58273` `#7FA3D4` | `#0A5F1E` `#6B4A00` `#9B1500` `#003E9C` |
 | the same, as fills and dots | `--live-solid` `--warn-solid` `--fault-solid` `--info-solid` | `#3D8B4A` `#B8862C` `#A93A2E` `#4A6FA5` | `#4E9E5C` `#C4922F` `#BC4A3B` `#6489BC` | = text |
 | focus ring | `--focus` + `--focus-ring-width` | `#1A1917` 2px | `#EDE9E0` 2px | `#000000` 3px |
@@ -192,7 +192,9 @@ Native controls styled in `base.css`. **States:** default; hover n/a (native);
 focus-visible ring; disabled; loading n/a; error `aria-invalid="true"` and a
 `.unit` line under the field in `--fault` linked by `aria-describedby`; empty
 is the placeholder in `--ink-muted`. **Keyboard:** native. **Tokens:**
-`--input-bg/fg/border/placeholder/radius/height/pad-x`.
+`--input-bg/fg/border/placeholder/radius/height/pad-x`. The custom `Select`
+takes a per-option `disabled` (+ `title` saying why): the row stays listed,
+`aria-disabled`, `.ddopt.off` in `--ink-muted`, and is never committed.
 
 ### Card
 
@@ -208,6 +210,10 @@ what would fill it. **Tokens:** `--card-bg/border/radius/shadow/pad`.
 `.pill` (`.mono` for figures) is the read-only chip; a toggling chip is a
 `<button aria-pressed>` inside `.chips`, filled when pressed. **States:** default, focus
 (when a button), disabled n/a, others n/a. **Tokens:** `--chip-bg/fg/border/radius/pad-x`.
+The Models tab's outlined facts (`.mdl-pill`: Dynamic, best fit, a task) use
+`--pill-fg/border`; its pressed toolbar toggles and segmented controls use
+`--toggle-on-bg/fg`, which are `--fill`/`--on-fill` under a name that says
+what they are for.
 
 ### Nav
 
@@ -286,7 +292,19 @@ behaviour, by design.
 against the line the verdict used; past `usable` is painted `--fault`;
 `usable: null` draws no fault region. `ProportionBar({value, width, height,
 tone, label})`: `value: null` is a dashed hollow track, distinct from 0.
-**Tokens:** `--bar-track/keyline/limiting`.
+**Tokens:** `--bar-track/keyline/limiting/fill`. `--bar-fill` is a filled
+share outside a SegmentBar: the Models tab's node bars and download progress.
+
+### Models tab tiles and rows
+
+Not shared components: classes in `derate.css` under `/* Models tab */`,
+drawn only by `ui/src/tabs/models/`. Quant cards, hub cards and worth-trying
+tiles are `--tile-bg/border/border-hover`; list rows and suggestions hover in
+`--row-hover` and select in `--row-selected` with an inset `--ink` rule.
+Engine initials sit on `--logo-tile` in `--logo-ink`, both pinned light/dark
+in every theme because a brand mark is drawn for a light ground (pair in
+`pairs.json`). **States:** default, hover, selected (`aria-current` /
+`aria-pressed`), focus-visible; disabled n/a.
 
 ### Copyable
 
@@ -317,6 +335,36 @@ name the key by id, never by a prefix of the secret.
 **A11y:** `role="dialog" aria-modal="true" aria-labelledby` the heading.
 **States:** `default`, `long` (43-char secret dense in `-`/`_`, must wrap
 inside the card). **Tokens:** `--sheet-*`, plus Copyable's.
+
+### ProviderAddForm
+
+`components/ProviderAddForm.tsx`: `providers`, `kinds`, `knownRefs`,
+`onAdded?`. Adding a provider, shared by Settings' `ProvidersCard` and the
+Models tab's `ProviderAddDialog` so the two cannot drift.
+**Anatomy:** one sentence on where the credential goes (follows the kind and
+the key mode), then one wrapping row: the kind `Select` (the server's
+`/api/providers/kinds`, never a local list), Base URL (hidden for sign-in
+kinds; a localhost address adds the "dialled from the coordinator" note),
+the two-mode `KeyField` (hidden for keyless and sign-in kinds), and "Add
+provider". A sign-in kind renders `ProviderSignIn` below instead of the button.
+**Behaviour:** changing the kind carries its default base URL into the field.
+Exactly one of `api_key` / `api_key_ref` is sent. Success clears the fields,
+invalidates, and calls `onAdded`. The server's rejection renders verbatim in
+`--fault`. **States:** `default`, `busy` ("Adding…"), `error`.
+**Tokens:** `--rule`, `--fault`, `--space-*`.
+
+### ProviderAddDialog
+
+`components/ProviderAddDialog.tsx`: `providers`, `kinds`, `onClose`. The
+Models toolbar's Provider button. `RevealModal`'s shell (portalled
+`.sheet.on`, a `.card.wide`, focus moved in on open, Tab contained via
+`focusTrap.ts`) around a heading row ("Add a provider" and a `close` icon
+button), one sentence on what a provider is, and `ProviderAddForm`.
+**Behaviour:** unlike the reveal nothing is lost by leaving, so Escape and
+the close button both call `onClose`; a successful add or sign-in closes it.
+**A11y:** `role="dialog" aria-modal="true" aria-labelledby` the heading; the
+close button is `aria-label="Close"`. **States:** `default`.
+**Tokens:** `--sheet-*`, plus the form's.
 
 ### ProvidersCard
 
@@ -438,7 +486,8 @@ HTTP boundary, including stale completions, callback secrecy and recovery.
 
 ### OverrideGate
 
-`reason` (verbatim refusal), `sentence` (the first-person claim that is the
+`reason` (verbatim refusal; `null` when the caller already printed that exact
+sentence, so it is not said twice), `sentence` (the first-person claim that is the
 checkbox label), `checked`, `onChange`, `onLaunch?`, `launching`,
 `launchLabel`. The button appears only once the box is ticked; stacked gates
 share one button below the stack.
@@ -457,11 +506,12 @@ of `label` (meaningful: `role="img" aria-label`) or `decorative`
 
 ### Skeleton
 
-QuantLadder's placeholder rows: `--skeleton-bg` with a `--skeleton-shimmer`
-sweep (`--dur-sweep`), `aria-busy="true"` on the container and a visually
-hidden "loading" sentence; reduced motion shows the static bar. Not a shared
-component yet; add it when a second screen needs
-it.
+Specified, with no consumer since the Models tab redesign (2026-11-20): the
+quantization section now says "Reading the quantizations on the Hub…" while
+its ladder loads. When one is built: `--skeleton-bg` with a
+`--skeleton-shimmer` sweep (`--dur-sweep`), `aria-busy="true"` on the
+container and a visually hidden "loading" sentence; reduced motion shows the
+static bar.
 
 ### PasswordField
 

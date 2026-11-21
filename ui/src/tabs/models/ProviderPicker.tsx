@@ -3,7 +3,7 @@ import { Lamp } from '../../components/Lamp'
 
 /** Which machine a pull lands on.
  *
- *  What `NodeBoard` is for a cluster launch, this is for a pull: the same
+ *  What `NodeBars` is for a cluster launch, this is for a pull: the same
  *  shape of choice, against a different set of machines. It reads facts and
  *  computes nothing -- in particular it does not size anything.
  *

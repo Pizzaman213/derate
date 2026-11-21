@@ -776,9 +776,12 @@ class Registry:
                 )
             self._agent_urls[node_id] = agent_url
             state.profile = confirmed
-            state.last_seen = self._clock()
-            state.healthy = True
-            self._misses[node_id] = 0
+            # Through record_health, not by setting the flag: a member that was
+            # marked down and comes back by re-joining (a reinstall, a restart
+            # that beat the next health round) has to emit `node_recovered`
+            # exactly as a passing health check would, or the "node down" alert
+            # outlives the outage with nothing left to clear it.
+            self.record_health(node_id, True)
             if collecting:
                 # The one-time hand-over. From here on this member re-joins on
                 # the token in this answer and on nothing else.

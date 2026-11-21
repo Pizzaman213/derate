@@ -58,6 +58,10 @@ def profile_from_dict(data: dict) -> NodeProfile:
         memory_bandwidth_gbps=float(data.get("memory_bandwidth_gbps", 0.0)),
         compute_capability=str(data.get("compute_capability", "")),
         driver_version=str(data.get("driver_version", "")),
+        # Absent from an agent older than the field: unknown, not a guess. Only
+        # the two names an image platform can be; anything else from a peer is
+        # unknown too, because it ends up choosing which image a launch runs.
+        arch=a if (a := str(data.get("arch", "") or "")) in ("amd64", "arm64") else "",
     )
 
 

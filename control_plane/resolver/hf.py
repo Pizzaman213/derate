@@ -60,6 +60,13 @@ class ModelInfo:
     tags: tuple[str, ...]
     #: File name to size in bytes, when the hub reported blob sizes.
     file_sizes: dict[str, int] = dataclass_field(default_factory=dict)
+    #: Popularity and provenance, as the hub reported them. None when absent.
+    downloads: int | None = None
+    likes: int | None = None
+    last_modified: str | None = None
+    license: str | None = None
+    gated: bool | None = None
+    pipeline_tag: str | None = None
 
     def has_file(self, name: str) -> bool:
         return name in self.siblings
@@ -97,6 +104,44 @@ class ModelInfo:
             summed = sum(v for v in params.values() if isinstance(v, int))
             return summed or None
         return None
+
+
+def hub_stats_from(data: dict[str, Any]) -> dict[str, Any]:
+    """The popularity/provenance fields of a hub model record, typed.
+
+    ``license`` prefers ``cardData.license`` and falls back to a
+    ``license:<id>`` tag. ``gated`` is ``false`` or the gating mode string.
+    """
+    def _int(v: Any) -> int | None:
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    def _str(v: Any) -> str | None:
+        return v if isinstance(v, str) and v else None
+
+    card = data.get("cardData")
+    license_ = _str(card.get("license")) if isinstance(card, dict) else None
+    if license_ is None:
+        for tag in data.get("tags") or ():
+            if isinstance(tag, str) and tag.startswith("license:") and len(tag) > 8:
+                license_ = tag[8:]
+                break
+    gated_raw = data.get("gated")
+    gated = None if gated_raw is None else bool(gated_raw)
+    return {
+        "downloads": _int(data.get("downloads")),
+        "likes": _int(data.get("likes")),
+        "last_modified": _str(data.get("lastModified")),
+        "license": license_,
+        "gated": gated,
+        "pipeline_tag": _str(data.get("pipeline_tag")),
+    }
+
+
+HUB_SORTS = ("downloads", "trendingScore", "lastModified", "likes")
+_SEARCH_EXPAND = (
+    "downloads", "likes", "lastModified", "trendingScore",
+    "pipeline_tag", "tags", "gated",
+)
 
 
 class HubClient:
@@ -172,6 +217,7 @@ class HubClient:
             gguf=data.get("gguf"),
             tags=tuple(data.get("tags", []) or ()),
             file_sizes=file_sizes,
+            **hub_stats_from(data),
         )
 
     def is_gated(self, model_id: str) -> bool:
@@ -242,17 +288,32 @@ class HubClient:
         finally:
             resp.close()
 
-    def search(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 50,
+        *,
+        author: str | None = None,
+        pipeline_tag: str | None = None,
+        sort: str = "downloads",
+    ) -> list[dict[str, Any]]:
+        if sort not in HUB_SORTS:
+            raise ValueError(f"sort must be one of {', '.join(HUB_SORTS)}")
         url = f"{self.endpoint}/api/models"
-        resp = self._get(
-            url,
-            params={
-                "search": query,
-                "limit": str(limit),
-                "sort": "downloads",
-                "direction": "-1",
-            },
-        )
+        # Checked live 2026-11-20: with expand[] the hub still returns `id`
+        # and exactly the fields named, so the list is the whole row.
+        params: dict[str, Any] = {
+            "search": query,
+            "limit": str(limit),
+            "sort": sort,
+            "direction": "-1",
+            "expand[]": list(_SEARCH_EXPAND),
+        }
+        if author:
+            params["author"] = author
+        if pipeline_tag:
+            params["pipeline_tag"] = pipeline_tag
+        resp = self._get(url, params=params)
         # "No such model" and "the hub would not answer" are different facts,
         # and returning [] for both makes a rate limit look like an empty
         # catalogue. A fabricated answer is worse than a raised one: the caller

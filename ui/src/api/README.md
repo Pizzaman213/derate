@@ -222,8 +222,8 @@ from. And `origin` is part of every resource's cache identity: two coordinators
 answering the same path are not answering the same question.
 
 The rest of the imports are narrow. `state/useMetrics.ts` takes `StreamState`;
-`inspectors/node/NodeRuntimeCard.tsx`, `tabs/models/QuantLadder.tsx` and
-`tabs/models/PullCard.tsx` take `ApiError` to branch on a status.
+`inspectors/node/NodeRuntimeCard.tsx`, `tabs/models/gates.ts`,
+`tabs/models/useModelSession.ts` and `tabs/models/PullCard.tsx` take `ApiError` to branch on a status.
 `inspectors/node/Terminal.tsx` takes `wsUrl`, `tabs/cluster/providerLogo.ts`
 takes `apiUrl`, and `tabs/settings/CoordinatorCard.tsx` takes the four an
 operator's Test-and-save needs — `describeBase`, `normalizeBase`,

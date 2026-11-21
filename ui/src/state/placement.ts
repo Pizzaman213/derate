@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from 'react'
 import type { ParallelismRequest } from '../api/types'
 import { useRouter } from './router'
+import { degreesFromRoute } from './routes'
 
 // The deployment shape a model is being planned at: which machines, and at
 // which degrees. Both live in the URL (`?on=`, `?tp=`/`?pp=`/`?ep=`) for the same
@@ -31,36 +32,21 @@ export function usePlacement(): PlacementApi {
 
   // Sorted here as well as in `routes.ts` so the identity below is stable
   // across a poll that did not change the URL: `useMemo` on `route.on` is only
-  // as good as the array it is handed, and `ServePanel`'s debounced plan effect
-  // has both of these in its dependency array. A new array every render would
-  // refire it forever -- the failure `ServePanel` documents where it drops a
-  // machine that left the cluster.
+  // as good as the array it is handed, and `useModelSession`'s debounced plan
+  // effect has both of these in its dependency array. A new array every render
+  // would refire it forever -- the failure `useModelSession` documents where
+  // it drops a machine that left the cluster.
   const key = route.on ? route.on.join(',') : null
   const nodeIds = useMemo(() => (key ? key.split(',') : null), [key])
 
-  // `data_parallel` mirrors `expert_parallel` and is never its own control.
-  // vLLM builds no rank group for expert parallel -- the expert-parallel size
-  // IS `dp * tp` -- so across machines the only shape that means EP=n is
-  // `dp=n, tp=1`, which is the one `enumerate_candidates` emits. A DP field
-  // would therefore have exactly one legal value given EP and no meaning
-  // without it. This is not a legality check in the browser, which this pane
-  // deliberately does not do: `legality.py::ep_rejection` still judges the
-  // pairing and still refuses a bad one in its own words.
+  // `data_parallel` mirrors `expert_parallel`; `degreesFromRoute` says why.
   const degrees = useMemo<ParallelismRequest | null>(
-    () =>
-      route.tp === null && route.pp === null && route.ep === null
-        ? null
-        : {
-            tensor_parallel: route.tp ?? 1,
-            pipeline_parallel: route.pp ?? 1,
-            expert_parallel: route.ep ?? 1,
-            data_parallel: route.ep ?? 1,
-          },
+    () => degreesFromRoute(route.tp, route.pp, route.ep),
     [route.tp, route.pp, route.ep],
   )
 
   // Both setters take only `navigate`, so they keep one identity for the life
-  // of the pane. `NodeBoard` hands them to a checkbox per row, and a new
+  // of the pane. `NodeBars` hands them to a checkbox per row, and a new
   // function on every plan that lands would rebuild every row underneath the
   // cursor -- the same identity trap `selection.tsx` documents for its toggles.
   const setNodeIds = useCallback(

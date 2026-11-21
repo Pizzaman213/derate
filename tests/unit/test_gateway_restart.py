@@ -15,6 +15,7 @@ patched down so a full three-attempt exhaustion runs in well under a second.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from control_plane.contracts import DeploymentState
 from control_plane.deploy.events import EventBus
@@ -421,6 +422,24 @@ def test_auto_restart_disabled_never_schedules_anything(monkeypatch):
         await asyncio.sleep(0.3)
         assert deployments.launched == []
         assert attempted_events(ctx) == []
+        assert deployment.served_name not in coordinator._state
+
+    run(_run_coordinator(ctx, body))
+
+
+def test_a_benchmark_copy_that_crashes_is_never_relaunched(monkeypatch):
+    """Seen live: a bench copy died at startup, the run's `finally` stopped the
+    dead record, and the restart coordinator brought it back for nobody."""
+    monkeypatch.setattr(restart_module, "RESTART_BACKOFF_S", FAST_BACKOFF)
+    ctx, deployments = build_ctx()
+    deployment = crashed_deployment()
+    deployments.deployments.append(deployment)
+    ctx.bench = SimpleNamespace(owns=lambda name: name == deployment.served_name)
+
+    async def body(coordinator):
+        deployments.bus.emit(**crash_event(deployment))
+        await asyncio.sleep(0.3)
+        assert deployments.launched == []
         assert deployment.served_name not in coordinator._state
 
     run(_run_coordinator(ctx, body))

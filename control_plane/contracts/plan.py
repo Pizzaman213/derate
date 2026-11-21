@@ -222,3 +222,9 @@ class FitRequest:
     # existed. The fit gate charges its weights and its extra cache when it is
     # present and changes nothing when it is not.
     speculative: SpeculativeSpec | None = None
+    # vLLM's --max-num-batched-tokens, when the operator set one: the
+    # activation chunk the gate sizes with. None keeps the calculator's own.
+    chunk_tokens: int | None = None
+    # Bytes every rank holds beyond the model's own replicated terms -- today
+    # the multimodal processor cache (--mm-processor-cache-gb).
+    extra_replicated_bytes: int = 0
