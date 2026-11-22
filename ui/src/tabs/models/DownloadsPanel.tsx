@@ -223,11 +223,16 @@ function TransferControls({ d }: { d: DownloadActivity }) {
           {gib(d.completed)} / {gib(d.total)}
           {rateLine(d)}
         </span>
-        <span className="mdl-dl-actions">
-          <button type="button" className="ghost" disabled={busy} onClick={cancel}>
-            Cancel
-          </button>
-        </span>
+        {/* Only a running copy can be stopped: a verifying one is already
+            committing on the node (the server refuses), and a finished,
+            failed or cancelling one has nothing left to cancel. */}
+        {d.status === 'running' ? (
+          <span className="mdl-dl-actions">
+            <button type="button" className="ghost" disabled={busy} onClick={cancel}>
+              Cancel
+            </button>
+          </span>
+        ) : null}
       </div>
       {err ? <Verbatim text={err} size="unit" /> : null}
     </>
