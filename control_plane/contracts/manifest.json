@@ -1351,6 +1351,18 @@
           "type": "bool",
           "optional": true,
           "default": false
+        },
+        {
+          "name": "codec_resident_bytes",
+          "type": "int",
+          "optional": true,
+          "default": 0
+        },
+        {
+          "name": "codec_bytes_per_frame",
+          "type": "int",
+          "optional": true,
+          "default": 0
         }
       ]
     },
@@ -1418,6 +1430,18 @@
           "type": "str",
           "optional": true,
           "default": ""
+        },
+        {
+          "name": "infiniband",
+          "type": "bool | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "host_memory_bandwidth_gbps",
+          "type": "float | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -1483,6 +1507,12 @@
           "type": "str",
           "optional": true,
           "default": ""
+        },
+        {
+          "name": "features",
+          "type": "tuple[str, ...] | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -2488,8 +2518,8 @@
           "bits_per_weight": 4.5,
           "family": "block-float",
           "native_compute_capability": 10.0,
-          "emulated_below_native": false,
-          "note": "Blackwell only; no pre-Blackwell kernel"
+          "emulated_below_native": true,
+          "note": "native FP4 tensor cores from Blackwell; below that vLLM runs the weights through Marlin as weight-only FP4 -- measured on an RTX 3090 (sm_86) under vLLM 0.31.0, where nvidia/Qwen3-8B-NVFP4 (modelopt) and RedHatAI/Qwen3-8B-NVFP4 (compressed-tensors) both loaded and answered"
         },
         "awq_int4": {
           "key": "awq_int4",
@@ -3076,6 +3106,11 @@
       "owner": "docker/entrypoint.sh",
       "note": ""
     },
+    "DERATE_EXTRA_CACHE_DIRS": {
+      "default": null,
+      "owner": "control_plane/registry/modelcache.py",
+      "note": "colon-separated folders beneath the HF cache root a copy lands in when the hub's disk is short; anything not beneath that root is refused"
+    },
     "DERATE_GALLERY_ONLY": {
       "default": null,
       "owner": ".omp/tests/ui/layout.check.mjs",
@@ -3251,6 +3286,11 @@
       "owner": "control_plane/deploy/flags.py",
       "note": ""
     },
+    "DERATE_SGLANG_IMAGE_AMD64": {
+      "default": null,
+      "owner": "control_plane/deploy/flags.py",
+      "note": "the sglang image for an x86 (amd64) machine; DERATE_SGLANG_IMAGE is the arm64 one the DGX Sparks run"
+    },
     "DERATE_SHELL": {
       "default": "0",
       "owner": "control_plane/registry/shell_config.py",
@@ -3350,6 +3390,11 @@
       "default": null,
       "owner": "control_plane/deploy/flags.py",
       "note": ""
+    },
+    "DERATE_TTS_IMAGE_AMD64": {
+      "default": null,
+      "owner": "control_plane/deploy/flags.py",
+      "note": "the tts image for an x86 (amd64) machine; there is no published one, build docker/tts.Dockerfile on that machine (see its header)"
     },
     "DERATE_TTS_VOICE_DIR": {
       "default": null,

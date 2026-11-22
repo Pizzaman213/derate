@@ -61,6 +61,7 @@ import type {
   NodeProfile,
   NodeRuntime,
   NodeStateDTO,
+  NodeTransfer,
   OrgRow,
   PlanRequest,
   PlanResponse,
@@ -73,6 +74,9 @@ import type {
   PullAccepted,
   QuantTable,
   ReachReport,
+  FabricHealthReport,
+  ReplicationProposal,
+  ReplicationState,
   RequestHistory,
   RouteLimits,
   RoutingConfig,
@@ -219,6 +223,9 @@ export interface Backend {
    *  serving — deliberately not a mode of `measureLink`, which saturates the
    *  interconnect. */
   checkReach(a: string, b: string): Promise<ReachReport>
+  /** What to change on the fabric ports between two nodes. Read-only: a few
+   *  sysfs reads and `ethtool` queries on each end, nothing on the wire. */
+  linkHealth(a: string, b: string): Promise<FabricHealthReport>
   /** Start a calibration for a pair and RETURN -- the work outlives the
    *  request. It runs one two-rank collective per candidate setting, so it is
    *  minutes; holding a fetch open that long would tie up a worker, trip any
@@ -268,6 +275,20 @@ export interface Backend {
   resumeDownload(downloadId: string): Promise<HubDownload>
   /** Stops and forgets the job; blobs already on disk stay. */
   cancelDownload(downloadId: string): Promise<void>
+  /** Copy a cached model folder from the coordinator to another node. */
+  startTransfer(folder: string, nodeId: string): Promise<NodeTransfer>
+  /** Stops the copy. Files that already arrived and verified stay on the node,
+   *  so a later copy resumes; unfinished ones are removed. 409 while the node is
+   *  verifying -- the copy then finishes on its own. */
+  cancelTransfer(id: string): Promise<void>
+  /** Copies between nodes this coordinator is running, and ones that just finished. */
+  transfers(): Promise<{ transfers: NodeTransfer[] }>
+  /** Background copies derate proposes, the ones it skipped, and its copies. */
+  replication(): Promise<ReplicationState>
+  /** Approves one proposal; `evict` is exactly the deletions the user was shown. */
+  approveReplication(folder: string, nodeId: string, evict: string[]): Promise<ReplicationProposal>
+  /** Hides a proposal until the coordinator's copy of the model changes. */
+  dismissReplication(folder: string, nodeId: string): Promise<void>
   benchmarks(modelId?: string): Promise<{ benchmarks: BenchRecord[] }>
   benchmark(benchId: string): Promise<BenchRecord>
   runBenchmark(body: BenchRequest): Promise<BenchRecord>
@@ -753,6 +774,9 @@ interface ClusterWire {
   nodes: NodeWire[]
   links: LinkMeasurement[]
   summary: { node_count: number; healthy_nodes: number }
+  /** The coordinator's build; absent from a gateway older than the field. */
+  build?: string | null
+  agent_features?: string[]
 }
 
 interface NodeWire {
@@ -781,6 +805,9 @@ interface NodeWire {
   last_error?: string | null
   eligible?: boolean
   ineligible_reason?: string | null
+  build?: string | null
+  build_skew?: boolean
+  features?: string[] | null
 }
 
 /** The gateway reports node health as `healthy | unhealthy`; the UI's three-way
@@ -829,6 +856,11 @@ export function toNodeState(n: NodeWire, coordinator: string | null): NodeStateD
     last_error: n.last_error ?? null,
     eligible: n.eligible,
     ineligible_reason: n.ineligible_reason ?? null,
+    build: n.build ?? null,
+    build_skew: n.build_skew === true,
+    // `?? null`, never `?? []`: an absent list is "not said", which reads
+    // as "upgrade this node", and [] is "said, and has none".
+    features: n.features ?? null,
   }
 }
 
@@ -897,6 +929,8 @@ export const httpBackend: Backend = {
           (a, n) => a + n.profile.addressable_memory,
           0,
         ),
+        coordinator_build: wire.build ?? null,
+        agent_features: wire.agent_features ?? [],
       },
       nodes,
       links: wire.links ?? [],
@@ -1357,6 +1391,7 @@ export const httpBackend: Backend = {
       method: 'POST',
       body: JSON.stringify({ a, b }),
     }),
+  linkHealth: (a, b) => req<FabricHealthReport>(`/api/links/health${qs({ a, b })}`),
   tuneLink: (a, b) =>
     req<{ a: string; b: string; measuring: boolean }>('/api/links/tune', {
       method: 'POST',
@@ -1452,6 +1487,15 @@ export const httpBackend: Backend = {
     req<HubDownload>(`/api/downloads/${seg(downloadId)}/resume`, post()),
   cancelDownload: (downloadId) =>
     req<void>(`/api/downloads/${seg(downloadId)}`, { method: 'DELETE' }),
+  startTransfer: (folder, nodeId) =>
+    req<NodeTransfer>('/api/transfers', post({ folder, node_id: nodeId })),
+  cancelTransfer: (id) => req<void>(`/api/transfers/${seg(id)}`, { method: 'DELETE' }),
+  transfers: () => req<{ transfers: NodeTransfer[] }>('/api/transfers'),
+  replication: () => req<ReplicationState>('/api/replication'),
+  approveReplication: (folder, nodeId, evict) =>
+    req<ReplicationProposal>('/api/replication/approve', post({ folder, node_id: nodeId, evict })),
+  dismissReplication: (folder, nodeId) =>
+    req<void>('/api/replication/dismiss', post({ folder, node_id: nodeId })),
   benchmarks: (modelId) =>
     req<{ benchmarks: BenchRecord[] }>(
       query('/api/benchmarks', modelId ? [`model_id=${encodeURIComponent(modelId)}`] : []),

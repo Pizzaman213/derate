@@ -27,7 +27,7 @@
 // screen where it means nothing. If that changes, it goes in alongside the
 // provider choice as one announced change to `routes.ts` and its checker.
 
-import type { Modality } from '../api/types'
+import type { DeviceClass, Modality } from '../api/types'
 
 export type Runtime = 'vllm' | 'sglang' | 'tts' | 'llamacpp' | 'ollama'
 
@@ -38,9 +38,10 @@ export interface RuntimeOption {
    *  `(CPU)` appears twice and means two different strengths of thing. On
    *  `ollama` it is the case the option exists for and NOT a claim derate
    *  checks -- a provider is a URL, and nothing here probes what is behind it.
-   *  On `llamacpp` it is checked: the placement gate refuses that runtime on a
-   *  machine that has GPU memory, and refuses a GPU runtime on one that has
-   *  none (`deploy/flags.py::placement_refusal`). */
+   *  On `llamacpp` it is checked: the server runs on the machine's CPU out of
+   *  host RAM, the placement gate refuses it on a unified-memory machine, and
+   *  refuses a GPU runtime on one with no GPU memory
+   *  (`deploy/flags.py::placement_refusal`). */
   label: string
 }
 
@@ -64,28 +65,34 @@ export function memoryPool(runtime: Runtime): 'gpu' | 'host' {
   return runtime === 'llamacpp' ? 'host' : 'gpu'
 }
 
+/** Device classes whose host RAM is a pool of its own, so a host-pool runtime
+ *  can be budgeted there. Mirrors `registry/telemetry.py::HOST_POOL_CLASSES`. */
+const HOST_POOL_CLASSES: readonly DeviceClass[] = ['cpu', 'discrete']
+
 /** Whether a machine of this shape can carry a rank of this runtime.
  *
  *  The client half of `deploy/flags.py::placement_refusal`, and deliberately
  *  only the half that can be answered from a node row: this says whether the
- *  HARDWARE is the right kind, and the server additionally refuses a CPU node
- *  whose memory nothing has measured.
+ *  HARDWARE is the right kind, and the server additionally refuses a machine
+ *  whose host memory nothing has measured.
  *
  *  Both directions are refusals. A GPU runtime needs GPU memory, which is the
- *  obvious one. `llamacpp` refusing a machine that HAS a GPU is the one worth
- *  stating properly, because the tempting reason is the wrong one: it is not
- *  that llama.cpp would waste the card. It would run there, on the CPU, and
- *  nothing would break. It is that derate cannot budget it there --
- *  `registry.allocatable_bytes` reports host memory only for a CPU device
- *  class, so the fit gate would size a host-RAM launch against a GPU figure.
- *  An accounting limit in this build, not a fact about llama.cpp.
+ *  obvious one. `llamacpp` refusing a unified-memory machine (a Spark, a Mac)
+ *  is the one worth stating properly, because the tempting reason is the wrong
+ *  one: it is not that llama.cpp would waste the card. It would run there, on
+ *  the CPU, and nothing would break. It is that derate cannot budget it there
+ *  -- the GPU and the server would spend one pool, which
+ *  `registry.allocatable_bytes` budgets as GPU memory. A discrete-GPU box is
+ *  accepted: its host RAM is a separate pool, and the gate sizes the launch
+ *  against that, never against the card. An unidentified machine is refused,
+ *  since nothing says which kind it is.
  */
 export function canCarryRank(
   runtime: Runtime,
-  node: { addressable_memory: number },
+  node: { addressable_memory: number; device_class: DeviceClass },
 ): boolean {
   return memoryPool(runtime) === 'host'
-    ? node.addressable_memory <= 0
+    ? HOST_POOL_CLASSES.includes(node.device_class)
     : node.addressable_memory > 0
 }
 

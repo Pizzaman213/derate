@@ -125,6 +125,89 @@ def test_the_names_that_do_pass_a_flag_keep_the_width_the_gate_charged():
         assert rendered.startswith("fp8")
 
 
+def test_every_packed_layout_the_gate_prices_reaches_the_engine_by_its_own_name():
+    """A packed width is a kernel, so there is no "model's own" fallback that
+    could be correct: each one must render itself, and the image must take it."""
+    from control_plane.deploy.flags import VLLM_KV_CACHE_DTYPES, render_kv_cache_dtype
+
+    for name in fit_kv.PACKED_KV_DTYPES:
+        assert render_kv_cache_dtype(name) == name
+        assert name in VLLM_KV_CACHE_DTYPES
+
+
+def test_packed_pages_match_what_the_image_allocates():
+    """Page bytes per layer per token, computed in the pinned image by each
+    backend's own `customize_spec` (vLLM 0.28.1rc1.dev486). Llama-3.3-70B's
+    geometry: 8 KV heads of 128. A per-element shortcut misses the scales --
+    int8 at "1 byte" would be 2048, not 2112 -- in the OOM direction."""
+    import dataclasses
+
+    from tests.fixtures import LLAMA_3_3_70B
+
+    expected = {
+        "int8_per_token_head": 2112,
+        "fp8_per_token_head": 2112,
+        "int4_per_token_head": 1088,
+        "nvfp4": 1152,
+        "nvfp4_4over6": 1152,
+        "turboquant_k8v4": 1568,
+        "turboquant_4bit_nc": 1072,
+        "turboquant_k3v4_nc": 944,
+        "turboquant_3bit_nc": 816,
+    }
+    for name, page in expected.items():
+        assert fit_kv.per_layer_per_token_bytes(LLAMA_3_3_70B, name) == page, name
+    # head_dim 80 is where the even-slot rounding and the floor divisions bite.
+    odd = dataclasses.replace(LLAMA_3_3_70B, head_dim=80)
+    assert fit_kv.per_layer_per_token_bytes(odd, "turboquant_k3v4_nc") == 8 * 76
+    assert fit_kv.per_layer_per_token_bytes(odd, "nvfp4") == 2 * 8 * 45
+    # MLA: one latent slot of 576 plus the fp32 scale pair.
+    assert fit_kv.per_layer_per_token_bytes(DEEPSEEK_V3, "int8_per_token_head") == 584
+    assert fit_kv.per_layer_per_token_bytes(DEEPSEEK_V3, "int4_per_token_head") == 296
+    assert fit_kv.per_layer_per_token_bytes(DEEPSEEK_V3, "fp8_ds_mla") == 656
+
+
+def test_turboquant_keeps_four_boundary_layers_wide():
+    """The image stores layers 0, 1, L-2 and L-1 at the model's own width.
+    Pricing every layer at the packed rate under-charges by four layers'
+    worth."""
+    from tests.fixtures import LLAMA_3_3_70B
+
+    tq, wide = "turboquant_k8v4", fit_kv.per_layer_per_token_bytes(LLAMA_3_3_70B, "auto")
+    narrow = fit_kv.per_layer_per_token_bytes(LLAMA_3_3_70B, tq)
+    assert fit_kv.skipped_layers(LLAMA_3_3_70B, tq) == 4
+    assert fit_kv.kv_bytes_per_token(LLAMA_3_3_70B, tq) == 76 * narrow + 4 * wide
+    assert fit_kv.kv_cache_bytes(LLAMA_3_3_70B, 1000, 2, tq) == (
+        2 * 1000 * (76 * narrow + 4 * wide)
+    )
+    assert fit_kv.skipped_layers(LLAMA_3_3_70B, "nvfp4") == 0
+
+    # A pipeline puts the wide layers at both ENDS: the busiest stage of a
+    # four-way split holds two of them, never a proportional quarter of four.
+    from tests.unit.test_fit import make_plan
+
+    per_rank = fit_kv.kv_cache_bytes_per_rank(LLAMA_3_3_70B, make_plan(pp=4), 1000, 1, tq)
+    # Exactly two: stages are layers 0-19, 20-39, 40-59, 60-79.
+    assert per_rank == 1000 * (20 * narrow + 2 * (wide - narrow))
+    whole = fit_kv.kv_cache_bytes_per_rank(LLAMA_3_3_70B, make_plan(), 1000, 1, tq)
+    assert whole == fit_kv.kv_cache_bytes(LLAMA_3_3_70B, 1000, 1, tq)
+
+
+def test_a_packed_layout_for_the_other_attention_geometry_is_refused():
+    """No page the gate could size honestly: the image either never builds it
+    or builds it in a way nothing here derived."""
+    from tests.fixtures import GPT_OSS_120B, LLAMA_3_3_70B
+
+    assert fit_kv.kv_dtype_refusal(LLAMA_3_3_70B, "fp8_ds_mla") is not None
+    assert fit_kv.kv_dtype_refusal(DEEPSEEK_V3, "nvfp4") is not None
+    assert fit_kv.kv_dtype_refusal(DEEPSEEK_V3, "turboquant_k8v4") is not None
+    # Sliding-window layers beside TurboQuant's wide boundary layers pad pages.
+    assert fit_kv.kv_dtype_refusal(GPT_OSS_120B, "turboquant_k8v4") is not None
+    for ok in ("int8_per_token_head", "nvfp4", "turboquant_k8v4", "fp8"):
+        assert fit_kv.kv_dtype_refusal(LLAMA_3_3_70B, ok) is None
+    assert fit_kv.kv_dtype_refusal(DEEPSEEK_V3, "int4_per_token_head") is None
+
+
 # ==========================================================================
 # NCCL tuning selection: one environment, collectives four decades apart
 # ==========================================================================
@@ -288,3 +371,31 @@ def test_an_idle_window_records_nothing_rather_than_pure_decode(tmp_path):
 
     assert EngineLoad(prompt_tokens=0.0, generation_tokens=0.0).prefill_share is None
     assert EngineLoad(prompt_tokens=8000.0, generation_tokens=50.0).prefill_share > 0.99
+
+
+def test_a_draft_under_turboquant_is_charged_as_the_busiest_stage_holds_it():
+    """Both speculative terms -- the drafted positions and the head's own
+    cache -- go through `kv_cache_bytes_per_rank`. Dividing the whole-model
+    figure by the pipeline divisor spread TurboQuant's four wide boundary
+    layers evenly, when the first and last stages each hold two."""
+    from control_plane.contracts import SpeculativeMethod, SpeculativeSpec
+    from control_plane.fit.calculator import speculative_kv_bytes_per_rank
+    from tests.fixtures import LLAMA_3_3_70B
+    from tests.unit.test_fit import make_plan
+
+    tq, plan, ratio, k, seqs, ctx = "turboquant_k8v4", make_plan(pp=4), 5 / 80, 5, 2, 8192
+    spec = SpeculativeSpec(SpeculativeMethod.DSPARK, k, 0, 0, "h", ratio)
+    charged = speculative_kv_bytes_per_rank(LLAMA_3_3_70B, plan, seqs, tq, spec, ctx)
+    expected = (
+        fit_kv.kv_cache_bytes_per_rank(LLAMA_3_3_70B, plan, k, seqs, tq)
+        # The head's own cache at the model's own width: its geometry is
+        # unknown, and a ratio of the packed cache under-charges its share
+        # of TurboQuant's fixed full-width boundary layers.
+        + fit_kv.kv_cache_bytes_per_rank(LLAMA_3_3_70B, plan, ctx, seqs, "auto") * ratio
+    )
+    assert charged == expected
+    # Never less than the packed ratio it replaced.
+    assert charged > (
+        fit_kv.kv_cache_bytes_per_rank(LLAMA_3_3_70B, plan, k, seqs, tq)
+        + fit_kv.kv_cache_bytes_per_rank(LLAMA_3_3_70B, plan, ctx, seqs, tq) * ratio
+    )

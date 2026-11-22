@@ -49,12 +49,17 @@ def _accepts_allocatable(check: Any) -> bool:
     turning a real bug into a silent fallback to the budget we are trying to
     stop trusting.
     """
+    return _accepts_keyword(check, "allocatable")
+
+
+def _accepts_keyword(fn: Any, name: str) -> bool:
+    """Whether *fn* takes the keyword *name* (or ``**kwargs``)."""
     try:
-        sig = inspect.signature(check)
+        sig = inspect.signature(fn)
     except (TypeError, ValueError):  # builtins, C callables, exotic proxies
         return False
     for param in sig.parameters.values():
-        if param.name == "allocatable":
+        if param.name == name:
             return True
         if param.kind is inspect.Parameter.VAR_KEYWORD:
             return True
@@ -62,7 +67,7 @@ def _accepts_allocatable(check: Any) -> bool:
 
 
 def allocatable_map(
-    registry: Any, node_ids: list[str]
+    registry: Any, node_ids: list[str], pool: str = "gpu"
 ) -> tuple[dict[str, int], list[dict[str, str]], str | None]:
     """node_id -> live allocatable bytes, plus what we had to exclude.
 
@@ -79,6 +84,12 @@ def allocatable_map(
     "live"``. Falling back keeps a registry that only has the older method
     working exactly as before.
 
+    ``pool`` is the runtime's ``RuntimeSpec.memory_pool``. ``"gpu"`` calls the
+    registry exactly as before. Any other pool is passed through as
+    ``pool=``, and a registry whose method cannot take it answers nothing
+    rather than a GPU figure: a llamacpp launch on a discrete box sized
+    against its VRAM is the bug the parameter exists to end.
+
     Returns ``(budgets, excluded, unavailable_reason)``. ``excluded`` carries
     one entry per node dropped from the budget and why, so a refusal can name
     the exclusion instead of silently refusing everything.
@@ -88,12 +99,17 @@ def allocatable_map(
         available = getattr(registry, "available_memory", None)
     if not callable(available):
         return {}, [], "this registry does not report live allocatable memory"
+    kwargs: dict[str, str] = {}
+    if pool != "gpu":
+        if not _accepts_keyword(available, "pool"):
+            return {}, [], f"this registry does not report {pool} memory"
+        kwargs["pool"] = pool
 
     budgets: dict[str, int] = {}
     excluded: list[dict[str, str]] = []
     for node_id in node_ids:
         try:
-            value = available(node_id)
+            value = available(node_id, **kwargs)
         except Exception:
             log.exception("available_memory failed for %s", node_id)
             excluded.append(

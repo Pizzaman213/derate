@@ -2417,6 +2417,11 @@ main:has(> section:not([hidden]) > .mdl-tab) {
   text-align: right;
   white-space: nowrap;
 }
+/* "49.6 GiB host RAM free" is wider than the figure column; it wraps there
+   rather than run past the card, and every other figure stays on one line. */
+.mdl-node > .unit.mdl-node-pool {
+  white-space: normal;
+}
 .mdl-nbar {
   display: flex;
   height: var(--space-18);
@@ -2787,6 +2792,10 @@ main:has(> section:not([hidden]) > .mdl-tab) {
   grid-template-columns: auto minmax(0, 1fr) var(--space-48) minmax(0, 1fr);
   align-items: center;
   gap: var(--space-8);
+}
+.mdl-kvgrid-ratio {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
 }
 .mdl-subdetails > summary {
   cursor: pointer;

@@ -440,7 +440,13 @@ class IbWriteBwMeasurer(_ClientSideMixin):
             "no collective latency was measured: ib_write_lat times a one-sided "
             "2-byte RDMA write, not a two-rank all-reduce, so it is reported "
             "here as evidence and not as latency_us"
-            + (f" (ib_write_lat: {write_latency:.2f} us)" if write_latency is not None else ""),
+            # Only an ib_write_lat figure is labelled one. The TCP fallback
+            # carries its own figure in its own note below.
+            + (
+                f" (ib_write_lat: {write_latency:.2f} us)"
+                if write_latency is not None and latency_note is None
+                else ""
+            ),
             "ib_write_bw cannot tell all-reduce from sendrecv, so both figures are the "
             "same estimate; re-measure with nccl-tests before trusting the difference",
         ]
@@ -486,8 +492,8 @@ class IbWriteBwMeasurer(_ClientSideMixin):
         if rtt is None:
             return None, None
         return rtt, (
-            "latency is a TCP connect round trip, not a collective latency; "
-            "ib_write_lat was unavailable"
+            f"ib_write_lat was unavailable; a TCP connect round trip took "
+            f"{rtt:.2f} us, which is not a collective latency and not an RDMA write"
         )
 
 

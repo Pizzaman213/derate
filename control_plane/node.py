@@ -74,7 +74,7 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     from control_plane.links.service import LinkService
     from control_plane.planner.planner import Planner
     from control_plane.providers.service import ProviderService
-    from control_plane.deploy.flags import RUNTIMES as RUNTIME_SPECS
+    from control_plane.deploy.flags import RUNTIMES as RUNTIME_SPECS, image_for_arch
     from control_plane.deploy.recipes import container_image
     from control_plane.resolver import imageprobe
     from control_plane.resolver.resolver import ModelResolver
@@ -93,12 +93,38 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     # being a hand-copied list of somebody else's architectures -- see
     # resolver/imageprobe.py. An image that is not on this machine is not
     # pulled and not waited for; the static table answers instead.
+    def arch_hosts(arch: str) -> list[str]:
+        """Docker hosts on every healthy machine of *arch*: the addresses a
+        launch already SSHes to (`SparkrunAdapter.hosts_for`), so asking an
+        image there needs no trust a launch does not already have. All of
+        them, because only a machine that holds the image can answer."""
+        from control_plane.registry.net import valid_host
+
+        try:
+            states = registry.healthy_nodes()
+        except Exception:
+            return []
+        return [
+            f"ssh://{state.profile.address}"
+            for state in states
+            if getattr(state.profile, "arch", "") == arch and valid_host(state.profile.address)
+        ]
+
     resolver = ModelResolver(
         runtime_images={
             name: container_image(spec)
             for name, spec in RUNTIME_SPECS.items()
             if name in imageprobe.SCRIPTS
-        }
+        },
+        # The image each other architecture runs, asked on a machine of it.
+        arch_images={
+            (name, arch): image
+            for name, spec in RUNTIME_SPECS.items()
+            if name in imageprobe.SCRIPTS
+            for arch, *_ in spec.arch_images
+            if (image := image_for_arch(spec, arch))
+        },
+        arch_hosts=arch_hosts,
     )
     fit = FitCalculator()
     # Never Planner(fit=FitCalculator()): the planner's fit argument is its
@@ -106,7 +132,12 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     # FitCalculator does not implement. The no-arg default resolves to
     # control_plane.fit's module-level helpers when they exist.
     planner = Planner()
-    deployments = DeploymentManager(registry=registry, state_dir=config.data_dir)
+    from control_plane.transfer.jobs import Replicator
+
+    replicator = Replicator(registry=registry, local_node_id=runtime.profile.node_id)
+    deployments = DeploymentManager(
+        registry=registry, state_dir=config.data_dir, replicator=replicator
+    )
     providers = ProviderService(data_path=config.data_dir)
     # The log files opened in main() started with a fresh Redactor, which knows
     # the vendor key shapes but no actual value. This is the first moment a
@@ -145,6 +176,7 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
         planner=planner,
         deployments=deployments,
         providers=providers,
+        transfers=replicator,
         strict=True,
         settings=settings,
     )

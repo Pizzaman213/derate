@@ -70,6 +70,7 @@ from control_plane.version import build_id
 from control_plane.registry import joinproof, modelcache, reach, storage as registry_storage
 from control_plane.registry import net as registry_net
 from control_plane.registry.serde import profile_from_dict
+from control_plane.registry.agent import AGENT_FEATURES
 
 from control_plane.telemetry import query as tquery
 
@@ -242,6 +243,39 @@ class _PlanOutcome:
     original_window: int | None = None
     #: The window the plan sized against: the trained one, times rope_factor.
     native_window: int | None = None
+    #: Whether the runtime loads this model on the machines the plan landed
+    #: on, judged by the image EACH of them runs (`_support_per_node`), and
+    #: the runtime's own sentence when it does not. The launch and the
+    #: restart read this rather than asking `supported_by` again: asked
+    #: without the machines, the question is answered by the default image,
+    #: which refuses an architecture only another machine's image loads.
+    runtime_supported: bool = True
+    runtime_unsupported_reason: str | None = None
+
+
+def _kv_dtype_ratios(shape) -> dict[str, float]:
+    """Every `--kv-cache-dtype` the gate prices for *shape*, as its cache
+    bytes per token over the 16-bit rate. Absent: a name the gate does not
+    price, cannot render, or refuses for this attention geometry."""
+    from control_plane.deploy.flags import VLLM_KV_CACHE_DTYPES, render_kv_cache_dtype
+    from control_plane.fit.kv import is_known_kv_dtype, kv_bytes_per_token, kv_dtype_refusal
+
+    base = kv_bytes_per_token(shape, "bf16")
+    if base <= 0:
+        return {}
+    out: dict[str, float] = {}
+    for name in sorted(VLLM_KV_CACHE_DTYPES):
+        if name == "auto" or not is_known_kv_dtype(name):
+            continue
+        try:
+            render_kv_cache_dtype(name)
+        except ValueError:
+            continue
+        if kv_dtype_refusal(shape, name) is not None:
+            continue
+        out[name] = kv_bytes_per_token(shape, name) / base
+    return out
+
 
 _ENGINE_ENV_VALUE = re.compile(r"^[A-Za-z0-9_.,:/=+-]*$")
 _MM_KEYS = ("image", "video", "audio")
@@ -453,6 +487,23 @@ def _without_vision(shape, weight_bytes: int | None):
     if weight_bytes is not None:
         weight_bytes = max(0, weight_bytes - vision_bytes)
     return shape, weight_bytes
+
+
+def _with_codec_working_set(shape, architectures):
+    """The shape carrying the tts server's measured codec working set
+    (`resolver/support.py::TTS_WORKING_SETS`), which the fit gate charges in
+    `activations`. Unchanged when the tts runtime loads none of
+    *architectures*: that is the support check's refusal to make."""
+    from control_plane.resolver.support import speech_working_set
+
+    found = speech_working_set(architectures)
+    if found is None:
+        return shape
+    return dataclasses.replace(
+        shape,
+        codec_resident_bytes=found.resident_bytes,
+        codec_bytes_per_frame=found.bytes_per_frame,
+    )
 
 
 def _parse_node_ids(payload: dict) -> list[str] | None:
@@ -784,12 +835,18 @@ def _placement_refusal(registry, runtime: str, node_id: str, profile) -> str | N
     spec = RUNTIMES.get(runtime)
     live = None
     if spec is not None and spec.memory_pool == "host":
-        try:
-            live = registry.allocatable_or_none(node_id)
-        except Exception:
-            log.exception("live memory lookup failed for %s while planning", node_id)
-            live = None
-    return placement_refusal(runtime, node_id, profile.addressable_memory, live)
+        # The HOST pool's reading, never the GPU's: on a discrete box the two
+        # are different machines' worth of memory.
+        probe = getattr(registry, "allocatable_or_none", None)
+        if callable(probe) and livefit._accepts_keyword(probe, "pool"):
+            try:
+                live = probe(node_id, pool=spec.memory_pool)
+            except Exception:
+                log.exception(
+                    "live memory lookup failed for %s while planning", node_id
+                )
+                live = None
+    return placement_refusal(runtime, profile, live)
 
 
 def _select_nodes(registry, nodes, requested, warnings: list[str], runtime: str = "vllm"):
@@ -1055,30 +1112,31 @@ def _attach_measurements(options: list[dict], model_id: str, nodes: list) -> lis
         return options
 
     gpu = bandwidth = None
+    arch = ""
     for node in nodes:
         if getattr(node, "memory_bandwidth_gbps", 0):
             gpu = getattr(node, "gpu_name", None)
             bandwidth = node.memory_bandwidth_gbps
+            arch = getattr(node, "arch", "") or ""
             break
-    version = None
-    try:
-        from control_plane.resolver import support
-
-        probed = support.probed("vllm")
-        version = getattr(probed, "version", None) if probed else None
-    except Exception:
-        version = None
+    # The version of the image THAT machine runs, never the default image's:
+    # a record taken under the 3090's vLLM 0.31 must not answer for a Spark on
+    # 0.28.1. No probe of that image is a miss -- `matching` reads a falsy
+    # version as "any", so the lookup is skipped rather than asked.
+    version = measurements.image_version("vllm", arch) if gpu is not None else ""
 
     out: list[dict] = []
     for option in options:
-        try:
-            found = measurements.matching(
-                model_id, option.get("method", ""), gpu_name=gpu,
-                memory_bandwidth_gbps=bandwidth, runtime_version=version,
-            )
-        except Exception:
-            log.exception("reading speculative measurements failed")
-            found = []
+        found = []
+        if version:
+            try:
+                found = measurements.matching(
+                    model_id, option.get("method", ""), gpu_name=gpu,
+                    memory_bandwidth_gbps=bandwidth, runtime_version=version,
+                )
+            except Exception:
+                log.exception("reading speculative measurements failed")
+                found = []
         out.append({
             **option,
             "measured": [serialize.measurement(r) for r in found],
@@ -1086,7 +1144,9 @@ def _attach_measurements(options: list[dict], model_id: str, nodes: list) -> lis
     return out
 
 
-def _measured_decode(model_id: str, nodes: list, context_length: int) -> dict | None:
+def _measured_decode(
+    model_id: str, nodes: list, context_length: int, runtime: str
+) -> dict | None:
     """The measured decode rate for THIS model on THESE machines, or None.
 
     The same argument as :func:`_attach_measurements`, applied to the ordinary
@@ -1113,18 +1173,25 @@ def _measured_decode(model_id: str, nodes: list, context_length: int) -> dict | 
         return None
 
     gpu = bandwidth = None
+    arch = ""
     for node in nodes:
         if getattr(node, "memory_bandwidth_gbps", 0):
             gpu = getattr(node, "gpu_name", None)
             bandwidth = node.memory_bandwidth_gbps
+            arch = getattr(node, "arch", "") or ""
             break
     if gpu is None:
+        return None
+    # The image THAT machine runs for THIS runtime; no probe of it is a miss.
+    version = measurements.image_version(runtime, arch)
+    if not version:
         return None
     try:
         found = measurements.matching_decode(
             model_id,
             gpu_name=gpu,
             memory_bandwidth_gbps=bandwidth,
+            runtime_version=version,
             context_band=measurements.band(context_length),
         )
     except Exception:
@@ -1577,6 +1644,62 @@ def _launch_options(payload: dict) -> dict:
     return out
 
 
+def _runtime_image(runtime: str, arch: str) -> str | None:
+    """The image *runtime* runs on a machine of *arch* (`flags.image_for_arch`),
+    or None for a runtime the launcher has no spec for."""
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+
+    spec = RUNTIMES.get(runtime)
+    return image_for_arch(spec, arch) if spec is not None else None
+
+
+async def _support_per_node(resolver, shape, runtime: str, nodes) -> dict[str, tuple[bool, str]]:
+    """`supported_by` for each machine, asked of the image that machine runs.
+
+    One call per distinct image, not per machine: every Spark runs the same
+    one. Empty when the resolver cannot answer at all.
+    """
+    supported_by = getattr(resolver, "supported_by", None)
+    if not callable(supported_by):
+        return {}
+    by_image: dict[str | None, tuple[bool, str]] = {}
+    out: dict[str, tuple[bool, str]] = {}
+    for node in nodes:
+        image = _runtime_image(runtime, getattr(node, "arch", ""))
+        if image not in by_image:
+            by_image[image] = await asyncio.to_thread(
+                supported_by, shape, runtime, image=image
+            )
+        out[node.node_id] = by_image[image]
+    return out
+
+
+def _silicon_per_node(
+    runtime: str, nodes, *, dtype: str, quant_method: str,
+    kv_cache_dtype: str | None, kv_label: str,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """`support.silicon_check` for each machine against the image it runs:
+    the refusals by node id, and every machine's warnings by node id."""
+    from control_plane.resolver.support import silicon_check
+
+    refused: dict[str, str] = {}
+    notes: dict[str, list[str]] = {}
+    for node in nodes:
+        refusal, warnings = silicon_check(
+            runtime,
+            node,
+            _runtime_image(runtime, getattr(node, "arch", "")),
+            dtype=dtype,
+            quant_method=quant_method,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_label=kv_label,
+        )
+        if refusal is not None:
+            refused[node.node_id] = refusal
+        notes[node.node_id] = warnings
+    return refused, notes
+
+
 async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     """Resolve, plan, check fit. Launches nothing.
 
@@ -1661,6 +1784,21 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     if engine_options.language_model_only:
         shape, weight_bytes = _without_vision(shape, weight_bytes)
 
+    # The tts server's codec is its biggest allocation and is sized BEFORE
+    # planning for the same reason. Only a resolution names the architecture;
+    # one the table has no row for is one the tts runtime does not load, and
+    # the support check below refuses it rather than this pricing a guess.
+    if runtime == "tts" and callable(resolve_full):
+        shape = _with_codec_working_set(shape, resolution.architectures)
+
+    # A packed KV layout is a kernel for one attention geometry; asked of the
+    # other one there is no page the gate could size honestly.
+    from control_plane.fit.kv import kv_dtype_refusal
+
+    kv_refusal = kv_dtype_refusal(shape, kv_dtype)
+    if kv_refusal is not None:
+        raise ValueError(kv_refusal)
+
     native_window = (
         getattr(resolution, "max_position_embeddings", None)
         if callable(resolve_full)
@@ -1713,23 +1851,12 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         if refusal is not None:
             raise ValueError(refusal)
 
-    # Same question `create_deployment` asks before it will launch --
-    # asked here too so a dry run cannot say "fits, click Serve" about an
-    # architecture the runtime does not implement at all. Without this the
-    # fit box only learns the launch was hopeless from the 400 the click
-    # itself produces, and the Serve button never stops offering it.
-    runtime_supported_by = getattr(ctx.deps.resolver, "supported_by", None)
-    runtime_ok, runtime_unsupported_reason = True, None
-    if callable(runtime_supported_by):
-        runtime_ok, runtime_unsupported_reason = await asyncio.to_thread(
-            runtime_supported_by, shape, runtime
-        )
-
     try:
         nodes = [n.profile for n in ctx.deps.registry.healthy_nodes()]
     except Exception:
         log.exception("registry unavailable while planning")
         nodes = []
+    healthy = list(nodes)
 
     # Narrow here, before the link lookup, so `worst_all_reduce` measures
     # only the path this deployment will actually cross. Filtering later
@@ -1754,6 +1881,154 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
                 f"so the planner left {'it' if len(skipped) == 1 else 'them'} out."
             )
         nodes = runnable
+        # A host-pool runtime leaves out every machine `placement_refusal`
+        # refuses -- a unified-memory machine, or one whose host memory nothing
+        # has measured -- for the reason the arch filter above gives: handing
+        # the planner a node the named-machine path would refuse with 400
+        # plans a launch onto it. GPU runtimes keep their existing path, where
+        # `drop_unbudgetable` already removes a machine with nothing to spend.
+        from control_plane.deploy.flags import RUNTIMES as _RUNTIMES
+
+        if getattr(_RUNTIMES.get(runtime), "memory_pool", "gpu") == "host":
+            refused_here = {
+                n.node_id: r
+                for n in nodes
+                if (r := _placement_refusal(ctx.deps.registry, runtime, n.node_id, n))
+                is not None
+            }
+            if refused_here:
+                placement_warnings.append(
+                    f"{runtime} cannot be placed on "
+                    f"{', '.join(sorted(refused_here))}, so the planner left "
+                    f"{'it' if len(refused_here) == 1 else 'them'} out: "
+                    f"{next(iter(refused_here.values()))}"
+                )
+                nodes = [n for n in nodes if n.node_id not in refused_here]
+
+    # Whether the runtime loads this architecture, asked of the image EACH
+    # machine runs rather than of the default one: the 3090's vLLM 0.31.0
+    # registers architectures the Spark's 0.28.1 does not, and the reverse.
+    # The same verdict `create_deployment` launches on (it rides the outcome),
+    # so a dry run cannot say "fits, click Serve" about an architecture the
+    # placed machines cannot load -- and cannot refuse one they can.
+    runtime_ok, runtime_unsupported_reason = True, None
+    runtime_supported_by = getattr(ctx.deps.resolver, "supported_by", None)
+    if callable(runtime_supported_by) and not nodes:
+        runtime_ok, runtime_unsupported_reason = await asyncio.to_thread(
+            runtime_supported_by, shape, runtime
+        )
+    elif callable(runtime_supported_by):
+        verdicts = await _support_per_node(ctx.deps.resolver, shape, runtime, nodes)
+        unsupported = {nid: why for nid, (ok, why) in verdicts.items() if not ok}
+        if unsupported and requested_nodes is None and len(unsupported) < len(nodes):
+            placement_warnings.append(
+                f"{runtime} cannot load this model on "
+                f"{', '.join(sorted(unsupported))}, so the planner left "
+                f"{'it' if len(unsupported) == 1 else 'them'} out: "
+                f"{next(iter(unsupported.values()))}"
+            )
+            nodes = [n for n in nodes if n.node_id not in unsupported]
+        elif unsupported:
+            elsewhere: list[str] = []
+            if requested_nodes is not None:
+                from control_plane.deploy.flags import arch_refusal
+
+                others = [
+                    n for n in healthy
+                    if n.node_id not in verdicts
+                    and arch_refusal(runtime, n.node_id, getattr(n, "arch", "")) is None
+                ]
+                elsewhere = sorted(
+                    nid
+                    for nid, (ok, _) in (
+                        await _support_per_node(ctx.deps.resolver, shape, runtime, others)
+                    ).items()
+                    if ok
+                )
+            if requested_nodes is not None and (elsewhere or len(unsupported) < len(nodes)):
+                # A named machine whose image cannot load it while another
+                # machine's can: the machine is what to change, so it is
+                # named, with its own code -- not the "nothing here loads
+                # this" verdict below, which no choice of machine unblocks.
+                first = next(iter(unsupported))
+                usable = elsewhere or sorted(set(verdicts) - set(unsupported))
+                raise _PlacementRefused(
+                    400,
+                    f"On '{first}': {unsupported[first]}. "
+                    f"{', '.join(usable)} run{'s' if len(usable) == 1 else ''} an "
+                    f"image that loads it.",
+                    "runtime_unsupported_on_machine",
+                    param=_PLACEMENT_PARAM,
+                    extra={"unusable_node_ids": sorted(unsupported)},
+                )
+            runtime_ok, runtime_unsupported_reason = False, next(iter(unsupported.values()))
+
+    # The GPU in each machine, asked of the image it runs: vLLM's own floor
+    # for the checkpoint's quantization method and the KV widths its attention
+    # selector has a kernel for (`support.silicon_check`). A named machine
+    # that cannot is a 400 naming it; the planner's own pick leaves it out --
+    # unless no machine can, which is a 400 too, because nothing is left to
+    # plan on and every machine got the same answer.
+    if nodes:
+        from control_plane.deploy.flags import render_kv_cache_dtype, render_quantization
+
+        quant_method = (
+            str(getattr(resolution, "quant_method", "") or "")
+            if callable(resolve_full)
+            else ""
+        )
+        kv_cache_dtype = None
+        if runtime == "vllm":
+            # A forced scheme is what the loader will be told; `quantization_refusal`
+            # answers for one this build cannot render.
+            try:
+                quant_method = (render_quantization(dtype) if dtype else None) or quant_method
+            except ValueError:
+                pass
+            # The probe asked the selector about ordinary attention only, so an
+            # MLA model's cache is not judged: no evidence is no refusal.
+            if not getattr(shape, "mla_latent_dim", 0):
+                try:
+                    kv_cache_dtype = render_kv_cache_dtype(kv_dtype)
+                except ValueError:
+                    kv_cache_dtype = None
+        silicon_refused, silicon_notes = _silicon_per_node(
+            runtime,
+            nodes,
+            dtype=shape.dtype,
+            quant_method=quant_method,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_label=kv_dtype,
+        )
+        if silicon_refused and (
+            requested_nodes is not None or len(silicon_refused) == len(nodes)
+        ):
+            raise _PlacementRefused(
+                400,
+                next(iter(silicon_refused.values())),
+                "unsupported_on_this_gpu",
+                param=_PLACEMENT_PARAM if requested_nodes is not None else None,
+                extra={"unusable_node_ids": sorted(silicon_refused)},
+            )
+        if silicon_refused:
+            placement_warnings.append(
+                f"{', '.join(sorted(silicon_refused))} cannot run this on "
+                f"{'its' if len(silicon_refused) == 1 else 'their'} GPU, so the "
+                f"planner left {'it' if len(silicon_refused) == 1 else 'them'} "
+                f"out: {next(iter(silicon_refused.values()))}"
+            )
+            nodes = [n for n in nodes if n.node_id not in silicon_refused]
+        for node in nodes:
+            placement_warnings.extend(silicon_notes.get(node.node_id, ()))
+
+    # The machines as this runtime's budget sees them. For a host-pool runtime
+    # on a discrete box that is the box without its card (`flags.budget_profile`),
+    # so the planner and the fit gate below never size a host-RAM launch
+    # against VRAM. Applied after every placement check above, which judge the
+    # real hardware.
+    from control_plane.deploy.flags import budget_profile
+
+    nodes = [budget_profile(runtime, n) for n in nodes]
 
     link = None
     if len(nodes) > 1:
@@ -1846,6 +2121,17 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     _check_every_node_used(plan, nodes, requested_nodes, requested_degrees)
 
     plan_nodes = [n for n in nodes if n.node_id in set(plan.node_ids)] or nodes
+    # The recipe clears /dev/infiniband for every host when any one of them
+    # lacks it (`recipes.synthesize`), so a multi-node plan across such a
+    # machine runs NCCL over TCP. Same predicate as the recipe's, said here.
+    from control_plane.deploy.recipes import tcp_fabric_note
+
+    if len(plan.node_ids) > 1 and (
+        fabric_note := tcp_fabric_note(
+            [n for n in nodes if n.node_id in set(plan.node_ids)]
+        )
+    ):
+        placement_warnings.append(fabric_note)
 
     # The live budget. Two checks, not one widened verdict: the breakdown
     # is identical under both budgets and only the budget-dependent terms
@@ -1856,8 +2142,15 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     # named is derived against this budget: choosing it off the static
     # ceiling would offer a window the machine cannot actually hold right
     # now, which is the whole reason the live budget exists.
+    #
+    # In the runtime's own pool: host RAM for llamacpp, so a discrete box is
+    # budgeted from MemAvailable rather than from its card.
+    from control_plane.deploy.flags import RUNTIMES as _RUNTIMES
+
     budgets, excluded, live_reason = livefit.allocatable_map(
-        ctx.deps.registry, [n.node_id for n in plan_nodes]
+        ctx.deps.registry,
+        [n.node_id for n in plan_nodes],
+        pool=getattr(_RUNTIMES.get(runtime), "memory_pool", "gpu"),
     )
     budgets, zero_excluded = livefit.drop_unbudgetable(plan_nodes, budgets)
     excluded = excluded + zero_excluded
@@ -2002,7 +2295,9 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     return _PlanOutcome(
         shape=shape,
         plan=plan,
-        measured_decode=_measured_decode(shape.model_id, plan_nodes, context_length),
+        measured_decode=_measured_decode(
+            shape.model_id, plan_nodes, context_length, runtime
+        ),
         fit=fit,
         fit_live=fit_live,
         capacity=capacity,
@@ -2024,6 +2319,8 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         engine_options=engine_options,
         original_window=original_window,
         native_window=native_window,
+        runtime_supported=runtime_ok,
+        runtime_unsupported_reason=runtime_unsupported_reason,
     )
 
 
@@ -2127,6 +2424,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             {
                 "cluster_id": settings.cluster_id,
                 "coordinator": settings.coordinator_node_id,
+                # The build every node row's `build_skew` was compared with,
+                # so a screen can say what the node differs FROM. Null when
+                # this process cannot establish its own build.
+                "build": _coordinator_build() or None,
+                # Every feature an agent of this build reports when healthy;
+                # a node row whose `features` lacks one is missing it.
+                "agent_features": list(AGENT_FEATURES),
                 "nodes": [
                     serialize.node_payload(
                         n, labels.get(n.profile.node_id), _coordinator_build()
@@ -3001,6 +3305,148 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "reach_failed",
             )
         return JSONResponse(serialize.plain(result))
+
+    @router.get("/api/links/health")
+    async def link_health(a: str | None = None, b: str | None = None) -> Response:
+        """What to change on each fabric port, per pair of healthy nodes.
+
+        Asks every healthy node's agent for its RDMA ports
+        (`GET /agent/links/health`) and compares the two ends of each pair
+        (`links/nichealth.py`). `?a=&b=` narrows it to one pair, which is what
+        the cluster rail asks for. Read-only and seconds: a handful of sysfs
+        reads and `ethtool` calls per node, then one end of each pair dials the
+        other's copy receiver once from each rail toward each fabric address
+        (`nichealth.probe_plan`, bounded and timed out) -- a TCP connect that is
+        closed as soon as it opens -- so a rail that is up and carries nothing
+        is a warning. The coordinator dials from itself; any other end is asked
+        through its agent (`POST /agent/links/probe`).
+        """
+        from control_plane.links import nichealth
+
+        try:
+            healthy = [n.profile.node_id for n in ctx.deps.registry.healthy_nodes()]
+        except Exception:
+            log.exception("registry unavailable")
+            healthy = []
+        if (a is None) != (b is None) or (a is not None and a == b):
+            return errors.error_response(
+                400, "Name both ends of one link: ?a=<node_id>&b=<node_id>.",
+                "invalid_request_error", "invalid_request",
+            )
+        wanted = sorted(healthy) if a is None else [n for n in (a, b) if n in healthy]
+        pairs = (
+            [(x, y) for i, x in enumerate(wanted) for y in wanted[i + 1 :]]
+            if a is None
+            else ([(a, b)] if len(wanted) == 2 else [])
+        )
+        involved = sorted({n for p in pairs for n in p})
+        health: dict[str, dict] = {}
+        unreadable: dict[str, str] = {}
+        if a is not None:
+            for n in (a, b):
+                if n not in healthy:
+                    unreadable[n] = f"'{n}' is not a healthy member of this cluster."
+
+        import httpx
+
+        async def _read(client, node_id: str) -> None:
+            try:
+                agent_url = ctx.deps.registry.agent_url(node_id)
+            except Exception:
+                agent_url = None
+            headers = _agent_headers(node_id)
+            if not agent_url:
+                unreadable[node_id] = f"No agent address is known for '{node_id}'."
+                return
+            if headers is None:
+                unreadable[node_id] = f"No agent credential is held for '{node_id}'."
+                return
+            try:
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/links/health", headers=headers
+                )
+            except Exception as exc:
+                unreadable[node_id] = (
+                    f"The node agent on '{node_id}' did not answer: "
+                    f"{errors.detail(exc, _redactor())}"
+                )
+                return
+            if res.status_code == 404:
+                unreadable[node_id] = (
+                    f"The node agent on '{node_id}' has no fabric settings route, so it "
+                    "runs a build from before they were read. Upgrade that node."
+                )
+                return
+            try:
+                res.raise_for_status()
+                payload = res.json()
+            except Exception as exc:
+                unreadable[node_id] = (
+                    f"The node agent on '{node_id}' did not answer: "
+                    f"{errors.detail(exc, _redactor())}"
+                )
+                return
+            if isinstance(payload, dict):
+                health[node_id] = payload
+
+        async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+            await asyncio.gather(*(_read(client, n) for n in involved))
+
+            coordinator = getattr(ctx.settings, "coordinator_node_id", None)
+            reach: dict[tuple[str, str], nichealth.RailReach] = {}
+
+            async def _probe(client, a_id: str, b_id: str) -> None:
+                # The coordinator's own end probes from this process; it is
+                # on the host network and its agent would only be a detour.
+                prober, other = (b_id, a_id) if b_id == coordinator else (a_id, b_id)
+                local = nichealth.rails_from(health[prober])
+                targets = nichealth.probe_plan(local, nichealth.rails_from(health[other]))
+                if not targets:
+                    return
+                if prober == coordinator:
+                    results = await asyncio.to_thread(nichealth.probe_rails, targets, local)
+                    reach[(a_id, b_id)] = nichealth.RailReach(prober, other, tuple(results))
+                    return
+                agent_url = ctx.deps.registry.agent_url(prober)
+                headers = _agent_headers(prober)
+                try:
+                    res = await client.post(
+                        f"{agent_url.rstrip('/')}/agent/links/probe",
+                        headers=headers,
+                        json={"targets": [t.to_json() for t in targets]},
+                    )
+                    if res.status_code == 404:
+                        reach[(a_id, b_id)] = nichealth.RailReach(
+                            prober, other,
+                            unavailable=(
+                                f"The node agent on '{prober}' has no rail probe route, so "
+                                f"whether each rail carries traffic to '{other}' was not "
+                                "checked. Upgrade that node."
+                            ),
+                        )
+                        return
+                    res.raise_for_status()
+                    rows = res.json().get("results") or []
+                except Exception as exc:
+                    reach[(a_id, b_id)] = nichealth.RailReach(
+                        prober, other,
+                        unavailable=(
+                            f"The node agent on '{prober}' could not probe its rails: "
+                            f"{errors.detail(exc, _redactor())}"
+                        ),
+                    )
+                    return
+                reach[(a_id, b_id)] = nichealth.RailReach(
+                    prober, other,
+                    tuple(nichealth.ProbeResult.from_json(r) for r in rows if isinstance(r, dict)),
+                )
+
+            await asyncio.gather(
+                *(_probe(client, x, y) for x, y in pairs if x in health and y in health)
+            )
+        return JSONResponse(
+            nichealth.link_health_report(pairs, health, unreadable, time.time(), reach)
+        )
 
     # -- routing -----------------------------------------------------------
 
@@ -4394,6 +4840,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # on) and the trained one, so the UI can offer YaRN.
                 "native_window": out.native_window,
                 "original_window": out.original_window,
+                # Cache bytes per token at each KV width this image takes,
+                # over this model's 16-bit rate. Per model, because a packed
+                # layout's overhead depends on head_dim and its boundary
+                # layers on the layer count. A width refused for this
+                # geometry is absent.
+                "kv_dtype_ratios": _kv_dtype_ratios(out.shape),
                 # Whose choice the machines and the degrees were.
                 "placement": out.placement,
                 "degrees": out.degrees,
@@ -4544,11 +4996,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         }
 
         from control_plane import computeprobe, measurements
+        from control_plane.deploy.flags import budget_profile
         from control_plane.fit.calculator import bandwidth_ceiling_tps, prefill_floor_seconds
-        from control_plane.fit.kv import kv_cache_bytes, kv_divisor
+        from control_plane.fit.kv import kv_cache_bytes, kv_cache_bytes_per_rank
 
+        # The machines as the runtime sees them, like the plan: a llamacpp
+        # launch decodes from host RAM, never at the card's bandwidth.
+        runtime = base.get("runtime") or "vllm"
         try:
-            profiles = [n.profile for n in ctx.deps.registry.healthy_nodes()]
+            profiles = [
+                budget_profile(runtime, n.profile)
+                for n in ctx.deps.registry.healthy_nodes()
+            ]
         except Exception:
             log.exception("registry unavailable while sizing concurrency")
             profiles = []
@@ -4582,7 +5041,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             bw = min(rates) if rates else 0.0
             bandwidth = bw if bandwidth is None else min(bandwidth, bw)
             kv_read = kv_cache_bytes(shape, context, 1, out.kv_dtype)
-            kv_seq = kv_read / kv_divisor(shape, plan)
+            # One sequence's cache on the busiest rank, boundary layers
+            # included -- the same figure the fit gate charged.
+            kv_seq = kv_cache_bytes_per_rank(shape, plan, context, 1, out.kv_dtype)
             fixed = fit.breakdown.total - fit.breakdown.kv_cache
             if kv_seq > 0:
                 wall = max(0, int((fit.usable_per_node - fixed) // kv_seq))
@@ -5007,13 +5468,19 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
 
         runtime = payload.get("runtime") or "vllm"
-        supported_by = getattr(ctx.deps.resolver, "supported_by", None)
-        if callable(supported_by):
-            ok, reason = await asyncio.to_thread(supported_by, shape, runtime)
-            if not ok:
-                return errors.error_response(
-                    400, reason, "invalid_request_error", "runtime_unsupported"
-                )
+        # The verdict `_plan_and_fit` reached on the machines it placed this
+        # on, each judged by the image it runs -- along with the GPU check,
+        # which refused there or left a machine out. Not asked again here:
+        # `supported_by` without the machines answers for the default image,
+        # and would refuse an architecture only the placed machine's image
+        # loads.
+        if not out.runtime_supported:
+            return errors.error_response(
+                400,
+                out.runtime_unsupported_reason or f"{runtime} cannot load this model",
+                "invalid_request_error",
+                "runtime_unsupported",
+            )
 
         # A shape the launcher cannot start, ahead of the runtime question
         # because it is the more specific one: vLLM shards fine, and this is
@@ -5052,7 +5519,27 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
 
         # If the verdict is WONT_FIT the launch is refused with the reason.
-        # Nothing is started.
+        # Nothing is started. For a host-pool runtime (llamacpp) the LIVE
+        # verdict is that verdict: its static budget is 0 by design -- there
+        # is no host-RAM nameplate, see `flags.budget_profile` -- so judging it
+        # statically refused every llamacpp launch everywhere, a Pi and the
+        # RTX box alike, while /api/plan (which reads the live one) said fits.
+        from control_plane.deploy.flags import runtime_spec
+
+        host_pool = runtime_spec(runtime).memory_pool == "host"
+        if host_pool and out.fit_live is None:
+            return errors.error_response(
+                400,
+                f"{runtime} serves from host memory, and there is no live reading "
+                f"of host memory on {', '.join(plan.node_ids) or 'these machines'}. "
+                f"derate never invents a host budget: wait for the next sample, "
+                f"and make sure the machine's agent is current (an agent older "
+                f"than host-pool budgeting does not report host memory).",
+                "invalid_request_error",
+                "host_memory_unmeasured",
+            )
+        if host_pool:
+            fit = out.fit_live
         if fit.verdict is Verdict.WONT_FIT:
             return JSONResponse(
                 status_code=400,
@@ -5122,7 +5609,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # above distinguishable from this.
         live = out.fit_live
         allow_over = bool(payload.get(_OVERRIDE_PARAM))
-        if live is not None and live.verdict is Verdict.WONT_FIT and not allow_over:
+        if (
+            live is not None and live.verdict is Verdict.WONT_FIT and not allow_over
+            and not host_pool
+        ):
             return JSONResponse(
                 status_code=409,
                 content={
@@ -5382,22 +5872,24 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     # -- Benchmarks (gateway/bench.py): a throwaway copy, measured, stopped. --
 
-    def _bench_describe(node_ids: list[str]) -> tuple[str | None, str | None]:
-        gpu = None
+    def _bench_describe(
+        node_ids: list[str], runtime: str
+    ) -> tuple[str | None, str | None]:
+        """The GPU and image version of the machine the benchmark ran on --
+        the version of the image THAT machine runs for *runtime*, never the
+        default image's. None when that image has no probe."""
+        from control_plane import measurements
+
         for node_id in node_ids:
             node = ctx.deps.registry.get_node(node_id)
-            hw = getattr(node, "hardware", node)
-            gpu = getattr(hw, "gpu_name", None) or gpu
+            profile = getattr(node, "profile", None)
+            gpu = getattr(profile, "gpu_name", None)
             if gpu:
-                break
-        try:
-            from control_plane.resolver import support
-
-            probed = support.probed("vllm")
-            version = getattr(probed, "version", None) if probed else None
-        except Exception:
-            version = None
-        return gpu, version
+                version = measurements.image_version(
+                    runtime, getattr(profile, "arch", "") or ""
+                )
+                return gpu, version or None
+        return None, None
 
     def _bench_done(record) -> None:
         """A finished benchmark is the result of every profile with its setup."""
@@ -5804,6 +6296,177 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
         return Response(status_code=204)
 
+    # Copies of a cached model from the coordinator to another node, over the
+    # fabric when there is one (control_plane/transfer). Process-local like the
+    # prefetches above, so /api/activity lists them without fan-out. The audit
+    # action is DOWNLOAD_CHANGED on purpose: a new AuditAction member would be a
+    # frozen-contract edit, and "op" already says which kind of change it was.
+
+    def _transfers_unavailable() -> JSONResponse:
+        return errors.error_response(
+            503, "Copies between nodes are not available on this gateway.",
+            "server_error", "transfers_unavailable",
+        )
+
+    @router.post("/api/transfers")
+    async def start_transfer(request: Request) -> JSONResponse:
+        from control_plane.transfer.jobs import ReplicateRefused
+        from control_plane.transfer.protocol import DEFAULT_STREAMS
+
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        folder = body.get("folder")
+        node_id = body.get("node_id")
+        streams = body.get("streams")
+        if not isinstance(node_id, str) or not node_id.strip():
+            return errors.error_response(
+                400, "node_id is required.", "invalid_request_error", "invalid_request"
+            )
+        if ctx.deps.transfers is None:
+            return _transfers_unavailable()
+        try:
+            job = await asyncio.to_thread(
+                ctx.deps.transfers.start, folder, node_id.strip(),
+                streams=streams or DEFAULT_STREAMS,
+            )
+        except ReplicateRefused as exc:
+            return errors.error_response(exc.status, exc.sentence, "invalid_request_error", exc.code)
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "transfer", job["transfer_id"],
+            after={"op": "transfer_start", "folder": folder, "node_id": node_id.strip(),
+                   "streams": job["streams"]},
+        )
+        return JSONResponse(job, status_code=202)
+
+    @router.get("/api/transfers")
+    async def list_transfers() -> JSONResponse:
+        if ctx.deps.transfers is None:
+            return JSONResponse({"transfers": []})
+        return JSONResponse({"transfers": await asyncio.to_thread(ctx.deps.transfers.list)})
+
+    @router.delete("/api/transfers/{transfer_id}")
+    async def cancel_transfer(transfer_id: str, request: Request) -> Response:
+        if ctx.deps.transfers is None:
+            return _transfers_unavailable()
+        from control_plane.transfer.jobs import CancelRefused
+
+        try:
+            cancelled = await asyncio.to_thread(ctx.deps.transfers.cancel, transfer_id)
+        except CancelRefused as exc:
+            return errors.error_response(
+                409, exc.sentence, "invalid_request_error", "transfer_verifying"
+            )
+        if not cancelled:
+            return errors.error_response(
+                404, f"No copy '{transfer_id}' is running here.",
+                "invalid_request_error", "transfer_not_found",
+            )
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "transfer", transfer_id,
+            after={"op": "transfer_cancel"},
+        )
+        return Response(status_code=204)
+
+    # Background copies (control_plane/transfer/replication.py). The monitor
+    # PROPOSES; nothing is copied or deleted until one of these approvals,
+    # which must name the exact deletions the operator was shown.
+
+    def _replication_unavailable() -> JSONResponse:
+        return errors.error_response(
+            503, "Background copies are not available on this gateway.",
+            "server_error", "replication_unavailable",
+        )
+
+    def _replication_pair(body: dict) -> tuple[str, str] | JSONResponse:
+        folder, node_id = body.get("folder"), body.get("node_id")
+        if not isinstance(folder, str) or not folder or not isinstance(node_id, str) or not node_id:
+            return errors.error_response(
+                400, "folder and node_id are required.", "invalid_request_error", "invalid_request"
+            )
+        return folder, node_id
+
+    def _kick_replication() -> None:
+        async def run() -> None:
+            try:
+                await ctx.replication.tick()
+            except Exception:
+                log.exception("replication tick after an approval failed")
+
+        asyncio.get_running_loop().create_task(run())
+
+    @router.get("/api/replication")
+    async def replication_state() -> JSONResponse:
+        if ctx.replication is None:
+            return _replication_unavailable()
+        return JSONResponse(await asyncio.to_thread(ctx.replication.state))
+
+    @router.post("/api/replication/approve")
+    async def approve_replication(request: Request) -> JSONResponse:
+        from control_plane.transfer.replication import PlanChanged, ProposalNotFound
+
+        if ctx.replication is None:
+            return _replication_unavailable()
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        pair = _replication_pair(body)
+        if isinstance(pair, JSONResponse):
+            return pair
+        evict = body.get("evict", [])
+        if not isinstance(evict, list) or not all(isinstance(e, str) for e in evict):
+            return errors.error_response(
+                400, "evict must be the list of folders you were shown, [] for none.",
+                "invalid_request_error", "invalid_request",
+            )
+        try:
+            row = await asyncio.to_thread(ctx.replication.approve, pair[0], pair[1], evict)
+        except ProposalNotFound as exc:
+            return errors.error_response(
+                404, str(exc), "invalid_request_error", "replication_proposal_not_found"
+            )
+        except PlanChanged as exc:
+            return errors.error_response(
+                409, str(exc), "invalid_request_error", "replication_plan_changed"
+            )
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "replica", f"{pair[1]}/{pair[0]}",
+            after={"op": "replica_approve", "folder": pair[0], "node_id": pair[1],
+                   "evict": sorted(evict), "bytes": row["bytes"]},
+        )
+        _kick_replication()
+        return JSONResponse(row)
+
+    @router.post("/api/replication/dismiss")
+    async def dismiss_replication(request: Request) -> Response:
+        if ctx.replication is None:
+            return _replication_unavailable()
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        pair = _replication_pair(body)
+        if isinstance(pair, JSONResponse):
+            return pair
+        if not await asyncio.to_thread(ctx.replication.dismiss, pair[0], pair[1]):
+            return errors.error_response(
+                404, f"No proposal to copy {pair[0]} to {pair[1]}.",
+                "invalid_request_error", "replication_proposal_not_found",
+            )
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "replica", f"{pair[1]}/{pair[0]}",
+            after={"op": "replica_dismiss", "folder": pair[0], "node_id": pair[1]},
+        )
+        return Response(status_code=204)
+
     @router.get("/api/activity")
     async def activity() -> JSONResponse:
         """What is arriving: transfers in flight, and models still starting.
@@ -5870,6 +6533,32 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             }
             for job in hub_jobs
         )
+        # Copies to other nodes, in the same row shape.
+        if ctx.deps.transfers is not None:
+            try:
+                copies = ctx.deps.transfers.list()
+            except Exception:
+                log.exception("reading copies between nodes failed while reading activity")
+                copies = []
+            # The link the copy chose, as it describes itself ("RoCE, 2 × 200 Gb/s").
+            downloads.extend(
+                {
+                    "pull_id": t["transfer_id"],
+                    "provider_id": None,
+                    "provider": f"copy to {t['node_id']}" + (f" over {t['link']}" if t.get("link") else ""),
+                    "model": t["repo_id"],
+                    "completed": t["completed"],
+                    "total": t["total"],
+                    "status": t["status"],
+                    "error": t["error"],
+                    "done": t["status"] == "done",
+                    "kind": "transfer",
+                    "transfer_id": t["transfer_id"],
+                    "rate_bps": t["rate_bps"],
+                    "eta_s": t["eta_s"],
+                }
+                for t in copies
+            )
 
         try:
             deployments = ctx.deps.deployments.list()
@@ -5944,7 +6633,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             del _LAUNCH_SEEN[stale]
 
         launches.sort(key=lambda item: item["since"])
-        return JSONResponse({"downloads": downloads, "launches": launches})
+        body: dict = {"downloads": downloads, "launches": launches}
+        if ctx.replication is not None:
+            try:
+                body["replication"] = {"awaiting": await asyncio.to_thread(ctx.replication.awaiting)}
+            except Exception:
+                log.exception("reading background copy proposals failed while reading activity")
+        return JSONResponse(body)
 
     # -- metrics -----------------------------------------------------------
 
@@ -6252,6 +6947,51 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 f"{errors.detail(exc, _redactor())}"
             )
 
+    async def _agent_copy_receiver(node_id: str, agent_url: str) -> dict:
+        """Whether a node can take a copy, read before anybody clicks one.
+
+        `available` False carries the sentence the copy would have failed with:
+        an agent with no capacity route predates copies (404), a 503 is the
+        agent's own refusal (no receiver on 47101, no cache folder), and a
+        transport error is that error. `free` is the cache filesystem's free
+        bytes when the agent could say. Never raises.
+        """
+        import httpx
+
+        def _no(reason: str) -> dict:
+            return {"available": False, "reason": reason, "free": None}
+
+        try:
+            async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/transfers/capacity",
+                    headers=_agent_headers(node_id),
+                )
+        except Exception as exc:
+            log.warning("copy capacity read failed for %s: %s", node_id, exc)
+            return _no(f"{node_id} did not answer: {errors.detail(exc, _redactor())}")
+        if res.status_code == 404:
+            return _no(
+                f"{node_id} runs an older build without the copy receiver; upgrade it"
+            )
+        if res.status_code != 200:
+            try:
+                detail = res.json().get("detail")
+            except Exception:
+                detail = None
+            if not isinstance(detail, str) or not detail:
+                detail = f"its agent answered HTTP {res.status_code}"
+            return _no(f"{node_id}: {detail}")
+        try:
+            free = res.json().get("free")
+        except Exception as exc:
+            return _no(f"{node_id} did not answer: {errors.detail(exc, _redactor())}")
+        return {
+            "available": True,
+            "reason": None,
+            "free": free if isinstance(free, int) else None,
+        }
+
     @router.get("/api/storage")
     async def storage() -> Response:
         """Disk across the cluster, and what this product is spending it on.
@@ -6306,8 +7046,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         caches = list(
             await asyncio.gather(*(_agent_model_cache(n, u) for n, u in targets))
         )
-        for row, cache in zip(measured, caches):
+        receivers = list(
+            await asyncio.gather(*(_agent_copy_receiver(n, u) for n, u in targets))
+        )
+        for row, cache, receiver in zip(measured, caches, receivers):
             row["models"] = cache
+            row["copy_receiver"] = receiver
+        for row in no_agent:
+            row["copy_receiver"] = {
+                "available": False,
+                "reason": f"No agent URL for node '{row['node_id']}'.",
+                "free": None,
+            }
         node_rows = sorted(measured + no_agent, key=lambda r: r["node_id"])
 
         # The retention horizons come from the module that enforces them, so

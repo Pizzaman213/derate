@@ -151,9 +151,16 @@ def test_reemitted_row_replaces(tmp_path):
     assert [r[0] for r in rows] == [4]
 
 
+#: The last commit whose archive predates inbound auth (no key_id anywhere).
+#: Pinned: HEAD carried that schema when this test was written and has carried
+#: the current one since c68f06d, so reading HEAD migrated nothing and the
+#: re-roll assertion failed against correct code.
+_V1_COMMIT = "ca4908ab4ef9f80898f0d4352dd1b13a5a07d288"
+
+
 def _v1_schema() -> str:
     src = subprocess.run(
-        ["git", "show", "HEAD:control_plane/telemetry/archive.py"],
+        ["git", "show", f"{_V1_COMMIT}:control_plane/telemetry/archive.py"],
         cwd=ROOT, capture_output=True, text=True, check=True,
     ).stdout
     start = src.index('_SCHEMA = """') + len('_SCHEMA = """')

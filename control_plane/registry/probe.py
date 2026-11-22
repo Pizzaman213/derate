@@ -17,6 +17,7 @@ import logging
 import re
 import socket
 import subprocess
+import threading
 from pathlib import Path
 
 from control_plane.contracts import DeviceClass, NodeProfile
@@ -346,14 +347,147 @@ def local_arch(machine: str | None = None) -> str:
     return _ARCH.get(m, "")
 
 
+#: Where the kernel lists uverbs devices; each one is a `/dev/infiniband/
+#: uverbsN` on the host. Read rather than `/dev` alone because the agent can
+#: run in a container that was never handed the device node, while sysfs is
+#: the host's either way.
+INFINIBAND_VERBS = Path("/sys/class/infiniband_verbs")
+INFINIBAND_DEV = Path("/dev/infiniband")
+
+
+def local_infiniband(
+    verbs: Path = INFINIBAND_VERBS, dev: Path = INFINIBAND_DEV
+) -> bool:
+    """Whether `docker run --device /dev/infiniband` can succeed here: a uverbs
+    device in sysfs, or the device directory itself. Never raises."""
+    try:
+        if verbs.is_dir() and any(e.name.startswith("uverbs") for e in verbs.iterdir()):
+            return True
+        return dev.exists()
+    except OSError:
+        return False
+
+
+#: The host memory measurement. Each thread copies its own buffer onto its
+#: own second one, so a thread holds 2x this; 64 MiB is above the L3 of any
+#: desktop part and of one CCD of a server part, so the copy reaches DRAM.
+#: Measured on the RTX 3090 box (Ryzen 7 5700X, dual-channel DDR4): ~47 GB/s
+#: at 2 threads, the same figure 256 MiB buffers gave, in ~0.5 s total.
+HOST_BW_BUFFER = 64 * 2**20
+#: Thread counts tried, best kept. Two saturate a dual-channel desktop; a
+#: many-channel server would want more, so there the figure is a floor.
+HOST_BW_THREADS = (1, 2, 4)
+#: Never hold more than this, nor more than an eighth of what the kernel says
+#: is available: the probe re-runs on a box that may be serving from host RAM.
+HOST_BW_MAX_BYTES = 512 * 2**20
+#: Stop adding thread counts once this much time has gone.
+HOST_BW_BUDGET_S = 1.5
+_HOST_BW_REPS = 4
+_HOST_BW_TRIALS = 3
+
+
+def measure_host_bandwidth(
+    buffer: int = HOST_BW_BUFFER,
+    threads: tuple[int, ...] = HOST_BW_THREADS,
+    max_bytes: int = HOST_BW_MAX_BYTES,
+    available: int | None = None,
+) -> float | None:
+    """Host memory bandwidth in GB/s, read+write, or None when it could not be
+    measured within the memory allowed.
+
+    A threaded `memmove` -- ctypes releases the GIL, so the threads copy in
+    parallel -- counting each byte copied twice (read and write), best of
+    several trials per thread count. Standard library only: the agent image
+    has no numpy. On the 3090 box it read 46.3 GB/s while llama.cpp decoded a
+    10.82 GB Q2_K checkpoint at 3.91 tok/s, i.e. ~42.3 GB/s of weight reads,
+    so the figure is the one a CPU decode actually runs against.
+    """
+    import ctypes
+    import os
+    import time
+
+    if available is None:
+        from .telemetry import read_host_memory
+
+        host = read_host_memory()
+        available = host.available if host is not None else 0
+    allowed = min(max_bytes, max(0, available) // 8)
+    cpus = os.cpu_count() or 1
+    counts = sorted({t for t in threads if 1 <= t <= cpus and 2 * buffer * t <= allowed})
+    if not counts:
+        return None
+    started = time.perf_counter()
+    bufs = [
+        (ctypes.create_string_buffer(buffer), ctypes.create_string_buffer(buffer))
+        for _ in range(counts[-1])
+    ]
+    for src, dst in bufs:
+        ctypes.memset(src, 1, buffer)
+        ctypes.memset(dst, 0, buffer)
+
+    def copy(i: int) -> None:
+        src, dst = bufs[i]
+        for _ in range(_HOST_BW_REPS):
+            ctypes.memmove(dst, src, buffer)
+
+    best = 0.0
+    for count in counts:
+        if time.perf_counter() - started > HOST_BW_BUDGET_S:
+            break
+        for _ in range(_HOST_BW_TRIALS):
+            workers = [threading.Thread(target=copy, args=(i,)) for i in range(count)]
+            t0 = time.perf_counter()
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+            elapsed = time.perf_counter() - t0
+            if elapsed > 0:
+                best = max(best, count * _HOST_BW_REPS * buffer * 2 / elapsed / 1e9)
+    return round(best, 1) if best > 0 else None
+
+
+_host_bw_lock = threading.Lock()
+_host_bw: list[float | None] = []
+
+
+def local_host_bandwidth(device_class: DeviceClass, measure=measure_host_bandwidth) -> float | None:
+    """This machine's host memory bandwidth, for a node whose host-pool runtime
+    would decode out of host RAM: a CPU node, or a discrete box with its card
+    cleared. None for every other class -- a GB10's pool already has its
+    bandwidth in `memory_bandwidth_gbps`, and the GPU-pool math never reads
+    this.
+
+    Measured ONCE per process and then repeated: the probe re-runs on a timer,
+    a second reading would differ by noise and publish a "hardware changed"
+    every interval, and copying memory on a box that is decoding would both
+    slow the server and read low. Never raises."""
+    if device_class not in (DeviceClass.CPU, DeviceClass.DISCRETE):
+        return None
+    with _host_bw_lock:
+        if not _host_bw:
+            try:
+                _host_bw.append(measure())
+            except Exception as exc:  # a probe never raises
+                log.debug("host bandwidth measurement failed: %s", exc)
+                _host_bw.append(None)
+        return _host_bw[0]
+
+
 def probe_local(*args, **kwargs) -> NodeProfile:
-    """`_probe_local`, with the architecture stamped on whichever branch
-    answered. One place rather than five constructors, and it never raises."""
+    """`_probe_local`, with the architecture, the InfiniBand answer and the
+    host memory bandwidth stamped on whichever branch answered. One place
+    rather than five constructors, and it never raises."""
     import dataclasses
 
     profile = _probe_local(*args, **kwargs)
     try:
-        return dataclasses.replace(profile, arch=local_arch())
+        return dataclasses.replace(
+            profile,
+            arch=local_arch(),
+            infiniband=local_infiniband(),
+            host_memory_bandwidth_gbps=local_host_bandwidth(profile.device_class),
+        )
     except Exception:  # pragma: no cover - a probe never raises
         return profile
 

@@ -128,7 +128,7 @@ class BenchRunner:
     def __init__(
         self, *, launcher: Callable[[], Launcher | None], deployments,
         directory: Path | None = None, transport: httpx.AsyncBaseTransport | None = None,
-        describe: Callable[[list[str]], tuple[str | None, str | None]] | None = None,
+        describe: Callable[[list[str], str], tuple[str | None, str | None]] | None = None,
         ready_poll_s: float = READY_POLL_S, ready_timeout_s: float = READY_TIMEOUT_S,
         on_done: Callable[[measurements.BenchRecord], None] | None = None,
     ) -> None:
@@ -241,7 +241,10 @@ class BenchRunner:
                                    or record.node_ids)
             if self._describe is not None:
                 try:
-                    record.gpu_name, record.runtime_version = self._describe(record.node_ids)
+                    record.gpu_name, record.runtime_version = self._describe(
+                        record.node_ids,
+                        body.get("runtime") or record.runtime or "vllm",
+                    )
                 except Exception:
                     log.debug("bench describe failed", exc_info=True)
             self._save(record)

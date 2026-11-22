@@ -13,9 +13,10 @@ a fault marker tell an operator more than a row that vanished.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Sequence
 from urllib.parse import urlsplit
 
 from control_plane.contracts import (
@@ -77,6 +78,8 @@ from .serde import (
     temp_reading,
 )
 from .telemetry import (
+    HOST_POOL_CLASSES,
+    POOL_HOST,
     TelemetryStore,
     TelemetrySample,
     allocatable_bytes,
@@ -200,6 +203,10 @@ class Registry:
         self._telemetry = TelemetryStore()
         self._tasks: list[asyncio.Task] = []
         self._running = False
+        # What the coordinator's own agent can do. The local node is never
+        # dialled over HTTP (check_health answers for it in-process), so the
+        # one agent the registry cannot ask is handed over by startup.py.
+        self._local_features: Callable[[], Sequence[str]] | None = None
 
         self._load_roster()
 
@@ -1267,6 +1274,8 @@ class Registry:
             state = self._members.get(node_id)
             if state is not None:
                 state.build = build_id()
+                if self._local_features is not None:
+                    state.features = tuple(self._local_features())
             return True
         url = self._agent_urls.get(node_id)
         if not url:
@@ -1278,6 +1287,7 @@ class Registry:
                 headers=self._agent_headers(node_id),
             )
             self._record_build(node_id, body)
+            self._record_features(node_id, body)
             self._last_error.pop(node_id, None)
             return True
         except ProbeFailed as exc:
@@ -1301,6 +1311,38 @@ class Registry:
         if build != state.build:
             log.info("node %s is running build %s", node_id, build)
         state.build = build
+
+    def set_local_features(self, read: Callable[[], Sequence[str]]) -> None:
+        """How to ask the coordinator's own agent what it can do."""
+        self._local_features = read
+
+    def _record_features(self, node_id: str, body: object) -> None:
+        """Store what the node said it can do -- or that it did not say.
+
+        The opposite of ``_record_build``'s rule, deliberately. A build id
+        going missing tells nothing about the build, but a features list going
+        missing is exactly what a node rolled back to an older agent looks
+        like, and keeping the last list would offer it as a copy target for a
+        route it no longer has. So absence is recorded as None (unknown), and
+        a malformed value is too; it is never an empty list, which would claim
+        the agent answered and can do nothing.
+        """
+        state = self._members.get(node_id)
+        if state is None or not isinstance(body, dict):
+            return
+        raw = body.get("features")
+        features = (
+            tuple(dict.fromkeys(str(f) for f in raw if isinstance(f, str) and f))
+            if isinstance(raw, list)
+            else None
+        )
+        if features != state.features:
+            log.info(
+                "node %s reports features %s",
+                node_id,
+                ", ".join(features) if features is not None else "(none: older agent)",
+            )
+        state.features = features
 
     async def refresh_profile(self, node_id: str) -> bool:
         """Re-read one member's hardware. True when the stored profile changed.
@@ -1341,6 +1383,21 @@ class Registry:
                 fresh.node_id,
             )
             return False
+        if node_id != self.local_node_id and fresh.address != state.profile.address:
+            agent_host = urlsplit(self._agent_urls.get(node_id, "")).hostname
+            if not _same_host(fresh.address, agent_host):
+                # The address is what the cluster SSHes to, launches on and
+                # probes images through, so an agent may only move it to the
+                # machine it answers from -- the rule handle_join applies.
+                log.warning(
+                    "refresh of %s reported address %s, which is not its agent "
+                    "host %s; keeping %s",
+                    node_id,
+                    fresh.address,
+                    agent_host,
+                    state.profile.address,
+                )
+                fresh = dataclasses.replace(fresh, address=state.profile.address)
         if not profile_supersedes(fresh, state.profile) or fresh == state.profile:
             return False
         # See agent.py: device_class alone is the field a driver upgrade does
@@ -1447,12 +1504,18 @@ class Registry:
         ):
             # On unified memory a model that overcommits does not fail to
             # allocate, it pushes the OS into swap and takes throughput with it.
+            # A discrete box reports host RAM too now (for llamacpp's budget),
+            # and there swapping says nothing about the GPU's pool.
             log.warning(
-                "node %s is swapping (%.1f GiB, up %.1f GiB): the unified pool "
-                "is overcommitted and decode throughput will collapse",
+                "node %s is swapping (%.1f GiB, up %.1f GiB): %s",
                 node_id,
                 sample.swap_used / 1024**3,
                 (sample.swap_used - previous.swap_used) / 1024**3,
+                "the unified pool is overcommitted and decode throughput will "
+                "collapse"
+                if state.profile.device_class.unified_memory
+                else "host memory is overcommitted, and anything serving from "
+                "it will slow down",
             )
         self._telemetry.record(node_id, sample)
         state.memory_used = sample.memory_used
@@ -1527,7 +1590,9 @@ class Registry:
             return_exceptions=True,
         )
 
-    def available_memory(self, node_id: str, guardrail: float = DEFAULT_GUARDRAIL) -> int:
+    def available_memory(
+        self, node_id: str, guardrail: float = DEFAULT_GUARDRAIL, pool: str = "gpu"
+    ) -> int:
         """Live allocatable bytes on one node. What the fit calculator should gate on.
 
         ``NodeProfile.usable_memory`` is the static ceiling this hardware could
@@ -1535,6 +1600,9 @@ class Registry:
         system is running in the same pool, so a fit check against it approves
         models that will not load. This is the same question asked of the
         machine as it is right now.
+
+        ``pool`` is the runtime's ``RuntimeSpec.memory_pool``; see
+        ``telemetry.allocatable_bytes`` for what each one answers.
         """
         state = self._members.get(node_id)
         if state is None:
@@ -1544,10 +1612,11 @@ class Registry:
             self._telemetry.latest(node_id),
             guardrail=guardrail,
             host_reserve=self.config.host_memory_reserve,
+            pool=pool,
         )
 
     def allocatable_or_none(
-        self, node_id: str, guardrail: float = DEFAULT_GUARDRAIL
+        self, node_id: str, guardrail: float = DEFAULT_GUARDRAIL, pool: str = "gpu"
     ) -> int | None:
         """:meth:`available_memory`, with absence spelled out instead of filled in.
 
@@ -1574,6 +1643,7 @@ class Registry:
             self._telemetry.latest(node_id),
             guardrail=guardrail,
             host_reserve=self.config.host_memory_reserve,
+            pool=pool,
         )
 
     def memory_report(self, node_id: str) -> dict | None:
@@ -1602,6 +1672,16 @@ class Registry:
             "host_reserve": self.config.host_memory_reserve,
             "swap_used": sample.swap_used if sample else 0,
             "allocatable": self.available_memory(node_id),
+            # What a host-pool runtime (llamacpp) would be budgeted against:
+            # the same figure `allocatable_or_none(pool="host")` hands the fit
+            # gate. None where host RAM is not a pool of its own (a unified
+            # part, an unidentified machine) and where nothing measured it --
+            # never a GPU figure standing in for it.
+            "host_allocatable": (
+                self.allocatable_or_none(node_id, pool=POOL_HOST)
+                if profile.device_class in HOST_POOL_CLASSES
+                else None
+            ),
             "stale": not state.healthy,
         }
 

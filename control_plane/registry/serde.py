@@ -7,6 +7,7 @@ must be ignorable and a missing one must have a defined default.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 
 from control_plane.contracts import DeviceClass, GpuProcess, NodeProfile, NodeState
@@ -62,7 +63,21 @@ def profile_from_dict(data: dict) -> NodeProfile:
         # the two names an image platform can be; anything else from a peer is
         # unknown too, because it ends up choosing which image a launch runs.
         arch=a if (a := str(data.get("arch", "") or "")) in ("amd64", "arm64") else "",
+        # Same rule: absent or anything but a real boolean is "unknown", which
+        # keeps the device in the recipe -- what every launch did before.
+        infiniband=ib if isinstance(ib := data.get("infiniband"), bool) else None,
+        host_memory_bandwidth_gbps=_host_bandwidth(data.get("host_memory_bandwidth_gbps")),
     )
+
+
+def _host_bandwidth(value: object) -> float | None:
+    """A peer's host bandwidth, or None: absent (an older agent), not a real
+    number, or not a positive finite one is unmeasured, never 0 -- a 0 would
+    read as a machine that cannot move memory."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value > 0 else None
 
 
 def power_reading(state: NodeState) -> float | None:

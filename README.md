@@ -50,7 +50,7 @@ under Docker Desktop, `--gpus` needs the NVIDIA container toolkit, and
 
    ```bash
    f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh -o "$f" \
-     && echo "0ca3bc3d3e86e6e0382b796525c2daa696b2c772fc3394f48646c3de6f0b807c  $f" | sha256sum -c - \
+     && echo "88087ac4e07f64a59081d707429918cf23c49e4ccb51129bd9170e66aa62b5af  $f" | sha256sum -c - \
      && sh "$f"
    ```
 
@@ -126,6 +126,13 @@ on — a node that joins, reports healthy, and shows zeros. `--pid=host`
 because on GB10 per-process accounting is the only memory number nvidia-smi
 will still give you, and it only counts processes in its own namespace.
 `install.sh` passes both for you.
+
+`--fabric-setup` is an opt-in that reaches past the container: on a machine
+with RDMA rails it prints exactly what will change and asks, then sets MTU
+9000, maximum rings, `rx_cqe_compress` and one `10.100.(152+i).<LAN
+octet>/24` address per rail, and installs a systemd timer that keeps them that
+way. [`docs/guide/install.md`](docs/guide/install.md) has the details;
+`--leave` undoes it.
 
 ## One endpoint
 

@@ -13,6 +13,7 @@
 //                                       /chat /usage /settings
 //   ...and the screen's own subject     /models/<model id>
 //                                       /usage/requests/<id>  /usage/keys/<id>
+//   ...and a screen's section           /usage/keys  /settings/storage
 //   the QUERY names what is selected    ?node= ?link= ?dep= ?open= ?ctx= ?seq=
 //   ...and, on a model, the shape it is    ?on= ?tp= ?pp= ?ep=
 //   being planned at
@@ -91,10 +92,31 @@ export const REQUEST_WINDOWS = ['24h', '7d', '30d'] as const
 export const USAGE_SUBS = ['overview', 'requests', 'rate-limits', 'keys'] as const
 export type UsageSub = (typeof USAGE_SUBS)[number]
 
+/** The sections of /settings, in nav order. Unlike /usage there is no bare
+ *  default: `/settings` (section null) opens Instance when the address bar
+ *  names a node and Connection otherwise (tabs/SettingsTab.tsx), so every
+ *  named section is written into the path, Connection included. */
+export const SETTINGS_SECTIONS = [
+  'connection',
+  'nodes',
+  'instance',
+  'storage',
+  'providers',
+  'policy',
+  'admins',
+  'audit',
+  'appearance',
+  'about',
+] as const
+export type SettingsSection = (typeof SETTINGS_SECTIONS)[number]
+
 export interface Route {
   dest: Dest
   /** Which pane of `/usage`: `overview` on the bare path, null off `/usage`. */
   sub: UsageSub | null
+  /** Which section of `/settings` -- `/settings/storage`. Null on the bare
+   *  path (the tab picks) and off `/settings`. */
+  section: SettingsSection | null
   /** The model open in the models tab's detail pane. Only on `/models`. */
   model: string | null
   /** The key whose detail page is open. Only on `/usage/keys`. */
@@ -342,6 +364,10 @@ export function parse(url: string): Route {
         ? (segments[1] as UsageSub)
         : params.get('dep') ? 'rate-limits' : 'overview'
       : null
+  const section: SettingsSection | null =
+    dest === 'settings' && (SETTINGS_SECTIONS as readonly string[]).includes(segments[1] ?? '')
+      ? (segments[1] as SettingsSection)
+      : null
   // Single slugs, unlike a model id: only the segment after the pane is the
   // subject, and anything past it is a typo to drop.
   const key = sub === 'keys' ? (segments[2] ?? null) : null
@@ -378,6 +404,7 @@ export function parse(url: string): Route {
   return {
     dest,
     sub,
+    section,
     model,
     key,
     node: params.get('node') || null,
@@ -419,6 +446,7 @@ export function href(route: Route): string {
     if (sub === 'keys' && route.key) path.push(encodeURIComponent(route.key))
     if (sub === 'requests' && route.request) path.push(encodeURIComponent(route.request))
   }
+  if (route.dest === 'settings' && route.section) path.push(route.section)
 
   const query: string[] = []
   const put = (key: string, value: string | null) => {

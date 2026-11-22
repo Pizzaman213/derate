@@ -1,0 +1,12 @@
+# Installed by `install.sh --fabric-setup`; removed by `install.sh --leave`.
+# Re-asserts MTU, rings, rx_cqe_compress and the fabric IPv4 on this machine's
+# RDMA rails (control_plane/links/fabric_setup.py), because NVIDIA Sync and
+# NetworkManager rewrite them. A converged machine runs no command at all.
+[Unit]
+Description=derate: assert the RDMA fabric settings
+Wants=network-online.target
+After=network-online.target NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 /usr/local/lib/derate/fabric_setup.py --apply --config /etc/derate/fabric.json --snapshot /var/lib/derate/fabric-snapshot.json

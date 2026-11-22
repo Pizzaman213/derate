@@ -1,0 +1,11 @@
+# Installed by `install.sh --fabric-setup`; removed by `install.sh --leave`.
+[Unit]
+Description=derate: re-assert the RDMA fabric settings every 30 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30min
+Unit=derate-fabric.service
+
+[Install]
+WantedBy=timers.target

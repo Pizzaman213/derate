@@ -80,6 +80,15 @@ except ImportError:  # pragma: no cover - no web framework installed
 
 log = logging.getLogger(__name__)
 
+# What an agent of this build can be asked to do beyond the routes every agent
+# has always had, named so the coordinator can tell "this node runs an older
+# build" from "this node runs the same build and something failed to start
+# there" -- the first is cured by upgrading the node, the second is not.
+# Reported on the trusted /agent/health and /agent/profile only, beside
+# ``build`` and for the same reason. Append a name when a route lands that the
+# coordinator would otherwise discover by getting a 404 from an older node.
+AGENT_FEATURES = ("copy_receiver", "link_health", "transfer_capacity")
+
 
 class NodeAgent:
     """Local hardware, local telemetry, and our advertisement of both."""
@@ -142,6 +151,9 @@ class NodeAgent:
         # that cannot check a credential must not act on an uncredentialed
         # request.
         self._token = token or None
+        # The copy receiver (control_plane/transfer/receiver.py), set by
+        # startup once port 47101 is bound; None means copies are refused.
+        self.transfer_receiver = None
         # peer -> (last journalled refusal, refusals since). See note_refused.
         self._refusals: dict[str, tuple[float, int]] = {}
         # (peer, path) -> (last journalled read, reads since). See note_read.
@@ -186,7 +198,24 @@ class NodeAgent:
         payload = profile_to_dict(self.profile)
         if include_build:
             payload["build"] = build_id()
+            payload["features"] = self.features()
         return payload
+
+    def features(self) -> list[str]:
+        """Which of ``AGENT_FEATURES`` this agent can serve right now.
+
+        Not simply the tuple: the copy routes exist in every agent of this
+        build but answer 503 when port 47101 could not be bound, and a node
+        that cannot receive a copy must not be offered as a copy target.
+        ``link_health`` is a plain route and has no runtime half to fail.
+        """
+        receiver = self.transfer_receiver
+        have = {"link_health"}
+        if receiver is not None:
+            have.add("copy_receiver")
+            if callable(getattr(receiver, "capacity", None)):
+                have.add("transfer_capacity")
+        return [f for f in AGENT_FEATURES if f in have]
 
     def telemetry_payload(self) -> dict:
         return telemetry_to_dict(self.node_id, self._ring.latest)
@@ -456,8 +485,10 @@ class NodeAgent:
         if include_build:
             # Rides the heartbeat rather than needing a call of its own: the
             # coordinator already dials this endpoint every 5s, with this
-            # node's agent token. Nobody else learns the version.
+            # node's agent token. Nobody else learns the version -- or, for
+            # the same reason, what this node can be asked to do.
             payload["build"] = build_id()
+            payload["features"] = self.features()
         return payload
 
     async def reach_payload(self, url: object, client=None) -> dict:
@@ -734,7 +765,7 @@ class NodeAgent:
 
 def create_agent_app(node_agent: NodeAgent):
     """A FastAPI app serving the /agent/* surface."""
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Query
 
     # No /openapi.json either: the schema would answer whether /agent/shell is
     # installed, which is the one thing the conditional registration below hides.
@@ -754,7 +785,7 @@ def create_agent_app(node_agent: NodeAgent):
             peer = _peer(request)
             node_agent.note_trusted(peer)
             # Reads only: the actions record themselves (note_action).
-            if request.method == "GET" or request.url.path == "/agent/reach":
+            if request.method == "GET" or request.url.path in ("/agent/reach", "/agent/links/probe"):
                 node_agent.note_read(peer, request.method, request.url.path)
             return
         node_agent.note_refused(_peer(request), request.method, request.url.path)
@@ -871,6 +902,45 @@ def create_agent_app(node_agent: NodeAgent):
         )
         return result
 
+    @app.get("/agent/links/health")
+    async def get_link_health(
+        request: Request, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
+        # Token-gated like storage: the addresses and counters of every fabric
+        # port are an inventory of this machine no other host needs. Read-only;
+        # control_plane/links/nichealth.py says what is read and why.
+        _require_token(request, x_derate_token)
+        from control_plane.links import nichealth
+
+        return await asyncio.to_thread(nichealth.read_nic_health)
+
+    @app.post("/agent/links/probe")
+    async def probe_links(
+        request: Request, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
+        # Token-gated before the body is read, for /agent/reach's reason: this
+        # makes THIS machine dial addresses the caller names. Bounded in
+        # nichealth.validate_probe_targets: this node's own RDMA ports as the
+        # source, the copy receiver's port only, private or link-local
+        # addresses only, at most MAX_PROBE_TARGETS, each connect timed out.
+        _require_token(request, x_derate_token)
+        from control_plane.links import nichealth
+
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON.") from None
+        local = await asyncio.to_thread(nichealth.local_rails)
+        try:
+            targets = nichealth.validate_probe_targets(
+                body.get("targets") if isinstance(body, dict) else None,
+                {r.iface for r in local},
+            )
+        except nichealth.ProbeRefused as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        results = await asyncio.to_thread(nichealth.probe_rails, targets, local)
+        return {"results": [r.to_json() for r in results]}
+
     @app.post("/agent/reach")
     async def reach_peer(
         request: Request,
@@ -915,6 +985,83 @@ def create_agent_app(node_agent: NodeAgent):
             name=body.get("name") or "", signal_sent=body.get("signal_sent"),
         )
         return body
+
+    # Copies into this node's model cache (control_plane/transfer). The HTTP
+    # half opens a session against a validated manifest; the bytes then arrive
+    # on the transfer receiver's own port, each stream proving it holds the
+    # session secret this route handed out. Token first, like every mutation.
+    def _receiver():
+        receiver = node_agent.transfer_receiver
+        if receiver is None:
+            raise HTTPException(
+                status_code=503,
+                detail="this node is not accepting copies: port 47101 could not be opened",
+            )
+        return receiver
+
+    @app.post("/agent/transfers")
+    async def open_transfer(
+        request: Request, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
+        _require_token(request, x_derate_token)
+        receiver = _receiver()
+        from control_plane.transfer.receiver import TransferRefused
+
+        body = await request.json()
+        try:
+            return await asyncio.to_thread(receiver.open, body)
+        except TransferRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.sentence) from None
+
+    @app.post("/agent/transfers/{session_id}/commit")
+    async def commit_transfer(
+        request: Request, session_id: str, x_derate_token: str | None = Header(default=None)
+    ) -> dict:
+        _require_token(request, x_derate_token)
+        receiver = _receiver()
+        from control_plane.transfer.receiver import TransferRefused
+
+        try:
+            res = await asyncio.to_thread(receiver.commit, session_id)
+        except TransferRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.sentence) from None
+        node_agent.note_action(
+            "transfer_received", _peer(request), request.url.path,
+            folder=res["folder"], bytes=res["bytes"],
+        )
+        return res
+
+    @app.get("/agent/transfers/capacity")
+    async def transfer_capacity(
+        request: Request,
+        folder: str | None = None,
+        needed: int = Query(default=0, alias="bytes", ge=0),
+        x_derate_token: str | None = Header(default=None),
+    ) -> dict:
+        # Read by the coordinator's background-copy planner before it proposes
+        # anything: whether a copy would leave this node above its floor.
+        # `free`/`total` are the roomiest landing folder's (the hub, or a
+        # DERATE_EXTRA_CACHE_DIRS folder); `dirs` lists each, `refused` the rest.
+        # With `?folder=` (and `&bytes=`, the size of the copy) they are the
+        # filesystem that folder would actually land on, named by `landing`.
+        _require_token(request, x_derate_token)
+        receiver = _receiver()
+        from control_plane.transfer.receiver import TransferRefused
+
+        try:
+            return await asyncio.to_thread(receiver.capacity, folder, needed)
+        except TransferRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.sentence) from None
+
+    @app.delete("/agent/transfers/{session_id}", status_code=204)
+    async def abort_transfer(
+        request: Request, session_id: str, x_derate_token: str | None = Header(default=None)
+    ) -> None:
+        _require_token(request, x_derate_token)
+        receiver = _receiver()
+        if not await asyncio.to_thread(receiver.abort, session_id):
+            raise HTTPException(status_code=404, detail="no such copy session")
+        return None
 
     # The shell, and only if it was asked for. Registered conditionally rather
     # than registered-and-refusing: an absent route cannot be probed for, and

@@ -40,6 +40,8 @@ spill-on-saturation, change the one constant `LB_POLICY` in `sockets.ts`.
 | `GraphToolbar.tsx` | Add model, Add rate limit, zoom, Arrange, Discard, Save N changes |
 | `BalancerDialog.tsx` | one served name's dialog: policy, its rate limit, its live targets, Remove this load balancer |
 | `SelectionRail.tsx` | the Links card: measured pairs, Measure, reachability |
+| `FabricPanel.tsx` | "Fabric settings" under a selected link: each end's port findings from `/api/links/health`, sentence verbatim, fix copyable |
+| `fabric.ts` | which of four states the fabric section is in, finding order, the summary line. Pure |
 | `loading.ts` | a launch's phase (preparing, downloading, loading, serving) and its clock |
 | `providerLogo.ts` | a provider's logo URL, or none (the monogram tile is always painted under it) |
 | `blocks/editor.tsx` | `EditorContext` (the edit callbacks blocks call) and `Socket`, the one handle component |
@@ -200,3 +202,10 @@ discovered by `npm run check`.
 - `particles.check.mjs` — emission is one block per request in flight, flight
   times, stream rates and their caps.
 - `loading.check.mjs` — a launch's phase and stepper rules.
+- `fabric.check.mjs` — the pair is found either way round, warnings sort first,
+  and clean, unreadable and no-fabric stay three different states.
+- `software.check.mjs` — `software.ts`, a node's build and agent `features`
+  against the coordinator's: the skew line names both builds, "not said"
+  (null) and "said, none" ([]) stay apart, a node on the coordinator's own
+  build is never told to upgrade, and `validate` raises them only as live
+  warnings on the machine block, so a rolling upgrade never blocks Save.

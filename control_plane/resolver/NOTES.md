@@ -59,9 +59,10 @@ ok, reason = resolver.supported_on(shape, "vllm", nodes)   # also checks compute
 
 `supported_by` reads the architecture out of the resolution cache, so call it on a
 shape this resolver produced. A fixture shape reports "unverified" rather than a
-guess. NVFP4 needs Blackwell outright; MXFP4 runs emulated below it, and on
-pre-Hopper the runtime widens the weights to bf16, which quadruples the footprint
-the fit check was told to expect.
+guess. NVFP4 is native on Blackwell and runs weight-only through Marlin below
+it; MXFP4 runs emulated below Blackwell, and on pre-Hopper the runtime widens
+the weights to bf16, which quadruples the footprint the fit check was told to
+expect.
 
 ## Where the numbers come from
 

@@ -47,27 +47,36 @@ const ENGINE: Record<Runtime, { tile: string; logo?: string; note: string }> = {
     note: 'Radix prefix cache; strong when many requests share a long prompt. No speculative decoding here.',
   },
   tts: { tile: 'TT', note: 'derate’s own speech server, one checkpoint, one process.' },
-  llamacpp: { tile: 'LC', logo: llamacppLogo, note: 'GGUF on a machine with no GPU.' },
+  llamacpp: {
+    tile: 'LC',
+    logo: llamacppLogo,
+    note: 'GGUF from host RAM: a machine with no GPU, or a discrete-GPU box serving off its CPU.',
+  },
   ollama: { tile: 'OL', logo: ollamaLogo, note: 'Pull a GGUF onto a provider machine; the gateway routes to it.' },
 }
 
 /** The KV cache widths the gate prices AND the pinned engine accepts. */
 const KV_OPTIONS: { value: string; label: string }[] = [
   { value: '', label: 'The model’s own (default)' },
-  { value: 'fp8', label: 'fp8 — half the bytes per token' },
+  { value: 'fp8', label: 'fp8, half the bytes per token' },
   { value: 'fp8_e4m3', label: 'fp8_e4m3' },
   { value: 'fp8_e5m2', label: 'fp8_e5m2' },
 ]
 
+/** The names `flags.render_kv_cache_dtype` maps to no flag: the 16-bit
+ *  widths are the model's own, so the launch passes nothing. */
+const NO_KV_FLAG: Record<string, true> = { auto: true, float16: true, bfloat16: true }
+
 /** Only the schemes a runtime can actually be told to load. The resolver
  *  prices 33 and most are llama.cpp's GGUF formats, which nothing here can be
- *  told to load into a safetensors checkpoint. nvfp4 is Blackwell-only and
- *  mxfp4 is emulated below it, which the coordinator refuses on the node
- *  rather than this list pretending to know the hardware. */
+ *  told to load into a safetensors checkpoint. nvfp4 and mxfp4 are native on
+ *  Blackwell and emulated below it; what a given machine's GPU and image can
+ *  load is the coordinator's question (`support.silicon_check`), answered per
+ *  node, rather than this list pretending to know the hardware. */
 const QUANT_OPTIONS: SelectOption<string>[] = [
   { value: '', label: 'As the checkpoint ships (default)' },
   { value: 'fp8', label: 'fp8 — 8 bits per weight' },
-  { value: 'nvfp4', label: 'nvfp4 — 4.5 bits, Blackwell only' },
+  { value: 'nvfp4', label: 'nvfp4 — 4.5 bits' },
   { value: 'mxfp4', label: 'mxfp4 — 4.25 bits' },
   { value: 'awq_int4', label: 'awq_int4 — 4.5 bits' },
   { value: 'gptq_int4', label: 'gptq_int4 — 4.5 bits' },
@@ -112,9 +121,15 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
   const info = runtimes?.find((r) => r.name === s.runtime) ?? null
   // The variant's own format, which a runtime either loads or does not.
   const format = s.variant?.gguf_file ? 'gguf' : 'safetensors'
+  // `auto` is the default row already; listing it again would show a second
+  // "model's own" with nothing to price.
   const kvOptions = info
-    ? [{ value: '', label: 'The model’s own (default)' }, ...info.kv_dtypes.map((d) => ({ value: d, label: d }))]
+    ? [
+        { value: '', label: 'The model’s own (default)' },
+        ...info.kv_dtypes.filter((d) => d !== 'auto').map((d) => ({ value: d, label: d })),
+      ]
     : KV_OPTIONS
+  const kvRatios = s.kvRatios
 
   const measure = async (a: string, b: string) => {
     const key = `${a} ${b}`
@@ -280,9 +295,29 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
               {/* KV cache width. Unlike a launch-only flag this changes what
                   the gate APPROVES: the verdict re-plans when it moves, so
                   every number above is already the number for this width. */}
-              <div className="mdl-kvgrid" role="radiogroup" aria-label="KV cache precision">
+              <div
+                className="mdl-kvgrid"
+                role="radiogroup"
+                aria-label="KV cache precision"
+                aria-describedby={`${uid}-kvnote`}
+              >
                 {kvOptions.map((o) => {
-                  const bytes = o.value ? info?.kv_dtype_bytes?.[o.value] : undefined
+                  // This model's own ratio when a plan has carried one: a
+                  // packed layout's scales and wide boundary layers depend on
+                  // the model, so only the plain widths have a model-free one.
+                  // Kept across a refused plan (`s.kvRatios`), so picking a
+                  // width the gate refuses does not blank the others.
+                  const flat = o.value ? info?.kv_dtype_bytes?.[o.value] : undefined
+                  const ratio = o.value ? (kvRatios?.[o.value] ?? (flat != null ? flat / 2 : undefined)) : undefined
+                  // A dash only once the server has answered for this model:
+                  // before that an absent ratio means "not asked yet".
+                  const unpriced = o.value !== '' && ratio == null && kvRatios != null
+                  // `render_kv_cache_dtype` passes no flag for the 16-bit names
+                  // and cannot render a name it does not price.
+                  const flag =
+                    o.value && !NO_KV_FLAG[o.value] && (kvRatios == null || o.value in kvRatios)
+                      ? `--kv-cache-dtype ${o.value}`
+                      : ''
                   return (
                     <label key={o.value || 'default'} className="mdl-check label">
                       <input
@@ -292,17 +327,35 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
                         onChange={() => s.setKvDtype(o.value)}
                       />
                       <span>{o.label}</span>
-                      <span className="mono unit">{bytes != null ? `×${bytes / 2}` : o.value ? '—' : ''}</span>
-                      <span className="mono unit">{o.value ? `--kv-cache-dtype ${o.value}` : ''}</span>
+                      <span className="mono unit mdl-kvgrid-ratio">
+                        {ratio != null ? (
+                          <>
+                            {`×${ratio.toFixed(2)}`}
+                            <span className="sr-only"> times the 16-bit cache</span>
+                          </>
+                        ) : unpriced ? (
+                          <>
+                            <span aria-hidden="true">—</span>
+                            <span className="sr-only">not priced for this model</span>
+                          </>
+                        ) : (
+                          ''
+                        )}
+                      </span>
+                      <span className="mono unit">{flag}</span>
                     </label>
                   )
                 })}
               </div>
-              <p className="unit">
-                Stores each cached key and value in one byte instead of two. The verdict above is recomputed for
-                it, so the context and the memory figures shown are already the ones for this width — and the
-                engine is told the same width the gate sized with, which is the only way those two numbers can be
-                the same number.
+              <p className="unit" id={`${uid}-kvnote`}>
+                Stores each cached key and value narrower than the model's own 16 bits. The multiplier is this
+                model's cache against 16-bit, scales and any layers the kernel keeps wide included. A dash is a
+                width this model's attention cannot use, or one this build cannot pass to the engine; the plan or
+                the launch refuses it. A multiplier is the cache size, not a promise that every machine has a
+                kernel for it; the plan names any machine that does not. The verdict above is recomputed for
+                the choice, so the context and the memory figures shown are already the ones for this width, and
+                the engine is told the same width the gate sized with, which is the only way those two numbers
+                can be the same number.
               </p>
               <PrefixAndShare s={s} />
               {s.forcedQuantApplies ? (

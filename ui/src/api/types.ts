@@ -153,6 +153,42 @@ export interface ReachReport {
   legs: ReachLeg[]
 }
 
+/** One thing to change on a fabric port, from `GET /api/links/health`
+ *  (control_plane/links/nichealth.py). `sentence` is the server's and renders
+ *  verbatim; `fix` is the exact command or netplan stanza, multi-line. */
+export interface FabricFinding {
+  severity: 'warning' | 'info'
+  node_id: string
+  /** One port, or several joined by commas when one stanza fixes them all. */
+  iface: string
+  sentence: string
+  fix: string
+}
+
+/** One TCP connect from a rail to the far end's copy receiver (port 47101),
+ *  from `GET /api/links/health`. `ms` is the connect (or refusal) round trip,
+ *  null when nothing answered; `error` is the server's text, rendered verbatim. */
+export interface FabricReach {
+  /** The node that dialled, and which of its rails. */
+  node_id: string
+  iface: string
+  /** "10.100.152.1", or "fe80::…%enp1s0f0np0" scoped to the dialling rail. */
+  target: string
+  ok: boolean
+  ms: number | null
+  error: string | null
+}
+
+export interface FabricHealthReport {
+  /** Only pairs where both ends were read and both have a port with carrier.
+   *  `reach`: one row per (rail, far address) the probing end dialled; empty
+   *  when the pair was not probed. Absent from coordinators before the probe. */
+  links: { a: string; b: string; findings: FabricFinding[]; reach?: FabricReach[] }[]
+  /** Nodes whose agent could not be asked, each with the server's sentence. */
+  unreadable: { node_id: string; reason: string }[]
+  measured_at: number
+}
+
 export interface TopologyDeployment {
   deployment_id: string
   served_name: string
@@ -310,6 +346,15 @@ export interface NodeStateDTO {
   /** false when this node cannot join the current serving pool */
   eligible?: boolean
   ineligible_reason?: string | null
+  /** The derate build this node's agent reports; null until it has said. */
+  build?: string | null
+  /** The server's own comparison with the coordinator's build. Never true when
+   *  either side is unknown: a node that has not said is not one that differs. */
+  build_skew?: boolean
+  /** What this node's agent says it can do (`AGENT_FEATURES` on the server).
+   *  null = not said (an older agent, or no answer yet); [] = said, and has
+   *  none. Two different answers, and only the first is cured by upgrading. */
+  features?: string[] | null
 }
 
 /** One compute context holding GPU memory on a node, as `nvidia-smi
@@ -430,6 +475,11 @@ export interface ClusterSummary {
   node_count: number
   healthy_count: number
   total_addressable_memory: number
+  /** The coordinator's own build, which every `build_skew` compares with.
+   *  Absent from an older gateway; null when the server cannot name its own. */
+  coordinator_build?: string | null
+  /** Every feature an agent of the coordinator's build reports. */
+  agent_features?: string[]
 }
 
 export interface Cluster {
@@ -750,6 +800,11 @@ export interface MemoryReport {
   memory_severity?: 'ok' | 'warning' | 'critical' | null
   sampled_at?: number
   allocatable?: number | null
+  /** What a host-pool runtime (llamacpp) is budgeted against on this machine:
+   *  MemAvailable less the CPU reserve. Null on a unified-memory or
+   *  unidentified machine, where host RAM is not a pool of its own, and when
+   *  nothing has measured it. Optional: an older coordinator omits it. */
+  host_allocatable?: number | null
   static_ceiling?: number | null
   addressable?: number | null
   pool_used?: number | null
@@ -914,6 +969,13 @@ export interface PlanResponse {
    *  YaRN is on -- and the model's trained one. Absent on an older gateway. */
   native_window?: number | null
   original_window?: number | null
+  /** Cache bytes per token at each `--kv-cache-dtype` the gate prices for
+   *  THIS model, over its 16-bit rate (`fit/kv.py`). Includes the packed
+   *  layouts, whose scales and boundary layers depend on the model. Absent
+   *  per name when the gate does not price it, this build cannot render it
+   *  as a flag, or this attention geometry refuses it (`internal_api.py::
+   *  _kv_dtype_ratios`); `auto` is never listed. Absent on an older gateway. */
+  kv_dtype_ratios?: Record<string, number>
 }
 
 export interface LaunchRequest {
@@ -1943,6 +2005,17 @@ export interface CapacitySide {
   best: CapacityRow | null
 }
 
+/** `CapacityReport.host_pool`: one machine, live only. */
+export interface CapacityHostPool extends CapacitySide {
+  /** The host-pool runtimes this answers for, e.g. `["llamacpp"]`. */
+  runtimes: string[]
+  node_id: string
+  /** The KV width the rows were priced at: the requested one if the runtime
+   *  can be told it, else fp16. */
+  kv_dtype: string
+  allocatable_per_node: number
+}
+
 export interface CapacityReport {
   probed_node: string
   /** The context every row was taken at, or null when the gate chose one per
@@ -1981,6 +2054,17 @@ export interface CapacityReport {
    *  from addressable memory, which is 0 on a machine with no GPU on purpose,
    *  so the whole side would read 0.0 GiB beside rows that say "fits". */
   static?: CapacitySide | null
+  /** The same walk for the runtimes that serve from HOST RAM (llamacpp),
+   *  beside the GPU sides and never instead of them: on a discrete box host
+   *  RAM is a pool of its own. Sized on `probed_node` against its live host
+   *  budget with the card taken out -- what that launch's own gate uses.
+   *  Null when the machine's host RAM is not its own pool (GB10, Apple,
+   *  unknown), when nothing measured it, or for `basis=static`; absent from a
+   *  coordinator older than the field. */
+  host_pool?: CapacityHostPool | null
+  /** Why `host_pool` is null on a machine that would qualify -- the launch
+   *  gate's own sentence. Null otherwise. */
+  host_pool_unavailable_reason?: string | null
 }
 
 export interface MemoryReportList {
@@ -2485,6 +2569,9 @@ export interface CachedModel {
   bytes: number
   blob_count: number
   revisions: string[]
+  /** The commit `refs/main` names; null when the folder has no such ref,
+   *  absent from an agent older than the field. */
+  commit?: string | null
   last_modified: number | null
 }
 
@@ -2577,6 +2664,18 @@ export interface NodeStorage {
   /** The downloaded weights on this node. Fetched in the same fan-out, so it
    *  can never be a poll behind the filesystem it is filling. */
   models?: ModelCache
+  /** Whether this node can take a copy from the coordinator, read in the same
+   *  fan-out (`GET /agent/transfers/capacity`). Absent on an older gateway. */
+  copy_receiver?: CopyReceiver
+}
+
+/** `available: false` carries the sentence a copy would fail with: an agent
+ *  that predates copies, its own refusal, or why it did not answer. `free` is
+ *  the cache filesystem's free bytes when the agent said. */
+export interface CopyReceiver {
+  available: boolean
+  reason: string | null
+  free: number | null
 }
 
 /** The coordinator's view of one node's collection: how far behind it is, and
@@ -2868,16 +2967,120 @@ export interface DownloadActivity {
   error: string | null
   done: boolean
   /** `hub` is a coordinator-side weight prefetch, `provider` a pull onto a
-   *  provider. Absent on an older gateway: read it as `provider`. */
-  kind?: 'hub' | 'provider'
+   *  provider, `transfer` a copy from the coordinator's cache to another
+   *  node. Absent on an older gateway: read it as `provider`. */
+  kind?: 'hub' | 'provider' | 'transfer'
   /** Hub rows only: the id the pause/resume/cancel routes take. */
   download_id?: string
+  /** Transfer rows only: the id DELETE /api/transfers/{id} takes. */
+  transfer_id?: string
   paused?: boolean
   /** Hub rows only: bytes/s over the last few samples, and seconds left at
    *  that rate. Null until two samples exist, while paused, or without a
    *  total. Always null on a provider row. */
   rate_bps?: number | null
   eta_s?: number | null
+}
+
+/** `POST /api/transfers` and `GET /api/transfers`: one copy of a cached model
+ *  folder from the coordinator to another node (control_plane/transfer/jobs.py). */
+export interface NodeTransfer {
+  transfer_id: string
+  folder: string
+  repo_id: string
+  node_id: string
+  streams: number
+  /** null until the copy has chosen its links. `fabric`: RDMA-capable ports
+   *  (RoCE); `network`: the fastest other link that answered; `management`:
+   *  nothing answered, so the agent's own address. */
+  path: 'fabric' | 'network' | 'management' | null
+  /** `local->remote` pairs the streams are spread across; link-local dials
+   *  carry their `%iface` scope. */
+  routes: string[]
+  /** What a person reads, e.g. "RoCE, 2 × 200 Gb/s". null until chosen. */
+  link: string | null
+  /** null until the session opens and the bytes still needed are known. */
+  total: number | null
+  completed: number
+  status: 'running' | 'verifying' | 'cancelling' | 'done' | 'error'
+  error: string | null
+  started_at: number
+  finished_at: number | null
+  rate_bps: number | null
+  eta_s: number | null
+  /** The commit the coordinator's `refs/main` named when the copy started. */
+  revision?: string | null
+  /** The snapshot ids (commits) the coordinator's folder held at that moment. */
+  snapshots?: string[]
+}
+
+/** A copy derate would delete on the target first, to make room. */
+export interface ReplicationEviction {
+  folder: string
+  repo_id: string
+  bytes: number
+}
+
+/** One background copy derate proposes and will not start without approval
+ *  (`GET /api/replication`). */
+export interface ReplicationProposal {
+  folder: string
+  repo_id: string
+  node_id: string
+  /** Bytes still to send. */
+  bytes: number
+  /** Why the copy is wanted, one sentence each. */
+  reasons: string[]
+  /** EVERY copy of derate's own it would delete on that node first. */
+  evict: ReplicationEviction[]
+  /** Free space on the target now; null when the node did not report it. */
+  free_bytes: number | null
+  /** This node's free-space floor: the smaller of 100 GiB and a fifth of its
+   *  cache disk. Absent on a coordinator that predates per-node floors. */
+  floor_bytes?: number
+  status: 'awaiting_approval' | 'approved' | 'copying'
+  /** Set while copying. */
+  transfer_id: string | null
+  last_error: string | null
+}
+
+/** A copy that is wanted but will not be proposed; `sentence` says why. */
+export interface ReplicationSkip {
+  folder: string
+  repo_id: string
+  node_id: string
+  sentence: string
+  /** Set only when the free-space floor is why; the floor it was judged at. */
+  floor_bytes?: number | null
+}
+
+/** A copy derate placed itself. */
+export interface Replica {
+  folder: string
+  repo_id: string
+  node_id: string
+  bytes: number
+  placed_at: number
+  used_at: number | null
+  /** False from the moment a copy starts until it finishes, so a paused or
+   *  dismissed half-copy is still listed and can be cleaned up. */
+  complete: boolean
+  /** The commit the coordinator's `refs/main` named when the copy started;
+   *  null (or absent, from an older gateway) when it had none. */
+  revision?: string | null
+}
+
+/** `GET /api/replication`. */
+export interface ReplicationState {
+  enabled: boolean
+  /** The free-space floor's cap. Each node keeps the smaller of this and a
+   *  fifth of its cache disk; each proposal carries its own `floor_bytes`. */
+  floor_bytes: number
+  /** Unix seconds of the last plan; null before the first. */
+  checked_at: number | null
+  proposals: ReplicationProposal[]
+  skipped: ReplicationSkip[]
+  replicas: Replica[]
 }
 
 /** A model that is starting but not yet serving.
@@ -2969,6 +3172,8 @@ export interface NodeLogTail {
 export interface Activity {
   downloads: DownloadActivity[]
   launches: LaunchActivity[]
+  /** Background copies waiting for approval. Absent on an older gateway. */
+  replication?: { awaiting: number }
 }
 
 /** `GET /api/setup`. Whether this coordinator has been set up, and the one
@@ -3488,13 +3693,19 @@ export interface RuntimeInfo {
     shards: boolean
   }
   kv_dtypes: string[]
-  /** Bytes per cached element for each of `kv_dtypes` (`fit/kv.py`). */
+  /** Bytes per cached element for the PLAIN widths among `kv_dtypes` only
+   *  (`fit/kv.py`); a packed layout's cost depends on the model and is in
+   *  `/api/plan`'s `kv_dtype_ratios` instead. */
   kv_dtype_bytes: Record<string, number>
   engine_options: string[]
   reasoning_parsers: string[]
   tool_call_parsers: string[]
   nccl_tunables: string[]
   version: string | null
+  /** Per CPU architecture, the version the image that architecture runs
+   *  reported when probed, or null when nothing has probed it. Measurements
+   *  are keyed by the measured machine's entry, never by `version`. */
+  image_versions: Record<string, string | null>
 }
 
 /** `POST /api/plan/command`. */

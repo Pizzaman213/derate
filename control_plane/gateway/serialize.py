@@ -173,6 +173,10 @@ def node_payload(
         "device_class": profile.device_class.value,
         "gpu_name": profile.gpu_name,
         "gpu_count": profile.gpu_count,
+        # amd64/arm64, or "" for an agent older than the field. Which image a
+        # machine runs follows from it, and a measurement is keyed by THAT
+        # image's version (`tests/spec_sweep.py::runtime_version`).
+        "arch": profile.arch,
         "total_memory": profile.total_memory,
         # Live, from the sample, and 0 until one arrives. Separate from
         # total_memory on purpose: that one is GPU memory and is summed into
@@ -181,6 +185,8 @@ def node_payload(
         "memory_total": state.memory_total,
         "addressable_memory": profile.addressable_memory,
         "memory_bandwidth_gbps": profile.memory_bandwidth_gbps,
+        # What a host-pool runtime decodes against; null when unmeasured.
+        "host_memory_bandwidth_gbps": profile.host_memory_bandwidth_gbps,
         "compute_capability": profile.compute_capability,
         "driver_version": profile.driver_version,
         "healthy": state.healthy,
@@ -211,6 +217,11 @@ def node_payload(
         # that has not said is not a node that disagrees.
         "build": state.build or None,
         "build_skew": skewed,
+        # What this node's agent says it can do (registry/agent.py::
+        # AGENT_FEATURES). Null when it has not said -- an older agent, or
+        # one that has not answered yet -- and never [] for that: an empty
+        # list is an agent that answered and can do none of them.
+        "features": list(state.features) if state.features is not None else None,
     }
 
 

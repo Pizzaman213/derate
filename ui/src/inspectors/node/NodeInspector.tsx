@@ -22,11 +22,17 @@ import { NodeRuntimeCard } from './NodeRuntimeCard'
 import { NodeTerminal } from './Terminal'
 import { RenameNode } from './RenameNode'
 import { DeploymentLog } from '../DeploymentLog'
+import { IssueList } from '../../components/IssueList'
+import { featureLine, nodeSoftware } from '../../tabs/cluster/software'
 
 interface Props {
   node: NodeStateDTO
   deployments: DeploymentDTO[]
   routing: RoutingConfig[]
+  /** `/api/cluster`'s own build, which this node's `build_skew` compared with. */
+  coordinatorBuild: string | null
+  /** Every feature an agent of the coordinator's build reports. */
+  agentFeatures: string[]
   frame: SafeMetricsFrame | null
   stale: boolean
   onClose: () => void
@@ -53,7 +59,7 @@ interface Props {
  *  deployment inspector and each served name here is a button into it, and the
  *  throttle slider the original mockup had stays gone because there is still
  *  nothing on the wire to throttle. */
-export function NodeInspector({ node, deployments, routing, frame, stale, onClose }: Props) {
+export function NodeInspector({ node, deployments, routing, coordinatorBuild, agentFeatures, frame, stale, onClose }: Props) {
   const [window, setWindow] = useState<HistoryWindow>('live')
   const memoryReport = useMemoryReport()
 
@@ -98,6 +104,12 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
   // the moment it lands in FAILED does not just read as "Nothing.", with no
   // error, no log and no sign anything had happened.
   const { here, previous } = runningOrPrevious(deployments, p.node_id)
+  // Warn, never refuse: a rolling upgrade has some node on the other build
+  // for a while. software.ts decides which cure each gap gets.
+  const software = nodeSoftware(nodeName(fromState(node)), node, coordinatorBuild, agentFeatures)
+  const softwareIssues = [software.skew, ...software.gaps]
+    .filter((m): m is string => m !== null)
+    .map((message, k) => ({ id: `software:${k}`, level: 'warn' as const, message }))
 
   return (
     <div>
@@ -134,6 +146,12 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
         </div>
       ) : null}
 
+      {softwareIssues.length > 0 ? (
+        <div style={{ margin: 'var(--space-14) 0 0' }}>
+          <IssueList label="Software on this node" issues={softwareIssues} />
+        </div>
+      ) : null}
+
       <div className="nodegrid" style={{ marginTop: 'var(--space-14)' }}>
         <div>
           <div className="quad">
@@ -160,6 +178,17 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
 
           <div className="sub">links to other machines</div>
           <Interconnect nodeId={p.node_id} />
+
+          <div className="sub">software</div>
+          <div className="unit">
+            {node.build ? `build ${node.build}` : 'build not reported'}
+            {' · '}
+            {software.features === null
+              ? 'features not reported'
+              : software.features.length > 0
+                ? featureLine(software.features)
+                : 'no features'}
+          </div>
 
           <div className="sub">name</div>
           <RenameNode nodeId={p.node_id} label={node.label ?? null} />

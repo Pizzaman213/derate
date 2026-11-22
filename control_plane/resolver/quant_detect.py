@@ -280,3 +280,55 @@ def detect(
         "parameter, which is the largest plausible footprint"
     )
     return DEFAULT_DTYPE, QuantSource.DEFAULTED, warnings
+
+
+#: ModelOpt's FP8 spellings, which vLLM routes to its `modelopt` method.
+_MODELOPT_FP8_ALGOS = frozenset({"FP8", "FP8_PER_CHANNEL_PER_TOKEN", "FP8_PB_WO"})
+
+
+def vllm_quant_method(
+    config: dict[str, Any], hf_quant_config: dict[str, Any] | None = None
+) -> str:
+    """The name vLLM gives this checkpoint's packing, or "" when it has none.
+
+    Not the dtype key above, which prices bytes: this names the LOADER, and
+    the loader is what has a minimum compute capability. They part ways
+    exactly where it matters -- an NVFP4 checkpoint is `modelopt_fp4` (vLLM's
+    floor sm_75) from ModelOpt and `compressed-tensors` (sm_70) from
+    llm-compressor, and a ModelOpt FP8 one is `modelopt` (sm_80) where a
+    plain `fp8` one is sm_75.
+
+    Mirrors what vLLM does with the same files (read off 0.28.1's
+    `transformers_utils/config.py`, `model_arch_config_convertor.py` and
+    `ModelConfig._verify_quantization`): `quantization_config` (or
+    `compression_config`), else the ModelOpt `hf_quant_config.json` sidecar;
+    `compressed_tensors` spelled with a hyphen; and a ModelOpt config named
+    by its `quant_algo`, the way the `modelopt*` overrides pick. The other
+    overrides (`gptq` -> `gptq_marlin`, `awq` -> `awq_marlin`) are not
+    followed because both names carry the same floor.
+    """
+    qc = config.get("quantization_config") or config.get("compression_config")
+    if not isinstance(qc, dict) or not qc:
+        qc = hf_quant_config if isinstance(hf_quant_config, dict) else None
+    if not qc:
+        return ""
+    method = str(qc.get("quant_method") or "").strip().lower()
+    method = method.replace("compressed_tensors", "compressed-tensors")
+    producer = qc.get("producer")
+    inner = qc.get("quantization")
+    modelopt = method.startswith("modelopt") or (
+        isinstance(producer, dict) and producer.get("name") == "modelopt"
+    ) or (isinstance(inner, dict) and "modelopt_quant_config" in inner)
+    if modelopt:
+        raw = inner.get("quant_algo") if isinstance(inner, dict) else qc.get("quant_algo")
+        algo = str(raw or "").upper()
+        if algo in _MODELOPT_FP8_ALGOS:
+            return "modelopt"
+        if "NVFP4" in algo or "FP4" in algo:
+            return "modelopt_fp4"
+        if "MXFP8" in algo:
+            return "modelopt_mxfp8"
+        if algo == "MIXED_PRECISION":
+            return "modelopt_mixed"
+        return method or "modelopt"
+    return method

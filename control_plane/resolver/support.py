@@ -220,6 +220,49 @@ SGLANG_ARCHITECTURES: frozenset[str] = frozenset(
     }
 )
 
+
+@dataclass(frozen=True)
+class SpeechWorkingSet:
+    """What the tts server's torch allocator holds beyond the weight index
+    for one architecture: ``resident_bytes`` from load on, and
+    ``bytes_per_frame`` for every frame decoded back to audio. Both are
+    RESERVED bytes, because the server caps the allocator's reservation at
+    ``--gpu-memory-utilization`` and that cap is what a synthesis runs into.
+    """
+
+    resident_bytes: int
+    bytes_per_frame: int
+
+
+#: The tts runtime's working set per architecture -- measured, never derived,
+#: and the same "somebody ran it through that server" bar as the list itself.
+#: TTS_ARCHITECTURES is this table's keys, so the runtime cannot load an
+#: architecture nobody has priced: one without a row is refused by the support
+#: check rather than charged a guess.
+TTS_WORKING_SETS: dict[str, SpeechWorkingSet] = {
+    # DualAR: a slow transformer emitting one semantic token per audio
+    # frame, a fast one emitting that frame's codebooks, and a bundled
+    # 44.1 kHz codec. Verified on a GB10 against
+    # Audio8/Audio8-TTS-Preview-0.6b.
+    #
+    # Measured 2026-11-21 on an RTX 3090 (derate/tts:amd64, bf16, SpeechEngine
+    # as served, torch peak stats, cache emptied between runs). After load the
+    # allocator reserves 1,933,574,144 B against a weight index of
+    # 1,202,342,528 B: the 731,231,616 B difference is the codec, resident
+    # since `load()` forces it. Generating is flat (+69 MB at every length);
+    # DECODING is linear in frames -- peak reserved minus load reserved was
+    # 306,184,192 B at 64 frames, 553,648,128 at 128, 1,293,942,784 at 256,
+    # 2,489,319,424 at 512, 3,623,878,656 at 768, 4,825,546,752 at 1024
+    # (allocated rises an exact 2.76 MB/frame; the reservation runs ~1.7x
+    # that). The per-frame figure is the WORST of those ratios (256 frames),
+    # so the charge is at or above every measured point. The checkpoint
+    # never emits its stop token on its own, so every request runs to its
+    # frame limit, which the server clamps to the window.
+    "ArkttsModel": SpeechWorkingSet(
+        resident_bytes=731_231_616, bytes_per_frame=5_054_464
+    ),
+}
+
 #: Architectures ``control_plane/runtimes/tts.py`` can load and drive.
 #:
 #: Narrower than "text-to-speech models", and deliberately so. That server is a
@@ -230,16 +273,19 @@ SGLANG_ARCHITECTURES: frozenset[str] = frozenset(
 #: answers those three calls". A name goes in after somebody has run it
 #: through that server, never because the model card says TTS: a model listed
 #: here and not loadable is a launch that passes every gate and dies at load,
-#: which is the failure the support table exists to prevent.
-TTS_ARCHITECTURES: frozenset[str] = frozenset(
-    {
-        # DualAR: a slow transformer emitting one semantic token per audio
-        # frame, a fast one emitting that frame's codebooks, and a bundled
-        # 44.1 kHz codec. Verified on a GB10 against
-        # Audio8/Audio8-TTS-Preview-0.6b.
-        "ArkttsModel",
-    }
-)
+#: which is the failure the support table exists to prevent. It goes in as a
+#: row of TTS_WORKING_SETS, because that run is also what measures its price.
+TTS_ARCHITECTURES: frozenset[str] = frozenset(TTS_WORKING_SETS)
+
+
+def speech_working_set(architectures) -> SpeechWorkingSet | None:
+    """The measured working set for the first of *architectures* the tts
+    runtime loads, or None when it loads none of them."""
+    for name in architectures or ():
+        if name in TTS_WORKING_SETS:
+            return TTS_WORKING_SETS[name]
+    return None
+
 
 #: Architectures this build knows are speech models, and which endpoint family
 #: each answers. The resolver reports it; the deployment manager records it on
@@ -505,9 +551,17 @@ RUNTIMES: dict[str, RuntimeProfile] = {
 #: lookup with a fallback rather than a branch every caller has to remember.
 _PROBED: dict[str, "object"] = {}
 
+#: Every probe by (runtime, image reference), the default image's AND the
+#: per-architecture ones. A machine of another architecture runs a different
+#: image, and what the default image loads says nothing about it -- the 3090
+#: runs upstream vLLM 0.31.0, whose registry and silicon floors are not the
+#: Spark image's.
+_PROBED_IMAGES: dict[tuple[str, str], "object"] = {}
+
 
 def record_probe(found) -> None:
-    """Adopt an `imageprobe.ImageProbe`, replacing any earlier one.
+    """Adopt an `imageprobe.ImageProbe` of the runtime's DEFAULT image,
+    replacing any earlier one.
 
     Duck-typed rather than imported so `support` keeps its independence: this
     module is imported by the fit and launch paths on every node, and the
@@ -515,10 +569,19 @@ def record_probe(found) -> None:
     docker socket to run.
     """
     _PROBED[found.runtime.strip().lower()] = found
+    record_image_probe(found)
+
+
+def record_image_probe(found) -> None:
+    """Adopt a probe of one specific image -- a per-architecture image asked on
+    a machine of that architecture. It answers for that image alone, so it
+    never replaces the runtime's default probe."""
+    _PROBED_IMAGES[(found.runtime.strip().lower(), found.image)] = found
 
 
 def clear_probes() -> None:
     _PROBED.clear()
+    _PROBED_IMAGES.clear()
 
 
 def probed(runtime: str):
@@ -526,8 +589,39 @@ def probed(runtime: str):
     return _PROBED.get(runtime.strip().lower())
 
 
+def probed_image(runtime: str, image: str):
+    """The probe of exactly *image* for *runtime*, or None when nothing has
+    asked that image."""
+    return _PROBED_IMAGES.get((runtime.strip().lower(), image))
+
+
+def probe_for(runtime: str, image: str | None):
+    """The evidence about the image a machine runs: a probe of exactly
+    *image*; with no image named, the runtime's default probe; else None.
+
+    A NAMED image with no probe of its own is unknown, and answers None --
+    never the default image's probe. Another image's registry and kernel
+    list are not evidence about this one: borrowing them refused an amd64
+    image for an architecture or KV width only the arm64 default lacked.
+    None falls back to the static table and refuses nothing it cannot show.
+    """
+    key = runtime.strip().lower()
+    default = _PROBED.get(key)
+    if not image:
+        return default
+    found = _PROBED_IMAGES.get((key, image))
+    if found is not None:
+        return found
+    if default is not None and default.image == image:
+        return default
+    return None
+
+
 def architectures_for(runtime: str) -> frozenset[str]:
-    """What *runtime* loads: the image's answer when there is one, else ours."""
+    """What *runtime*'s DEFAULT image loads: its probe's answer when there is
+    one, else ours. It answers "which runtime could serve this at all" for a
+    refusal's hint; whether a particular machine can is
+    `evaluate_runtime(..., image=)`, asked of the image that machine runs."""
     key = runtime.strip().lower()
     found = _PROBED.get(key)
     if found is not None:
@@ -615,9 +709,17 @@ def _quant_hint(runtime: str, dtype: str) -> str:
 
 
 def evaluate_runtime(
-    runtime: str, architectures: tuple[str, ...], dtype: str
+    runtime: str, architectures: tuple[str, ...], dtype: str, *, image: str | None = None
 ) -> RuntimeSupport:
-    """Architecture and quantization support for one runtime."""
+    """Architecture and quantization support for one runtime.
+
+    *image* is the image the placed machines run (`flags.image_for_arch`).
+    A machine of another architecture runs a different image with a different
+    registry -- the 3090's vLLM 0.31.0 registers architectures the Spark's
+    0.28.1 does not -- so its own probe answers when one exists. Without
+    *image*, the default image's probe answers; an image nothing has asked
+    is unknown, and the static table answers (`probe_for`).
+    """
     key = runtime.strip().lower()
     profile = RUNTIMES.get(key)
     if profile is None:
@@ -629,7 +731,7 @@ def evaluate_runtime(
     # "not in our list" and "not in the registry of the image we launch" are
     # different strengths of claim and the operator has to be able to tell
     # them apart.
-    found = _PROBED.get(key)
+    found = probe_for(key, image)
     known_architectures = found.architectures if found is not None else profile.architectures
     #: The image's own version string, when a probe has run. Carried on every
     #: verdict below, not only the ones whose reason happens to mention it, so
@@ -724,12 +826,16 @@ def build_verdict(architectures: tuple[str, ...], dtype: str) -> SupportVerdict:
 def check_nodes(
     dtype: str, nodes: list[NodeProfile]
 ) -> tuple[bool, list[str]]:
-    """Whether every node can run this quantization scheme.
+    """Whether every node can run this quantization scheme, by the static
+    table alone (`QUANT_INFO`).
 
     MXFP4 is the case that matters here: native on Blackwell, which is what a
     Spark is, dequantized in kernel on Hopper and Ada, and on anything older the
     runtime widens the weights to bf16, which quadruples the footprint the fit
     check was told to expect.
+
+    The plan and launch gate is `silicon_check`, which prefers what the image
+    each machine runs says about itself and falls back to this table.
     """
     requirement = quant_requirement(dtype)
     problems: list[str] = []
@@ -742,6 +848,163 @@ def check_nodes(
         elif "emulated" in reason:
             problems.append(f"{node.describe()}: {reason}")
     return ok, problems
+
+
+def _capability(raw) -> tuple[int, int] | None:
+    """`"8.6"` -> (8, 6). None for anything unreadable."""
+    major, _, minor = str(raw or "").strip().partition(".")
+    try:
+        return int(major), int(minor or 0)
+    except ValueError:
+        return None
+
+
+def _sm(cap: tuple[int, int]) -> str:
+    """(12, 1) -> `sm_121`: vLLM's own spelling, and nvcc's."""
+    return f"sm_{cap[0]}{cap[1]}"
+
+
+def _sm_of_number(value: float | int) -> str:
+    """vLLM's integer floor (100) or the table's float (10.0) as `sm_100`."""
+    whole = int(value) if isinstance(value, int) else int(round(float(value) * 10))
+    return f"sm_{whole}"
+
+
+def silicon_check(
+    runtime: str,
+    node: NodeProfile,
+    image: str | None,
+    *,
+    dtype: str,
+    quant_method: str = "",
+    kv_cache_dtype: str | None = None,
+    kv_label: str | None = None,
+) -> tuple[str | None, list[str]]:
+    """Whether the GPU in *node* can run these weights and this KV cache under
+    the image it runs: ``(refusal or None, warnings)``.
+
+    Nothing in the plan or launch path asked this until 2026-11-21, because
+    every machine was a Spark and every Spark is sm_121. An RTX 3090 is sm_86,
+    and there the answer depends on the IMAGE -- so the evidence is that
+    image's own probe (`imageprobe.py`), the one *image* names (the default
+    image's probe only when no image is named), and then the static table:
+
+    * weights: *quant_method* is vLLM's name for the checkpoint's packing
+      (``modelopt_fp4``, ``compressed-tensors``, ``fp_quant``), and the
+      probe's ``quant_min_capability`` is vLLM's own floor for it. Below the
+      floor is a refusal. A method the probe does not list, or no probe at
+      all, falls back to `QUANT_INFO` through `QuantRequirement.check`.
+      Running emulated below the native capability is a WARNING either way,
+      never a refusal: NVFP4 weights load on sm_86 through Marlin.
+    * KV cache: *kv_cache_dtype* is vLLM's spelling of the requested width
+      (`flags.render_kv_cache_dtype`), None for the model's own dtype -- which
+      is never refused -- and None for an MLA layer, which the probe could not
+      ask about. Refused when the image's probe lists KV dtypes and this one
+      is not among them (the image does not accept it), when its attention
+      selector found a backend for it at no capability, or at capabilities
+      that were asked and do not include this one. A null map, or a
+      capability nobody asked about, is no evidence, and no evidence is no
+      refusal. *kv_label* is the operator's spelling, for
+      the sentence.
+
+    An unreadable compute capability is no evidence either, and refuses
+    nothing: the placement gate is what answers for a machine with no GPU.
+    """
+    cap = _capability(node.compute_capability)
+    if cap is None:
+        return None, []
+    name = f"'{node.node_id}'"
+    here = _sm(cap)
+    found = probe_for(runtime, image)
+    warnings: list[str] = []
+
+    requirement = quant_requirement(dtype)
+    passed, reason = requirement.check(f"{cap[0]}.{cap[1]}")
+    floor = (
+        found.quant_min_capability.get(quant_method)
+        if found is not None and quant_method
+        else None
+    )
+    if floor is not None:
+        if cap[0] * 10 + cap[1] < floor:
+            return (
+                f"{name} is {here}, and {found.provenance} loads {quant_method} "
+                f"weights only from {_sm_of_number(floor)} up -- vLLM's own "
+                f"minimum for that method, read off the image. Serve this on a "
+                f"machine at {_sm_of_number(floor)} or newer, or use a build of "
+                f"the model in another quantization.",
+                [],
+            )
+    elif not passed:
+        need = requirement.native_compute_capability
+        note = f" ({requirement.note})" if requirement.note else ""
+        source = (
+            f"{found.provenance} does not list {quant_method or 'this packing'}"
+            if found is not None
+            else "nothing has probed the image it runs"
+        )
+        return (
+            f"{name} is {here}, and {dtype} weights need {_sm_of_number(need)}"
+            f"{note}; {source}, so derate's own table decides. Serve this on a "
+            f"machine at {_sm_of_number(need)} or newer, or use a build of the "
+            f"model in another quantization.",
+            [],
+        )
+    if passed and "emulated" in reason:
+        note = f": {requirement.note}" if requirement.note else ""
+        warnings.append(
+            f"{name} is {here}, below native {dtype} "
+            f"({_sm_of_number(requirement.native_compute_capability)}), so the "
+            f"weights run emulated{note}"
+        )
+
+    kv_caps = found.kv_capabilities if found is not None else None
+    # The probe asks the selector about every dtype the image's own
+    # `CacheDType` lists, so a non-null map is the image's whole vocabulary:
+    # a width absent from it is one this image does not accept at all. Only
+    # a null map is "unknown".
+    if (
+        kv_caps is not None
+        and kv_cache_dtype
+        and kv_cache_dtype != "auto"
+        and kv_cache_dtype not in kv_caps
+    ):
+        label = kv_label or kv_cache_dtype
+        return (
+            f"{found.provenance} does not accept kv_dtype {label!r} -- it is "
+            f"not among the KV cache dtypes that image lists -- so the engine "
+            f"would refuse to start on {name} ({here}). Use the model's own "
+            f"dtype for the KV cache, or an image that lists {label!r}.",
+            warnings,
+        )
+    valid = kv_caps.get(kv_cache_dtype) if kv_caps and kv_cache_dtype else None
+    if valid is not None:
+        label = kv_label or kv_cache_dtype
+        asked = sorted(
+            (c for c in (_capability(v) for v in found.kv_asked()) if c is not None)
+        )
+        fp8_here = f"{cap[0]}.{cap[1]}" in kv_caps.get("fp8", ())
+        instead = "fp8 or the model's own dtype" if fp8_here else "the model's own dtype"
+        if not valid:
+            span = f", {_sm(asked[0])} to {_sm(asked[-1])}" if asked else ""
+            return (
+                f"{found.provenance} has no attention backend for kv_dtype "
+                f"{label!r} on any GPU its selector was asked about{span}, so "
+                f"the engine would refuse to start on {name} ({here}). Use "
+                f"{instead} for the KV cache.",
+                warnings,
+            )
+        if cap in asked and f"{cap[0]}.{cap[1]}" not in valid:
+            where = ", ".join(
+                _sm(c) for c in sorted(filter(None, (_capability(v) for v in valid)))
+            )
+            return (
+                f"{found.provenance} has an attention backend for kv_dtype "
+                f"{label!r} only at {where}, and {name} is {here}. Serve this "
+                f"on one of those machines, or use {instead} for the KV cache.",
+                warnings,
+            )
+    return None, warnings
 
 
 def sharding_notes(shape: ModelShape, world_size: int) -> list[str]:

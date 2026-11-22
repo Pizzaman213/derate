@@ -24,8 +24,10 @@ import { load, report } from '../check/harness.mjs'
 const R = await load(import.meta.url, './runtime.ts')
 const { check, done } = report()
 
-const gpu = { profile: { addressable_memory: 120 * 1024 ** 3 } }
-const cpu = { profile: { addressable_memory: 0 } }
+const gpu = { profile: { addressable_memory: 120 * 1024 ** 3, device_class: 'gb10' } }
+const cpu = { profile: { addressable_memory: 0, device_class: 'cpu' } }
+// An RTX 3090 Ti: GPU memory of its own AND host RAM of its own.
+const discrete = { profile: { addressable_memory: 24 * 1024 ** 3, device_class: 'discrete' } }
 
 // ── the picker's own consistency ────────────────────────────────────────────
 //
@@ -56,13 +58,20 @@ for (const name of ['vllm', 'sglang', 'tts']) {
 
 // The mirror of `deploy/flags.py::placement_refusal`. Both directions are
 // refusals, which is the part a single `addressable_memory > 0` test cannot
-// express: the Pi is the only machine llamacpp will take, and the Spark is
-// the only machine the other three will.
+// express: the Spark is refused by llamacpp and the Pi by the other three,
+// while a discrete-GPU box is the one machine both kinds can carry.
 check(R.canCarryRank('vllm', gpu.profile) === true, 'vllm takes a machine with GPU memory')
 check(R.canCarryRank('vllm', cpu.profile) === false, 'and refuses one without')
 check(R.canCarryRank('llamacpp', cpu.profile) === true, 'llamacpp takes a machine with no GPU')
 check(R.canCarryRank('llamacpp', gpu.profile) === false,
-  'and refuses one with a GPU, rather than running on its CPU and wasting it')
+  'and refuses a unified-memory one, whose host RAM is the GPU\'s pool and is budgeted as GPU memory')
+check(R.canCarryRank('llamacpp', { ...gpu.profile, device_class: 'apple' }) === false,
+  'Apple silicon is unified too, so it is refused for the same reason')
+check(R.canCarryRank('llamacpp', discrete.profile) === true,
+  'a discrete-GPU box takes llamacpp: its host RAM is a separate pool the gate budgets on its own')
+check(R.canCarryRank('vllm', discrete.profile) === true, 'and still takes vllm against its VRAM')
+check(R.canCarryRank('llamacpp', { addressable_memory: 0, device_class: 'unknown' }) === false,
+  'an unidentified machine is refused: nothing says whether its host RAM is its own pool')
 
 // ── the recommendation ──────────────────────────────────────────────────────
 check(R.runtimeFor('speech', [gpu]).runtime === 'tts', 'a speech model picks tts')

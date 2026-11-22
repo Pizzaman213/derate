@@ -44,6 +44,41 @@ def records_dir() -> Path:
     return data_dir() / SUBDIR
 
 
+def image_probe(runtime: str, arch: str):
+    """The probe of the image *runtime* runs on a machine of *arch*, or None.
+
+    Every record here is keyed by an image version, and it has to be the
+    version of the image the MEASURED (or queried) machine runs --
+    `flags.image_for_arch`, the same rule a launch uses -- never the default
+    image's. The 3090 runs vLLM 0.31 and the default (Spark) image is
+    0.28.1rc1, so reading the default probe filed a 3090 measurement under the
+    Spark's version, where a later Spark lookup would match it.
+
+    None when this build has no image for *arch* or nothing has probed that
+    image (`support.probe_for` never lends a named image the default's
+    probe). Every caller treats that as a MISS.
+    """
+    try:
+        from control_plane.deploy.flags import RUNTIMES, image_for_arch
+        from control_plane.resolver import support
+    except Exception:  # pragma: no cover - deploy/resolver not installed
+        return None
+    spec = RUNTIMES.get(runtime)
+    if spec is None:
+        return None
+    image = image_for_arch(spec, arch or "")
+    if not image:
+        return None
+    return support.probe_for(runtime, image)
+
+
+def image_version(runtime: str, arch: str) -> str:
+    """:func:`image_probe`'s version, or "" -- which every reader and writer
+    treats as a MISS, never as "any version"."""
+    found = image_probe(runtime, arch)
+    return str(getattr(found, "version", "") or "") if found is not None else ""
+
+
 @dataclass(frozen=True)
 class SpecRecord:
     """One sweep result: what was run, on what, and what came out."""

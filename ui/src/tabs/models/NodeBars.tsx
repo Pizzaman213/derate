@@ -241,13 +241,14 @@ function NodeBar({
   const pct = (bytes: number) => (track ? `${Math.min(100, (bytes / track) * 100)}%` : '0%')
 
   let note: JSX.Element
-  if (row.allocatable == null) note = <span className="unit">not read yet</span>
+  if (row.allocatable == null) note = <span className="unit">{row.noHostPool ? 'no host pool' : 'not read yet'}</span>
   else if (row.inPlan && perNode != null)
     note = over ? (
       <span className="unit mdl-sig-fault">{`short ${gib(perNode - row.allocatable)}`}</span>
     ) : (
       <span className="unit">{`${gib(row.allocatable - perNode)} left`}</span>
     )
+  else if (row.hostPool) note = <span className="unit mdl-node-pool">{`${gib(row.allocatable)} host RAM free`}</span>
   else note = <span className="unit">{`${gib(row.allocatable)} free`}</span>
 
   return (
@@ -258,6 +259,7 @@ function NodeBar({
         checked={checked}
         disabled={!row.selectable || onlyTicked}
         onChange={(e) => onToggle(e.target.checked)}
+        aria-describedby={!row.selectable && row.unselectableReason ? `${id}-why` : undefined}
         title={onlyTicked ? 'the last machine: it stays ticked' : undefined}
       />
       <label htmlFor={id} className="mdl-node-name">
@@ -265,11 +267,9 @@ function NodeBar({
           signal={row.inPlan ? 'live' : 'idle'}
           hollow={!row.inPlan}
           size={7}
-          label={row.inPlan ? `${row.name} is in the plan` : (row.unselectableReason ?? `${row.name} is not in the plan`)}
+          label={row.inPlan ? `${row.name} is in the plan` : `${row.name} is not in the plan`}
         />
-        <span className="mono" title={row.unselectableReason ?? ''}>
-          {row.name}
-        </span>
+        <span className="mono">{row.name}</span>
       </label>
       <div className="mdl-nbar" aria-hidden="true">
         {track ? (
@@ -305,7 +305,7 @@ function NodeBar({
           and the board's for why it cannot carry a rank. Shown, never hidden:
           "why isn't my other box being used" deserves an answer here. */}
       {!row.selectable && row.unselectableReason ? (
-        <div className="mdl-node-note">
+        <div className="mdl-node-note" id={`${id}-why`}>
           <Verbatim text={row.unselectableReason} size="unit" />
         </div>
       ) : null}

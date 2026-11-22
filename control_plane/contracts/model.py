@@ -61,6 +61,17 @@ class ModelShape:
     # is real memory it does not count.
     is_encoder_decoder: bool = False
 
+    # A speech checkpoint's audio codec, as derate's own tts server drives it:
+    # what the torch allocator holds beyond the weight index once the codec is
+    # resident, and what decoding one generated frame back to audio adds on
+    # top -- the codec decodes the whole clip in one call, so it grows with
+    # the frames generated, which the server bounds by the context window.
+    # Measured per architecture, never derived (`resolver/support.py::
+    # TTS_WORKING_SETS`), and applied by the gateway for the tts runtime only.
+    # 0 for every other shape.
+    codec_resident_bytes: int = 0
+    codec_bytes_per_frame: int = 0
+
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0
@@ -92,6 +103,14 @@ class ModelShape:
         if self.active_params is not None:
             return self.active_params
         return self.total_params
+
+    def codec_working_set(self, context: int) -> int:
+        """Bytes the codec holds while a clip of up to *context* frames is
+        decoded. One clip at a time: the tts server synthesises under a lock,
+        so concurrency does not multiply it."""
+        return max(0, self.codec_resident_bytes) + max(
+            0, self.codec_bytes_per_frame
+        ) * max(0, int(context))
 
     def bytes_per_param(self) -> float:
         try:

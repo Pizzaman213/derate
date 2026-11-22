@@ -24,11 +24,25 @@ export function CacheTable({
   node,
   servedFolders,
   onDelete,
+  copyTargets,
+  copyBlocked,
+  onCopy,
+  replicaFolders,
   busy,
 }: {
   node: NodeStorage
   servedFolders?: Set<string>
   onDelete?: (nodeId: string, m: CachedModel) => void
+  /** Nodes a repository can be copied to; one `Copy to <node>` button each. */
+  copyTargets?: string[]
+  /** Target -> why it cannot take a copy (its agent's own answer). Those
+   *  buttons are disabled with the reason as their title, and the reason is
+   *  said once under the table. */
+  copyBlocked?: Map<string, string>
+  onCopy?: (m: CachedModel, target: string) => void
+  /** Folders derate itself copied onto this node, to whether the copy is
+   *  complete; each is labelled so. */
+  replicaFolders?: Map<string, boolean>
   busy?: string | null
 }) {
   const cache = node.models
@@ -81,7 +95,7 @@ export function CacheTable({
               <th style={{ width: 90 }}></th>
               <th style={{ textAlign: 'right' }}>Size</th>
               <th>Downloaded</th>
-              {onDelete ? <th></th> : null}
+              {onDelete || onCopy ? <th></th> : null}
             </tr>
           </thead>
           <tbody>
@@ -94,6 +108,11 @@ export function CacheTable({
                     {m.repo_id}
                     {m.revisions.length > 1 ? (
                       <span className="unit"> · {m.revisions.length} revisions</span>
+                    ) : null}
+                    {replicaFolders?.has(m.folder) ? (
+                      <span className="unit">
+                        {replicaFolders.get(m.folder) ? ' · copied by derate' : ' · partial copy by derate'}
+                      </span>
                     ) : null}
                   </td>
                   <td>
@@ -109,23 +128,41 @@ export function CacheTable({
                   <td className="unit">
                     {m.last_modified ? relativeTime(m.last_modified) : '—'}
                   </td>
-                  {onDelete ? (
+                  {onDelete || onCopy ? (
                     <td style={{ textAlign: 'right' }}>
-                      {inUse ? (
-                        // Marked, not merely disabled: the server refuses this
-                        // with a 409, and the reason is the useful half.
-                        <span className="unit" style={{ color: 'var(--live)' }}>
-                          serving
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => onDelete(node.node_id, m)}
-                          disabled={busy != null}
-                        >
-                          {busy === key ? 'Deleting…' : 'Delete'}
-                        </button>
-                      )}
+                      <span
+                        style={{ display: 'inline-flex', gap: 'var(--space-4)', alignItems: 'center' }}
+                      >
+                        {onCopy
+                          ? (copyTargets ?? []).map((target) => (
+                              <button
+                                key={target}
+                                type="button"
+                                className="ghost"
+                                onClick={() => onCopy(m, target)}
+                                disabled={busy != null || copyBlocked?.has(target)}
+                                title={copyBlocked?.get(target)}
+                              >
+                                {busy === `copy:${target}/${m.folder}` ? 'Starting…' : `Copy to ${target}`}
+                              </button>
+                            ))
+                          : null}
+                        {!onDelete ? null : inUse ? (
+                          // Marked, not merely disabled: the server refuses this
+                          // with a 409, and the reason is the useful half.
+                          <span className="unit" style={{ color: 'var(--live)' }}>
+                            serving
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => onDelete(node.node_id, m)}
+                            disabled={busy != null}
+                          >
+                            {busy === key ? 'Deleting…' : 'Delete'}
+                          </button>
+                        )}
+                      </span>
                     </td>
                   ) : null}
                 </tr>
@@ -134,6 +171,14 @@ export function CacheTable({
           </tbody>
         </table>
       </div>
+      {onCopy && copyBlocked?.size
+        ? [...copyBlocked].map(([target, why]) => (
+            <div key={target} className="unit" style={{ marginTop: 'var(--space-4)' }}>
+              Copy to {target} is unavailable:
+              <Verbatim text={why} size="unit" />
+            </div>
+          ))
+        : null}
     </div>
   )
 }

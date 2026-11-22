@@ -180,6 +180,32 @@ def test_runtimes_lists_every_runtime(searching, monkeypatch):
     assert rows["vllm"]["nccl_tunables"]
 
 
+def test_runtimes_say_which_version_each_architectures_image_runs(searching, monkeypatch):
+    """A sweep keys its record by the image the MEASURED machine runs. The
+    default image's `version` filed a 3090 (vLLM 0.31) measurement under the
+    Spark's 0.28.1; this is what the sweep reads instead, and an image nothing
+    has probed is null -- a miss, never the default's version."""
+    from types import SimpleNamespace
+
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.resolver import support
+
+    monkeypatch.setattr(capacity_api, "_image_present", lambda image: False)
+    monkeypatch.setattr(support, "_PROBED", {})
+    monkeypatch.setattr(support, "_PROBED_IMAGES", {})
+    spec = RUNTIMES["vllm"]
+    support.record_probe(SimpleNamespace(
+        runtime="vllm", image=image_for_arch(spec, "arm64"), version="0.28.1rc1"))
+    c, _ = searching
+    rows = {r["name"]: r for r in c.get("/api/runtimes").json()}
+    assert rows["vllm"]["image_versions"] == {"amd64": None, "arm64": "0.28.1rc1"}
+
+    support.record_image_probe(SimpleNamespace(
+        runtime="vllm", image=image_for_arch(spec, "amd64"), version="0.31.0"))
+    rows = {r["name"]: r for r in c.get("/api/runtimes").json()}
+    assert rows["vllm"]["image_versions"] == {"amd64": "0.31.0", "arm64": "0.28.1rc1"}
+
+
 def test_runtimes_carry_the_kv_width_the_gate_charges(searching, monkeypatch):
     monkeypatch.setattr(capacity_api, "_image_present", lambda image: False)
     c, _ = searching

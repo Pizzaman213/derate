@@ -27,6 +27,8 @@ rungs it returns `None`, and `None` is a state the planner handles.
 | `probe_server.py` | 175 | the built-in TCP sink and its client — the rung that needs no binary |
 | `runner.py` | 164 | the fork-or-ssh seam every shell-out goes through |
 | `qsfp.py` | 141 | which fabric cages are lit, and what one cable caps at |
+| `nichealth.py` | 815 | each RDMA port's MTU, rings, CQE flag, drop counters and addresses, what to change between two ends, and whether each rail actually reaches the other |
+| `fabric_setup.py` | 696 | the HOST-side tool that puts every rail into that state and keeps it there (`install.sh --fabric-setup`) |
 | `stub.py` | 120 | the day-0 `LinkPort` fixture |
 | `store.py` | 119 | durable JSON store; writes swap a whole mapping so readers never block |
 | `gdr.py` | 103 | whether GPUDirect RDMA is actually on — the flag that explains the number |
@@ -222,6 +224,76 @@ It is local by construction, and `PortStatus.inspected_on` names whose fabric wa
 read. `measure.py::_ports_for` will not call it at all when neither endpoint is
 this node — attaching our own cages to a link between two other machines would be
 a plausible-looking lie.
+
+## `nichealth.py`
+
+The ladder says how fast a pair is; this says what is holding it back. On the
+agent, `read_nic_health` lists every interface with an RDMA device
+(`/sys/class/net/<if>/device/infiniband/*`): carrier, speed and MTU from sysfs,
+rings (`ethtool -g`), `rx_cqe_compress` (`--show-priv-flags`), four counters
+(`ethtool -S`) and IPv4 (`ip -o -4 addr`). No `ethtool` (the node image ships it
+since 2026-11-21) leaves those fields None with a sentence in `unread`.
+
+On the coordinator, `compare_health` pairs the two ends' ports (shared IPv4
+subnet, then interface name, then sorted order) and returns findings with the
+exact fix: an MTU mismatch (netplan `mtu:` for the lower end), a rail pair with
+no shared IPv4 subnet (netplan `addresses:` in the peer's subnet -- copies work
+over IPv6 link-local, NCCL's bootstrap and sparkrun's `ib_detect.sh` do not), a
+ring below its maximum and `rx_cqe_compress` off (`ethtool` plus a udev line to
+keep it), and a nonzero drop counter. Drop counters are since boot and every
+sentence says so; `link_down_events_phy` is reported and never judged, because
+the link goes down at least once per boot. Ports without carrier are never
+judged. Routes: `GET /agent/links/health` (token-gated) and
+`GET /api/links/health[?a=&b=]`.
+
+Settings do not say a rail carries anything (exo's "ghost node": every link up,
+every ping lost), so the health route also has one end of each pair -- the
+coordinator itself when it is an end, otherwise through
+`POST /agent/links/probe` -- open one TCP connection per (local rail, far
+address) to the far end's copy receiver on 47101: IPv4 only within a shared
+subnet, bound to the rail's own address so the SYN leaves through that rail,
+and IPv6 link-local scoped `%<rail>`, which pins the egress port with no address
+plan at all. At most 16 targets, 1.5 s each, in parallel; the agent refuses any
+source that is not one of its RDMA ports, any port but 47101 and any address
+outside RFC 1918, 169.254/16 and fe80::/10 (`validate_probe_targets`). Each row
+lands in the link's `reach` list (`node_id, iface, target, ok, ms, error`). A
+rail on which no target answered is a warning; a REFUSED connection proves the
+rail (the far kernel's RST came back over it), so refusals on every rail are one
+info finding that nothing listens on 47101 there. A prober whose agent has no
+probe route (404) is an info finding too, never a failure.
+
+## `fabric_setup.py`
+
+`nichealth.py` says what to change; this changes it. It runs as root on the
+HOST, outside any container, from `derate-fabric.timer` (`systemd/`: 30 s after
+boot, then every 30 minutes), so it is standard library only and imports
+nothing from `control_plane` -- `install.sh --fabric-setup` copies the one file
+out of the node image into `/usr/local/lib/derate/`. It re-asserts rather than
+configuring once because NVIDIA Sync rewrites netplan and NetworkManager
+re-applies connections (exo's fabric service answers the same problem the same
+way).
+
+`plan(state, config)` is pure and returns idempotent actions, none when the
+rails already match. A rail is an interface with an RDMA device and carrier,
+ordered by PCI address (a byte sort of the names puts `enP2p1s0f0np0` before
+`enp1s0f0np0`). Each gets MTU 9000, rings at their maximum, `rx_cqe_compress`
+on, and one address: rail *i* is `10.100.(152+i).0/24` (`subnet_base`) with the
+last octet of the management address (the default route's) as the host part,
+so spark-26af is `.172` and spark-4d38 `.71` with nobody assigning anything. A
+management network that is not a /24, or an octet of 0 or 255, is refused with
+a sentence naming `/etc/derate/fabric.json`'s `addresses`, which overrides per
+interface. An address already inside a fabric subnet is kept (spark-4d38's
+hand-made `.1` stays beside `.71`); with `exclusive` (default true) every other
+IPv4 on a rail is removed -- the stale `10.100.0.2/30` and `169.254.212.153/16`
+here are what NCCL's bootstrap and RoCE GID selection picked. Additions run
+before removals and the management address is never removed. An unknown config
+key is refused, never ignored.
+
+`--dry-run` prints the plan without root. `--apply --snapshot PATH` records
+each rail's original MTU, rings, CQE flag and IPv4 the first time it sees that
+rail and accumulates the addresses it adds; `--restore PATH` (what `install.sh
+--leave` runs) puts the originals back, deletes only those added addresses, and
+removes the record once every action succeeded.
 
 ## `stub.py`
 

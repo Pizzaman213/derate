@@ -152,6 +152,31 @@ def test_success_measures_each_user_count_and_stops_the_copy(tmp_path):
     assert stored.state == "done" and stored.node_ids == ["spark-01"]
 
 
+@pytest.mark.parametrize("runtime", ["sglang", "llamacpp"])
+def test_a_record_is_described_by_the_runtime_it_benchmarked(tmp_path, runtime):
+    """The version a benchmark is filed under is the image the measured
+    machine runs for THIS runtime -- an sglang run is not a vLLM one."""
+    asked: list[tuple[list[str], str]] = []
+
+    def describe(node_ids, runtime):
+        asked.append((list(node_ids), runtime))
+        return "GPU", f"{runtime}-1.0"
+
+    async def go():
+        r = BenchRunner(
+            launcher=lambda: _launcher(), deployments=_Deps(), directory=tmp_path,
+            transport=_transport(), ready_poll_s=0.0, ready_timeout_s=5.0,
+            describe=describe,
+        )
+        rec = r.start({**REQ, "runtime": runtime}, users=[1])
+        await r.wait()
+        return rec
+
+    rec = asyncio.run(go())
+    assert asked == [(["spark-01"], runtime)]
+    assert (rec.gpu_name, rec.runtime_version) == ("GPU", f"{runtime}-1.0")
+
+
 def test_refused_launch_fails_with_the_servers_message(tmp_path):
     deps = _Deps()
 

@@ -40,7 +40,21 @@ python3 -m tests.model_sweep --arch    # VLLM_ARCHITECTURES against the image's 
 python3 -m tests.spec_sweep --scan --model X   # every published head, ranked, no launch
 python3 -m tests.spec_sweep --smoke   # speculative acceptance: plumbing, ~1 min
 python3 -m tests.spec_sweep --model Qwen/Qwen3-4B   # ...and a real measurement
+python3 -m tests.placement_sweep --model X --nodes a,b --dry-run   # each ranked shape's launch body
+python3 -m tests.placement_sweep --model X --nodes a,b   # launch each, measure, vs the planner's pick
 ```
+
+`tests/placement_sweep.py` is the planner's ground truth, after exo's bench
+tool: it takes the shapes `POST /api/plan/candidates` ranked on the named
+machines (never its own enumeration), launches each one at a time pinned to
+its own `node_ids` and `parallelism`, drives `control_plane/bench_data/` at
+concurrency 1 (one stream's decode tok/s) and N (aggregate tok/s), records
+TTFT at both, stops it, and writes a JSON record under
+`data_dir()/measurements/placement/` plus a table saying where the measured
+order departs from the planner's pick. A shape the gate refused is recorded in
+its own words and not launched. It logs in as `DERATE_CHECK_ADMIN_USER` the
+way `ui/src/check/auth.mjs` does; `tests/unit/test_placement_sweep.py` runs
+`--dry-run` against an in-process gateway with the real planner.
 
 `tests/model_sweep.py` is the model tester and `tests/unit/test_model_corpus.py`
 gates the suite on it.
@@ -157,6 +171,12 @@ control_plane/resolver/    HuggingFace id -> ModelShape, quantization table
 control_plane/fit/         the blocking out-of-memory gate
 control_plane/planner/     TP/PP/EP from measured facts
 control_plane/deploy/      sparkrun adapter, lifecycle
+control_plane/transfer/    copies a cache folder from the coordinator to other
+                           nodes over the fastest links they share (RoCE rails
+                           by IPv6 link-local, no netplan needed): a receiver on
+                           every agent (port 47101), N raw TCP streams, blobs
+                           hashed against their names. A launch pre-stages with
+                           it; background copies propose it and run on approval.
 control_plane/gateway/     the one HTTP surface: /v1, /api, and the built UI.
                            authz.py is the credential gate: a session on /api,
                            a drt_ key on /v1, everything else open by name.
@@ -539,6 +559,18 @@ bootstrap address: on this estate it chose a stray `10.100.0.2/30` on the
 peer's RoCE NIC that the coordinator cannot route to, and hung until timeout --
 which reads exactly like a fabric fault and is not one. Name the interface.
 
+**The device is mapped only where it exists, and a missing one is fatal, not
+slow.** sparkrun maps `/dev/infiniband` into EVERY rootless launch, and
+`docker run` refuses a device that is not there ("error gathering device
+information") before the container exists -- which sparkrun reports as
+"Container died unexpectedly". The 3090 has no InfiniBand, so every launch
+there died that way. `NodeProfile.infiniband` (the agent reads
+`/sys/class/infiniband_verbs`, which works from inside its container) feeds
+`recipes.fabric_on_every_node`: the recipe writes `devices: []` for a one-node
+plan or when any plan node reports False, NCCL then runs over TCP on every
+rank, and the plan's placement warnings say so (`tcp_fabric_note`). None (an
+agent older than the field) keeps the device, which is today's behaviour.
+
 **NCCL is configured through the recipe's `env:` block, and derate ships no
 defaults for it on purpose.** `DERATE_NCCL_ENV` ("NCCL_PROTO=LL,...") is parsed
 per launch and rendered beside `VLLM_CACHE_ROOT`; `NCCL_TUNABLES` is every
@@ -683,24 +715,39 @@ measurement is missing. Degrading would mean fabricating.
 **"Has no GPU" and "cannot serve" are two questions now.** They were one for
 the life of the project, asked as `addressable_memory <= 0` in six places.
 `RuntimeSpec.memory_pool` (`"gpu"` / `"host"`) is the fact, and
-`flags.placement_refusal` is the single predicate -- both directions are
-refusals, because `llamacpp` refuses a machine that HAS a GPU.
+`flags.placement_refusal(runtime, profile, live_budget)` is the single
+predicate -- both directions are refusals, because `llamacpp` refuses some
+machines that HAVE a GPU.
 
-**That refusal is an ACCOUNTING one, and the tempting reason for it is the
-wrong one.** "llama.cpp would not use the card" is a preference, and a
-preference is not grounds for a refusal here: it would run on a Spark's CPU
-perfectly well, just slowly, and nothing would break. What derate cannot do is
-BUDGET it there. `registry.allocatable_bytes` branches on device class --
-host memory for `DeviceClass.CPU`, a GPU figure for every other -- so the fit
-gate would compare a host-RAM demand against a GPU number, which can approve a
-launch that exhausts RAM as easily as refuse one that would have fitted. The
-refusal therefore describes THIS BUILD and names what would have to change.
-It is also wider than it strictly needs to be: on a discrete-GPU box VRAM and
-host RAM are separate pools and a host-pool runtime there is perfectly
-budgetable. Narrowing that is a change to `allocatable_bytes`, not to the
-placement predicate. `ui/src/state/runtime.ts::
-canCarryRank` is the client's mirror and `board.ts` must keep agreeing with it,
-or the node board offers a tick the launch answers with 400.
+**That refusal is an ACCOUNTING one, and since 2026-11-21 it is exactly as
+wide as the accounting.** "llama.cpp would not use the card" is a preference,
+and a preference is not grounds for a refusal here. What decides it is whether
+derate can BUDGET host RAM on that machine: `telemetry.allocatable_bytes(...,
+pool="host")` answers for `DeviceClass.CPU` and `DeviceClass.DISCRETE` (VRAM
+and host RAM are separate pools; the agent now samples host memory on a
+discrete box too) and 0 everywhere else. On GB10 and Apple the GPU and the
+server would spend the SAME bytes, which derate budgets as GPU memory, so a
+host-pool runtime there is still refused, as is UNKNOWN. A discrete box is
+placed through `flags.budget_profile`, which shows the planner and the fit
+gate the machine with its card removed: static ceiling 0, the live host budget
+the only figure, so the CPU rule above (unsampled refuses) applies unchanged.
+`ui/src/state/runtime.ts::canCarryRank` is the client's mirror and `board.ts`
+must keep agreeing with it, or the node board offers a tick the launch answers
+with 400.
+
+**A host-RAM decode is priced at a MEASURED host bandwidth, taken once.**
+`NodeProfile.host_memory_bandwidth_gbps` is the agent's own threaded
+`memmove` (`probe.py::measure_host_bandwidth`, stdlib, ~0.5 s, at most 512 MiB
+and never more than an eighth of MemAvailable) on CPU and discrete nodes; GB10,
+Apple and UNKNOWN get None. `budget_profile` puts it in `memory_bandwidth_gbps`
+for a host-pool runtime, so the fit gate's tok/s, the users chart and the
+routing fallback read host RAM, never the card. On the 3090 box (Ryzen 7 5700X,
+dual-channel DDR4) it reads ~46-47 GB/s and llama.cpp decoded a 10.82 GB Q2_K
+at 3.91 tok/s (~42.3 GB/s of weights) -- above the 0.75 end of the decode
+efficiency range, so the card's range is conservative on CPU. It is measured
+ONCE per process: the probe re-runs on a timer, and a second copy would both
+slow a serving box and publish noise as a hardware change. None means
+unmeasured, and then there is no prediction and a neutral routing score.
 
 **sparkrun's container defaults assume a GPU, and one of them is fatal
 without one.** `EXECUTOR_DEFAULTS` carries `gpus: "all"`, which on a machine
@@ -753,16 +800,15 @@ the rendered command died with `llama-server: not found`. Both templates carry
 `PATH="/app:$PATH"` now, prepended rather than hardcoded as an absolute path,
 so pointing `DERATE_LLAMACPP_IMAGE` back at sparkrun's CUDA image still works.
 
-**The llamacpp path cannot be exercised on this estate, and that is two
-constants stacking rather than a bug.** `placement_refusal` refuses a host-pool
-runtime on a machine that HAS a GPU (an accounting refusal -- see above), so it
-can only go to `connor-pi`; the Pi has 1.9 GB of RAM, `cpu_host_reserve` floors
-at 1 GiB and `FRAMEWORK_OVERHEAD` is a flat, runtime-blind 1 GiB
-(`contracts/constants.py`), so its live budget is ~348 MiB and no GGUF of any
-size is ever approved. A CPU node needs ~2 GiB free before the gate will pass
-anything. `FRAMEWORK_OVERHEAD` is a frozen contract and describes a CUDA
-runtime, not llama.cpp; making it per-runtime is a contract change and is
-therefore announced, never done to unblock a test.
+**On a CPU-only machine the llamacpp path still cannot approve anything, and
+that is two constants stacking rather than a bug.** The Pi has 1.9 GB of RAM,
+`cpu_host_reserve` floors at 1 GiB and `FRAMEWORK_OVERHEAD` is a flat,
+runtime-blind 1 GiB (`contracts/constants.py`), so its live budget is ~348 MiB
+and no GGUF of any size is ever approved. A CPU node needs ~2 GiB free before
+the gate will pass anything. `FRAMEWORK_OVERHEAD` is a frozen contract and
+describes a CUDA runtime, not llama.cpp; making it per-runtime is a contract
+change and is therefore announced, never done to unblock a test. The 3090 box
+(discrete, ~60 GiB host RAM) is now where llamacpp can actually be exercised.
 
 **A KV cache has a WIDTH and a CAP, and both have to travel.** The fit gate
 halves `kv_bytes_per_token` for `fp8` (`fit/kv.py::KV_ELEM_BYTES`), approves a
@@ -783,6 +829,31 @@ that width. `VLLM_KV_CACHE_DTYPES` was read off the pinned image's own
 and cannot be served, so they raise. The invariant is in
 `tests/unit/test_integration_kv.py`: a dtype the gate prices at anything other
 than two bytes must produce a flag or an error, never silence.
+The packed kernels (`*_per_token_head`, `nvfp4*`, `turboquant_*`, `*_ds_mla`)
+are priced too, from the page formulas each backend's `customize_spec` uses in
+the pinned image -- scales included, and TurboQuant's four full-width boundary
+layers -- never as a per-element width, which would under-charge every one of
+them. The picker's multiplier for those is per model (`/api/plan`'s
+`kv_dtype_ratios`). `fp8_inc` is Gaudi's and stays refused.
+
+**Each machine is judged by the image IT runs.** The probe used to read ONE
+image, the coordinator's arm64 default, and every machine was judged by it --
+so the 3090's vLLM 0.31.0 was refused architectures it loads and offered ones
+it does not. `support.probe_for(runtime, image)` now answers per image, and
+`_plan_and_fit` asks `supported_by(..., image=)` and `support.silicon_check`
+for each placed machine against `flags.image_for_arch`: a named machine that
+cannot is a 400 (`runtime_unsupported_on_machine`, `unsupported_on_this_gpu`),
+the planner's own pick leaves it out and says so, and the launch and crash
+restart reuse the plan's verdict rather than asking the default image again.
+An image the coordinator cannot start is probed on a healthy machine of its
+architecture with `docker -H ssh://<address>` -- the address and SSH trust a
+launch already uses -- every `ARCH_PROBE_INTERVAL_S` (`resolver.py`), and the
+cache is keyed by the image's layer digests, not its docker id, which differs
+between a containerd and an overlay2 store for the same bytes. The silicon
+facts are vLLM's own: each quantization method's `get_min_capability()` and,
+per KV dtype, the capabilities its attention selector has a backend for (the
+probe runs `--gpus all` for that half and retries without). No probe falls
+back to `QUANT_INFO`; running emulated is a warning, never a refusal.
 
 **`gpu_memory_utilization` is a claim on the whole device, not a limit.** vLLM
 refuses to start unless that share of the GPU is *free*, then fills it with KV
@@ -906,7 +977,9 @@ a real destination and off the nav) and that screen's own subject
 (`/models/<model id>`, `/usage/requests/<id>`, `/usage/keys/<id>`); the query names what is selected (`?node=`, `?link=`,
 `?dep=`, `?open=node:spark-01`, `?ctx=`/`?seq=`, and `/usage`'s own `?win=`). `/usage`'s pane
 (Overview, Requests, Rate limits, Keys) is a path segment, `Route.sub`; the old `/spend`, `/keys` and
-`/requests` paths are parse-only aliases since 2026-11-18, rewritten to `/usage...`. `ui/src/state/
+`/requests` paths are parse-only aliases since 2026-11-18, rewritten to `/usage...`. Settings'
+section is a path segment too, `Route.section` (`/settings/storage`); bare `/settings` stays and
+lets the tab pick (Instance with `?node=`, Connection otherwise). `ui/src/state/
 routes.ts` is the scheme -- pure, verified by `router.check.mjs` --
 `router.tsx` is the provider, and `selection.tsx` reads and writes it so no
 call site knows a URL is involved. Selecting replaces, opening pushes. Details
@@ -944,6 +1017,31 @@ already do.
   retired copy and `/home/connor/derate-evidence-20261118T222901Z` the
   pre-move evidence snapshot (checksummed in `SHA256SUMS`); start nothing on
   either. `:8080` is somebody else's. Boot test instances on **18xxx**.
+- **The amd64 machine is the 3090** (`connor3090-system-product-name`,
+  192.168.0.69). Its vllm image is upstream `vllm/vllm-openai` unless
+  `DERATE_VLLM_IMAGE_AMD64` names another; amd64 sglang is upstream
+  `lmsysorg/sglang` (pulled on demand); amd64 tts is `derate/tts:amd64`,
+  built ON the 3090 from docker/tts.Dockerfile on `vllm/vllm-openai:v0.31.0`
+  and never pushed. **The coordinator holds a copy of it** (`docker -H
+  ssh://192.168.0.69 save ... | docker load`), because sparkrun streams an
+  image from the control machine to any host that cannot pull it: that is how
+  a new amd64 machine gets it at its first launch, with no build of its own.
+  The probe cache is keyed by layer digests, so the coordinator's copy answers
+  for every amd64 machine. Confirm after a restart: `grep "on amd64 loads"
+  logs/node.log`.
+- **The 3090 runs ufw.** Model ports are opened for the coordinator with
+  `sudo ufw allow from 192.168.0.172 to any port 8100:8199 proto tcp`; a new
+  machine with a firewall needs the same, and a launch now refuses up front
+  (manager `_refuse_dropped_port`) when the port is silently dropped. Its
+  agent runs in docker (`derate/node:local`, `restart=unless-stopped`); it is
+  rebuilt from this tree with a buildx builder on its own daemon
+  (`docker buildx create --name derate-x86 ssh://192.168.0.69`, then
+  `docker buildx build --builder derate-x86 --platform linux/amd64 --load -t
+  derate/node:amd64-transfer .`). `--load` lands in THIS machine's docker, not
+  the 3090's -- building straight to `derate/node:local` silently replaces the
+  coordinator's arm64 tag -- so ship it (`docker save ... | ssh 192.168.0.69
+  docker load`), retag it `derate/node:local` there, and recreate the
+  container with the same settings (`docker inspect derate`).
 - `npx vite build` is live on :8088 with no restart, *if* `DERATE_UI_DIR` still
   points at `ui/dist` -- read it off `/proc/<pid>/environ` and confirm with
   `curl -s localhost:8088/ | grep -o 'assets/index-[^"]*\.js'`. Equal hashes is

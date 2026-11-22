@@ -1251,3 +1251,246 @@ def test_padding_only_ever_grows_a_prompt():
     assert pad("hello", 0) == "hello"
     assert pad("hello", 200).endswith("hello")
     assert len(pad("hello", 200)) > len(pad("hello", 50))
+
+
+# -- keyed by the image the measured machine runs -----------------------------
+
+
+@pytest.fixture
+def _probes(monkeypatch, tmp_path):
+    """An empty probe table and an empty estate, for one test."""
+    from control_plane.resolver import support
+
+    monkeypatch.setattr(support, "_PROBED", {})
+    monkeypatch.setattr(support, "_PROBED_IMAGES", {})
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    return support
+
+
+def _image_probe(image: str, version: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(runtime="vllm", image=image, version=version,
+                           speculators=frozenset(), architectures=frozenset())
+
+
+def test_a_measurement_is_read_under_the_version_of_the_image_that_machine_runs(_probes):
+    """The 3090 runs vLLM 0.31 and the default (Spark) image is 0.28.1rc1.
+    Keyed by the DEFAULT probe, a 3090 measurement was filed under 0.28.1rc1
+    and a lookup for the 3090 answered with it. The version is the one the
+    queried machine's own image reported; an image nothing probed MISSES."""
+    import dataclasses
+
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.gateway.internal_api import (
+        _attach_measurements, _measured_decode,
+    )
+    from control_plane.measurements import DecodeRecord, save_decode
+    from tests.fixtures import WS_3090
+
+    spec = RUNTIMES["vllm"]
+    default, amd64 = image_for_arch(spec, "arm64"), image_for_arch(spec, "amd64")
+    assert default and amd64 and default != amd64
+    _probes.record_probe(_image_probe(default, "0.28.1rc1"))
+    rtx = dataclasses.replace(WS_3090, arch="amd64")
+    on_rtx = dict(gpu_name=rtx.gpu_name, memory_bandwidth_gbps=rtx.memory_bandwidth_gbps)
+
+    def decode(version: str, tps: float) -> DecodeRecord:
+        return DecodeRecord(
+            model_id="Qwen/Qwen3-4B", runtime_version=version,
+            context_band=measurements.band(4096), concurrency_band=1,
+            decode_tps=tps, tokens=900.0, decode_seconds=7.0, requests=4.0,
+            predicted_tps=None, measured_at=1.0, **on_rtx,
+        )
+
+    # What the old writer filed: the 3090's GPU under the DEFAULT version.
+    measurements.save(_record(runtime_version="0.28.1rc1", **on_rtx))
+    save_decode(decode("0.28.1rc1", 50.0))
+    options = [{"method": "ngram"}]
+
+    # The 3090's image has no probe: a miss, never the default's version.
+    assert _attach_measurements(options, "Qwen/Qwen3-4B", [rtx])[0]["measured"] == []
+    assert _measured_decode("Qwen/Qwen3-4B", [rtx], 4096, "vllm") is None
+
+    # Probed at 0.31.0: its own record answers, the Spark-version one does not.
+    _probes.record_image_probe(_image_probe(amd64, "0.31.0"))
+    measurements.save(_record(runtime_version="0.31.0", best_tps=99.0, **on_rtx))
+    save_decode(decode("0.31.0", 77.0))
+    measured = _attach_measurements(options, "Qwen/Qwen3-4B", [rtx])[0]["measured"]
+    assert [m["runtime_version"] for m in measured] == ["0.31.0"]
+    assert _measured_decode("Qwen/Qwen3-4B", [rtx], 4096, "vllm")["decode_tps"] == 77.0
+
+
+def test_a_sweep_keys_its_record_by_the_measured_machines_image(monkeypatch):
+    """The sweep's record names the node's GPU, so it names the image THAT node
+    runs -- read off `/api/runtimes`' `image_versions` by its architecture,
+    not off the default image's support verdict. No architecture, or an image
+    nothing probed, is '' and never matches a versioned lookup."""
+    from tests import spec_sweep
+
+    rows = [{"name": "vllm", "version": "0.28.1rc1",
+             "image_versions": {"amd64": "0.31.0", "arm64": "0.28.1rc1"}},
+            {"name": "sglang", "image_versions": {"amd64": None}}]
+    asked: list[str] = []
+
+    def call(base, path, **_kw):
+        asked.append(path)
+        return rows if path == "/api/runtimes" else {}
+
+    monkeypatch.setattr(spec_sweep, "_call", call)
+    assert spec_sweep.runtime_version("http://x", {"arch": "amd64"}) == "0.31.0"
+    assert spec_sweep.runtime_version("http://x", {"arch": "arm64"}) == "0.28.1rc1"
+    assert spec_sweep.runtime_version("http://x", {"arch": "amd64"}, "sglang") == ""
+    assert spec_sweep.runtime_version("http://x", {}) == ""
+    assert set(asked) == {"/api/runtimes"}
+
+
+def test_a_decode_sweep_files_its_records_under_the_measured_machines_image(
+    _probes, monkeypatch
+):
+    """The decode sweep writes what it measured on the roster's first node,
+    so the record carries the version of the image THAT node runs."""
+    from tests import decode_sweep, spec_sweep
+
+    node = {"node_id": "rtx", "gpu_name": "NVIDIA GeForce RTX 3090 Ti",
+            "memory_bandwidth_gbps": 1008.0, "arch": "amd64"}
+    found = decode_sweep.Measured(
+        model_id="Qwen/Qwen3-0.6B", served_name="q", deployment_id="d-1",
+        context_length=4096, decode_tps=120.0, tokens=900.0, decode_seconds=7.5,
+        requests=4.0, mean_sequence=600.0, client_tps=None, predicted_tps=None,
+        predicted_tps_empty=None, weights_bytes=1, kv_cache_bytes=1,
+        kv_cache_usage=None, preemptions=0.0,
+    )
+    rows = [{"name": "vllm", "version": "0.28.1rc1",
+             "image_versions": {"amd64": "0.31.0", "arm64": "0.28.1rc1"}}]
+    monkeypatch.setattr(decode_sweep, "node_profile", lambda base: node)
+    monkeypatch.setattr(decode_sweep, "ready_vllm",
+                        lambda base: [{"served_name": "q", "model_id": found.model_id}])
+    monkeypatch.setattr(decode_sweep, "measure", lambda dep, **_kw: found)
+    monkeypatch.setattr(spec_sweep, "_call",
+                        lambda base, path, **_kw: rows if path == "/api/runtimes" else {})
+
+    decode_sweep.main(["--base", "http://x"])
+
+    (record,) = measurements.load_decode_all()
+    assert record.runtime_version == "0.31.0"
+    assert record.gpu_name == node["gpu_name"]
+
+
+@pytest.mark.parametrize("arch, runs_it", [("amd64", False), ("arm64", True), ("", True)])
+def test_a_head_scan_asks_the_image_the_measured_machine_runs(monkeypatch, arch, runs_it):
+    """Which heads load is the speculator registry of the image the node runs.
+    The coordinator only starts the image it launches itself; another
+    architecture's is answered from the probe cache or not at all."""
+    from types import SimpleNamespace
+
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane import resolver as resolver_pkg
+    from control_plane.resolver import imageprobe
+    from tests import spec_sweep
+
+    asked: list[tuple[str, bool]] = []
+    priced_with: list = []
+
+    class _Resolver:
+        cache = SimpleNamespace(directory=Path("/nonexistent/cache"))
+
+        def resolve_full(self, model_id):
+            return SimpleNamespace(shape=None)
+
+    def probe(runtime, image, *, cache_dir, run=True, **_kw):
+        asked.append((image, run))
+        return SimpleNamespace(speculators=frozenset({image}))
+
+    def price(resolver, shape, rows, specs, **_kw):
+        priced_with.append(specs)
+        return [], []
+
+    monkeypatch.setattr(resolver_pkg, "ModelResolver", _Resolver)
+    monkeypatch.setattr(imageprobe, "probe", probe)
+    monkeypatch.setattr(spec_sweep, "node_profile",
+                        lambda base: {"arch": arch, "memory_bandwidth_gbps": 1008.0})
+    monkeypatch.setattr(head_scan, "candidates", lambda resolver, model_id: [])
+    monkeypatch.setattr(head_scan, "price", price)
+    monkeypatch.setattr(head_scan, "rank", lambda usable, shape, bw: (0.0, []))
+    monkeypatch.setattr(spec_sweep, "_print_scan", lambda *a, **k: None)
+
+    spec_sweep.run_scan(SimpleNamespace(model="Qwen/Qwen3-8B", base="http://x", measure_top=0))
+
+    image = image_for_arch(RUNTIMES["vllm"], arch)
+    assert asked == [(image, runs_it)]
+    assert priced_with == [frozenset({image})]
+
+
+def test_a_benchmark_is_filed_under_the_image_its_machine_runs(_probes):
+    """`_bench_describe` names the GPU and the version of the image that
+    machine runs for the benchmarked runtime; an unprobed image is None,
+    never the default image's version."""
+    import dataclasses
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.gateway import create_app
+    from tests.fixtures import WS_3090, node_state
+    from tests.unit.test_gateway import FakeRegistry, build_deps
+
+    spec = RUNTIMES["vllm"]
+    _probes.record_probe(_image_probe(image_for_arch(spec, "arm64"), "0.28.1rc1"))
+    rtx = dataclasses.replace(WS_3090, arch="amd64")
+    app = create_app(build_deps(registry=FakeRegistry([node_state(rtx)])))
+    with TestClient(app):
+        describe = app.state.ctx.bench._describe
+        assert describe([rtx.node_id], "vllm") == (rtx.gpu_name, None)
+        _probes.record_image_probe(_image_probe(image_for_arch(spec, "amd64"), "0.31.0"))
+        assert describe([rtx.node_id], "vllm") == (rtx.gpu_name, "0.31.0")
+
+
+@pytest.mark.parametrize("probed_amd64", [False, True])
+def test_the_head_ranking_is_keyed_by_the_image_the_node_runs(_probes, monkeypatch, probed_amd64):
+    """`/api/models/speculative-heads` stores its scan under an image version
+    and reads sweeps under it. On the 3090 that is the amd64 image's; with
+    that image unprobed nothing is read or written -- never under the default
+    image's version."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.gateway import create_app
+    from tests.fixtures import QWEN3_30B_A3B, WS_3090, node_state
+    from tests.unit.test_gateway import FakeRegistry, build_deps
+
+    spec = RUNTIMES["vllm"]
+    _probes.record_probe(_image_probe(image_for_arch(spec, "arm64"), "0.28.1rc1"))
+    if probed_amd64:
+        _probes.record_image_probe(_image_probe(image_for_arch(spec, "amd64"), "0.31.0"))
+    saved: list[str] = []
+    looked_up: list[str] = []
+    monkeypatch.setattr(head_scan, "candidates", lambda resolver, model_id: [])
+    monkeypatch.setattr(head_scan, "price", lambda *a, **k: ([], []))
+    monkeypatch.setattr(head_scan, "cached_scan",
+                        lambda model_id, version: looked_up.append(version))
+    monkeypatch.setattr(head_scan, "save_scan",
+                        lambda model_id, version, *a, **k: saved.append(version))
+
+    class _Resolver:
+        def search_models(self, *a, **k):
+            return []
+
+        def resolve_full(self, model_id, dtype=None):
+            return SimpleNamespace(shape=QWEN3_30B_A3B, speculators=(), model_type="qwen3_moe")
+
+    rtx = dataclasses.replace(WS_3090, arch="amd64")
+    deps = build_deps(registry=FakeRegistry([node_state(rtx)]))
+    deps.resolver = _Resolver()
+    with TestClient(create_app(deps)) as client:
+        response = client.get(
+            "/api/models/speculative-heads",
+            params={"model_id": f"acme/Heads-{probed_amd64}", "refresh": 0},
+        )
+
+    assert response.status_code == 200, response.text
+    expected = ["0.31.0"] if probed_amd64 else []
+    assert looked_up == expected and saved == expected

@@ -4,6 +4,7 @@ import { useState } from 'react'
 import type { DownloadActivity } from '../../api/types'
 import { useBackend } from '../../state/backend'
 import { useActivity } from '../../state/resources'
+import { plainClick, useRouter } from '../../state/router'
 import { PullCard } from './PullCard'
 import { gib } from './verdictView'
 
@@ -43,6 +44,8 @@ export function DownloadsPanel({ providerKinds }: DownloadsPanelProps) {
 
       {activity.error ? <Verbatim text={activity.error.message} size="unit" /> : null}
 
+      <AwaitingCopies n={activity.data?.replication?.awaiting ?? 0} />
+
       {launches.map((l) => (
         <div key={l.deployment_id} className="mdl-dl-row">
           <div className="mdl-dl-line">
@@ -80,6 +83,7 @@ export function DownloadsPanel({ providerKinds }: DownloadsPanelProps) {
             <span className="unit">{d.provider}</span>
           </div>
           {d.kind === 'hub' && d.download_id ? <HubControls d={d} /> : null}
+          {d.kind === 'transfer' && d.transfer_id ? <TransferControls d={d} /> : null}
           {d.total != null ? (
             <div className="mdl-bar" aria-hidden="true">
               <div
@@ -104,6 +108,30 @@ export function DownloadsPanel({ providerKinds }: DownloadsPanelProps) {
       <div className="sub mdl-dl-pull">Pull onto a provider</div>
       <PullCard providerKinds={providerKinds} />
     </section>
+  )
+}
+
+/** Background copies the coordinator proposed and is waiting on a person
+ *  for. Nothing copies until they approve, and the approval lives with the
+ *  disk it spends -- /settings/storage -- so this links straight there. */
+function AwaitingCopies({ n }: { n: number }) {
+  const { linkTo, navigate } = useRouter()
+  if (n <= 0) return null
+  const to = { dest: 'settings' as const, section: 'storage' as const }
+  return (
+    <p className="unit">
+      {n} background {n === 1 ? 'copy' : 'copies'} waiting for your OK in{' '}
+      <a
+        href={linkTo(to)}
+        onClick={(e) => {
+          if (!plainClick(e)) return
+          e.preventDefault()
+          navigate(to)
+        }}
+      >
+        Settings → Storage → Background copies
+      </a>
+    </p>
   )
 }
 
@@ -162,6 +190,49 @@ function HubControls({ d }: { d: DownloadActivity }) {
             Cancel
           </button>
         </span>
+      </div>
+      {err ? <Verbatim text={err} size="unit" /> : null}
+    </>
+  )
+}
+
+/** A copy from the coordinator's cache to another node can be cancelled, not
+ *  paused: the receiving node discards a session that goes quiet. */
+function TransferControls({ d }: { d: DownloadActivity }) {
+  const { backend, invalidate } = useBackend()
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const id = d.transfer_id!
+  const cancel = () => {
+    const sure = window.confirm(
+      'Cancel this copy? Files that already arrived and verified stay on the node, so a later copy resumes; unfinished ones are removed.',
+    )
+    if (!sure) return
+    setBusy(true)
+    setErr(null)
+    backend
+      .cancelTransfer(id)
+      .then(() => invalidate())
+      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+      .finally(() => setBusy(false))
+  }
+  return (
+    <>
+      <div className="mdl-dl-line">
+        <span className="unit mdl-num">
+          {gib(d.completed)} / {gib(d.total)}
+          {rateLine(d)}
+        </span>
+        {/* Only a running copy can be stopped: a verifying one is already
+            committing on the node (the server refuses), and a finished,
+            failed or cancelling one has nothing left to cancel. */}
+        {d.status === 'running' ? (
+          <span className="mdl-dl-actions">
+            <button type="button" className="ghost" disabled={busy} onClick={cancel}>
+              Cancel
+            </button>
+          </span>
+        ) : null}
       </div>
       {err ? <Verbatim text={err} size="unit" /> : null}
     </>

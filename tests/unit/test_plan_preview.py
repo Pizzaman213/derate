@@ -93,3 +93,39 @@ def test_concurrency_rejects_a_bad_context_list():
     with _client() as client:
         r = client.post("/api/plan/concurrency", json=_plan_body(contexts=[]))
     assert r.status_code == 400
+
+
+def test_the_users_wall_charges_a_turboquant_pipeline_as_its_busiest_stage(monkeypatch):
+    """One sequence's cache is `kv_cache_bytes_per_rank`, not the whole-model
+    figure over `kv_divisor`: the second spreads TurboQuant's wide boundary
+    layers across a pipeline when the end stages each hold two, and so put
+    the wall above what the busiest stage can actually hold."""
+    from control_plane.fit import kv as fit_kv
+    from control_plane.gateway import internal_api
+    from tests.unit.test_fit import make_plan
+
+    small = {"model_id": "Qwen/Qwen3-30B-A3B"}
+    tq, plan = "turboquant_k8v4", make_plan(pp=4, node_ids=("spark-01",))
+    real = internal_api._plan_and_fit
+    shapes = []
+
+    async def pipelined(ctx, payload):
+        out = await real(ctx, payload)
+        shapes.append(out.shape)
+        return dataclasses.replace(out, plan=plan, kv_dtype=tq)
+
+    monkeypatch.setattr(internal_api, "_plan_and_fit", pipelined)
+    with _client() as client:
+        r = client.post(
+            "/api/plan/concurrency", json=_plan_body(contexts=[32768], max_users=256, **small)
+        )
+        plan_body = client.post(
+            "/api/plan", json=_plan_body(context=32768, concurrency=1, **small)
+        ).json()
+    assert r.status_code == 200, r.text
+    fit = plan_body["fit_live"] or plan_body["fit"]
+    per_seq = fit_kv.kv_cache_bytes_per_rank(shapes[0], plan, 32768, 1, tq)
+    fixed = fit["breakdown"]["total"] - fit["breakdown"]["kv_cache"]
+    expected = max(0, int((fit["usable_per_node"] - fixed) // per_seq))
+    assert expected > 1, "the wall must be off the floor for this to compare anything"
+    assert r.json()["series"][0]["wall_users"] == expected

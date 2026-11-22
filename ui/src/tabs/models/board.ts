@@ -1,12 +1,13 @@
 import type {
   DeploymentDTO,
+  DeviceClass,
   MemoryReport,
   NodeStateDTO,
   PlacementBlock,
   TopologyEdge,
 } from '../../api/types'
 import { TERMINAL, type CacheIndex } from './rows'
-import { canCarryRank, memoryPool, type Runtime } from '../../state/runtime'
+import { RUNTIME_OPTIONS, canCarryRank, memoryPool, servesOnCluster, type Runtime } from '../../state/runtime'
 /** One deployment on a machine, as the node bar draws its segment. */
 export interface Occupant {
   served_name: string
@@ -83,6 +84,11 @@ export interface BoardRow {
   /** Live allocatable bytes, or null when nothing has read this machine. Null
    *  is not zero: an unpolled node must never draw as a full one. */
   allocatable: number | null
+  /** `allocatable` is host RAM (a host-pool runtime), not GPU memory. */
+  hostPool: boolean
+  /** Under a host-pool runtime, this machine has no host pool of its own to
+   *  budget (unified memory, or unidentified), so no reading is coming. */
+  noHostPool: boolean
   /** The static ceiling the fit gate falls back to when there is no reading. */
   ceiling: number | null
   /** The live reading is older than the poll that should have refreshed it. */
@@ -172,40 +178,51 @@ function edgeKey(a: string, b: string): string {
  *
  *  It was one sentence until there was a runtime that did not need a GPU.
  *  `addressable_memory <= 0` was then both "has no GPU" and "cannot serve",
- *  and a single string could say so. Now a machine with no GPU is the ONLY
- *  kind `llamacpp` will run on, and a machine with one is the only kind the
- *  other three will -- so there are two refusals pointing in opposite
- *  directions, and each has to name the remedy that is actually available.
+ *  and a single string could say so. Now `llamacpp` runs where host RAM is a
+ *  pool of its own -- a machine with no GPU, or a discrete-GPU box -- and the
+ *  other three only where there is GPU memory, so there are two refusals
+ *  pointing in different directions, and each has to name the remedy that is
+ *  actually available.
  *
- *  The second one is an ACCOUNTING refusal and has to read like one. Saying
+ *  The llamacpp one is an ACCOUNTING refusal and has to read like one. Saying
  *  llama.cpp "would not use" a GPU is a consequence dressed as a reason, and
  *  a preference is not grounds for a refusal here: it would run on a Spark's
  *  CPU perfectly well, just slowly. What derate cannot do is budget it there
- *  -- `registry.allocatable_bytes` reports host memory only for a CPU device
- *  class and a GPU figure for every other, so the gate would size a host-RAM
- *  launch against memory the server never touches.
+ *  -- on unified memory the GPU and the server spend one pool, which
+ *  `registry.allocatable_bytes` budgets as GPU memory.
  *
- *  The server refuses a third case this cannot see: a CPU node whose free
+ *  The server refuses a third case this cannot see: a machine whose free host
  *  memory nothing has measured. That needs a live telemetry read, and the
  *  board would rather offer a tick the launch explains than withhold one on a
  *  reading it does not have. */
-function rankRefusal(runtime: Runtime, addressable: number): string | null {
+function rankRefusal(runtime: Runtime, profile: { addressable_memory: number; device_class: DeviceClass }): string | null {
+  if (canCarryRank(runtime, profile)) return null
+  // `flags.placement_refusal`'s sentences, with "this machine" for its id.
   if (memoryPool(runtime) === 'host') {
-    return addressable > 0
-      ? 'llamacpp serves from host RAM, and derate only measures host RAM on a machine with no GPU — here the fit gate would size the launch against GPU memory the server never touches. Pick a machine with no GPU, or serve this on vllm or sglang.'
-      : null
+    const why =
+      profile.device_class === 'unknown'
+        ? `Nothing identified what kind of machine this is, so derate cannot tell whether its host RAM is a pool of its own, and the ${runtime} runtime is budgeted against exactly that.`
+        : `This machine has unified memory: its GPU and its operating system spend one pool, and derate budgets that pool as GPU memory. The ${runtime} runtime serves from host RAM, so the fit gate would size it against bytes the GPU is counting on too, a budget that can approve a launch that exhausts RAM.`
+    return `${why} Serve it on a machine whose host RAM is its own pool, one with a discrete GPU or none, or use one of the GPU runtimes here (${GPU_RUNTIMES}).`
   }
-  return addressable > 0
-    ? null
-    : 'This machine reports no addressable GPU memory, so it cannot carry a rank of this runtime. Pick llamacpp to serve from its RAM instead.'
+  const refusal = `This machine reports no addressable GPU memory, so ${runtime} cannot be placed on it. It can still be a cluster member; it cannot be a serving node for this runtime.`
+  // The server names no remedy because it answers for one runtime. The board
+  // knows the runtime picker one control away, so it names llamacpp, but only
+  // where llamacpp would itself be accepted.
+  return canCarryRank('llamacpp', profile) ? `${refusal} Pick llamacpp to serve from its RAM instead.` : refusal
 }
+
+/** `placement_refusal`'s `others`: every runtime that places in GPU memory. */
+const GPU_RUNTIMES = RUNTIME_OPTIONS.map((o) => o.value)
+  .filter((r) => servesOnCluster(r) && memoryPool(r) === 'gpu')
+  .join(', ')
 
 /** The client's half of the deployment manager's one-copy-per-node rule. Said
  *  here so the tick is withheld rather than offered and then refused; the
  *  server's own sentence, which names the deployment to stop, is what the
  *  409 renders if a launch reaches it anyway. */
 const RUNNING_IT = (servedName: string) =>
-  `This machine is already running this model as ${servedName}. A node runs one copy of a model: a second copy shares the same GPU and the same unified memory.`
+  `This machine is already running this model as ${servedName}. A node runs one copy of a model: a second copy shares the same GPU and the same memory.`
 
 export function buildBoard(input: BoardInput): Board {
   const { nodes, memory, edges, deployments, cache, repoId } = input
@@ -322,15 +339,25 @@ export function buildBoard(input: BoardInput): Board {
         ? null
         : busyWith !== undefined
           ? RUNNING_IT(busyWith)
-          : rankRefusal(input.runtime, n.profile.addressable_memory),
+          : rankRefusal(input.runtime, n.profile),
       runningThisModel: busyWith !== undefined,
       ticked,
       inPlan: inPlan.has(id),
       unused: unused.has(id),
       // `?? null` and not `?? 0`: a machine nothing has polled has no reading,
       // and a zero would draw as one with nothing left.
-      allocatable: m?.allocatable ?? null,
-      ceiling: m?.static_ceiling ?? null,
+      //
+      // In the runtime's own pool. A llamacpp launch on a discrete box is
+      // budgeted against host RAM, so drawing its VRAM here would show a
+      // different number from the one the gate uses -- and host RAM has no
+      // nameplate, so there is no static ceiling to draw it against.
+      allocatable:
+        memoryPool(input.runtime) === 'host'
+          ? m?.host_allocatable ?? null
+          : m?.allocatable ?? null,
+      hostPool: memoryPool(input.runtime) === 'host',
+      noHostPool: memoryPool(input.runtime) === 'host' && !canCarryRank(input.runtime, n.profile),
+      ceiling: memoryPool(input.runtime) === 'host' ? null : m?.static_ceiling ?? null,
       stale: m?.stale === true,
       cached: cachedOn.has(id),
       cachedBytes: cachedOn.has(id) ? cachedBytes : null,

@@ -80,6 +80,9 @@ FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb
 # curl: the container healthcheck, and sparkrun's own model_sync.sh and
 #       nv_monitor_wrapper.sh, which it runs locally rather than over SSH when
 #       the target host is this one.
+# ethtool: the fabric settings the cluster rail reports (control_plane/links/
+#          nichealth.py) -- ring sizes, the rx_cqe_compress flag and the drop
+#          counters. Without it those fields come back empty with a reason.
 #
 # `apt-get upgrade` first: the base image is rebuilt on its own schedule, and
 # a Debian security fix published since then (zlib1g, apt) otherwise waits for
@@ -94,6 +97,7 @@ RUN apt-get update \
       git \
       iproute2 \
       curl \
+      ethtool \
       ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && python -m pip uninstall -y pip
