@@ -363,6 +363,12 @@
     },
     {
       "methods": [
+        "GET"
+      ],
+      "path": "/api/links/health"
+    },
+    {
+      "methods": [
         "POST"
       ],
       "path": "/api/links/measure"
@@ -731,6 +737,24 @@
       "methods": [
         "GET"
       ],
+      "path": "/api/replication"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/replication/approve"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/replication/dismiss"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
       "path": "/api/requests"
     },
     {
@@ -857,6 +881,24 @@
       "methods": [
         "GET"
       ],
+      "path": "/api/transfers"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/transfers"
+    },
+    {
+      "methods": [
+        "DELETE"
+      ],
+      "path": "/api/transfers/{transfer_id}"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
       "path": "/api/usage"
     },
     {
@@ -961,6 +1003,18 @@
       "methods": [
         "GET"
       ],
+      "path": "/agent/links/health"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/agent/links/probe"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
       "path": "/agent/logs"
     },
     {
@@ -1010,6 +1064,30 @@
         "GET"
       ],
       "path": "/agent/telemetry"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/agent/transfers"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/agent/transfers/capacity"
+    },
+    {
+      "methods": [
+        "DELETE"
+      ],
+      "path": "/agent/transfers/{session_id}"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "path": "/agent/transfers/{session_id}/commit"
     }
   ]
 }

@@ -217,6 +217,11 @@ def node_payload(
         # that has not said is not a node that disagrees.
         "build": state.build or None,
         "build_skew": skewed,
+        # What this node's agent says it can do (registry/agent.py::
+        # AGENT_FEATURES). Null when it has not said -- an older agent, or
+        # one that has not answered yet -- and never [] for that: an empty
+        # list is an agent that answered and can do none of them.
+        "features": list(state.features) if state.features is not None else None,
     }
 
 

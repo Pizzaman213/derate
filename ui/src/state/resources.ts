@@ -152,6 +152,20 @@ export const useNodeProcesses = (nodeId: string) =>
 export const useStorage = (enabled = true) =>
   useResource((b) => (enabled ? b.storage() : Promise.resolve(null)), 30000)
 
+// Background copies derate proposes and the ones it placed. 15s: a proposal
+// moves when the coordinator re-plans, not per second, and a copy's progress
+// is the Downloads row's job. Approve and dismiss call `invalidate()`, which
+// refetches at once. `useResource` does not deduplicate, so this is mounted
+// ONCE, by Settings → Storage's container (tabs/storage/StorageSection.tsx),
+// which hands the one subscription to Background copies, Downloaded models
+// and Models by node.
+export const useReplication = () => useResource((b) => b.replication(), 15000)
+// Copies between nodes in flight, for the Models by node table's "copying"
+// cells. An in-memory job list, no fan-out, so 5s costs nothing; the bar
+// itself is the Downloads row's and polls with the activity feed. Mounted once,
+// by the same container.
+export const useTransfers = () => useResource((b) => b.transfers(), 5000)
+
 // The capacity walk resolves models against the hub and is memoised server
 // side; polling it hard would buy nothing and cost the hub.
 //

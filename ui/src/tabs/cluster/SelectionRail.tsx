@@ -8,6 +8,7 @@ const TP_THRESHOLD = 40
 // them: `check.mjs` bundles with esbuild `platform: 'neutral'` and cannot
 // import anything that pulls in React.
 import { canTune, tuningEvidence, tuningLabel, tuningState } from './tuning'
+import { FabricPanel } from './FabricPanel'
 
 /** Everything the two link rails need to run and show a reachability check.
  *  Passed as one object because both rails take all of it and none of it means
@@ -204,6 +205,7 @@ function UnmeasuredLinkRail({
           question, so it is offered first and is not gated on a measurement
           ever having been taken. */}
       <ReachPanel a={a} b={b} name={name} reach={reach} />
+      <FabricPanel a={a} b={b} name={name} />
       <TunePanel
         a={a}
         b={b}
@@ -358,6 +360,7 @@ function LinkRail({
           ? `At or above the ${TP_THRESHOLD} GB/s threshold, so tensor parallel is viable across this pair.`
           : `Below the ${TP_THRESHOLD} GB/s tensor-parallel threshold, which is why the planner chooses pipeline parallel over this pair.`}
       </div>
+      <FabricPanel a={edge.src} b={edge.dst} name={name} />
     </div>
   )
 }

@@ -1,9 +1,9 @@
 import { useState } from 'react'
-import { useStorage } from '../../state/resources'
+import type { Resource } from '../../state/backend'
 import { useBackend } from '../../state/backend'
 import { ProportionBar } from '../../components/Bars'
 import { gbytes } from '../../format'
-import type { EstateEntry, NodeStorage, RetentionPolicy } from '../../api/types'
+import type { EstateEntry, NodeStorage, RetentionPolicy, StorageReport } from '../../api/types'
 
 const MiB = 1024 ** 2
 
@@ -78,8 +78,7 @@ function EstateRows({ node, retention }: { node: NodeStorage; retention?: Retent
  *  safe by construction — a miss costs one hub round trip — which is why it is
  *  the only thing offered: nothing else under the data root can be deleted
  *  without losing a record the product needs. */
-export function EstateCard() {
-  const storage = useStorage()
+export function EstateCard({ storage }: { storage: Resource<StorageReport | null> }) {
   const { backend, invalidate } = useBackend()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)

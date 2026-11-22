@@ -1507,6 +1507,12 @@
           "type": "str",
           "optional": true,
           "default": ""
+        },
+        {
+          "name": "features",
+          "type": "tuple[str, ...] | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -3099,6 +3105,11 @@
       "default": null,
       "owner": "docker/entrypoint.sh",
       "note": ""
+    },
+    "DERATE_EXTRA_CACHE_DIRS": {
+      "default": null,
+      "owner": "control_plane/registry/modelcache.py",
+      "note": "colon-separated folders beneath the HF cache root a copy lands in when the hub's disk is short; anything not beneath that root is refused"
     },
     "DERATE_GALLERY_ONLY": {
       "default": null,

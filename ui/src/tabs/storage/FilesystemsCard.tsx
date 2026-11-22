@@ -1,9 +1,9 @@
-import { useStorage } from '../../state/resources'
+import type { Resource } from '../../state/backend'
 import { Verbatim } from '../../components/Verbatim'
 import { ProportionBar } from '../../components/Bars'
 import { Readout } from '../../components/Readout'
 import { gbytes } from '../../format'
-import type { Filesystem, NodeStorage } from '../../api/types'
+import type { Filesystem, NodeStorage, StorageReport } from '../../api/types'
 
 /** Free space is the number an operator decides against, so it is the one that
  *  gets the readout width; the percentage is context for it. */
@@ -92,8 +92,7 @@ function NodeRow({ node }: { node: NodeStorage }) {
  *  A filesystem appears once however many of our paths sit on it: the data
  *  root, the resolver cache and the sparkrun cache are usually one disk, and
  *  listing them separately would report the same bytes three times. */
-export function FilesystemsCard() {
-  const storage = useStorage()
+export function FilesystemsCard({ storage }: { storage: Resource<StorageReport | null> }) {
   const nodes = storage.data?.nodes ?? []
 
   return (

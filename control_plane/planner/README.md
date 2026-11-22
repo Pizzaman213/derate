@@ -460,6 +460,32 @@ says "and N more" rather than printing a wall of node ids.
   `Candidate(1,1,1,1)` so the caller gets a plan with an honest reason rather
   than an empty list.
 
+## Checking the ranking against the hardware
+
+`estimated_step_seconds` orders candidates, and nothing in this folder knows
+whether that order is the one the machines deliver. `tests/placement_sweep.py`
+is how to find out:
+
+```bash
+python3 -m tests.placement_sweep --model Qwen/Qwen3-4B --nodes spark-26af,spark-4d38 --dry-run
+python3 -m tests.placement_sweep --model Qwen/Qwen3-4B --nodes spark-26af,spark-4d38
+```
+
+It asks `POST /api/plan/candidates` for the best-ranked plan of each kind on
+the named machines -- this planner's `alternatives`, re-judged by the fit gate
+-- and launches each viable one in turn with both `node_ids` and `parallelism`
+pinned, so the gateway's every-node-used check holds the launch to that shape.
+A refused shape is recorded in the gate's own words and not launched. Each
+launch is driven from `control_plane/bench_data/` at concurrency 1 and N and
+torn down before the next. The table compares the measured order to the pick
+twice, because they are different questions: at 1 by one stream's decode
+rate, where a pipeline costs the same at every degree (see `comm.py`), and at
+N by aggregate tok/s, where it can win. `agrees` is null when the pick itself
+never served -- a launch failure is not a ranking error. The JSON record lands
+in `data_dir()/measurements/placement/`; nothing reads it back into a plan yet,
+so a disagreement is evidence to act on here, not a correction applied
+automatically.
+
 ## Deliberately not built
 
 **A throughput prediction.** `estimated_step_seconds` orders candidates and

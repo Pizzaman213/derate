@@ -174,6 +174,8 @@ function SheetBody({
         node={node}
         deployments={cluster?.deployments ?? []}
         routing={routing ?? []}
+        coordinatorBuild={cluster?.summary.coordinator_build ?? null}
+        agentFeatures={cluster?.summary.agent_features ?? []}
         frame={frame}
         stale={stale}
         onClose={onClose}

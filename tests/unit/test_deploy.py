@@ -6328,3 +6328,109 @@ def test_the_firewall_rule_covers_a_port_checked_past_the_usual_span(tmp_path):
         manager._preflight_port(fx.single_node_plan(), base + 150)
     assert "port %d:%d proto tcp" % (base, base + 150) in str(excinfo.value)
     manager.close()
+
+
+# ==========================================================================
+# Pre-staging: the replicator copies the weights to the plan's other nodes
+# before sparkrun runs, and a copy that fails never fails the launch.
+# ==========================================================================
+
+
+class _FakeReplicator:
+    local_node_id = "spark-01"
+
+    def __init__(self, manager_ref, final):
+        self.manager_ref = manager_ref
+        self.final = final
+        self.started: list[tuple[str, str]] = []
+        self.seen: list[dict] = []
+
+    def start(self, folder, node_id, *, streams=8):
+        self.started.append((folder, node_id))
+        return {"transfer_id": "tr-1"}
+
+    def wait(self, transfer_id, on_update, poll_s=1.0):
+        on_update({"status": "running", "path": "fabric", "link": "RoCE, 2 × 200 Gb/s",
+                   "completed": 2 << 30, "total": 4 << 30, "eta_s": 3.0})
+        self.seen.append(dict(self.manager_ref[0].progress()))
+        return self.final
+
+    def cancel(self, transfer_id):
+        return True
+
+
+def _prestage_manager(tmp_path, monkeypatch, final, shape=fx.LLAMA_3_3_70B):
+    from control_plane.registry import modelcache
+
+    cache = tmp_path / "hub"
+    (cache / modelcache.folder_for(fx.LLAMA_3_3_70B.model_id) / "snapshots").mkdir(parents=True)
+    (cache / modelcache.folder_for(fx.LLAMA_3_3_70B.model_id) / "blobs").mkdir()
+    monkeypatch.setenv("DERATE_HF_CACHE", str(cache))
+    ref: list = []
+    replicator = _FakeReplicator(ref, final)
+    manager = make_manager(tmp_path, replicator=replicator)
+    ref.append(manager)
+    dep = manager.launch(shape, fx.pp2_plan(), fx.fits_degraded(), "vllm", 8192, 16)
+    return manager, replicator, dep
+
+
+def test_a_two_node_launch_copies_to_the_other_node_and_says_so(tmp_path, monkeypatch):
+    manager, replicator, dep = _prestage_manager(tmp_path, monkeypatch, {"status": "done"})
+    assert wait_for(lambda: manager.adapter.launches)
+    assert replicator.started == [("models--meta-llama--Llama-3.3-70B-Instruct", "spark-02")]
+    reading = replicator.seen[0][dep.deployment_id]
+    assert reading["source"] == "derate" and reading["phase"] == "downloading"
+    assert reading["status"].startswith(
+        "copying meta-llama/Llama-3.3-70B-Instruct to spark-02 over RoCE, 2 × 200 Gb/s: 2.0 of 4.0 GiB"
+    )
+    assert reading["fraction"] == 0.5
+    manager.close()
+
+
+def test_a_failed_copy_still_launches(tmp_path, monkeypatch):
+    manager, replicator, _ = _prestage_manager(
+        tmp_path, monkeypatch, {"status": "error", "error": "x"}
+    )
+    assert wait_for(lambda: manager.adapter.launches)
+    assert replicator.started
+    manager.close()
+
+
+class _StoppingReplicator(_FakeReplicator):
+    """The operator presses Stop while the weights are still copying; the copy
+    is already committing, so the cancel is refused and the wait runs out."""
+
+    def __init__(self, manager_ref, final):
+        super().__init__(manager_ref, final)
+        self.cancels: list[str] = []
+
+    def wait(self, transfer_id, on_update, poll_s=1.0):
+        manager = self.manager_ref[0]
+        (dep_id,) = list(manager._records)
+        manager.stop(dep_id)
+        on_update({"status": "verifying", "completed": 1, "total": 1, "eta_s": None})
+        return {"status": "done"}
+
+    def cancel(self, transfer_id):
+        from control_plane.transfer.jobs import CancelRefused
+
+        self.cancels.append(transfer_id)
+        raise CancelRefused("the copy is being verified on spark-02")
+
+
+def test_a_stop_during_the_copy_never_launches(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_FakeReplicator", _StoppingReplicator)
+    manager, replicator, dep = _prestage_manager(tmp_path, monkeypatch, {"status": "done"})
+    assert wait_for(lambda: replicator.cancels)
+    assert wait_for(lambda: manager.get(dep.deployment_id).state in TERMINAL)
+    time.sleep(0.2)
+    assert manager.adapter.launches == []
+    manager.close()
+
+
+def test_a_model_id_that_is_not_a_hub_repo_is_never_copied(tmp_path, monkeypatch):
+    shape = dataclasses.replace(fx.LLAMA_3_3_70B, model_id="org/repo/subdir")
+    manager, replicator, dep = _prestage_manager(tmp_path, monkeypatch, {"status": "done"}, shape)
+    assert wait_for(lambda: manager.adapter.launches)
+    assert replicator.started == []
+    manager.close()

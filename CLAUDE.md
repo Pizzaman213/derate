@@ -40,7 +40,21 @@ python3 -m tests.model_sweep --arch    # VLLM_ARCHITECTURES against the image's 
 python3 -m tests.spec_sweep --scan --model X   # every published head, ranked, no launch
 python3 -m tests.spec_sweep --smoke   # speculative acceptance: plumbing, ~1 min
 python3 -m tests.spec_sweep --model Qwen/Qwen3-4B   # ...and a real measurement
+python3 -m tests.placement_sweep --model X --nodes a,b --dry-run   # each ranked shape's launch body
+python3 -m tests.placement_sweep --model X --nodes a,b   # launch each, measure, vs the planner's pick
 ```
+
+`tests/placement_sweep.py` is the planner's ground truth, after exo's bench
+tool: it takes the shapes `POST /api/plan/candidates` ranked on the named
+machines (never its own enumeration), launches each one at a time pinned to
+its own `node_ids` and `parallelism`, drives `control_plane/bench_data/` at
+concurrency 1 (one stream's decode tok/s) and N (aggregate tok/s), records
+TTFT at both, stops it, and writes a JSON record under
+`data_dir()/measurements/placement/` plus a table saying where the measured
+order departs from the planner's pick. A shape the gate refused is recorded in
+its own words and not launched. It logs in as `DERATE_CHECK_ADMIN_USER` the
+way `ui/src/check/auth.mjs` does; `tests/unit/test_placement_sweep.py` runs
+`--dry-run` against an in-process gateway with the real planner.
 
 `tests/model_sweep.py` is the model tester and `tests/unit/test_model_corpus.py`
 gates the suite on it.
@@ -157,6 +171,12 @@ control_plane/resolver/    HuggingFace id -> ModelShape, quantization table
 control_plane/fit/         the blocking out-of-memory gate
 control_plane/planner/     TP/PP/EP from measured facts
 control_plane/deploy/      sparkrun adapter, lifecycle
+control_plane/transfer/    copies a cache folder from the coordinator to other
+                           nodes over the fastest links they share (RoCE rails
+                           by IPv6 link-local, no netplan needed): a receiver on
+                           every agent (port 47101), N raw TCP streams, blobs
+                           hashed against their names. A launch pre-stages with
+                           it; background copies propose it and run on approval.
 control_plane/gateway/     the one HTTP surface: /v1, /api, and the built UI.
                            authz.py is the credential gate: a session on /api,
                            a drt_ key on /v1, everything else open by name.
@@ -957,7 +977,9 @@ a real destination and off the nav) and that screen's own subject
 (`/models/<model id>`, `/usage/requests/<id>`, `/usage/keys/<id>`); the query names what is selected (`?node=`, `?link=`,
 `?dep=`, `?open=node:spark-01`, `?ctx=`/`?seq=`, and `/usage`'s own `?win=`). `/usage`'s pane
 (Overview, Requests, Rate limits, Keys) is a path segment, `Route.sub`; the old `/spend`, `/keys` and
-`/requests` paths are parse-only aliases since 2026-11-18, rewritten to `/usage...`. `ui/src/state/
+`/requests` paths are parse-only aliases since 2026-11-18, rewritten to `/usage...`. Settings'
+section is a path segment too, `Route.section` (`/settings/storage`); bare `/settings` stays and
+lets the tab pick (Instance with `?node=`, Connection otherwise). `ui/src/state/
 routes.ts` is the scheme -- pure, verified by `router.check.mjs` --
 `router.tsx` is the provider, and `selection.tsx` reads and writes it so no
 call site knows a URL is involved. Selecting replaces, opening pushes. Details

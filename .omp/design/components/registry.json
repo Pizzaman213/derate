@@ -390,6 +390,10 @@
         "node",
         "servedFolders",
         "onDelete",
+        "copyTargets",
+        "copyBlocked",
+        "onCopy",
+        "replicaFolders",
         "busy"
       ],
       "variants": {},
@@ -398,7 +402,8 @@
         "empty",
         "busy",
         "unavailable",
-        "read-only"
+        "read-only",
+        "copy-blocked"
       ],
       "tokens": [
         "ink-muted",
@@ -1495,6 +1500,21 @@
       "icons": []
     },
     {
+      "name": "FabricPanel",
+      "kind": "screen",
+      "path": "ui/src/tabs/cluster/FabricPanel.tsx",
+      "tokens": [
+        "fault",
+        "rule",
+        "space-10",
+        "space-2",
+        "space-4",
+        "space-6",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
       "name": "WiringCanvas",
       "kind": "screen",
       "path": "ui/src/tabs/cluster/WiringCanvas.tsx",
@@ -2302,6 +2322,26 @@
       "icons": []
     },
     {
+      "name": "StorageSection",
+      "kind": "screen",
+      "path": "ui/src/tabs/storage/StorageSection.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
+      "name": "ModelPresenceCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/storage/ModelPresenceCard.tsx",
+      "tokens": [
+        "ink-muted",
+        "live",
+        "space-10",
+        "space-8",
+        "warn"
+      ],
+      "icons": []
+    },
+    {
       "name": "ModelCacheCard",
       "kind": "screen",
       "path": "ui/src/tabs/storage/ModelCacheCard.tsx",
@@ -2309,6 +2349,23 @@
         "fault",
         "space-10",
         "space-8"
+      ],
+      "icons": []
+    },
+    {
+      "name": "ReplicationCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/storage/ReplicationCard.tsx",
+      "tokens": [
+        "fault",
+        "live",
+        "rule",
+        "space-10",
+        "space-2",
+        "space-4",
+        "space-6",
+        "space-8",
+        "warn"
       ],
       "icons": []
     },

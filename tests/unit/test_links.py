@@ -562,7 +562,7 @@ def test_ib_write_lat_is_reported_as_evidence_and_never_as_latency_us():
 
     notes = " ".join(result.annotation.notes)
     assert "no collective latency was measured" in notes
-    assert "2.05" in notes, "the figure is kept, as evidence"
+    assert "(ib_write_lat: 2.05 us)" in notes, "the figure is kept, as evidence, under its own name"
     assert "not a two-rank all-reduce" in notes
 
 
@@ -1336,3 +1336,121 @@ def test_available_is_false_without_docker_or_without_the_image():
 
     assert TorchNcclMeasurer(NoDocker(), image="img").available() is False
     assert TorchNcclMeasurer(NoImage(), image="img").available() is False
+
+
+# --------------------------------------------------------------------------- discovery precedence
+
+
+def test_nccl_tests_dir_beats_path_and_mpirun_override_beats_which(monkeypatch):
+    runner = FakeRunner(
+        binaries=("mpirun", "all_reduce_perf", "sendrecv_perf"),
+        files={
+            "/opt/nt/build/all_reduce_perf": "",
+            "/opt/nt/build/sendrecv_perf": "",
+        },
+    )
+    monkeypatch.setenv("DERATE_NCCL_TESTS_DIR", "/opt/nt/build")
+    monkeypatch.setenv("DERATE_MPIRUN", "/opt/openmpi/bin/mpirun")
+    measurer = NcclMeasurer(runner, clock=lambda: T0)
+    assert measurer.available() is True
+    measurer.measure(Endpoint("a", "h1"), Endpoint("b", "h2"))
+    launches = [c for c in runner.calls if c and c[0] == "/opt/openmpi/bin/mpirun"]
+    assert len(launches) == 2, runner.calls
+    assert "/opt/nt/build/all_reduce_perf" in launches[0]
+    assert "/opt/nt/build/sendrecv_perf" in launches[1]
+    assert not any(c[0] == "/usr/bin/mpirun" for c in runner.calls)
+
+
+def test_a_tests_dir_without_the_binary_falls_through_to_path(monkeypatch):
+    monkeypatch.setenv("DERATE_NCCL_TESTS_DIR", "/opt/empty")
+    runner = FakeRunner(binaries=("mpirun", "all_reduce_perf", "sendrecv_perf"))
+    measurer = NcclMeasurer(runner, clock=lambda: T0)
+    measurer.measure(Endpoint("a", "h1"), Endpoint("b", "h2"))
+    assert runner.calls[0][0] == "/usr/bin/mpirun"
+    assert "/usr/bin/all_reduce_perf" in runner.calls[0]
+
+
+def _ib_without_lat():
+    return ib_runner(binaries=("ib_write_bw",), outputs={"ib_write_bw": IB_WRITE_BW_OUT})
+
+
+def test_missing_ib_write_lat_off_box_reports_no_latency_at_all(monkeypatch):
+    """README "Failure behaviour": when endpoint a is not this node, a round
+    trip measured from here is the wrong one, so none is taken."""
+    called = []
+    monkeypatch.setattr("control_plane.links.measure.tcp_rtt_us", lambda *a, **k: called.append(a) or 55.0)
+    result = IbWriteBwMeasurer(_ib_without_lat(), clock=lambda: T0).measure(
+        Endpoint("a", "h1"), Endpoint("b", "h2")
+    )
+    assert result.latency_us is None
+    assert called == []
+    notes = " ".join(result.annotation.notes)
+    assert "(ib_write_lat:" not in notes
+    assert "TCP connect round trip" not in notes
+
+
+def test_missing_ib_write_lat_on_box_notes_the_tcp_round_trip(monkeypatch):
+    monkeypatch.setattr("control_plane.links.measure.tcp_rtt_us", lambda *a, **k: 55.0)
+    result = IbWriteBwMeasurer(_ib_without_lat(), clock=lambda: T0).measure(
+        Endpoint("a", "h1", is_local=True), Endpoint("b", "h2")
+    )
+    # Still never latency_us: a TCP RTT is not a collective either.
+    assert result.latency_us is None
+    notes = result.annotation.notes
+    # The TCP figure is named for what it is -- a connect round trip -- and is
+    # never labelled an ib_write_lat figure, which would claim an RDMA write
+    # was timed when the binary was not even there.
+    assert not any("ib_write_lat: 55" in n for n in notes)
+    tcp = [n for n in notes if "TCP connect round trip" in n]
+    assert len(tcp) == 1
+    assert "55.00 us" in tcp[0] and "not a collective latency" in tcp[0]
+    assert "ib_write_lat was unavailable" in tcp[0]
+
+
+class RecordingMeasurer(ScriptedMeasurer):
+    def __init__(self):
+        super().__init__("nccl-tests", link())
+        self.endpoints = []
+
+    def measure(self, a, b):
+        self.endpoints.append((a, b))
+        return super().measure(a, b)
+
+
+class _Registry:
+    def __init__(self, addresses):
+        self._addresses = addresses
+
+    def get_node(self, node_id):
+        from types import SimpleNamespace
+
+        if node_id not in self._addresses:
+            return None
+        return SimpleNamespace(profile=SimpleNamespace(address=self._addresses[node_id], hostname=node_id))
+
+
+@pytest.mark.parametrize(
+    "explicit,env,expected",
+    [
+        ({"spark-26af": "10.100.152.2"}, "10.100.153.2", "10.100.152.2"),
+        ({}, "10.100.153.2", "10.100.153.2"),
+        ({}, None, "192.168.0.172"),
+    ],
+)
+def test_endpoint_prefers_explicit_then_env_then_registry(tmp_path, monkeypatch, explicit, env, expected):
+    if env:
+        monkeypatch.setenv("DERATE_DATAPLANE_SPARK_26AF", env)
+    else:
+        monkeypatch.delenv("DERATE_DATAPLANE_SPARK_26AF", raising=False)
+    monkeypatch.delenv("DERATE_DATAPLANE_SPARK_4D38", raising=False)
+    measurer = RecordingMeasurer()
+    svc = service(
+        tmp_path,
+        measurer=measurer,
+        registry=_Registry({"spark-26af": "192.168.0.172", "spark-4d38": "192.168.0.71"}),
+        data_plane_addresses=explicit,
+    )
+    svc.measure("spark-26af", "spark-4d38")
+    a, b = measurer.endpoints[0]
+    assert (a.node_id, a.host) == ("spark-26af", expected)
+    assert (b.node_id, b.host) == ("spark-4d38", "192.168.0.71")

@@ -500,6 +500,87 @@ share one button below the stack.
 
 See Table. `node`, `servedFolders?`, `onDelete?`, `busy?`; without
 `servedFolders` the in-use column says "unknown", never "not in use".
+`copyTargets?`/`onCopy?` add one ghost `Copy to <node>` button per target before Delete; the coordinator's table is the only one given them, because copies are sent from the coordinator's cache.
+`copyBlocked?` (target -> the agent's sentence, from `/api/storage`'s `copy_receiver`) disables that target's buttons with the sentence as their `title`, and says it once under the table (`Copy to <node> is unavailable:` over `Verbatim`, `.unit`, `--space-4` above), so a node without the copy receiver is explained before the click instead of failing on it.
+`replicaFolders?` (folder -> complete) labels each listed folder ` · copied by derate`, or ` · partial copy by derate` while that copy is incomplete (`.unit`), after the repo id, so a copy derate placed reads differently from one a launch downloaded.
+
+### ReplicationCard
+
+`ui/src/tabs/storage/ReplicationCard.tsx`, Settings → Storage, directly above
+Downloaded models. Background copies derate proposes from `GET
+/api/replication`. **Anatomy:** `card2`, heading "Background copies", one
+`.unit` explainer (what is proposed, that nothing moves until approved, the
+free-space floor rule: a fifth of the disk, capped in GiB); one block per proposal with a left rule
+(`--space-2`, `--warn` while awaiting approval, `--rule` once approved) naming
+`repo → node`, bytes to send, free space there, that node's own floor (`keeps … free`), each reason via `Verbatim`,
+and EVERY deletion as its own `--warn` line; `last_error` sits under a
+`--fault` rule as a "last attempt failed" label over `Verbatim`. A collapsed
+`<details>` "Not proposed (n)" lists each skip's sentence verbatim; "derate's
+copies" lists the placed replicas, ` · partial` after the size for one that
+has not finished. **States:** reading; error (server
+sentence); switched off; empty ("Nothing to copy."); awaiting (Approve +
+ghost "Not now"); approved; copying (points at Downloads). **Behaviour:**
+Approve always goes through `window.confirm` restating model, node, size,
+every deletion and that it runs in the background and pauses for a launch,
+then sends exactly the deletions shown; a 409 shows the server's sentence and
+refreshes. **Tokens:** `--warn`, `--fault`, `--live`, `--rule`, `--space-2`,
+`--space-4`, `--space-6`, `--space-8`, `--space-10`.
+
+### FabricPanel
+
+`ui/src/tabs/cluster/FabricPanel.tsx`, the "Fabric settings" section under a
+selected link in the Cluster rail (`SelectionRail`), measured or not. Reads
+`GET /api/links/health?a=&b=` when the link is selected and on "Read again"
+(ghost), never on a poll. **Anatomy:** `.sub` heading; a `.row` with the
+summary (`fabric.ts::fabricSummary`, "2 warnings · 6 to tune") and when it was
+read; then, when the pair was probed, a "Rail reach" block: one row per
+(rail, far address) the probing end dialled on the copy receiver's port, each
+with a left rule (`--space-2`; `--rule` when the far end answered, `--fault`
+when nothing did), a `.label.mono` `node · iface → target`, and either
+"connected · 0.12 ms" or the server's error via `Verbatim` (a refusal also
+shows its round trip: the far kernel answered over that rail) --
+`fabric.ts::reachLine`. Then one block per finding with a left rule
+(`--space-2`, `--warn` for a
+warning, `--rule` for info), a `.label.mono` `node · iface` (just `node` when
+the finding names no port), the sentence via
+`Verbatim`, and the fix in `Copyable` when there is one (multi-line netplan
+stanzas keep their indentation). Warnings sort first. **States**
+(`fabric.ts::fabricView`,
+held by `fabric.check.mjs`): reading; findings; clean ("Nothing to change on
+either end."); unreadable (each server sentence verbatim -- never shown as
+clean); no-fabric (one end has no RDMA port with a link). A coordinator from
+before the probe sends no `reach`, which renders no block. **Tokens:**
+`--warn`, `--fault`, `--rule`, `--space-2`, `--space-4`, `--space-6`,
+`--space-10`.
+
+### StorageSection
+
+`ui/src/tabs/storage/StorageSection.tsx`, the body of Settings → Storage
+(`/settings/storage`). Calls `useStorage`, `useCluster`, `useReplication` and
+`useTransfers` ONCE and passes each result to the cards, in order:
+Filesystems, Background copies, Models by node, Downloaded models, Estate,
+Collection. `useResource` does not deduplicate, so a card mounting its own
+hook is its own poll; no card under it may.
+
+### ModelPresenceCard
+
+`ui/src/tabs/storage/ModelPresenceCard.tsx`, Settings → Storage, between
+Background copies and Downloaded models. **Anatomy:** `card2`, heading
+"Models by node", one `.unit` explainer; a Table with one row per model any
+node's cache lists (largest first, repo id in `.mono`, folder as `title`) and
+one right-aligned `.num` column per node (coordinator first). The cell
+decision is `presence.ts::presenceTable`, verified by `presence.check.mjs`.
+**States (per cell):** present (size); partial (`--warn`, `partial · size`,
+an incomplete derate copy, even though the cache lists it); copying
+(`--live`, `copying N%` when the total is known); proposed (`--warn`, awaiting
+approval); won't fit (`--ink-muted`, a replication skip that says it could
+never be served there); absent (`—`, `--ink-muted`); unknown (`--ink-muted`,
+that node's cache could not be read -- never shown as absent). Precedence is
+copying > partial > present > proposed > won't fit. The won't-fit and
+unknown sentences are listed under the table with `VerbatimList`
+(`--space-8` above) and also ride the cell's `title`. **Card states:**
+measuring; empty ("No node reported a downloaded model."). **Tokens:**
+`--warn`, `--live`, `--ink-muted`, `--space-8`, `--space-10`.
 
 ### Icon
 

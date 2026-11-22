@@ -34,7 +34,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterable
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterable
 
 from control_plane import measurements
 from control_plane.contracts.deployment import (
@@ -92,6 +92,9 @@ from control_plane.paths import data_dir
 from control_plane.resolver import imageprobe
 
 from control_plane.redaction import REDACTED
+
+if TYPE_CHECKING:
+    from control_plane.transfer.jobs import Replicator
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -606,6 +609,7 @@ class DeploymentManager:
         port_free_fn: Callable[[int], bool] = port_is_free,
         port_reach_fn: Callable[[str, int], tuple[str | None, str]] | None = None,
         autostart: bool = True,
+        replicator: "Replicator | None" = None,
     ) -> None:
         state_dir = Path(state_dir) if state_dir is not None else data_dir()
         self.adapter = adapter or SparkrunAdapter(registry, recipe_dir=state_dir / "recipes")
@@ -647,6 +651,9 @@ class DeploymentManager:
         # binding it here, so the suite can swap the one function for every
         # manager it builds (tests/unit/conftest.py) and no test dials a LAN.
         self._port_reach = port_reach_fn
+        #: Copies the weights to the plan's other nodes before sparkrun runs
+        #: (see _prestage). None means sparkrun's own rsync does it all.
+        self.replicator = replicator
 
         self._lock = threading.RLock()
         self._records: dict[str, _Record] = {}
@@ -1981,6 +1988,97 @@ class DeploymentManager:
                 buffer.append(line)
         self._note_progress(record, read(line))
 
+    _HUB_ID_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+    def _prestage(self, record: _Record) -> float:
+        """Copy the model's cache folder to every other plan node, over the
+        fabric, before sparkrun is asked to. Returns the seconds it took.
+
+        sparkrun distributes weights with rsync over ssh, which this fabric
+        holds to ~1.3 GB/s per stream; the replicator runs many raw streams
+        across both rails. sparkrun's rsync still runs afterwards and finds
+        nothing to send (sizes, modes and mtimes are carried over), so a copy
+        that fails here costs time and never the launch.
+        """
+        if self.replicator is None:
+            return 0.0
+        from control_plane.registry import modelcache
+        from control_plane.transfer.jobs import CancelRefused, ReplicateRefused
+
+        deployment = record.deployment
+        model_id = deployment.shape.model_id
+        if not self._HUB_ID_RE.match(model_id or ""):
+            return 0.0
+        cache = modelcache.cache_dir()
+        if cache is None:
+            return 0.0
+        folder = modelcache.folder_for(model_id)
+        if not (cache / folder / "snapshots").is_dir():
+            return 0.0
+        try:
+            if any(p.name.endswith(".incomplete") for p in (cache / folder / "blobs").iterdir()):
+                return 0.0
+        except OSError:
+            return 0.0
+        started = time.monotonic()
+        # The copy names its own link ("RoCE, 2 × 200 Gb/s"); None until it has chosen.
+        for node_id in deployment.plan.node_ids:
+            if node_id == self.replicator.local_node_id:
+                continue
+            try:
+                job = self.replicator.start(folder, node_id)
+            except ReplicateRefused as exc:
+                logger.warning("not pre-staging %s on %s: %s", folder, node_id, exc.sentence)
+                continue
+            transfer_id = job["transfer_id"]
+
+            def on_update(j: dict, _node: str = node_id, _id: str = transfer_id) -> None:
+                if record.deployment.state is not S.LAUNCHING:
+                    try:
+                        self.replicator.cancel(_id)
+                    except CancelRefused:
+                        pass  # committing on the node; the wait ends when it does
+                    return
+                total = j.get("total")
+                completed = j.get("completed") or 0
+                if j.get("status") == "verifying":
+                    caption = f"verifying {model_id} on {_node}: hashing every blob"
+                else:
+                    caption = (
+                        f"copying {model_id} to {_node} over "
+                        f"{j.get('link') or 'the network'}: "
+                        f"{completed / 2**30:.1f} of {(total or 0) / 2**30:.1f} GiB"
+                    )
+                self._note_progress(
+                    record,
+                    LaunchProgress(
+                        phase="downloading",
+                        status=caption,
+                        fraction=(completed / total) if total else None,
+                        eta_s=j.get("eta_s"),
+                        source="derate",
+                    ),
+                )
+
+            final = self.replicator.wait(transfer_id, on_update=on_update)
+            if final.get("status") != "done":
+                reason = final.get("error") or "cancelled"
+                logger.warning("pre-staging %s on %s did not finish: %s", folder, node_id, reason)
+                self._note_progress(
+                    record,
+                    LaunchProgress(
+                        phase="downloading",
+                        status=(
+                            f"copying {model_id} to {node_id} failed: {reason}; "
+                            "sparkrun will copy it instead"
+                        ),
+                        source="derate",
+                    ),
+                )
+            if record.deployment.state is not S.LAUNCHING:
+                break
+        return time.monotonic() - started
+
     #: Headroom added on top of `fit.breakdown.kv_cache` before it becomes
     #: `--kv-cache-memory-bytes`. Two measured shortfalls, both real, neither
     #: fixed by the fit gate's own arithmetic being "more correct":
@@ -2289,6 +2387,12 @@ class DeploymentManager:
                 share,
                 deployment.fit.breakdown.total / 1024**3,
             )
+        # Outside the readiness budget: a copy is not a startup.
+        deadline += self._prestage(record)
+        if record.deployment.state is not S.LAUNCHING:
+            # Stopped while the weights were being copied: launching now would
+            # start a container for a record that is already over.
+            return
         try:
             result = self.adapter.launch(
                 deployment.plan,

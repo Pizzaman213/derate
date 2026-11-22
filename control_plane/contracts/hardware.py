@@ -134,6 +134,13 @@ class NodeState:
     # reported itself as unidentified hardware, and the roster had no way to
     # say "the machine is fine, the software is stale".
     build: str = ""
+    # What this node's agent says it can do (``registry/agent.py::
+    # AGENT_FEATURES``), from the same trusted /agent/health as ``build``.
+    # None means the agent has not said -- not answered yet, or a build older
+    # than the field -- and is deliberately not ``()``: an empty tuple is an
+    # agent that answered and can do none of them, and only the first one is
+    # cured by upgrading the node.
+    features: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

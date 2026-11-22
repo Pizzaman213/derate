@@ -435,7 +435,11 @@ three ways — a single path segment, the `models--` prefix, and a resolved path
 parent is the resolved cache — and lives here rather than at the route so no future
 caller can reach `rmtree` without passing them. `delete` measures before and
 confirms the directory's absence after, because "the call did not raise" and "the
-bytes came back" are different claims.
+bytes came back" are different claims. The one folder that may resolve elsewhere is
+derate's own relative link into a `DERATE_EXTRA_CACHE_DIRS` folder
+(`linked_folder`): the scan measures through it and the delete removes the folder
+and the link, bounded to a direct child of a configured extra folder. Every other
+link is skipped and refused as before; see `control_plane/transfer/README.md`.
 
 ## `storage.py`
 
