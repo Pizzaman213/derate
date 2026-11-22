@@ -113,6 +113,17 @@ check('sglang partitions exactly as vllm does',
   partitionForRuntime(ladder, 'sglang').servable.map((v) => v.label).join(','),
   onCluster.servable.map((v) => v.label).join(','))
 
+// A GGUF row the gateway marks launchable is llamacpp's, not vllm's: the
+// ladder's `launchable` says "some runtime here", and vllm refuses the plan.
+const both = [
+  gguf({ label: 'Q4_K_M', launchable: true }),
+  gguf({ label: 'bf16', dtype: 'bf16', gguf_file: null, launchable: true }),
+]
+check('vllm does not offer a launchable GGUF row',
+  partitionForRuntime(both, 'vllm').servable.map((v) => v.label).join(','), 'bf16')
+check('llamacpp offers only the GGUF row',
+  partitionForRuntime(both, 'llamacpp').servable.map((v) => v.label).join(','), 'Q4_K_M')
+
 // --- what a row is LAUNCHED as, which is not what it is keyed by ---------
 //
 // The repository id names a checkpoint for a safetensors row and a directory

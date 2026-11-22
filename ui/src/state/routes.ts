@@ -174,6 +174,26 @@ export interface SpecRef {
   model?: string
 }
 
+/** The degrees a route names, as the request wants them, or null for "the
+ *  planner picks". `data_parallel` mirrors `expert_parallel` and is never its
+ *  own control: vLLM's expert-parallel size IS `dp * tp`, so across machines
+ *  the only shape that means EP=n is `dp=n, tp=1`. The coordinator still
+ *  judges the pairing (`legality.py::ep_rejection`). */
+export function degreesFromRoute(
+  tp: number | null,
+  pp: number | null,
+  ep: number | null,
+): { tensor_parallel: number; pipeline_parallel: number; expert_parallel: number; data_parallel: number } | null {
+  return tp === null && pp === null && ep === null
+    ? null
+    : {
+        tensor_parallel: tp ?? 1,
+        pipeline_parallel: pp ?? 1,
+        expert_parallel: ep ?? 1,
+        data_parallel: ep ?? 1,
+      }
+}
+
 const SEGMENT: Record<Dest, string> = {
   dash: 'dashboard',
   models: 'models',

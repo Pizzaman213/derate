@@ -25,9 +25,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping, Sequence
 
+from control_plane.contracts.deployment import EngineOptions
 from control_plane.contracts.quant import BYTES_PER_PARAM
 
 #: The launcher's name on PATH, and the fallback when nothing overrides it.
@@ -382,6 +384,23 @@ class RuntimeSpec:
     #: shared, writable Inductor/Triton tree is a place one model container
     #: can plant `.py`/`.so` the next trusted launch loads.
     cache_per_model: bool = False
+    #: Which `EngineOptions` fields this runtime can be told. `env` everywhere
+    #: (it rides the NCCL path, which refuses on its own terms); everything
+    #: else is a vLLM flag. A non-default field outside this set is refused by
+    #: `engine_options_refusal`, never dropped.
+    engine_options_supported: frozenset[str] = frozenset({"env"})
+    #: The architecture `default_image` is built for ("arm64", "amd64"), or
+    #: None for a multi-arch image that runs anywhere. A launch on a machine
+    #: of another architecture uses `arch_images`, or is refused -- never run
+    #: with an image that would die at `exec format error`.
+    default_image_arch: str | None = None
+    #: Images for other architectures: (arch, env var that overrides it,
+    #: image, executor_config entries that image needs). The env var is
+    #: declared in envspec.py like every other. The last element exists for
+    #: upstream vLLM, whose ENTRYPOINT is `vllm serve`: sparkrun starts its
+    #: container with `sleep infinity` and execs the command after, so that
+    #: entrypoint has to be cleared -- the same reason llamacpp clears its own.
+    arch_images: tuple[tuple[str, str, str, tuple[tuple[str, str], ...]], ...] = ()
 
 
 #: What `--kv-cache-dtype` accepts, read off the pinned image's own
@@ -985,6 +1004,15 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         # A text deployment cannot tell the two images apart. Set
         # DERATE_VLLM_IMAGE to go back to upstream exactly.
         default_image="ghcr.io/pizzaman213/derate/vllm-audio:latest",
+        # Built FROM a DGX Spark nightly (docker/audio.Dockerfile), so arm64
+        # only. An x86 machine -- a discrete-GPU box joined to the cluster --
+        # runs upstream vLLM, which publishes amd64. That image has no audio
+        # decoder, so a Whisper launch there has the gap the comment above
+        # describes; text is unaffected.
+        default_image_arch="arm64",
+        arch_images=(
+            ("amd64", "DERATE_VLLM_IMAGE_AMD64", "vllm/vllm-openai:latest", (("entrypoint", ""),)),
+        ),
         max_seqs_key="max_num_seqs",
         command_template=_VLLM_COMMAND,
         custom_command_prefix=_VLLM_CUSTOM_PREFIX,
@@ -1021,11 +1049,15 @@ RUNTIMES: dict[str, RuntimeSpec] = {
             "--revision {revision} --code-revision {revision} "
             "--tokenizer-revision {revision}"
         ),
+        engine_options_supported=frozenset(
+            f.name for f in dataclasses.fields(EngineOptions)
+        ),
     ),
     "sglang": RuntimeSpec(
         name="sglang",
         sparkrun_runtime="sglang",
         default_image_env="DERATE_SGLANG_IMAGE",
+        default_image_arch="arm64",
         # Digest-pinned 2026-11-18 (`docker buildx imagetools inspect`): a tag
         # on Docker Hub can be re-pushed, a digest cannot. Bump both together.
         default_image=(
@@ -1103,6 +1135,7 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         sparkrun_runtime="vllm",
         default_image_env="DERATE_TTS_IMAGE",
         default_image="ghcr.io/pizzaman213/derate/tts:latest",
+        default_image_arch="arm64",
         max_seqs_key="max_num_seqs",
         command_template=_TTS_COMMAND,
         custom_command_prefix=_TTS_CUSTOM_PREFIX,
@@ -1438,6 +1471,56 @@ def placement_refusal(
     return None
 
 
+def image_for_arch(
+    spec: RuntimeSpec, arch: str, env: dict[str, str] | None = None
+) -> str | None:
+    """The container image *spec* runs on a machine of *arch*, or None when
+    this build has none for it.
+
+    An unknown arch ("": an agent older than the field) gets the default
+    image -- what every launch got before there was a choice, so an old
+    agent's launches are unchanged rather than refused.
+    """
+    env = os.environ if env is None else env
+    if arch:
+        for image_arch, var, image, _ in spec.arch_images:
+            if image_arch == arch:
+                return env.get(var) or image
+    if not arch or spec.default_image_arch in (None, arch):
+        return env.get(spec.default_image_env) or spec.default_image
+    return None
+
+
+def image_executor_config(
+    spec: RuntimeSpec, image: str, env: dict[str, str] | None = None
+) -> tuple[tuple[str, str], ...]:
+    """The runtime's `executor_config`, plus whatever the per-architecture
+    image *image* needs on top. The default image adds nothing."""
+    env = os.environ if env is None else env
+    extra: tuple[tuple[str, str], ...] = ()
+    for _, var, default, cfg in spec.arch_images:
+        if image == (env.get(var) or default):
+            extra = cfg
+            break
+    keys = {k for k, _ in extra}
+    return tuple((k, v) for k, v in spec.executor_config if k not in keys) + extra
+
+
+def arch_refusal(runtime: str, node_id: str, arch: str) -> str | None:
+    """Why *runtime* cannot run on *node_id* for want of an image built for
+    its architecture, or None. Names what would change it."""
+    spec = RUNTIMES.get(runtime)
+    if spec is None or image_for_arch(spec, arch) is not None:
+        return None
+    return (
+        f"'{node_id}' is {arch} and {runtime}'s image is built for "
+        f"{spec.default_image_arch} only, so it cannot run there. Pick a "
+        f"runtime with an {arch} image, or point {spec.default_image_env} at "
+        f"one built for both."
+    )
+
+
+
 def is_hub_gguf_blob(model_id: str) -> bool:
     """Whether this is derate's own post-resolve spelling for a hub GGUF blob.
 
@@ -1686,3 +1769,190 @@ def sharding_refusal(
         "architectures %s loads are the ones no other runtime here can load "
         "at all." % (spec.name, " and ".join(named), spec.name)
     )
+
+
+# -- typed engine options ------------------------------------------------------
+
+#: What `--reasoning-parser` accepts, read off the pinned image's own registry
+#: (vLLM 0.28.1rc1.dev462+g9ca97b28b), never a changelog. Re-read with:
+#:   docker run --rm --entrypoint python3 <vllm image> -c 'from vllm.reasoning \
+#:     import ReasoningParserManager as R; print(sorted(set(R.reasoning_parsers) \
+#:     | set(R.lazy_parsers)))'
+VLLM_REASONING_PARSERS: frozenset[str] = frozenset({
+    "cohere_command3", "cohere_command4", "deepseek_r1", "deepseek_v3",
+    "deepseek_v4", "ernie45", "gemma4", "glm45", "glm47", "granite", "holo2",
+    "hunyuan_a13b", "hy_v3", "hy_v4", "inkling", "k2_horizon", "kimi_k2",
+    "kimi_k3", "ling3", "mimo", "minimax_m2", "minimax_m2_append_think",
+    "minimax_m3", "mistral", "muse_glimmer", "nemotron_v3", "olmo3",
+    "openai_gptoss", "poolside_v1", "qwen3", "seed_oss", "step3", "step3p5",
+})
+
+#: What `--tool-call-parser` accepts, same image, same version. Re-read with:
+#:   docker run --rm --entrypoint python3 <vllm image> -c 'from \
+#:     vllm.entrypoints.openai.tool_parsers import ToolParserManager as T; \
+#:     print(sorted(set(T.tool_parsers) | set(T.lazy_parsers)))'
+VLLM_TOOL_CALL_PARSERS: frozenset[str] = frozenset({
+    "apertus", "cohere_command3", "cohere_command4", "deepseek_v3",
+    "deepseek_v31", "deepseek_v32", "deepseek_v4", "dots", "ernie45",
+    "functiongemma", "gemma4", "gigachat3", "glm45", "glm47", "granite",
+    "granite-20b-fc", "granite4", "hermes", "hunyuan_a13b", "hy_v3", "hy_v4",
+    "inkling", "internlm", "jamba", "k2_horizon", "kimi_k2", "kimi_k3", "lfm2",
+    "ling3", "llama3_json", "llama4_json", "llama4_pythonic", "longcat", "mimo",
+    "minicpm5", "minimax_m2", "minimax_m3", "mistral", "muse_glimmer", "olmo3",
+    "openai", "phi4_mini_json", "poolside_v1", "pythonic", "qwen3_coder",
+    "qwen3_xml", "seed_oss", "step3", "step3p5", "xlam",
+})
+
+#: The `--hf-overrides` key YaRN goes under. transformers 5.16.1 in the pinned
+#: image (`python3 -c 'import transformers; print(transformers.__version__)'`);
+#: from v5 the config field is `rope_parameters`, below it `rope_scaling`.
+HF_ROPE_KEY = "rope_parameters"
+
+#: Whole-string grammar for every JSON-valued engine flag. Single-quoted in the
+#: command under `bash -c`, so nothing here may close that quote or open a
+#: substitution: no quote but `"`, no space, no `$`.
+_ENGINE_JSON_SAFE = re.compile(r'^\{[A-Za-z0-9_":.,{}-]*\}$')
+
+#: JSON-valued flag -> the recipe key that carries it (defaults block).
+_ENGINE_JSON_KEYS: dict[str, str] = {
+    "--limit-mm-per-prompt": "limit_mm_per_prompt",
+    "--hf-overrides": "hf_overrides",
+    "--override-generation-config": "override_generation_config",
+}
+
+
+def _engine_json(obj: Mapping[str, Any]) -> str:
+    rendered = json.dumps(obj, separators=(",", ":"), sort_keys=True)
+    if not _ENGINE_JSON_SAFE.match(rendered):
+        raise ValueError(
+            "refusing to substitute %r into the launch command: it is not the "
+            "JSON object this flag is allowed to carry" % rendered
+        )
+    return rendered
+
+
+def engine_options_set_fields(options: EngineOptions) -> list[str]:
+    """The names of every field set away from its default."""
+    return [
+        f.name
+        for f in dataclasses.fields(EngineOptions)
+        if getattr(options, f.name) != f.default
+    ]
+
+
+def engine_options_refusal(
+    options: EngineOptions, runtime: str, *, world_size: int | None = None
+) -> str | None:
+    """Why this runtime cannot be told these engine options, or None.
+
+    Refused rather than dropped, like `kv_cache_dtype_refusal`: a field the
+    template has no flag for would launch and silently not apply. A
+    non-empty `env` runs `nccl_env_refusal` too when *world_size* is given.
+    """
+    spec = runtime_spec(runtime)
+    for name in engine_options_set_fields(options):
+        if name not in spec.engine_options_supported:
+            return f"{name} is a vLLM option; {runtime} launches do not take it."
+    if options.env and world_size is not None:
+        return nccl_env_refusal(runtime, dict(options.env), world_size=world_size)
+    return None
+
+
+def _engine_option_items(
+    options: EngineOptions, *, original_window: int | None
+) -> list[tuple[str, str | None]]:
+    """(flag, value) in render order; value None for a bare flag."""
+    items: list[tuple[str, str | None]] = []
+    if options.reasoning_parser is not None:
+        if options.reasoning_parser not in VLLM_REASONING_PARSERS:
+            raise ValueError(
+                f"{options.reasoning_parser} is not a reasoning parser in this "
+                f"vLLM build; it has: {', '.join(sorted(VLLM_REASONING_PARSERS))}."
+            )
+        items.append(("--reasoning-parser", options.reasoning_parser))
+    if options.tool_call_parser is not None:
+        if options.tool_call_parser not in VLLM_TOOL_CALL_PARSERS:
+            raise ValueError(
+                f"{options.tool_call_parser} is not a tool-call parser in this "
+                f"vLLM build; it has: {', '.join(sorted(VLLM_TOOL_CALL_PARSERS))}."
+            )
+        items.append(("--enable-auto-tool-choice", None))
+        items.append(("--tool-call-parser", options.tool_call_parser))
+    if options.prefix_caching is True:
+        items.append(("--enable-prefix-caching", None))
+    elif options.prefix_caching is False:
+        items.append(("--no-enable-prefix-caching", None))
+    if options.max_num_batched_tokens is not None:
+        items.append(("--max-num-batched-tokens", str(int(options.max_num_batched_tokens))))
+    if options.async_scheduling:
+        items.append(("--async-scheduling", None))
+    if options.limit_mm_per_prompt:
+        items.append((
+            "--limit-mm-per-prompt",
+            _engine_json({k: int(v) for k, v in options.limit_mm_per_prompt}),
+        ))
+    if options.mm_processor_cache_gb is not None:
+        items.append(("--mm-processor-cache-gb", format(float(options.mm_processor_cache_gb), "g")))
+    if options.language_model_only:
+        items.append(("--language-model-only", None))
+    if options.rope_factor is not None:
+        if not original_window:
+            raise ValueError(
+                "YaRN needs the model's trained window, and this config does "
+                "not state max_position_embeddings."
+            )
+        items.append((
+            "--hf-overrides",
+            _engine_json({HF_ROPE_KEY: {
+                "rope_type": "yarn",
+                "factor": float(options.rope_factor),
+                "original_max_position_embeddings": int(original_window),
+            }}),
+        ))
+    if options.generation_overrides:
+        items.append((
+            "--override-generation-config",
+            _engine_json({
+                k: (int(v) if k == "top_k" else float(v))
+                for k, v in options.generation_overrides
+            }),
+        ))
+    return items
+
+
+def render_engine_options(
+    options: EngineOptions, *, original_window: int | None
+) -> tuple[str, ...]:
+    """The serve-command tokens for *options*, JSON values unquoted."""
+    tokens: list[str] = []
+    for flag, value in _engine_option_items(options, original_window=original_window):
+        tokens.append(flag)
+        if value is not None:
+            tokens.append(value)
+    return tuple(tokens)
+
+
+def engine_options_recipe(
+    options: EngineOptions, *, original_window: int | None
+) -> tuple[str, list[tuple[str, str]]]:
+    """(command fragment, recipe defaults) for *options*.
+
+    Plain flags are literal text (every value is an allowlisted name or a
+    number). JSON-valued ones become `'{key}'` placeholders whose value is
+    carried json.dumps'd in the defaults block -- exactly how
+    `speculative_config` travels, and for the same reason: a bare `{` is a
+    YAML flow mapping.
+    """
+    parts: list[str] = []
+    defaults: list[tuple[str, str]] = []
+    for flag, value in _engine_option_items(options, original_window=original_window):
+        key = _ENGINE_JSON_KEYS.get(flag)
+        if key is not None:
+            assert value is not None
+            defaults.append((key, json.dumps(value)))
+            parts.append("%s '{%s}'" % (flag, key))
+        elif value is None:
+            parts.append(flag)
+        else:
+            parts.append("%s %s" % (flag, value))
+    return " \\\n    ".join(parts), defaults

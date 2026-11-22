@@ -180,6 +180,49 @@ def predict_decode_tps(
     return ceiling * efficiency
 
 
+def bandwidth_ceiling_tps(
+    shape: ModelShape,
+    bandwidth_gbps: float,
+    kv_read_bytes: float,
+    users: int,
+    efficiency: float = DECODE_EFFICIENCY,
+) -> float:
+    """Decode tok/s EACH, for `users` sequences decoding together, from
+    memory bandwidth alone.
+
+    One step reads the active weights once and every sequence's cache, so
+    ``bandwidth / (weights + kv_read_bytes * users) * efficiency``. At one
+    user this IS `predict_decode_tps` -- it is computed by it -- which is what
+    ties the users chart to the number on the Verdict card. A ceiling only:
+    past a few users decode turns compute-bound, and nothing here models that.
+    """
+    return predict_decode_tps(
+        shape, bandwidth_gbps, max(0.0, kv_read_bytes) * max(1, int(users)), efficiency
+    )
+
+
+def prefill_floor_seconds(
+    shape: ModelShape,
+    prompt_tokens: int,
+    tflops: float,
+    tensor_parallel: int,
+) -> float | None:
+    """Seconds to prefill one prompt, as a FLOOR, from measured compute.
+
+    ``2 * active_params * prompt_tokens`` FLOPs over the measured matmul rate,
+    split across the tensor-parallel ranks. Dense weights only -- attention
+    FLOPs, scheduling and queueing are excluded -- and no efficiency constant,
+    so the real first token is never sooner than this. The compute counterpart
+    of the decode ceiling. None when there is no rate to divide by.
+    """
+    if not tflops or tflops <= 0:
+        return None
+    return (
+        2 * shape.effective_active_params * prompt_tokens
+        / (tflops * 1e12 * max(1, int(tensor_parallel)))
+    )
+
+
 def speculative_decode_tps_range(
     shape: ModelShape,
     bandwidth_gbps: float,
@@ -587,6 +630,8 @@ def memory_breakdown(
     chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
     weight_bytes: int | None = None,
     speculative: SpeculativeSpec | None = None,
+    *,
+    extra_replicated_bytes: int = 0,
 ) -> tuple[MemoryBreakdown, list[str]]:
     """Per-rank memory, and everything worth warning about while computing it.
 
@@ -672,7 +717,7 @@ def memory_breakdown(
         kv_cache=int(kv_total / kv_divisor(shape, plan) + spec_kv),
         activations=int(activation_bytes(shape, max_seqs, context, chunk_tokens)),
         comm_buffers=int(comm_buffer_bytes(plan)),
-        replicated=int(replicated_bytes_per_rank(shape)),
+        replicated=int(replicated_bytes_per_rank(shape)) + int(extra_replicated_bytes),
         framework_overhead=int(FRAMEWORK_OVERHEAD),
     )
     return breakdown, warnings
@@ -753,10 +798,17 @@ class FitCalculator:
             req.context_length,
             req.max_concurrent_seqs,
             req.kv_dtype,
-            self.chunk_tokens,
+            req.chunk_tokens if req.chunk_tokens is not None else self.chunk_tokens,
             req.weight_bytes,
             req.speculative,
+            extra_replicated_bytes=req.extra_replicated_bytes,
         )
+        if req.extra_replicated_bytes:
+            budget_warnings.append(
+                f"Includes {req.extra_replicated_bytes / 2**30:g} GiB for the "
+                "multimodal processor cache on every node; on GB10 it comes "
+                "out of the same memory pool."
+            )
         warnings.extend(budget_warnings)
         headroom = usable - breakdown.total
 
@@ -817,6 +869,8 @@ class FitCalculator:
             req.kv_dtype,
             weight_bytes=req.weight_bytes,
             speculative=req.speculative,
+            chunk_tokens=req.chunk_tokens,
+            extra_replicated_bytes=req.extra_replicated_bytes,
         )
 
         ranks = sum(max(1, n.gpu_count) for n in used)
@@ -1238,6 +1292,9 @@ class FitCalculator:
         usable: int,
         weight_bytes: int | None = None,
         speculative: SpeculativeSpec | None = None,
+        *,
+        chunk_tokens: int | None = None,
+        extra_replicated_bytes: int = 0,
     ) -> bool:
         breakdown, _ = memory_breakdown(
             shape,
@@ -1245,9 +1302,10 @@ class FitCalculator:
             context,
             max_seqs,
             kv_dtype,
-            self.chunk_tokens,
+            chunk_tokens if chunk_tokens is not None else self.chunk_tokens,
             weight_bytes,
             speculative,
+            extra_replicated_bytes=extra_replicated_bytes,
         )
         return breakdown.total <= usable
 
@@ -1292,6 +1350,9 @@ class FitCalculator:
         kv_dtype: str,
         weight_bytes: int | None = None,
         speculative: SpeculativeSpec | None = None,
+        *,
+        chunk_tokens: int | None = None,
+        extra_replicated_bytes: int = 0,
     ) -> int:
         step = CONTEXT_ROUNDING
 
@@ -1305,6 +1366,8 @@ class FitCalculator:
                 usable,
                 weight_bytes,
                 speculative,
+                chunk_tokens=chunk_tokens,
+                extra_replicated_bytes=extra_replicated_bytes,
             )
 
         if not fits(1):
@@ -1323,7 +1386,8 @@ class FitCalculator:
         # Never report a context we have not verified. The search is monotonic
         # so this loop should not run, and it costs nothing if it does not.
         while result > 0 and not self._fits_at(
-            shape, plan, result, max_seqs, kv_dtype, usable, weight_bytes, speculative
+            shape, plan, result, max_seqs, kv_dtype, usable, weight_bytes, speculative,
+            chunk_tokens=chunk_tokens, extra_replicated_bytes=extra_replicated_bytes,
         ):
             result -= step
         return max(0, result)

@@ -105,6 +105,22 @@
       ]
     },
     {
+      "name": "link",
+      "category": "action",
+      "tags": [
+        "url",
+        "hyperlink",
+        "chain",
+        "paste",
+        "huggingface link"
+      ],
+      "usage": "<Icon name=\"link\" decorative />  beside text that says a link was used (e.g. 'Opened <repo> from the link'); `label=\"Link\"` when the icon stands alone",
+      "added": "2026-11-20",
+      "replaces": [
+        "🔗"
+      ]
+    },
+    {
       "name": "trash",
       "category": "action",
       "tags": [
@@ -755,6 +771,19 @@
       ],
       "usage": "<Icon name=\"x-circle\" label=\"Failed\" />  (or `decorative` inside a control that already has a label)",
       "added": "2026-11-18",
+      "replaces": []
+    },
+    {
+      "name": "pin",
+      "category": "action",
+      "tags": [
+        "pin",
+        "pinned",
+        "favourite",
+        "keep on top"
+      ],
+      "usage": "<Icon name=\"pin\" decorative />  inside a toggle button labelled Pin/Unpin <id>",
+      "added": "2026-11-20",
       "replaces": []
     }
   ]

@@ -254,6 +254,69 @@
       "added": "2026-11-17"
     },
     {
+      "name": "ProviderAddForm",
+      "kind": "shared",
+      "path": "ui/src/components/ProviderAddForm.tsx",
+      "props": [
+        "providers",
+        "kinds",
+        "knownRefs",
+        "onAdded"
+      ],
+      "variants": {
+        "mode": [
+          "key",
+          "sign-in",
+          "keyless"
+        ]
+      },
+      "states": [
+        "default",
+        "busy",
+        "error"
+      ],
+      "tokens": [
+        "rule",
+        "fault",
+        "space-4",
+        "space-8",
+        "space-10",
+        "space-12"
+      ],
+      "icons": [],
+      "tests": null,
+      "spec": "DESIGN.md#provideraddform",
+      "added": "2026-11-20"
+    },
+    {
+      "name": "ProviderAddDialog",
+      "kind": "shared",
+      "path": "ui/src/components/ProviderAddDialog.tsx",
+      "props": [
+        "providers",
+        "kinds",
+        "onClose"
+      ],
+      "variants": {},
+      "states": [
+        "default"
+      ],
+      "tokens": [
+        "panel-overlay",
+        "panel-raised",
+        "shadow-raised",
+        "z-overlay",
+        "rule",
+        "space-8"
+      ],
+      "icons": [
+        "close"
+      ],
+      "tests": null,
+      "spec": "DESIGN.md#provideradddialog",
+      "added": "2026-11-20"
+    },
+    {
       "name": "ProviderSignIn",
       "kind": "shared",
       "path": "ui/src/tabs/settings/ProviderSignIn.tsx",
@@ -864,6 +927,40 @@
       "tests": null,
       "spec": "DESIGN.md#hosttable",
       "added": "2026-11-18"
+    },
+    {
+      "name": "Select",
+      "kind": "shared",
+      "path": "ui/src/components/Select.tsx",
+      "props": [
+        "id",
+        "value",
+        "options",
+        "onChange",
+        "disabled",
+        "className",
+        "style"
+      ],
+      "variants": {},
+      "states": [
+        "closed",
+        "open",
+        "option-disabled"
+      ],
+      "tokens": [
+        "panel",
+        "panel-raised",
+        "hover",
+        "ink-muted",
+        "rule",
+        "radius",
+        "shadow-raised",
+        "size-unit"
+      ],
+      "icons": [],
+      "tests": null,
+      "spec": "DESIGN.md#input--select--textarea",
+      "added": "2026-11-20"
     },
     {
       "name": "DeploymentInspector",

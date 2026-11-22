@@ -68,6 +68,7 @@ PROFILE_DIFF_FIELDS = (
     "driver_version",
     "hostname",
     "address",
+    "arch",
 )
 
 

@@ -1,6 +1,6 @@
 // Serving a model by routing to somebody else's hardware.
 //
-// The other half of the Serve pane. `ServePanel` answers "run it here": plan,
+// The other half of the Serve tab. `VerdictBox` answers "run it here": plan,
 // fit gate, machines, sparkrun. This answers the question that has no launch in
 // it at all -- a provider already runs this model, and the only decision left is
 // whether this cluster's /v1 carries its name.

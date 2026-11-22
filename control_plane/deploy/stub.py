@@ -29,6 +29,8 @@ from control_plane.contracts import (
     Deployment,
     DeploymentState as S,
     FitResult,
+    EngineOptions,
+    Lifecycle,
     Modality,
     ModelShape,
     ParallelismPlan,
@@ -91,6 +93,9 @@ class StubDeploymentManager:
         quantization: str | None = None,
         revision: str | None = None,
         speculative_tokens: int = 0,
+        engine_options: EngineOptions = EngineOptions(),
+        original_window: int | None = None,
+        lifecycle: Lifecycle = Lifecycle(),
     ) -> Deployment:
         name = served_name or default_served_name(shape)
         if fit.verdict is Verdict.WONT_FIT:
@@ -136,6 +141,9 @@ class StubDeploymentManager:
                 quantization=quantization or None,
                 revision=revision,
                 speculative_tokens=speculative_tokens,
+                engine_options=engine_options,
+                original_window=original_window,
+                lifecycle=lifecycle,
             )
             record = _Record(deployment=deployment, handle={"port": port})
             self._records[deployment.deployment_id] = record
@@ -147,7 +155,7 @@ class StubDeploymentManager:
         timer.start()
         return deployment
 
-    def stop(self, deployment_id: str) -> None:
+    def stop(self, deployment_id: str, *, reason: str | None = None) -> None:
         with self._lock:
             record = self._records.get(deployment_id)
             if record is None:
@@ -164,7 +172,7 @@ class StubDeploymentManager:
                 self._transition(record, S.FAILED, reason="stopped during launch")
                 return
             self._transition(record, S.STOPPING)
-            self._transition(record, S.STOPPED)
+            self._transition(record, S.STOPPED, reason=reason)
 
     def list(self) -> list[Deployment]:
         with self._lock:

@@ -63,6 +63,7 @@ from .headers import SecurityHeaders
 from .metrics import MetricsHub
 from .parking import ParkingLot
 from .proxy import UpstreamProxy
+from .idle import IdleMonitor, boot_relaunch
 from .restart import RestartCoordinator
 from .router import Router
 from .routing_store import RoutingStore
@@ -436,6 +437,7 @@ def create_app(
     # successful relaunch), so it is built after GatewayContext rather than
     # alongside the services passed into it above.
     restart = RestartCoordinator(ctx)
+    idle = IdleMonitor(ctx)
 
     # Wires deps.registry and deps.providers together to do, on a timer,
     # exactly what runtime_api.py's manual POST route does on a click. See
@@ -537,6 +539,13 @@ def create_app(
         await admission.start()
         await router.start()
         await restart.start()
+        await idle.start()
+        # After reconcile (step 4) and with the router up: a start-at-boot
+        # record whose name nothing live answers to is launched once.
+        try:
+            await boot_relaunch(ctx)
+        except Exception:
+            log.exception("start-at-boot relaunch failed")
         await metrics.start()
         # Spec-decode counters from every local engine, attributed to each
         # request after it settles; and the sweep that marks lapsed keys
@@ -612,7 +621,16 @@ def create_app(
             # Before the proxy: the poller scrapes through its clients.
             await ctx.engine_metrics.stop()
             await metrics.stop()
+            await idle.stop()
             await restart.stop()
+            # Hub prefetch workers are their own process groups; they would
+            # outlive the coordinator otherwise.
+            try:
+                from control_plane.deploy import prefetch as _prefetch
+
+                await asyncio.to_thread(_prefetch.shutdown_default)
+            except Exception:
+                log.exception("stopping hub prefetches failed")
             await router.stop()
             await admission.stop()
             await proxy.stop()
@@ -695,6 +713,9 @@ def create_app(
             )
         return await call_next(request)
 
+    if ctx.profiles is None:
+        from .profiles_store import ProfileStore
+        ctx.profiles = ProfileStore()
     app.include_router(openai_api.create_router(ctx))
     app.include_router(internal_api.create_router(ctx))
     # Above the StaticFiles mount below, and it must stay there: a Starlette

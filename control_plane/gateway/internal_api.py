@@ -28,7 +28,11 @@ from fastapi import APIRouter, Query, Request
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from control_plane.contracts.constants import JOIN_PER_ADDRESS_PER_MIN
-from control_plane.contracts.deployment import check_speculative_tokens
+from control_plane.contracts.deployment import (
+    EngineOptions,
+    Lifecycle,
+    check_speculative_tokens,
+)
 from control_plane.contracts import (
     DeviceClass,
     DeploymentState,
@@ -123,6 +127,10 @@ _DEGREE_AXES = (
     "expert_parallel",
     "data_parallel",
 )
+
+#: One compute measurement at a time on this host: two matmul probes sharing
+#: the GPU would each time half of it.
+_COMPUTE_LOCK = threading.Lock()
 
 
 class _PlacementRefused(Exception):
@@ -226,6 +234,226 @@ class _PlanOutcome:
     #: The commit sha the resolver read the shape from, so the launch runs
     #: exactly that revision's remote code (M7). None when unknown.
     revision: str | None = None
+    #: The typed engine options the request carried, parsed once here so the
+    #: plan and the launch render the same flags.
+    engine_options: EngineOptions = EngineOptions()
+    #: The model's trained window (max_position_embeddings), None when the
+    #: config states none. Rendering YaRN needs it.
+    original_window: int | None = None
+    #: The window the plan sized against: the trained one, times rope_factor.
+    native_window: int | None = None
+
+_ENGINE_ENV_VALUE = re.compile(r"^[A-Za-z0-9_.,:/=+-]*$")
+_MM_KEYS = ("image", "video", "audio")
+
+
+def _engine_number(name: str, value: object, *, integer: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"engine_options.{name} must be a number.")
+    if integer and (not isinstance(value, int) and not float(value).is_integer()):
+        raise ValueError(f"engine_options.{name} must be a whole number.")
+    return value
+
+
+def _parse_engine_options(payload: dict) -> EngineOptions:
+    """The request's `engine_options`, typed and range-checked.
+
+    Unknown keys are a 400 rather than ignored: a misspelled knob would
+    otherwise launch and report as set. The three object-valued fields are
+    turned into the contract's sorted tuples of pairs.
+    """
+    from control_plane.deploy.flags import (
+        NCCL_TUNABLES,
+        VLLM_REASONING_PARSERS,
+        VLLM_TOOL_CALL_PARSERS,
+    )
+
+    raw = payload.get("engine_options") if isinstance(payload, dict) else None
+    if raw is None:
+        return EngineOptions()
+    if not isinstance(raw, dict):
+        raise ValueError("engine_options must be an object.")
+    known = [f.name for f in dataclasses.fields(EngineOptions)]
+    unknown = sorted(set(raw) - set(known))
+    if unknown:
+        raise ValueError(
+            f"engine_options has no field {', '.join(unknown)}. "
+            f"Valid fields: {', '.join(known)}."
+        )
+    out: dict = {}
+    for name in ("reasoning_parser", "tool_call_parser"):
+        value = raw.get(name)
+        if value is not None:
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"engine_options.{name} must be a parser name.")
+            allowed = (
+                VLLM_REASONING_PARSERS if name == "reasoning_parser" else VLLM_TOOL_CALL_PARSERS
+            )
+            if value not in allowed:
+                kind = "reasoning" if name == "reasoning_parser" else "tool-call"
+                raise ValueError(
+                    f"{value} is not a {kind} parser in this vLLM build; it has: "
+                    f"{', '.join(sorted(allowed))}."
+                )
+            out[name] = value
+    for name in ("prefix_caching",):
+        value = raw.get(name)
+        if value is not None:
+            if not isinstance(value, bool):
+                raise ValueError(f"engine_options.{name} must be true, false or null.")
+            out[name] = value
+    for name in ("async_scheduling", "language_model_only"):
+        value = raw.get(name, False)
+        if not isinstance(value, bool):
+            raise ValueError(f"engine_options.{name} must be true or false.")
+        out[name] = value
+    value = raw.get("max_num_batched_tokens")
+    if value is not None:
+        value = _engine_number("max_num_batched_tokens", value, integer=True)
+        if not 1 <= value <= 1_048_576:
+            raise ValueError("engine_options.max_num_batched_tokens must be from 1 to 1048576.")
+        out["max_num_batched_tokens"] = int(value)
+    mm = raw.get("limit_mm_per_prompt")
+    if mm is not None:
+        if not isinstance(mm, dict):
+            raise ValueError("engine_options.limit_mm_per_prompt must be an object.")
+        pairs = []
+        for key, count in mm.items():
+            if key not in _MM_KEYS:
+                raise ValueError(
+                    f"engine_options.limit_mm_per_prompt has no key {key}; "
+                    f"use {', '.join(_MM_KEYS)}."
+                )
+            count = _engine_number(f"limit_mm_per_prompt.{key}", count, integer=True)
+            if not 0 <= count <= 64:
+                raise ValueError(f"engine_options.limit_mm_per_prompt.{key} must be from 0 to 64.")
+            pairs.append((key, int(count)))
+        out["limit_mm_per_prompt"] = tuple(sorted(pairs))
+    value = raw.get("mm_processor_cache_gb")
+    if value is not None:
+        value = _engine_number("mm_processor_cache_gb", value)
+        if not 0 <= value <= 64:
+            raise ValueError("engine_options.mm_processor_cache_gb must be from 0 to 64.")
+        out["mm_processor_cache_gb"] = float(value)
+    value = raw.get("rope_factor")
+    if value is not None:
+        value = _engine_number("rope_factor", value)
+        if not 1.0 < value <= 8.0:
+            raise ValueError("engine_options.rope_factor must be above 1 and at most 8.")
+        out["rope_factor"] = float(value)
+    gen = raw.get("generation_overrides")
+    if gen is not None:
+        if not isinstance(gen, dict):
+            raise ValueError("engine_options.generation_overrides must be an object.")
+        pairs = []
+        for key, number in gen.items():
+            if key == "temperature":
+                number = _engine_number("generation_overrides.temperature", number)
+                ok = 0 <= number <= 2
+            elif key == "top_p":
+                number = _engine_number("generation_overrides.top_p", number)
+                ok = 0 < number <= 1
+            elif key == "top_k":
+                number = _engine_number("generation_overrides.top_k", number, integer=True)
+                ok = -1 <= number <= 1000
+            else:
+                raise ValueError(
+                    f"engine_options.generation_overrides has no key {key}; "
+                    "use temperature, top_p, top_k."
+                )
+            if not ok:
+                raise ValueError(f"engine_options.generation_overrides.{key} is out of range.")
+            pairs.append((key, float(number)))
+        out["generation_overrides"] = tuple(sorted(pairs))
+    env = raw.get("env")
+    if env is not None:
+        if not isinstance(env, dict):
+            raise ValueError("engine_options.env must be an object of names to values.")
+        pairs = []
+        for name, value in env.items():
+            if name not in NCCL_TUNABLES:
+                raise ValueError(
+                    f"{name} is not an NCCL variable this image's library reads; "
+                    "derate only passes NCCL tuning through a launch."
+                )
+            if not isinstance(value, str) or not _ENGINE_ENV_VALUE.match(value):
+                raise ValueError(
+                    f"engine_options.env.{name} must be a string of letters, digits "
+                    "and _.,:/=+-"
+                )
+            pairs.append((name, value))
+        out["env"] = tuple(sorted(pairs))
+    return EngineOptions(**out)
+
+
+_LIFECYCLE_PRIORITIES = ("low", "normal", "high", "pinned")
+_IDLE_UNLOAD_RANGE = (300, 604800)
+
+
+def _parse_lifecycle(payload: dict, base: Lifecycle = Lifecycle()) -> Lifecycle:
+    """The request's `lifecycle`, merged over `base` (PATCH sends a partial).
+
+    Not a fit input. Unknown keys are a 400, like `engine_options`.
+    """
+    raw = payload.get("lifecycle") if isinstance(payload, dict) else None
+    if raw is None:
+        return base
+    if not isinstance(raw, dict):
+        raise ValueError("lifecycle must be an object.")
+    known = {f.name for f in dataclasses.fields(Lifecycle)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(
+            f"lifecycle has no field {', '.join(unknown)}; it takes "
+            f"{', '.join(sorted(known))}."
+        )
+    changes: dict = {}
+    if "idle_unload_s" in raw:
+        v = raw["idle_unload_s"]
+        lo, hi = _IDLE_UNLOAD_RANGE
+        if v is not None and (
+            isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi
+        ):
+            raise ValueError(
+                f"lifecycle.idle_unload_s must be whole seconds from {lo} to "
+                f"{hi}, or null to stay loaded."
+            )
+        changes["idle_unload_s"] = v
+    if "priority" in raw:
+        v = raw["priority"]
+        if v not in _LIFECYCLE_PRIORITIES:
+            raise ValueError(
+                f"lifecycle.priority must be one of {', '.join(_LIFECYCLE_PRIORITIES)}."
+            )
+        changes["priority"] = v
+    if "start_at_boot" in raw:
+        v = raw["start_at_boot"]
+        if not isinstance(v, bool):
+            raise ValueError("lifecycle.start_at_boot must be true or false.")
+        changes["start_at_boot"] = v
+    return dataclasses.replace(base, **changes)
+
+
+def _without_vision(shape, weight_bytes: int | None):
+    """The shape and measured weights with the vision tower taken out, for
+    `engine_options.language_model_only` (vLLM `--language-model-only`)."""
+    if shape.vision_params == 0:
+        raise ValueError("This model has no vision tower to skip.")
+    vision_bytes = int(shape.vision_params * shape.bytes_per_param())
+    shape = dataclasses.replace(
+        shape,
+        vision_params=0,
+        total_params=shape.total_params - shape.vision_params,
+        active_params=(
+            shape.active_params - shape.vision_params
+            if shape.active_params is not None
+            else None
+        ),
+    )
+    if weight_bytes is not None:
+        weight_bytes = max(0, weight_bytes - vision_bytes)
+    return shape, weight_bytes
+
 
 def _parse_node_ids(payload: dict) -> list[str] | None:
     """The machines the operator named, or None when they named none.
@@ -630,9 +858,38 @@ def _select_nodes(registry, nodes, requested, warnings: list[str], runtime: str 
                 param=_PLACEMENT_PARAM,
                 extra={"unusable_node_ids": [node_id]},
             )
+        # A machine this runtime has no image for. Its own code, because the
+        # fix is a different one: not memory, but a runtime -- or an image --
+        # built for this machine's architecture.
+        from control_plane.deploy.flags import arch_refusal
+
+        refusal = arch_refusal(runtime, node_id, getattr(profile, "arch", ""))
+        if refusal is not None:
+            raise _PlacementRefused(
+                400,
+                refusal,
+                "no_image_for_architecture",
+                param=_PLACEMENT_PARAM,
+                extra={"unusable_node_ids": [node_id]},
+            )
         if profile.device_class is DeviceClass.UNKNOWN:
             warnings.append(serialize.INELIGIBLE_DEVICE_CLASS)
         chosen.append(profile)
+    # One launch runs one image, and an image is built for one architecture:
+    # a set that mixes them cannot be one deployment, whatever each machine
+    # could run on its own.
+    arches = {p.arch for p in chosen if getattr(p, "arch", "")}
+    if len(arches) > 1:
+        by = ", ".join(f"{p.node_id} ({p.arch})" for p in chosen if p.arch)
+        raise _PlacementRefused(
+            400,
+            f"These machines are different architectures -- {by} -- and one "
+            f"deployment runs one container image, built for one of them. "
+            f"Tick machines of one architecture.",
+            "mixed_architecture",
+            param=_PLACEMENT_PARAM,
+            extra={"architectures": sorted(arches)},
+        )
     return chosen
 
 
@@ -1277,6 +1534,49 @@ def _capacity_block(
     }
 
 
+def _launch_options(payload: dict) -> dict:
+    """The launch-only keys of a deployment request, read as
+    `create_deployment` reads them, as keyword arguments for
+    `preview_launch`. ValueError on a malformed one."""
+    out: dict = {}
+    served_name = payload.get("served_name")
+    if served_name is not None:
+        if not isinstance(served_name, str) or not served_name.strip():
+            raise ValueError(
+                "served_name must be the name clients will pass as \"model\", "
+                "or be omitted to derive one from the model id."
+            )
+        out["served_name"] = served_name.strip()
+    for field in ("extra_args", "custom_command"):
+        raw = payload.get(field)
+        if not raw:
+            out[field] = ()
+            continue
+        if not isinstance(raw, str):
+            raise ValueError("%s must be a string of space-separated CLI tokens." % field)
+        try:
+            out[field] = tuple(shlex.split(raw))
+        except ValueError as exc:
+            raise ValueError(
+                "%s could not be parsed as a CLI argument string: %s" % (field, exc)
+            ) from None
+    for field in ("trust_remote_code", "enforce_eager"):
+        value = payload.get(field, False)
+        if value is None:
+            value = False
+        if not isinstance(value, bool):
+            raise ValueError("%s must be true or false." % field)
+        out[field] = value
+    sizes = payload.get("cudagraph_capture_sizes")
+    if sizes is not None:
+        if not isinstance(sizes, list) or not sizes or not all(
+            isinstance(n, int) and not isinstance(n, bool) for n in sizes
+        ):
+            raise ValueError("cudagraph_capture_sizes must be a non-empty list of integers.")
+        out["cudagraph_capture_sizes"] = tuple(sizes)
+    return out
+
+
 async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     """Resolve, plan, check fit. Launches nothing.
 
@@ -1320,6 +1620,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
             "send either speculative_tokens or speculative, not both: "
             "speculative={method: 'mtp', ...} is the general form"
         )
+    engine_options = _parse_engine_options(payload)
 
     # Prefer resolve_full when the port exposes it: it carries warnings
     # worth showing and, on mixed-precision repos, real measured weight
@@ -1355,11 +1656,25 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     else:
         shape = await asyncio.to_thread(ctx.deps.resolver.resolve, model_id, dtype)
 
+    # Skipping the vision tower is sized BEFORE planning, so the planner, the
+    # fit and the decode prediction all see the smaller shape.
+    if engine_options.language_model_only:
+        shape, weight_bytes = _without_vision(shape, weight_bytes)
+
     native_window = (
         getattr(resolution, "max_position_embeddings", None)
         if callable(resolve_full)
         else None
     )
+    # The trained window, always: the UI offers YaRN against it.
+    original_window: int | None = int(native_window) if native_window else None
+    if engine_options.rope_factor is not None:
+        if native_window is None:
+            raise ValueError(
+                "YaRN needs the model's trained window, and this config does "
+                "not state max_position_embeddings."
+            )
+        native_window = int(native_window * engine_options.rope_factor)
 
     # What this checkpoint could be served with, and what the operator asked
     # for out of that set. Both need the resolution: the options are read off
@@ -1425,6 +1740,20 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         nodes = _select_nodes(
             ctx.deps.registry, nodes, requested_nodes, placement_warnings, runtime
         )
+    else:
+        # The planner's own pick: leave out every machine this runtime has no
+        # image for, said once, rather than hand it a node the launch would
+        # die on at `exec format error`.
+        from control_plane.deploy.flags import arch_refusal
+
+        runnable = [n for n in nodes if arch_refusal(runtime, n.node_id, getattr(n, "arch", "")) is None]
+        if len(runnable) < len(nodes):
+            skipped = sorted({n.node_id for n in nodes} - {n.node_id for n in runnable})
+            placement_warnings.append(
+                f"{runtime} has no image for the architecture of {', '.join(skipped)}, "
+                f"so the planner left {'it' if len(skipped) == 1 else 'them'} out."
+            )
+        nodes = runnable
 
     link = None
     if len(nodes) > 1:
@@ -1592,6 +1921,12 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         weight_bytes=weight_bytes,
         native_window=native_window,
         speculative=speculative,
+        chunk_tokens=engine_options.max_num_batched_tokens,
+        extra_replicated_bytes=(
+            int(engine_options.mm_processor_cache_gb * 2**30)
+            if engine_options.mm_processor_cache_gb
+            else 0
+        ),
     )
 
     fit, fit_live, unavailable = await asyncio.to_thread(
@@ -1686,6 +2021,9 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         kv_dtype=kv_dtype,
         quantization=dtype,
         revision=(getattr(resolution, "revision", None) if callable(resolve_full) else None),
+        engine_options=engine_options,
+        original_window=original_window,
+        native_window=native_window,
     )
 
 
@@ -4052,6 +4390,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "serve": out.serve,
                 "resolver_warnings": out.resolver_warnings,
                 "remote_code": out.remote_code,
+                # The window the plan sized against (stretched when YaRN is
+                # on) and the trained one, so the UI can offer YaRN.
+                "native_window": out.native_window,
+                "original_window": out.original_window,
                 # Whose choice the machines and the degrees were.
                 "placement": out.placement,
                 "degrees": out.degrees,
@@ -4073,6 +4415,384 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "speculative": serialize.speculative_payload(out.speculative),
             }
         )
+
+    async def _read_plan_body(request: Request) -> dict | Response:
+        try:
+            payload = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except Exception:
+            return errors.error_response(
+                400, "Body must be JSON.", "invalid_request_error", "invalid_json"
+            )
+        if not isinstance(payload, dict):
+            return errors.error_response(
+                400, "Body must be a JSON object.", "invalid_request_error", "invalid_request"
+            )
+        return payload
+
+    async def _plan_or_error(payload: dict):
+        """`_plan_and_fit`, with its failures answered the way /api/plan
+        answers them. Returns the outcome or a Response."""
+        model_id = payload.get("model_id")
+        try:
+            return await _plan_and_fit(ctx, payload)
+        except _PlacementRefused as exc:
+            return exc.response()
+        except ValueError as exc:
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "invalid_request"
+            )
+        except Exception as exc:
+            log.exception("planning %s failed", model_id)
+            return _plan_error_response(exc, model_id)
+
+    @router.post("/api/plan/command")
+    async def plan_command(request: Request) -> Response:
+        """The command and recipe a launch of this body would run, refused
+        exactly as the launch would refuse it. Starts nothing."""
+        payload = await _read_plan_body(request)
+        if isinstance(payload, Response):
+            return payload
+        preview = getattr(ctx.deps.deployments, "preview_launch", None)
+        if not callable(preview):
+            return errors.error_response(
+                501, "This deployment backend cannot preview a launch command.",
+                "server_error", "preview_unavailable",
+            )
+        try:
+            options = _launch_options(payload)
+        except ValueError as exc:
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "invalid_request"
+            )
+        out = await _plan_or_error(payload)
+        if isinstance(out, Response):
+            return out
+        fit = out.fit_live if out.fit_live is not None else out.fit
+        if fit is None:
+            return errors.error_response(
+                503, "the fit calculator is not wired; there is no budget to render",
+                "server_error", "fit_unavailable",
+            )
+        from control_plane.deploy.flags import render_kv_cache_dtype, render_quantization
+
+        try:
+            result = await asyncio.to_thread(
+                partial(
+                    preview,
+                    out.shape,
+                    out.plan,
+                    fit,
+                    payload.get("runtime") or "vllm",
+                    out.context_length,
+                    out.concurrency,
+                    modality=out.modality,
+                    speculative=out.speculative,
+                    # The same spreads create_deployment applies.
+                    kv_dtype=(
+                        out.kv_dtype if render_kv_cache_dtype(out.kv_dtype) is not None else None
+                    ),
+                    quantization=(
+                        out.quantization
+                        if out.quantization and render_quantization(out.quantization) is not None
+                        else None
+                    ),
+                    revision=out.revision,
+                    speculative_tokens=payload.get("speculative_tokens", 0),
+                    engine_options=out.engine_options,
+                    original_window=(
+                        out.original_window
+                        if out.engine_options.rope_factor is not None
+                        else None
+                    ),
+                    **options,
+                )
+            )
+        except ValueError as exc:
+            return errors.error_response(
+                400, str(exc), "invalid_request_error", "invalid_request"
+            )
+        return JSONResponse(result)
+
+    @router.post("/api/plan/concurrency")
+    async def plan_concurrency(request: Request) -> Response:
+        """How many users a plan holds before its KV cache is full, and the
+        per-user decode ceiling memory bandwidth allows at each count."""
+        payload = await _read_plan_body(request)
+        if isinstance(payload, Response):
+            return payload
+
+        def bad(message: str) -> Response:
+            return errors.error_response(
+                400, message, "invalid_request_error", "invalid_request"
+            )
+
+        contexts = payload.get("contexts")
+        if (
+            not isinstance(contexts, list)
+            or not 1 <= len(contexts) <= 4
+            or not all(isinstance(c, int) and not isinstance(c, bool) for c in contexts)
+            or any(c < 512 for c in contexts)
+        ):
+            return bad("contexts must be a list of 1 to 4 whole numbers, each at least 512.")
+        max_users = payload.get("max_users", 64)
+        if isinstance(max_users, bool) or not isinstance(max_users, int) or not 1 <= max_users <= 256:
+            return bad("max_users must be a whole number from 1 to 256.")
+        base = {
+            k: v for k, v in payload.items() if k not in ("contexts", "max_users")
+        }
+
+        from control_plane import computeprobe, measurements
+        from control_plane.fit.calculator import bandwidth_ceiling_tps, prefill_floor_seconds
+        from control_plane.fit.kv import kv_cache_bytes, kv_divisor
+
+        try:
+            profiles = [n.profile for n in ctx.deps.registry.healthy_nodes()]
+        except Exception:
+            log.exception("registry unavailable while sizing concurrency")
+            profiles = []
+
+        series = []
+        bandwidth = None
+        basis = "static"
+        compute = None
+        compute_looked = False
+        for context in contexts:
+            out = await _plan_or_error({**base, "context": context, "concurrency": 1})
+            if isinstance(out, Response):
+                return out
+            if out.native_window is not None and context > out.native_window:
+                return bad(
+                    f"{context} is past this model's {out.native_window}-token window."
+                )
+            fit = out.fit_live if out.fit_live is not None else out.fit
+            if fit is None:
+                return errors.error_response(
+                    503, "the fit calculator is not wired; there is no budget to size",
+                    "server_error", "fit_unavailable",
+                )
+            if out.fit_live is not None:
+                basis = "live"
+            shape, plan = out.shape, out.plan
+            used = set(plan.node_ids)
+            rates = [
+                p.memory_bandwidth_gbps for p in profiles if p.node_id in used
+            ]
+            bw = min(rates) if rates else 0.0
+            bandwidth = bw if bandwidth is None else min(bandwidth, bw)
+            kv_read = kv_cache_bytes(shape, context, 1, out.kv_dtype)
+            kv_seq = kv_read / kv_divisor(shape, plan)
+            fixed = fit.breakdown.total - fit.breakdown.kv_cache
+            if kv_seq > 0:
+                wall = max(0, int((fit.usable_per_node - fixed) // kv_seq))
+            else:
+                wall = max_users
+            users = set()
+            n = 1
+            while n <= max_users:
+                users.add(n)
+                n *= 2
+            if wall >= 1:
+                users.add(wall)
+            if not compute_looked:
+                # Once, against the first plan's machines: the floor is only
+                # stated for a GPU this image was measured on, and a plan over
+                # unlike GPUs has no single rate to divide by.
+                compute_looked = True
+                gpus = {p.gpu_name for p in profiles if p.node_id in used}
+                if len(gpus) == 1:
+                    try:
+                        compute = await asyncio.to_thread(
+                            measurements.matching_compute,
+                            next(iter(gpus)),
+                            image=computeprobe.resolved_image(),
+                        )
+                    except Exception:
+                        log.exception("reading compute records failed")
+                        compute = None
+            prefill = (
+                prefill_floor_seconds(shape, context, compute.tflops, plan.tensor_parallel)
+                if compute is not None
+                else None
+            )
+            points = []
+            for u in sorted(users):
+                each = (
+                    bandwidth_ceiling_tps(shape, bw, kv_read, u) if bw > 0 else None
+                )
+                points.append(
+                    {
+                        "users": u,
+                        "ceiling_tps_each": each,
+                        "ceiling_tps_total": (
+                            each * min(u, max(wall, 1)) if each is not None else None
+                        ),
+                        "queued": u > wall,
+                        # Past the wall a request waits for a slot, and how
+                        # long is not something derate can say.
+                        "ttft_floor_s": (
+                            u * prefill if prefill is not None and u <= wall else None
+                        ),
+                    }
+                )
+            series.append(
+                {
+                    "context": context,
+                    "wall_users": wall,
+                    "prompt_tokens": context,
+                    "points": points,
+                }
+            )
+        return JSONResponse(
+            {
+                "series": series,
+                "bandwidth_gbps": bandwidth if bandwidth else None,
+                "basis": basis,
+                "caveat": (
+                    "A ceiling from memory bandwidth alone. Past a few users "
+                    "decode becomes compute-bound and runs slower than this; "
+                    "derate has not measured where that starts on this "
+                    "hardware. Run a benchmark for real numbers."
+                ),
+                "compute": (
+                    {
+                        "tflops": compute.tflops,
+                        "gpu_name": compute.gpu_name,
+                        "measured_at": compute.measured_at,
+                    }
+                    if compute is not None
+                    else None
+                ),
+                "ttft_caveat": (
+                    "No sooner than this: every prompt is the full context, all "
+                    "users send at once, and only the weights' matrix work is "
+                    "counted on compute measured on this machine. Attention, "
+                    "scheduling and queueing make it slower; a benchmark shows "
+                    "the real figure."
+                ),
+            }
+        )
+
+    @router.post("/api/plan/candidates")
+    async def plan_candidates(request: Request) -> Response:
+        """The best-ranked plan of each kind on this node set, each re-judged
+        by the fit gate at the planner pick's context and concurrency."""
+        payload = await _read_plan_body(request)
+        if isinstance(payload, Response):
+            return payload
+        base = {k: v for k, v in payload.items() if k != _DEGREES_PARAM}
+        out = await _plan_or_error(base)
+        if isinstance(out, Response):
+            return out
+        kept: list[dict] = []
+        seen: set[str] = set()
+        for alt in out.alternatives:
+            if alt["kind"] in seen:
+                continue
+            seen.add(alt["kind"])
+            kept.append(alt)
+            if len(kept) == 5:
+                break
+        candidates = []
+        for alt in kept:
+            degrees = {axis: alt[axis] for axis in _DEGREE_AXES}
+            row = {
+                "kind": alt["kind"],
+                "degrees": degrees,
+                "node_ids": list(alt["node_ids"]),
+                "verdict": None,
+                "per_node_bytes": None,
+                "reason": None,
+                "error": None,
+            }
+            try:
+                one = await _plan_and_fit(
+                    ctx,
+                    {
+                        **base,
+                        _PLACEMENT_PARAM: list(alt["node_ids"]),
+                        _DEGREES_PARAM: degrees,
+                        "context": out.context_length,
+                        "concurrency": out.concurrency,
+                    },
+                )
+            except _PlacementRefused as exc:
+                row["error"] = exc.message
+                candidates.append(row)
+                continue
+            except Exception:
+                log.exception("re-judging the %s candidate failed", alt["kind"])
+                continue
+            fit = one.fit_live if one.fit_live is not None else one.fit
+            if fit is not None:
+                row["verdict"] = fit.verdict.value
+                row["per_node_bytes"] = fit.breakdown.total
+            row["reason"] = one.plan.reason
+            candidates.append(row)
+        recommended = out.recommended if out.recommended is not None else out.plan
+        return JSONResponse(
+            {"candidates": candidates, "recommended_kind": recommended.kind.value}
+        )
+
+    @router.get("/api/compute")
+    async def list_compute() -> JSONResponse:
+        from control_plane import measurements
+
+        records = await asyncio.to_thread(measurements.load_compute_all)
+        return JSONResponse({"records": [dataclasses.asdict(r) for r in records]})
+
+    @router.post("/api/compute/measure")
+    async def measure_compute(request: Request) -> Response:
+        """Time a bf16 matmul on THIS host's GPU, in the serving image."""
+        from control_plane import computeprobe, measurements
+
+        registry = ctx.deps.registry
+        local = getattr(registry, "local_profile", None)
+        if local is None:
+            try:
+                local = next(
+                    (n.profile for n in registry.healthy_nodes() if getattr(n, "is_local", False)),
+                    None,
+                )
+            except Exception:
+                local = None
+        if local is None:
+            return errors.error_response(
+                503,
+                "This coordinator has no GPU node of its own registered, so there "
+                "is nothing here to measure.",
+                "server_error", "measurement_failed",
+            )
+        if not _COMPUTE_LOCK.acquire(blocking=False):
+            return errors.error_response(
+                409, "A compute measurement is already running on this machine.",
+                "invalid_request_error", "measurement_running",
+            )
+        try:
+            image = computeprobe.resolved_image()
+            result = await asyncio.to_thread(computeprobe.run_compute, image=image)
+        finally:
+            _COMPUTE_LOCK.release()
+        if result.error is not None or result.tflops is None:
+            return errors.error_response(
+                503, result.error or "the matmul did not complete",
+                "server_error", "measurement_failed",
+            )
+        record = measurements.ComputeRecord(
+            gpu_name=local.gpu_name,
+            image=image,
+            dtype="bf16",
+            tflops=result.tflops,
+            node_id=local.node_id,
+            measured_at=time.time(),
+        )
+        await asyncio.to_thread(measurements.save_compute, record)
+        audit_request(
+            request, AuditAction.API_WRITE, "compute", local.node_id,
+            after={"tflops": round(result.tflops, 2), "image": image},
+        )
+        return JSONResponse(dataclasses.asdict(record))
 
     @router.get("/api/deployments")
     async def list_deployments(limit: int = DEPLOYMENT_LIST_TERMINAL) -> JSONResponse:
@@ -4138,6 +4858,27 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
+        return await _launch_response(payload, request=request)
+
+    async def _create_deployment(
+        payload: dict, *, actor: str, request: Request | None = None
+    ) -> tuple[int, dict]:
+        """Launch exactly as POST /api/deployments does, for callers inside
+        the coordinator (boot relaunch, benchmarks). Returns the status and
+        body the route would have answered; audit is written only when there
+        is a `request` to attribute it to. `actor` names the caller in logs."""
+        response = await _launch_response(payload, request=request)
+        try:
+            body = json.loads(bytes(response.body or b"{}"))
+        except ValueError:
+            body = {}
+        if response.status_code != 201:
+            log.info("%s launch refused (%s)", actor, response.status_code)
+        return response.status_code, body
+
+    ctx.launcher = _create_deployment
+
+    async def _launch_response(payload, *, request: Request | None) -> Response:
         model_id = payload.get("model_id") if isinstance(payload, dict) else None
 
         # A dtype used to be refused here outright, and the reason given was
@@ -4173,71 +4914,23 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # refused as a ValueError from launch() itself, turned into a 400 in
         # the except block below, so the two parses below do not need to
         # agree with each other about which one wins.
-        def _parse_cli_tokens(field: str) -> tuple[str, ...] | Response:
-            raw = payload.get(field) if isinstance(payload, dict) else None
-            if not raw:
-                return ()
-            if not isinstance(raw, str):
-                return errors.error_response(
-                    400,
-                    "%s must be a string of space-separated CLI tokens." % field,
-                    "invalid_request_error",
-                    "invalid_request",
-                )
-            try:
-                return tuple(shlex.split(raw))
-            except ValueError as exc:
-                return errors.error_response(
-                    400,
-                    "%s could not be parsed as a CLI argument string: %s"
-                    % (field, exc),
-                    "invalid_request_error",
-                    "invalid_request",
-                )
-
-        served_name = payload.get("served_name") if isinstance(payload, dict) else None
-        if served_name is not None and (
-            not isinstance(served_name, str) or not served_name.strip()
-        ):
+        # One parser for the launch-only keys, shared with /api/plan/command.
+        try:
+            launch_opts = _launch_options(payload if isinstance(payload, dict) else {})
+            lifecycle = _parse_lifecycle(payload)
+        except ValueError as exc:
             return errors.error_response(
-                400,
-                "served_name must be the name clients will pass as \"model\", "
-                "or be omitted to derive one from the model id.",
-                "invalid_request_error",
-                "invalid_request",
+                400, str(exc), "invalid_request_error", "invalid_request"
             )
-        served_name = served_name.strip() if served_name else None
-
-        extra_args = _parse_cli_tokens("extra_args")
-        if isinstance(extra_args, Response):
-            return extra_args
-        custom_command = _parse_cli_tokens("custom_command")
-        if isinstance(custom_command, Response):
-            return custom_command
+        served_name = launch_opts.get("served_name")
+        extra_args = launch_opts["extra_args"]
+        custom_command = launch_opts["custom_command"]
         # Opt-in (R2): the repo's own Python runs in the container only when
         # the operator asked for it, and the audit row says they did.
-        trust_remote_code = (
-            payload.get("trust_remote_code", False) if isinstance(payload, dict) else False
-        )
-        if not isinstance(trust_remote_code, bool):
-            return errors.error_response(
-                400, "trust_remote_code must be true or false.",
-                "invalid_request_error", "invalid_request",
-            )
-
-        # A launch-only choice, like extra_args/custom_command above: it
-        # changes startup time and decode-graph behavior, not memory sizing,
-        # so it is read here rather than inside _plan_and_fit and never
-        # reaches the fit gate.
-        enforce_eager = payload.get("enforce_eager") if isinstance(payload, dict) else None
-        if enforce_eager is not None and not isinstance(enforce_eager, bool):
-            return errors.error_response(
-                400,
-                "enforce_eager must be a boolean.",
-                "invalid_request_error",
-                "invalid_request",
-            )
-        enforce_eager = bool(enforce_eager)
+        trust_remote_code = launch_opts["trust_remote_code"]
+        # Launch-only: changes startup time, not memory sizing.
+        enforce_eager = launch_opts["enforce_eager"]
+        cudagraph_capture_sizes = launch_opts.get("cudagraph_capture_sizes")
 
         # Local, like `sharding_refusal` and `speculative_refusal` above:
         # the gateway does not import deploy internals at module scope.
@@ -4288,21 +4981,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 return errors.error_response(
                     400, str(exc), "invalid_request_error", "invalid_request"
                 )
-
-        cudagraph_capture_sizes = (
-            payload.get("cudagraph_capture_sizes") if isinstance(payload, dict) else None
-        )
-        if cudagraph_capture_sizes is not None:
-            if not isinstance(cudagraph_capture_sizes, list) or not cudagraph_capture_sizes or not all(
-                isinstance(n, int) and not isinstance(n, bool) for n in cudagraph_capture_sizes
-            ):
-                return errors.error_response(
-                    400,
-                    "cudagraph_capture_sizes must be a non-empty list of integers.",
-                    "invalid_request_error",
-                    "invalid_request",
-                )
-            cudagraph_capture_sizes = tuple(cudagraph_capture_sizes)
 
         try:
             out = await _plan_and_fit(ctx, payload)
@@ -4607,6 +5285,23 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     # Only sent when set, so a DeploymentPort that predates
                     # the opt-in still launches everything it always did.
                     **({"trust_remote_code": True} if trust_remote_code else {}),
+                    # Spread on `speculative`'s terms: only a launch that
+                    # asked for an engine option passes them.
+                    **(
+                        {
+                            "engine_options": out.engine_options,
+                            # Stored only when YaRN stretched the window.
+                            "original_window": (
+                                out.original_window
+                                if out.engine_options.rope_factor is not None
+                                else None
+                            ),
+                        }
+                        if out.engine_options != EngineOptions()
+                        else {}
+                    ),
+                    # Same spread: a port that predates lifecycle keeps working.
+                    **({"lifecycle": lifecycle} if lifecycle != Lifecycle() else {}),
                 )
             )
         except ValueError as exc:
@@ -4658,14 +5353,152 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "launch_failed",
             )
         ctx.router.rebuild(force_scores=True)
-        audit_request(
-            request, AuditAction.DEPLOYMENT_LAUNCHED, "deployment",
-            str(getattr(deployment, "deployment_id", "")),
-            after=_deployment_audit(deployment),
-        )
+        if request is not None:
+            audit_request(
+                request, AuditAction.DEPLOYMENT_LAUNCHED, "deployment",
+                str(getattr(deployment, "deployment_id", "")),
+                after=_deployment_audit(deployment),
+            )
+            # An operator launch is remembered as a run profile. Boot relaunch
+            # and benchmark copies pass no request and are not. A profile
+            # write must never fail the launch it describes.
+            if ctx.profiles is not None:
+                try:
+                    from control_plane.deploy import relaunch
+
+                    session = request.scope.get("state", {}).get("session")
+                    ctx.profiles.record_run(
+                        model_id=deployment.shape.model_id,
+                        request=relaunch.launch_request_from(deployment),
+                        deployment_id=deployment.deployment_id,
+                        served_name=deployment.served_name,
+                        actor=session.username if session is not None else "-",
+                    )
+                except Exception:
+                    log.warning("could not record the run profile", exc_info=True)
         return JSONResponse(
             serialize.deployment_payload(deployment), status_code=201
         )
+
+    # -- Benchmarks (gateway/bench.py): a throwaway copy, measured, stopped. --
+
+    def _bench_describe(node_ids: list[str]) -> tuple[str | None, str | None]:
+        gpu = None
+        for node_id in node_ids:
+            node = ctx.deps.registry.get_node(node_id)
+            hw = getattr(node, "hardware", node)
+            gpu = getattr(hw, "gpu_name", None) or gpu
+            if gpu:
+                break
+        try:
+            from control_plane.resolver import support
+
+            probed = support.probed("vllm")
+            version = getattr(probed, "version", None) if probed else None
+        except Exception:
+            version = None
+        return gpu, version
+
+    def _bench_done(record) -> None:
+        """A finished benchmark is the result of every profile with its setup."""
+        if ctx.profiles is None:
+            return
+        one = next((p for p in record.points if p.get("users") == 1), None) or {}
+        ctx.profiles.attach_result(record.request, {
+            "bench_id": record.bench_id,
+            "finished_at": record.finished_at,
+            "spec_mean_acceptance": record.spec_mean_acceptance,
+            "tps_each_1": one.get("tps_each_mean"),
+            "ttft_ms_1": one.get("ttft_ms_p50"),
+        })
+
+    if ctx.bench is None:
+        from .bench import BenchRunner
+
+        ctx.bench = BenchRunner(
+            launcher=lambda: ctx.launcher,
+            deployments=ctx.deps.deployments,
+            describe=_bench_describe,
+            on_done=_bench_done,
+        )
+
+    def _bench_not_found() -> JSONResponse:
+        return errors.error_response(
+            404, "No benchmark has that id.", "invalid_request_error",
+            "benchmark_not_found",
+        )
+
+    @router.get("/api/benchmarks")
+    async def list_benchmarks(model_id: str | None = None) -> JSONResponse:
+        records = await asyncio.to_thread(ctx.bench.list, model_id)
+        return JSONResponse({"benchmarks": [dataclasses.asdict(r) for r in records]})
+
+    @router.get("/api/benchmarks/{bench_id}")
+    async def get_benchmark(bench_id: str) -> JSONResponse:
+        record = ctx.bench.get(bench_id)
+        if record is None:
+            return _bench_not_found()
+        return JSONResponse(dataclasses.asdict(record))
+
+    @router.post("/api/benchmarks")
+    async def run_benchmark(request: Request) -> Response:
+        from .bench import WORKLOADS, BenchBusy
+
+        try:
+            payload = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except Exception:
+            return errors.error_response(
+                400, "Body must be JSON.", "invalid_request_error", "invalid_json"
+            )
+
+        def bad(message: str) -> JSONResponse:
+            return errors.error_response(
+                400, message, "invalid_request_error", "invalid_request"
+            )
+
+        if not isinstance(payload, dict):
+            return bad("Body must be a JSON object.")
+        launch = payload.get("request")
+        if not isinstance(launch, dict) or not isinstance(launch.get("model_id"), str):
+            return bad("request must be a launch request with a model_id.")
+        workload = payload.get("workload", "prose")
+        if workload not in WORKLOADS:
+            return bad(f"workload must be one of {', '.join(WORKLOADS)}.")
+        users = payload.get("users", [1, 4, 8, 16])
+        if (
+            not isinstance(users, list)
+            or not 1 <= len(users) <= 4
+            or len(set(users)) != len(users)
+            or not all(isinstance(u, int) and not isinstance(u, bool) and 1 <= u <= 64
+                       for u in users)
+        ):
+            return bad("users must be 1 to 4 distinct whole numbers from 1 to 64.")
+        try:
+            record = ctx.bench.start(launch, workload=workload, users=users)
+        except BenchBusy as exc:
+            return errors.error_response(
+                409, str(exc), "invalid_request_error", "benchmark_running"
+            )
+        after = dataclasses.asdict(record)
+        audit_request(
+            request, AuditAction.BENCHMARK_CHANGED, "benchmark", record.bench_id,
+            after=after,
+        )
+        return JSONResponse(after, status_code=202)
+
+    @router.delete("/api/benchmarks/{bench_id}")
+    async def delete_benchmark(bench_id: str, request: Request) -> Response:
+        record = ctx.bench.get(bench_id)
+        if record is None:
+            return _bench_not_found()
+        ctx.bench.delete(bench_id)
+        audit_request(
+            request, AuditAction.BENCHMARK_CHANGED, "benchmark", bench_id,
+            before=dataclasses.asdict(record),
+        )
+        return Response(status_code=204)
 
     @router.patch("/api/deployments/{deployment_id}")
     async def patch_deployment(deployment_id: str, request: Request) -> Response:
@@ -4681,25 +5514,28 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         True)` that makes the edit take effect with no restart and nothing
         else to press.
         """
-        set_serving = getattr(ctx.deps.deployments, "set_serving", None)
-        if not callable(set_serving):
-            return _not_implemented("Deployment update", "deployment manager")
         try:
             patch = await request.json()
         except Exception:
             return errors.error_response(
                 400, "Body must be JSON.", "invalid_request_error", "invalid_json"
             )
-        if not isinstance(patch, dict) or "serving" not in patch:
+        if not isinstance(patch, dict) or not ({"serving", "lifecycle"} & set(patch)):
             return errors.error_response(
                 400,
-                "Body must be an object with a 'serving' boolean. It is the "
-                "only field this route edits.",
+                "Body must be an object with a 'serving' boolean and/or a "
+                "'lifecycle' object. They are the only fields this route edits.",
                 "invalid_request_error",
                 "invalid_request",
             )
-        serving = patch["serving"]
-        if not isinstance(serving, bool):
+        set_serving = getattr(ctx.deps.deployments, "set_serving", None)
+        set_lifecycle = getattr(ctx.deps.deployments, "set_lifecycle", None)
+        if ("serving" in patch and not callable(set_serving)) or (
+            "lifecycle" in patch and not callable(set_lifecycle)
+        ):
+            return _not_implemented("Deployment update", "deployment manager")
+        serving = patch.get("serving")
+        if "serving" in patch and not isinstance(serving, bool):
             # Not coerced. "false" and 0 are both truthy-adjacent in ways that
             # would silently do the opposite of what was asked, and this route
             # decides whether a model is reachable.
@@ -4709,8 +5545,34 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "invalid_request",
             )
+        lifecycle = None
+        if "lifecycle" in patch:
+            try:
+                current = ctx.deps.deployments.get(deployment_id)
+            except Exception:
+                log.exception("deployment lookup failed")
+                current = None
+            if current is None:
+                return errors.error_response(
+                    404, f"No deployment '{deployment_id}'.",
+                    "invalid_request_error", "deployment_not_found",
+                )
+            try:
+                lifecycle = _parse_lifecycle(
+                    patch, getattr(current, "lifecycle", None) or Lifecycle()
+                )
+            except ValueError as exc:
+                return errors.error_response(
+                    400, str(exc), "invalid_request_error", "invalid_request"
+                )
         try:
-            deployment = await asyncio.to_thread(set_serving, deployment_id, serving)
+            deployment = None
+            if lifecycle is not None:
+                deployment = await asyncio.to_thread(
+                    set_lifecycle, deployment_id, lifecycle
+                )
+            if "serving" in patch and (lifecycle is None or deployment is not None):
+                deployment = await asyncio.to_thread(set_serving, deployment_id, serving)
         except Exception as exc:
             log.exception("deployment update failed")
             return errors.error_response(
@@ -4739,6 +5601,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 404, f"No deployment '{deployment_id}'.",
                 "invalid_request_error", "deployment_not_found",
             )
+        # An operator's stop is not undone at the next boot.
+        set_lifecycle = getattr(ctx.deps.deployments, "set_lifecycle", None)
+        current_lc = getattr(existing, "lifecycle", None)
+        if callable(set_lifecycle) and current_lc is not None and current_lc.start_at_boot:
+            try:
+                await asyncio.to_thread(
+                    set_lifecycle,
+                    deployment_id,
+                    dataclasses.replace(current_lc, start_at_boot=False),
+                )
+            except Exception:
+                log.exception("clearing start_at_boot failed")
         # Stop admitting immediately; in-flight requests finish on their own.
         ctx.admission.set_draining(deployment_id, True)
         try:
@@ -4820,6 +5694,116 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     # -- activity ----------------------------------------------------------
 
+    # -- Hub weight prefetch: download without launching ----------------
+    # deploy/prefetch.py says why it runs on the coordinator. Process-local,
+    # so /api/activity reads it without fan-out.
+
+    _PREFETCH_DEFAULT_PATTERNS = ("*.safetensors", "*.json", "*.model", "*.txt", "tokenizer*")
+    _PREFETCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+
+    def _prefetch_sizes(model_id: str, revision: str | None) -> dict[str, int]:
+        client = getattr(ctx.deps.resolver, "client", None)
+        if client is None or not hasattr(client, "model_info"):
+            from control_plane.resolver.hf import HubClient
+
+            client = HubClient()
+        info = client.model_info(model_id, revision or "main")
+        return dict(info.file_sizes)
+
+    def _download_not_found(download_id: str) -> JSONResponse:
+        return errors.error_response(
+            404, f"No download '{download_id}' is running here.",
+            "invalid_request_error", "download_not_found",
+        )
+
+    @router.post("/api/downloads")
+    async def start_download(request: Request) -> JSONResponse:
+        import fnmatch
+
+        from control_plane.deploy import prefetch
+
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        model_id = body.get("model_id")
+        gguf_file = body.get("gguf_file")
+        revision = body.get("revision")
+        problem = None
+        if not isinstance(model_id, str) or not _PREFETCH_ID_RE.match(model_id.strip()):
+            problem = "model_id must be a Hugging Face repository id, owner/name."
+        elif gguf_file is not None and (
+            not isinstance(gguf_file, str) or not gguf_file.endswith(".gguf")
+            or ".." in gguf_file or gguf_file.startswith("/")
+        ):
+            problem = "gguf_file must be a .gguf file path inside the repository."
+        elif revision is not None and (
+            not isinstance(revision, str) or not re.match(r"^[A-Za-z0-9._/-]{1,96}$", revision)
+        ):
+            problem = "revision must be a branch, tag or commit."
+        if problem:
+            return errors.error_response(400, problem, "invalid_request_error", "invalid_request")
+        model_id = model_id.strip()
+        patterns = (gguf_file,) if gguf_file else _PREFETCH_DEFAULT_PATTERNS
+        try:
+            sizes = await asyncio.to_thread(_prefetch_sizes, model_id, revision)
+        except Exception as exc:  # noqa: BLE001 -- the hub's sentence is the answer
+            return errors.error_response(
+                502, f"Could not read the file sizes for {model_id}: {exc}",
+                "upstream_error", "metadata_unavailable",
+            )
+        total = sum(
+            size for name, size in sizes.items()
+            if any(fnmatch.fnmatch(name, p) for p in patterns)
+        )
+        try:
+            job = await asyncio.to_thread(
+                prefetch.default().start, model_id, revision=revision,
+                patterns=patterns, total_bytes=total or None,
+            )
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "download", job["download_id"],
+            after={"op": "start", "repo_id": model_id, "patterns": list(patterns)},
+        )
+        return JSONResponse(job, status_code=202)
+
+    async def _download_op(request: Request, download_id: str, op: str) -> JSONResponse:
+        from control_plane.deploy import prefetch
+
+        reg = prefetch.default()
+        job = await asyncio.to_thread(getattr(reg, op), download_id)
+        if job is None:
+            return _download_not_found(download_id)
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "download", download_id,
+            after={"op": op, "repo_id": job["repo_id"], "status": job["status"]},
+        )
+        return JSONResponse(job)
+
+    @router.post("/api/downloads/{download_id}/pause")
+    async def pause_download(download_id: str, request: Request) -> JSONResponse:
+        return await _download_op(request, download_id, "pause")
+
+    @router.post("/api/downloads/{download_id}/resume")
+    async def resume_download(download_id: str, request: Request) -> JSONResponse:
+        return await _download_op(request, download_id, "resume")
+
+    @router.delete("/api/downloads/{download_id}")
+    async def cancel_download(download_id: str, request: Request) -> Response:
+        from control_plane.deploy import prefetch
+
+        if not await asyncio.to_thread(prefetch.default().cancel, download_id):
+            return _download_not_found(download_id)
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "download", download_id,
+            after={"op": "cancel"},
+        )
+        return Response(status_code=204)
+
     @router.get("/api/activity")
     async def activity() -> JSONResponse:
         """What is arriving: transfers in flight, and models still starting.
@@ -4851,9 +5835,41 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "status": rec.status,
                 "error": rec.error,
                 "done": rec.finished_at is not None,
+                "kind": "provider",
+                "rate_bps": None,
+                "eta_s": None,
             }
             for rec in _sweep_downloads(now)
         ]
+        # Hub prefetches, in the same row shape plus their own keys. Imported
+        # lazily: the deploy package is the coordinator's, and a gateway built
+        # without it must still answer this route.
+        try:
+            from control_plane.deploy import prefetch as _prefetch
+
+            hub_jobs = _prefetch.default().list()
+        except Exception:
+            log.exception("reading hub prefetches failed while reading activity")
+            hub_jobs = []
+        downloads.extend(
+            {
+                "pull_id": job["download_id"],
+                "provider_id": None,
+                "provider": "Hugging Face",
+                "model": job["repo_id"],
+                "completed": job["completed"],
+                "total": job["total"],
+                "status": job["status"],
+                "error": job["error"],
+                "done": job["status"] == "done",
+                "kind": "hub",
+                "download_id": job["download_id"],
+                "paused": job["status"] == "paused",
+                "rate_bps": job.get("rate_bps"),
+                "eta_s": job.get("eta_s"),
+            }
+            for job in hub_jobs
+        )
 
         try:
             deployments = ctx.deps.deployments.list()

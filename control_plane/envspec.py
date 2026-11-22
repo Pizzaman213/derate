@@ -104,6 +104,9 @@ _DECLARED = (
 
     # -- launching -----------------------------------------------------------
     _v("DERATE_VLLM_IMAGE", None, "control_plane/deploy/flags.py", ""),
+    _v("DERATE_VLLM_IMAGE_AMD64", None, "control_plane/deploy/flags.py",
+       "the vllm image for an x86 (amd64) machine; DERATE_VLLM_IMAGE is the "
+       "arm64 one the DGX Sparks run"),
     _v("DERATE_SGLANG_IMAGE", None, "control_plane/deploy/flags.py", ""),
     _v("DERATE_TTS_IMAGE", None, "control_plane/deploy/flags.py", ""),
     _v("DERATE_LLAMACPP_IMAGE", None, "control_plane/deploy/flags.py",

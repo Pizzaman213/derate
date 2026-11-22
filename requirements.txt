@@ -44,6 +44,10 @@ argon2-cffi==25.1.0
 PyJWT[crypto]==2.15.1
 # PyJWT's RS256/ES256 verification backend for that same ID-token check.
 cryptography==50.0.0
+# Weight prefetch (control_plane/deploy/prefetch_worker.py) calls the same
+# snapshot_download sparkrun does, into the same cache. Already a sparkrun
+# transitive; named because derate imports it directly.
+huggingface-hub==1.8.0
 # NVIDIA's cluster launcher (control_plane/deploy/sparkrun.py). Bump only after
 # re-checking control_plane/deploy/flags.py against the new version.
 sparkrun==0.2.40

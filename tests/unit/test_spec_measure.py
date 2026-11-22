@@ -203,7 +203,7 @@ def test_one_model_one_method_one_gpu_two_workloads_two_answers():
     Both are Qwen/Qwen3-0.6B with ngram at k=10, on the same GB10, on the same
     image, taken minutes apart:
 
-        code_edit (tests/spec_data, via `spec_sweep --smoke`)   0.203
+        code_edit (control_plane/bench_data, via `spec_sweep --smoke`)   0.203
         a repetitive code-echo prompt                           0.733
 
     Same model, same method, same hardware, same runtime -- and three and a
@@ -437,7 +437,7 @@ def test_every_workload_file_parses_and_is_not_prefix_hostile():
     prefix caching. Reusing that here would drive acceptance to near zero and
     produce a number that means nothing, so this pins the opposite property.
     """
-    data = Path(__file__).resolve().parents[1] / "spec_data"
+    data = Path(__file__).resolve().parents[2] / "control_plane" / "bench_data"
     for name in ("code_edit", "extraction", "prose"):
         rows = [json.loads(line) for line in
                 (data / f"{name}.jsonl").read_text().splitlines() if line.strip()]

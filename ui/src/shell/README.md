@@ -225,7 +225,7 @@ the scroll lock, and a focus trap that holds across a content swap.
 
 `SheetBody` dispatches on `sheet.kind` from `state/selection`'s `SheetTarget`
 (the URL's form of the same thing is `SheetRef` in `state/routes.ts`):
-`model` -> `ModelInspector`, which resolves its own payloads because a model is
+`model` -> `ModelPane`, which resolves its own payloads because a model is
 not something the cluster roster holds; `node` -> `NodeInspector` after finding
 the node by `profile.node_id`; everything else -> `DeploymentInspector`. `Gone`
 -- two lines reading "No longer in the cluster." -- is the `node` and `dep`
@@ -301,7 +301,7 @@ read `useSelection()`, `useRouter()` and the resource hooks themselves.
 
 `Sheet` is the only consumer of `useSelection().sheet`.
 `inspectors/node/NodeInspector` and `inspectors/DeploymentInspector` are reached
-from nowhere else. `tabs/models/ModelInspector` is not: `tabs/ModelsTab.tsx`
+from nowhere else. `tabs/models/ModelPane` is not: `tabs/ModelsTab.tsx`
 also renders it inline as the Models split's detail pane, keyed on the selected
 id, and hands it `providers` and `providerKinds` off polls the list already made
 -- props the sheet does not pass, because the sheet has no list to have polled

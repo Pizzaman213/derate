@@ -209,6 +209,18 @@
   --bar-track: var(--panel-sunk);
   --bar-keyline: var(--edge);
   --bar-limiting: var(--warn-solid);
+  --bar-fill: var(--fill);
+  --tile-bg: var(--panel);
+  --tile-border: var(--rule);
+  --tile-border-hover: var(--rule-strong);
+  --toggle-on-bg: var(--fill);
+  --toggle-on-fg: var(--on-fill);
+  --row-hover: var(--panel-sunk);
+  --row-selected: var(--panel-sunk);
+  --pill-fg: var(--ink-muted);
+  --pill-border: var(--rule);
+  --logo-tile: #F7F4EE;
+  --logo-ink: #1A1917;
   --qr-ink: #1A1917;
   --qr-tile: #F7F4EE;
   --toast-bg: var(--fill);

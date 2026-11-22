@@ -68,7 +68,7 @@ function sameServe(
 
 /** Save a launch's custom command, or bump it to the front if it repeats.
  *
- *  Called once, from `ServePanel`, and only after `backend.launch` has
+ *  Called once, from `useModelSession`, and only after `backend.launch` has
  *  already resolved -- a launch the backend rejected taught nothing worth
  *  replaying. */
 export function recordCustomServe(entry: {

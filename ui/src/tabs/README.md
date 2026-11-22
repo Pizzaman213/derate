@@ -46,7 +46,7 @@ Each destination's parts live in a folder beside it:
 | [`chat/`](./chat/README.md) | the picker, transcript, composer and voice fields, sectioned by the endpoint each row answers on |
 | [`cluster/`](./cluster/README.md) | the wiring editor: sockets, the document, blocks, particles and the links rail |
 | [`dashboard/`](./dashboard/README.md) | the aggregate row, the deployments strip, and the three sub-tabs under it — a headroom table, a charted `TelemetrySub`, and `LoadSub`'s node-by-target matrix |
-| [`models/`](./models/README.md) | rows, cards, the quantization ladder, and `ServePanel` — the one planning surface left |
+| [`models/`](./models/README.md) | the list (views, typed search, rows, hub cards), the detail pane, the quantization picker, and `useModelSession` — the one planning surface left |
 | [`settings/`](./settings/README.md) | the cards the settings sub-tabs compose, and the key fields that never render a secret |
 | [`setup/`](./setup/README.md) | the admin step (`AdminStep.tsx`), the QR encoder the last setup step draws, and `setup.css` |
 | [`spend/`](./spend/README.md) | `OverviewSub.tsx`, the Usage overview pane (bare `/usage`), and `rows.ts`: metered against estimated, and every rule for when a figure is a lower bound |
@@ -190,7 +190,7 @@ The context and sequences fields are gone from this screen. Two fields writing o
 piece of state read as two settings that might disagree, and both asked for a
 number in the units of a thing nobody had picked yet. The coordinator derives a
 context per model from what fits, clamped to that model's own window; an override
-lives behind `ServePanel`'s advanced disclosure. `?ctx=`/`?seq=` stay in the URL,
+lives under the model pane's Advanced › Context. `?ctx=`/`?seq=` stay in the URL,
 where null now means "the coordinator picked" — a different request from
 `?ctx=8192`.
 
@@ -367,8 +367,8 @@ Headroom sits second because it answers the planner's question in reverse — no
 "does this fit" but "what fits".
 
 **Planning is not here.** The bar that used to sit above these tabs, always
-visible, was a second copy of `models/ServePanel.tsx`: the same `POST /api/plan`,
-the same `Verdict` box. It was removed on 2026-09-07. The copy on the model's own
+visible, was a second copy of the model page's plan (then `models/ServePanel.tsx`,
+now `models/useModelSession.ts`): the same `POST /api/plan`, the same verdict box. It was removed on 2026-09-07. The copy on the model's own
 URL is the better one, because it carries the question in the URL (`?ctx=`,
 `?seq=`, the degrees) while this one held it in component state — so a plan asked
 here could not be linked to. One plan surface, on the screen that names the
@@ -399,7 +399,7 @@ and none of the three can be changed as if it were private to a screen here.
 `runners` out of it, and `inspectors/node/Interconnect.tsx` pulls `linkMeasured` from `models/board.ts`.
 `dashboard/Chart.tsx` is next — `inspectors/node/NodeCharts.tsx` takes `Chart`
 and `ChartGrid`, `inspectors/node/ServingBlock.tsx` takes `Chart`. `Sheet.tsx`
-is the only importer of `models/ModelInspector`. So the model pane, the floor's
+is the only importer of `models/ModelPane` outside the Models tab. So the model pane, the floor's
 geometry and the chart primitive are shared surfaces: a change to any of them
 shows up on a screen this folder does not own, and the node sheet is where it
 shows up first.
@@ -493,7 +493,7 @@ request is pure cost on the machine that is busy loading a model.
 ## Deliberately not built
 
 **A planner bar on the dashboard.** Removed 2026-09-07. Serving happens on a
-model's own URL, in `models/ServePanel.tsx`, because that is where the question
+model's own URL, in `models/useModelSession.ts` and `models/VerdictBox.tsx`, because that is where the question
 travels in the link.
 
 **Context and sequences fields above the model list.** They asked for a number in

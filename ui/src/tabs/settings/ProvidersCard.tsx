@@ -1,25 +1,18 @@
 import { Fragment, useState, type MouseEvent } from 'react'
-import type { Provider, ProviderKind } from '../../api/types'
+import type { Provider } from '../../api/types'
 import { useProviderKinds, useProviderSecretRefs, useProviders, useRouting } from '../../state/resources'
 import { useBackend } from '../../state/backend'
 import { relativeTime } from '../../format'
 import { Disclosure } from '../../components/Panel'
 import { href, parse } from '../../state/routes'
 import { plainClick, useRouter } from '../../state/router'
-import {
-  keyPlaceholder,
-  keyStateNote,
-  keyStateTone,
-  mintedRef,
-  predictedProviderId,
-  type KeyMode,
-} from './keyfield'
+import { keyStateNote, keyStateTone, mintedRef, type KeyMode } from './keyfield'
 import { KeyField } from './KeyField'
 import { environmentKeyNote, keyCheckNote, keyCheckTone, parseWarnDays } from './keycheck'
 import { Icon } from '../../components/Icon'
 import { ProviderSignIn } from './ProviderSignIn'
 import { ProviderBackupPanel } from './ProviderBackupPanel'
-import { Select, type SelectOption } from '../../components/Select'
+import { ProviderAddForm } from '../../components/ProviderAddForm'
 
 // Ported from mockups-next/js/settings.js `settings()`'s `provTable` block.
 // One row per provider, same as the mockup -- a provider's own accounting
@@ -34,14 +27,6 @@ import { Select, type SelectOption } from '../../components/Select'
 // on the coordinator -- so "leave blank for the default" pointed at the wrong
 // machine and failed as a bare connection timeout.
 
-/** True for an address that resolves on whatever machine dials it.
- *
- *  Not a security check -- it decides whether to warn that "localhost" means
- *  the coordinator rather than the box the operator is picturing. */
-function isLocalUrl(url: string): boolean {
-  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(url.trim())
-}
-
 export function ProvidersCard() {
   const providers = useProviders()
   const routing = useRouting()
@@ -54,16 +39,6 @@ export function ProvidersCard() {
   }
   const kinds = useProviderKinds()
   const secretRefs = useProviderSecretRefs()
-  const [kind, setKind] = useState<ProviderKind>('openrouter')
-  const [baseUrl, setBaseUrl] = useState('')
-  // Two ways to give a credential, and the field for one is not the field for
-  // the other. Paste is the default because it needs nothing set up first: the
-  // coordinator writes the key to secrets.json and keeps only the reference.
-  // Naming a reference stays for operators who already manage keys in the
-  // environment -- which used to be the only path, and had no way to say so.
-  const [keyMode, setKeyMode] = useState<KeyMode>('key')
-  const [apiKey, setApiKey] = useState('')
-  const [apiKeyRef, setApiKeyRef] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   // Which row is having its key set, and that editor's own fields. One row at
@@ -84,9 +59,6 @@ export function ProvidersCard() {
   const [rowKey, setRowKey] = useState('')
   const [rowRef, setRowRef] = useState('')
   const [rowError, setRowError] = useState<string | null>(null)
-  // Bumped when a first sign-in is acknowledged, so the add form's sign-in
-  // starts over from its first step for the next one.
-  const [signInRun, setSignInRun] = useState(0)
   // A row's own failure -- a refused Test key or warn-days value -- shown on
   // that row, verbatim, rather than at the foot of the card.
   const [rowNotice, setRowNotice] = useState<{ id: string; message: string } | null>(null)
@@ -96,31 +68,7 @@ export function ProvidersCard() {
 
   const list = providers.data ?? []
   const specs = kinds.data ?? []
-  const spec = specs.find((k) => k.kind === kind)
-  const offered = specs.filter((k) => !k.unsupported_reason)
   const knownRefs = secretRefs.data ?? []
-  const needsKey = !spec || spec.requires_key
-  // A kind added by signing in: no address to edit, no key, no Add button.
-  const signingIn = spec?.sign_in ?? null
-  // Where Cancel on the sign-in lands: the first kind that takes a key.
-  const firstKeyKind = offered.find((k) => !k.sign_in)?.kind ?? 'openrouter'
-  // Where a pasted key will land. The id is predicted the way the coordinator
-  // mints it, so the card can name the reference rather than describe it.
-  const destination = mintedRef(predictedProviderId(kind, list.map((p) => p.provider_id)))
-
-  // Changing the kind carries its default into the field rather than leaving a
-  // blank the server fills in silently. The operator can see the address that
-  // is about to be dialled, and edit it -- which for a LAN box like Ollama on
-  // another machine is the whole job.
-  const chooseKind = (next: ProviderKind) => {
-    setKind(next)
-    const target = specs.find((k) => k.kind === next)
-    setBaseUrl(target?.base_url ?? '')
-    if (target && (!target.requires_key || target.sign_in)) {
-      setApiKey('')
-      setApiKeyRef('')
-    }
-  }
 
   const remove = async (p: Provider) => {
     const id = p.provider_id
@@ -234,31 +182,6 @@ export function ProvidersCard() {
       invalidate()
     } catch (e) {
       setRowNotice({ id, message: e instanceof Error ? e.message : String(e) })
-    }
-  }
-
-  const add = async () => {
-    setBusy('__add__')
-    setError(null)
-    try {
-      // One or the other, never both: sending both would ask the coordinator
-      // to store this key under a name the operator meant to reuse as-is.
-      await backend.addProvider({
-        kind,
-        base_url: baseUrl.trim() || undefined,
-        api_key: keyMode === 'key' ? apiKey.trim() || undefined : undefined,
-        api_key_ref: keyMode === 'ref' ? apiKeyRef.trim() || undefined : undefined,
-      })
-      setBaseUrl('')
-      setApiKey('')
-      setApiKeyRef('')
-      invalidate()
-    } catch (e) {
-      // The server's own rejection -- e.g. a pasted key instead of a
-      // reference -- rendered verbatim, never paraphrased.
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(null)
     }
   }
 
@@ -633,95 +556,7 @@ export function ProvidersCard() {
           </tbody>
         </table>
       </div>
-      <div
-        className="unit"
-        style={{ marginTop: 'var(--space-12)', paddingTop: 'var(--space-10)', borderTop: '1px solid var(--rule)' }}
-      >
-        {signingIn
-          ? `Signing in stores ${signingIn === 'claude' ? 'Claude' : 'ChatGPT'}'s tokens on the coordinator, in oauth.json at 0600, where they are refreshed. They are never displayed, logged, or included in exports. Requests routed to this provider use your ${signingIn === 'claude' ? 'Claude subscription' : 'ChatGPT plan'} allowance, not a key.`
-          : spec && !spec.requires_key
-          ? `${spec.display_name} takes no key — it is a server you run, reached over the network. Only the address matters.`
-          : keyMode === 'key'
-            ? `Paste the key and it is stored on the coordinator, in secrets.json at 0600, under a reference. Only the reference is written to the provider record. Nothing sends the key back — there is no reveal control and adding one would be the bug.`
-            : `A reference is the name of an environment variable or of a secrets.json key, never the key itself. It is resolved at request time and the value never leaves the coordinator.`}
-      </div>
-
-      <div style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'flex-end', marginTop: 'var(--space-12)', flexWrap: 'wrap' }}>
-        <div className="fld">
-          <label htmlFor="pkind">Provider</label>
-          <Select
-            id="pkind"
-            value={kind}
-            options={offered.map((k): SelectOption<ProviderKind> => ({ value: k.kind, label: k.display_name }))}
-            onChange={chooseKind}
-          />
-        </div>
-        <div className="fld" style={{ flex: 1, minWidth: 180, display: signingIn ? 'none' : undefined }}>
-          <label htmlFor="pbase">Base URL</label>
-          <input
-            id="pbase"
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder={spec?.base_url || 'https://…/v1'}
-            spellCheck={false}
-          />
-          {spec && isLocalUrl(baseUrl || spec.base_url) ? (
-            <div className="unit" style={{ marginTop: 'var(--space-4)' }}>
-              This address is dialled from the coordinator, so localhost means the
-              coordinator itself. For a server on another machine, use its address.
-            </div>
-          ) : null}
-        </div>
-        {/* One field with two modes rather than one field with a warning. The
-            single masked input labelled "Key reference" was the whole bug: it
-            looked exactly like somewhere to paste a key, took the name of an
-            environment variable, and said so only in prose beneath the table.
-            Naming the mode makes the two inputs different things on screen,
-            which is what they always were on the wire. */}
-        <div
-          className="fld"
-          style={{ flex: 1, minWidth: 220, display: needsKey && !signingIn ? undefined : 'none' }}
-        >
-          <KeyField
-            idPrefix="padd"
-            // The kind's own name and key shape, not "API key" and "sk-…".
-            // The field is the freeze point this card exists to remove, and
-            // an operator arriving with an OpenRouter key in the clipboard
-            // should be able to see that it is the field for it without
-            // reading the prose underneath. `spec` is the server's kind
-            // record, so the label follows the dropdown for free.
-            label={spec ? `${spec.display_name} key` : 'API key'}
-            placeholder={keyPlaceholder(kind)}
-            mode={keyMode}
-            onMode={setKeyMode}
-            apiKey={apiKey}
-            onApiKey={setApiKey}
-            apiKeyRef={apiKeyRef}
-            onApiKeyRef={setApiKeyRef}
-            knownRefs={knownRefs}
-            destination={destination}
-          />
-        </div>
-        {signingIn ? null : (
-          <button type="button" onClick={() => void add()} disabled={busy === '__add__'}>
-            {busy === '__add__' ? 'Adding…' : 'Add provider'}
-          </button>
-        )}
-      </div>
-
-      {signingIn ? (
-        <div style={{ marginTop: 'var(--space-12)' }}>
-          <ProviderSignIn
-            key={`${signingIn}:${signInRun}`}
-            flow={signingIn}
-            onDone={() => {
-              invalidate()
-              setSignInRun((n) => n + 1)
-            }}
-            onCancel={() => chooseKind(firstKeyKind)}
-          />
-        </div>
-      ) : null}
+      <ProviderAddForm providers={list} kinds={specs} knownRefs={knownRefs} />
 
       {error ? (
         <div className="label" style={{ color: 'var(--fault)', marginTop: 'var(--space-8)', whiteSpace: 'pre-wrap' }}>

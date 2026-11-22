@@ -8,7 +8,7 @@ import type { Cluster, RoutingConfig, Settings } from '../api/types'
 import type { SafeMetricsFrame } from '../state/useMetrics'
 import { NodeInspector } from '../inspectors/node/NodeInspector'
 import { DeploymentInspector } from '../inspectors/DeploymentInspector'
-import { ModelInspector } from '../tabs/models/ModelInspector'
+import { ModelPane } from '../tabs/models/ModelPane'
 import { runners } from '../tabs/models/rows'
 
 // The one modal host (mockups-next: a single `#sheet`/`#cardBody` pair reused
@@ -156,7 +156,8 @@ function SheetBody({
     // Resolves itself: a model is not something the cluster roster holds, and
     // both of its payloads are hub-bound and belong outside `resources.ts`.
     return (
-      <ModelInspector
+      <ModelPane
+        key={sheet.id}
         modelId={sheet.id}
         context={sheet.context}
         concurrency={sheet.concurrency}

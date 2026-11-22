@@ -98,7 +98,7 @@ check(M.diffEntry({ a: 1, b: [1, 2] }, { a: 1, b: [1, 2] }).length === 0, 'equal
   check(M.auditQuery({ actor: '', action: '', target: '', range: '30d', page: 1 }, now).start === now - 30 * 86400, '30d')
 }
 
-check(M.AUDIT_ACTIONS.length === 50 && M.AUDIT_ACTIONS[0] === 'login' && M.AUDIT_ACTIONS[49] === 'node_runtime_model_changed', 'every action, contract order')
+check(M.AUDIT_ACTIONS.length === 53 && M.AUDIT_ACTIONS[0] === 'login' && M.AUDIT_ACTIONS[52] === 'node_runtime_model_changed', 'every action, contract order')
 check(new Set(M.AUDIT_ACTIONS).size === M.AUDIT_ACTIONS.length, 'no action listed twice')
 check(M.pageCount(0, 50) === 1 && M.pageCount(50, 50) === 1 && M.pageCount(51, 50) === 2, 'page count')
 

@@ -98,6 +98,19 @@ import type {
   SpeculativeHeads,
   WiringRequest,
   WiringResponse,
+  BenchRecord,
+  BenchRequest,
+  CommandPreview,
+  ConcurrencyRequest,
+  ConcurrencyResponse,
+  CandidatesResponse,
+  ComputeRecord,
+  HubDownload,
+  Lifecycle,
+  Profile,
+  ProfileCreate,
+  ProfilePatch,
+  RuntimeInfo,
 } from './types'
 
 /** One turn's worth of arguments for `chatStream`.
@@ -224,6 +237,42 @@ export interface Backend {
    *  stops offering it. The container keeps running and keeps holding its
    *  GPU memory either way — `stopDeployment` is what frees it. */
   setDeploymentServing(deploymentId: string, serving: boolean): Promise<DeploymentDTO>
+  /** Partial lifecycle, merged server-side over the current one. */
+  setDeploymentLifecycle(
+    deploymentId: string,
+    lifecycle: Partial<Lifecycle>,
+  ): Promise<DeploymentDTO>
+  /** Every runtime `flags.RUNTIMES` knows, and what each supports. */
+  runtimes(): Promise<RuntimeInfo[]>
+  /** The serve command and recipe a launch with this body would run. Launches
+   *  nothing; refuses exactly as the launch would. */
+  planCommand(body: PlanRequest): Promise<CommandPreview>
+  /** The "how many users" curve: KV wall plus a bandwidth ceiling. */
+  planConcurrency(body: ConcurrencyRequest): Promise<ConcurrencyResponse>
+  /** The best plan of each kind for this body, each with its own verdict. */
+  planCandidates(body: PlanRequest): Promise<CandidatesResponse>
+  /** Every stored matmul measurement. */
+  computeRecords(): Promise<{ records: ComputeRecord[] }>
+  /** Time bf16 matmuls on the coordinator's own GPU, in the serving image.
+   *  Seconds to a few minutes; 409 while one is running. */
+  measureCompute(): Promise<ComputeRecord>
+  profiles(modelId?: string): Promise<{ profiles: Profile[] }>
+  createProfile(body: ProfileCreate): Promise<Profile>
+  patchProfile(profileId: string, patch: ProfilePatch): Promise<Profile>
+  deleteProfile(profileId: string): Promise<void>
+  pins(): Promise<{ pins: string[] }>
+  setPins(pins: string[]): Promise<{ pins: string[] }>
+  /** Prefetch weights into the coordinator's cache without launching. */
+  startDownload(body: { model_id: string; gguf_file?: string; revision?: string }): Promise<HubDownload>
+  pauseDownload(downloadId: string): Promise<HubDownload>
+  resumeDownload(downloadId: string): Promise<HubDownload>
+  /** Stops and forgets the job; blobs already on disk stay. */
+  cancelDownload(downloadId: string): Promise<void>
+  benchmarks(modelId?: string): Promise<{ benchmarks: BenchRecord[] }>
+  benchmark(benchId: string): Promise<BenchRecord>
+  runBenchmark(body: BenchRequest): Promise<BenchRecord>
+  /** Cancels a running benchmark, or deletes a finished record. */
+  cancelBenchmark(benchId: string): Promise<void>
   /** What the launcher and the backend have said, for the sheet that shows
    *  it. Cheap while a launch is in flight — those lines are already in the
    *  coordinator's memory — and one bounded `sparkrun logs` afterwards, which
@@ -309,7 +358,15 @@ export interface Backend {
   modelRegistry(): Promise<ModelRegistryResponse>
   /** Three sources at once, none resolved. Degrades to the local two when
    *  the hub is unreachable rather than answering empty. */
-  searchModels(q: string, limit?: number): Promise<ModelSearchResponse>
+  searchModels(
+    q: string,
+    opts?: {
+      limit?: number
+      author?: string
+      task?: string
+      sort?: 'downloads' | 'trending' | 'updated' | 'likes'
+    },
+  ): Promise<ModelSearchResponse>
   /** Draft heads published for one model, priced and ranked. Launches nothing.
    *  Called on demand — never on the plan path, which fires per keystroke. */
   /** Every way this model can speculate, ranked, plus the one to offer.
@@ -1323,9 +1380,12 @@ export const httpBackend: Backend = {
         `&limit=${opts?.limit ?? 12}` +
         (opts?.refresh ? '&refresh=1' : ''),
     ),
-  searchModels: (q, limit) =>
+  searchModels: (q, opts) =>
     req<ModelSearchResponse>(
-      `/api/models/search?q=${encodeURIComponent(q)}&limit=${limit ?? 40}`,
+      `/api/models/search?q=${encodeURIComponent(q)}&limit=${opts?.limit ?? 40}` +
+        (opts?.author ? `&author=${encodeURIComponent(opts.author)}` : '') +
+        (opts?.task ? `&task=${encodeURIComponent(opts.task)}` : '') +
+        (opts?.sort ? `&sort=${opts.sort}` : ''),
     ),
   modelDetail: (modelId) =>
     req<ModelDetail>(`/api/models/detail?model_id=${encodeURIComponent(modelId)}`),
@@ -1359,6 +1419,47 @@ export const httpBackend: Backend = {
       method: 'PATCH',
       body: JSON.stringify({ serving }),
     }),
+  setDeploymentLifecycle: (deploymentId, lifecycle) =>
+    req<DeploymentDTO>(`/api/deployments/${encodeURIComponent(deploymentId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ lifecycle }),
+    }),
+  runtimes: () => req<RuntimeInfo[]>('/api/runtimes'),
+  planCommand: (body) => req<CommandPreview>('/api/plan/command', post(body)),
+  planConcurrency: (body) => req<ConcurrencyResponse>('/api/plan/concurrency', post(body)),
+  planCandidates: (body) => req<CandidatesResponse>('/api/plan/candidates', post(body)),
+  computeRecords: () => req<{ records: ComputeRecord[] }>('/api/compute'),
+  measureCompute: () => req<ComputeRecord>('/api/compute/measure', post({})),
+  profiles: (modelId) =>
+    req<{ profiles: Profile[] }>(
+      query('/api/profiles', modelId ? [`model_id=${encodeURIComponent(modelId)}`] : []),
+    ),
+  createProfile: (body) => req<Profile>('/api/profiles', post(body)),
+  patchProfile: (profileId, patch) =>
+    req<Profile>(`/api/profiles/${seg(profileId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteProfile: (profileId) =>
+    req<void>(`/api/profiles/${seg(profileId)}`, { method: 'DELETE' }),
+  pins: () => req<{ pins: string[] }>('/api/pins'),
+  setPins: (pins) =>
+    req<{ pins: string[] }>('/api/pins', { method: 'PUT', body: JSON.stringify({ pins }) }),
+  startDownload: (body) => req<HubDownload>('/api/downloads', post(body)),
+  pauseDownload: (downloadId) =>
+    req<HubDownload>(`/api/downloads/${seg(downloadId)}/pause`, post()),
+  resumeDownload: (downloadId) =>
+    req<HubDownload>(`/api/downloads/${seg(downloadId)}/resume`, post()),
+  cancelDownload: (downloadId) =>
+    req<void>(`/api/downloads/${seg(downloadId)}`, { method: 'DELETE' }),
+  benchmarks: (modelId) =>
+    req<{ benchmarks: BenchRecord[] }>(
+      query('/api/benchmarks', modelId ? [`model_id=${encodeURIComponent(modelId)}`] : []),
+    ),
+  benchmark: (benchId) => req<BenchRecord>(`/api/benchmarks/${seg(benchId)}`),
+  runBenchmark: (body) => req<BenchRecord>('/api/benchmarks', post(body)),
+  cancelBenchmark: (benchId) =>
+    req<void>(`/api/benchmarks/${seg(benchId)}`, { method: 'DELETE' }),
   deploymentLogs: (deploymentId, tail) =>
     req<DeploymentLogs>(
       `/api/deployments/${encodeURIComponent(deploymentId)}/logs` +

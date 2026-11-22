@@ -69,7 +69,13 @@ from .constants import (
     TP_VIABLE_THRESHOLD,
     UNMEASURED_COLLECTIVE_LATENCY_US,
 )
-from .deployment import Deployment, DeploymentOrigin, DeploymentState
+from .deployment import (
+    Deployment,
+    DeploymentOrigin,
+    DeploymentState,
+    EngineOptions,
+    Lifecycle,
+)
 from .hardware import (
     DeviceClass,
     GpuProcess,
@@ -183,6 +189,8 @@ __all__ = [
     "DeploymentOrigin",
     "DeploymentPort",
     "DeploymentState",
+    "EngineOptions",
+    "Lifecycle",
     "DeviceClass",
     "ENDPOINT_FOR_MODALITY",
     "FitPort",

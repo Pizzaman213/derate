@@ -183,6 +183,9 @@ class AuditAction(str, Enum):
     NODE_JOINED = "node_joined"
     #: A ChatGPT sign-in finished on the redirect and created or rebound a provider.
     PROVIDER_SIGNED_IN = "provider_signed_in"
+    PROFILE_CHANGED = "profile_changed"
+    DOWNLOAD_CHANGED = "download_changed"
+    BENCHMARK_CHANGED = "benchmark_changed"
     # Security events: refusals written as rows rather than left as silence,
     # at most one per (action, actor, ip) a minute, counted.
     LOGIN_LOCKED = "login_locked"

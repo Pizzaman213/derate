@@ -63,9 +63,10 @@ place of the button for a match. Deleting calls
 `backend.deleteCachedModel(nodeId, m.folder)` behind a `window.confirm` that
 names the size and says it cannot be undone, then `invalidate()`.
 
-The table itself is `components/CacheTable.tsx` (138 lines), shared with
-`tabs/models/InstalledModelsCard.tsx`, which passes neither `onDelete` nor
-`servedFolders` and so gets the same rows with no actions column.
+The table itself is `components/CacheTable.tsx` (138 lines). It used to be
+shared with the Models tab's read-only installed card, which passed neither
+`onDelete` nor `servedFolders`; that card was replaced by the Models tab's
+"On this cluster" view, and this card is now its only caller.
 
 ## `EstateCard.tsx`
 

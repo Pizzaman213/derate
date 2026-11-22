@@ -10,11 +10,12 @@ a browser that starts subtracting two of them is how a screen begins disagreeing
 with the planner.
 
 Planning is not here. The bar that used to sit above these tabs was a second
-copy of `tabs/models/ServePanel.tsx` -- the same `POST /api/plan`, the same
-`Verdict` box -- and it held the question in component state, so a plan asked
-here could not be linked to; `tabs/DashboardTab.tsx` records the removal. That
-is why the dashboard has no plan panel and why `Verdict.tsx` and
-`DegreeFields.tsx` are under `tabs/models/`.
+copy of the model page's plan (then `tabs/models/ServePanel.tsx`) -- the same
+`POST /api/plan`, the same verdict box -- and it held the question in component
+state, so a plan asked here could not be linked to; `tabs/DashboardTab.tsx`
+records the removal. That is why the dashboard has no plan panel and why
+`useModelSession.ts`, `VerdictBox.tsx` and `DegreeFields.tsx` are under
+`tabs/models/`.
 
 ## Layout
 
@@ -340,7 +341,7 @@ measured.
 ## Deliberately not built
 
 **A plan panel.** Recorded in `tabs/DashboardTab.tsx`: the always-visible
-planner bar was a second copy of `tabs/models/ServePanel.tsx` against the same
+planner bar was a second copy of the model page's plan (then `tabs/models/ServePanel.tsx`) against the same
 `POST /api/plan`, and it kept the question in component state, so a plan asked
 here could not be linked to. The copy on the model's own URL carries `?ctx=`,
 `?seq=` and the degrees in the path, which is why it is the one that survived.

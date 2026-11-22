@@ -17,10 +17,11 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
+from control_plane.contracts.deployment import EngineOptions, Lifecycle
 from control_plane.contracts import (
     Deployment,
     DeploymentOrigin,
@@ -264,6 +265,9 @@ def encode(d: Deployment) -> dict[str, Any]:
         "speculative_tokens": d.speculative_tokens,
         "trust_remote_code": d.trust_remote_code,
         "image_id": d.image_id,
+        "engine_options": asdict(d.engine_options),
+        "lifecycle": asdict(d.lifecycle),
+        "original_window": d.original_window,
     }
 
 
@@ -332,6 +336,12 @@ def decode(raw: dict[str, Any]) -> Deployment:
         speculative_tokens=int(raw.get("speculative_tokens", 0)),
         trust_remote_code=bool(raw.get("trust_remote_code", False)),
         image_id=str(raw.get("image_id", "")),
+        # Absent from every record written before these existed: defaults.
+        engine_options=_decode_engine_options(raw.get("engine_options")),
+        lifecycle=_decode_lifecycle(raw.get("lifecycle")),
+        original_window=(
+            int(raw["original_window"]) if raw.get("original_window") else None
+        ),
     )
 
 
@@ -342,3 +352,28 @@ def _decode_speculative(raw: dict[str, Any] | None) -> SpeculativeSpec | None:
     return SpeculativeSpec(
         **{**data, "method": SpeculativeMethod(data["method"])}
     )
+
+
+_PAIR_FIELDS = ("limit_mm_per_prompt", "generation_overrides", "env")
+
+
+def _decode_engine_options(raw: dict[str, Any] | None) -> EngineOptions:
+    """Lists back to tuples; unknown keys ignored, missing ones defaulted."""
+    if not raw:
+        return EngineOptions()
+    known = {f.name for f in fields(EngineOptions)}
+    data: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in known:
+            continue
+        if key in _PAIR_FIELDS:
+            value = tuple(tuple(pair) for pair in (value or ()))
+        data[key] = value
+    return EngineOptions(**data)
+
+
+def _decode_lifecycle(raw: dict[str, Any] | None) -> Lifecycle:
+    if not raw:
+        return Lifecycle()
+    known = {f.name for f in fields(Lifecycle)}
+    return Lifecycle(**{k: v for k, v in raw.items() if k in known})

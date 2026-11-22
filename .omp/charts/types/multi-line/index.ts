@@ -19,6 +19,9 @@ export const options = z.object({
   gaps: gapsOption('gap'),
   xType: xTypeOption,
   points: pointsOption,
+  verticalMarkers: z.array(z.object({ x: z.number(), series: z.string(), label: z.string() })).default([]).describe('dashed vertical rules at a numeric x, in the named series colour'),
+  pointsOnly: z.array(z.string()).default([]).describe('series drawn as dots with no line (measured points)'),
+  dashed: z.array(z.string()).default([]).describe('series whose line is drawn dashed'),
   xTitle: z.string().optional(),
   yTitle: z.string().optional(),
 })
@@ -41,7 +44,7 @@ export const multiLine = defineChart<MultiLineRow[], MultiLineOptions>({
   zoom: 'x',
   hover: 'nearest-x',
   isEmpty: (data) => data.length === 0,
-  draw: (ctx) => drawLines(ctx, { curve: CURVES[ctx.options.curve], area: false, endLabels: ctx.options.endLabels }),
+  draw: (ctx) => drawLines(ctx, { curve: CURVES[ctx.options.curve], area: false, endLabels: ctx.options.endLabels, dashed: ctx.options.dashed, pointsOnly: ctx.options.pointsOnly, verticalMarkers: ctx.options.verticalMarkers }),
   describe: ({ data, options: o, fmt, name }) => {
     const n = new Set(data.map((r) => r.series)).size
     const noun = yNoun(o)

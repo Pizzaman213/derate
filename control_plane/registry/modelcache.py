@@ -86,12 +86,16 @@ def repo_from_folder(folder: str) -> str:
     return f"{org}/{name}" if sep else org
 
 
-def _blob_bytes(repo: Path) -> tuple[int, int, float | None]:
+def _blob_bytes(repo: Path, *, follow_symlinks: bool = False) -> tuple[int, int, float | None]:
     """(bytes, blob count, newest mtime) for one repository.
 
     Only ``blobs/`` is measured, and it is a flat directory, so this is one
     ``scandir`` per repository however many revisions are cached. Measured at
     6 ms for 51 repositories holding 894 GiB.
+
+    ``follow_symlinks`` is for a progress reading of one repo: huggingface_hub
+    1.x can land a finished blob as a link into a shared ``hub/blobs/`` store,
+    and a download measured by lstat then reads ~0 bytes once it completes.
     """
     blobs = repo / "blobs"
     if not blobs.is_dir():
@@ -103,9 +107,9 @@ def _blob_bytes(repo: Path) -> tuple[int, int, float | None]:
         with os.scandir(blobs) as entries:
             for entry in entries:
                 try:
-                    # lstat, so a symlinked blob counts as the link it is and
-                    # its target is not attributed here twice.
-                    stat = entry.stat(follow_symlinks=False)
+                    # lstat by default, so a symlinked blob counts as the link
+                    # it is and its target is not attributed here twice.
+                    stat = entry.stat(follow_symlinks=follow_symlinks)
                 except OSError:
                     continue
                 total += stat.st_size
