@@ -175,6 +175,8 @@ the PATH names the screen         /dashboard  /models  /cluster
                                   (/usage's panes -- overview, requests, rate-limits, keys --
                                   is a path segment, Route.sub; the old /spend,
                                   /keys, /requests paths are parse-only aliases)
+                                  /settings/<section> -- connection, nodes, storage, ...
+                                  -- is Route.section; bare /settings lets the tab pick
 the QUERY names what is selected  ?node=spark-01        a machine
                                   ?link=spark-01~spark-02   a link
                                   ?dep=qwen3-30b-a3b    the deployment in the sidebar

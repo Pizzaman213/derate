@@ -193,13 +193,24 @@ caller appends its own `GB` — `FilesystemsCard`'s captions and its readout
 itself does not call it; it is handed `fs.free / 1024 ** 3` with
 `decimals={0}`.
 
-**All four cards call `useStorage()`, and `useResource` does not deduplicate.**
-`state/resources.ts` states that plainly at `useActivity`, and
-`useKeyedResource` holds its state per component with no shared cache. Because
+**Every feed is subscribed ONCE, by `StorageSection.tsx`, and handed down.**
+`useResource` does not deduplicate (`state/resources.ts` says so at
+`useActivity`; `useKeyedResource` holds its state per component with no shared
+cache), so when each card called `useStorage()` itself, one tick was four
+cluster-wide disk walks, and `useReplication()` was polled twice. The container
+calls `useStorage`, `useCluster`, `useReplication` and `useTransfers` once and
+passes each result as a prop; no card here mounts one of them. Because
 `SettingsTab` keeps every panel mounted and hides it with `hidden` rather than
 unmounting — enrollment tokens and half-typed addresses must survive a tab
-switch — the cluster-wide disk walk starts when `/settings` loads, not when the
-Storage sub-tab is opened.
+switch — the disk walk starts when `/settings` loads, not when the Storage
+section is opened.
+
+**Models by node is a decision per cell, kept out of React.** `presence.ts`
+decides present / partial / copying / proposed / won't fit / absent / unknown
+for each model on each node, and `copyBlocked` whether Copy to <node> is
+disabled (from `/api/storage`'s `copy_receiver`). An incomplete derate copy is
+also listed in that node's cache, so precedence is the whole point:
+`presence.check.mjs` pins it.
 
 **The estate is a declared list, not a directory listing.**
 `registry/storage.py`'s `ESTATE` names thirteen components and every one is
@@ -262,11 +273,10 @@ removed without losing a record the product needs. A ceiling is drawn for the
 archive and the journal precisely because retention already deletes those two
 without anybody pressing a button.
 
-**No verifier in this folder.** Twenty-one `*.check.mjs` files sit under
-`ui/src` — in `api/`, `shell/`, `sidebar/`, `state/` and seven folders under
-`tabs/`, two of them in the sibling `tabs/settings/` — and none of them is here.
-These cards reach a browser only through `shell/screens.check.mjs`, which walks
-`routes.ts`'s `DESTINATIONS` (derived from `SEGMENT`, never a hand-kept list).
-`/settings` is a destination and `SettingsTab` opens on
-`useState<Sub>('connection')`, so the four cards are mounted and hidden in that
+**One verifier in this folder:** `presence.check.mjs`, for the cell
+decisions above. The cards themselves reach a browser only through
+`shell/screens.check.mjs`, which walks `routes.ts`'s `DESTINATIONS` (derived
+from `SEGMENT`, never a hand-kept list). `/settings` is a destination and the
+bare path opens on Connection, so the cards are mounted and hidden in that
 capture — typechecked and screenshot-adjacent, not asserted on.
+`/settings/storage` opens this section directly.

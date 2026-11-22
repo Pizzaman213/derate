@@ -376,6 +376,7 @@ Every value that crosses the wire as a string.
 | `sample_ts` | `float` | yes |
 | `is_local` | `bool` | yes |
 | `build` | `str` | yes |
+| `features` | `tuple[str, ...] | None` | yes |
 
 ### `Org`
 
@@ -695,7 +696,7 @@ the canonical value.
 
 ## HTTP surface
 
-### Coordinator gateway (156 routes)
+### Coordinator gateway (163 routes)
 
 | Method | Path |
 |---|---|
@@ -759,6 +760,7 @@ the canonical value.
 | POST | `/api/keys/{key_id}/reset-cycle` |
 | POST | `/api/keys/{key_id}/rotate` |
 | GET | `/api/links` |
+| GET | `/api/links/health` |
 | POST | `/api/links/measure` |
 | POST | `/api/links/reach` |
 | POST | `/api/links/tune` |
@@ -820,6 +822,9 @@ the canonical value.
 | POST | `/api/providers/{provider_id}/refresh` |
 | GET | `/api/publishers/avatars` |
 | GET | `/api/publishers/{owner}/avatar` |
+| GET | `/api/replication` |
+| POST | `/api/replication/approve` |
+| POST | `/api/replication/dismiss` |
 | GET | `/api/requests` |
 | GET | `/api/routing` |
 | DELETE | `/api/routing/{served_name}` |
@@ -841,6 +846,9 @@ the canonical value.
 | DELETE | `/api/storage/cache/resolver` |
 | DELETE | `/api/storage/nodes/{node_id}/models/{folder}` |
 | GET | `/api/topology` |
+| GET | `/api/transfers` |
+| POST | `/api/transfers` |
+| DELETE | `/api/transfers/{transfer_id}` |
 | GET | `/api/usage` |
 | POST | `/api/wiring` |
 | GET | `/auth/callback` |
@@ -856,13 +864,15 @@ the canonical value.
 | GET | `/v1/models` |
 | WEBSOCKET | `/v1/realtime` |
 
-### Node agent (12 routes)
+### Node agent (18 routes)
 
 | Method | Path |
 |---|---|
 | GET | `/agent/containers` |
 | GET | `/agent/health` |
 | GET | `/agent/journal` |
+| GET | `/agent/links/health` |
+| POST | `/agent/links/probe` |
 | GET | `/agent/logs` |
 | GET | `/agent/models/cache` |
 | DELETE | `/agent/models/cache/{folder}` |
@@ -872,6 +882,10 @@ the canonical value.
 | POST | `/agent/reach` |
 | GET | `/agent/storage` |
 | GET | `/agent/telemetry` |
+| POST | `/agent/transfers` |
+| GET | `/agent/transfers/capacity` |
+| DELETE | `/agent/transfers/{session_id}` |
+| POST | `/agent/transfers/{session_id}/commit` |
 
 ## Environment
 
@@ -906,6 +920,7 @@ default. A blank default means absence is itself the answer.
 | `DERATE_E2E_ORIGIN` | `http://localhost:8088` | `tests/unit/test_gateway.py` — which coordinator the audio round trip launches real models on |
 | `DERATE_ELECTRICITY_RATE` | `0` | `control_plane/gateway/main.py` — currency per kWh; 0 means the spend screen shows no power cost |
 | `DERATE_ENTRYPOINT` |  | `docker/entrypoint.sh` |
+| `DERATE_EXTRA_CACHE_DIRS` |  | `control_plane/registry/modelcache.py` — colon-separated folders beneath the HF cache root a copy lands in when the hub's disk is short; anything not beneath that root is refused |
 | `DERATE_GALLERY_ONLY` |  | `.omp/tests/ui/layout.check.mjs` — comma-separated component names; run.mjs sets it to scope the gallery layout matrix to the components a ui:check path names |
 | `DERATE_GATEWAY` |  | `ui/vite.config.ts` — dev server only: which coordinator `npm run dev` proxies to |
 | `DERATE_HF_CACHE` |  | `control_plane/registry/modelcache.py` |

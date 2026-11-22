@@ -84,3 +84,14 @@ def test_the_byte_cap_ends_a_blast(monkeypatch):
                     break
                 reply += chunk
     assert json.loads(reply)["bytes"] == 1000
+
+
+def test_tcp_rtt_times_a_real_connect_and_says_none_for_a_closed_port():
+    from control_plane.links.probe_server import tcp_rtt_us
+
+    with start_probe_server("127.0.0.1", 0) as sink:
+        rtt = tcp_rtt_us("127.0.0.1", sink.port, samples=3)
+        port = sink.port
+    assert isinstance(rtt, float) and rtt > 0
+    # The sink is closed now, so nothing is listening on its port.
+    assert tcp_rtt_us("127.0.0.1", port, samples=2, timeout=0.5) is None

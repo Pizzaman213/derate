@@ -74,3 +74,15 @@ def test_run_on_ends_ssh_options_before_the_host(monkeypatch):
     argv = seen[0]
     assert argv[:3] == ["ssh", "-oBatchMode=yes", "--"]
     assert argv[3] == "-oProxyCommand=x"
+
+
+def test_subprocess_runner_reports_a_missing_binary_as_127():
+    result = SubprocessRunner().run(["derate-no-such-binary-xyz"], timeout=5)
+    assert result.returncode == 127
+    assert not result.timed_out
+
+
+def test_subprocess_runner_reports_a_timeout_rather_than_raising():
+    result = SubprocessRunner().run(["sleep", "5"], timeout=0.2)
+    assert result.timed_out is True
+    assert result.duration_s < 4

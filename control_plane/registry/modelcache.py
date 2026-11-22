@@ -32,6 +32,22 @@ path segment, so it is validated as a single name, required to start with the
 cache's own prefix, and the resolved path is required to sit directly inside
 the resolved cache directory. Any one of those alone would probably do; a
 delete of a directory tree gets all three.
+
+**Extra storage lives beneath the HuggingFace root, or it cannot be served.**
+A launched container mounts exactly one folder, the cache root
+(``~/.cache/huggingface`` -> ``/cache/huggingface``), and the recipe format has
+no ``volumes:`` key, so a disk mounted anywhere else is invisible to the
+runtime. ``DERATE_EXTRA_CACHE_DIRS`` names folders beneath that root (docker's
+``-v`` is a recursive bind, so a disk mounted at ``<root>/extra-ssd`` is
+inside the container too); anything else is refused with a sentence. A model
+placed on one lives at ``<extra>/models--X`` and ``hub/models--X`` is a
+RELATIVE symlink to it -- an absolute one names a host path the container does
+not have. sparkrun's ``rsync -a ... <src>/models--X/ <host>:<hub>/models--X``
+writes through such a link rather than replacing it, because rsync enters the
+destination folder named on its command line. That is derate's own link, and
+`linked_folder` is the only thing that recognises one: scan measures through
+it, delete removes the folder and the link, and any other symlink keeps being
+ignored by the scan and refused by the delete.
 """
 
 from __future__ import annotations
@@ -39,6 +55,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 #: The cache's own naming convention: ``org/name`` becomes ``models--org--name``.
@@ -64,6 +81,105 @@ def cache_dir() -> Path | None:
         return Path(hf_home) / "hub"
     default = Path.home() / ".cache" / "huggingface" / "hub"
     return default if default.is_dir() else None
+
+
+#: Colon-separated folders beneath the HuggingFace root a copy may land in when
+#: the hub's own filesystem is short. See `extra_cache_dirs`.
+EXTRA_DIRS_ENV = "DERATE_EXTRA_CACHE_DIRS"
+
+
+def hf_root(cache: Path | str) -> Path:
+    """The folder a launched container mounts: the hub cache's parent (``HF_HOME``)."""
+    return Path(cache).parent
+
+
+def extra_cache_dirs(
+    cache: Path | str | None = None, raw: str | None = None
+) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    """(usable extra folders, resolved, in the order given; one sentence per refused entry).
+
+    An entry is usable only when it is an existing directory that resolves
+    strictly beneath the HuggingFace root and outside the hub cache itself. A
+    folder that resolves anywhere else -- including through a symlink planted
+    beneath the root -- would hold weights no launched container can read.
+    """
+    text = os.environ.get(EXTRA_DIRS_ENV, "") if raw is None else raw
+    entries = [e.strip() for e in text.split(":") if e.strip()]
+    if not entries:
+        return (), ()
+    hub = Path(cache) if cache is not None else cache_dir()
+    if hub is None:
+        return (), (f"{EXTRA_DIRS_ENV} is set, but this node has no model cache, so none of it is used.",)
+    root = hf_root(hub)
+    try:
+        root_r = root.resolve(strict=True)
+    except OSError:
+        return (), (f"{EXTRA_DIRS_ENV} is set, but {root} does not exist, so none of it is used.",)
+    hub_r = hub.resolve()
+    dirs: list[Path] = []
+    refused: list[str] = []
+    for entry in entries:
+        path = Path(entry)
+        if not path.is_absolute():
+            refused.append(f"{entry} in {EXTRA_DIRS_ENV} is not an absolute path, so it is not used.")
+            continue
+        try:
+            real = path.resolve(strict=True)
+        except OSError:
+            refused.append(f"{entry} in {EXTRA_DIRS_ENV} does not exist on this node, so it is not used.")
+            continue
+        if not real.is_dir():
+            refused.append(f"{entry} in {EXTRA_DIRS_ENV} is not a directory, so it is not used.")
+            continue
+        if real == root_r or not real.is_relative_to(root_r):
+            refused.append(
+                f"{entry} in {EXTRA_DIRS_ENV} is not beneath {root}, the only folder a launched "
+                f"model container mounts, so weights there could not be served; mount the disk "
+                f"beneath it instead (for example at {root}/extra-ssd)."
+            )
+            continue
+        if real == hub_r or real.is_relative_to(hub_r):
+            refused.append(
+                f"{entry} in {EXTRA_DIRS_ENV} is the hub cache or inside it, so it adds no room; "
+                f"use a folder beside {hub.name}/ instead."
+            )
+            continue
+        if real not in dirs:
+            dirs.append(real)
+    return tuple(dirs), tuple(refused)
+
+
+def linked_folder(
+    cache: Path | str, folder: str, extras: Sequence[Path] | None = None
+) -> Path | None:
+    """Where ``cache/folder`` points when it is derate's own link into an extra
+    folder, else None.
+
+    Ours means: a relative link whose target, read lexically, is a folder of the
+    same name directly inside a configured extra folder and is not itself a
+    link. Lexical on purpose, so a link whose disk is not mounted is still
+    recognised (and refused for that reason) rather than mistaken for a foreign one.
+    """
+    link = Path(cache) / folder
+    if not link.is_symlink():
+        return None
+    try:
+        text = os.readlink(link)
+    except OSError:
+        return None
+    if os.path.isabs(text):
+        return None
+    dirs = extra_cache_dirs(cache)[0] if extras is None else tuple(extras)
+    where = Path(os.path.normpath(os.path.join(Path(cache).resolve(), text)))
+    if where.name != folder or where.parent not in dirs or where.is_symlink():
+        return None
+    return where
+
+
+def link_text(cache: Path | str, target: Path) -> str:
+    """The relative link ``cache/<name>`` must hold to reach *target*: relative so
+    it resolves the same on the host and under the container's mount point."""
+    return os.path.relpath(target, Path(cache).resolve())
 
 
 def folder_for(repo_id: str) -> str:
@@ -131,6 +247,24 @@ def _revisions(repo: Path) -> list[str]:
         return []
 
 
+def main_commit(repo: Path) -> str | None:
+    """The commit `refs/main` names, or None when the folder has no such ref.
+
+    A snapshot folder is named after a commit too, so "the node has the
+    coordinator's revision" is this string being among the other's
+    `_revisions`."""
+    try:
+        text = (repo / "refs" / "main").read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
+
+
+def revision(repo: Path) -> dict:
+    """What a copy of this folder is pinned to: `{"commit", "snapshots"}`."""
+    return {"commit": main_commit(repo), "snapshots": _revisions(repo)}
+
+
 def scan(directory: Path | str | None = None) -> dict:
     """Every cached repository on this node, largest first.
 
@@ -175,12 +309,19 @@ def scan(directory: Path | str | None = None) -> dict:
             "reason": f"{path} could not be read: {exc.strerror or exc}.",
         }
 
+    extras = extra_cache_dirs(path)[0]
     for entry in entries:
         if not entry.name.startswith(FOLDER_PREFIX) or not entry.is_dir():
             continue
         if entry.is_symlink():
-            continue
-        size, blob_count, newest = _blob_bytes(entry)
+            # Only derate's own link into an extra folder is measured; any
+            # other link would count bytes that live somewhere else.
+            real = linked_folder(path, entry.name, extras)
+            if real is None:
+                continue
+            size, blob_count, newest = _blob_bytes(real)
+        else:
+            size, blob_count, newest = _blob_bytes(entry)
         repos.append(
             {
                 "folder": entry.name,
@@ -188,6 +329,7 @@ def scan(directory: Path | str | None = None) -> dict:
                 "bytes": size,
                 "blob_count": blob_count,
                 "revisions": _revisions(entry),
+                "commit": main_commit(entry),
                 "last_modified": newest,
             }
         )
@@ -237,7 +379,10 @@ def resolve_target(folder: str, directory: Path | str | None = None) -> Path:
             f"{folder!r} is not in the model cache on this node."
         ) from None
     if resolved.parent != root:
-        raise DeleteRefused(f"{folder!r} is not directly inside the model cache.")
+        # The one exception: derate's own link into a configured extra folder,
+        # where the removal is bounded to that folder's direct child instead.
+        if linked_folder(path, folder) != resolved:
+            raise DeleteRefused(f"{folder!r} is not directly inside the model cache.")
     if not resolved.is_dir():
         raise DeleteRefused(f"{folder!r} is not a directory.")
     return resolved
@@ -251,15 +396,20 @@ def delete(folder: str, directory: Path | str | None = None) -> dict:
     back" are different claims and only the second one is worth reporting.
     """
     target = resolve_target(folder, directory)
+    base = Path(directory) if directory is not None else cache_dir()
+    link = Path(base) / folder  # resolve_target has refused a missing cache
+    is_link = link.is_symlink()
     size, _, _ = _blob_bytes(target)
     try:
         shutil.rmtree(target)
+        if is_link:
+            link.unlink()
     except OSError as exc:
         raise DeleteRefused(
             f"{folder!r} could not be removed: {exc.strerror or exc}."
         ) from None
     return {
-        "deleted": not target.exists(),
+        "deleted": not target.exists() and not os.path.lexists(link),
         "folder": folder,
         "repo_id": repo_from_folder(folder),
         "bytes_freed": size,

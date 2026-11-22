@@ -70,6 +70,7 @@ from control_plane.version import build_id
 from control_plane.registry import joinproof, modelcache, reach, storage as registry_storage
 from control_plane.registry import net as registry_net
 from control_plane.registry.serde import profile_from_dict
+from control_plane.registry.agent import AGENT_FEATURES
 
 from control_plane.telemetry import query as tquery
 
@@ -2423,6 +2424,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             {
                 "cluster_id": settings.cluster_id,
                 "coordinator": settings.coordinator_node_id,
+                # The build every node row's `build_skew` was compared with,
+                # so a screen can say what the node differs FROM. Null when
+                # this process cannot establish its own build.
+                "build": _coordinator_build() or None,
+                # Every feature an agent of this build reports when healthy;
+                # a node row whose `features` lacks one is missing it.
+                "agent_features": list(AGENT_FEATURES),
                 "nodes": [
                     serialize.node_payload(
                         n, labels.get(n.profile.node_id), _coordinator_build()
@@ -3297,6 +3305,148 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "server_error", "reach_failed",
             )
         return JSONResponse(serialize.plain(result))
+
+    @router.get("/api/links/health")
+    async def link_health(a: str | None = None, b: str | None = None) -> Response:
+        """What to change on each fabric port, per pair of healthy nodes.
+
+        Asks every healthy node's agent for its RDMA ports
+        (`GET /agent/links/health`) and compares the two ends of each pair
+        (`links/nichealth.py`). `?a=&b=` narrows it to one pair, which is what
+        the cluster rail asks for. Read-only and seconds: a handful of sysfs
+        reads and `ethtool` calls per node, then one end of each pair dials the
+        other's copy receiver once from each rail toward each fabric address
+        (`nichealth.probe_plan`, bounded and timed out) -- a TCP connect that is
+        closed as soon as it opens -- so a rail that is up and carries nothing
+        is a warning. The coordinator dials from itself; any other end is asked
+        through its agent (`POST /agent/links/probe`).
+        """
+        from control_plane.links import nichealth
+
+        try:
+            healthy = [n.profile.node_id for n in ctx.deps.registry.healthy_nodes()]
+        except Exception:
+            log.exception("registry unavailable")
+            healthy = []
+        if (a is None) != (b is None) or (a is not None and a == b):
+            return errors.error_response(
+                400, "Name both ends of one link: ?a=<node_id>&b=<node_id>.",
+                "invalid_request_error", "invalid_request",
+            )
+        wanted = sorted(healthy) if a is None else [n for n in (a, b) if n in healthy]
+        pairs = (
+            [(x, y) for i, x in enumerate(wanted) for y in wanted[i + 1 :]]
+            if a is None
+            else ([(a, b)] if len(wanted) == 2 else [])
+        )
+        involved = sorted({n for p in pairs for n in p})
+        health: dict[str, dict] = {}
+        unreadable: dict[str, str] = {}
+        if a is not None:
+            for n in (a, b):
+                if n not in healthy:
+                    unreadable[n] = f"'{n}' is not a healthy member of this cluster."
+
+        import httpx
+
+        async def _read(client, node_id: str) -> None:
+            try:
+                agent_url = ctx.deps.registry.agent_url(node_id)
+            except Exception:
+                agent_url = None
+            headers = _agent_headers(node_id)
+            if not agent_url:
+                unreadable[node_id] = f"No agent address is known for '{node_id}'."
+                return
+            if headers is None:
+                unreadable[node_id] = f"No agent credential is held for '{node_id}'."
+                return
+            try:
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/links/health", headers=headers
+                )
+            except Exception as exc:
+                unreadable[node_id] = (
+                    f"The node agent on '{node_id}' did not answer: "
+                    f"{errors.detail(exc, _redactor())}"
+                )
+                return
+            if res.status_code == 404:
+                unreadable[node_id] = (
+                    f"The node agent on '{node_id}' has no fabric settings route, so it "
+                    "runs a build from before they were read. Upgrade that node."
+                )
+                return
+            try:
+                res.raise_for_status()
+                payload = res.json()
+            except Exception as exc:
+                unreadable[node_id] = (
+                    f"The node agent on '{node_id}' did not answer: "
+                    f"{errors.detail(exc, _redactor())}"
+                )
+                return
+            if isinstance(payload, dict):
+                health[node_id] = payload
+
+        async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+            await asyncio.gather(*(_read(client, n) for n in involved))
+
+            coordinator = getattr(ctx.settings, "coordinator_node_id", None)
+            reach: dict[tuple[str, str], nichealth.RailReach] = {}
+
+            async def _probe(client, a_id: str, b_id: str) -> None:
+                # The coordinator's own end probes from this process; it is
+                # on the host network and its agent would only be a detour.
+                prober, other = (b_id, a_id) if b_id == coordinator else (a_id, b_id)
+                local = nichealth.rails_from(health[prober])
+                targets = nichealth.probe_plan(local, nichealth.rails_from(health[other]))
+                if not targets:
+                    return
+                if prober == coordinator:
+                    results = await asyncio.to_thread(nichealth.probe_rails, targets, local)
+                    reach[(a_id, b_id)] = nichealth.RailReach(prober, other, tuple(results))
+                    return
+                agent_url = ctx.deps.registry.agent_url(prober)
+                headers = _agent_headers(prober)
+                try:
+                    res = await client.post(
+                        f"{agent_url.rstrip('/')}/agent/links/probe",
+                        headers=headers,
+                        json={"targets": [t.to_json() for t in targets]},
+                    )
+                    if res.status_code == 404:
+                        reach[(a_id, b_id)] = nichealth.RailReach(
+                            prober, other,
+                            unavailable=(
+                                f"The node agent on '{prober}' has no rail probe route, so "
+                                f"whether each rail carries traffic to '{other}' was not "
+                                "checked. Upgrade that node."
+                            ),
+                        )
+                        return
+                    res.raise_for_status()
+                    rows = res.json().get("results") or []
+                except Exception as exc:
+                    reach[(a_id, b_id)] = nichealth.RailReach(
+                        prober, other,
+                        unavailable=(
+                            f"The node agent on '{prober}' could not probe its rails: "
+                            f"{errors.detail(exc, _redactor())}"
+                        ),
+                    )
+                    return
+                reach[(a_id, b_id)] = nichealth.RailReach(
+                    prober, other,
+                    tuple(nichealth.ProbeResult.from_json(r) for r in rows if isinstance(r, dict)),
+                )
+
+            await asyncio.gather(
+                *(_probe(client, x, y) for x, y in pairs if x in health and y in health)
+            )
+        return JSONResponse(
+            nichealth.link_health_report(pairs, health, unreadable, time.time(), reach)
+        )
 
     # -- routing -----------------------------------------------------------
 
@@ -6146,6 +6296,177 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         )
         return Response(status_code=204)
 
+    # Copies of a cached model from the coordinator to another node, over the
+    # fabric when there is one (control_plane/transfer). Process-local like the
+    # prefetches above, so /api/activity lists them without fan-out. The audit
+    # action is DOWNLOAD_CHANGED on purpose: a new AuditAction member would be a
+    # frozen-contract edit, and "op" already says which kind of change it was.
+
+    def _transfers_unavailable() -> JSONResponse:
+        return errors.error_response(
+            503, "Copies between nodes are not available on this gateway.",
+            "server_error", "transfers_unavailable",
+        )
+
+    @router.post("/api/transfers")
+    async def start_transfer(request: Request) -> JSONResponse:
+        from control_plane.transfer.jobs import ReplicateRefused
+        from control_plane.transfer.protocol import DEFAULT_STREAMS
+
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        folder = body.get("folder")
+        node_id = body.get("node_id")
+        streams = body.get("streams")
+        if not isinstance(node_id, str) or not node_id.strip():
+            return errors.error_response(
+                400, "node_id is required.", "invalid_request_error", "invalid_request"
+            )
+        if ctx.deps.transfers is None:
+            return _transfers_unavailable()
+        try:
+            job = await asyncio.to_thread(
+                ctx.deps.transfers.start, folder, node_id.strip(),
+                streams=streams or DEFAULT_STREAMS,
+            )
+        except ReplicateRefused as exc:
+            return errors.error_response(exc.status, exc.sentence, "invalid_request_error", exc.code)
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "transfer", job["transfer_id"],
+            after={"op": "transfer_start", "folder": folder, "node_id": node_id.strip(),
+                   "streams": job["streams"]},
+        )
+        return JSONResponse(job, status_code=202)
+
+    @router.get("/api/transfers")
+    async def list_transfers() -> JSONResponse:
+        if ctx.deps.transfers is None:
+            return JSONResponse({"transfers": []})
+        return JSONResponse({"transfers": await asyncio.to_thread(ctx.deps.transfers.list)})
+
+    @router.delete("/api/transfers/{transfer_id}")
+    async def cancel_transfer(transfer_id: str, request: Request) -> Response:
+        if ctx.deps.transfers is None:
+            return _transfers_unavailable()
+        from control_plane.transfer.jobs import CancelRefused
+
+        try:
+            cancelled = await asyncio.to_thread(ctx.deps.transfers.cancel, transfer_id)
+        except CancelRefused as exc:
+            return errors.error_response(
+                409, exc.sentence, "invalid_request_error", "transfer_verifying"
+            )
+        if not cancelled:
+            return errors.error_response(
+                404, f"No copy '{transfer_id}' is running here.",
+                "invalid_request_error", "transfer_not_found",
+            )
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "transfer", transfer_id,
+            after={"op": "transfer_cancel"},
+        )
+        return Response(status_code=204)
+
+    # Background copies (control_plane/transfer/replication.py). The monitor
+    # PROPOSES; nothing is copied or deleted until one of these approvals,
+    # which must name the exact deletions the operator was shown.
+
+    def _replication_unavailable() -> JSONResponse:
+        return errors.error_response(
+            503, "Background copies are not available on this gateway.",
+            "server_error", "replication_unavailable",
+        )
+
+    def _replication_pair(body: dict) -> tuple[str, str] | JSONResponse:
+        folder, node_id = body.get("folder"), body.get("node_id")
+        if not isinstance(folder, str) or not folder or not isinstance(node_id, str) or not node_id:
+            return errors.error_response(
+                400, "folder and node_id are required.", "invalid_request_error", "invalid_request"
+            )
+        return folder, node_id
+
+    def _kick_replication() -> None:
+        async def run() -> None:
+            try:
+                await ctx.replication.tick()
+            except Exception:
+                log.exception("replication tick after an approval failed")
+
+        asyncio.get_running_loop().create_task(run())
+
+    @router.get("/api/replication")
+    async def replication_state() -> JSONResponse:
+        if ctx.replication is None:
+            return _replication_unavailable()
+        return JSONResponse(await asyncio.to_thread(ctx.replication.state))
+
+    @router.post("/api/replication/approve")
+    async def approve_replication(request: Request) -> JSONResponse:
+        from control_plane.transfer.replication import PlanChanged, ProposalNotFound
+
+        if ctx.replication is None:
+            return _replication_unavailable()
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        pair = _replication_pair(body)
+        if isinstance(pair, JSONResponse):
+            return pair
+        evict = body.get("evict", [])
+        if not isinstance(evict, list) or not all(isinstance(e, str) for e in evict):
+            return errors.error_response(
+                400, "evict must be the list of folders you were shown, [] for none.",
+                "invalid_request_error", "invalid_request",
+            )
+        try:
+            row = await asyncio.to_thread(ctx.replication.approve, pair[0], pair[1], evict)
+        except ProposalNotFound as exc:
+            return errors.error_response(
+                404, str(exc), "invalid_request_error", "replication_proposal_not_found"
+            )
+        except PlanChanged as exc:
+            return errors.error_response(
+                409, str(exc), "invalid_request_error", "replication_plan_changed"
+            )
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "replica", f"{pair[1]}/{pair[0]}",
+            after={"op": "replica_approve", "folder": pair[0], "node_id": pair[1],
+                   "evict": sorted(evict), "bytes": row["bytes"]},
+        )
+        _kick_replication()
+        return JSONResponse(row)
+
+    @router.post("/api/replication/dismiss")
+    async def dismiss_replication(request: Request) -> Response:
+        if ctx.replication is None:
+            return _replication_unavailable()
+        try:
+            body = await read_json_object(request)
+        except BodyTooLarge:
+            return payload_too_large()
+        except ValueError as exc:
+            return errors.error_response(400, str(exc), "invalid_request_error", "invalid_request")
+        pair = _replication_pair(body)
+        if isinstance(pair, JSONResponse):
+            return pair
+        if not await asyncio.to_thread(ctx.replication.dismiss, pair[0], pair[1]):
+            return errors.error_response(
+                404, f"No proposal to copy {pair[0]} to {pair[1]}.",
+                "invalid_request_error", "replication_proposal_not_found",
+            )
+        audit_request(
+            request, AuditAction.DOWNLOAD_CHANGED, "replica", f"{pair[1]}/{pair[0]}",
+            after={"op": "replica_dismiss", "folder": pair[0], "node_id": pair[1]},
+        )
+        return Response(status_code=204)
+
     @router.get("/api/activity")
     async def activity() -> JSONResponse:
         """What is arriving: transfers in flight, and models still starting.
@@ -6212,6 +6533,32 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             }
             for job in hub_jobs
         )
+        # Copies to other nodes, in the same row shape.
+        if ctx.deps.transfers is not None:
+            try:
+                copies = ctx.deps.transfers.list()
+            except Exception:
+                log.exception("reading copies between nodes failed while reading activity")
+                copies = []
+            # The link the copy chose, as it describes itself ("RoCE, 2 × 200 Gb/s").
+            downloads.extend(
+                {
+                    "pull_id": t["transfer_id"],
+                    "provider_id": None,
+                    "provider": f"copy to {t['node_id']}" + (f" over {t['link']}" if t.get("link") else ""),
+                    "model": t["repo_id"],
+                    "completed": t["completed"],
+                    "total": t["total"],
+                    "status": t["status"],
+                    "error": t["error"],
+                    "done": t["status"] == "done",
+                    "kind": "transfer",
+                    "transfer_id": t["transfer_id"],
+                    "rate_bps": t["rate_bps"],
+                    "eta_s": t["eta_s"],
+                }
+                for t in copies
+            )
 
         try:
             deployments = ctx.deps.deployments.list()
@@ -6286,7 +6633,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             del _LAUNCH_SEEN[stale]
 
         launches.sort(key=lambda item: item["since"])
-        return JSONResponse({"downloads": downloads, "launches": launches})
+        body: dict = {"downloads": downloads, "launches": launches}
+        if ctx.replication is not None:
+            try:
+                body["replication"] = {"awaiting": await asyncio.to_thread(ctx.replication.awaiting)}
+            except Exception:
+                log.exception("reading background copy proposals failed while reading activity")
+        return JSONResponse(body)
 
     # -- metrics -----------------------------------------------------------
 
@@ -6594,6 +6947,51 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 f"{errors.detail(exc, _redactor())}"
             )
 
+    async def _agent_copy_receiver(node_id: str, agent_url: str) -> dict:
+        """Whether a node can take a copy, read before anybody clicks one.
+
+        `available` False carries the sentence the copy would have failed with:
+        an agent with no capacity route predates copies (404), a 503 is the
+        agent's own refusal (no receiver on 47101, no cache folder), and a
+        transport error is that error. `free` is the cache filesystem's free
+        bytes when the agent could say. Never raises.
+        """
+        import httpx
+
+        def _no(reason: str) -> dict:
+            return {"available": False, "reason": reason, "free": None}
+
+        try:
+            async with httpx.AsyncClient(timeout=_AGENT_TIMEOUT_S) as client:
+                res = await client.get(
+                    f"{agent_url.rstrip('/')}/agent/transfers/capacity",
+                    headers=_agent_headers(node_id),
+                )
+        except Exception as exc:
+            log.warning("copy capacity read failed for %s: %s", node_id, exc)
+            return _no(f"{node_id} did not answer: {errors.detail(exc, _redactor())}")
+        if res.status_code == 404:
+            return _no(
+                f"{node_id} runs an older build without the copy receiver; upgrade it"
+            )
+        if res.status_code != 200:
+            try:
+                detail = res.json().get("detail")
+            except Exception:
+                detail = None
+            if not isinstance(detail, str) or not detail:
+                detail = f"its agent answered HTTP {res.status_code}"
+            return _no(f"{node_id}: {detail}")
+        try:
+            free = res.json().get("free")
+        except Exception as exc:
+            return _no(f"{node_id} did not answer: {errors.detail(exc, _redactor())}")
+        return {
+            "available": True,
+            "reason": None,
+            "free": free if isinstance(free, int) else None,
+        }
+
     @router.get("/api/storage")
     async def storage() -> Response:
         """Disk across the cluster, and what this product is spending it on.
@@ -6648,8 +7046,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         caches = list(
             await asyncio.gather(*(_agent_model_cache(n, u) for n, u in targets))
         )
-        for row, cache in zip(measured, caches):
+        receivers = list(
+            await asyncio.gather(*(_agent_copy_receiver(n, u) for n, u in targets))
+        )
+        for row, cache, receiver in zip(measured, caches, receivers):
             row["models"] = cache
+            row["copy_receiver"] = receiver
+        for row in no_agent:
+            row["copy_receiver"] = {
+                "available": False,
+                "reason": f"No agent URL for node '{row['node_id']}'.",
+                "free": None,
+            }
         node_rows = sorted(measured + no_agent, key=lambda r: r["node_id"])
 
         # The retention horizons come from the module that enforces them, so

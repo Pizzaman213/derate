@@ -33,7 +33,7 @@ Run this on the machine you want to be the coordinator.
 
 ```bash
 f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Pizzaman213/derate/main/install.sh -o "$f" \
-  && echo "0ca3bc3d3e86e6e0382b796525c2daa696b2c772fc3394f48646c3de6f0b807c  $f" | sha256sum -c - \
+  && echo "88087ac4e07f64a59081d707429918cf23c49e4ccb51129bd9170e66aa62b5af  $f" | sha256sum -c - \
   && sh "$f"
 ```
 
@@ -222,7 +222,8 @@ re-joined since the upgrade.
   position on the cluster floor. Use it before moving a machine to a different
   cluster, or the node keeps presenting the old cluster's token and is turned
   away. Without `--uninstall` it restarts the node afterwards, so it comes back
-  looking for a cluster to join.
+  looking for a cluster to join. On a machine that had `--fabric-setup` it also
+  removes the fabric timer and puts back the rail settings it recorded.
 - **`--install-docker`** — install Docker from `get.docker.com` if it is
   missing. Opt-in: the script does not install daemons you did not ask for.
 - **`--install-ollama`** — install Ollama on this machine and bind it, through a
@@ -245,6 +246,25 @@ re-joined since the upgrade.
   superseded. By default, once the new node has answered its health check, the
   old ones are removed; a derate image is around 300 MB and every upgrade would
   otherwise leave one behind forever.
+- **`--fabric-setup`** — after the node is up, put this machine's RDMA rails
+  into the state the fabric needs and keep them there: MTU 9000, rings at their
+  maximum, `rx_cqe_compress` on, and one IPv4 address per rail. Rail *i*
+  (ordered by PCI address) gets `10.100.(152+i).<last octet of this machine's
+  LAN address>/24`, so every node numbers itself consistently without being
+  told anything; a LAN that is not a /24 is refused, and
+  `/etc/derate/fabric.json`'s `addresses` names them instead. `exclusive: true`
+  (the default) removes every other IPv4 address on a rail — a stale `/30` or a
+  `169.254/16` link-local address is what NCCL's bootstrap and RoCE GID
+  selection pick otherwise. The script prints the exact plan and asks first
+  (`--yes` answers for it; no terminal is a no). It needs root or sudo and
+  `python3` on the host, copies `fabric_setup.py` out of the image into
+  `/usr/local/lib/derate/`, records the original settings in
+  `/var/lib/derate/fabric-snapshot.json`, and enables `derate-fabric.timer`,
+  which re-asserts it 30 s after boot and every 30 minutes, because NVIDIA Sync
+  and NetworkManager rewrite these settings. Ring and `rx_cqe_compress` changes
+  reopen the NIC's queues, so run it with no model spanning the rails.
+  `python3 /usr/local/lib/derate/fabric_setup.py --dry-run` shows what it
+  would change at any time.
 
 ## 5. By hand, or with compose
 

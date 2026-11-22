@@ -64,6 +64,7 @@ class NodeRuntime:
     registry: Registry | None = None
     telemetry: "object | None" = None
     probe_server: "object | None" = None
+    transfer_receiver: "object | None" = None
     _stopped: bool = field(default=False, repr=False)
     _rejoin_task: "asyncio.Task | None" = field(default=None, repr=False)
     _announce_task: "asyncio.Task | None" = field(default=None, repr=False)
@@ -305,6 +306,8 @@ class NodeRuntime:
             await self.telemetry.stop()
         if self.probe_server is not None:
             self.probe_server.close()
+        if self.transfer_receiver is not None:
+            self.transfer_receiver.close()
 
 
 def recover_credentials(config: RegistryConfig) -> RegistryConfig:
@@ -392,6 +395,25 @@ def _open_probe_sink(node_agent: NodeAgent | None = None):
             exc,
         )
         return None
+
+
+def _open_transfer_receiver(node_agent: NodeAgent | None = None):
+    """The raw-TCP port model copies arrive on (control_plane/transfer).
+
+    Opened on every node, like the probe sink. A port somebody else holds is a
+    warning, not a failed boot: the agent then answers its copy routes with
+    503 and a launch falls back to sparkrun's own rsync.
+    """
+    from control_plane.transfer.protocol import TRANSFER_PORT
+
+    try:
+        from control_plane.transfer.receiver import start_transfer_receiver
+
+        return start_transfer_receiver()
+    except OSError as exc:
+        log.warning("transfer receiver not started on port %d: %s", TRANSFER_PORT, exc)
+        return None
+
 
 
 def _open_telemetry(config: RegistryConfig, profile: NodeProfile, role: str):
@@ -537,6 +559,9 @@ async def start_node(
     await node_agent.start()
     await telemetry.start(node_id=profile.node_id)
     probe_server = _open_probe_sink(node_agent)
+    transfer_receiver = _open_transfer_receiver(node_agent)
+    if node_agent is not None:
+        node_agent.transfer_receiver = transfer_receiver
 
     registry: Registry | None = None
     if decision.role == ROLE_COORDINATOR:
@@ -551,6 +576,9 @@ async def start_node(
         # every other member; and it is the only reader its own agent has.
         node_agent.set_token(registry.agent_token(profile.node_id))
         node_agent.set_coordinator(profile.address)
+        # The local node is answered in-process, never dialled, so its
+        # feature list comes straight from the agent beside it.
+        registry.set_local_features(node_agent.features)
         await registry.start()
         print(banner(identity, f"http://{profile.address}:{config.coordinator_port}"))
     else:
@@ -571,6 +599,7 @@ async def start_node(
         registry=registry,
         telemetry=telemetry,
         probe_server=probe_server,
+        transfer_receiver=transfer_receiver,
     )
 
     # Every node, both roles: keeps the mDNS record true when this machine's

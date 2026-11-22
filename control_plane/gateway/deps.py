@@ -7,6 +7,7 @@ and is how the tests run, so the gateway is never blocked on another agent.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from control_plane.contracts import (
     DeploymentPort,
@@ -32,6 +33,10 @@ class GatewayDeps:
     planner: PlannerPort = None  # type: ignore[assignment]
     deployments: DeploymentPort = None  # type: ignore[assignment]
     providers: ProviderPort = None  # type: ignore[assignment]
+    # Copies between nodes' model caches (control_plane/transfer/jobs.py
+    # Replicator). Optional, and outside the strict-ports check below: a
+    # gateway without it answers /api/transfers with 503.
+    transfers: Any = None
     # When True, a missing port is a startup error rather than a stub. For a
     # deployment that means to run for real: silently falling back to fixture
     # data is exactly the C-1 failure mode (a day-0 stub wearing a real
@@ -127,6 +132,9 @@ class GatewayContext:
     # Saved and auto-recorded run profiles (gateway/profiles_store.py). Set by
     # app.py; the launch path records runs into it when present.
     profiles: "object" = None
+    # Background copies to other nodes, run only on approval
+    # (transfer/replication.py ReplicationMonitor). None: /api/replication 503.
+    replication: "object" = None
 
     def __post_init__(self) -> None:
         from control_plane.telemetry import NULL_SINK

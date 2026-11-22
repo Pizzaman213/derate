@@ -45,6 +45,15 @@ KEEP_IMAGES=0
 INSTALL_DOCKER=0
 INSTALL_OLLAMA=0
 OLLAMA_BIND=""
+FABRIC_SETUP=0
+ASSUME_YES=0
+# --fabric-setup: where the host-side fabric tool, its config, its record of
+# the original settings and its systemd units live.
+FABRIC_LIB=/usr/local/lib/derate
+FABRIC_CONFIG=/etc/derate/fabric.json
+FABRIC_SNAPSHOT=/var/lib/derate/fabric-snapshot.json
+FABRIC_UNITS=/etc/systemd/system
+FABRIC_SRC=/opt/derate/control_plane/links
 # DERATE_IMAGE_DIGEST / --digest: pull "$IMAGE@<digest>" rather than the tag.
 IMAGE_DIGEST="${DERATE_IMAGE_DIGEST:-}"
 HEALTH_TIMEOUT=60
@@ -97,6 +106,19 @@ Options
                       Without --uninstall it restarts the node afterwards, so
                       it comes back looking for a cluster to join.
   --keep-images       do not reclaim derate images the upgrade superseded
+  --fabric-setup      after the node is up, put this machine's RDMA rails into
+                      the state the fabric needs and keep them there: MTU 9000,
+                      rings at their maximum, rx_cqe_compress on, and one IPv4
+                      address per rail -- rail i gets 10.100.(152+i).<last octet
+                      of this machine's LAN address>/24 -- with every OTHER IPv4
+                      address on a rail removed (exclusive: true). Prints exactly
+                      what will change and asks first. Needs root or sudo and
+                      python3 on the host. Installs a systemd timer that
+                      re-asserts it every 30 minutes, because NVIDIA Sync and
+                      NetworkManager rewrite these settings. Edit
+                      /etc/derate/fabric.json to change any of it. --leave
+                      removes the timer and restores the original settings.
+  --yes               answer yes to --fabric-setup's question (no terminal: no)
   -h, --help          this
 
 The dev build
@@ -154,6 +176,8 @@ while [ $# -gt 0 ]; do
         --purge)        PURGE=1; shift ;;
         --keep-images)  KEEP_IMAGES=1; shift ;;
         --leave)        LEAVE=1; shift ;;
+        --fabric-setup) FABRIC_SETUP=1; shift ;;
+        --yes|-y)       ASSUME_YES=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown option '$1'. Try --help." ;;
     esac
@@ -249,6 +273,153 @@ ensure_docker() {
 }
 
 # ---------------------------------------------------------------------------
+# The fabric (--fabric-setup)
+#
+# control_plane/links/fabric_setup.py runs on the HOST, as root, from a
+# systemd timer: it changes interface settings, which the node container can
+# read and must not own. It is copied out of the image this script installs,
+# so the tool and the node are always the same build.
+# ---------------------------------------------------------------------------
+
+can_be_root() { [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; }
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+setup_fabric() {
+    command -v python3 >/dev/null 2>&1 || {
+        info "--fabric-setup needs python3 on this machine and there is none; the fabric was left unchanged."
+        return 0
+    }
+    can_be_root || {
+        info "--fabric-setup changes interface settings and needs root or sudo; the fabric was left unchanged."
+        return 0
+    }
+    _fdir=$(mktemp -d "${TMPDIR:-/tmp}/derate-fabric.XXXXXX") || {
+        info "could not create a temporary directory; the fabric was left unchanged."
+        return 0
+    }
+    # docker cp rather than running a binary in the image: it needs nothing
+    # from the image but the files themselves.
+    _cid=$($DOCKER create "$IMAGE" 2>/dev/null) || _cid=""
+    _missing=""
+    for _f in fabric_setup.py systemd/derate-fabric.service systemd/derate-fabric.timer; do
+        if [ -z "$_cid" ] || ! $DOCKER cp "$_cid:$FABRIC_SRC/$_f" "$_fdir/${_f##*/}" >/dev/null 2>&1; then
+            _missing="$_missing $_f"
+        fi
+    done
+    [ -z "$_cid" ] || $DOCKER rm "$_cid" >/dev/null 2>&1 || true
+    if [ -n "$_missing" ]; then
+        info "$IMAGE does not carry$_missing under $FABRIC_SRC (an image older than"
+        info "--fabric-setup); the fabric was left unchanged."
+        rm -rf "$_fdir"
+        return 0
+    fi
+
+    # An existing config is the operator's and is used as it is; otherwise the
+    # defaults are written out in full, so what was consented to is on disk.
+    _cfg="$FABRIC_CONFIG"
+    if [ ! -e "$_cfg" ]; then
+        _cfg="$_fdir/fabric.json"
+        printf '%s\n' '{' \
+            '  "mtu": 9000,' \
+            '  "ring": "max",' \
+            '  "rx_cqe_compress": true,' \
+            '  "subnet_base": "10.100.152.0",' \
+            '  "exclusive": true,' \
+            '  "addresses": {}' \
+            '}' >"$_cfg"
+    fi
+
+    info "--fabric-setup: what would change on this machine's RDMA rails"
+    if ! python3 "$_fdir/fabric_setup.py" --dry-run --config "$_cfg" >"$_fdir/plan.txt" 2>&1; then
+        sed 's/^/    /' "$_fdir/plan.txt" >&2
+        info "the fabric was left unchanged."
+        rm -rf "$_fdir"
+        return 0
+    fi
+    sed 's/^/    /' "$_fdir/plan.txt" >&2
+    if [ "$ASSUME_YES" -eq 0 ] \
+       && ! ask_yes_no "Apply this, and re-assert it every 30 minutes?"; then
+        info "the fabric was left unchanged. --fabric-setup --yes applies it without asking."
+        rm -rf "$_fdir"
+        return 0
+    fi
+
+    as_root mkdir -p "$FABRIC_LIB" "${FABRIC_CONFIG%/*}" "${FABRIC_SNAPSHOT%/*}" \
+        && as_root cp "$_fdir/fabric_setup.py" "$FABRIC_LIB/fabric_setup.py" \
+        && as_root chmod 0755 "$FABRIC_LIB/fabric_setup.py" || {
+            info "could not install $FABRIC_LIB/fabric_setup.py; the fabric was left unchanged."
+            rm -rf "$_fdir"
+            return 0
+        }
+    if [ "$_cfg" != "$FABRIC_CONFIG" ]; then
+        as_root cp "$_cfg" "$FABRIC_CONFIG" && as_root chmod 0644 "$FABRIC_CONFIG" \
+            || info "could not write $FABRIC_CONFIG; the defaults apply."
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        as_root cp "$_fdir/derate-fabric.service" "$_fdir/derate-fabric.timer" "$FABRIC_UNITS/" \
+            && as_root chmod 0644 "$FABRIC_UNITS/derate-fabric.service" "$FABRIC_UNITS/derate-fabric.timer" \
+            && as_root systemctl daemon-reload || {
+                info "could not install the systemd units; the fabric was left unchanged."
+                rm -rf "$_fdir"
+                return 0
+            }
+        # The first run, now and in the foreground: it records the original
+        # settings in $FABRIC_SNAPSHOT before it changes anything.
+        if as_root systemctl start derate-fabric.service; then
+            info "applied. The original settings are recorded in $FABRIC_SNAPSHOT."
+        else
+            info "applying reported a failure: journalctl -u derate-fabric.service"
+        fi
+        as_root systemctl enable --now derate-fabric.timer >/dev/null 2>&1 \
+            && info "derate-fabric.timer re-asserts it every 30 minutes" \
+            || info "could not enable derate-fabric.timer; the settings will not be re-asserted."
+    else
+        if as_root python3 "$FABRIC_LIB/fabric_setup.py" --apply --config "$FABRIC_CONFIG" \
+                --snapshot "$FABRIC_SNAPSHOT" >&2; then
+            info "applied once. This machine has no systemctl, so nothing re-asserts it"
+            info "after NetworkManager or a reboot changes it; re-run this script to."
+        else
+            info "applying reported a failure (above)."
+        fi
+    fi
+    rm -rf "$_fdir"
+}
+
+# The inverse, for --leave: stop re-asserting, then put back what the first
+# apply recorded. A machine that never had --fabric-setup is not touched, and
+# nothing is asked of sudo there.
+remove_fabric_setup() {
+    [ -e "$FABRIC_UNITS/derate-fabric.timer" ] || [ -e "$FABRIC_UNITS/derate-fabric.service" ] \
+        || [ -e "$FABRIC_SNAPSHOT" ] || [ -e "$FABRIC_LIB/fabric_setup.py" ] || return 0
+    can_be_root || {
+        info "--fabric-setup is installed here and removing it needs root or sudo; it was left in place."
+        return 0
+    }
+    if command -v systemctl >/dev/null 2>&1; then
+        as_root systemctl disable --now derate-fabric.timer >/dev/null 2>&1 || true
+        as_root systemctl stop derate-fabric.service >/dev/null 2>&1 || true
+        as_root rm -f "$FABRIC_UNITS/derate-fabric.timer" "$FABRIC_UNITS/derate-fabric.service"
+        as_root systemctl daemon-reload >/dev/null 2>&1 || true
+        info "removed derate-fabric.timer and derate-fabric.service"
+    fi
+    if [ -e "$FABRIC_SNAPSHOT" ]; then
+        if [ -e "$FABRIC_LIB/fabric_setup.py" ] && command -v python3 >/dev/null 2>&1 \
+           && as_root python3 "$FABRIC_LIB/fabric_setup.py" --restore "$FABRIC_SNAPSHOT" >&2; then
+            info "restored the rails' original settings from $FABRIC_SNAPSHOT"
+        else
+            info "could not restore every original setting; the record is kept at $FABRIC_SNAPSHOT"
+            return 0
+        fi
+    fi
+    as_root rm -f "$FABRIC_LIB/fabric_setup.py"
+    as_root rmdir "$FABRIC_LIB" >/dev/null 2>&1 || true
+    info "removed fabric setup ($FABRIC_CONFIG is kept for a later --fabric-setup)"
+}
+
+# ---------------------------------------------------------------------------
 # Uninstall
 # ---------------------------------------------------------------------------
 
@@ -267,6 +438,7 @@ leave_cluster() {
     else
         info "no $CONTAINER container: nothing to forget"
     fi
+    remove_fabric_setup
 }
 
 if [ "$LEAVE" -eq 1 ] && [ "$UNINSTALL" -eq 0 ]; then
@@ -389,6 +561,10 @@ set -- "$@" -e "DERATE_PORT=$PORT" -e "DERATE_AGENT_PORT=$AGENT_PORT"
 [ -n "$NAME" ]  && set -- "$@" -e "DERATE_NODE_ID=$NAME"
 # So this node, as a coordinator, hands the same digest to the nodes it adds.
 [ -n "$IMAGE_DIGEST" ] && set -- "$@" -e "DERATE_IMAGE_DIGEST=$IMAGE_DIGEST"
+# Folders beneath the HF cache root a copy may land in when its disk is short
+# (control_plane/registry/modelcache.py). Beneath it, because that root is the
+# one mount above: a disk mounted there is inside this container too.
+[ -n "${DERATE_EXTRA_CACHE_DIRS:-}" ] && set -- "$@" -e "DERATE_EXTRA_CACHE_DIRS=$DERATE_EXTRA_CACHE_DIRS"
 set -- "$@" "$IMAGE"
 
 # The GPU. Held apart from the rest of the run because a Docker that cannot
@@ -452,6 +628,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     else
         say "docker run $*"
     fi
+    [ "$FABRIC_SETUP" -eq 0 ] || info "--fabric-setup runs after the node is up, and prints its own plan before changing anything"
     exit 0
 fi
 
@@ -835,6 +1012,13 @@ install_ollama() {
 
 if [ "$INSTALL_OLLAMA" -eq 1 ]; then
     install_ollama
+fi
+
+# After the node, for the same reason as Ollama: a machine whose node did not
+# start has a worse problem than an untuned rail. And from the image that just
+# answered /agent/health, so the host tool is that build's.
+if [ "$FABRIC_SETUP" -eq 1 ]; then
+    setup_fabric
 fi
 
 # Which build is now on this machine. Read off the container, not out of this

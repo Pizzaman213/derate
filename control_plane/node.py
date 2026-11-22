@@ -132,7 +132,12 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     # FitCalculator does not implement. The no-arg default resolves to
     # control_plane.fit's module-level helpers when they exist.
     planner = Planner()
-    deployments = DeploymentManager(registry=registry, state_dir=config.data_dir)
+    from control_plane.transfer.jobs import Replicator
+
+    replicator = Replicator(registry=registry, local_node_id=runtime.profile.node_id)
+    deployments = DeploymentManager(
+        registry=registry, state_dir=config.data_dir, replicator=replicator
+    )
     providers = ProviderService(data_path=config.data_dir)
     # The log files opened in main() started with a fresh Redactor, which knows
     # the vendor key shapes but no actual value. This is the first moment a
@@ -171,6 +176,7 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
         planner=planner,
         deployments=deployments,
         providers=providers,
+        transfers=replicator,
         strict=True,
         settings=settings,
     )

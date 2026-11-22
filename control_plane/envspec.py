@@ -90,6 +90,9 @@ _DECLARED = (
     _v("DERATE_UI_DIR", None, "control_plane/gateway/settings.py",
        "the built UI to serve; absent means the API answers and no screen does"),
     _v("DERATE_HF_CACHE", None, "control_plane/registry/modelcache.py", ""),
+    _v("DERATE_EXTRA_CACHE_DIRS", None, "control_plane/registry/modelcache.py",
+       "colon-separated folders beneath the HF cache root a copy lands in when the "
+       "hub's disk is short; anything not beneath that root is refused"),
 
     # -- the model resolver --------------------------------------------------
     _v("DERATE_HF_TOKEN", None, "control_plane/resolver/hf.py", "gated repositories"),

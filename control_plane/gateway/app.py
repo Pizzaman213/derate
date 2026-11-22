@@ -546,6 +546,23 @@ def create_app(
             await boot_relaunch(ctx)
         except Exception:
             log.exception("start-at-boot relaunch failed")
+        # Background copies to other nodes: proposals only, each run after an
+        # operator approves it (control_plane/transfer/replication.py).
+        if (
+            ctx.replication is None
+            and deps.transfers is not None
+            and getattr(deps.transfers, "local_node_id", None)
+        ):
+            from control_plane.transfer.replication import ReplicationMonitor
+
+            ctx.replication = ReplicationMonitor(
+                deployments=deps.deployments,
+                registry=deps.registry,
+                replicator=deps.transfers,
+                pins=lambda: ctx.profiles.pins() if ctx.profiles is not None else [],
+            )
+        if ctx.replication is not None:
+            await ctx.replication.start()
         await metrics.start()
         # Spec-decode counters from every local engine, attributed to each
         # request after it settles; and the sweep that marks lapsed keys
@@ -631,6 +648,14 @@ def create_app(
                 await asyncio.to_thread(_prefetch.shutdown_default)
             except Exception:
                 log.exception("stopping hub prefetches failed")
+            if ctx.replication is not None:
+                await ctx.replication.stop()
+            # Copies to other nodes are threads holding sockets and sessions.
+            if deps.transfers is not None:
+                try:
+                    await asyncio.to_thread(deps.transfers.shutdown)
+                except Exception:
+                    log.exception("stopping copies between nodes failed")
             await router.stop()
             await admission.stop()
             await proxy.stop()

@@ -38,7 +38,7 @@ await bundleWithEsbuild({
   logLevel: 'warning',
 })
 
-const { parse, href, DESTINATIONS, DEFAULT_CONTEXT, DEFAULT_CONCURRENCY } = await import(pathToFileURL(bundle).href)
+const { parse, href, DESTINATIONS, SETTINGS_SECTIONS, DEFAULT_CONTEXT, DEFAULT_CONCURRENCY } = await import(pathToFileURL(bundle).href)
 
 let failures = 0
 function check(what, got, want) {
@@ -157,6 +157,23 @@ check('/audit is not a destination', parse('/audit').dest, 'dash')
 // Orgs are not in the UI any more: every setting is on the key.
 check('/orgs is not a destination', parse('/orgs/o1').dest, 'dash')
 check('a key id never lands on /models', href({ ...parse('/models'), key: 'k1' }), '/models')
+
+// ── /settings: one destination, its section in the path ──────────────────────
+
+for (const s of SETTINGS_SECTIONS) {
+  check(`/settings/${s} opens ${s}`, [parse(`/settings/${s}`).dest, parse(`/settings/${s}`).section], ['settings', s])
+  check(`/settings/${s} round trips`, href(parse(`/settings/${s}`)), `/settings/${s}`)
+}
+// The bare path stays a URL of its own: the tab picks (Instance with a node
+// selected, Connection otherwise), which a written-out section would override.
+check('bare /settings has no section', parse('/settings').section, null)
+check('bare /settings round trips', href(parse('/settings')), '/settings')
+check('/settings with a node keeps it', href(parse('/settings?node=spark-01')), '/settings?node=spark-01')
+check('an unknown section is the bare path', href(parse('/settings/bogus/x')), '/settings')
+check('a section never follows the route elsewhere', href({ ...parse('/settings/storage'), dest: 'cluster' }), '/cluster')
+check('no section off /settings', parse('/usage/keys').section, null)
+check('a usage pane never lands on /settings', href({ ...parse('/usage/keys'), dest: 'settings' }), '/settings')
+check('switching section keeps the selection', href({ ...parse('/settings/nodes?node=spark-01'), section: 'storage' }), '/settings/storage?node=spark-01')
 
 // ── The spend window: a selection owned by the overview ──────────────────────
 
@@ -391,6 +408,7 @@ const URLS = [
   '/cluster?node=spark-01&open=node:spark-02',
   `/usage?open=model:${HF}&ctx=131072`,
   '/settings?node=spark-01&dep=qwen3-30b-a3b&open=dep:qwen3-30b-a3b',
+  '/settings/storage?node=spark-01',
   '/nonsense?ctx=99',
   `/models/${HF}?ctx=32768&seq=8&on=spark-4d38`,
   '/models?on=spark-01,spark-02&tp=2&pp=1&ep=1',

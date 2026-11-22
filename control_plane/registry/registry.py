@@ -16,7 +16,7 @@ import asyncio
 import dataclasses
 import logging
 import time
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Sequence
 from urllib.parse import urlsplit
 
 from control_plane.contracts import (
@@ -203,6 +203,10 @@ class Registry:
         self._telemetry = TelemetryStore()
         self._tasks: list[asyncio.Task] = []
         self._running = False
+        # What the coordinator's own agent can do. The local node is never
+        # dialled over HTTP (check_health answers for it in-process), so the
+        # one agent the registry cannot ask is handed over by startup.py.
+        self._local_features: Callable[[], Sequence[str]] | None = None
 
         self._load_roster()
 
@@ -1270,6 +1274,8 @@ class Registry:
             state = self._members.get(node_id)
             if state is not None:
                 state.build = build_id()
+                if self._local_features is not None:
+                    state.features = tuple(self._local_features())
             return True
         url = self._agent_urls.get(node_id)
         if not url:
@@ -1281,6 +1287,7 @@ class Registry:
                 headers=self._agent_headers(node_id),
             )
             self._record_build(node_id, body)
+            self._record_features(node_id, body)
             self._last_error.pop(node_id, None)
             return True
         except ProbeFailed as exc:
@@ -1304,6 +1311,38 @@ class Registry:
         if build != state.build:
             log.info("node %s is running build %s", node_id, build)
         state.build = build
+
+    def set_local_features(self, read: Callable[[], Sequence[str]]) -> None:
+        """How to ask the coordinator's own agent what it can do."""
+        self._local_features = read
+
+    def _record_features(self, node_id: str, body: object) -> None:
+        """Store what the node said it can do -- or that it did not say.
+
+        The opposite of ``_record_build``'s rule, deliberately. A build id
+        going missing tells nothing about the build, but a features list going
+        missing is exactly what a node rolled back to an older agent looks
+        like, and keeping the last list would offer it as a copy target for a
+        route it no longer has. So absence is recorded as None (unknown), and
+        a malformed value is too; it is never an empty list, which would claim
+        the agent answered and can do nothing.
+        """
+        state = self._members.get(node_id)
+        if state is None or not isinstance(body, dict):
+            return
+        raw = body.get("features")
+        features = (
+            tuple(dict.fromkeys(str(f) for f in raw if isinstance(f, str) and f))
+            if isinstance(raw, list)
+            else None
+        )
+        if features != state.features:
+            log.info(
+                "node %s reports features %s",
+                node_id,
+                ", ".join(features) if features is not None else "(none: older agent)",
+            )
+        state.features = features
 
     async def refresh_profile(self, node_id: str) -> bool:
         """Re-read one member's hardware. True when the stored profile changed.

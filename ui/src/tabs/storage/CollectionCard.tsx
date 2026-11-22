@@ -1,8 +1,8 @@
-import { useStorage } from '../../state/resources'
+import type { Resource } from '../../state/backend'
 import { Lamp } from '../../components/Lamp'
 import { Verbatim } from '../../components/Verbatim'
 import { relativeTime } from '../../format'
-import type { CollectorCursor } from '../../api/types'
+import type { CollectorCursor, StorageReport } from '../../api/types'
 
 const MiB = 1024 ** 2
 
@@ -28,8 +28,7 @@ function signal(c: CollectorCursor): 'live' | 'warn' | 'fault' {
  *  rows still serves, still reports live telemetry, and still draws a full
  *  graph — it is simply no longer keeping the history, and nothing else in the
  *  product would ever say so. */
-export function CollectionCard() {
-  const storage = useStorage()
+export function CollectionCard({ storage }: { storage: Resource<StorageReport | null> }) {
   const telemetry = storage.data?.telemetry
 
   if (storage.loading) {

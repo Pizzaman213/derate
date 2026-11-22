@@ -379,3 +379,102 @@ def test_a_node_on_an_older_build_says_so_rather_than_echoing_a_404():
     # The HTTP client's own 404 string, and the MDN link it carries, must not
     # reach an operator.
     assert "404" not in row["reason"]
+
+
+def _storage_with_capacity_answers(monkeypatch, answers: dict) -> dict:
+    """`/api/storage` over a fake agent per node; `answers` maps node id to
+    what its `/agent/transfers/capacity` does: (status, body) or an exception."""
+    import httpx
+
+    from control_plane.gateway.app import create_app
+    from control_plane.gateway.deps import GatewayDeps
+
+    class _Registry:
+        def list_nodes(self):
+            return [
+                type("N", (), {"profile": type("P", (), {"node_id": n})()})()
+                for n in answers
+            ]
+
+        def agent_url(self, node_id):
+            return f"http://{node_id}.test:8081"
+
+    class _Response:
+        def __init__(self, status: int, body: dict):
+            self.status_code = status
+            self._body = body
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("bad", request=None, response=None)
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            node = url.split("//", 1)[1].split(".test", 1)[0]
+            if url.endswith("/agent/transfers/capacity"):
+                answer = answers[node]
+                if isinstance(answer, Exception):
+                    raise answer
+                return _Response(*answer)
+            if url.endswith("/agent/models/cache"):
+                return _Response(200, {"available": True, "path": "/c", "repos": [],
+                                       "total_bytes": 0, "reason": None})
+            return _Response(200, {"filesystems": [], "estate": [], "unreadable": []})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    deps = GatewayDeps()
+    deps.registry = _Registry()
+    body = TestClient(create_app(deps)).get("/api/storage").json()
+    return {row["node_id"]: row for row in body["nodes"]}
+
+
+def test_each_node_row_says_whether_it_can_take_a_copy(monkeypatch):
+    """The Copy to <node> button is disabled with this reason BEFORE a click,
+    so each failure mode has to arrive as its own sentence, and a node that
+    can take one has to say so with its free space."""
+    import httpx
+
+    rows = _storage_with_capacity_answers(monkeypatch, {
+        "ready": (200, {"cache": "/c", "free": 314 * 2**30, "total": 4 * 2**40}),
+        "old": (404, {"detail": "Not Found"}),
+        "noport": (503, {"detail": "this node is not accepting copies: port 47101 could not be opened"}),
+        "down": httpx.ConnectError("connection refused"),
+    })
+
+    assert rows["ready"]["copy_receiver"] == {"available": True, "reason": None, "free": 314 * 2**30}
+
+    old = rows["old"]["copy_receiver"]
+    assert old["available"] is False and old["free"] is None
+    assert "older build without the copy receiver; upgrade it" in old["reason"]
+    assert "404" not in old["reason"]
+
+    noport = rows["noport"]["copy_receiver"]
+    assert noport["available"] is False
+    assert "port 47101 could not be opened" in noport["reason"]
+    assert noport["reason"].startswith("noport")
+
+    down = rows["down"]["copy_receiver"]
+    assert down["available"] is False
+    assert "connection refused" in down["reason"]
+
+    # The disk picture of every node is unaffected by its copy answer.
+    assert all(r["available"] is True for r in rows.values())
+
+
+def test_a_node_with_no_agent_url_cannot_take_a_copy_either():
+    body = _gateway_client().get("/api/storage").json()
+    for row in body["nodes"]:
+        assert row["copy_receiver"]["available"] is False
+        assert row["copy_receiver"]["reason"]

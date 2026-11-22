@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { useStorage, useCluster } from '../../state/resources'
 import { useBackend } from '../../state/backend'
+import type { Resource } from '../../state/backend'
 import { CacheTable } from '../../components/CacheTable'
-import type { CachedModel } from '../../api/types'
+import type { CachedModel, Cluster, ReplicationState, StorageReport } from '../../api/types'
+import { copyBlocked } from './presence'
 import { folderFor } from '../../api/modelcache'
 
 const GiB = 1024 ** 3
@@ -21,9 +22,15 @@ function sizeLabel(b: number | null | undefined): string {
  *  see them. The control plane does not download them: the runtime container
  *  does, into the host cache it mounts, which is the same directory the node
  *  agent reads here. */
-export function ModelCacheCard() {
-  const storage = useStorage()
-  const cluster = useCluster()
+export function ModelCacheCard({
+  storage,
+  cluster,
+  replication,
+}: {
+  storage: Resource<StorageReport | null>
+  cluster: Resource<Cluster>
+  replication: Resource<ReplicationState>
+}) {
   const { backend, invalidate } = useBackend()
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -63,7 +70,44 @@ export function ModelCacheCard() {
     }
   }
 
+  // Copies go out of the coordinator's cache only, so only its table offers
+  // them, one button per other node.
+  const coordinatorId = cluster.data?.nodes.find((n) => n.role === 'coordinator')?.profile.node_id
+  const targets = (cluster.data?.nodes ?? [])
+    .map((n) => n.profile.node_id)
+    .filter((id) => id !== coordinatorId)
+  // Read off the same fan-out, so a target whose agent cannot take a copy is
+  // a disabled button with its reason rather than a failure on click.
+  const blocked = new Map<string, string>()
+  for (const t of targets) {
+    const why = copyBlocked(nodes, t)
+    if (why) blocked.set(t, why)
+  }
+
+  const copy = async (m: CachedModel, target: string) => {
+    setBusy(`copy:${target}/${m.folder}`)
+    setError(null)
+    setFreed(null)
+    try {
+      await backend.startTransfer(m.folder, target)
+      setFreed(`Copying ${m.repo_id} to ${target}; progress shows under Downloads.`)
+      invalidate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const anyCache = nodes.some((n) => n.models)
+
+  // The copies derate placed itself, per node, so each row says so.
+  const replicaFolders = new Map<string, Map<string, boolean>>()
+  for (const r of replication.data?.replicas ?? []) {
+    const folders = replicaFolders.get(r.node_id) ?? new Map<string, boolean>()
+    folders.set(r.folder, r.complete)
+    replicaFolders.set(r.node_id, folders)
+  }
 
   return (
     <div className="card2">
@@ -86,6 +130,10 @@ export function ModelCacheCard() {
             node={n}
             servedFolders={servedFolders}
             onDelete={remove}
+            copyTargets={n.node_id === coordinatorId ? targets : undefined}
+            copyBlocked={n.node_id === coordinatorId ? blocked : undefined}
+            onCopy={n.node_id === coordinatorId ? copy : undefined}
+            replicaFolders={replicaFolders.get(n.node_id)}
             busy={busy}
           />
         ))

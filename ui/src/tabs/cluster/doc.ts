@@ -40,6 +40,7 @@ import {
   type SocketSpec,
   type SocketType,
 } from './sockets'
+import { nodeSoftware } from './software'
 
 // ── Inputs and the document ──────────────────────────────────────────────────
 
@@ -1313,6 +1314,16 @@ export function validate(
       block: key.startsWith('provider:') ? key : `split:${name}`,
       conflict: key,
     })
+  }
+  // Live, and a warning only: a node on another build, or one missing a
+  // feature its agent should have. Rolling upgrades stay allowed, so this
+  // never blocks Save -- it tints the machine and names the cure.
+  for (const n of s.cluster.nodes) {
+    const id = n.profile.node_id
+    const sw = nodeSoftware(names.get(id) ?? id, n, s.cluster.summary.coordinator_build, s.cluster.summary.agent_features ?? [])
+    for (const [k, message] of [sw.skew, ...sw.gaps].entries()) {
+      if (message) issues.push({ id: `software:${id}:${k}`, level: 'warn', live: true, message, block: `machine:${id}` })
+    }
   }
   return issues
 }

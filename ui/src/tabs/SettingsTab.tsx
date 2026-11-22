@@ -1,5 +1,5 @@
-import { useState } from 'react'
 import { useRouter } from '../state/router'
+import type { SettingsSection } from '../state/routes'
 import { CoordinatorCard } from './settings/CoordinatorCard'
 import { ApiTokenCard } from './settings/ApiTokenCard'
 import { AddNodeCard } from './settings/AddNodeCard'
@@ -14,23 +14,10 @@ import { SessionsCard } from './settings/SessionsCard'
 import { PricingCard } from './settings/PricingCard'
 import { AppearanceCard } from './settings/AppearanceCard'
 import { ScopeCards } from './settings/ScopeCards'
-import { FilesystemsCard } from './storage/FilesystemsCard'
-import { ModelCacheCard } from './storage/ModelCacheCard'
-import { EstateCard } from './storage/EstateCard'
-import { CollectionCard } from './storage/CollectionCard'
+import { StorageSection } from './storage/StorageSection'
 import { AuditTab } from './audit/AuditTab'
 
-type Sub =
-  | 'connection'
-  | 'nodes'
-  | 'instance'
-  | 'storage'
-  | 'providers'
-  | 'policy'
-  | 'admins'
-  | 'audit'
-  | 'appearance'
-  | 'about'
+type Sub = SettingsSection
 
 const SUBS: { id: Sub; label: string }[] = [
   // Connection first for the same reason Coordinator used to be the first
@@ -59,11 +46,12 @@ const SUBS: { id: Sub; label: string }[] = [
  *  About cards, which are documentation and never change. Splitting on the
  *  job puts every screen inside one viewport.
  *
- *  Instance opens automatically when the address bar already names a node
+ *  The section is in the path (`/settings/storage`, `Route.section`), the
+ *  way /usage's panes are, so a link -- the Downloads panel's "waiting for
+ *  your OK" -- opens the section it is about. The bare `/settings` still
+ *  picks one: Instance when the address bar already names a node
  *  (`/settings?node=&dep=`, the same global selection every other screen
- *  shares) -- landing there used to be indistinguishable from a plain
- *  `/settings`, which is the bug this exists to fix. That only decides the
- *  FIRST render; switching sub-tabs by hand afterward is untouched.
+ *  shares), Connection otherwise. Picking a section pushes, like a pane.
  *
  *  Storage joined this tab rather than staying its own destination: it is the
  *  same job as Nodes -- reading facts off the machines behind this
@@ -91,8 +79,8 @@ const SUBS: { id: Sub; label: string }[] = [
  *  section, plus AddNodeCard, which the mockup gestured at with an address
  *  form it could not wire up. */
 export function SettingsTab() {
-  const { route } = useRouter()
-  const [sub, setSub] = useState<Sub>(() => (route.node ? 'instance' : 'connection'))
+  const { route, navigate } = useRouter()
+  const sub: Sub = route.section ?? (route.node ? 'instance' : 'connection')
 
   return (
     <div>
@@ -105,7 +93,7 @@ export function SettingsTab() {
             type="button"
             aria-selected={sub === s.id}
             aria-controls={`st-${s.id}`}
-            onClick={() => setSub(s.id)}
+            onClick={() => navigate({ dest: 'settings', section: s.id })}
           >
             {s.label}
           </button>
@@ -143,10 +131,7 @@ export function SettingsTab() {
       </div>
 
       <div id="st-storage" role="tabpanel" aria-labelledby="st-tab-storage" hidden={sub !== 'storage'}>
-        <FilesystemsCard />
-        <ModelCacheCard />
-        <EstateCard />
-        <CollectionCard />
+        <StorageSection />
       </div>
 
       <div
