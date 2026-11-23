@@ -1,4 +1,6 @@
 #!/bin/sh
 # Enable once per clone:  git config core.hooksPath .githooks
-# Runs the mechanical validation gate; a red gate blocks the push.
-exec npm --prefix "$(git rev-parse --show-toplevel)/.omp" run validate
+# Runs the fast gate (static checks, line budgets) on the working tree; a red gate blocks the
+# push. The full gate (tests, typecheck, UI verifiers) needs credentials and a built tree, so
+# agents run it with `cd .omp && npm run validate` before reporting done.
+exec npm --prefix "$(git rev-parse --show-toplevel)/.omp" run validate -- --fast
