@@ -158,16 +158,18 @@ Removing it from derate deletes local tokens, not remote Claude authorization.
 See `control_plane/providers/README.md` for supported requests and live-verification limits.
 
 The endpoint is not open. `/v1` answers only to a derate API key,
-`Authorization: Bearer drt_<id>_<secret>`, minted on the **Keys** screen and
+`Authorization: Bearer derate-<id>_<secret>`, minted on the **Keys** screen and
 shown exactly once; the screens and `/api` answer only to a signed-in admin,
 and the first admin is created by the first step of setup, from the
 coordinator itself (loopback, or an `ssh -L` tunnel to it). A key belongs to an
 org, expires (1 to 365 days), can be disabled, rotated or deleted, and carries
 limits — tokens, requests and dollars per 30-day cycle, local and cloud pools,
 rpm, tpm, concurrency, per-request caps, per model — that refuse with a 429
-naming the limit that tripped. Every request row records the key that sent it,
-so each key has its own usage page. `GET /v1/key` tells a client what
-its key may do. See `docs/guide/the-endpoint.md`.
+naming the limit that tripped. A key that names no rpm is held to 120. Minting
+or rotating a key asks for the admin's password again. Every request row
+records the key that sent it, so each key has its own usage page.
+`GET /v1/key` tells a client what its key may do. See
+`docs/guide/the-endpoint.md`.
 
 ## The cluster
 
@@ -210,6 +212,9 @@ coordinator before you need them (`docs/FORENSICS.md` is how to use them):
 DERATE_AUDIT_SINK=https://<collector>/...  # with DERATE_AUDIT_SINK_TOKEN; or tcp://<siem>:6514
 DERATE_TRUSTED_PROXIES=<proxy ip/cidr>     # when a proxy fronts the UI or /v1
 DERATE_PUBLIC_ORIGIN=https://...           # likewise
+DERATE_EDGE_PORT=8089                      # cloudflared points here: /v1 only, never the UI
+DERATE_EDGE_HOST=127.0.0.1                 # the docker bridge address if cloudflared is a container
+DERATE_EDGE_CLIENT_HEADER=cf-connecting-ip
 DERATE_REQUESTS_RETENTION_DAYS=90
 DERATE_AUDIT_LOG_DAYS=400
 DERATE_LOG_BACKUPS=14
@@ -219,6 +224,15 @@ The sink is off by default, and without it the audit chain's only copies are
 on the box an intruder would be on. Without `DERATE_TRUSTED_PROXIES` behind a
 proxy every recorded address is the proxy's; it takes addresses and CIDRs
 only, and `*` or a `/0` stops the node at startup.
+
+Point the tunnel at the edge port, never at `DERATE_PORT`; the edge answers
+404 to everything but `/v1`, takes the caller's address from Cloudflare's
+header and refuses a request that lacks it. Name only a header the edge itself
+overwrites in `DERATE_EDGE_CLIENT_HEADER`: one a client can set would let it
+choose the address every throttle and audit row records. A `/v1` body whose
+`image_url` (or video/audio URL) names a private or LAN host is refused 400,
+and an address that presents 20 bad keys in a minute is answered 429 until
+the minute passes.
 
 Prefer an `https://` sink with `DERATE_AUDIT_SINK_TOKEN`. The `udp://` and
 `tcp://` syslog transports are unauthenticated: anyone who can reach the

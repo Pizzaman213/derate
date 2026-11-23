@@ -46,7 +46,7 @@ from . import (
     shell_api,
     ui_api,
 )
-from control_plane.contracts.auth import AuditAction
+from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN, AuditAction
 from control_plane.deploy.autoadopt import ContainerAutoAdopter
 from control_plane.inventory import api as inventory_api
 from control_plane.paths import data_path
@@ -688,7 +688,12 @@ def create_app(
     # request id. Plain ASGI, not @app.middleware("http") -- see AuthGuard
     # for the measured reason. It also writes the access record for every
     # HTTP request and socket.
-    app.add_middleware(authz.AuthGuard)
+    # One per-address budget of refused keys, shared by the HTTP gate and
+    # require_key on the sockets, so neither path can be used to drain the
+    # other's allowance. On app.state because the socket handlers have no
+    # handle on the guard instance (Starlette builds middleware lazily).
+    app.state.key_refusals = authz.RefusalWindow(KEY_REFUSALS_PER_ADDRESS_PER_MIN)
+    app.add_middleware(authz.AuthGuard, key_refusals=app.state.key_refusals)
 
     # Last, so outermost: every answer carries the headers, including the
     # refusals AuthGuard sends itself and every static

@@ -513,9 +513,9 @@ export interface Backend {
   disableOrgKeys(orgId: string, reason?: string): Promise<{ disabled: string[] }>
   enableKey(keyId: string): Promise<ApiKeyRow>
   /** Replaces the secret and reveals the new one, once. The old one stops
-   *  working immediately. An admin key also needs the signed-in admin's
-   *  `currentPassword`; other keys ignore it. */
-  rotateKey(keyId: string, currentPassword?: string): Promise<MintedKey>
+   *  working immediately. Needs the signed-in admin's `currentPassword` for
+   *  every key: a stolen session alone must not mint a credential. */
+  rotateKey(keyId: string, currentPassword: string): Promise<MintedKey>
   /** This cycle only: the override is gone when the cycle ends. */
   raiseLimit(keyId: string, limitType: string, value: number): Promise<LimitState>
   resetCycle(keyId: string): Promise<void>
@@ -644,7 +644,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 /** `req` without `scrub()`. Used by exactly three calls -- `setupAdmin`,
- *  `createKey`, `rotateKey` -- because their whole answer is a `drt_` secret
+ *  `createKey`, `rotateKey` -- because their whole answer is a `derate-` secret
  *  shown once (redact.ts names the exception). Nothing else may use it. */
 async function reqUnscrubbed<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetchOk(path, init)
@@ -1669,7 +1669,7 @@ export const httpBackend: Backend = {
   rotateKey: (keyId, currentPassword) =>
     reqUnscrubbed<MintedKey>(
       `/api/keys/${seg(keyId)}/rotate`,
-      post(currentPassword ? { current_password: currentPassword } : undefined),
+      post({ current_password: currentPassword }),
     ),
   raiseLimit: (keyId, limitType, value) =>
     req<LimitState>(`/api/keys/${seg(keyId)}/raise`, post({ limit_type: limitType, value })),

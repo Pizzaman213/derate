@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { Copyable } from './Copyable'
 import { containTab } from './focusTrap'
 
-/** The one place a `drt_` API key is ever on screen.
+/** The one place a `derate-` API key is ever on screen.
  *
  *  The coordinator stores only a hash of the secret, so this is the reveal and
  *  there is no second one: the key's own page, the keys table and every other

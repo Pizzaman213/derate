@@ -197,6 +197,16 @@ _DECLARED = (
     _v("DERATE_PUBLIC_ORIGIN", "", "control_plane/gateway/settings.py",
        "the origin browsers use when a TLS terminator fronts the gateway, "
        "e.g. https://derate.example; drives the cookie's Secure flag and CSRF"),
+    _v("DERATE_EDGE_PORT", "", "control_plane/gateway/settings.py",
+       "second listener for a WAN edge (cloudflared): answers /v1/** only, "
+       "takes the client address from DERATE_EDGE_CLIENT_HEADER, forces https; "
+       "unset = no edge socket"),
+    _v("DERATE_EDGE_HOST", "127.0.0.1", "control_plane/gateway/settings.py",
+       "address the edge socket binds; loopback when cloudflared runs on this "
+       "host, the docker bridge address when it is a container"),
+    _v("DERATE_EDGE_CLIENT_HEADER", "cf-connecting-ip", "control_plane/gateway/settings.py",
+       "header naming the real client on an edge connection; a request without "
+       "a valid IP in it is refused 400"),
 
     # -- the audit trail -----------------------------------------------------
     _v("DERATE_AUDIT_SINK", "", "control_plane/auditlog.py",
@@ -236,7 +246,7 @@ _DECLARED = (
     _v("DERATE_CHECK_ADMIN_PASSWORD", "", "ui/src/check/auth.mjs",
        "that admin's password"),
     _v("DERATE_CHECK_API_KEY", "", "ui/src/check/auth.mjs",
-       "a drt_ key for verifiers that call /v1 directly"),
+       "a derate- key for verifiers that call /v1 directly"),
     _v("DERATE_GALLERY_ONLY", None, ".omp/tests/ui/layout.check.mjs",
        "comma-separated component names; run.mjs sets it to scope the gallery "
        "layout matrix to the components a ui:check path names"),

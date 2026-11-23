@@ -159,9 +159,9 @@ control_plane/planner/     TP/PP/EP from measured facts
 control_plane/deploy/      sparkrun adapter, lifecycle
 control_plane/gateway/     the one HTTP surface: /v1, /api, and the built UI.
                            authz.py is the credential gate: a session on /api,
-                           a drt_ key on /v1, everything else open by name.
+                           a derate- key on /v1, everything else open by name.
 control_plane/auth/        admins (argon2id), sessions, login lockout, audit log
-control_plane/keys/        orgs and drt_ API keys; keys/format.py is the key shape
+control_plane/keys/        orgs and derate- API keys; keys/format.py is the key shape
 control_plane/limits/      30-day cycle counters, rpm/tpm/concurrency windows,
                            per-request caps, local model pricing (limits.db)
 control_plane/providers/   remote upstreams as route targets
@@ -215,8 +215,8 @@ what to change, and rewriting it destroys the thing that made it useful.
 
 **No API key is ever rendered -- with one exception.** `ui/src/api/redact.ts`
 scrubs responses on the way in, by field name for provider keys and by value
-(`drt_<id>_<secret>`) for derate's own. Do not add an inverse. The exception,
-added 2026-11-17: a `drt_` secret is shown exactly once, in
+(`derate-<id>_<secret>`) for derate's own. Do not add an inverse. The exception,
+added 2026-11-17: a `derate-` secret is shown exactly once, in
 `components/RevealModal.tsx`, from the `secret_once` field of exactly three
 responses -- `POST /api/setup/admin`, `POST /api/keys`,
 `POST /api/keys/{id}/rotate` -- which `client.ts` fetches through

@@ -73,7 +73,7 @@ def test_mint_1000_ids_are_10_lowercase_alnum_and_parse_back():
     for _ in range(1000):
         key_id, secret, raw = kf.mint()
         assert len(key_id) == KEY_ID_LEN and set(key_id) <= alphabet
-        assert raw == f"drt_{key_id}_{secret}"
+        assert raw == f"derate-{key_id}_{secret}"
         assert kf.parse(raw) == (key_id, secret)  # secrets may contain "_"
         assert pattern.fullmatch(raw)
         ids.add(key_id)
@@ -84,13 +84,15 @@ def test_mint_1000_ids_are_10_lowercase_alnum_and_parse_back():
     "raw",
     [
         "sk_abcdefghij_" + "x" * 43,  # wrong prefix
-        "DRT_abcdefghij_" + "x" * 43,
-        "drt_abcdefghi_" + "x" * 43,  # 9-char id
-        "drt_abcdefghijk_" + "x" * 43,  # 11-char id
-        "drt_ABCDEFGHIJ_" + "x" * 43,  # uppercase id
-        "drt_abcdefghi-_" + "x" * 43,  # bad charset
-        "drt_abcdefghij_",  # empty secret
-        "drt_abcdefghij",  # no separator
+        "DERATE-abcdefghij_" + "x" * 43,
+        "drt_abcdefghij_" + "x" * 43,  # the retired prefix: a hard cut, no alias
+        "derate_abcdefghij_" + "x" * 43,  # underscore, not hyphen
+        "derate-abcdefghi_" + "x" * 43,  # 9-char id
+        "derate-abcdefghijk_" + "x" * 43,  # 11-char id
+        "derate-ABCDEFGHIJ_" + "x" * 43,  # uppercase id
+        "derate-abcdefghi-_" + "x" * 43,  # bad charset
+        "derate-abcdefghij_",  # empty secret
+        "derate-abcdefghij",  # no separator
         "",
     ],
 )
@@ -284,7 +286,9 @@ def test_authenticate_success_updates_last_used(svc, clock):
     "mangle",
     [
         lambda raw: "garbage",
-        lambda raw: "drt_zzzzzzzzzz_" + "x" * 43,  # unknown id
+        lambda raw: "derate-zzzzzzzzzz_" + "x" * 43,  # unknown id
+        # A real key's id and secret behind the retired prefix.
+        lambda raw: "drt_" + raw.removeprefix("derate-"),
         lambda raw: raw[:-1] + ("A" if raw[-1] != "A" else "B"),  # wrong secret
     ],
 )

@@ -1,6 +1,6 @@
 # keys
 
-Orgs and the `drt_` API keys every `/v1` request has to carry.
+Orgs and the `derate-` API keys every `/v1` request has to carry.
 `KeyService` implements `contracts/auth.py::KeyPort` over one SQLite file,
 `keys.db` under `paths.data_dir()`, and is opened on first use by
 `gateway/authz.py::AuthStores` as `ctx.auth_stores.keys`.
@@ -29,7 +29,7 @@ request's `Principal`. `gateway/keys_api.py` serves `/api/orgs*` and
 
 ## The key
 
-`drt_<key_id>_<secret>`: `key_id` is 10 chars of `[a-z0-9]` (`secrets.choice`)
+`derate-<key_id>_<secret>`: `key_id` is 10 chars of `[a-z0-9]` (`secrets.choice`)
 and is what the row is found by; `secret` is `secrets.token_urlsafe(32)`, so it
 may itself contain `_` -- `parse` splits once. `KEY_PATTERN` is the regex the
 redactors scrub by value.

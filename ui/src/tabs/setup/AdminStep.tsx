@@ -18,7 +18,7 @@ import '../login/login.css'
 // nothing else, and none of the wizard's prefetches run, until "I saved it".
 //
 // `POST /api/setup/admin` answers with the default API key's secret, once
-// (RevealModal is the only place a `drt_` secret is ever drawn). It is held in
+// (RevealModal is the only place a `derate-` secret is ever drawn). It is held in
 // this component's state only until the person says they saved it, then
 // dropped; it is never logged, never put in a URL and never stored.
 

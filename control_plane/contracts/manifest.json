@@ -300,7 +300,10 @@
         "LIMIT_EXCEEDS_ORG": "limit_exceeds_org",
         "ALLOWLIST_EXCEEDS_ORG": "allowlist_exceeds_org",
         "MODEL_NOT_ALLOWED": "model_not_allowed",
-        "SETUP_LOCAL_ONLY": "setup_local_only"
+        "SETUP_LOCAL_ONLY": "setup_local_only",
+        "EDGE_NOT_FOUND": "not_found",
+        "EDGE_CLIENT_UNKNOWN": "edge_client_unknown",
+        "MEDIA_URL_REFUSED": "media_url_refused"
       }
     },
     "AuthPort": {
@@ -2231,6 +2234,10 @@
       "module": "control_plane.contracts.hardware",
       "value": 0.9
     },
+    "DEFAULT_KEY_RPM": {
+      "module": "control_plane.contracts.auth",
+      "value": 120
+    },
     "DEGRADED_TPS_THRESHOLD": {
       "module": "control_plane.contracts.constants",
       "value": 10.0
@@ -2294,7 +2301,11 @@
     },
     "KEY_PREFIX": {
       "module": "control_plane.contracts.auth",
-      "value": "drt_"
+      "value": "derate-"
+    },
+    "KEY_REFUSALS_PER_ADDRESS_PER_MIN": {
+      "module": "control_plane.contracts.auth",
+      "value": 20
     },
     "KEY_SECRET_BYTES": {
       "module": "control_plane.contracts.auth",
@@ -2822,10 +2833,10 @@
       ],
       "restated_at": []
     },
-    "drt_key_pattern": {
+    "derate_key_pattern": {
       "canonical": "control_plane.keys.format:KEY_PATTERN",
-      "value": "\\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\\-]{32,}",
-      "why": "the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, copy",
+      "value": "\\bderate-[a-z0-9]{10}_[A-Za-z0-9_\\-]{32,}",
+      "why": "the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts KEY_PATTERN is a third, TypeScript, copy",
       "copies": [
         "control_plane.redaction:KEY_PATTERN"
       ],
@@ -3029,7 +3040,7 @@
     "DERATE_CHECK_API_KEY": {
       "default": "",
       "owner": "ui/src/check/auth.mjs",
-      "note": "a drt_ key for verifiers that call /v1 directly"
+      "note": "a derate- key for verifiers that call /v1 directly"
     },
     "DERATE_CHECK_BROWSER": {
       "default": null,
@@ -3065,6 +3076,21 @@
       "default": "http://localhost:8088",
       "owner": "tests/unit/test_gateway.py",
       "note": "which coordinator the audio round trip launches real models on"
+    },
+    "DERATE_EDGE_CLIENT_HEADER": {
+      "default": "cf-connecting-ip",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "header naming the real client on an edge connection; a request without a valid IP in it is refused 400"
+    },
+    "DERATE_EDGE_HOST": {
+      "default": "127.0.0.1",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "address the edge socket binds; loopback when cloudflared runs on this host, the docker bridge address when it is a container"
+    },
+    "DERATE_EDGE_PORT": {
+      "default": "",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "second listener for a WAN edge (cloudflared): answers /v1/** only, takes the client address from DERATE_EDGE_CLIENT_HEADER, forces https; unset = no edge socket"
     },
     "DERATE_ELECTRICITY_RATE": {
       "default": "0",

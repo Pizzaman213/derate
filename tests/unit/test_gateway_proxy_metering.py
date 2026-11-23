@@ -22,7 +22,7 @@ from starlette.websockets import WebSocketDisconnect
 from control_plane.contracts.auth import LimitScope
 from control_plane.gateway import create_app
 from control_plane.limits.service import estimate_prompt_tokens
-from tests.unit.conftest import credentials
+from tests.unit.conftest import BOOT_PASSWORD, credentials
 from tests.unit.test_gateway import (
     SECRET_KEY,
     FakeBackend,
@@ -111,7 +111,8 @@ def _mint(app, **limits) -> tuple[str, str]:
     cookie, _ = credentials(app)
     r = TestClient(app).post(
         "/api/keys",
-        json={"name": "metered", "expiry_days": 30, "limits": limits},
+        json={"name": "metered", "expiry_days": 30, "limits": limits,
+              "current_password": BOOT_PASSWORD},
         headers={"Cookie": f"derate_session={cookie}"},
     )
     assert r.status_code == 200, r.text

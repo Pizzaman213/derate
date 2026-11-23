@@ -50,14 +50,14 @@ def _rows(app, action: AuditAction):
 
 def test_key_refusals_are_one_row_per_minute_per_source_with_a_count(gate):
     app, client, _ = gate
-    bad = "drt_abcdefghij_" + "x" * 43
+    bad = "derate-abcdefghij_" + "x" * 43
     for _ in range(3):
         r = client.get("/v1/models", headers={"Authorization": f"Bearer {bad}"})
         assert r.status_code == 401
     rows = _rows(app, AuditAction.KEY_REFUSED)
     assert len(rows) == 1
     assert rows[0].actor == "-"
-    assert rows[0].after["presented"] == "drt_abcdefghij"
+    assert rows[0].after["presented"] == "derate-abcdefghij"
     assert rows[0].ip == "127.0.0.1"
     assert "x" * 43 not in str(rows[0].after)
     # The next row for the same source carries what was folded in since.
@@ -71,14 +71,71 @@ def test_key_refusals_are_one_row_per_minute_per_source_with_a_count(gate):
 def test_a_fresh_fake_key_id_per_request_is_still_one_row_per_address(gate):
     app, client, _ = gate
     for i in range(200):
-        bad = f"drt_{i:010d}_" + "x" * 43
-        assert client.get("/v1/models", headers={"Authorization": f"Bearer {bad}"}).status_code == 401
+        bad = f"derate-{i:010d}_" + "x" * 43
+        # 401 until the address's refusal budget is spent, 429 after; both
+        # are KEY_REFUSED events from one address and fold into one row.
+        status = client.get("/v1/models", headers={"Authorization": f"Bearer {bad}"}).status_code
+        assert status in (401, 429)
     rows = _rows(app, AuditAction.KEY_REFUSED)
     assert len(rows) == 1 and rows[0].after["count"] == 1
     app.state.ctx.secevents._window = 0.0
-    client.get("/v1/models", headers={"Authorization": "Bearer drt_zzzzzzzzzz_" + "x" * 43})
+    client.get("/v1/models", headers={"Authorization": "Bearer derate-zzzzzzzzzz_" + "x" * 43})
     rows = _rows(app, AuditAction.KEY_REFUSED)
     assert sorted(r.after["count"] for r in rows) == [1, 200]
+
+
+def test_refused_keys_from_one_address_are_throttled_without_a_lookup(gate, monkeypatch):
+    """Past KEY_REFUSALS_PER_ADDRESS_PER_MIN bad keys inside a minute an
+    address is answered 429 before the key store is read -- a valid key
+    included, since the budget is the address's -- while another address is
+    still 401, and the budget comes back once the window drains."""
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
+    from control_plane.keys.service import KeyService
+
+    app, client, cookie = gate
+    now = [1000.0]
+    app.state.key_refusals._clock = lambda: now[0]
+    lookups: list[str] = []
+    real = KeyService.authenticate
+
+    def counting(self, token, **kw):
+        lookups.append(token)
+        return real(self, token, **kw)
+
+    monkeypatch.setattr(KeyService, "authenticate", counting)
+    minted = client.post(
+        "/api/keys",
+        json={"name": "throttle", "expiry_days": 30, "current_password": ADMIN["password"]},
+        headers=cookie,
+    )
+    assert minted.status_code == 200, minted.text
+    good = {"Authorization": f"Bearer {minted.json()['secret_once']}"}
+    assert client.get("/v1/models", headers=good).status_code == 200
+
+    def bad(i: int) -> dict:
+        return {"Authorization": f"Bearer derate-{i:010d}_" + "x" * 43}
+
+    for i in range(KEY_REFUSALS_PER_ADDRESS_PER_MIN):
+        assert client.get("/v1/models", headers=bad(i)).status_code == 401
+    seen = len(lookups)
+    r = client.get("/v1/models", headers=bad(99))
+    assert r.status_code == 429, r.text
+    assert r.json()["error"]["code"] == "rate_limited"
+    assert r.headers["retry-after"] == "60"
+    assert "WWW-Authenticate" not in r.headers
+    assert len(lookups) == seen  # no store read for the throttled answer
+    assert client.get("/v1/models", headers=good).status_code == 429
+    other = TestClient(app, client=("10.0.0.7", 50000))
+    assert other.get("/v1/models", headers=bad(5)).status_code == 401
+    assert other.get("/v1/models", headers=good).status_code == 200
+    # The socket gate shares the window.
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/v1/realtime", headers=good):
+            pass
+    assert (caught.value.code, caught.value.reason) == (1008, "rate_limited")
+    now[0] += 61.0
+    assert client.get("/v1/models", headers=bad(98)).status_code == 401
+    assert client.get("/v1/models", headers=good).status_code == 200
 
 
 def test_a_refusal_returns_before_its_row_is_written():
@@ -94,7 +151,7 @@ def test_a_refusal_returns_before_its_row_is_written():
         written.append(kwargs["after"])
 
     events = SecurityEvents(slow_audit, queue_max=1)
-    events.note(AuditAction.KEY_REFUSED, actor="drt_aaaaaaaaaa", ip="10.0.0.1")
+    events.note(AuditAction.KEY_REFUSED, actor="derate-aaaaaaaaaa", ip="10.0.0.1")
     assert written == []  # note() did not wait for the slow write
     # A full queue drops and counts; the next written row says how many.
     events.note(AuditAction.KEY_REFUSED, actor="-", ip="10.0.0.2")

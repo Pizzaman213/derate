@@ -235,7 +235,7 @@ onboarding/model-surface/cluster item; this file is the flat checklist.
 - [ ] Run natively on macOS and Windows (Linux-only today; `derate` is taken
       on PyPI, needs a distribution name/channel)
 - [x] Inbound authentication on the gateway — admins + sessions on `/api`,
-      `drt_` API keys with per-key/org limits on `/v1`, an audit log, and the
+      `derate-` API keys with per-key/org limits on `/v1`, an audit log, and the
       `/login`, `/keys`, `/orgs`, `/audit` screens (2026-11-17; see
       `.omp/work/auth-keys/PROGRESS.md`)
 - [ ] Shareable guest access via QR code (person-scoped, revocable token

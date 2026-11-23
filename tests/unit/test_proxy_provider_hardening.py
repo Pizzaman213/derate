@@ -591,12 +591,13 @@ def test_voices_counts_against_the_key():
 
 
 def _mint_allowlisted(app, models: list[str]) -> str:
-    from tests.unit.conftest import credentials
+    from tests.unit.conftest import BOOT_PASSWORD, credentials
 
     cookie, _ = credentials(app)
     r = TestClient(app).post(
         "/api/keys",
-        json={"name": "narrow", "expiry_days": 30, "allowed_models": models},
+        json={"name": "narrow", "expiry_days": 30, "allowed_models": models,
+              "current_password": BOOT_PASSWORD},
         headers={"Cookie": f"derate_session={cookie}"},
     )
     assert r.status_code == 200, r.text
@@ -645,12 +646,13 @@ def test_max_tokens_1e999_is_a_400_not_a_500():
 
 def test_keys_api_refuses_an_infinite_limit():
     app = create_app(build_deps())
-    from tests.unit.conftest import credentials
+    from tests.unit.conftest import BOOT_PASSWORD, credentials
 
     cookie, _ = credentials(app)
     r = TestClient(app).post(
         "/api/keys",
-        content=b'{"name": "x", "expiry_days": 30, "limits": {"rpm": 1e999}}',
+        content=b'{"name": "x", "expiry_days": 30, "limits": {"rpm": 1e999}, '
+        b'"current_password": "' + BOOT_PASSWORD.encode() + b'"}',
         headers={"Cookie": f"derate_session={cookie}", "content-type": "application/json"},
     )
     assert r.status_code == 400

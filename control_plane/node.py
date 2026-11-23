@@ -26,7 +26,10 @@ A coordinator additionally:
 
 Both servers run as ``uvicorn.Server`` instances awaited concurrently in one
 event loop; SIGTERM/SIGINT flip ``should_exit`` on both, and
-``runtime.stop()`` always runs on the way out.
+``runtime.stop()`` always runs on the way out. With ``DERATE_EDGE_PORT`` set
+the gateway server listens on a second socket too -- the edge cloudflared is
+pointed at -- under the same app and one lifespan; ``gateway/authz.py`` tells
+the two apart per connection from ``scope["server"]``.
 
 The worker path must stay light: nothing from ``control_plane.gateway``,
 ``control_plane.deploy``, ``control_plane.providers``, ``control_plane.fit``,
@@ -39,14 +42,18 @@ or :func:`_serve_coordinator`, never at module scope.
 from __future__ import annotations
 
 import asyncio
+import errno
+import ipaddress
 import logging
 import os
 import signal
+import socket
 from typing import Callable
 
 import uvicorn
 
 from control_plane import logfiles
+from control_plane.redaction import Redactor, SecretRedactingFilter
 from control_plane.registry import NodeRuntime, RegistryConfig, start_node
 from control_plane.registry.config import ROLE_COORDINATOR
 
@@ -150,12 +157,12 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     )
 
 
-def _make_server(app, *, host: str, port: int) -> uvicorn.Server:
+def _config(app, *, host: str, port: int) -> uvicorn.Config:
     from control_plane.gateway.settings import uvicorn_proxy_kwargs
 
     # access_log=False: gateway.access (authz.on_request_done) is the access
     # line now -- request id, principal, UTC -- and uvicorn's would double it.
-    config = uvicorn.Config(
+    return uvicorn.Config(
         app,
         host=host,
         port=port,
@@ -165,7 +172,33 @@ def _make_server(app, *, host: str, port: int) -> uvicorn.Server:
         server_header=False,
         **uvicorn_proxy_kwargs(),
     )
-    return uvicorn.Server(config)
+
+
+def _make_server(app, *, host: str, port: int) -> uvicorn.Server:
+    return uvicorn.Server(_config(app, host=host, port=port))
+
+
+class _Server(uvicorn.Server):
+    """A uvicorn server that serves the sockets it was given: one lifespan
+    over several listeners, so the gateway and its edge share one app."""
+
+    def __init__(self, config: uvicorn.Config, sockets: list[socket.socket] | None = None):
+        super().__init__(config)
+        self._sockets = sockets
+
+    async def serve(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().serve(sockets=sockets or self._sockets)
+
+
+def _bind(host: str, port: int) -> socket.socket:
+    """A listening-ready socket bound the way ``uvicorn.Config.bind_socket``
+    binds one, so the edge behaves like the main listener in every respect
+    but the port."""
+    sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.set_inheritable(True)
+    return sock
 
 
 def _install_shutdown(
@@ -213,6 +246,13 @@ async def _serve_worker(runtime: NodeRuntime, config: RegistryConfig) -> None:
     await _run_with_signals([server])
 
 
+def _is_loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 async def _serve_coordinator(runtime: NodeRuntime, config: RegistryConfig) -> None:
     """Worker duties, plus the real gateway on the coordinator port."""
     from control_plane.gateway.app import create_app
@@ -231,9 +271,44 @@ async def _serve_coordinator(runtime: NodeRuntime, config: RegistryConfig) -> No
     agent_server = _make_server(
         runtime.agent_app(), host="0.0.0.0", port=config.agent_port
     )
-    gateway_server = _make_server(
-        gateway_app, host=deps.settings.host, port=deps.settings.port
-    )
+    settings = deps.settings
+    if settings.edge_port is None:
+        gateway_server = _make_server(gateway_app, host=settings.host, port=settings.port)
+    else:
+        if settings.edge_port == settings.port:
+            raise SystemExit("[derate] DERATE_EDGE_PORT must differ from DERATE_PORT")
+        # Bound first, so a taken edge port stops startup before the main
+        # listener exists, and says which variable moves it.
+        try:
+            edge = _bind(settings.edge_host, settings.edge_port)
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            raise SystemExit(
+                f"[derate] DERATE_EDGE_PORT {settings.edge_port} is already in use on "
+                f"{settings.edge_host}; pick another one."
+            ) from None
+        config = _config(gateway_app, host=settings.host, port=settings.port)
+        gateway_server = _Server(
+            config,
+            # bind_socket logs the main listener the way uvicorn always has.
+            sockets=[config.bind_socket(), edge],
+        )
+        log.info(
+            "edge listener on %s:%d: /v1 only, client address from %s",
+            settings.edge_host,
+            settings.edge_port,
+            settings.edge_client_header,
+        )
+        if not _is_loopback_host(settings.edge_host):
+            log.warning(
+                "edge listener is bound to %s, not loopback: anything that reaches "
+                "it directly can write %s and choose the address every throttle "
+                "and audit row records. Bind 127.0.0.1 unless cloudflared runs "
+                "in a container, and then firewall the port to it alone",
+                settings.edge_host,
+                settings.edge_client_header,
+            )
     await _run_with_signals([agent_server, gateway_server])
 
 
@@ -256,6 +331,9 @@ def main() -> None:
     )
     for handler in logging.getLogger().handlers:
         handler.setFormatter(logfiles.UTCFormatter(logfiles.LOG_FORMAT))
+        # Pattern rules now; logfiles.adopt_redactor swaps in the provider
+        # service's redactor (remembered values too) once that exists.
+        handler.addFilter(SecretRedactingFilter(Redactor()))
     logging.getLogger().setLevel(os.environ.get("DERATE_LOG_LEVEL", "INFO"))
     # Before asyncio.run, so a failure to start a node is in the file rather
     # than only on a stderr that systemd or `docker run -d` swallowed.

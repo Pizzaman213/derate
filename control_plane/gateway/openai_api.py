@@ -34,6 +34,7 @@ from control_plane.telemetry.records import spec_fields
 
 from . import authz, errors, policies, proxy as proxy_mod, realtime
 from .body import read_bounded_body
+from .media import media_url_refusal
 from .proxy import Attempt
 from .deps import GatewayContext
 
@@ -482,6 +483,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             return errors.error_response(
                 400, "Request body must be a JSON object.",
                 "invalid_request_error", "invalid_json",
+            )
+        # The model node fetches media URLs itself, from inside the LAN; a
+        # URL naming that LAN is refused before anything is forwarded. The
+        # raw body still goes on byte for byte when it passes.
+        why = media_url_refusal(body)
+        if why is not None:
+            return errors.error_response(
+                400, why, "invalid_request_error", AuthErrorCode.MEDIA_URL_REFUSED.value
             )
 
         model = body.get("model")

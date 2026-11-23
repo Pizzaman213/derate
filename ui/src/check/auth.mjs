@@ -1,4 +1,4 @@
-// The gateway answers /api only to an admin session and /v1 only to a `drt_`
+// The gateway answers /api only to an admin session and /v1 only to a `derate-`
 // API key (control_plane/gateway/authz.py). Every verifier that talks to a
 // live coordinator imports this file for its side effect: it logs in once as
 // $DERATE_CHECK_ADMIN_USER and wraps `globalThis.fetch` so a request to

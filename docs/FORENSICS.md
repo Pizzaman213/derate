@@ -75,7 +75,7 @@ written after a truncation re-anchors `HEAD` on what is left -- the
 
 ```bash
 python3 -m control_plane.forensics --since 2026-11-17T00:00:00Z \
-  --data-dir $case/data [--ip A.B.C.D] [--key drt_<id>] [--actor NAME] \
+  --data-dir $case/data [--ip A.B.C.D] [--key derate-<id>] [--actor NAME] \
   [--request-id r-...] [--until ...] [--format text|jsonl]
 ```
 
@@ -90,9 +90,11 @@ Exit 1 when the chain is broken. Sources:
 | `session` | `auth.db` `sessions` | sessions still live: who, from where, which browser, when they were last used |
 | `login` | `auth.db` `login_attempts` | only the last lockout window (15 minutes) |
 | `v1` | `telemetry/archive.db` `requests` | every `/v1` attempt: key, client address, user agent, model, status, request id; 90 days |
-| `access` | `telemetry/archive.db` `access` | every HTTP request the gateway answered -- reads, open paths (`/healthz`, `/install.sh`, `/auth/callback`, the static UI) and refusals included -- and every socket on close (status 101 when accepted, else its close code): address and source port, `session:<admin>` / `key:drt_<id>` / `-`, method, path, query string (first 200 characters, redacted), status, duration, user agent, request id; `DERATE_REQUESTS_RETENTION_DAYS` |
+| `access` | `telemetry/archive.db` `access` | every HTTP request the gateway answered -- reads, open paths (`/healthz`, `/install.sh`, `/auth/callback`, the static UI) and refusals included -- and every socket on close (status 101 when accepted, else its close code): address and source port, `session:<admin>` / `key:derate-<id>` / `-`, method, path, query string (first 200 characters, redacted), status, duration, user agent, request id; `DERATE_REQUESTS_RETENTION_DAYS` |
 | `agent` | `telemetry/archive.db` `events` where `source='agent'` | what a node agent did or refused on its `X-Derate-Token` routes, journalled on the node itself and shipped with its journal: `process_killed` (pid, name, signal), `cache_deleted` (folder, bytes freed), `journal_cursor_clamped` (a read that tried to acknowledge rows the node never wrote), `agent_refused` (method and path; at most one a minute per peer, with the count in between). `ip` is the peer that asked and `who` is `node:<node_id>`. A cluster-token holder who talks to an agent directly, bypassing the coordinator, leaves these and nothing else. Membership changes are `audit` rows: `node_joined` (who joined, from which address, on which credential, and the `agent_url` it replaced) |
 | `mirror!` | `logs/audit/*.jsonl` | an audit row the mirror holds that `auth.db` no longer holds as written -- the row as it was before somebody changed or deleted it |
+
+Rows written before 2026-11-22 carry the old `key:drt_<id>` form; `--key` finds both.
 
 ## 4. Pivot
 
@@ -100,7 +102,7 @@ The usual walk: start from what you know (an address in a firewall log, a key
 that spent money, an admin who says it was not them).
 
 1. `--ip` -> which keys and sessions that address used.
-2. `--key drt_<id>` -> every request that key made, from which addresses,
+2. `--key derate-<id>` -> every request that key made, from which addresses,
    and the audit rows that created, rotated or changed it (and by whom).
 3. `--actor <admin>` -> everything that admin did; the `session` column of
    each row (12 hex) is the session it came from, which joins to the

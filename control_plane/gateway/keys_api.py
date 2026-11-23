@@ -371,10 +371,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.post("/api/keys")
     async def create_key(request: Request) -> Response:
-        """A new key. ``secret_once`` is in this response and nowhere else, ever."""
+        """A new key. ``secret_once`` is in this response and nowhere else, ever.
+        Needs ``current_password`` in the body: a stolen session alone must not
+        be able to mint a credential."""
         body = await json_object(request)
         if isinstance(body, Response):
             return body
+        refused = await reauthenticated(request, stores(), body)
+        if refused is not None:
+            return refused
         keys = stores().keys
         name = body.get("name")
         if not isinstance(name, str):
@@ -523,17 +528,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.post("/api/keys/{key_id}/rotate")
     async def rotate_key(key_id: str, request: Request) -> Response:
         """A new secret for the same key; the old one fails from the next call.
-        ``secret_once`` is in this response and nowhere else, ever. An admin
-        key needs ``current_password`` in the body: it is that admin's
-        credential, so a stolen session alone must not be able to take it."""
-        key = stores().keys.get_key(key_id)
-        if key is not None and key.is_admin_key:
-            body = await optional_json_object(request)
-            if isinstance(body, Response):
-                return body
-            refused = await reauthenticated(request, stores(), body)
-            if refused is not None:
-                return refused
+        ``secret_once`` is in this response and nowhere else, ever. Needs
+        ``current_password`` in the body for any key: a stolen session alone
+        must not be able to mint a credential."""
+        body = await optional_json_object(request)
+        if isinstance(body, Response):
+            return body
+        refused = await reauthenticated(request, stores(), body)
+        if refused is not None:
+            return refused
         minted: list = []
 
         def apply(keys, actor):

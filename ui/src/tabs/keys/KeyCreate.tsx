@@ -5,6 +5,7 @@ import { KEY_EXPIRY_DAYS } from '../../api/types'
 import { containTab } from '../../components/focusTrap'
 import { Icon } from '../../components/Icon'
 import { Disclosure } from '../../components/Panel'
+import { PasswordField } from '../../components/PasswordField'
 import { RevealModal } from '../../components/RevealModal'
 import { Verbatim } from '../../components/Verbatim'
 import { useBackend } from '../../state/backend'
@@ -36,6 +37,8 @@ export function KeyCreate({ models }: { models: ServedModel[] }) {
   const [policy, setPolicy] = useState<RoutingPolicy | ''>('')
   const [fallback, setFallback] = useState('')
   const [notes, setNotes] = useState('')
+  /** Minting re-authenticates: sent as `current_password`, cleared with the draft. */
+  const [currentPassword, setCurrentPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [minted, setMinted] = useState<{
@@ -56,6 +59,7 @@ export function KeyCreate({ models }: { models: ServedModel[] }) {
     setPolicy('')
     setFallback('')
     setNotes('')
+    setCurrentPassword('')
     setError(null)
     setRoutingOpen(false)
   }
@@ -114,6 +118,7 @@ export function KeyCreate({ models }: { models: ServedModel[] }) {
       routing_policy: policy || null,
       notes,
       cloud_fallback_local_model: fallback || null,
+      current_password: currentPassword,
     }
     try {
       const res = await backend.createKey(spec)
@@ -296,6 +301,17 @@ export function KeyCreate({ models }: { models: ServedModel[] }) {
                     <textarea id="kc-notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
                   </div>
 
+                  <div className="fld" style={{ marginTop: 'var(--space-12)' }}>
+                    <label htmlFor="kc-current-pw">Your password</label>
+                    <PasswordField
+                      id="kc-current-pw"
+                      value={currentPassword}
+                      autoComplete="current-password"
+                      onChange={setCurrentPassword}
+                    />
+                    <span className="unit">Minting a key is an admin action: confirm it is you.</span>
+                  </div>
+
                   <div
                     style={{
                       marginTop: 'var(--space-12)',
@@ -303,7 +319,7 @@ export function KeyCreate({ models }: { models: ServedModel[] }) {
                       gap: 'var(--space-8)',
                     }}
                   >
-                    <button type="submit" disabled={busy}>
+                    <button type="submit" disabled={busy || !currentPassword}>
                       {busy ? 'Creating…' : 'Create key'}
                     </button>
                     <button type="button" className="ghost" onClick={cancel} disabled={busy}>

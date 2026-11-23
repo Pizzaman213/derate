@@ -15,7 +15,7 @@ Each event is two things:
   run is one row a minute per source, not a million rows, and still says how
   many.
 
-For the refusals whose "actor" is a name the caller chose -- a ``drt_<id>``
+For the refusals whose "actor" is a name the caller chose -- a ``derate-<id>``
 for any ten characters, a ``node_id`` out of an open join body, a setup
 attempt -- the fold key is ``(action, "-", ip)`` and the presented name moves
 to ``after["presented"]`` (the one that opened the row; every later one is in

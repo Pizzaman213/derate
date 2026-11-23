@@ -347,7 +347,11 @@ def test_every_limit_type_configures_blocks_at_threshold_and_reports_resets(h, m
     assert (d.resets_at is None) == is_cap
     assert d.limit_source in d.message
 
-    [state] = h.svc.states(LimitScope.KEY, "k1", now=blocked.at)
+    states = {s.limit_type: s for s in h.svc.states(LimitScope.KEY, "k1", now=blocked.at)}
+    # Every key also carries the default rpm unless it names its own; a
+    # per-model rpm is a different limit and does not replace it.
+    assert set(states) == {name, "rpm"}
+    state = states[name]
     assert (state.limit_type, state.scope, state.scope_id) == (name, LimitScope.KEY, "k1")
     assert state.limit == state.effective_limit == scenario.value
     assert (state.resets_at is None) == is_cap
@@ -435,6 +439,27 @@ def test_rpm_window_slides(h):
     assert (d.allowed, d.resets_at, d.used) == (False, NOW + 60, 2)
     assert h.run(now=NOW + 60).allowed  # the first one aged out
     assert not h.run(now=NOW + 61).allowed
+
+
+def test_a_key_that_names_no_rpm_is_held_to_the_default(h):
+    from control_plane.contracts.auth import DEFAULT_KEY_RPM
+
+    h.key(limits={"requests_cycle": 1000})
+    h.key("k2", limits={"rpm": 5})
+    for i in range(DEFAULT_KEY_RPM):
+        assert h.run(now=NOW + i * 0.1).allowed, i
+    d = h.run(now=NOW + 13)
+    assert (d.allowed, d.limit_source, d.limit) == (False, "key:rpm", DEFAULT_KEY_RPM)
+    state = h.state("rpm")
+    assert (state.limit, state.used) == (DEFAULT_KEY_RPM, DEFAULT_KEY_RPM)
+    # A key that names its own rpm keeps it, lower or higher.
+    for i in range(5):
+        assert h.run("k2", now=NOW + i).allowed
+    assert h.run("k2", now=NOW + 6).limit_source == "key:rpm"
+    h.key("k3", limits={"rpm": 1000})
+    for i in range(DEFAULT_KEY_RPM + 1):
+        assert h.run("k3", now=NOW + i * 0.1).allowed, i
+
 
 
 def test_tpm_counts_live_estimates_then_actual_tokens(h):

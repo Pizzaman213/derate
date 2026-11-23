@@ -31,7 +31,7 @@ ADMIN = {
     "email": "cover-admin@derate.test",
     "password": "cover-boot-pw-123456",
 }
-GARBAGE = "drt_zzzzzzzzzz_" + "x" * 43
+GARBAGE = "derate-zzzzzzzzzz_" + "x" * 43
 #: Setup answers a loopback peer only; TestClient's default peer is "testclient".
 LOOPBACK = ("127.0.0.1", 50000)
 
@@ -92,7 +92,11 @@ def world(tmp_path_factory):
     client.cookies.clear()
 
     def mint(name: str) -> dict:
-        m = client.post("/api/keys", json={"name": name, "expiry_days": 30}, headers=cookie)
+        m = client.post(
+            "/api/keys",
+            json={"name": name, "expiry_days": 30, "current_password": ADMIN["password"]},
+            headers=cookie,
+        )
         assert m.status_code == 200, m.text
         return m.json()
 
@@ -136,6 +140,9 @@ def test_every_v1_route_refuses_each_bad_key_with_its_own_code(world, route, cod
     headers = {} if key is None else {"Authorization": f"Bearer {key}"}
     method, path = route.split(" ", 1)
     client = world["client"]
+    # Every case here is a refused key from one address; the per-address
+    # budget (test_gateway_security_gate.py pins it) would trip mid-walk.
+    client.app.state.key_refusals.reset()
     if method == "WEBSOCKET":
         refusal = _socket_refusal(client, path, headers)
         assert refusal.code == 1008
@@ -204,7 +211,7 @@ def test_setup_is_open_before_the_first_admin(tmp_path, monkeypatch):
     assert state["setup_local_only"] is False
     r = client.post("/api/setup/admin", json=ADMIN)
     assert r.status_code == 200
-    assert r.json()["secret_once"].startswith("drt_")
+    assert r.json()["secret_once"].startswith("derate-")
 
 
 def test_setup_from_another_host_is_open_until_the_first_admin(tmp_path, monkeypatch):
@@ -217,7 +224,7 @@ def test_setup_from_another_host_is_open_until_the_first_admin(tmp_path, monkeyp
     assert remote.get("/api/auth/state").json()["setup_local_only"] is False
     r = remote.post("/api/setup/admin", json=ADMIN)
     assert r.status_code == 200, r.text
-    assert r.json()["secret_once"].startswith("drt_")
+    assert r.json()["secret_once"].startswith("derate-")
     late = TestClient(app, client=("10.0.0.9", 50000))
     assert late.post("/api/setup/admin", json=ADMIN).status_code == 410
     local = TestClient(app, client=LOOPBACK)
@@ -261,3 +268,126 @@ def test_a_real_preflight_passes_when_an_origin_is_allowed(tmp_path, monkeypatch
     assert r.status_code == 200, r.text
     # Without the preflight header it is just an OPTIONS, and gated.
     assert client.options("/api/keys", headers={"Origin": "http://dev:5173"}).status_code == 401
+
+
+# -- the edge listener (DERATE_EDGE_PORT) ------------------------------------
+
+EDGE_PORT = 18099
+#: A documentation address (RFC 5737), the caller Cloudflare would name.
+WAN = {"CF-Connecting-IP": "203.0.113.9"}
+#: Paths outside both sets that the main port answers without a credential.
+EDGE_EXTRA = ["GET /", "GET /healthz", "GET /install.sh", "GET /auth/callback"]
+
+
+@pytest.fixture(scope="module")
+def edge(tmp_path_factory):
+    """One app with an edge port, a client on each listener, and a valid key.
+    Starlette's TestClient sets ``scope["server"]`` from the base URL's port,
+    which is exactly what uvicorn sets from the accepted socket."""
+    data = tmp_path_factory.mktemp("edge")
+    mp = pytest.MonkeyPatch()
+    mp.setenv("DERATE_DATA_DIR", str(data))
+    mp.setenv("DERATE_EDGE_PORT", str(EDGE_PORT))
+    mp.delenv("DERATE_EDGE_CLIENT_HEADER", raising=False)
+    app = create_app()
+    main = TestClient(app, client=LOOPBACK)
+    r = main.post("/api/setup/admin", json=ADMIN)
+    assert r.status_code == 200, r.text
+    cookie = {"Cookie": f"derate_session={r.cookies['derate_session']}"}
+    main.cookies.clear()
+    m = main.post(
+        "/api/keys",
+        json={"name": "edge", "expiry_days": 30, "current_password": ADMIN["password"]},
+        headers=cookie,
+    )
+    assert m.status_code == 200, m.text
+    edge_client = TestClient(app, base_url=f"http://testserver:{EDGE_PORT}", client=LOOPBACK)
+    yield {
+        "app": app,
+        "main": main,
+        "edge": edge_client,
+        "key": {"Authorization": f"Bearer {m.json()['secret_once']}"},
+        "cookie": cookie,
+    }
+    mp.undo()
+
+
+def _edge_socket(edge, path: str, headers: dict) -> WebSocketDisconnect:
+    # websocket_connect joins onto ws://testserver and drops the base URL's
+    # port, so the edge's port has to be in an absolute URL.
+    return _socket_refusal(edge["edge"], f"ws://testserver:{EDGE_PORT}{path}", headers)
+
+
+@pytest.mark.parametrize("route", sorted(set(API_ROUTES) | set(ALWAYS_OPEN) | set(EDGE_EXTRA)))
+def test_the_edge_answers_nothing_but_v1(edge, route):
+    method, path = route.split(" ", 1)
+    edge["app"].state.key_refusals.reset()
+    if method == "WEBSOCKET":
+        refusal = _edge_socket(edge, path, {**WAN, **edge["cookie"]})
+        assert refusal.code == 1008
+        return
+    # A session cookie and a valid key change nothing: the path decides.
+    r = _send(edge["edge"], route, {**WAN, **edge["cookie"], **edge["key"]})
+    assert r.status_code == 404, (route, r.status_code, r.text)
+    assert r.json()["error"]["code"] == "not_found"
+    assert "WWW-Authenticate" not in r.headers
+    assert "set-cookie" not in r.headers
+
+
+@pytest.mark.parametrize("route", V1_ROUTES)
+def test_every_v1_route_on_the_edge_answers_as_the_main_port_does(edge, route):
+    method, path = route.split(" ", 1)
+    edge["app"].state.key_refusals.reset()
+    if method == "WEBSOCKET":
+        # Without the client header the socket never reaches the key gate...
+        assert _edge_socket(edge, path + "?model=x", edge["key"]).code == 1008
+        # ...with it, a bad key is refused by the key gate, by name.
+        refusal = _edge_socket(edge, path, {**WAN, "Authorization": f"Bearer {GARBAGE}"})
+        assert (refusal.code, refusal.reason) == (1008, "invalid_api_key")
+        return
+    main = _send(edge["main"], route, edge["key"])
+    via_edge = _send(edge["edge"], route, {**WAN, **edge["key"]})
+    assert via_edge.status_code == main.status_code, (route, via_edge.text, main.text)
+    if via_edge.status_code >= 400 and "json" in via_edge.headers.get("content-type", ""):
+        assert via_edge.json()["error"]["code"] not in ("not_found", "edge_client_unknown"), route
+
+
+@pytest.mark.parametrize("client_header", [None, "nonsense", "203.0.113.9, 10.0.0.1", ""])
+def test_an_edge_v1_call_without_a_usable_client_address_is_400(edge, client_header):
+    headers = dict(edge["key"])
+    if client_header is not None:
+        headers["CF-Connecting-IP"] = client_header
+    r = edge["edge"].get("/v1/models", headers=headers)
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "edge_client_unknown"
+    assert "cf-connecting-ip" in r.json()["error"]["message"]
+    # The main port never reads the header at all.
+    assert edge["main"].get("/v1/models", headers=headers).status_code == 200
+
+
+def test_the_edge_records_the_client_header_and_ignores_x_forwarded_for(edge):
+    edge["app"].state.key_refusals.reset()
+    stores = edge["app"].state.ctx.auth_stores
+    r = edge["edge"].get(
+        "/v1/models",
+        headers={"CF-Connecting-IP": "2001:db8::7", "X-Forwarded-For": "198.51.100.1", **edge["key"]},
+    )
+    assert r.status_code == 200, r.text
+    (key,) = [k for k in stores.keys.list_keys() if k.name == "edge"]
+    assert key.last_used_ip == "2001:db8::7"
+
+
+def test_the_edge_is_https_and_the_main_port_is_not(edge):
+    via_edge = edge["edge"].get("/v1/models", headers={**WAN, **edge["key"]})
+    assert via_edge.headers["strict-transport-security"].startswith("max-age=")
+    main = edge["main"].get("/v1/models", headers=edge["key"])
+    assert "strict-transport-security" not in main.headers
+
+
+def test_the_main_port_is_unchanged_with_an_edge_configured(edge):
+    main = edge["main"]
+    assert main.get("/api/auth/state").status_code == 200
+    assert main.get("/api/keys", headers=edge["cookie"]).status_code == 200
+    assert main.get("/healthz").status_code == 200
+    r = main.get("/v1/models", headers={"Authorization": f"Bearer {GARBAGE}"})
+    assert (r.status_code, r.json()["error"]["code"]) == (401, "invalid_api_key")

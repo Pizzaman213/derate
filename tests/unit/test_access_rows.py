@@ -94,7 +94,7 @@ def test_a_handler_exception_is_recorded_as_500(gate):
 
 def test_a_key_in_the_query_is_redacted(gate):
     client, cookie, recorder = gate
-    secret = "drt_abcdefghij_" + "s" * 43
+    secret = "derate-abcdefghij_" + "s" * 43
     client.get(f"/api/keys?token={secret}", headers=cookie)
     row = [r for r in recorder.rows if r.path == "/api/keys"][-1]
     assert secret not in row.query
@@ -213,7 +213,7 @@ def test_an_accepted_socket_leaves_a_ws_row_with_its_key(keyed):
     rows = [r for r in recorder.rows if r.path == "/v1/test/socket"]
     assert len(rows) == 1
     assert rows[0].method == "WS" and rows[0].status == 101
-    assert rows[0].who == f"key:drt_{setup['key']['key_id']}"
+    assert rows[0].who == f"key:derate-{setup['key']['key_id']}"
     assert rows[0].client_port == 50124 and rows[0].peer_ip == "127.0.0.1"
 
 
@@ -232,5 +232,5 @@ def test_a_refused_realtime_socket_records_its_close_code(keyed):
             ws.receive_text()
     rows = [r for r in recorder.rows if r.path == "/v1/realtime"]
     assert [(r.method, r.status) for r in rows] == [("WS", 1008), ("WS", 1008)]
-    assert rows[0].who == f"key:drt_{setup['key']['key_id']}"
+    assert rows[0].who == f"key:derate-{setup['key']['key_id']}"
     assert rows[1].who == "-"

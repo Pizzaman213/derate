@@ -13,7 +13,8 @@ Three kinds of state, and where each lives:
 
 * cycle counters -- ``limits.db``, one row per (scope, id, cycle_start,
   metric), written once per settled request in one transaction;
-* rpm/tpm windows -- in memory, a sliding 60 s deque per (scope, id[, model]);
+* rpm/tpm windows -- in memory, a sliding 60 s deque per (scope, id[, model]).
+  A key with no ``rpm`` is held to ``DEFAULT_KEY_RPM``;
 * in-flight reservations -- in memory, which is also ``max_concurrent``.
 
 The in-memory two do not survive a restart, and do not need to: a window is
@@ -35,6 +36,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from control_plane.contracts.auth import (
+    DEFAULT_KEY_RPM,
     NEAR_LIMIT_FRACTION,
     ApiKey,
     AuthErrorCode,
@@ -464,6 +466,11 @@ class LimitService:
         model: str | None,
         now: float,
     ) -> _Scope:
+        # One place, so check_and_reserve, settle, states() and raise all see
+        # the same limit: a key that names no rpm is held to DEFAULT_KEY_RPM
+        # rather than being unlimited. An operator who wants more sets more.
+        if scope is LimitScope.KEY and "rpm" not in (limits or {}):
+            limits = {**(limits or {}), "rpm": DEFAULT_KEY_RPM}
         configured = self._configured(limits, model)
         start, resets_at = cycle_bounds(anchor, now)
         overrides: dict[str, float] = {}

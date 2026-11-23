@@ -1,4 +1,4 @@
-"""``KeyService``: orgs and ``drt_`` API keys, implementing ``KeyPort``.
+"""``KeyService``: orgs and ``derate-`` API keys, implementing ``KeyPort``.
 
 Pure state. Nothing here writes an audit row -- the gateway does, because it
 holds the actor's session and the before/after it wants recorded. Nothing

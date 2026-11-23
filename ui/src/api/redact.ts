@@ -25,7 +25,7 @@
 // filter exists to keep off the screen; before this, the documented way to add
 // a machine was to copy that one by hand.
 //
-// derate's own API keys (`drt_<id>_<secret>`) are scrubbed by VALUE, in every
+// derate's own API keys (`derate-<id>_<secret>`) are scrubbed by VALUE, in every
 // string of every payload, because unlike a provider key they have no field
 // name to catch them by: a log line, an error message or a request row could
 // quote one. The one exception is the one-time reveal -- `secret_once` on
@@ -42,7 +42,7 @@ const KEY_LIKE =
   /^(api_?key|runtime_api_key|secret|token|authorization|auth|password|bearer|access_token|refresh_token|id_token)$/i
 
 /** Mirrors `control_plane/keys/format.py::KEY_PATTERN`. */
-export const DRT_KEY = /\bdrt_[a-z0-9]{10}_[A-Za-z0-9_-]{32,}/g
+export const KEY_PATTERN = /\bderate-[a-z0-9]{10}_[A-Za-z0-9_-]{32,}/g
 
 /** Anything that looks like a credential is replaced before it reaches a
  *  component. `api_key_ref` is an environment variable NAME and is kept. */
@@ -67,6 +67,6 @@ function walk(value: unknown): unknown {
     }
     return out
   }
-  if (typeof value === 'string') return value.replace(DRT_KEY, '***')
+  if (typeof value === 'string') return value.replace(KEY_PATTERN, '***')
   return value
 }

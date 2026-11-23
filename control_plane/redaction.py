@@ -34,11 +34,11 @@ from urllib.parse import quote
 #: anywhere else stops matching.
 REDACTED = "***"
 
-#: derate's own API keys, ``drt_<key_id>_<secret>``, anywhere in a string. A
+#: derate's own API keys, ``derate-<key_id>_<secret>``, anywhere in a string. A
 #: copy of ``control_plane.keys.format.KEY_PATTERN`` -- this module may import
 #: nothing from the keys package (see the module docstring) -- held equal to it
 #: by a row in ``control_plane/contracts/derived.py``.
-KEY_PATTERN = r"\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}"
+KEY_PATTERN = r"\bderate-[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}"
 
 
 #: Field / variable names whose VALUE is always a secret, whatever it looks

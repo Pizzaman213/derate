@@ -55,7 +55,7 @@ the rows above it.
 | [`planner/`](../control_plane/planner/README.md) | Picks tensor, pipeline, expert and data parallel degrees from measured hardware facts, and hands back a sentence naming what the decision turned on. |
 | [`deploy/`](../control_plane/deploy/README.md) | Turns an approved plan into a running sparkrun backend, watches it, and tears it down. Every phase a person sees is a line one of two programs actually printed. |
 | [`auth/`](../control_plane/auth/README.md) | Admin accounts, browser sessions, the login lockout and the append-only audit log, in `auth.db`. Fails closed: a store it cannot open is a 503, never an open door. |
-| [`keys/`](../control_plane/keys/README.md) | Orgs and the `drt_` API keys every `/v1` request carries, in `keys.db`. A secret is stored as its hash and shown once. |
+| [`keys/`](../control_plane/keys/README.md) | Orgs and the `derate-` API keys every `/v1` request carries, in `keys.db`. A secret is stored as its hash and shown once. |
 | [`limits/`](../control_plane/limits/README.md) | Per-key and per-org limits checked before dispatch, 30-day cycle counters, and local model pricing, in `limits.db`. A refusal names the limit that stopped it. |
 | [`gateway/`](../control_plane/gateway/README.md) | One OpenAI endpoint, seven routing policies, admission control, and the request path's answer to a node dying under it. |
 | [`providers/`](../control_plane/providers/README.md) | Remote OpenAI-compatible upstreams as first-class route targets, alongside local deployments. The cluster is the default; a paid API is the overflow valve. |
@@ -122,7 +122,7 @@ one file per screen the URL can name.
   stylesheet for the one screen with no header and no rail.
 - [`tabs/login/`](../ui/src/tabs/login/README.md) — the sign-in screen, drawn
   before the frame; it words the server's lockout and keeps no count of its own.
-- [`tabs/keys/`](../ui/src/tabs/keys/README.md) — the `drt_` API keys, one page
+- [`tabs/keys/`](../ui/src/tabs/keys/README.md) — the `derate-` API keys, one page
   per key with thirty days of what it did. A secret is drawn once, in
   `RevealModal`, and nowhere else.
 - [`tabs/audit/`](../ui/src/tabs/audit/README.md) — every admin action, newest

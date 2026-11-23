@@ -39,7 +39,7 @@ def _forged_page() -> dict:
         })},
         {"kind": KIND_ACCESS, "seq": 3, "ts": NOW, "body": json.dumps(
             AccessRecord(request_id="a-forged", ts=NOW, client_ip="203.0.113.9",
-                         who="key:drt_victim", method="POST", path="/v1/chat/completions").as_dict()
+                         who="key:derate-victim", method="POST", path="/v1/chat/completions").as_dict()
         )},
     ]
     return {"rows": rows, "next": 3, "head": 3, "dropped": 0}
@@ -97,7 +97,7 @@ def test_forensics_names_the_node_of_a_row_the_coordinator_did_not_write(tmp_pat
     )
     archive.conn.execute(
         "INSERT INTO access(request_id, ts, node_id, who, method, path, status) "
-        "VALUES('a-forged', ?, 'worker', 'key:drt_victim', 'POST', '/v1/chat/completions', 200)",
+        "VALUES('a-forged', ?, 'worker', 'key:derate-victim', 'POST', '/v1/chat/completions', 200)",
         (NOW,),
     )
     archive.ingest("coord", own, trusted=True)

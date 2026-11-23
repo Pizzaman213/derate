@@ -281,12 +281,33 @@ Without it a benched target reads as `healthy: false` for a deployment that
 Nothing here answers an anonymous caller any more, except the five calls that
 must work before anyone can sign in (`authz.OPEN_ROUTES`). `authz.AuthGuard`
 decides by path: `/api/**` needs a `derate_session` cookie naming a live admin
-session (401 `session_required`); `/v1/**` needs `Authorization: Bearer drt_...`
+session (401 `session_required`); `/v1/**` needs `Authorization: Bearer derate-...`
 (401 `missing_api_key` / `invalid_api_key` / `api_key_disabled` /
 `api_key_expired`, each with `WWW-Authenticate`). `POST /api/setup/admin` is open
 until the first admin exists and 410 `setup_closed` forever after. A store that
 cannot be opened answers 503 `auth_unavailable` on every gated path. The two
 websocket routes check for themselves, closing 1008 before `accept`.
+
+An address whose keys were refused `KEY_REFUSALS_PER_ADDRESS_PER_MIN` (20)
+times inside a minute is answered 429 `rate_limited` (`Retry-After: 60`) on
+`/v1` before the key store is read, a valid key included -- the budget is the
+address's. One `authz.RefusalWindow` per process, built in `create_app` and
+shared by the HTTP gate and `require_key` through `app.state.key_refusals`.
+Minting a key (`POST /api/keys`) and rotating any key ask for
+`current_password` (`auth_api.reauthenticated`), so a stolen session alone
+cannot mint a credential. A `/v1` JSON body whose media URL names a
+non-public host is refused 400 `media_url_refused` (`media.py`; names are not
+resolved, so DNS rebinding is out of its reach).
+
+**The edge listener.** With `DERATE_EDGE_PORT` set, `node.py` binds a second
+socket on the same uvicorn server (one app, one lifespan); `authz.is_edge`
+tells the two apart from `scope["server"]`. On the edge everything but
+`/v1/**` is 404 `not_found` (websockets close 1008), the client address is
+`DERATE_EDGE_CLIENT_HEADER` (`cf-connecting-ip`) and nothing else --
+`X-Forwarded-For` and `DERATE_TRUSTED_PROXIES` are not consulted -- a request
+without a valid IP there is 400 `edge_client_unknown`, and the scheme is
+https, so HSTS is sent (`headers.py` reads the scheme at response time for
+that reason). The main port is unchanged.
 
 The stores (`auth.db`, `keys.db`, `limits.db`) open on first use, so building an
 app touches no disk for them. The middleware is registered before `_csrf_guard`
@@ -331,7 +352,7 @@ decorators.
 | `stubs.py` | 508 | the day-0 ports that serve the whole surface from fixtures |
 | `router.py` | 470 | the target index, policy resolution (and a key's override), per-name route limits, weight refresh, `parkable` |
 | `routing_store.py` | 90 | `routing.json`: policy overrides and route limits, so a restart keeps them; a bad file is an empty state |
-| `authz.py` | 399 | the credential gate: session on `/api`, `drt_` key on `/v1`, lazy auth stores, fail closed |
+| `authz.py` | 399 | the credential gate: session on `/api`, `derate-` key on `/v1`, lazy auth stores, fail closed |
 | `admission.py` | 350 | the per-request KV commitment, and the three block reasons |
 | `restart.py` | 290 | relaunching a deployment that crashed, three tries, backed off |
 | `policies.py` | 286 | the seven selectors and `hedge_candidate`. Frozen |

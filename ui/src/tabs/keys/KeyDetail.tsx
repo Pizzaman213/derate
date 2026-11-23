@@ -179,7 +179,9 @@ function LimitRow({ s, now }: { s: LimitState; now: number }) {
         ) : null}
       </td>
       <td>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)' }}>
+        {/* baseline, not center: the % label is a smaller font than the row,
+            and centring it against the bar pulls it off the row's baseline. */}
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--space-6)' }}>
           <ProportionBar
             value={s.fraction}
             width="var(--space-96)"

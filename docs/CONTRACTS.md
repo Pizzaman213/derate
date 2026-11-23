@@ -20,7 +20,7 @@ Every value that crosses the wire as a string.
 | Type | Values | Defined in |
 |---|---|---|
 | `AuditAction` | `login`, `login_failed`, `logout`, `password_changed`, `admin_added`, `admin_removed`, `setup_admin_created`, `org_created`, `org_updated`, `org_deleted`, `key_created`, `key_updated`, `key_disabled`, `key_enabled`, `key_rotated`, `key_deleted`, `limit_changed`, `limit_raised`, `cycle_reset`, `pricing_changed`, `api_write`, `shell_opened`, `shell_closed`, `provider_created`, `provider_updated`, `provider_deleted`, `settings_changed`, `enrollment_minted`, `enrollment_revoked`, `deployment_launched`, `deployment_stopped`, `node_removed`, `node_admitted`, `node_process_killed`, `routing_changed`, `storage_deleted`, `sessions_revoked`, `node_joined`, `provider_signed_in`, `profile_changed`, `download_changed`, `benchmark_changed`, `login_locked`, `key_refused`, `session_refused`, `setup_refused`, `join_rejected`, `cross_origin_refused`, `session_ip_changed`, `audit_chain_broken`, `agent_refused`, `cluster_token_rotated`, `node_runtime_model_changed` | `control_plane.contracts.auth` |
-| `AuthErrorCode` | `missing_api_key`, `invalid_api_key`, `api_key_disabled`, `api_key_expired`, `session_required`, `invalid_credentials`, `login_locked`, `setup_closed`, `auth_unavailable`, `limit_exceeded`, `max_output_tokens_exceeded`, `max_prompt_tokens_exceeded`, `limit_exceeds_org`, `allowlist_exceeds_org`, `model_not_allowed`, `setup_local_only` | `control_plane.contracts.auth` |
+| `AuthErrorCode` | `missing_api_key`, `invalid_api_key`, `api_key_disabled`, `api_key_expired`, `session_required`, `invalid_credentials`, `login_locked`, `setup_closed`, `auth_unavailable`, `limit_exceeded`, `max_output_tokens_exceeded`, `max_prompt_tokens_exceeded`, `limit_exceeds_org`, `allowlist_exceeds_org`, `model_not_allowed`, `setup_local_only`, `not_found`, `edge_client_unknown`, `media_url_refused` | `control_plane.contracts.auth` |
 | `ContextBucket` | `0-8k`, `8-32k`, `32-128k`, `128k+` | `control_plane.contracts.telemetry` |
 | `CostBasis` | `metered`, `estimated`, `unpriced` | `control_plane.contracts.telemetry` |
 | `DeploymentOrigin` | `launched`, `adopted` | `control_plane.contracts.deployment` |
@@ -578,6 +578,7 @@ The interfaces components hold each other to.
 | `CYCLE_DAYS` | `30` | `control_plane.contracts.auth` |
 | `DEFAULT_DTYPE` | `bf16` | `control_plane.contracts.quant` |
 | `DEFAULT_GUARDRAIL` | `0.9` | `control_plane.contracts.hardware` |
+| `DEFAULT_KEY_RPM` | `120` | `control_plane.contracts.auth` |
 | `DEGRADED_TPS_THRESHOLD` | `10.0` | `control_plane.contracts.constants` |
 | `EMAIL_MAX_LEN` | `254` | `control_plane.contracts.auth` |
 | `ENDPOINT_FOR_MODALITY` | (4 entries) | `control_plane.contracts.modality` |
@@ -590,7 +591,8 @@ The interfaces components hold each other to.
 | `JOIN_PER_ADDRESS_PER_MIN` | `30` | `control_plane.contracts.constants` |
 | `KEY_EXPIRY_DAYS` | `[1, 10, 20, 30, 50, 100, 365]` | `control_plane.contracts.auth` |
 | `KEY_ID_LEN` | `10` | `control_plane.contracts.auth` |
-| `KEY_PREFIX` | `drt_` | `control_plane.contracts.auth` |
+| `KEY_PREFIX` | `derate-` | `control_plane.contracts.auth` |
+| `KEY_REFUSALS_PER_ADDRESS_PER_MIN` | `20` | `control_plane.contracts.auth` |
 | `KEY_SECRET_BYTES` | `32` | `control_plane.contracts.auth` |
 | `LIMIT_TYPES` | `['tokens_total_cycle', 'tokens_input_cycle', 'tokens_output_cycle', 'requests_cycle', 'budget_usd_cycle', 'local_tokens_cycle', 'local_usd_cycle', 'cloud_tokens_cycle', 'cloud_usd_cycle', 'rpm', 'tpm', 'max_concurrent', 'max_output_tokens_per_request', 'max_prompt_tokens_per_request', 'model:<id>:tokens_cycle', 'model:<id>:usd_cycle', 'model:<id>:rpm', 'model:<id>:tpm']` | `control_plane.contracts.auth` |
 | `LOGIN_DELAY_MAX_S` | `8` | `control_plane.contracts.auth` |
@@ -653,10 +655,10 @@ the canonical value.
 - **Why not in `contracts/`**: a judgement about DeploymentState rather than part of it, and it belongs beside the transition table that enforces it. The gateway cannot import it -- the deploy package __init__ pulls the manager, the sparkrun adapter and the event bus into a request module -- so gateway/states.py holds the gateway's one spelling and this holds the two together
 - **Checked copies**: `control_plane.gateway.states:TERMINAL`
 
-### `drt_key_pattern`
+### `derate_key_pattern`
 
-- **Canonical**: `control_plane.keys.format:KEY_PATTERN` = `\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}`
-- **Why not in `contracts/`**: the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, copy
+- **Canonical**: `control_plane.keys.format:KEY_PATTERN` = `\bderate-[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}`
+- **Why not in `contracts/`**: the key format belongs to the keys package; redaction.py may import nothing from it (every node, including the worker path, imports the scrubber), so it holds a copy of the pattern it scrubs by. ui/src/api/redact.ts KEY_PATTERN is a third, TypeScript, copy
 - **Checked copies**: `control_plane.redaction:KEY_PATTERN`
 - **Restated (not checkable)**: `ui/src/api/redact.ts`, `ui/src/shell/screens.check.mjs`
 
@@ -892,7 +894,7 @@ default. A blank default means absence is itself the answer.
 | `DERATE_CACHE_DIR` |  | `control_plane/resolver/cache.py` — also read by registry/storage.py |
 | `DERATE_CHECK_ADMIN_PASSWORD` | `` | `ui/src/check/auth.mjs` — that admin's password |
 | `DERATE_CHECK_ADMIN_USER` | `` | `ui/src/check/auth.mjs` — the admin the live-API verifiers log in as; the gateway answers /api only to a session |
-| `DERATE_CHECK_API_KEY` | `` | `ui/src/check/auth.mjs` — a drt_ key for verifiers that call /v1 directly |
+| `DERATE_CHECK_API_KEY` | `` | `ui/src/check/auth.mjs` — a derate- key for verifiers that call /v1 directly |
 | `DERATE_CHECK_BROWSER` |  | `ui/src/check/browser.mjs` — an explicit Chromium path, for a machine whose Playwright cache is somewhere the finder does not look |
 | `DERATE_CHECK_ORIGIN` | `http://localhost:8088` | `ui/src/**/*.check.mjs` — which coordinator the live-API verifiers talk to |
 | `DERATE_CHECK_STRICT` |  | `ui/check.mjs` — 1 makes an unmet requirement a failure rather than its own column, which is the mode for a box where the coordinator is actually up |
@@ -900,6 +902,9 @@ default. A blank default means absence is itself the answer.
 | `DERATE_DATA` | `/data` | `docker/entrypoint.sh` — SHELL ONLY. The entrypoint bridges it onto DERATE_DATA_DIR; no Python reads it. Overriding this alone moves nothing (audit defect M-17) |
 | `DERATE_DATA_DIR` |  | `control_plane/paths.py` — unset: /data when writable, else the platform application-state dir |
 | `DERATE_E2E_ORIGIN` | `http://localhost:8088` | `tests/unit/test_gateway.py` — which coordinator the audio round trip launches real models on |
+| `DERATE_EDGE_CLIENT_HEADER` | `cf-connecting-ip` | `control_plane/gateway/settings.py` — header naming the real client on an edge connection; a request without a valid IP in it is refused 400 |
+| `DERATE_EDGE_HOST` | `127.0.0.1` | `control_plane/gateway/settings.py` — address the edge socket binds; loopback when cloudflared runs on this host, the docker bridge address when it is a container |
+| `DERATE_EDGE_PORT` | `` | `control_plane/gateway/settings.py` — second listener for a WAN edge (cloudflared): answers /v1/** only, takes the client address from DERATE_EDGE_CLIENT_HEADER, forces https; unset = no edge socket |
 | `DERATE_ELECTRICITY_RATE` | `0` | `control_plane/gateway/main.py` — currency per kWh; 0 means the spend screen shows no power cost |
 | `DERATE_ENTRYPOINT` |  | `docker/entrypoint.sh` |
 | `DERATE_GALLERY_ONLY` |  | `.omp/tests/ui/layout.check.mjs` — comma-separated component names; run.mjs sets it to scope the gallery layout matrix to the components a ui:check path names |

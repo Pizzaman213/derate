@@ -305,11 +305,13 @@ def adopt_redactor(redactor: Any, root: logging.Logger | None = None) -> None:
     root = root or logging.getLogger()
     replacement = _redacting_filter(redactor)
     for handler in root.handlers:
-        if not getattr(handler, "_derate_logfile", None):
+        current = [f for f in handler.filters if isinstance(f, SecretRedactingFilter)]
+        # The two files, and stderr once an entrypoint has put a pattern-only
+        # filter on it: `docker logs` must scrub what node.log scrubs.
+        if not getattr(handler, "_derate_logfile", None) and not current:
             continue
-        for existing in list(handler.filters):
-            if isinstance(existing, SecretRedactingFilter):
-                handler.removeFilter(existing)
+        for existing in current:
+            handler.removeFilter(existing)
         handler.addFilter(replacement)
 
 

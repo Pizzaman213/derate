@@ -10,6 +10,7 @@ import type { EngineOptions, Lifecycle, LifecyclePriority, RuntimeInfo, Speculat
 import { KEY_EXPIRY_DAYS } from '../../api/types'
 import { Copyable } from '../../components/Copyable'
 import { Lamp } from '../../components/Lamp'
+import { PasswordField } from '../../components/PasswordField'
 import { RevealModal } from '../../components/RevealModal'
 import { Select, type SelectOption } from '../../components/Select'
 import { Verbatim } from '../../components/Verbatim'
@@ -437,6 +438,8 @@ export function ApiFields({ s, info }: { s: ModelSession; info: RuntimeInfo | nu
   const o = s.engineOptions
   const [minted, setMinted] = useState<{ secret: string; keyId: string } | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  /** Minting a key re-authenticates the signed-in admin. */
+  const [currentPassword, setCurrentPassword] = useState('')
   const parserOptions = (names: string[]): SelectOption<string>[] => [
     { value: '', label: 'None' },
     ...names.map((n) => ({ value: n, label: n })),
@@ -455,8 +458,14 @@ export function ApiFields({ s, info }: { s: ModelSession; info: RuntimeInfo | nu
   const createKey = async () => {
     setErr(null)
     try {
-      const r = await backend.createKey({ name: `${name} key`, expiry_days: KEY_DAYS, allowed_models: [name] })
+      const r = await backend.createKey({
+        name: `${name} key`,
+        expiry_days: KEY_DAYS,
+        allowed_models: [name],
+        current_password: currentPassword,
+      })
       setMinted({ secret: r.secret_once, keyId: r.key.key_id })
+      setCurrentPassword('')
       invalidate()
     } catch (e) {
       setErr(errText(e))
@@ -508,8 +517,17 @@ export function ApiFields({ s, info }: { s: ModelSession; info: RuntimeInfo | nu
           </div>
         ))}
       </fieldset>
+      <div className="fld">
+        <label htmlFor={`${uid}-current-pw`}>Your password</label>
+        <PasswordField
+          id={`${uid}-current-pw`}
+          value={currentPassword}
+          autoComplete="current-password"
+          onChange={setCurrentPassword}
+        />
+      </div>
       <div>
-        <button type="button" className="ghost" onClick={() => void createKey()}>
+        <button type="button" className="ghost" disabled={!currentPassword} onClick={() => void createKey()}>
           Create a key for this model
         </button>
       </div>

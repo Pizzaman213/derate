@@ -44,9 +44,9 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [reason, setReason] = useState('')
-  /** An admin key's rotate re-checks the signed-in admin's password. */
+  /** Every rotate re-checks the signed-in admin's password: minting a
+   *  credential must not be possible with a stolen session alone. */
   const [currentPassword, setCurrentPassword] = useState('')
-  const needsPassword = row.is_admin_key
   const [raiseType, setRaiseType] = useState('')
   const [raiseValue, setRaiseValue] = useState('')
   const limitTypes = [
@@ -96,7 +96,7 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
       else if (pending === 'reset') await backend.resetCycle(id)
       else if (pending === 'raise') await backend.raiseLimit(id, type, value)
       else if (pending === 'rotate') {
-        const res = await backend.rotateKey(id, needsPassword ? currentPassword : undefined)
+        const res = await backend.rotateKey(id, currentPassword)
         setMinted({ secret: res.secret_once, keyId: res.key.key_id })
       }
       setPending(null)
@@ -139,7 +139,7 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
               <input id="ka-reason" value={reason} onChange={(e) => setReason(e.target.value)} />
             </div>
           ) : null}
-          {pending === 'rotate' && needsPassword ? (
+          {pending === 'rotate' ? (
             <div className="fld" style={{ marginTop: 'var(--space-8)' }}>
               <label htmlFor="ka-current-pw">Your password</label>
               <PasswordField
@@ -148,7 +148,7 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
                 autoComplete="current-password"
                 onChange={setCurrentPassword}
               />
-              <span className="unit">An admin key is an admin&rsquo;s credential: confirm it is you.</span>
+              <span className="unit">Minting a secret is an admin action: confirm it is you.</span>
             </div>
           ) : null}
           {pending === 'raise' ? (
@@ -185,7 +185,7 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
           <div style={{ display: 'flex', gap: 'var(--space-8)', marginTop: 'var(--space-8)' }}>
             <button
               type="button"
-              disabled={busy || (pending === 'rotate' && needsPassword && !currentPassword)}
+              disabled={busy || (pending === 'rotate' && !currentPassword)}
               onClick={() => void run()}
             >
               {busy ? CONFIRM[pending].busy : `${CONFIRM[pending].button} ${row.name}`}
