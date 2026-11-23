@@ -962,7 +962,8 @@ pack's typecheck); `.omp/README.md` is the index of every file and script.
 (`duplication-reviewer` and `repo-steward` and `breaker` always, run together in one parallel batch, `design-reviewer` for UI, `security-reviewer` for
 auth and keys) and that each finding is fixed or answered in the report. The
 verifiers inside it need `DERATE_CHECK_ADMIN_USER`/`_PASSWORD` set, or they skip and
-the gate reports them red. Never boot a scratch coordinator on a box that runs model containers: it adopts them and
-its supervisor relaunches them with its own key (2026-11-23); test in-process instead.
+the gate reports them red. Never boot a scratch coordinator on a box that runs model containers without
+`DERATE_AUTO_ADOPT_CONTAINERS=0 DERATE_AUTO_ADOPT_RUNTIMES=0`: by default it adopts them, and
+its supervisor relaunches them with its own key (2026-11-23). Agents test in-process instead.
 Enable the push gate once per clone with
 `git config core.hooksPath .githooks`.
