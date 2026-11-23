@@ -17,8 +17,9 @@ const counted = (p) => /\.(py|tsx?|mjs|sh|css)$/.test(p) && !/(^|\/)(node_module
 
 const record = () => (existsSync(RECORD) ? JSON.parse(readFileSync(RECORD, 'utf8')) : {})
 const baseSize = (p) => {
-  try { return lineCount(execFileSync('git', ['show', `${base}:${p}`], { encoding: 'utf8', maxBuffer: 1 << 28 })) } catch { return null }
+  try { return lineCount(execFileSync('git', ['show', `${base}:${p}`], { encoding: 'utf8', maxBuffer: 1 << 28, stdio: ['ignore', 'pipe', 'ignore'] })) } catch { return null }
 }
+export const budgetOf = (p) => limit(p, record())
 const sizes = () => Object.fromEntries(allFiles().filter(counted).map((p) => [p, read(p).length]))
 const limit = (p, rec) => allow.budget?.[p]?.max ?? rec[p] ?? defaultBudget(p)
 

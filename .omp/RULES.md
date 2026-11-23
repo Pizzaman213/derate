@@ -8,4 +8,5 @@ Design pack lives in `.omp/`; index in `.omp/README.md`. These rules apply to ev
 6. When you find a premade asset outside the pack (an icon someone dropped in, a hardcoded color, an unregistered component), migrate it into the pack and replace the original.
 7. If the stack, folders, or tooling change, update `design/DESIGN.md`, `README.md`, and these rules to match. The pack must never drift from the code.
 8. You run the checks (`cd .omp && npm run check`), not the user. Only report done when everything is green.
-9. Every task ends with `cd .omp && npm run validate` and the reviewers in `rules/validation.md` (`duplication-reviewer` and `repo-steward` and `breaker` always, all in one parallel batch; `design-reviewer`, `security-reviewer` by what changed). Report what each found.
+9. Before a non-trivial task read `OWNERSHIP.md` and `lessons.md`; a large change needs a design note and `design-critic` first (`rules/validation.md` step 0).
+10. Every task ends with `cd .omp && npm run validate` and the reviewers in `rules/validation.md` (`duplication-reviewer` and `repo-steward` and `breaker` always, all in one parallel batch; `design-reviewer`, `security-reviewer` by what changed). Report what each found.

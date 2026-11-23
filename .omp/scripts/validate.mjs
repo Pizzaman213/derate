@@ -11,11 +11,16 @@
 // UI verifiers run --strict: a skip is a failure, because "checked nothing" must not be
 // green. They need DERATE_CHECK_ADMIN_USER / DERATE_CHECK_ADMIN_PASSWORD (see CLAUDE.md).
 // Checks live in scripts/validate/*.mjs, one concern per file, each exporting `steps`.
+// Planning helpers: scripts/ownership.mjs (map, --headroom); design notes: .omp/design-note.md.
 import { spawnSync } from 'node:child_process'
 import { baseRef, base, changed } from './validate/context.mjs'
 import * as budget from './validate/budget.mjs'
 import * as duplicates from './validate/duplicates.mjs'
 import * as statics from './validate/static.mjs'
+import * as designnote from './validate/designnote.mjs'
+import * as docsdrift from './validate/docsdrift.mjs'
+import * as lessons from './validate/lessons.mjs'
+import * as ownership from './validate/ownership.mjs'
 
 if (process.argv.includes('--update-budget')) { budget.updateRecord(); process.exit(0) }
 
@@ -32,8 +37,10 @@ const suites = process.argv.includes('--fast') ? [] : [
 ]
 
 console.log(`base ${baseRef} @ ${base.slice(0, 8)}; ${changed.length} changed file(s)\n`)
+const all = [...statics.steps, ...duplicates.steps, ...budget.steps, ...ownership.steps, ...designnote.steps, ...docsdrift.steps, ...suites]
+all.push({ name: 'lessons.md only names gate steps that exist', run: () => lessons.check(all.map((s) => s.name)) })
 const failed = []
-for (const { name, run: check } of [...statics.steps, ...duplicates.steps, ...budget.steps, ...suites]) {
+for (const { name, run: check } of all) {
   const failures = check()
   console.log(`${failures.length ? 'FAIL' : 'PASS'}  ${name}`)
   failures.slice(0, 40).forEach((f) => console.log(`      ${f}`))

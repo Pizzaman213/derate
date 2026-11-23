@@ -2,6 +2,17 @@
 description: Every task ends with the validation gate and independent review
 alwaysApply: true
 ---
+Before STARTING any non-trivial task (more than a one-file edit):
+
+0. Decide where the code goes. Read `.omp/OWNERSHIP.md` (which area owns the concern) and
+   `.omp/lessons.md` (what has gone wrong before), and run
+   `node .omp/scripts/ownership.mjs --headroom <files you expect to change>`. A change over
+   ~150 net new source lines, or any growth in a file past 70% of its budget, needs a design
+   note first: copy `.omp/design-note.md` to `.omp/work/design-notes/<slug>.md`, fill it in,
+   and get the `design-critic` agent's verdict before writing code. The gate refuses such a
+   change with no note. When you add an area (a new package or tab directory), give it a
+   README whose first paragraph says what it owns and re-run `node .omp/scripts/ownership.mjs`.
+
 Before reporting ANY task done (anything beyond a one-line or docs-only change):
 
 1. Run `cd .omp && npm run validate`. It is the mechanical gate; the step names it prints say
@@ -23,7 +34,9 @@ Before reporting ANY task done (anything beyond a one-line or docs-only change):
    - `design-reviewer` -- when `ui/src` or `.omp/design` changed.
    - `security-reviewer` -- when auth, keys, sessions, gateway routes or contracts changed.
    - `reviewer` -- anything else non-trivial.
-3. Fix what they find, then re-run the gate (and only the reviewers whose area you changed).
+3. Reviewers read `.omp/lessons.md` first. When a finding is mechanical (a script could have
+   caught it), add a row to `lessons.md` and, if it recurs, a gate step.
+4. Fix what they find, then re-run the gate (and only the reviewers whose area you changed).
    Every finding is fixed or answered in the final report with a reason. Say which
    reviewers ran and what each found, including "no findings".
 

@@ -8,6 +8,8 @@ You are the breaker. The author believes the change works; your job is to prove 
 
 **NEVER start a coordinator (`python3 -m control_plane.node`) on a host that runs model containers.** A scratch coordinator adopts the host's running containers at first start, and its restart supervisor then relaunches them with its own `VLLM_API_KEY` when the live coordinator restarts; the live one can no longer authenticate to them. This happened on 2026-11-23 (`sparkrun_4ecb...` relaunched by a scratch on :18200). Attack in-process instead: `create_app(build_deps(...))` with the fakes in `tests/unit/test_gateway.py` and `TestClient`, as `tests/unit/test_gateway_auth.py` does, or call the service classes directly on a `/tmp` SQLite file. For the UI, serve the built `ui/dist` statically (`python3 -m http.server` on an `18xxx` port) and stub `/api/*` with `tab.route`; anything that needs a real coordinator is reported as NOT EXERCISED, never worked around by booting one.
 
+Read `.omp/lessons.md` first: a lesson already enforced by a gate step is not your job; one marked `todo` or `reviewer:breaker` is.
+
 Start from the diff (`git diff $(git merge-base HEAD dev)` plus `git ls-files -o --exclude-standard`) and the acceptance criteria you were given. For each changed behaviour, attack it from every angle that applies:
 
 1. **Input.** Empty, null, wrong type, huge, negative, zero, NaN/inf, unicode, whitespace-only, SQL/HTML/path metacharacters, duplicates, a value that is valid alone and invalid in combination.

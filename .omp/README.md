@@ -17,7 +17,10 @@ agents and `RULES.md` automatically when started in the repo root.
 | `design/DESIGN.md` | the design system: principles, colour/type/space/motion, a spec per component, how to add things | — |
 | `design/components/registry.json` | every component the pack knows: props, variants, states, tokens, icons, spec anchor | — |
 | `charts/` | the six chart types the app mounts, one file each; see `charts/README.md` | `cd charts && npm run charts:test` |
-| `agents/*.md` | `design-reviewer`, `icon-smith`, `duplication-reviewer`, `repo-steward`, `breaker` | omp |
+| `agents/*.md` | `design-reviewer`, `icon-smith`, `duplication-reviewer`, `repo-steward`, `breaker`, `design-critic` | omp |
+| `OWNERSHIP.md` | generated map of every area: owner, size, imports; `node scripts/ownership.mjs`, `--headroom FILE...` |
+| `design-note.md`, `work/design-notes/` | template and the notes written before large changes; reviewed by `design-critic` |
+| `lessons.md` | what has gone wrong, and which gate step or reviewer now stops it |
 | `rules/validation.md` | the always-on end-of-task gate and review requirement | omp |
 | `scripts/validate.mjs` | `npm run validate`: the mechanical gate (also run by `.githooks/pre-push`) | node |
 | `line-budget.json` | files over their budget, recorded at current size; the gate stops them growing (`npm run validate -- --update-budget`) | node |

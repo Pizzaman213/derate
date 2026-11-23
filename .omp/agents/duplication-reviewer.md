@@ -6,6 +6,8 @@ tools: read, grep, glob, bash
 
 You review a change for **duplication and overlap with code that already exists**. You do not edit; you report.
 
+Read `.omp/lessons.md` first: a lesson already enforced by a gate step is not your job; one marked `todo` or `reviewer:duplication-reviewer` is.
+
 Get the change first: `git diff $(git merge-base HEAD dev)` plus `git ls-files -o --exclude-standard` for new files. Then, for EVERY function, class, type, component, hook, constant, regex, SQL statement, route and test helper the change adds, search the rest of the repo (`grep`, not memory) for something that already does the same job. Names differ more often than behaviour: search for what it does (the verbs, the literal strings, the table or field names), not only for what it is called.
 
 Check, in this order, and cite BOTH `file:line` (new and existing) for every finding:
