@@ -10,6 +10,7 @@ at once; and llama.cpp's own output-length spelling cannot outrun a key's cap.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -116,3 +117,69 @@ def test_n_predict_cannot_outrun_the_output_cap():
     assert capped.status_code == 200, capped.text
     assert backend.requests[-1]["max_tokens"] == 100
     assert "n_predict" not in backend.requests[-1]
+
+
+@pytest.mark.parametrize("n_predict", [-1, 0])
+def test_a_non_positive_ceiling_is_refused_not_ignored(n_predict):
+    """llama-server reads ``n_predict: -1`` as unbounded; a ceiling below one
+    was skipped as "no ceiling", so the body went upstream with it and the
+    key's output cap never applied."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        app = create_app(build_deps(deployments=FakeDeployments(
+            [make_deployment("d-1", "llama", backend_url=running.base_url)]
+        )))
+        key = _mint(app, max_output_tokens_per_request=256)
+        with TestClient(app) as client:
+            r = client.post("/v1/chat/completions", json={**CHAT, "max_tokens": 16, "n_predict": n_predict},
+                            headers={"Authorization": f"Bearer {key}"})
+    assert r.status_code == 400, r.text
+    assert backend.requests == []
+
+
+def _counting_loads(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real = openai_api.json.loads
+
+    def loads(raw, *a, **k):
+        calls.append(len(raw))
+        return real(raw, *a, **k)
+
+    monkeypatch.setattr(openai_api.json, "loads", loads)
+    return calls
+
+
+def test_a_body_of_too_many_values_is_refused_before_it_is_parsed(monkeypatch):
+    """Parsing and estimating run on the event loop: a 23 MiB batch of
+    one-token lists held every stream and /healthz for ~3 s."""
+    app = create_app(build_deps())
+    _, key = credentials(app)
+    raw = b'{"model": "llama", "prompt": [' + b"1," * openai_api.MAX_JSON_VALUES + b"1]}"
+    calls = _counting_loads(monkeypatch)
+    with TestClient(app) as client:
+        r = client.post("/v1/completions", content=raw,
+                        headers={"content-type": "application/json", "Authorization": f"Bearer {key}"})
+    assert (r.status_code, r.json()["error"]["code"]) == (413, "too_many_json_values")
+    assert len(raw) not in calls
+
+
+def test_a_key_over_its_rpm_is_refused_before_its_body_is_parsed(monkeypatch):
+    """The rpm refused a request only after parsing it, so a key past its
+    limit could still make the gateway parse as fast as it could upload."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        app = create_app(build_deps(deployments=FakeDeployments(
+            [make_deployment("d-1", "llama", backend_url=running.base_url)]
+        )))
+        key = _mint(app, rpm=2)
+        bearer = {"Authorization": f"Bearer {key}"}
+        with TestClient(app) as client:
+            codes = [client.post("/v1/chat/completions", json=CHAT, headers=bearer).status_code for _ in range(3)]
+            calls = _counting_loads(monkeypatch)
+            raw = json.dumps({**CHAT, "user": "cooled"}).encode()
+            cooled = client.post("/v1/chat/completions", content=raw,
+                                 headers={**bearer, "content-type": "application/json"})
+    assert codes == [200, 200, 429]
+    assert cooled.status_code == 429 and cooled.json()["error"]["code"] == "limit_exceeded"
+    assert cooled.json()["error"]["limit_source"] == "key:rpm"
+    assert len(raw) not in calls

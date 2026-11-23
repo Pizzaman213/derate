@@ -101,8 +101,9 @@ class SecurityEvents:
         self._window = window_s
         self._clock = clock
         self._lock = threading.Lock()
-        #: (action, actor, ip) -> [monotonic time of the last row, events since]
-        self._seen: dict[tuple[str, str, str], list[float]] = {}
+        #: (action, actor, address bucket) -> [monotonic time of the last row,
+        #: events folded since, the last full address seen]
+        self._seen: dict[tuple[str, str, str], list] = {}
         self._queue: queue.Queue[tuple[tuple, dict]] = queue.Queue(maxsize=queue_max)
         self._dropped = 0
         self._thread: threading.Thread | None = None
@@ -122,6 +123,29 @@ class SecurityEvents:
                 return False
             time.sleep(0.005)
         return True
+
+    def close(self, timeout: float = 5.0) -> bool:
+        """Write every folded count no row has reported yet, then wait for the
+        queue. Once, at shutdown, before the audit store closes: a stopped
+        flood's last burst otherwise lives only in ``_seen`` until a prune or
+        an eviction that never comes, and the writer is a daemon thread that
+        dies with the process. True when drained."""
+        if self._audit is None:
+            return True
+        rows: list[tuple[tuple, dict]] = []
+        with self._lock:
+            for k, entry in self._seen.items():
+                rows.extend(self._pending_row(k, entry))
+                entry[1] = 0
+        for row in rows:
+            try:
+                self._queue.put_nowait(row)
+            except queue.Full:
+                with self._lock:
+                    self._dropped += 1
+        if rows:
+            self._ensure_writer()
+        return self.flush(timeout)
 
     def _ensure_writer(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -156,9 +180,10 @@ class SecurityEvents:
         target_id: str = "",
         detail: dict | None = None,
     ) -> None:
-        detail = dict(detail or {})
-        if isinstance(detail.get("path"), str):
-            detail["path"] = detail["path"][:_DETAIL_MAX]
+        # Every string the caller could have chosen is cut -- the path, an
+        # Origin header, anything a future caller adds to detail -- or one
+        # request writes a permanent row as large as the header it sent.
+        detail = {k: (v[:_DETAIL_MAX] if isinstance(v, str) else v) for k, v in (detail or {}).items()}
         target_id = (target_id or "")[:_DETAIL_MAX]
         actor = (actor or "-")[:254]
         if action in _FOLD_BY_IP:
@@ -166,22 +191,25 @@ class SecurityEvents:
                 detail["presented"] = actor
             actor = "-"
         now = self._clock()
-        # A caller-chosen refusal folds per address BUCKET -- an IPv6 /64, as
-        # the key throttle counts it -- or one /64 would open a fresh row,
-        # two fsyncs and a permanent audit entry per request by rotating its
-        # low bits. The row still records the full address that opened it.
-        key = (action.value, actor, address_bucket(ip) if action in _FOLD_BY_IP else (ip or ""))
+        # Every action folds per address BUCKET -- an IPv6 /64, as the key
+        # throttle counts it -- or one /64 would open a fresh row, two fsyncs
+        # and a permanent audit entry per request by rotating its low bits
+        # (a cross-origin refusal did exactly that after KEY_REFUSED was
+        # fixed). The row still records the full address that opened it, and
+        # a later count row the last full address seen.
+        key = (action.value, actor, address_bucket(ip))
         flushed: list[tuple[tuple, dict]] = []
         with self._lock:
             entry = self._seen.get(key)
             if entry is not None and now - entry[0] < self._window:
                 entry[1] += 1
+                entry[2] = ip
                 return
             count = 1 + (int(entry[1]) if entry is not None else 0)
             # Re-inserted rather than assigned, so dict order is the order
             # rows were opened and the oldest are first to go.
             self._seen.pop(key, None)
-            self._seen[key] = [now, 0]
+            self._seen[key] = [now, 0, ip]
             if len(self._seen) > _PRUNE_AT and now - self._pruned_at >= self._window:
                 flushed = self._prune(now)
                 self._pruned_at = now
@@ -226,16 +254,23 @@ class SecurityEvents:
         events folded into it since as a row of their own. Caller holds the
         lock."""
         k = next(iter(self._seen))
-        return self._pending_row(k, int(self._seen.pop(k)[1]))
+        return self._pending_row(k, self._seen.pop(k))
 
     @staticmethod
-    def _pending_row(k: tuple, pending: int) -> list[tuple[tuple, dict]]:
+    def _pending_row(k: tuple, entry: list) -> list[tuple[tuple, dict]]:
+        """The row for events folded into *entry* since its last row, if any.
+        ``ip`` is a real address -- the last one seen -- so a search by
+        address finds it; the bucket it stood for is in ``after``."""
+        pending, last_ip = int(entry[1]), entry[2]
         if not pending:
             return []
-        action_value, actor, ip = k
+        action_value, actor, bucket = k
+        after = {"count": pending}
+        if bucket and bucket != last_ip:
+            after["bucket"] = bucket
         return [(
             (actor, AuditAction(action_value), "security", ""),
-            {"after": {"count": pending}, "ip": ip or None, "request_id": None, "user_agent": None},
+            {"after": after, "ip": last_ip or None, "request_id": None, "user_agent": None},
         )]
 
     def _prune(self, now: float) -> list[tuple[tuple, dict]]:
@@ -246,5 +281,5 @@ class SecurityEvents:
         stale = now - 10 * self._window
         rows: list[tuple[tuple, dict]] = []
         for k in [k for k, v in self._seen.items() if v[0] < stale]:
-            rows.extend(self._pending_row(k, int(self._seen.pop(k)[1])))
+            rows.extend(self._pending_row(k, self._seen.pop(k)))
         return rows

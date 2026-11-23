@@ -3080,6 +3080,7 @@ export type AuditAction =
   | 'setup_refused'
   | 'join_rejected'
   | 'cross_origin_refused'
+  | 'edge_refused'
   | 'session_ip_changed'
   | 'audit_chain_broken'
   | 'agent_refused'

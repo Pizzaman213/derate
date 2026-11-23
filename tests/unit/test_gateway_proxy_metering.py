@@ -331,6 +331,91 @@ def test_a_client_that_hangs_up_mid_stream_is_counted_against_its_key():
             assert _state(app, key_id, "rpm").used == 1  # the window entry was kept
 
 
+@pytest.mark.parametrize("model, limit", [(LOCAL, "local_tokens_cycle"), (CLOUD, "cloud_tokens_cycle")])
+def test_an_unstreamed_body_the_client_cut_is_settled_on_its_usage_block(model, limit):
+    """An unstreamed answer is generated in full before its first byte, so a
+    client that read one chunk and hung up was served all of it -- and used to
+    be charged its first chunk's size / 4, because the usage block is last."""
+    pieces = [b'{"id":"c","object":"chat.completion","choices":[{"index":0,"message":'
+              b'{"role":"assistant","content":"']
+    pieces += [b"7" * 65536] * 24
+    pieces += [b'"},"finish_reason":"length"}],'
+               b'"usage":{"prompt_tokens":10,"completion_tokens":150000}}']
+
+    async def slow_body():
+        for piece in pieces:
+            await asyncio.sleep(0.005)
+            yield piece
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request.read()
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=slow_body())
+
+    deps = build_deps(
+        deployments=FakeDeployments([make_deployment("d-local", LOCAL, backend_url="http://local-backend/v1")]),
+        providers=FakeProviders([make_provider("openrouter", base_url="http://cloud/v1",
+                                               served_name=CLOUD, upstream_id="up/cloud")]),
+    )
+    app = create_app(deps, http_client=httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    rows = _wire(app)
+    key_id, key = _mint(app, local_tokens_cycle=10_000_000, cloud_tokens_cycle=10_000_000)
+    with RunningServer(app) as gateway, httpx.Client(timeout=30) as client:
+        body = {"model": model, "messages": [{"role": "user", "content": "go"}]}
+        with client.stream("POST", f"{gateway.url}/v1/chat/completions", json=body,
+                           headers={"Authorization": f"Bearer {key}"}) as response:
+            assert response.status_code == 200
+            next(response.iter_raw())  # one chunk, then walk away
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not any(r.status == 200 for r in rows.rows):
+            time.sleep(0.05)
+    row = next(r for r in rows.rows if r.status == 200)
+    assert (row.completion_tokens, row.tokens_estimated) == (150_000, False)
+    assert _state(app, key_id, limit).used == 150_010
+
+
+def test_a_body_nobody_started_gives_back_its_kv_and_its_slot_when_reaped(mocked):
+    """A client gone between the response line and the first chunk leaves the
+    body generator unstarted, and an unstarted generator runs no `finally`:
+    the janitor closed the upstream but released neither the deployment's KV
+    commitment nor the key's max_concurrent slot -- for the process's life."""
+    app, _, _ = mocked
+    key_id, key = _mint(app)
+    body = json.dumps({"model": LOCAL, "messages": [{"role": "user", "content": "hi"}]}).encode()
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "scheme": "http",
+        "method": "POST", "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions",
+        "root_path": "", "query_string": b"", "server": ("testserver", 80), "client": ("127.0.0.1", 5000),
+        "headers": [(b"host", b"testserver"), (b"content-type", b"application/json"),
+                    (b"authorization", f"Bearer {key}".encode())],
+    }
+    proxy, admission = app.state.ctx.proxy, app.state.ctx.admission
+
+    async def run():
+        sent = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            if sent:
+                return sent.pop()
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                raise OSError("the client went away")
+
+        with pytest.raises(OSError):
+            await app(scope, receive, send)
+        assert admission.committed("d-local") > 0
+        assert _state(app, key_id, "max_concurrent").used == 1
+        for entry in proxy._open.values():
+            entry.opened_at -= 60.0
+        await proxy._reap()
+
+    asyncio.run(run())
+    assert admission.committed("d-local") == 0
+    assert _state(app, key_id, "max_concurrent").used == 0
+
+
+
 def test_a_provider_stream_the_client_walked_away_from_is_billed_to_its_day(tmp_path):
     provider_upstream = ProviderUpstream()
     provider_upstream.chat_responses.append(

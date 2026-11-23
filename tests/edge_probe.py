@@ -217,7 +217,9 @@ class Probe:
         # The last five are what Starlette would rebuild request.url from:
         # they used to move the path the gate checked away from the router's.
         for host in ("127.0.0.1:8088", "localhost", "127.0.0.1", "[::1]:8088", "",
-                     "x#", "x?", f"{self.host_header()}/v1", "[", "x/v1#"):
+                     "x#", "x?", f"{self.host_header()}/v1", "[", "x/v1#",
+                     # urlsplit raises on these: they were a 500 per request.
+                     "[1.2.3.4]", "[:]", "[1]"):
             data = self.raw(self.request("/api/auth/state", host=host))
             ok, how = self.verdict(data)
             ok = ok and (b" 404 " in data.split(b"\r\n", 1)[0] or b" 400 " in data[:16])
@@ -229,11 +231,26 @@ class Probe:
         if self.main:
             # The same trick against the LAN listener, with no credential at
             # all: before the fix this returned the key list to anyone.
-            for host in ("x#", "x?", "x/v1"):
+            for host in ("x#", "x?", "x/v1", "[1.2.3.4]"):
                 r = self.http.get(self.main + "/api/keys", headers={"Host": host})
                 self.check(f"the LAN port refuses an anonymous /api/keys with Host {host!r}",
                            r.status_code == 400 and field(r, "error", "code") == "invalid_host",
                            f"{r.status_code} {r.text[:120]}")
+
+    def sockets(self) -> None:
+        """A websocket upgrade is refused before accept, which uvicorn answers
+        403. One to a path no route owns used to reach the static mount,
+        which asserts http: a 500 and a traceback in node.log per attempt."""
+        upgrade = ("Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+                   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n")
+        for target in ("/v1/nope", "/v1/realtime/../x", "/api/x", "/"):
+            head = f"GET {target} HTTP/1.1\r\nHost: {self.host_header()}\r\nConnection: Upgrade\r\n" + upgrade
+            for name, value in self.who().items():
+                head += f"{name}: {value}\r\n"
+            data = self.raw((head + "\r\n").encode("latin-1"))
+            status = data.split(b"\r\n", 1)[0]
+            ok = b" 403 " in status + b" " or (self.via == "tunnel" and not data.startswith(b"HTTP/1.1 5"))
+            self.check(f"a websocket to {target!r} is refused, not a 500", ok, repr(data[:160]))
 
     def pipelining_and_smuggling(self) -> None:
         first = self.request("/v1/models", close=False)
@@ -380,6 +397,7 @@ class Probe:
         self.only_v1()
         self.raw_targets()
         self.host_games()
+        self.sockets()
         self.pipelining_and_smuggling()
         self.client_header()
         self.forged_forwarding()

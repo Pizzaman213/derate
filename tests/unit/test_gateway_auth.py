@@ -454,7 +454,14 @@ def test_disable_and_delete_are_audited_and_refuse_the_key(gw):
     r = gw.client.post(f"/api/keys/{key_id}/disable", json={"reason": "leaked"}, headers=gw.cookie)
     assert r.json()["status"] == "disabled" and r.json()["disabled_reason"] == "leaked"
     assert gw.chat(key).json()["error"]["code"] == "api_key_disabled"
-    assert gw.client.post(f"/api/keys/{key_id}/enable", headers=gw.cookie).json()["status"] == "active"
+    # Enabling makes a leaked key a credential again: a session alone is not enough.
+    refused = gw.client.post(f"/api/keys/{key_id}/enable", headers=gw.cookie)
+    assert (refused.status_code, refused.json()["error"]["code"]) == (401, "invalid_credentials")
+    assert gw.chat(key).json()["error"]["code"] == "api_key_disabled"
+    enabled = gw.client.post(
+        f"/api/keys/{key_id}/enable", json={"current_password": ADMIN["password"]}, headers=gw.cookie
+    )
+    assert enabled.json()["status"] == "active"
     assert gw.chat(key).status_code == 200
     assert gw.client.delete(f"/api/keys/{key_id}", headers=gw.cookie).status_code == 200
     assert gw.chat(key).json()["error"]["code"] == "invalid_api_key"

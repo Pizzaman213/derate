@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from .config import USAGE_BODY_LIMIT_BYTES, USAGE_TAIL_BYTES
@@ -139,9 +140,25 @@ def audio_duration_of(raw: bytes) -> float | None:
         return None
     try:
         obj = json.loads(raw.decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
-    return _duration(obj.get("duration") if isinstance(obj, dict) else None)
+    return seconds_of(obj)
+
+
+def seconds_of(obj: object) -> float | None:
+    """A transcription answer's audio length: ``duration`` (``verbose_json``),
+    else ``usage.seconds`` with ``usage.type == "duration"`` -- what OpenAI's
+    plain ``json`` carries. Reading only the first left every default-format
+    request on a per-minute rate unpriced."""
+    if not isinstance(obj, dict):
+        return None
+    found = _duration(obj.get("duration"))
+    if found is not None:
+        return found
+    usage = obj.get("usage")
+    if isinstance(usage, dict) and usage.get("type") == "duration":
+        return _duration(usage.get("seconds"))
+    return None
 
 
 def _duration(value: object) -> float | None:
@@ -153,32 +170,44 @@ def _duration(value: object) -> float | None:
     return value
 
 
+#: Candidates ``object_after_key`` tries before giving up. The block it wants
+#: is the last key of a body, so it is the first candidate from the end; a
+#: fragment of nothing but ``"usage",`` repeated was a copy per candidate --
+#: quadratic, ~50 s for an 8 MiB provider body.
+_MAX_KEY_CANDIDATES = 32
+_JSON_WS = re.compile(r"[ \t\r\n]*")
+
+
 def object_after_key(raw: bytes, key: str) -> object | None:
     """The JSON value following the LAST ``"key":`` in ``raw``, or None.
 
     For a fragment of a body -- its head or its tail -- that json.loads cannot
     read whole. An occurrence escaped inside a string (``\\"usage\\"``) is
     skipped, so a completion that quotes the word cannot impersonate the block.
+    Works on indices (no copy per candidate), tries at most
+    ``_MAX_KEY_CANDIDATES``, and never raises: a value nested past the
+    recursion limit is not a usage block.
     """
     text = raw.decode("utf-8", "replace")
     needle = f'"{key}"'
     end = len(text)
     decoder = json.JSONDecoder()
-    while True:
+    for _ in range(_MAX_KEY_CANDIDATES):
         at = text.rfind(needle, 0, end)
         if at < 0:
             return None
         end = at
         if at > 0 and text[at - 1] == "\\":
             continue
-        rest = text[at + len(needle) :].lstrip()
-        if not rest.startswith(":"):
+        i = _JSON_WS.match(text, at + len(needle)).end()
+        if text[i : i + 1] != ":":
             continue
         try:
-            value, _ = decoder.raw_decode(rest[1:].lstrip())
-        except ValueError:
+            value, _ = decoder.raw_decode(text, _JSON_WS.match(text, i + 1).end())
+        except (ValueError, RecursionError):
             continue
         return value
+    return None
 
 
 def usage_after_key(raw: bytes, *, metered: bool = False) -> Usage | None:
@@ -190,6 +219,9 @@ def usage_after_key(raw: bytes, *, metered: bool = False) -> Usage | None:
 
 
 def duration_after_key(raw: bytes) -> float | None:
-    """A transcription's ``duration`` out of a body fragment, as
+    """A transcription's audio length out of a body fragment, as
     audio_duration_of() would read it from the whole."""
-    return _duration(object_after_key(raw, "duration"))
+    found = _duration(object_after_key(raw, "duration"))
+    if found is not None:
+        return found
+    return seconds_of({"usage": object_after_key(raw, "usage")})

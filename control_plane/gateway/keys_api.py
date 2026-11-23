@@ -520,6 +520,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     @router.post("/api/keys/{key_id}/enable")
     async def enable_key(key_id: str, request: Request) -> Response:
+        """Needs ``current_password``: a key disabled because it leaked is a
+        credential again the moment it is enabled, so a stolen session alone
+        must not be able to do it -- the same rule as create and rotate."""
+        body = await optional_json_object(request)
+        if isinstance(body, Response):
+            return body
+        refused = await reauthenticated(request, stores(), body)
+        if refused is not None:
+            return refused
         return await _key_action(
             key_id, request, AuditAction.KEY_ENABLED,
             lambda keys, actor: keys.enable_key(key_id, actor=actor),

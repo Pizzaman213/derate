@@ -414,21 +414,60 @@ def test_the_refusal_window_is_bounded_and_drains_without_scanning(monkeypatch):
     assert len(window._window) == 0
 
 
-def test_security_events_fold_per_64_and_cut_caller_paths():
-    """KEY_REFUSED folded per full address while the throttle counted per
-    /64: rotating the low bits opened a permanent audit row per request,
-    each carrying whatever path the caller sent."""
+@pytest.mark.parametrize("action", [AuditAction.KEY_REFUSED, AuditAction.CROSS_ORIGIN_REFUSED, AuditAction.SESSION_REFUSED])
+def test_security_events_fold_per_64_and_cut_caller_strings(action):
+    """Every action folds per /64 and every caller-chosen string is cut: a
+    cross-origin refusal folded per full address and kept its Origin uncut,
+    so rotating the low bits wrote a permanent row per request as large as
+    the header."""
     from control_plane.gateway.secevents import _DETAIL_MAX, SecurityEvents
 
     rows: list[tuple] = []
     events = SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
     for i in range(500):
-        events.note(AuditAction.KEY_REFUSED, actor="-", ip=f"2001:db8:1:2::{i + 1:x}",
-                    detail={"path": "/v1/" + "a" * 20_000})
+        events.note(action, actor="-", ip=f"2001:db8:1:2::{i + 1:x}",
+                    detail={"path": "/v1/" + "a" * 20_000, "origin": "https://" + "b" * 20_000})
     assert events.flush()
     assert len(rows) == 1
     args, kwargs = rows[0]
     assert len(kwargs["after"]["path"]) <= _DETAIL_MAX and len(args[3]) <= _DETAIL_MAX
+    assert len(kwargs["after"]["origin"]) <= _DETAIL_MAX
+
+
+def test_a_folded_count_row_names_a_real_address():
+    """The count row a prune writes for a /64 used to carry the CIDR as its
+    ip, which no search by address ever matches."""
+    import ipaddress
+
+    from control_plane.gateway import secevents
+
+    now = [0.0]
+    rows: list[tuple] = []
+    events = secevents.SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: now[0])
+    events.note(AuditAction.KEY_REFUSED, actor="-", ip="2001:db8:5:6::1")
+    events.note(AuditAction.KEY_REFUSED, actor="-", ip="2001:db8:5:6::2")  # folded
+    events._pruned_at = -1e9
+    now[0] = 11 * secevents.WINDOW_S
+    for i in range(secevents._PRUNE_AT + 1):
+        events.note(AuditAction.KEY_REFUSED, actor="-", ip=f"10.1.{i // 256}.{i % 256}")
+    assert events.flush()
+    pending = [k for _, k in rows if k["after"].get("bucket") == "2001:db8:5:6::/64"]
+    assert len(pending) == 1 and pending[0]["after"]["count"] == 1
+    assert ipaddress.ip_address(pending[0]["ip"]) == ipaddress.ip_address("2001:db8:5:6::2")
+
+
+def test_closing_writes_the_counts_no_row_has_reported():
+    """Folded repeats were reported only by a prune or an eviction, and the
+    writer is a daemon thread: a flood that stopped before a restart lost its
+    last minute's count."""
+    from control_plane.gateway.secevents import SecurityEvents
+
+    rows: list[tuple] = []
+    events = SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
+    for _ in range(3):
+        events.note(AuditAction.SESSION_REFUSED, actor="-", ip="10.0.0.1")
+    assert events.close()
+    assert [k["after"]["count"] for _, k in rows] == [1, 2]
 
 
 def test_tracked_triples_are_capped_and_a_pending_count_survives_eviction(monkeypatch):

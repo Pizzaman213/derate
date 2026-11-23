@@ -96,6 +96,10 @@ MAX_OUTPUT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens",
 IMAGE_TOKENS_ESTIMATE = 1000
 #: Content-part types that carry an image: Chat Completions and Responses.
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
+#: Audio and video parts are tokens the template renders too; priced at the
+#: image estimate, which is the only per-part figure this module has.
+_MEDIA_PART_TYPES = _IMAGE_PART_TYPES | {"input_audio", "audio_url", "video_url", "video"}
+_MEDIA_PART_KEYS = ("image_url", "input_audio", "audio_url", "video_url")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cycle_counters (
@@ -138,17 +142,24 @@ _LOCAL = TargetKind.LOCAL.value
 _REMOTE = TargetKind.REMOTE.value
 
 
-def estimate_prompt_tokens(body: dict) -> int:
-    """``gateway/admission.py:221`` ``AdmissionController.estimate_prompt_tokens``.
+def estimate_prompt_tokens(
+    body: dict,
+    *,
+    chars_per_token: float = CHARS_PER_TOKEN,
+    per_message: int = TOKENS_PER_MESSAGE_OVERHEAD,
+) -> int:
+    """The one character-based prompt estimate: the prompt cap, the reservation
+    and admission's KV arithmetic all read it (admission passes its own
+    ``chars_per_token`` / ``tokens_per_message_overhead`` settings). There is
+    no tokenizer here; loading one per model would cost more than it is worth.
 
-    Reimplemented rather than called because it is an instance method that
-    reads ``self._settings``; this is that formula with the settings'
-    defaults (``CHARS_PER_TOKEN``, ``TOKENS_PER_MESSAGE_OVERHEAD``), so the
-    prompt cap and admission agree on what a prompt costs -- plus
-    ``IMAGE_TOKENS_ESTIMATE`` per image part, which admission's KV arithmetic
-    does not need and a prompt cap does.
+    Counts what the chat template renders, not only ``content``: token-id
+    prompts, ``tools``/``functions``/``response_format``, an assistant turn's
+    ``tool_calls`` arguments, and ``IMAGE_TOKENS_ESTIMATE`` per image, audio or
+    video part. Admission used to keep a second formula that counted strings
+    only, and settled a 30k-token token-id prompt as zero.
     """
-    cpt = max(1.0, CHARS_PER_TOKEN)
+    cpt = max(1.0, chars_per_token)
     chars = 0
     overhead = 0
     images = 0
@@ -157,20 +168,29 @@ def estimate_prompt_tokens(body: dict) -> int:
     messages = body.get("messages")
     if isinstance(messages, list):
         for message in messages:
-            overhead += TOKENS_PER_MESSAGE_OVERHEAD
-            content = message.get("content") if isinstance(message, dict) else None
+            overhead += per_message
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
             if isinstance(content, str):
                 chars += len(content)
             elif isinstance(content, list):
                 for part in content:
                     if not isinstance(part, dict):
                         continue
+                    kind = part.get("type")
                     if isinstance(part.get("text"), str):
                         chars += len(part["text"])
-                    elif part.get("type") in _IMAGE_PART_TYPES or "image_url" in part:
+                    elif (isinstance(kind, str) and kind in _MEDIA_PART_TYPES) or any(
+                        key in part for key in _MEDIA_PART_KEYS
+                    ):
                         images += 1
             elif content is not None:
                 chars += len(str(content))
+            # An assistant turn's calls are rendered back into the prompt.
+            for name in ("tool_calls", "function_call"):
+                if message.get(name) is not None:
+                    chars += len(json.dumps(message[name], default=str))
 
     prompt = body.get("prompt")
     if isinstance(prompt, str):
@@ -188,7 +208,7 @@ def estimate_prompt_tokens(body: dict) -> int:
 
     # Tool schemas and a JSON-schema response_format are rendered into the
     # prompt by the chat template, and can be the bulk of it.
-    for name in ("tools", "response_format"):
+    for name in ("tools", "functions", "response_format"):
         value = body.get(name)
         if value is not None:
             chars += len(json.dumps(value, default=str))
@@ -252,7 +272,11 @@ def requested_output(body: dict) -> tuple[str, float] | None:
                 f"{name} must be a finite number no greater than {MAX_OUTPUT_CEILING}, "
                 f"not {value!r}"
             )
-        if value > 0 and (best is None or value > best[1]):
+        if value < 1:
+            # Not "no ceiling": llama-server reads n_predict -1 as unbounded,
+            # and skipping it forwarded the body uncapped (vLLM refuses < 1).
+            raise ValueError(f"{name} must be a positive integer, not {value!r}")
+        if best is None or value > best[1]:
             best = (name, value)
     return best
 

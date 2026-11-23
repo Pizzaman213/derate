@@ -423,6 +423,46 @@ class TestSignalShutdown:
         shutdown()
         assert servers[0].force_exit is True
 
+    def test_one_real_sigterm_runs_every_lifespan_shutdown(self):
+        """uvicorn's own signal handlers fired beside derate's, so ONE SIGTERM
+        looked like two: force_exit on the first, and the gateway's lifespan
+        shutdown -- audit flush, store close -- skipped. The fakes above cannot
+        see that; a real signal, in a child so it can never reach pytest, can."""
+        import os
+        import subprocess
+
+        script = (
+            "import asyncio, os, signal\n"
+            "from control_plane import node\n"
+            "done = []\n"
+            "def app_named(name):\n"
+            "    async def app(scope, receive, send):\n"
+            "        while True:\n"
+            "            m = await receive()\n"
+            "            if m['type'] == 'lifespan.startup':\n"
+            "                await send({'type': 'lifespan.startup.complete'})\n"
+            "            elif m['type'] == 'lifespan.shutdown':\n"
+            "                done.append(name)\n"
+            "                await send({'type': 'lifespan.shutdown.complete'})\n"
+            "                return\n"
+            "    return app\n"
+            "async def main():\n"
+            "    servers = [node._make_server(app_named(n), host='127.0.0.1', port=0) for n in ('agent', 'gateway')]\n"
+            "    async def kick():\n"
+            "        while not all(s.started for s in servers):\n"
+            "            await asyncio.sleep(0.05)\n"
+            "        os.kill(os.getpid(), signal.SIGTERM)\n"
+            "    task = asyncio.get_running_loop().create_task(kick())\n"
+            "    await node._run_with_signals(servers)\n"
+            "    print([s.force_exit for s in servers], sorted(done))\n"
+            "asyncio.run(main())\n"
+        )
+        root = Path(__file__).resolve().parents[2]
+        out = subprocess.run([sys.executable, "-c", script], cwd=root, capture_output=True,
+                             text=True, timeout=60, env={**os.environ, "PYTHONPATH": str(root)})
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().splitlines()[-1] == "[False, False] ['agent', 'gateway']"
+
     def test_an_open_connection_cannot_hold_a_restart_forever(self):
         """uvicorn's defaults wait on every connection with no deadline and
         let one websocket buffer 32 x 16 MiB; an internet caller controls both."""

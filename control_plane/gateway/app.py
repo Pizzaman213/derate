@@ -54,11 +54,9 @@ from control_plane.providers.autoadopt import RuntimeAutoAdopter
 
 from . import auth_api, authz, chainwatch, engine_targets, keys_api
 from .admission import AdmissionController
-from .auth import is_unauthorized
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
 from .deps import GatewayContext, GatewayDeps
-from .errors import error_response
 from .headers import SecurityHeaders
 from .metrics import MetricsHub
 from .parking import ParkingLot
@@ -307,6 +305,15 @@ class _UIStatics(StaticFiles):
     #: exists must fail as a missing script, not load an HTML document into a
     #: ``<script type="module">``.
     _NO_FALLBACK = frozenset({"api", "v1", "assets", "healthz", "install.sh"})
+
+    async def __call__(self, scope, receive, send):
+        # Mount("/") also matches websocket scopes, and StaticFiles asserts
+        # http: a socket to any unrouted path was an uncaught AssertionError
+        # and a traceback in the log per attempt. Refuse it as a socket.
+        if scope["type"] != "http":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await super().__call__(scope, receive, send)
 
     async def get_response(self, path, scope):
         try:
@@ -641,6 +648,10 @@ def create_app(
             await _best_effort_shutdown("registry", deps.registry, "stop")
             # Last, so anything the shutdown path emits is still recorded.
             await telemetry.stop()
+            # Before the stores: its writer is a daemon thread with rows still
+            # queued, and folded counts no row has reported yet.
+            if ctx.secevents is not None:
+                await asyncio.to_thread(ctx.secevents.close, 5.0)
             await asyncio.to_thread(ctx.auth_stores.close)
 
     app = FastAPI(
@@ -693,6 +704,9 @@ def create_app(
     # other's allowance. On app.state because the socket handlers have no
     # handle on the guard instance (Starlette builds middleware lazily).
     app.state.key_refusals = authz.RefusalWindow(KEY_REFUSALS_PER_ADDRESS_PER_MIN)
+    # The noise budget: cheap anonymous refusals per address, past which they
+    # are answered without an access row each (authz.quiet_past_budget).
+    app.state.noise_refusals = authz.RefusalWindow(authz.NOISE_PER_ADDRESS_PER_MIN)
     app.add_middleware(authz.AuthGuard, key_refusals=app.state.key_refusals)
 
     # Last, so outermost: every answer carries the headers, including the
@@ -700,23 +714,10 @@ def create_app(
     # file. See headers.py for why each one is there.
     app.add_middleware(SecurityHeaders, settings=settings)
 
-    # Opt-in: a no-op unless DERATE_API_TOKEN is set. See auth.py for why
-    # /v1 and /api/nodes/join are not covered by this check.
-    @app.middleware("http")
-    async def _api_token_guard(request, call_next):
-        if is_unauthorized(
-            path=request.scope["path"],
-            authorization=request.headers.get("authorization"),
-            token=settings.api_token,
-        ):
-            return error_response(
-                401,
-                "Missing or invalid API token. Send it as "
-                "'Authorization: Bearer <token>'.",
-                "authentication_error",
-                "invalid_api_token",
-            )
-        return await call_next(request)
+    # DERATE_API_TOKEN (auth.py) is checked inside AuthGuard._refusal, not as
+    # middleware out here: registered last, a middleware runs FIRST, so its
+    # 401 went out before the edge's 404 for /api, with no request id, no
+    # security headers and no access row.
 
     if ctx.profiles is None:
         from .profiles_store import ProfileStore

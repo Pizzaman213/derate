@@ -74,6 +74,7 @@ def world(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def _fresh_budget(world):
     world["app"].state.key_refusals.reset()
+    world["app"].state.noise_refusals.reset()
 
 
 def _bearer(key: str) -> dict:
@@ -386,23 +387,110 @@ def test_a_dot_segment_on_the_edge_never_reaches_the_ui(tmp_path, monkeypatch, p
 def test_a_flood_stops_being_written_down_but_is_still_counted(world, caplog):
     """Past an address's budget, throttled 429s and edge 404s are answered
     but write no access line each: a flood would otherwise rotate node.log's
-    history away. The folded security row still counts every one."""
+    history away. The folded security rows still count every one -- the 404s
+    past the budget included, which used to leave no trace at all."""
     import logging
 
-    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
-    from control_plane.gateway.authz import EDGE_MISSES_PER_ADDRESS_PER_MIN
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN, AuditAction
+    from control_plane.gateway.authz import NOISE_PER_ADDRESS_PER_MIN
 
     caller = {"CF-Connecting-IP": "203.0.113.120"}
     bad = _bearer("derate-bbbbbbbbbb_" + "x" * 43)
     with caplog.at_level(logging.INFO):
         codes = [world["edge"].get("/v1/models", headers={**caller, **bad}).status_code for _ in range(60)]
-        misses = [world["edge"].get("/nope", headers=caller).status_code for _ in range(EDGE_MISSES_PER_ADDRESS_PER_MIN + 40)]
+        misses = [world["edge"].get("/nope", headers=caller).status_code for _ in range(NOISE_PER_ADDRESS_PER_MIN + 40)]
     assert codes.count(401) == KEY_REFUSALS_PER_ADDRESS_PER_MIN and codes.count(429) == 60 - KEY_REFUSALS_PER_ADDRESS_PER_MIN
     assert set(misses) == {404}
     access = [r for r in caplog.records if r.name == "gateway.access" and "203.0.113.120" in r.getMessage()]
-    assert len(access) == KEY_REFUSALS_PER_ADDRESS_PER_MIN + EDGE_MISSES_PER_ADDRESS_PER_MIN
+    assert len(access) == KEY_REFUSALS_PER_ADDRESS_PER_MIN + NOISE_PER_ADDRESS_PER_MIN
     warnings = [r for r in caplog.records if r.name == "gateway.security" and "203.0.113.120" in r.getMessage()]
-    assert len(warnings) == 1, [w.getMessage() for w in warnings]
+    assert sorted(w.getMessage().split()[0] for w in warnings) == ["edge_refused", "key_refused"]
+    ctx = world["app"].state.ctx
+    ctx.secevents.flush()
+    entries, _ = ctx.auth_stores.auth.audit_page(action=AuditAction.EDGE_REFUSED.value)
+    assert [e.ip for e in entries if e.ip == "203.0.113.120"] == ["203.0.113.120"]
+
+
+def test_cross_origin_refusals_fold_per_64_and_go_quiet(world, caplog):
+    """The round-1 flood controls covered refused keys and edge 404s only: a
+    cross-site write from rotating low bits wrote an access row and a
+    permanent audit row per request, Origin header uncut."""
+    import logging
+
+    from control_plane.contracts.auth import AuditAction
+    from control_plane.gateway.authz import NOISE_PER_ADDRESS_PER_MIN
+    from control_plane.gateway.secevents import _DETAIL_MAX
+
+    origin = "https://evil.example/" + "a" * 10_000
+    with caplog.at_level(logging.INFO):
+        codes = [
+            world["edge"].post(
+                "/v1/chat/completions",
+                json={},
+                headers={"CF-Connecting-IP": f"2001:db8:0:9::{i + 1:x}", "Origin": origin},
+            ).status_code
+            for i in range(NOISE_PER_ADDRESS_PER_MIN + 30)
+        ]
+    assert set(codes) == {403}
+    access = [r for r in caplog.records if r.name == "gateway.access" and "2001:db8:0:9:" in r.getMessage()]
+    assert len(access) == NOISE_PER_ADDRESS_PER_MIN
+    ctx = world["app"].state.ctx
+    ctx.secevents.flush()
+    entries, _ = ctx.auth_stores.auth.audit_page(action=AuditAction.CROSS_ORIGIN_REFUSED.value)
+    rows = [e for e in entries if (e.ip or "").startswith("2001:db8:0:9:")]
+    assert len(rows) == 1 and len(rows[0].after["origin"]) <= _DETAIL_MAX
+
+
+@pytest.mark.parametrize("port", [None, EDGE_PORT])
+def test_a_socket_to_an_unrouted_path_is_closed_not_a_traceback(tmp_path, monkeypatch, port):
+    """Mount("/") matches websocket scopes too, and StaticFiles asserts http:
+    every socket to an unrouted path was an uncaught AssertionError and a
+    traceback in node.log, from the edge with no key at all."""
+    from control_plane.gateway import GatewayDeps, GatewaySettings
+
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<!doctype html><title>ui</title>")
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path / "data"))
+    app = create_app(GatewayDeps(), settings=GatewaySettings(ui_dir=str(ui), edge_port=EDGE_PORT))
+    base = f"ws://testserver:{port}" if port else "ws://testserver"
+    client = TestClient(app, client=LOOPBACK)
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with client.websocket_connect(f"{base}/v1/nope", headers=WAN):
+            pass
+    assert closed.value.code == 1008
+
+
+def test_socket_floods_go_quiet_past_their_budgets(world, caplog):
+    """Every socket refusal wrote an access line and row: the HTTP half of the
+    flood fix had no websocket half."""
+    import logging
+
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
+    from control_plane.gateway.authz import NOISE_PER_ADDRESS_PER_MIN
+
+    def attempts(path: str, ip: str, n: int, headers: dict | None = None) -> set[int]:
+        codes = set()
+        for _ in range(n):
+            with pytest.raises(WebSocketDisconnect) as closed:
+                with world["edge"].websocket_connect(
+                    f"ws://testserver:{EDGE_PORT}{path}", headers={"CF-Connecting-IP": ip, **(headers or {})}
+                ):
+                    pass
+            codes.add(closed.value.code)
+        return codes
+
+    with caplog.at_level(logging.INFO):
+        assert attempts("/api/x", "203.0.113.122", NOISE_PER_ADDRESS_PER_MIN + 40) == {1008}
+        bad = _bearer("derate-dddddddddd_" + "x" * 43)
+        assert attempts("/v1/realtime?model=m", "203.0.113.123", KEY_REFUSALS_PER_ADDRESS_PER_MIN + 20, bad) == {1008}
+
+    def rows(ip: str) -> int:
+        return len([r for r in caplog.records if r.name == "gateway.access" and ip in r.getMessage()])
+
+    assert rows("203.0.113.122") == NOISE_PER_ADDRESS_PER_MIN
+    assert rows("203.0.113.123") == KEY_REFUSALS_PER_ADDRESS_PER_MIN
+
 
 
 def test_rotating_inside_a_64_opens_one_security_row(world):

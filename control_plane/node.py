@@ -42,6 +42,7 @@ or :func:`_serve_coordinator`, never at module scope.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import ipaddress
 import logging
@@ -188,16 +189,26 @@ def _config(app, *, host: str, port: int) -> uvicorn.Config:
 
 
 def _make_server(app, *, host: str, port: int) -> uvicorn.Server:
-    return uvicorn.Server(_config(app, host=host, port=port))
+    return _Server(_config(app, host=host, port=port))
 
 
 class _Server(uvicorn.Server):
     """A uvicorn server that serves the sockets it was given: one lifespan
-    over several listeners, so the gateway and its edge share one app."""
+    over several listeners, so the gateway and its edge share one app.
+
+    And one that leaves signals to `_run_with_signals`. uvicorn 0.33 installs
+    its own SIGTERM/SIGINT handlers around `serve` (`capture_signals`); with
+    derate's loop handler beside them both fired on ONE signal, so derate's
+    saw `should_exit` already set and forced the exit on the first SIGTERM --
+    skipping the gateway's lifespan shutdown, which is where the audit and
+    security rows are flushed and the stores closed."""
 
     def __init__(self, config: uvicorn.Config, sockets: list[socket.socket] | None = None):
         super().__init__(config)
         self._sockets = sockets
+
+    def capture_signals(self):
+        return contextlib.nullcontext()
 
     async def serve(self, sockets: list[socket.socket] | None = None) -> None:
         await super().serve(sockets=sockets or self._sockets)

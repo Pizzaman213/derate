@@ -172,7 +172,9 @@ def test_every_api_route_wants_a_session(world, route):
 #: Host values Starlette would rebuild ``request.url`` from: each one used to
 #: move the path the gate checked away from the path the router dispatched.
 #: ``x#`` and ``x?`` made it empty; ``x/v1`` put it under /v1.
-FORGED_HOSTS = ["x#", "x?", "x/v1", "x/healthz?", "x/v1#", "[", "a b", "x@y"]
+#: The bracketed ones passed the pattern and made urlsplit raise: a 500 each.
+FORGED_HOSTS = ["x#", "x?", "x/v1", "x/healthz?", "x/v1#", "[", "a b", "x@y",
+                "[1.2.3.4]", "[1.2.3.4]:80", "[:]", "[1]", "[fe80::1%eth0]"]
 
 
 @pytest.mark.parametrize("host", FORGED_HOSTS)

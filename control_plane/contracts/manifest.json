@@ -198,6 +198,7 @@
         "SETUP_REFUSED": "setup_refused",
         "JOIN_REJECTED": "join_rejected",
         "CROSS_ORIGIN_REFUSED": "cross_origin_refused",
+        "EDGE_REFUSED": "edge_refused",
         "SESSION_IP_CHANGED": "session_ip_changed",
         "AUDIT_CHAIN_BROKEN": "audit_chain_broken",
         "AGENT_REFUSED": "agent_refused",

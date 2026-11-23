@@ -119,6 +119,12 @@ def test_a_scheme_other_than_http_or_data_is_refused(url, scheme):
     )
 
 
+@pytest.mark.parametrize("url", ["http://[x/", "http://[127.0.0.1]/", "http://[foo]/"])
+def test_a_url_the_parser_raises_on_is_refused_not_a_500(url):
+    body = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]}
+    assert media_url_refusal(body)
+
+
 def test_every_part_shape_is_checked():
     lan = "http://192.168.0.9/x"
     assert media_url_refusal(_chat({"type": "image_url", "image_url": lan}))

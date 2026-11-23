@@ -511,7 +511,9 @@ export interface Backend {
   orgs(): Promise<OrgRow[]>
   /** Disable every active key of the org, admin keys included. */
   disableOrgKeys(orgId: string, reason?: string): Promise<{ disabled: string[] }>
-  enableKey(keyId: string): Promise<ApiKeyRow>
+  /** Needs the signed-in admin's `currentPassword`: a key disabled because it
+   *  leaked is a credential again the moment it is enabled. */
+  enableKey(keyId: string, currentPassword: string): Promise<ApiKeyRow>
   /** Replaces the secret and reveals the new one, once. The old one stops
    *  working immediately. Needs the signed-in admin's `currentPassword` for
    *  every key: a stolen session alone must not mint a credential. */
@@ -1665,7 +1667,8 @@ export const httpBackend: Backend = {
   orgs: () => req<OrgRow[]>('/api/orgs'),
   disableOrgKeys: (orgId, reason) =>
     req<{ disabled: string[] }>(`/api/orgs/${seg(orgId)}/keys/disable`, post(reason ? { reason } : {})),
-  enableKey: (keyId) => req<ApiKeyRow>(`/api/keys/${seg(keyId)}/enable`, post()),
+  enableKey: (keyId, currentPassword) =>
+    req<ApiKeyRow>(`/api/keys/${seg(keyId)}/enable`, post({ current_password: currentPassword })),
   rotateKey: (keyId, currentPassword) =>
     reqUnscrubbed<MintedKey>(
       `/api/keys/${seg(keyId)}/rotate`,

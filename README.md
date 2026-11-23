@@ -167,7 +167,7 @@ limits — tokens, requests and dollars per 30-day cycle, local and cloud pools,
 rpm, tpm, concurrency, per-request caps, per model — that refuse with a 429
 naming the limit that tripped. A key that names no rpm is held to 120, and one
 that names no concurrency to 16 requests at once. Minting
-or rotating a key asks for the admin's password again. Every request row
+or rotating a key, or enabling a disabled one, asks for the admin's password again. Every request row
 records the key that sent it, so each key has its own usage page.
 `GET /v1/key` tells a client what its key may do. See
 `docs/guide/the-endpoint.md`.

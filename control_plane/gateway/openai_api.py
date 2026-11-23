@@ -54,6 +54,24 @@ _GENERATION_PATHS = frozenset({"/chat/completions", "/completions"})
 #: rarely held by it.
 MAX_BODIES_IN_FLIGHT_PER_KEY = 4
 
+#: JSON values (``,`` ``[`` ``{``, counted at C speed before parsing) one body
+#: may carry. Parsing and estimating run on the event loop and cost ~0.1 s per
+#: million values in a token-id prompt -- 3 s for a 23 MiB batch of one-token
+#: lists, during which every stream, every key and /healthz waits. A million
+#: values is more prompt than any context window holds.
+MAX_JSON_VALUES = 1 << 20
+
+#: Refusals that hold a key whatever model it asks for next: its own and its
+#: org's requests per minute. One of them puts the key in `rpm_cooling`, and
+#: its bodies are then refused before they are read -- a request that the rpm
+#: refuses after parsing still paid for the parse, so it was unbounded.
+_MODEL_FREE_RPM = frozenset({f"{LimitScope.KEY.value}:rpm", f"{LimitScope.ORG.value}:rpm"})
+
+
+def _json_values(raw: bytes) -> int:
+    return raw.count(b",") + raw.count(b"[") + raw.count(b"{")
+
+
 #: Background attributions in flight; held so the loop does not drop them.
 _BACKGROUND: set[asyncio.Task] = set()
 
@@ -161,6 +179,12 @@ def _boundary_of(content_type: str) -> bytes | None:
 
 class _DuplicateField(ValueError):
     """A form field the gateway reads appears in more than one part."""
+
+
+#: Transcription answer formats that say how long the audio was: ``duration``
+#: (verbose_json) or ``usage.seconds`` (OpenAI's json). What a per-minute rate
+#: is charged on, so the only ones a per-minute-priced model is asked for.
+_DURATION_FORMATS = frozenset({"json", "verbose_json"})
 
 
 def _part_name(headers: bytes) -> str | None:
@@ -352,14 +376,22 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     engine_busy: dict[str, set[_EngineSlot]] = {}
     # key_id -> its request bodies being read or parsed right now.
     bodies_in_flight: dict[str, int] = {}
+    # key_id -> (monotonic time its rpm frees, the refusal that said so).
+    rpm_cooling: dict[str, tuple[float, object]] = {}
 
     def _hold_body_slot(request: Request) -> str | Response | None:
         """The calling key's id, now holding one of its body slots; a 429 when
-        it has none left; None when the request carries no key."""
+        it has none left, or is cooling off a requests-per-minute refusal
+        (the same 429 it was given); None when the request carries no key."""
         principal = getattr(request.state, "principal", None)
         key_id = getattr(getattr(principal, "key", None), "key_id", None)
         if not key_id:
             return None
+        cooling = rpm_cooling.get(key_id)
+        if cooling is not None:
+            if time.monotonic() < cooling[0]:
+                return _limit_refusal(cooling[1])
+            rpm_cooling.pop(key_id, None)
         held = bodies_in_flight.get(key_id, 0)
         if held >= MAX_BODIES_IN_FLIGHT_PER_KEY:
             return errors.error_response(
@@ -518,6 +550,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "invalid_request_error",
                     "payload_too_large",
                 )
+            if _json_values(raw) > MAX_JSON_VALUES:
+                return errors.error_response(
+                    413,
+                    f"The request body carries more than {MAX_JSON_VALUES} JSON values; "
+                    "no prompt that size fits a context window.",
+                    "invalid_request_error",
+                    "too_many_json_values",
+                )
             try:
                 body = json.loads(raw) if raw else {}
             except (ValueError, RecursionError) as exc:
@@ -613,9 +653,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         try:
             model = _multipart_field(raw, content_type, "model")
-        except _DuplicateField:
+            # Read only to refuse a second one: the gateway prices the format
+            # it reads, so two would let the upstream answer in the other.
+            _multipart_field(raw, content_type, "response_format")
+        except _DuplicateField as exc:
             return errors.error_response(
-                400, "duplicate multipart field: model -- send exactly one 'model' part.",
+                400, f"duplicate multipart field: {exc} -- send exactly one.",
                 "invalid_request_error", "invalid_request",
             )
         if not model:
@@ -808,6 +851,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 return _refused(authz.unavailable(exc), exc.code.value)
             if not decision.allowed:
                 trace.limit_source = decision.limit_source
+                if (
+                    principal is not None
+                    and decision.limit_source in _MODEL_FREE_RPM
+                    and decision.resets_at is not None
+                ):
+                    rpm_cooling[principal.key.key_id] = (
+                        time.monotonic() + max(0.0, decision.resets_at - time.time()),
+                        decision,
+                    )
                 return _refused(_limit_refusal(decision), decision.code)
             if (
                 decision.inject_max_tokens is not None
@@ -906,6 +958,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         model_served=record.served_name,
                     )
                 )
+            elif record.error_class == "Reaped":
+                # The janitor closed an answer whose body nobody ever started
+                # reading. The release in `_released_at_end` is a generator
+                # `finally` that never runs for it, so the reservation (and its
+                # max_concurrent slot) would be held for the life of the process.
+                _settle_limits(None)
             record = replace(
                 record, attempt_chain=list(attempt_chain), cost_usd=cost, cost_basis=basis
             )
@@ -1113,7 +1171,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         and body is not None
                     ):
                         decision = ctx.admission.check(deployment, body)
-                        trace.prompt_tokens = decision.prompt_tokens
+                        # Never below the reservation's estimate: whichever
+                        # is larger is what a stream with no usage frame
+                        # settles at, so a smaller one is a discount.
+                        trace.prompt_tokens = max(trace.prompt_tokens or 0, decision.prompt_tokens)
                         if not decision.ok:
                             ctx.breaker.abandon(target.target_id)
                             headers = (
@@ -1162,6 +1223,24 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     # Remote upstreams call the model something else. This is
                     # the only edit made to a request body, and it is required
                     # for it to route.
+                    rate = getattr(selection.model, "price_per_minute_usd", None)
+                    if rate is not None and content is not None and content_type is not None:
+                        fmt = (_multipart_field(content, content_type, "response_format") or "json").lower()
+                        if fmt not in _DURATION_FORMATS:
+                            # Priced per minute, and only a JSON answer says
+                            # how many: text/srt/vtt settled free.
+                            ctx.breaker.abandon(target.target_id)
+                            return _refused(
+                                errors.error_response(
+                                    400,
+                                    f"Model '{model}' is priced per minute of audio and a "
+                                    f"'{fmt[:32]}' answer does not say how many minutes it was. "
+                                    "Ask for response_format 'json' or 'verbose_json'.",
+                                    "invalid_request_error",
+                                    "invalid_request",
+                                ),
+                                "invalid_request",
+                            )
                     if selection.model is not None:
                         if body is not None:
                             upstream_body = dict(body)

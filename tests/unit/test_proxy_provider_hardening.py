@@ -789,10 +789,17 @@ def test_a_part_with_two_dispositions_is_refused():
 
 
 class _TimedAudioProviders(_ManagedProviders):
+    #: What the upstream answers, and how many times it was asked.
+    answer: bytes = json.dumps({"text": "hello", "duration": 120}).encode()
+    opened = 0
+
     @asynccontextmanager
     async def open_upstream(self, provider_id, upstream_id, body, stream=False, **kw):
+        self.opened += 1
+        answer = self.answer
+
         async def body_iter():
-            yield json.dumps({"text": "hello", "duration": 120}).encode()
+            yield answer
 
         yield UpstreamResponse(
             status_code=200, headers={"content-type": "application/json"},
@@ -800,23 +807,31 @@ class _TimedAudioProviders(_ManagedProviders):
         )
 
 
-def _timed_audio(rate):
+def _timed_audio_reply(rate, *, answer: dict | None = None, fields: dict | None = None):
     provider = make_provider("audio", served_name="whisper", upstream_id="whisper-1",
                              modality=Modality.TRANSCRIPTION)
     provider.models[0].price_per_minute_usd = rate
-    app = create_app(build_deps(providers=_TimedAudioProviders([provider])))
+    providers = _TimedAudioProviders([provider])
+    if answer is not None:
+        providers.answer = json.dumps(answer).encode()
+    app = create_app(build_deps(providers=providers))
     rows: list = []
     key_id, key = _mint(app, budget_usd_cycle=1.0)
     with TestClient(app) as client:
         app.state.ctx.sink.request = rows.append
         reply = client.post(
             "/v1/audio/transcriptions",
-            data={"model": "whisper"},
+            data={"model": "whisper", **(fields or {})},
             files={"file": ("clip.mp3", b"ID3audio", "audio/mpeg")},
             headers={"Authorization": f"Bearer {key}"},
         )
+    return reply, rows, _state(app, key_id, "budget_usd_cycle").used, providers
+
+
+def _timed_audio(rate, **kw):
+    reply, rows, used, _ = _timed_audio_reply(rate, **kw)
     assert reply.status_code == 200, reply.text
-    return rows[-1], _state(app, key_id, "budget_usd_cycle").used
+    return rows[-1], used
 
 
 def test_remote_audio_with_a_per_minute_rate_is_metered_on_its_duration():
@@ -824,6 +839,43 @@ def test_remote_audio_with_a_per_minute_rate_is_metered_on_its_duration():
     assert row.cost_usd == pytest.approx(0.012)
     assert row.cost_basis == "metered"
     assert used == pytest.approx(0.012)
+
+
+def test_plain_json_is_metered_on_its_usage_seconds():
+    """OpenAI's default ``json`` answer has no ``duration``, only
+    ``usage.seconds``: reading the first alone left every default-format
+    request on a per-minute rate free."""
+    row, used = _timed_audio(0.006, answer={"text": "hi", "usage": {"type": "duration", "seconds": 120}})
+    assert row.cost_usd == pytest.approx(0.012) and used == pytest.approx(0.012)
+
+
+@pytest.mark.parametrize("fmt", ["text", "srt", "vtt"])
+def test_a_per_minute_model_refuses_a_format_that_carries_no_duration(fmt):
+    reply, _, used, providers = _timed_audio_reply(0.006, fields={"response_format": fmt})
+    assert (reply.status_code, reply.json()["error"]["code"]) == (400, "invalid_request")
+    assert providers.opened == 0 and used == 0
+
+
+def test_a_model_without_a_rate_answers_any_format():
+    reply, _, _, providers = _timed_audio_reply(None, fields={"response_format": "text"})
+    assert reply.status_code == 200 and providers.opened == 1
+
+
+def test_a_second_response_format_is_refused():
+    """The gateway prices the format it reads; two would let the upstream
+    answer in the other."""
+    provider = make_provider("audio", served_name="whisper", upstream_id="whisper-1",
+                             modality=Modality.TRANSCRIPTION)
+    app = create_app(build_deps(providers=_TimedAudioProviders([provider])))
+    _, key = _mint(app, budget_usd_cycle=1.0)
+    with TestClient(app) as client:
+        reply = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "whisper", "response_format": ["json", "text"]},
+            files={"file": ("clip.mp3", b"ID3audio", "audio/mpeg")},
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert (reply.status_code, reply.json()["error"]["code"]) == (400, "invalid_request")
 
 
 def test_remote_audio_without_a_rate_stays_unpriced():
@@ -839,3 +891,20 @@ def test_the_provider_day_reads_the_transcription_duration():
     sniffer = UsageSniffer(stream=False)
     sniffer.feed(b'{"text": "x", "duration": 120}')
     assert sniffer.audio_duration_s() == 120.0
+    sniffer = UsageSniffer(stream=False)
+    sniffer.feed(b'{"text": "x", "usage": {"type": "duration", "seconds": 90}}')
+    assert sniffer.audio_duration_s() == 90.0
+
+
+def test_the_tail_parser_is_linear_and_never_raises():
+    """A hostile upstream's body: one ``"usage",`` per eight bytes was a copy
+    per candidate (quadratic), and a deep array escaped as RecursionError past
+    every ``except ValueError`` and leaked the upstream connection."""
+    from control_plane.providers.usage import audio_duration_of, object_after_key
+
+    started = time.monotonic()
+    assert object_after_key(b'"usage",' * 1_048_576, "usage") is None
+    assert object_after_key(b'"usage":' + b"[" * 100_000, "usage") is None
+    assert audio_duration_of(b'{"a":' + b"[" * 100_000) is None
+    assert time.monotonic() - started < 1.0
+    assert object_after_key(b'x"usage": {"a": 1}, "usage":{"b":2}', "usage") == {"b": 2}

@@ -293,9 +293,9 @@ times inside a minute is answered 429 `rate_limited` (`Retry-After: 60`) on
 `/v1` before the key store is read, a valid key included -- the budget is the
 address's. One `authz.RefusalWindow` per process, built in `create_app` and
 shared by the HTTP gate and `require_key` through `app.state.key_refusals`.
-Minting a key (`POST /api/keys`) and rotating any key ask for
-`current_password` (`auth_api.reauthenticated`), so a stolen session alone
-cannot mint a credential. A `/v1` JSON body whose media URL names a
+Minting a key (`POST /api/keys`), rotating any key and enabling a disabled one
+ask for `current_password` (`auth_api.reauthenticated`), so a stolen session
+alone cannot mint a credential or revive a leaked one. A `/v1` JSON body whose media URL names a
 non-public host is refused 400 `media_url_refused` (`media.py`; names are not
 resolved, so DNS rebinding is out of its reach).
 
@@ -312,18 +312,36 @@ uvicorn decodes `%2F`, so `/v1/..%2Fcluster` arrives under `/v1` by prefix and
 the static mount would resolve it to the admin UI. The main port is unchanged.
 
 **Every listener refuses a `Host` that is not a plain host[:port]** (400
-`invalid_host`), and every path decision reads `scope["path"]`, the field the
-router dispatches on. `request.url` is rebuilt from `Host`, so a decision made
-on it can be steered by the caller (see CLAUDE.md).
+`invalid_host`; a bracketed one must be an IPv6 address), and every path
+decision reads `scope["path"]`, the field the router dispatches on.
+`request.url` is rebuilt from `Host`, so a decision made on it can be steered
+by the caller (see CLAUDE.md). `DERATE_API_TOKEN` (`auth.py`) is checked inside
+`AuthGuard._refusal`, not as `@app.middleware`: a middleware registered after
+the guard runs before it, and that one answered the edge's `/api` with a 401
+instead of its 404. A websocket to a path no route owns is closed 1008 by
+`_UIStatics.__call__`; `StaticFiles` asserts `http` and logged a traceback.
 
 **Floods are counted, not transcribed.** An address past its refused-key
-budget, or past `EDGE_MISSES_PER_ADDRESS_PER_MIN` (60) edge 404s, is still
-answered but writes no access line or row per request (`state["quiet"]`); the
-security-event row, folded per `secevents.address_bucket` (an IPv6 /64), counts
-them, and its WARNING is written once per row, not per event. Paths in access
-lines and security rows are cut to 512 and 256 characters. One key may have
-`MAX_BODIES_IN_FLIGHT_PER_KEY` (4) request bodies being read or parsed at once
-(`openai_api.py`), because that happens before any per-key limit can run.
+budget, or past `authz.NOISE_PER_ADDRESS_PER_MIN` (60) cheap anonymous
+refusals -- edge 404s, cross-site writes, missing sessions, malformed `Host`s,
+over HTTP and websockets alike (`app.state.noise_refusals`) -- is still
+answered but writes no access line or row per request (`state["quiet"]`).
+Every security event folds per `secevents.address_bucket` (an IPv6 /64),
+whatever its action, so its row counts them, and its WARNING is written once
+per row, not per event; edge 404s past the budget are counted as
+`edge_refused`. A count row carries the last full address it stood for and the
+bucket in `after`. Every string in a security row's detail is cut to 256
+characters, paths in access lines to 512. `SecurityEvents.close` writes the
+counts no row has reported yet at shutdown, before the stores close.
+
+**Parsing is bounded before any limit runs.** One key may have
+`MAX_BODIES_IN_FLIGHT_PER_KEY` (4) request bodies being read or parsed at once,
+a body may carry `MAX_JSON_VALUES` (2^20) JSON values, counted at C speed before
+`json.loads` (parsing and estimating run on the event loop), and a key refused
+on its own or its org's rpm gets the same 429 before its next body is read
+until the window frees (`rpm_cooling`). Admission and the limits share one
+prompt estimator (`limits.service.estimate_prompt_tokens`), and an output
+ceiling below one is a 400: llama-server reads `n_predict: -1` as unbounded.
 
 The stores (`auth.db`, `keys.db`, `limits.db`) open on first use, so building an
 app touches no disk for them. The middleware is registered before `_csrf_guard`
@@ -342,7 +360,15 @@ ever reaches the browser. `/api/chat/models` and `/api/chat/voices` mirror
 once: the attempt that answered counts its usage from its telemetry row (in
 `_on_record`, which also prices it and appends to the attempt chain), and
 whatever is still held is released when the response is complete -- at once,
-or at the end of a stream's body. The client's `Authorization` and `Cookie` are
+or at the end of a stream's body. An unstreamed body is generated in full
+before its first byte and its usage block is last, so its upstream reads are
+shielded (`proxy._next_chunk`): a client's hang-up lands at the send, not
+inside the read, and the rest is read for its usage (`_drain_for_usage`)
+rather than settled at the first chunk's size / 4. An answer whose body
+nobody started is settled by the janitor (`_OpenUpstream.abandon`), releasing
+its KV commitment and its reservation. A per-minute-priced transcription model
+answers only `json` and `verbose_json`, the formats that carry `duration` or
+`usage.seconds`. The client's `Authorization` and `Cookie` are
 never forwarded upstream; a REMOTE target gets its provider's key and a LOCAL
 one gets none.
 

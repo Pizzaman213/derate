@@ -91,7 +91,7 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
     setError(null)
     try {
       if (pending === 'disable') await backend.disableKey(id, reason.trim() || undefined)
-      else if (pending === 'enable') await backend.enableKey(id)
+      else if (pending === 'enable') await backend.enableKey(id, currentPassword)
       else if (pending === 'delete') await backend.deleteKey(id)
       else if (pending === 'reset') await backend.resetCycle(id)
       else if (pending === 'raise') await backend.raiseLimit(id, type, value)
@@ -139,7 +139,7 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
               <input id="ka-reason" value={reason} onChange={(e) => setReason(e.target.value)} />
             </div>
           ) : null}
-          {pending === 'rotate' ? (
+          {pending === 'rotate' || pending === 'enable' ? (
             <div className="fld" style={{ marginTop: 'var(--space-8)' }}>
               <label htmlFor="ka-current-pw">Your password</label>
               <PasswordField
@@ -148,7 +148,11 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
                 autoComplete="current-password"
                 onChange={setCurrentPassword}
               />
-              <span className="unit">Minting a secret is an admin action: confirm it is you.</span>
+              <span className="unit">
+                {pending === 'rotate'
+                  ? 'Minting a secret is an admin action: confirm it is you.'
+                  : 'A disabled key is a credential again once enabled: confirm it is you.'}
+              </span>
             </div>
           ) : null}
           {pending === 'raise' ? (
@@ -185,7 +189,7 @@ export function KeyActions({ row }: { row: ApiKeyRow }) {
           <div style={{ display: 'flex', gap: 'var(--space-8)', marginTop: 'var(--space-8)' }}>
             <button
               type="button"
-              disabled={busy || (pending === 'rotate' && !currentPassword)}
+              disabled={busy || ((pending === 'rotate' || pending === 'enable') && !currentPassword)}
               onClick={() => void run()}
             >
               {busy ? CONFIRM[pending].busy : `${CONFIRM[pending].button} ${row.name}`}

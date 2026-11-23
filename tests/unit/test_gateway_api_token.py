@@ -123,3 +123,25 @@ def test_matching_bearer_token_reaches_the_route():
             "/api/providers", headers={**session, "Authorization": "Bearer secret"}
         )
     assert reply.status_code == 200
+
+
+@pytest.mark.raw_http
+def test_the_edge_answers_api_with_404_even_when_a_token_is_set():
+    """The token check was outer middleware, so it ran before the edge's 404
+    and told a WAN caller /api exists -- unlogged and unthrottled."""
+    settings = GatewaySettings(api_token="secret", edge_port=18096)
+    app = create_app(GatewayDeps(), settings=settings)
+    edge = TestClient(app, base_url="http://testserver:18096", client=("127.0.0.1", 50000))
+    reply = edge.get("/api/providers", headers={"CF-Connecting-IP": "203.0.113.9"})
+    assert (reply.status_code, reply.json()["error"]["code"]) == (404, "not_found")
+
+
+@pytest.mark.raw_http
+def test_a_missing_token_is_refused_inside_the_gate():
+    """Its 401 carries what every other refusal does: a request id and the
+    security headers."""
+    with _client(GatewaySettings(api_token="secret")) as client:
+        reply = client.get("/api/providers")
+    assert reply.json()["error"]["code"] == "invalid_api_token"
+    assert reply.headers["x-request-id"].startswith("r-")
+    assert reply.headers["x-content-type-options"] == "nosniff"

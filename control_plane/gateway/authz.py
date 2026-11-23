@@ -76,6 +76,7 @@ from control_plane.contracts.auth import (
 from control_plane.contracts.auth import AuditAction
 from control_plane.keys import format as key_format
 
+from .auth import is_unauthorized
 from .csrf import is_cross_site_write, trusted_origins
 from .errors import error_response
 from .secevents import address_bucket
@@ -285,6 +286,26 @@ def invalid_host() -> Response:
         "The Host header must be a host name or address, with an optional port.",
         "invalid_request_error",
         AuthErrorCode.INVALID_HOST.value,
+    )
+
+
+def api_token_refused(conn: HTTPConnection) -> bool:
+    """``DERATE_API_TOKEN`` is set and this /api request does not carry it."""
+    try:
+        token = conn.app.state.ctx.settings.api_token
+    except AttributeError:
+        return False
+    return is_unauthorized(
+        path=conn.scope["path"], authorization=conn.headers.get("authorization"), token=token
+    )
+
+
+def invalid_api_token() -> Response:
+    return error_response(
+        401,
+        "Missing or invalid API token. Send it as 'Authorization: Bearer <token>'.",
+        "authentication_error",
+        "invalid_api_token",
     )
 
 
@@ -605,9 +626,28 @@ def _log_access(state: dict, *, method: str, path: str, query: str,
 #: An access line or row keeps this much of a path. A URL can be ~16 KB through
 #: Cloudflare; a few thousand of those would rotate node.log's history away.
 _LOGGED_PATH_MAX = 512
-#: Edge 404s one address gets written down per minute; past it they are still
-#: answered, but quietly (see ``on_request_done``).
-EDGE_MISSES_PER_ADDRESS_PER_MIN = 60
+#: Cheap anonymous refusals -- an edge 404, a cross-site write, a missing
+#: session, a malformed Host -- one address gets written down per minute; past
+#: it they are still answered, but quietly (see ``on_request_done``), and the
+#: folded security-event row counts them.
+NOISE_PER_ADDRESS_PER_MIN = 60
+
+
+def quiet_past_budget(conn: HTTPConnection) -> bool:
+    """Count one cheap refusal against the caller's noise budget; past it,
+    mark the request quiet and say so. The window is ``app.state.noise_refusals``
+    (built in create_app, shared by HTTP and sockets); a bare test app has none
+    and nothing goes quiet."""
+    window = getattr(conn.app.state, "noise_refusals", None)
+    if window is None:
+        return False
+    state = conn.scope.setdefault("state", {})
+    caller = state.get("client_ip") or "-"
+    if window.over(caller):
+        state["quiet"] = True
+        return True
+    window.note(caller)
+    return False
 
 
 async def on_request_done(scope, status: int | None, duration_ms: float) -> None:
@@ -624,7 +664,7 @@ async def on_request_done(scope, status: int | None, duration_ms: float) -> None
     path = scope.get("path", "")
     query = _query_of(scope)
     # A flood answered past its address's budget (a throttled 429, an edge
-    # 404 beyond EDGE_MISSES_PER_ADDRESS_PER_MIN) writes no line and no row
+    # 404 or other cheap refusal past NOISE_PER_ADDRESS_PER_MIN) writes no line and no row
     # of its own: the folded security-event row counts it, and one access
     # entry per flooded request is what would rotate real history out.
     if not state.get("quiet"):
@@ -892,7 +932,17 @@ def host_is_valid(conn: HTTPConnection) -> bool:
     values = conn.headers.getlist("host")
     if not values:
         return True
-    return len(values) == 1 and _HOST_RE.fullmatch(values[0]) is not None
+    if len(values) != 1 or _HOST_RE.fullmatch(values[0]) is None:
+        return False
+    host = values[0]
+    if host.startswith("["):
+        # The class lets "[1.2.3.4]" and "[:]" through, and urlsplit raises
+        # on both -- a 500 on every request. Brackets hold an IPv6 address.
+        try:
+            return ipaddress.IPv6Address(host[1:host.index("]")]).scope_id is None
+        except ValueError:
+            return False
+    return True
 
 
 class RefusalWindow:
@@ -983,9 +1033,6 @@ class AuthGuard:
         # Client address -> refused keys in the last minute, read before the
         # key store so a flood of bad keys costs no lookups.
         self.key_refusals = key_refusals or RefusalWindow(KEY_REFUSALS_PER_ADDRESS_PER_MIN)
-        # Client address -> edge 404s in the last minute. Never refuses: past
-        # the budget the 404s still go out, they just stop being written down.
-        self.edge_misses = RefusalWindow(EDGE_MISSES_PER_ADDRESS_PER_MIN)
 
     def _warn_untrusted_proxy(self, request: Request, peer: str | None) -> None:
         """F8: a proxy in front with ``DERATE_TRUSTED_PROXIES`` unset records
@@ -1028,13 +1075,18 @@ class AuthGuard:
         state["user_agent"] = conn.headers.get("user-agent", "")[:512]
         status: int | None = None
 
-        if not host_is_valid(conn) or (
+        bad_host = not host_is_valid(conn)
+        if bad_host or (
             state.get("edge")
             and (_edge_path_refused(scope.get("path", "")) or state.get("edge_client_missing"))
         ):
             # A malformed Host anywhere, and on the edge anything but /v1 or a
             # caller without the client header: closed rather than answered,
-            # and the finally below records it.
+            # and the finally below records it -- unless the caller is past
+            # its noise budget, when the folded security row counts it instead.
+            if quiet_past_budget(conn):
+                _note(conn, AuditAction.EDGE_REFUSED, actor="-",
+                      detail={"path": scope.get("path", ""), "socket": True})
             status = CLOSE_POLICY
             try:
                 await send({"type": "websocket.close", "code": CLOSE_POLICY})
@@ -1114,11 +1166,11 @@ class AuthGuard:
             # write check, so a cross-site write is refused before anything
             # looks at its cookie, inside the guard so its row carries the
             # request id.
-            refusal = (
-                self._front_refusal(request)
-                or _cross_site_refusal(request)
-                or self._refusal(request)
-            )
+            refusal = self._front_refusal(request)
+            if refusal is None:
+                refusal = _cross_site_refusal(request)
+            if refusal is None:
+                refusal = self._refusal(request)
             if refusal is not None:
                 await refusal(scope, receive, tracking_send)
                 return
@@ -1145,6 +1197,7 @@ class AuthGuard:
         """A malformed Host on either listener; on the edge, anything but a
         plain /v1 path, and a /v1 call without the client header."""
         if not host_is_valid(request):
+            quiet_past_budget(request)
             return invalid_host()
         state = request.scope.get("state") or {}
         if not state.get("edge"):
@@ -1153,11 +1206,10 @@ class AuthGuard:
         # Before the CORS-preflight bypass and the cross-site check: a
         # preflight or a cross-site write to /api on the edge is still a 404.
         if _edge_path_refused(path):
-            caller = state.get("client_ip") or "-"
-            if self.edge_misses.over(caller):
-                state["quiet"] = True
-            else:
-                self.edge_misses.note(caller)
+            if quiet_past_budget(request):
+                # Past the budget, a scan still leaves a count: one folded
+                # row per address bucket per minute, never one per request.
+                _note(request, AuditAction.EDGE_REFUSED, actor="-", detail={"path": path})
             return edge_not_found()
         if state.get("edge_client_missing"):
             _note(
@@ -1186,6 +1238,12 @@ class AuthGuard:
         stores = stores_of(request)
         try:
             if is_api:
+                # DERATE_API_TOKEN, when set. Here rather than as outer
+                # middleware, so its 401 carries a request id, the security
+                # headers and an access row -- and so the edge's 404 for /api
+                # (decided above) is never preceded by a 401 that admits it.
+                if api_token_refused(request):
+                    return invalid_api_token()
                 route = (method, path)
                 if route in OPEN_ROUTES:
                     return None
@@ -1201,6 +1259,7 @@ class AuthGuard:
                 session = current_session(stores, request)
                 if session is None:
                     _note(request, AuditAction.SESSION_REFUSED, actor="-", detail={"path": path})
+                    quiet_past_budget(request)
                     return session_required()
                 request.state.session = session
             else:
@@ -1237,6 +1296,7 @@ class AuthGuard:
         except AuthUnavailable as exc:
             return unavailable(exc)
 
+
 def _cross_site_refusal(request: Request) -> Response | None:
     """The 403 for a cross-site write (csrf.py), or None.
 
@@ -1264,6 +1324,7 @@ def _cross_site_refusal(request: Request) -> Response | None:
         actor="-",
         detail={"origin": origin, "path": request.scope["path"]},
     )
+    quiet_past_budget(request)
     return error_response(
         403,
         f"Cross-origin write refused: {origin!r} does not match this "
@@ -1323,6 +1384,7 @@ def cross_site_socket(websocket) -> bool:
             actor="-",
             detail={"origin": origin, "path": websocket.scope["path"]},
         )
+        quiet_past_budget(websocket)
     return refused
 
 
@@ -1338,6 +1400,7 @@ async def require_session(websocket, stores: AuthStores) -> Session | None:
         session = None
     if session is None:
         _note(websocket, AuditAction.SESSION_REFUSED, actor="-", detail={"path": websocket.scope["path"]})
+        quiet_past_budget(websocket)
         await websocket.close(code=CLOSE_POLICY, reason=AuthErrorCode.SESSION_REQUIRED.value)
         return None
     websocket.scope["state"]["session"] = session
@@ -1365,6 +1428,7 @@ async def require_key(websocket, stores: AuthStores) -> Principal | None:
             actor=key_actor(bearer_token(websocket)),
             detail={"code": "rate_limited", "path": websocket.scope["path"]},
         )
+        websocket.scope["state"]["quiet"] = True
         await websocket.close(code=CLOSE_POLICY, reason="rate_limited")
         return None
     try:

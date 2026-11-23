@@ -74,7 +74,11 @@ def _address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
 
 
 def _refusal(url: str) -> str | None:
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        # "http://[x/", "http://[127.0.0.1]/": urlsplit raises on its own.
+        return f"Media URLs must be valid URLs; {_echo(url)} is not one."
     scheme = parts.scheme.lower()
     if scheme == "data":
         return None

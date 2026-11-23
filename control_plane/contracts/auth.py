@@ -212,6 +212,9 @@ class AuditAction(str, Enum):
     SETUP_REFUSED = "setup_refused"
     JOIN_REJECTED = "join_rejected"
     CROSS_ORIGIN_REFUSED = "cross_origin_refused"
+    #: An address past its noise budget kept asking the edge for something it
+    #: does not serve; one folded row per address bucket per minute counts it.
+    EDGE_REFUSED = "edge_refused"
     #: A live session was used from an address or user agent it was not last seen on.
     SESSION_IP_CHANGED = "session_ip_changed"
     #: The audit hash chain failed verification (actor ``system``).
