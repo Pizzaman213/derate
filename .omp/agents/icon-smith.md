@@ -13,3 +13,5 @@ Process:
 3. Register it in `icons.json` with `name`, `category`, `tags`, `usage`, `added`, `replaces`.
 4. `cd .omp && npm run icons:build && npm run icons:lint`; fix every finding the lint names.
 5. Migrate call sites: `<Icon name="…" decorative />` inside labelled controls, `<Icon name="…" label="…" />` where the icon is the information. Never leave the glyph and the icon both in place.
+
+Before you return: run `cd .omp && npm run validate -- --fast` and include its PASS/FAIL lines in your result; do not report done on a red gate (see `.omp/rules/validation.md`).

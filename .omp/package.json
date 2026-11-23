@@ -7,7 +7,8 @@
     "tokens:check": "node design/tokens/check.mjs",
     "icons:build": "node design/icons/build.mjs",
     "icons:lint": "node design/icons/lint.mjs",
-    "check": "npm run tokens:check && npm run icons:lint"
+    "check": "npm run tokens:check && npm run icons:lint",
+    "validate": "node scripts/validate.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.12",
