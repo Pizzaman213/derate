@@ -303,7 +303,8 @@
         "SETUP_LOCAL_ONLY": "setup_local_only",
         "EDGE_NOT_FOUND": "not_found",
         "EDGE_CLIENT_UNKNOWN": "edge_client_unknown",
-        "MEDIA_URL_REFUSED": "media_url_refused"
+        "MEDIA_URL_REFUSED": "media_url_refused",
+        "INVALID_HOST": "invalid_host"
       }
     },
     "AuthPort": {
@@ -2233,6 +2234,10 @@
     "DEFAULT_GUARDRAIL": {
       "module": "control_plane.contracts.hardware",
       "value": 0.9
+    },
+    "DEFAULT_KEY_MAX_CONCURRENT": {
+      "module": "control_plane.contracts.auth",
+      "value": 16
     },
     "DEFAULT_KEY_RPM": {
       "module": "control_plane.contracts.auth",

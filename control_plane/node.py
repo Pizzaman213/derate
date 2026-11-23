@@ -157,6 +157,12 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     )
 
 
+#: Seconds in-flight requests get to finish after a shutdown signal.
+SHUTDOWN_GRACE_S = 30
+#: Websocket frames buffered per connection (each up to uvicorn's 16 MiB).
+WS_MAX_QUEUE = 4
+
+
 def _config(app, *, host: str, port: int) -> uvicorn.Config:
     from control_plane.gateway.settings import uvicorn_proxy_kwargs
 
@@ -170,6 +176,13 @@ def _config(app, *, host: str, port: int) -> uvicorn.Config:
         access_log=False,
         # No "server: uvicorn": the version banner tells a scanner what to try.
         server_header=False,
+        # A client holding a stream or a realtime socket open must not hold a
+        # restart open with it: uvicorn's default waits for every connection
+        # forever, which an internet caller can now arrange at will.
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
+        # Frames a websocket may buffer while its upstream is slow. The
+        # default 32 x 16 MiB lets one realtime session hold 512 MiB.
+        ws_max_queue=WS_MAX_QUEUE,
         **uvicorn_proxy_kwargs(),
     )
 
@@ -192,19 +205,28 @@ class _Server(uvicorn.Server):
 
 def _bind(host: str, port: int) -> socket.socket:
     """A listening-ready socket bound the way ``uvicorn.Config.bind_socket``
-    binds one, so the edge behaves like the main listener in every respect
-    but the port."""
+    binds one, except not inheritable: nothing here forks workers, and the
+    shell relay's ``pty.fork`` + ``execve`` would otherwise hand the edge
+    listener to every shell an admin opens and every process left running
+    from one, which could then hold the port after the coordinator exits."""
     sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
-    sock.set_inheritable(True)
+    sock.set_inheritable(False)
+    return sock
+
+
+def _not_inheritable(sock: socket.socket) -> socket.socket:
+    sock.set_inheritable(False)
     return sock
 
 
 def _install_shutdown(
     servers: list[uvicorn.Server],
 ) -> Callable[[], None]:
-    """Build the signal callback: flip ``should_exit`` on every server.
+    """Build the signal callback: flip ``should_exit`` on every server, and
+    ``force_exit`` on a second signal -- the operator asking twice means do
+    not wait for the grace period.
 
     Split out from :func:`_run_with_signals` so the shutdown behaviour is
     exercisable directly in a test, with plain fake objects, without sending
@@ -214,6 +236,8 @@ def _install_shutdown(
     def _shutdown() -> None:
         log.info("shutdown signal received")
         for server in servers:
+            if server.should_exit:
+                server.force_exit = True
             server.should_exit = True
 
     return _shutdown
@@ -292,7 +316,7 @@ async def _serve_coordinator(runtime: NodeRuntime, config: RegistryConfig) -> No
         gateway_server = _Server(
             config,
             # bind_socket logs the main listener the way uvicorn always has.
-            sockets=[config.bind_socket(), edge],
+            sockets=[_not_inheritable(config.bind_socket()), edge],
         )
         log.info(
             "edge listener on %s:%d: /v1 only, client address from %s",

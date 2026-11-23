@@ -166,6 +166,105 @@ def test_a_stream_without_a_usage_frame_records_the_prompt_estimate_not_zero(moc
     assert row.completion_tokens == 4  # one per frame, with no usage block
 
 
+# -- (b) a body past the 1 MiB head is still counted (finding H1) ---------------
+
+
+def _big_body_app(payload: bytes):
+    """The gateway over one cloud target that answers every request with
+    ``payload``."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request.read()
+        return httpx.Response(200, headers={"content-type": "application/json"},
+                              stream=httpx.ByteStream(payload))
+
+    deps = build_deps(
+        deployments=FakeDeployments([]),
+        providers=FakeProviders([make_provider("openrouter", base_url="http://cloud/v1",
+                                               served_name=CLOUD, upstream_id="up/cloud")]),
+    )
+    app = create_app(deps, http_client=httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    return app, _wire(app)
+
+
+def _two_mib_choices() -> str:
+    logprobs = [{"token": "x", "logprob": -0.1, "top_logprobs": []}] * 40000
+    return json.dumps([{"index": 0, "message": {"role": "assistant", "content": "x"},
+                        "logprobs": {"content": logprobs}, "finish_reason": "length"}])
+
+
+def test_a_body_past_the_head_limit_records_its_usage_block_not_zero():
+    payload = ('{"id":"c","object":"chat.completion","choices":' + _two_mib_choices()
+               + ',"usage":{"prompt_tokens":10,"completion_tokens":5000}}').encode()
+    assert len(payload) > 2 * 1024 * 1024
+    app, rows = _big_body_app(payload)
+    key_id, key = _mint(app, cloud_tokens_cycle=10_000_000)
+    with TestClient(app) as client:
+        reply = client.post("/v1/chat/completions", json=PROMPT,
+                            headers={"Authorization": f"Bearer {key}"})
+    assert reply.status_code == 200
+    assert len(reply.content) == len(payload)
+    row = [r for r in rows.rows if r.status == 200][-1]
+    assert row.completion_tokens == 5000
+    assert row.prompt_tokens == 10
+    assert row.tokens_estimated is False
+    assert _state(app, key_id, "cloud_tokens_cycle").used == 5010
+
+
+def test_a_large_body_with_no_usage_block_settles_an_estimate_not_zero():
+    payload = ('{"id":"c","object":"chat.completion","choices":'
+               + _two_mib_choices() + "}").encode()
+    assert len(payload) > 1024 * 1024
+    app, rows = _big_body_app(payload)
+    key_id, key = _mint(app, cloud_tokens_cycle=10_000_000)
+    with TestClient(app) as client:
+        reply = client.post("/v1/chat/completions", json=PROMPT,
+                            headers={"Authorization": f"Bearer {key}"})
+    assert reply.status_code == 200
+    row = [r for r in rows.rows if r.status == 200][-1]
+    assert row.tokens_estimated is True
+    assert row.completion_tokens > 0
+    assert _state(app, key_id, "cloud_tokens_cycle").used >= row.completion_tokens
+
+
+def test_a_size_estimate_never_exceeds_what_the_request_could_produce():
+    """With no usage block the output is estimated from the body's size, which
+    counts JSON and logprobs too -- ~500k tokens for 2 MiB. When the request
+    named a ceiling the engine stopped there, so the estimate is settled at it
+    rather than charging a key's whole cycle for one call."""
+    payload = ('{"id":"c","object":"chat.completion","choices":'
+               + _two_mib_choices() + "}").encode()
+    app, rows = _big_body_app(payload)
+    key_id, key = _mint(app, cloud_tokens_cycle=10_000_000)
+    with TestClient(app) as client:
+        reply = client.post("/v1/chat/completions", json={**PROMPT, "max_tokens": 300},
+                            headers={"Authorization": f"Bearer {key}"})
+    assert reply.status_code == 200
+    row = [r for r in rows.rows if r.status == 200][-1]
+    assert (row.tokens_estimated, row.completion_tokens) == (True, 300)
+    assert _state(app, key_id, "cloud_tokens_cycle").used == (row.prompt_tokens or 0) + 300
+
+
+def test_a_large_transcription_keeps_its_duration_for_per_minute_pricing():
+    # Driven on the accounting directly: the FakeBackend's transcription route
+    # answers one fixed small body and no fixture carries a per-minute price,
+    # so the read H1 broke is pinned where it happens.
+    from control_plane.gateway.proxy import _NoAccounting
+
+    segments = json.dumps([{"id": i, "start": i, "end": i + 1, "text": "word " * 20}
+                           for i in range(3000)])
+    for body in (
+        '{"task":"transcribe","duration":3000.5,"segments":' + segments + "}",
+        '{"task":"transcribe","segments":' + segments + ',"duration":3000.5}',
+    ):
+        raw = body.encode()
+        assert len(raw) > _NoAccounting.LIMIT
+        accounting = _NoAccounting(0.0)
+        for i in range(0, len(raw), 4096):
+            accounting.note_chunk(raw[i : i + 4096], 0.0)
+        assert accounting.finish(0.0).audio_duration_s == 3000.5
+
+
 # -- (c) local streams always ask for usage ------------------------------------
 
 

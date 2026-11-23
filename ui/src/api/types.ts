@@ -3030,6 +3030,7 @@ export type AuthErrorCode =
   | 'not_found'
   | 'edge_client_unknown'
   | 'media_url_refused'
+  | 'invalid_host'
 export type AuditAction =
   | 'login'
   | 'login_failed'

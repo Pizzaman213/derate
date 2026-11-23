@@ -14,7 +14,8 @@ Three kinds of state, and where each lives:
 * cycle counters -- ``limits.db``, one row per (scope, id, cycle_start,
   metric), written once per settled request in one transaction;
 * rpm/tpm windows -- in memory, a sliding 60 s deque per (scope, id[, model]).
-  A key with no ``rpm`` is held to ``DEFAULT_KEY_RPM``;
+  A key with no ``rpm`` is held to ``DEFAULT_KEY_RPM`` and one with no
+  ``max_concurrent`` to ``DEFAULT_KEY_MAX_CONCURRENT``;
 * in-flight reservations -- in memory, which is also ``max_concurrent``.
 
 The in-memory two do not survive a restart, and do not need to: a window is
@@ -24,6 +25,7 @@ was serving it.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import secrets
@@ -36,6 +38,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from control_plane.contracts.auth import (
+    DEFAULT_KEY_MAX_CONCURRENT,
     DEFAULT_KEY_RPM,
     NEAR_LIMIT_FRACTION,
     ApiKey,
@@ -83,8 +86,10 @@ DEFAULT_OUTPUT_ESTIMATE = 256
 CHARS_PER_TOKEN = 4.0
 TOKENS_PER_MESSAGE_OVERHEAD = 4
 #: Every field a client may ask for an output ceiling in: Chat Completions
-#: (old and new spelling) and Responses.
-MAX_OUTPUT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+#: (old and new spelling), Responses, and llama.cpp's ``n_predict``, which
+#: llama-server honours over ``max_tokens`` -- unlisted, it was an uncapped
+#: output ceiling.
+MAX_OUTPUT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "n_predict")
 #: What one image part is assumed to cost in prompt tokens. Its bytes are a
 #: URL or base64 and say nothing about the vision encoder's tile count, and
 #: counting it as zero let an image-heavy prompt past every prompt cap.
@@ -147,6 +152,7 @@ def estimate_prompt_tokens(body: dict) -> int:
     chars = 0
     overhead = 0
     images = 0
+    tokens = 0
 
     messages = body.get("messages")
     if isinstance(messages, list):
@@ -170,17 +176,48 @@ def estimate_prompt_tokens(body: dict) -> int:
     if isinstance(prompt, str):
         chars += len(prompt)
     elif isinstance(prompt, list):
-        for item in prompt:
-            chars += len(item) if isinstance(item, str) else 0
+        chars, more = _count_list(prompt, chars)
+        tokens += more
 
     inputs = body.get("input")
     if isinstance(inputs, str):
         chars += len(inputs)
     elif isinstance(inputs, list):
-        for item in inputs:
-            chars += len(item) if isinstance(item, str) else 0
+        chars, more = _count_list(inputs, chars)
+        tokens += more
 
-    return int(chars / cpt) + overhead + images * IMAGE_TOKENS_ESTIMATE
+    # Tool schemas and a JSON-schema response_format are rendered into the
+    # prompt by the chat template, and can be the bulk of it.
+    for name in ("tools", "response_format"):
+        value = body.get(name)
+        if value is not None:
+            chars += len(json.dumps(value, default=str))
+
+    return int(chars / cpt) + tokens + overhead + images * IMAGE_TOKENS_ESTIMATE
+
+
+def _is_token_list(item: object) -> bool:
+    return (
+        isinstance(item, list)
+        and bool(item)
+        and all(isinstance(t, int) and not isinstance(t, bool) for t in item)
+    )
+
+
+def _count_list(items: list, chars: int) -> tuple[int, int]:
+    """``(chars, tokens)`` of a ``prompt``/``input`` list: strings are
+    characters, a list of token ids is already tokens, and a list of such lists
+    (a pre-tokenised batch) is the sum of their lengths. Counting ids as zero
+    let any prompt past ``max_prompt_tokens_per_request``."""
+    if _is_token_list(items):
+        return chars, len(items)
+    tokens = 0
+    for item in items:
+        if isinstance(item, str):
+            chars += len(item)
+        elif _is_token_list(item):
+            tokens += len(item)
+    return chars, tokens
 
 
 #: Largest output ceiling a request may name. Anything above is not a budget
@@ -227,17 +264,30 @@ MAX_COMPLETIONS = 128
 
 def completions_requested(body: dict) -> int:
     """How many completions one request generates: ``n`` returned, or
-    ``best_of`` generated server-side and billed even when not returned.
-    Every output ceiling is per completion, so a request's output is that
-    ceiling times this. ``ValueError`` above :data:`MAX_COMPLETIONS`."""
+    ``best_of`` generated server-side and billed even when not returned, times
+    the number of prompts in a ``/v1/completions`` batch (a list of strings or
+    of token lists generates one set per prompt). Every output ceiling is per
+    completion, so a request's output is that ceiling times this.
+
+    ``ValueError`` above :data:`MAX_COMPLETIONS` or for a value that is not an
+    integer: the engines coerce ``"128"`` and ``128.0`` to 128, so skipping
+    them counted one copy where the engine generated 128."""
     copies = 1
     for name in ("n", "best_of"):
         value = body.get(name)
-        if isinstance(value, bool) or not isinstance(value, int):
+        if value is None:
             continue
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer, not {value!r}")
         if value > MAX_COMPLETIONS:
             raise ValueError(f"{name} must be an integer no greater than {MAX_COMPLETIONS}")
         copies = max(copies, value)
+    prompt = body.get("prompt")
+    if isinstance(prompt, list) and not _is_token_list(prompt):
+        batch = sum(1 for p in prompt if isinstance(p, str) or _is_token_list(p))
+        copies *= max(1, batch)
     return copies
 
 
@@ -471,6 +521,10 @@ class LimitService:
         # rather than being unlimited. An operator who wants more sets more.
         if scope is LimitScope.KEY and "rpm" not in (limits or {}):
             limits = {**(limits or {}), "rpm": DEFAULT_KEY_RPM}
+        # Same for concurrency: one key could otherwise hold every connection
+        # a backend's pool has.
+        if scope is LimitScope.KEY and "max_concurrent" not in (limits or {}):
+            limits = {**(limits or {}), "max_concurrent": DEFAULT_KEY_MAX_CONCURRENT}
         configured = self._configured(limits, model)
         start, resets_at = cycle_bounds(anchor, now)
         overrides: dict[str, float] = {}

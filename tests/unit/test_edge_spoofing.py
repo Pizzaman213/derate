@@ -329,3 +329,93 @@ def test_first_run_setup_cannot_be_claimed_through_the_edge(tmp_path, monkeypatc
     assert r.status_code == 404
     state = TestClient(app, client=LOOPBACK).get("/api/auth/state").json()
     assert state["admin_exists"] is False
+
+
+# -- found by the blue-team review (2026-11-23) -------------------------------
+
+
+@pytest.mark.parametrize("host", ["testserver/v1", "x#", "x?", "[", "x/v1#"])
+def test_a_host_that_would_move_the_path_is_refused_on_the_edge(world, host):
+    """Starlette rebuilds ``request.url`` from ``Host``. The gate used to
+    decide on that rebuilt path while the router used ``scope["path"]``, so
+    ``Host: testserver/v1`` put ``/api/keys`` under the /v1 key gate and a
+    key holder got the key list."""
+    r = world["edge"].get("/api/keys", headers={**WAN, **_bearer(world["key"]), "Host": host})
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "invalid_host"), r.text[:200]
+    assert world["key_id"] not in r.text
+
+
+def test_a_cross_site_write_to_api_is_the_edge_404_not_a_403(world):
+    """The cross-site check ran first and answered 403 naming
+    DERATE_ALLOWED_ORIGINS: the edge admitted /api exists behind it."""
+    r = world["edge"].post(
+        "/api/auth/login", json={}, headers={**WAN, "Origin": "https://evil.example"}
+    )
+    assert (r.status_code, r.json()["error"]["code"]) == (404, "not_found")
+    assert "DERATE_ALLOWED_ORIGINS" not in r.text
+
+
+def _edge_app_with_ui(tmp_path, monkeypatch):
+    ui = tmp_path / "ui"
+    (ui / "assets").mkdir(parents=True)
+    (ui / "index.html").write_text("<!doctype html><html>admin ui</html>")
+    (ui / "assets" / "a.js").write_text("console.log('bundle')")
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DERATE_EDGE_PORT", str(EDGE_PORT))
+    monkeypatch.setenv("DERATE_UI_DIR", str(ui))
+    app = create_app()
+    main = TestClient(app, client=LOOPBACK)
+    key = main.post("/api/setup/admin", json=ADMIN).json()["secret_once"]
+    return app, key
+
+
+# Encoded, because an HTTP client resolves a literal "/v1/./x" itself before
+# sending; tests/edge_probe.py sends the literal forms over a raw socket.
+@pytest.mark.parametrize(
+    "path", ["/v1/..%2Fcluster", "/v1/..%2F", "/v1/..%2Fassets/a.js", "/v1/%2E/models", "/v1/%2E%2E/index.html"]
+)
+def test_a_dot_segment_on_the_edge_never_reaches_the_ui(tmp_path, monkeypatch, path):
+    """uvicorn decodes %2F, so /v1/..%2Fcluster arrives as /v1/../cluster:
+    under /v1 by prefix, and resolved by the static mount to the admin UI."""
+    app, key = _edge_app_with_ui(tmp_path, monkeypatch)
+    r = _edge_client(app).get(path, headers={**WAN, **_bearer(key)})
+    assert (r.status_code, r.json()["error"]["code"]) == (404, "not_found"), (path, r.text[:120])
+    assert "admin ui" not in r.text and "bundle" not in r.text
+
+
+def test_a_flood_stops_being_written_down_but_is_still_counted(world, caplog):
+    """Past an address's budget, throttled 429s and edge 404s are answered
+    but write no access line each: a flood would otherwise rotate node.log's
+    history away. The folded security row still counts every one."""
+    import logging
+
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
+    from control_plane.gateway.authz import EDGE_MISSES_PER_ADDRESS_PER_MIN
+
+    caller = {"CF-Connecting-IP": "203.0.113.120"}
+    bad = _bearer("derate-bbbbbbbbbb_" + "x" * 43)
+    with caplog.at_level(logging.INFO):
+        codes = [world["edge"].get("/v1/models", headers={**caller, **bad}).status_code for _ in range(60)]
+        misses = [world["edge"].get("/nope", headers=caller).status_code for _ in range(EDGE_MISSES_PER_ADDRESS_PER_MIN + 40)]
+    assert codes.count(401) == KEY_REFUSALS_PER_ADDRESS_PER_MIN and codes.count(429) == 60 - KEY_REFUSALS_PER_ADDRESS_PER_MIN
+    assert set(misses) == {404}
+    access = [r for r in caplog.records if r.name == "gateway.access" and "203.0.113.120" in r.getMessage()]
+    assert len(access) == KEY_REFUSALS_PER_ADDRESS_PER_MIN + EDGE_MISSES_PER_ADDRESS_PER_MIN
+    warnings = [r for r in caplog.records if r.name == "gateway.security" and "203.0.113.120" in r.getMessage()]
+    assert len(warnings) == 1, [w.getMessage() for w in warnings]
+
+
+def test_rotating_inside_a_64_opens_one_security_row(world):
+    """The security-event fold was per full address while the throttle was
+    per /64, so rotating the low bits wrote a permanent audit row (two
+    fsyncs) per request."""
+    from control_plane.contracts.auth import AuditAction
+
+    bad = _bearer("derate-cccccccccc_" + "x" * 43)
+    for i in range(50):
+        world["edge"].get("/v1/models", headers={"CF-Connecting-IP": f"2001:db8:77:1::{i + 1:x}", **bad})
+    ctx = world["app"].state.ctx
+    ctx.secevents.flush()
+    entries, _ = ctx.auth_stores.auth.audit_page(action=AuditAction.KEY_REFUSED.value)
+    rows = [e for e in entries if (e.ip or "").startswith("2001:db8:77:1:")]
+    assert len(rows) == 1, [(e.ip, e.after) for e in rows]

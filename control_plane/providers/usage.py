@@ -103,7 +103,9 @@ class UsageSniffer:
             try:
                 return _usage_from_obj(json.loads(text), metered=self._metered)
             except json.JSONDecodeError:
-                return None
+                # A body cut short still ends its `usage` object somewhere in
+                # what we kept; a parse failure is not a count of zero.
+                return usage_after_key(self._buffer, metered=self._metered)
         found: Usage | None = None
         lines = text.split("\n")
         if self._truncated and len(lines) > 1:
@@ -139,10 +141,55 @@ def audio_duration_of(raw: bytes) -> float | None:
         obj = json.loads(raw.decode("utf-8", "replace"))
     except ValueError:
         return None
-    value = obj.get("duration") if isinstance(obj, dict) else None
+    return _duration(obj.get("duration") if isinstance(obj, dict) else None)
+
+
+def _duration(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     value = float(value)
     if value != value or value < 0 or value == float("inf"):
         return None
     return value
+
+
+def object_after_key(raw: bytes, key: str) -> object | None:
+    """The JSON value following the LAST ``"key":`` in ``raw``, or None.
+
+    For a fragment of a body -- its head or its tail -- that json.loads cannot
+    read whole. An occurrence escaped inside a string (``\\"usage\\"``) is
+    skipped, so a completion that quotes the word cannot impersonate the block.
+    """
+    text = raw.decode("utf-8", "replace")
+    needle = f'"{key}"'
+    end = len(text)
+    decoder = json.JSONDecoder()
+    while True:
+        at = text.rfind(needle, 0, end)
+        if at < 0:
+            return None
+        end = at
+        if at > 0 and text[at - 1] == "\\":
+            continue
+        rest = text[at + len(needle) :].lstrip()
+        if not rest.startswith(":"):
+            continue
+        try:
+            value, _ = decoder.raw_decode(rest[1:].lstrip())
+        except ValueError:
+            continue
+        return value
+
+
+def usage_after_key(raw: bytes, *, metered: bool = False) -> Usage | None:
+    """The last ``usage`` block in a body fragment, for a non-streamed body too
+    large to hold whole (``usage`` follows ``choices``, so logprobs or a large
+    ``n`` push it to the end)."""
+    value = object_after_key(raw, "usage")
+    return _usage_from_obj({"usage": value}, metered=metered) if isinstance(value, dict) else None
+
+
+def duration_after_key(raw: bytes) -> float | None:
+    """A transcription's ``duration`` out of a body fragment, as
+    audio_duration_of() would read it from the whole."""
+    return _duration(object_after_key(raw, "duration"))

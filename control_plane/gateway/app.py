@@ -705,7 +705,7 @@ def create_app(
     @app.middleware("http")
     async def _api_token_guard(request, call_next):
         if is_unauthorized(
-            path=request.url.path,
+            path=request.scope["path"],
             authorization=request.headers.get("authorization"),
             token=settings.api_token,
         ):

@@ -169,6 +169,25 @@ def test_every_api_route_wants_a_session(world, route):
         assert r.json()["error"]["code"] == "session_required"
 
 
+#: Host values Starlette would rebuild ``request.url`` from: each one used to
+#: move the path the gate checked away from the path the router dispatched.
+#: ``x#`` and ``x?`` made it empty; ``x/v1`` put it under /v1.
+FORGED_HOSTS = ["x#", "x?", "x/v1", "x/healthz?", "x/v1#", "[", "a b", "x@y"]
+
+
+@pytest.mark.parametrize("host", FORGED_HOSTS)
+@pytest.mark.parametrize("route", [r for r in GATED_API if not r.startswith("WEBSOCKET")])
+def test_a_forged_host_never_opens_an_api_route(world, route, host):
+    r = _send(world["client"], route, {"Host": host})
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "invalid_host"), (route, host, r.text[:200])
+
+
+@pytest.mark.parametrize("host", ["testserver", "localhost:8088", "192.168.0.172:8088", "[::1]:8088", "derate_coordinator"])
+def test_a_plain_host_is_still_answered(world, host):
+    r = world["client"].get("/api/auth/state", headers={"Host": host})
+    assert r.status_code == 200 and "admin_exists" in r.json()
+
+
 @pytest.mark.parametrize("route", ALWAYS_OPEN)
 def test_the_open_routes_never_ask_for_a_credential(world, route):
     client = world["client"]

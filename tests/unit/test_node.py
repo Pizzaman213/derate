@@ -414,6 +414,32 @@ class TestSignalShutdown:
         shutdown()
         assert all(s.should_exit is True for s in servers)
 
+    def test_a_second_signal_forces_the_exit(self):
+        """The grace period waits for open streams; asking twice must not."""
+        servers = [SimpleNamespace(should_exit=False, force_exit=False)]
+        shutdown = node._install_shutdown(servers)
+        shutdown()
+        assert (servers[0].should_exit, servers[0].force_exit) == (True, False)
+        shutdown()
+        assert servers[0].force_exit is True
+
+    def test_an_open_connection_cannot_hold_a_restart_forever(self):
+        """uvicorn's defaults wait on every connection with no deadline and
+        let one websocket buffer 32 x 16 MiB; an internet caller controls both."""
+        config = node._config(lambda *a: None, host="127.0.0.1", port=18000)
+        assert config.timeout_graceful_shutdown == node.SHUTDOWN_GRACE_S
+        assert config.ws_max_queue == node.WS_MAX_QUEUE
+        assert config.ws_max_queue * config.ws_max_size <= 64 * 1024 * 1024
+
+    def test_the_edge_listener_is_not_handed_to_child_processes(self):
+        """The shell relay forks and execs; an inheritable listener would go
+        with every shell, and outlive the coordinator in anything left running."""
+        sock = node._bind("127.0.0.1", 0)
+        try:
+            assert sock.get_inheritable() is False
+        finally:
+            sock.close()
+
     def test_run_with_signals_exits_once_should_exit_flips(self):
         """No real socket, no real OS signal: a fake server whose ``serve()``
         polls ``should_exit`` the way uvicorn.Server really does, driven by

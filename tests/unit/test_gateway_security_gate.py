@@ -392,3 +392,56 @@ def test_password_checks_in_flight_are_capped_per_address_and_in_total(tmp_path,
     assert [r.status_code for r in finished] == [401] * VERIFY_INFLIGHT_MAX
     assert after.status_code == 401  # the slots were given back
     assert "u99" not in calls and "u98" not in calls
+
+
+def test_the_refusal_window_is_bounded_and_drains_without_scanning(monkeypatch):
+    """over() runs on every /v1 request, valid ones included. It used to copy
+    and scan every tracked address each time, so a spread-out flood made every
+    caller's request slower. Now a read creates nothing, the map has a hard
+    bound, and expired buckets leave from the front."""
+    from control_plane.gateway.authz import RefusalWindow
+
+    now = [0.0]
+    window = RefusalWindow(20, clock=lambda: now[0])
+    monkeypatch.setattr(RefusalWindow, "MAX_BUCKETS", 100)
+    for i in range(150):
+        window.note(f"198.18.{i // 250}.{i % 250 + 1}")
+    assert len(window._window) == 100
+    assert window.over("203.0.113.1") is False
+    assert "203.0.113.1" not in window._window  # a read creates no bucket
+    now[0] = 61.0
+    window.over("203.0.113.1")
+    assert len(window._window) == 0
+
+
+def test_security_events_fold_per_64_and_cut_caller_paths():
+    """KEY_REFUSED folded per full address while the throttle counted per
+    /64: rotating the low bits opened a permanent audit row per request,
+    each carrying whatever path the caller sent."""
+    from control_plane.gateway.secevents import _DETAIL_MAX, SecurityEvents
+
+    rows: list[tuple] = []
+    events = SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
+    for i in range(500):
+        events.note(AuditAction.KEY_REFUSED, actor="-", ip=f"2001:db8:1:2::{i + 1:x}",
+                    detail={"path": "/v1/" + "a" * 20_000})
+    assert events.flush()
+    assert len(rows) == 1
+    args, kwargs = rows[0]
+    assert len(kwargs["after"]["path"]) <= _DETAIL_MAX and len(args[3]) <= _DETAIL_MAX
+
+
+def test_tracked_triples_are_capped_and_a_pending_count_survives_eviction(monkeypatch):
+    from control_plane.gateway import secevents
+
+    monkeypatch.setattr(secevents, "_SEEN_MAX", 10)
+    rows: list[tuple] = []
+    events = secevents.SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
+    for i in range(10):
+        events.note(AuditAction.SESSION_REFUSED, actor="-", ip=f"10.0.0.{i}")
+        events.note(AuditAction.SESSION_REFUSED, actor="-", ip=f"10.0.0.{i}")  # folded
+    events.note(AuditAction.SESSION_REFUSED, actor="-", ip="10.0.1.1")  # evicts 10.0.0.0
+    assert events.flush()
+    assert len(events._seen) == 10
+    first = [k["after"]["count"] for _, k in rows if k["ip"] == "10.0.0.0"]
+    assert first == [1, 1]  # its row, then the folded repeat reported on eviction

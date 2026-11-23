@@ -77,6 +77,9 @@ KEY_REFUSALS_PER_ADDRESS_PER_MIN = 20
 #: The rpm a key is held to when it names none (its org's rpm, if any, is
 #: still checked at the org scope). No key is unlimited by omission.
 DEFAULT_KEY_RPM = 120
+#: The concurrent requests a key is held to when it names none. One key
+#: otherwise could hold every connection a backend's pool has (64).
+DEFAULT_KEY_MAX_CONCURRENT = 16
 
 #: A limit at or above this fraction of its effective value is "near".
 NEAR_LIMIT_FRACTION = 0.8
@@ -151,6 +154,8 @@ class AuthErrorCode(str, Enum):
     EDGE_CLIENT_UNKNOWN = "edge_client_unknown"
     #: A chat body's media URL names a non-public host.
     MEDIA_URL_REFUSED = "media_url_refused"
+    #: A ``Host`` header that is not a host[:port], on either listener.
+    INVALID_HOST = "invalid_host"
 
 
 class AuditAction(str, Enum):

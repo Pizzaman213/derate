@@ -79,15 +79,15 @@ def _refusal(url: str) -> str | None:
     if scheme == "data":
         return None
     if scheme not in ("http", "https"):
-        return f"Media URLs must be http(s) or data:; got scheme {scheme!r}."
+        return f"Media URLs must be http(s) or data:; got scheme {_echo(scheme)}."
     if any(c in "%\\" or c <= " " or c == "\x7f" for c in parts.netloc):
-        return f"Media URLs must name their host plainly; {parts.netloc!r} does not."
+        return f"Media URLs must name their host plainly; {_echo(parts.netloc)} does not."
     try:
         host = parts.hostname
     except ValueError:
         host = None
     if not host:
-        return f"Media URLs must point at a public host; {url!r} names none."
+        return f"Media URLs must point at a public host; {_echo(url)} names none."
     host = host.rstrip(".")
     if not host.isascii():
         # The fetcher IDNA-encodes a non-ASCII name, which folds fullwidth
@@ -95,15 +95,21 @@ def _refusal(url: str) -> str | None:
         try:
             host = host.encode("idna").decode("ascii").lower().rstrip(".")
         except UnicodeError:
-            return f"Media URLs must point at a public host; {host!r} is not a valid name."
+            return f"Media URLs must point at a public host; {_echo(host)} is not a valid name."
     address = _address(host)
     if address is not None:
         if address.is_global and not address.is_multicast:
             return None
-        return f"Media URLs must point at a public host; {host!r} is not one."
+        return f"Media URLs must point at a public host; {_echo(host)} is not one."
     if host == "localhost" or host.endswith(_LOCAL_SUFFIXES) or "." not in host:
-        return f"Media URLs must point at a public host; {host!r} is not one."
+        return f"Media URLs must point at a public host; {_echo(host)} is not one."
     return None
+
+
+def _echo(value: str) -> str:
+    """*value* as a refusal quotes it: repr'd, and cut at 200 characters --
+    a 25 MiB URL must not come back as a 25 MiB error body."""
+    return repr(value if len(value) <= 200 else value[:200] + "...")
 
 
 def media_url_refusal(body: dict) -> str | None:

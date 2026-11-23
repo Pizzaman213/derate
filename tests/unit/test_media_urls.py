@@ -162,3 +162,9 @@ def test_a_lan_image_is_refused_through_v1_and_never_forwarded():
     assert "'192.168.0.69'" in refused.json()["error"]["message"]
     assert passed.status_code == 200, passed.text
     assert len(backend.requests) == 1
+
+
+def test_a_refusal_does_not_echo_an_unbounded_url():
+    """A 25 MiB URL must not come back as a 25 MiB error body."""
+    why = media_url_refusal(_chat(_image("http:///" + "a" * 100_000)))
+    assert why is not None and len(why) < 400

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 from pathlib import Path
 
@@ -164,6 +165,18 @@ def test_an_image_part_is_estimated_not_free():
     assert estimate_prompt_tokens(body) == 1000 + 4
 
 
+def test_token_ids_tools_and_response_format_are_estimated_not_free():
+    """Token-id prompts, tool schemas and a response_format all counted zero."""
+    assert estimate_prompt_tokens({"prompt": [1, 2, 3, 4, 5]}) == 5
+    assert estimate_prompt_tokens({"prompt": [[1, 2], [3, 4, 5]]}) == 5
+    assert estimate_prompt_tokens({"input": [[1] * 10, [2] * 7]}) == 17
+    assert estimate_prompt_tokens({"input": ["abcd", [1, 2]]}) == 3
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"x": "y" * 400}}}]
+    fmt = {"type": "json_schema", "json_schema": {"d": "z" * 400}}
+    assert estimate_prompt_tokens({"tools": tools}) == int(len(json.dumps(tools)) / 4)
+    assert estimate_prompt_tokens({"response_format": fmt}) == int(len(json.dumps(fmt)) / 4)
+
+
 # -- pricing -------------------------------------------------------------------
 
 
@@ -255,3 +268,10 @@ def test_pricing_fails_closed_on_an_unopenable_path(tmp_path: Path):
     store = PricingStore.open(blocker / "limits.db")
     with pytest.raises(AuthUnavailable):
         store.get("m")
+
+
+def test_a_plain_string_prompt_is_still_estimated():
+    """The token-id branch left the count unset for a string prompt, so every
+    /v1/completions call with an ordinary prompt raised instead of estimating."""
+    assert estimate_prompt_tokens({"prompt": "x" * 400}) == 100
+    assert estimate_prompt_tokens({"prompt": "x" * 400, "input": [[1, 2, 3]]}) == 103

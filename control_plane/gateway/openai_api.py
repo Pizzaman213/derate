@@ -29,6 +29,7 @@ from control_plane.contracts.auth import (
     UsageActuals,
 )
 from control_plane.contracts.telemetry import CostBasis, FallbackReason, FieldError
+from control_plane.limits.service import MAX_OUTPUT_FIELDS
 from control_plane.telemetry import RequestTrace
 from control_plane.telemetry.records import spec_fields
 
@@ -43,6 +44,15 @@ log = logging.getLogger("gateway.openai")
 #: Endpoints whose body takes a ``max_tokens``. Only these get one injected
 #: when a key's ``max_output_tokens_per_request`` applies and none was sent.
 _GENERATION_PATHS = frozenset({"/chat/completions", "/completions"})
+
+#: Request bodies one key may have being read or parsed at once. Reading and
+#: parsing happen before any per-key limit is checked (the limit needs the
+#: parsed body), and a 25 MiB JSON body can become hundreds of MB of Python
+#: objects on the event loop -- so without this one key's parallel uploads
+#: would be bounded by nothing. It covers only the read and the parse, which
+#: are quick for a normal body, so a client running many requests at once is
+#: rarely held by it.
+MAX_BODIES_IN_FLIGHT_PER_KEY = 4
 
 #: Background attributions in flight; held so the loop does not drop them.
 _BACKGROUND: set[asyncio.Task] = set()
@@ -340,6 +350,38 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     router = APIRouter()
     # deployment_id -> the requests on that engine right now (see _EngineSlot).
     engine_busy: dict[str, set[_EngineSlot]] = {}
+    # key_id -> its request bodies being read or parsed right now.
+    bodies_in_flight: dict[str, int] = {}
+
+    def _hold_body_slot(request: Request) -> str | Response | None:
+        """The calling key's id, now holding one of its body slots; a 429 when
+        it has none left; None when the request carries no key."""
+        principal = getattr(request.state, "principal", None)
+        key_id = getattr(getattr(principal, "key", None), "key_id", None)
+        if not key_id:
+            return None
+        held = bodies_in_flight.get(key_id, 0)
+        if held >= MAX_BODIES_IN_FLIGHT_PER_KEY:
+            return errors.error_response(
+                429,
+                f"This key already has {held} request bodies being uploaded; "
+                "wait for one to finish.",
+                "rate_limit_error",
+                "too_many_requests",
+                headers={"Retry-After": "1"},
+                retry_after_s=1,
+            )
+        bodies_in_flight[key_id] = held + 1
+        return key_id
+
+    def _release_body_slot(key_id: str | None) -> None:
+        if key_id is None:
+            return
+        left = bodies_in_flight.get(key_id, 1) - 1
+        if left > 0:
+            bodies_in_flight[key_id] = left
+        else:
+            bodies_in_flight.pop(key_id, None)
 
     def _attribute_spec(record, slot: _EngineSlot) -> None:
         """Fill a local row's spec-decode columns once the engine's next
@@ -463,22 +505,35 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         request: Request, path: str, streaming_allowed: bool
     ) -> Response:
         """The JSON entry point: chat, completions, embeddings, audio/speech."""
-        limit = ctx.settings.max_json_body_bytes
-        raw = await read_bounded_body(request, limit)
-        if raw is None:
-            return errors.error_response(
-                413,
-                f"The request body is larger than the {limit // (1024 * 1024)} MiB limit.",
-                "invalid_request_error",
-                "payload_too_large",
-            )
+        slot = _hold_body_slot(request)
+        if isinstance(slot, Response):
+            return slot
         try:
-            body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError as exc:
-            return errors.error_response(
-                400, f"Request body is not valid JSON: {exc.msg}.",
-                "invalid_request_error", "invalid_json",
-            )
+            limit = ctx.settings.max_json_body_bytes
+            raw = await read_bounded_body(request, limit)
+            if raw is None:
+                return errors.error_response(
+                    413,
+                    f"The request body is larger than the {limit // (1024 * 1024)} MiB limit.",
+                    "invalid_request_error",
+                    "payload_too_large",
+                )
+            try:
+                body = json.loads(raw) if raw else {}
+            except (ValueError, RecursionError) as exc:
+                # JSONDecodeError, and also what it is not: a body that is not
+                # UTF-8 (UnicodeDecodeError) or nested past the recursion
+                # limit. All three are the caller's malformed body -- a 400,
+                # never a 500 with a traceback in the log.
+                why = getattr(exc, "msg", None) or (
+                    "it is nested too deeply" if isinstance(exc, RecursionError) else "it is not UTF-8"
+                )
+                return errors.error_response(
+                    400, f"Request body is not valid JSON: {why}.",
+                    "invalid_request_error", "invalid_json",
+                )
+        finally:
+            _release_body_slot(slot)
         if not isinstance(body, dict):
             return errors.error_response(
                 400, "Request body must be a JSON object.",
@@ -540,8 +595,14 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error", "invalid_request",
             )
 
-        limit = ctx.settings.max_audio_upload_bytes
-        raw = await read_bounded_body(request, limit)
+        slot = _hold_body_slot(request)
+        if isinstance(slot, Response):
+            return slot
+        try:
+            limit = ctx.settings.max_audio_upload_bytes
+            raw = await read_bounded_body(request, limit)
+        finally:
+            _release_body_slot(slot)
         if raw is None:
             return errors.error_response(
                 413,
@@ -755,10 +816,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             ):
                 body = dict(body)
                 body["max_tokens"] = decision.inject_max_tokens
-                # The engine reads `max_completion_tokens or max_tokens`, so
-                # leaving a client's other spelling beside the cap is a bypass.
+                # The engine reads `max_completion_tokens or max_tokens`, and
+                # llama-server lets `n_predict` override both, so leaving a
+                # client's other spelling beside the cap is a bypass.
                 body.pop("max_completion_tokens", None)
                 body.pop("max_output_tokens", None)
+                body.pop("n_predict", None)
                 raw_body = None
             if reservation is not None:
                 # The estimate the limits were checked on, so a stream whose
@@ -772,6 +835,19 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # deployment_id -> this request's slot on that engine, for the
         # spec-decode attribution's "was it alone" question.
         engine_slots: dict[str, _EngineSlot] = {}
+        # What the engine could have produced at most, when the forwarded body
+        # says: the client's own ceiling or the injected cap, times the copies.
+        # An ESTIMATED count above it (a large body with no usage block is
+        # estimated from its size, JSON and logprobs included) cannot be real,
+        # so it is settled at the bound. With no ceiling there is no bound,
+        # and the estimate stands: overcounting is the safe direction.
+        output_bound = (
+            reservation.estimated_output
+            if reservation is not None
+            and body is not None
+            and any(body.get(field) is not None for field in MAX_OUTPUT_FIELDS)
+            else None
+        )
 
         def _settle_limits(actuals: UsageActuals | None) -> None:
             """Count what the request used, or give the reservation back.
@@ -800,6 +876,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
             attempt_chain.append(entry)
             cost, basis = record.cost_usd, None
+            completion = record.completion_tokens or 0
+            if record.tokens_estimated and output_bound is not None and completion > output_bound:
+                completion = output_bound
+                record = replace(record, completion_tokens=completion)
             if not failed and record.status is not None and ctx.auth_stores is not None:
                 provider_model = getattr(selection, "model", None)
                 try:
@@ -807,7 +887,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         model=record.served_name,
                         target_kind=record.target_kind,
                         prompt_tokens=record.prompt_tokens or 0,
-                        completion_tokens=record.completion_tokens or 0,
+                        completion_tokens=completion,
                         metered_usd=record.cost_usd,
                         provider_in_per_mtok=getattr(provider_model, "input_cost_per_mtok", None),
                         provider_out_per_mtok=getattr(provider_model, "output_cost_per_mtok", None),
@@ -819,7 +899,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 _settle_limits(
                     UsageActuals(
                         prompt_tokens=record.prompt_tokens or 0,
-                        completion_tokens=record.completion_tokens or 0,
+                        completion_tokens=completion,
                         cost_usd=cost,
                         cost_basis=cost_basis,
                         target_kind=record.target_kind,

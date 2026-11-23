@@ -7,8 +7,9 @@ was indistinguishable from silence.
 
 Each event is two things:
 
-* a WARNING on logger ``gateway.security``, every time, so ``node.log``
-  carries the full rate;
+* a WARNING on logger ``gateway.security`` when a row is opened, carrying the
+  count folded into it -- not on every repeat, because a flood of refusals
+  would otherwise rotate ``node.log``'s whole history away in minutes;
 * an audit row (``AuthService.audit``), at most one per ``(action, actor,
   ip)`` per :data:`WINDOW_S`, whose ``after`` carries ``count`` -- the events
   folded into it since the previous row for that triple. A credential-stuffing
@@ -17,10 +18,11 @@ Each event is two things:
 
 For the refusals whose "actor" is a name the caller chose -- a ``derate-<id>``
 for any ten characters, a ``node_id`` out of an open join body, a setup
-attempt -- the fold key is ``(action, "-", ip)`` and the presented name moves
-to ``after["presented"]`` (the one that opened the row; every later one is in
-the WARNING line). Folding on the chosen name let every fresh fake id cost a
-committed row and an fsync.
+attempt -- the fold key is ``(action, "-", address bucket)`` and the presented
+name moves to ``after["presented"]`` (the one that opened the row). Folding on
+the chosen name let every fresh fake id cost a committed row and an fsync; the
+bucket is :func:`address_bucket`, the same IPv6 /64 the key throttle counts,
+for the same reason. A caller-supplied path is cut to :data:`_DETAIL_MAX`.
 
 The row is written off the request path: :meth:`SecurityEvents.note` puts it
 on a bounded queue and one daemon thread drains it. A full queue drops the
@@ -32,6 +34,7 @@ never turn it into a 500.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import queue
 import threading
@@ -47,6 +50,11 @@ log = logging.getLogger("gateway.security")
 WINDOW_S = 60.0
 #: Above this many tracked triples, the ones idle for ten windows are dropped.
 _PRUNE_AT = 4096
+#: Hard bound on tracked triples. Past it the oldest row's triple is dropped,
+#: its pending count written as a row of its own first.
+_SEEN_MAX = 65_536
+#: A caller-supplied path or target id is cut to this many characters.
+_DETAIL_MAX = 256
 #: Rows waiting for the writer thread. Past this, rows are dropped and counted.
 QUEUE_MAX = 10_000
 
@@ -54,6 +62,26 @@ QUEUE_MAX = 10_000
 _FOLD_BY_IP = frozenset(
     {AuditAction.KEY_REFUSED, AuditAction.JOIN_REJECTED, AuditAction.SETUP_REFUSED}
 )
+
+
+def address_bucket(ip: str | None) -> str:
+    """The unit one caller is counted as: the address, except an IPv6 address
+    counts under its /64 -- one subscriber is routinely handed a whole /64,
+    so per-address counting gives an IPv6 caller 2**64 budgets for free. An
+    IPv4-mapped address counts as the IPv4 address. Not an address: as is.
+    The key throttle (``authz.RefusalWindow``) and the security-event fold
+    both count with this, so the two cannot disagree about who one caller is."""
+    if not ip:
+        return ""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
 
 
 class SecurityEvents:
@@ -78,6 +106,7 @@ class SecurityEvents:
         self._queue: queue.Queue[tuple[tuple, dict]] = queue.Queue(maxsize=queue_max)
         self._dropped = 0
         self._thread: threading.Thread | None = None
+        self._pruned_at = float("-inf")
 
     @property
     def dropped(self) -> int:
@@ -128,24 +157,20 @@ class SecurityEvents:
         detail: dict | None = None,
     ) -> None:
         detail = dict(detail or {})
+        if isinstance(detail.get("path"), str):
+            detail["path"] = detail["path"][:_DETAIL_MAX]
+        target_id = (target_id or "")[:_DETAIL_MAX]
         actor = (actor or "-")[:254]
-        # printable(): actor and detail are whatever the caller typed, and a
-        # newline in them would forge a whole line in node.log. The row
-        # below keeps them raw -- it is structured, not a line.
-        log.warning(
-            "%s actor=%s ip=%s rid=%s %s",
-            action.value,
-            printable(actor),
-            printable(ip or "-"),
-            printable(request_id or "-"),
-            " ".join(f"{k}={printable(str(v))}" for k, v in sorted(detail.items())),
-        )
         if action in _FOLD_BY_IP:
             if actor != "-":
                 detail["presented"] = actor
             actor = "-"
         now = self._clock()
-        key = (action.value, actor, ip or "")
+        # A caller-chosen refusal folds per address BUCKET -- an IPv6 /64, as
+        # the key throttle counts it -- or one /64 would open a fresh row,
+        # two fsyncs and a permanent audit entry per request by rotating its
+        # low bits. The row still records the full address that opened it.
+        key = (action.value, actor, address_bucket(ip) if action in _FOLD_BY_IP else (ip or ""))
         flushed: list[tuple[tuple, dict]] = []
         with self._lock:
             entry = self._seen.get(key)
@@ -153,10 +178,31 @@ class SecurityEvents:
                 entry[1] += 1
                 return
             count = 1 + (int(entry[1]) if entry is not None else 0)
+            # Re-inserted rather than assigned, so dict order is the order
+            # rows were opened and the oldest are first to go.
+            self._seen.pop(key, None)
             self._seen[key] = [now, 0]
-            if len(self._seen) > _PRUNE_AT:
+            if len(self._seen) > _PRUNE_AT and now - self._pruned_at >= self._window:
                 flushed = self._prune(now)
+                self._pruned_at = now
+            while len(self._seen) > _SEEN_MAX:
+                flushed.extend(self._evict_oldest())
             dropped, self._dropped = self._dropped, 0
+        # The WARNING goes with the row, not with every folded repeat: a
+        # flood would otherwise rotate node.log's whole history away in
+        # minutes. The row's count says how many were folded in.
+        # printable(): actor and detail are whatever the caller typed, and a
+        # newline in them would forge a whole line in node.log. The row
+        # below keeps them raw -- it is structured, not a line.
+        log.warning(
+            "%s actor=%s ip=%s rid=%s count=%d %s",
+            action.value,
+            printable(actor),
+            printable(ip or "-"),
+            printable(request_id or "-"),
+            count,
+            " ".join(f"{k}={printable(str(v))}" for k, v in sorted(detail.items())),
+        )
         if self._audit is None:
             return
         after = {"count": count, **detail}
@@ -175,6 +221,23 @@ class SecurityEvents:
                     self._dropped += 1 + (dropped if queued is row else 0)
         self._ensure_writer()
 
+    def _evict_oldest(self) -> list[tuple[tuple, dict]]:
+        """Drop the triple whose row was opened longest ago, reporting any
+        events folded into it since as a row of their own. Caller holds the
+        lock."""
+        k = next(iter(self._seen))
+        return self._pending_row(k, int(self._seen.pop(k)[1]))
+
+    @staticmethod
+    def _pending_row(k: tuple, pending: int) -> list[tuple[tuple, dict]]:
+        if not pending:
+            return []
+        action_value, actor, ip = k
+        return [(
+            (actor, AuditAction(action_value), "security", ""),
+            {"after": {"count": pending}, "ip": ip or None, "request_id": None, "user_agent": None},
+        )]
+
     def _prune(self, now: float) -> list[tuple[tuple, dict]]:
         """Drop triples idle for ten windows. One still holding folded events
         that no row has reported yet is not dropped silently: its count is
@@ -183,12 +246,5 @@ class SecurityEvents:
         stale = now - 10 * self._window
         rows: list[tuple[tuple, dict]] = []
         for k in [k for k, v in self._seen.items() if v[0] < stale]:
-            pending = int(self._seen.pop(k)[1])
-            if pending:
-                action_value, actor, ip = k
-                rows.append((
-                    (actor, AuditAction(action_value), "security", ""),
-                    {"after": {"count": pending}, "ip": ip or None,
-                     "request_id": None, "user_agent": None},
-                ))
+            rows.extend(self._pending_row(k, int(self._seen.pop(k)[1])))
         return rows

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -36,7 +37,15 @@ from control_plane.providers.errors import (
 from control_plane.providers.service import RESPONSE_HEADER_ALLOWLIST
 from control_plane.redaction import Redactor
 
-from control_plane.providers.usage import UsageSniffer, audio_duration_of
+from control_plane.limits.service import CHARS_PER_TOKEN
+from control_plane.providers.config import USAGE_TAIL_BYTES
+from control_plane.providers.usage import (
+    UsageSniffer,
+    audio_duration_of,
+    duration_after_key,
+    object_after_key,
+    usage_after_key,
+)
 
 from .errors import error_response
 from .settings import GatewaySettings
@@ -354,6 +363,20 @@ class _StreamAccounting:
         return usage
 
 
+class _BodyTail:
+    """The last ``USAGE_TAIL_BYTES`` of a body, for when the head we keep is
+    not the whole of it: a large body's ``usage`` (after ``choices``) and a
+    large transcription's ``duration`` live in the part the head dropped."""
+
+    def __init__(self) -> None:
+        self.bytes = bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        self.bytes.extend(chunk[-USAGE_TAIL_BYTES:])
+        if len(self.bytes) > USAGE_TAIL_BYTES:
+            del self.bytes[: len(self.bytes) - USAGE_TAIL_BYTES]
+
+
 class _BodyAccounting:
     """Non-streaming responses carry a usage block; read it from a bounded
     copy while the bytes are already on their way to the client."""
@@ -365,6 +388,8 @@ class _BodyAccounting:
         self.usage = _Usage()
         self._sniffer = _DetailSniffer(stream=False)
         self._seen = 0
+        self._total = 0
+        self._tail = _BodyTail()
 
     def note_chunk(self, chunk: bytes, now: float) -> None:
         if self.usage.ttft_s is None:
@@ -373,10 +398,33 @@ class _BodyAccounting:
             room = self.LIMIT - self._seen
             self._sniffer.feed(chunk[:room])
             self._seen += min(len(chunk), room)
+        self._total += len(chunk)
+        self._tail.feed(chunk)
 
     def finish(self, now: float) -> _Usage:
         _apply_sniffed(self.usage, self._sniffer)
+        if self.usage.estimated and self._total > self._seen:
+            # The head was cut, so its `usage` (if any) was not in it.
+            tail = bytes(self._tail.bytes)
+            sniffed = usage_after_key(tail)
+            if sniffed is not None:
+                block = object_after_key(tail, "usage")
+                for name, value in _usage_details(block).items():
+                    setattr(self.usage, name, value)
+                self.usage.prompt_tokens = sniffed.input_tokens
+                self.usage.completion_tokens = sniffed.output_tokens
+                self.usage.estimated = False
+                if sniffed.output_tokens:
+                    self.usage.tokens = sniffed.output_tokens
+        if self.usage.estimated and not self.usage.tokens:
+            # No usage block anywhere: a body has no frames to count, so
+            # without this the answer would be settled as zero output while
+            # the upstream bills for it. Its size is the estimate we have;
+            # `estimated` stays True so the row says it is one.
+            self.usage.tokens = math.ceil(self._total / max(1.0, CHARS_PER_TOKEN))
+            self.usage.completion_tokens = self.usage.tokens
         return self.usage
+
 
 class _NoAccounting:
     """For a body that carries no tokens to count.
@@ -385,7 +433,8 @@ class _NoAccounting:
     whatever those bytes are -- so it is kept. Everything else stays None,
     which is what settle() records as "not measured" rather than as zero --
     except a transcription's JSON ``duration``, read from a small bounded copy
-    when the body starts as JSON (never an MP3), for per-minute pricing.
+    of the body's head and tail when it starts as JSON (never an MP3), for
+    per-minute pricing.
     """
 
     LIMIT = 64 * 1024
@@ -394,6 +443,7 @@ class _NoAccounting:
         self.started = started
         self.usage = _Usage()
         self._head = bytearray()
+        self._tail = _BodyTail()
         self._json: bool | None = None
 
     def note_chunk(self, chunk: bytes, now: float) -> None:
@@ -401,12 +451,23 @@ class _NoAccounting:
             self.usage.ttft_s = now - self.started
         if self._json is None and chunk.strip():
             self._json = chunk.lstrip()[:1] == b"{"
-        if self._json and len(self._head) <= self.LIMIT:
+        if not self._json:
+            return
+        if len(self._head) <= self.LIMIT:
             self._head.extend(chunk[: self.LIMIT + 1 - len(self._head)])
+        self._tail.feed(chunk)
 
     def finish(self, now: float) -> _Usage:
-        if self._json and len(self._head) <= self.LIMIT:
+        if not self._json:
+            return self.usage
+        if len(self._head) <= self.LIMIT:
             self.usage.audio_duration_s = audio_duration_of(bytes(self._head))
+        else:
+            # verbose_json puts `duration` before `segments`, so the head has
+            # it; the tail is the fallback for a server that orders it last.
+            self.usage.audio_duration_s = duration_after_key(
+                bytes(self._head)
+            ) or duration_after_key(bytes(self._tail.bytes))
         return self.usage
 
 

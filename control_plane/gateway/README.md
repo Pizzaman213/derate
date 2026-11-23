@@ -307,7 +307,23 @@ tells the two apart from `scope["server"]`. On the edge everything but
 `X-Forwarded-For` and `DERATE_TRUSTED_PROXIES` are not consulted -- a request
 without a valid IP there is 400 `edge_client_unknown`, and the scheme is
 https, so HSTS is sent (`headers.py` reads the scheme at response time for
-that reason). The main port is unchanged.
+that reason). On the edge, a path with a `.` or `..` segment is a 404 too:
+uvicorn decodes `%2F`, so `/v1/..%2Fcluster` arrives under `/v1` by prefix and
+the static mount would resolve it to the admin UI. The main port is unchanged.
+
+**Every listener refuses a `Host` that is not a plain host[:port]** (400
+`invalid_host`), and every path decision reads `scope["path"]`, the field the
+router dispatches on. `request.url` is rebuilt from `Host`, so a decision made
+on it can be steered by the caller (see CLAUDE.md).
+
+**Floods are counted, not transcribed.** An address past its refused-key
+budget, or past `EDGE_MISSES_PER_ADDRESS_PER_MIN` (60) edge 404s, is still
+answered but writes no access line or row per request (`state["quiet"]`); the
+security-event row, folded per `secevents.address_bucket` (an IPv6 /64), counts
+them, and its WARNING is written once per row, not per event. Paths in access
+lines and security rows are cut to 512 and 256 characters. One key may have
+`MAX_BODIES_IN_FLIGHT_PER_KEY` (4) request bodies being read or parsed at once
+(`openai_api.py`), because that happens before any per-key limit can run.
 
 The stores (`auth.db`, `keys.db`, `limits.db`) open on first use, so building an
 app touches no disk for them. The middleware is registered before `_csrf_guard`

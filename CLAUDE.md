@@ -231,6 +231,20 @@ hardcoded there and read from `.omp/work/auth-keys/sets/setup_routes.json` by
 routes.json and fails on one that answers without credentials. A new route is
 gated by default; opening one is an edit to that list and that set.
 
+**The gate decides on `scope["path"]`, never on `request.url`.** Starlette
+builds `request.url` from the caller's `Host` header and re-parses it, while
+the router dispatches on `scope["path"]`. Until 2026-11-23 the gate read
+`request.url.path`, so `Host: x#` made the path it checked empty and an
+anonymous LAN caller got `GET /api/keys` and every other `/api` handler that
+does not read the session itself; `Host: x/v1` put `/api/*` under the `/v1`
+key gate on the edge. Found by a blue-team review, on `:8088` since the gate
+was written. Now `authz.host_is_valid` refuses any `Host` that is not a plain
+host[:port] with 400 `invalid_host` before anything builds a URL, and every
+path decision (`_refusal`, `_cross_site_refusal`, the socket gates,
+`_api_token_guard`) reads `scope["path"]`. A new check that reads
+`request.url` for a decision reintroduces it; `test_gateway_auth_coverage.py`
+walks every `/api` route with forged `Host` values to catch that.
+
 **Live memory is an optional kwarg that degrades.** The fit gate prefers what a
 node can actually hand out now and falls back to the static ceiling when there
 is no reading. It never refuses for want of a live number.

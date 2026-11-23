@@ -201,6 +201,7 @@ class Probe:
             "//api/auth/state", "/v1/..;/api/auth/state", "/%61pi/auth/state",
             "/v1/models/../../api/auth/state", "/./api/auth/state", "/v1/./../api/auth/state",
             f"http://{host}/api/auth/state", "/v1/models/..%2f..%2fapi%2fkeys",
+            "/v1/..%2Fcluster", "/v1/..%2F", "/v1/%2E%2E/index.html",
         ]
         for target in targets:
             data = self.raw(self.request(target))
@@ -213,7 +214,10 @@ class Probe:
     def host_games(self) -> None:
         if self.via != "direct":
             return  # Cloudflare routes by Host; a foreign one never reaches the tunnel
-        for host in ("127.0.0.1:8088", "localhost", "127.0.0.1", "[::1]:8088", ""):
+        # The last five are what Starlette would rebuild request.url from:
+        # they used to move the path the gate checked away from the router's.
+        for host in ("127.0.0.1:8088", "localhost", "127.0.0.1", "[::1]:8088", "",
+                     "x#", "x?", f"{self.host_header()}/v1", "[", "x/v1#"):
             data = self.raw(self.request("/api/auth/state", host=host))
             ok, how = self.verdict(data)
             ok = ok and (b" 404 " in data.split(b"\r\n", 1)[0] or b" 400 " in data[:16])
@@ -222,6 +226,14 @@ class Probe:
             f"{k}: {v}\r\n".encode() for k, v in self.who().items()) + b"\r\n")
         ok, how = self.verdict(data)
         self.check("HTTP/1.0 with no Host still gets the edge's rules", ok, repr(data[:160]), how)
+        if self.main:
+            # The same trick against the LAN listener, with no credential at
+            # all: before the fix this returned the key list to anyone.
+            for host in ("x#", "x?", "x/v1"):
+                r = self.http.get(self.main + "/api/keys", headers={"Host": host})
+                self.check(f"the LAN port refuses an anonymous /api/keys with Host {host!r}",
+                           r.status_code == 400 and field(r, "error", "code") == "invalid_host",
+                           f"{r.status_code} {r.text[:120]}")
 
     def pipelining_and_smuggling(self) -> None:
         first = self.request("/v1/models", close=False)

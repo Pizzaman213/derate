@@ -348,9 +348,10 @@ def test_every_limit_type_configures_blocks_at_threshold_and_reports_resets(h, m
     assert d.limit_source in d.message
 
     states = {s.limit_type: s for s in h.svc.states(LimitScope.KEY, "k1", now=blocked.at)}
-    # Every key also carries the default rpm unless it names its own; a
-    # per-model rpm is a different limit and does not replace it.
-    assert set(states) == {name, "rpm"}
+    # Every key also carries the default rpm and max_concurrent unless it
+    # names its own; a per-model rpm is a different limit and does not
+    # replace either.
+    assert set(states) == {name, "rpm", "max_concurrent"}
     state = states[name]
     assert (state.limit_type, state.scope, state.scope_id) == (name, LimitScope.KEY, "k1")
     assert state.limit == state.effective_limit == scenario.value
@@ -460,6 +461,69 @@ def test_a_key_that_names_no_rpm_is_held_to_the_default(h):
     for i in range(DEFAULT_KEY_RPM + 1):
         assert h.run("k3", now=NOW + i * 0.1).allowed, i
 
+
+
+def test_a_key_that_names_no_max_concurrent_is_held_to_the_default(h):
+    from control_plane.contracts.auth import DEFAULT_KEY_MAX_CONCURRENT
+
+    h.key(limits={"rpm": 1000})
+    for i in range(DEFAULT_KEY_MAX_CONCURRENT):
+        d, res = h.check()
+        assert d.allowed and res is not None, i
+    d, res = h.check()
+    assert (d.allowed, d.limit_source, d.limit, res) == (
+        False,
+        "key:max_concurrent",
+        DEFAULT_KEY_MAX_CONCURRENT,
+        None,
+    )
+    h.key("k2", limits={"max_concurrent": 2})
+    assert h.check("k2")[0].allowed and h.check("k2")[0].allowed
+    assert h.check("k2")[0].limit_source == "key:max_concurrent"
+
+
+def test_string_or_float_n_counts_every_copy(h):
+    # The engines coerce "4" and 4.0 to 4; counting them as one copy let a
+    # request generate four times the output cap.
+    h.key(limits={"max_output_tokens_per_request": 100})
+    d, _ = h.check(body={"max_tokens": 50, "n": 4.0})
+    assert (d.allowed, d.code) == (False, "max_output_tokens_exceeded")
+    d, _ = h.check(body={"max_tokens": 50, "n": "4"})
+    assert (d.allowed, d.status, d.code) == (False, 400, "invalid_request")
+    assert "n must be an integer" in d.message
+    d, _ = h.check(body={"max_tokens": 50, "best_of": 129.0})
+    assert (d.allowed, d.status) == (False, 400)
+    d, _ = h.check(body={"max_tokens": 50, "n": True})
+    assert (d.allowed, d.status) == (False, 400)
+
+
+def test_n_predict_is_an_output_ceiling(h):
+    h.key(limits={"max_output_tokens_per_request": 100})
+    d, _ = h.check(body={"n_predict": 101})
+    assert (d.allowed, d.code) == (False, "max_output_tokens_exceeded")
+    d, _ = h.check(body={"n_predict": "101"})
+    assert (d.allowed, d.status) == (False, 400)
+    d, res = h.check(body={"n_predict": 100})
+    assert d.allowed and res.estimated_output == 100
+
+
+def test_a_completions_batch_multiplies_the_output(h):
+    h.key(limits={"max_output_tokens_per_request": 100})
+    d, _ = h.check(body={"max_tokens": 40, "prompt": ["a", "b", "c"]})
+    assert (d.allowed, d.code) == (False, "max_output_tokens_exceeded")
+    d, _ = h.check(body={"max_tokens": 40, "prompt": [[1, 2], [3]]})
+    assert d.allowed
+    # A single tokenised prompt is one prompt, not a batch of ints.
+    d, _ = h.check(body={"max_tokens": 90, "prompt": [1, 2, 3]})
+    assert d.allowed
+
+
+def test_token_id_prompts_count_toward_the_prompt_cap(h):
+    h.key(limits={"max_prompt_tokens_per_request": 100})
+    d, _ = h.check(body={"prompt": list(range(101))})
+    assert (d.allowed, d.code) == (False, "max_prompt_tokens_exceeded")
+    d, _ = h.check(body={"input": [list(range(60)), list(range(41))]})
+    assert (d.allowed, d.code) == (False, "max_prompt_tokens_exceeded")
 
 
 def test_tpm_counts_live_estimates_then_actual_tokens(h):

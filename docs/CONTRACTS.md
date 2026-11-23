@@ -20,7 +20,7 @@ Every value that crosses the wire as a string.
 | Type | Values | Defined in |
 |---|---|---|
 | `AuditAction` | `login`, `login_failed`, `logout`, `password_changed`, `admin_added`, `admin_removed`, `setup_admin_created`, `org_created`, `org_updated`, `org_deleted`, `key_created`, `key_updated`, `key_disabled`, `key_enabled`, `key_rotated`, `key_deleted`, `limit_changed`, `limit_raised`, `cycle_reset`, `pricing_changed`, `api_write`, `shell_opened`, `shell_closed`, `provider_created`, `provider_updated`, `provider_deleted`, `settings_changed`, `enrollment_minted`, `enrollment_revoked`, `deployment_launched`, `deployment_stopped`, `node_removed`, `node_admitted`, `node_process_killed`, `routing_changed`, `storage_deleted`, `sessions_revoked`, `node_joined`, `provider_signed_in`, `profile_changed`, `download_changed`, `benchmark_changed`, `login_locked`, `key_refused`, `session_refused`, `setup_refused`, `join_rejected`, `cross_origin_refused`, `session_ip_changed`, `audit_chain_broken`, `agent_refused`, `cluster_token_rotated`, `node_runtime_model_changed` | `control_plane.contracts.auth` |
-| `AuthErrorCode` | `missing_api_key`, `invalid_api_key`, `api_key_disabled`, `api_key_expired`, `session_required`, `invalid_credentials`, `login_locked`, `setup_closed`, `auth_unavailable`, `limit_exceeded`, `max_output_tokens_exceeded`, `max_prompt_tokens_exceeded`, `limit_exceeds_org`, `allowlist_exceeds_org`, `model_not_allowed`, `setup_local_only`, `not_found`, `edge_client_unknown`, `media_url_refused` | `control_plane.contracts.auth` |
+| `AuthErrorCode` | `missing_api_key`, `invalid_api_key`, `api_key_disabled`, `api_key_expired`, `session_required`, `invalid_credentials`, `login_locked`, `setup_closed`, `auth_unavailable`, `limit_exceeded`, `max_output_tokens_exceeded`, `max_prompt_tokens_exceeded`, `limit_exceeds_org`, `allowlist_exceeds_org`, `model_not_allowed`, `setup_local_only`, `not_found`, `edge_client_unknown`, `media_url_refused`, `invalid_host` | `control_plane.contracts.auth` |
 | `ContextBucket` | `0-8k`, `8-32k`, `32-128k`, `128k+` | `control_plane.contracts.telemetry` |
 | `CostBasis` | `metered`, `estimated`, `unpriced` | `control_plane.contracts.telemetry` |
 | `DeploymentOrigin` | `launched`, `adopted` | `control_plane.contracts.deployment` |
@@ -578,6 +578,7 @@ The interfaces components hold each other to.
 | `CYCLE_DAYS` | `30` | `control_plane.contracts.auth` |
 | `DEFAULT_DTYPE` | `bf16` | `control_plane.contracts.quant` |
 | `DEFAULT_GUARDRAIL` | `0.9` | `control_plane.contracts.hardware` |
+| `DEFAULT_KEY_MAX_CONCURRENT` | `16` | `control_plane.contracts.auth` |
 | `DEFAULT_KEY_RPM` | `120` | `control_plane.contracts.auth` |
 | `DEGRADED_TPS_THRESHOLD` | `10.0` | `control_plane.contracts.constants` |
 | `EMAIL_MAX_LEN` | `254` | `control_plane.contracts.auth` |

@@ -45,6 +45,7 @@ import asyncio
 import collections
 import ipaddress
 import logging
+import re
 import threading
 import time
 from dataclasses import asdict, is_dataclass, replace
@@ -77,6 +78,7 @@ from control_plane.keys import format as key_format
 
 from .csrf import is_cross_site_write, trusted_origins
 from .errors import error_response
+from .secevents import address_bucket
 from control_plane.redaction import Redactor, printable
 from control_plane.telemetry.records import AccessRecord
 
@@ -272,6 +274,17 @@ def edge_client_unknown(header: str) -> Response:
         "was sent; see DERATE_EDGE_CLIENT_HEADER.",
         "invalid_request_error",
         AuthErrorCode.EDGE_CLIENT_UNKNOWN.value,
+    )
+
+
+def invalid_host() -> Response:
+    """A ``Host`` that is not a host[:port]. Refused on both listeners before
+    anything reads ``request.url``, which Starlette builds from it."""
+    return error_response(
+        400,
+        "The Host header must be a host name or address, with an optional port.",
+        "invalid_request_error",
+        AuthErrorCode.INVALID_HOST.value,
     )
 
 
@@ -589,6 +602,14 @@ def _log_access(state: dict, *, method: str, path: str, query: str,
     )
 
 
+#: An access line or row keeps this much of a path. A URL can be ~16 KB through
+#: Cloudflare; a few thousand of those would rotate node.log's history away.
+_LOGGED_PATH_MAX = 512
+#: Edge 404s one address gets written down per minute; past it they are still
+#: answered, but quietly (see ``on_request_done``).
+EDGE_MISSES_PER_ADDRESS_PER_MIN = 60
+
+
 async def on_request_done(scope, status: int | None, duration_ms: float) -> None:
     """Called once per HTTP request -- every path, not only /api and /v1 --
     after its response has been sent, or after it failed (*status* None, or
@@ -602,10 +623,16 @@ async def on_request_done(scope, status: int | None, duration_ms: float) -> None
     method = scope.get("method", "")
     path = scope.get("path", "")
     query = _query_of(scope)
-    _log_access(state, method=method, path=path, query=query, status=status,
-                duration_ms=duration_ms)
-    _emit_access(scope, state, method=method, path=path, query=query, status=status,
-                 duration_ms=duration_ms)
+    # A flood answered past its address's budget (a throttled 429, an edge
+    # 404 beyond EDGE_MISSES_PER_ADDRESS_PER_MIN) writes no line and no row
+    # of its own: the folded security-event row counts it, and one access
+    # entry per flooded request is what would rotate real history out.
+    if not state.get("quiet"):
+        logged = path[:_LOGGED_PATH_MAX]
+        _log_access(state, method=method, path=logged, query=query, status=status,
+                    duration_ms=duration_ms)
+        _emit_access(scope, state, method=method, path=logged, query=query, status=status,
+                     duration_ms=duration_ms)
     session = state.get("session")
     if (
         session is None
@@ -841,49 +868,94 @@ def _gated(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(prefix + "/")
 
 
+def _edge_path_refused(path: str) -> bool:
+    """Whether the edge refuses *path*: anything outside ``/v1``, and any
+    path with a ``.`` or ``..`` segment. uvicorn decodes ``%2F``, so
+    ``/v1/..%2Fcluster`` arrives as ``/v1/../cluster`` -- under /v1 by
+    prefix, and resolved to the admin UI by the static mount behind it."""
+    if not _gated(path, "/v1"):
+        return True
+    segments = path.split("/")
+    return "." in segments or ".." in segments
+
+
+#: A Host header a client could legitimately send: a name or IPv4 address, or
+#: a bracketed IPv6 address, each with an optional port. Anything else -- "/",
+#: "?", "#", "@", whitespace, a lone "[" -- is refused before any URL is built
+#: from it, because Starlette builds ``request.url`` from exactly this value.
+_HOST_RE = re.compile(r"(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?")
+
+
+def host_is_valid(conn: HTTPConnection) -> bool:
+    """At most one ``Host``, and that one a plain host[:port]. None at all is
+    HTTP/1.0 and fine: the URL then falls back to the socket's own address."""
+    values = conn.headers.getlist("host")
+    if not values:
+        return True
+    return len(values) == 1 and _HOST_RE.fullmatch(values[0]) is not None
+
+
 class RefusalWindow:
     """Client address -> monotonic times of its refused keys in the last
     minute, the shape ``internal_api``'s join window has. :meth:`over` only
     reads; :meth:`note` appends. Its own instance, never the join window: a
     node's joins and a caller's bad keys are different budgets. ``create_app``
     builds one and hands it to :class:`AuthGuard` and ``app.state`` so the
-    HTTP gate and :func:`require_key` share it."""
+    HTTP gate and :func:`require_key` share it.
+
+    :meth:`over` runs on every /v1 request, valid ones included, on the event
+    loop, so it must not cost more as the number of refused addresses grows:
+    buckets are kept in last-refused order and expired ones are dropped from
+    the front only (amortised O(1)), never by scanning the whole map."""
+
+    #: Buckets kept at once. Past it the least recently refused is forgotten:
+    #: a caller spread over more addresses than this gets more than 20 a
+    #: minute in total, but no one address does, and memory stays flat.
+    MAX_BUCKETS = 100_000
 
     def __init__(self, per_minute: int, clock=time.monotonic) -> None:
         self._limit = per_minute
         self._clock = clock
-        self._window: dict[str, collections.deque[float]] = {}
+        self._window: collections.OrderedDict[str, collections.deque[float]] = collections.OrderedDict()
 
-    @staticmethod
-    def _bucket(ip: str) -> str:
-        """The key a refusal is counted under: the address, except an IPv6
-        address counts under its /64. One subscriber is routinely handed a
-        whole /64, so per-address counting would give an IPv6 caller 2**64
-        budgets of 20 -- rotating the low bits is free."""
-        try:
-            address = ipaddress.ip_address(ip)
-        except ValueError:
-            return ip
-        if isinstance(address, ipaddress.IPv6Address):
-            if address.ipv4_mapped is not None:
-                return str(address.ipv4_mapped)
-            return str(ipaddress.ip_network(f"{address}/64", strict=False))
-        return str(address)
+    #: The unit one caller is counted as (an IPv6 /64), shared with the
+    #: security-event fold so the two cannot disagree about who one caller is.
+    _bucket = staticmethod(address_bucket)
 
-    def _recent(self, ip: str, now: float) -> collections.deque[float]:
-        cutoff = now - 60.0
-        for key in [k for k, q in self._window.items() if not q or q[-1] < cutoff]:
-            del self._window[key]
-        recent = self._window.setdefault(self._bucket(ip), collections.deque())
-        while recent and recent[0] < cutoff:
-            recent.popleft()
-        return recent
+    def _prune(self, cutoff: float) -> None:
+        """Drop buckets whose newest refusal is older than *cutoff*. They are
+        in last-refused order, so the expired ones are all at the front."""
+        window = self._window
+        while window:
+            newest = next(iter(window.values()))
+            if newest and newest[-1] >= cutoff:
+                return
+            window.popitem(last=False)
 
     def over(self, ip: str) -> bool:
-        return len(self._recent(ip, self._clock())) >= self._limit
+        cutoff = self._clock() - 60.0
+        self._prune(cutoff)
+        recent = self._window.get(self._bucket(ip))
+        if not recent:
+            return False
+        while recent and recent[0] < cutoff:
+            recent.popleft()
+        return len(recent) >= self._limit
 
     def note(self, ip: str) -> None:
-        self._recent(ip, self._clock()).append(self._clock())
+        now = self._clock()
+        self._prune(now - 60.0)
+        bucket = self._bucket(ip)
+        recent = self._window.get(bucket)
+        if recent is None:
+            recent = self._window[bucket] = collections.deque()
+        else:
+            self._window.move_to_end(bucket)
+        while recent and recent[0] < now - 60.0:
+            recent.popleft()
+        recent.append(now)
+        while len(self._window) > self.MAX_BUCKETS:
+            self._window.popitem(last=False)
 
     def reset(self) -> None:
         self._window.clear()
@@ -911,6 +983,9 @@ class AuthGuard:
         # Client address -> refused keys in the last minute, read before the
         # key store so a flood of bad keys costs no lookups.
         self.key_refusals = key_refusals or RefusalWindow(KEY_REFUSALS_PER_ADDRESS_PER_MIN)
+        # Client address -> edge 404s in the last minute. Never refuses: past
+        # the budget the 404s still go out, they just stop being written down.
+        self.edge_misses = RefusalWindow(EDGE_MISSES_PER_ADDRESS_PER_MIN)
 
     def _warn_untrusted_proxy(self, request: Request, peer: str | None) -> None:
         """F8: a proxy in front with ``DERATE_TRUSTED_PROXIES`` unset records
@@ -953,11 +1028,13 @@ class AuthGuard:
         state["user_agent"] = conn.headers.get("user-agent", "")[:512]
         status: int | None = None
 
-        if state.get("edge") and (
-            not _gated(scope.get("path", ""), "/v1") or state.get("edge_client_missing")
+        if not host_is_valid(conn) or (
+            state.get("edge")
+            and (_edge_path_refused(scope.get("path", "")) or state.get("edge_client_missing"))
         ):
-            # The edge is /v1 only and needs the client header; a socket is
-            # closed rather than answered, and the finally below records it.
+            # A malformed Host anywhere, and on the edge anything but /v1 or a
+            # caller without the client header: closed rather than answered,
+            # and the finally below records it.
             status = CLOSE_POLICY
             try:
                 await send({"type": "websocket.close", "code": CLOSE_POLICY})
@@ -1031,10 +1108,17 @@ class AuthGuard:
             await send(message)
 
         try:
-            # The cross-site write check runs first, so a cross-site write is
-            # refused before anything looks at its cookie -- and inside the
-            # guard, so its cross_origin_refused row carries the request id.
-            refusal = _cross_site_refusal(request) or self._refusal(request)
+            # Host first: everything after it may build a URL from it. Then
+            # the edge's own refusals, so the edge never admits that /api
+            # exists -- not even as a cross-site 403. Then the cross-site
+            # write check, so a cross-site write is refused before anything
+            # looks at its cookie, inside the guard so its row carries the
+            # request id.
+            refusal = (
+                self._front_refusal(request)
+                or _cross_site_refusal(request)
+                or self._refusal(request)
+            )
             if refusal is not None:
                 await refusal(scope, receive, tracking_send)
                 return
@@ -1057,24 +1141,42 @@ class AuthGuard:
             except Exception:
                 log.exception("request-done hook failed for %s", rid)
 
-    def _refusal(self, request: Request) -> Response | None:
-        """The response that refuses this request, or None to let it through."""
-        path = request.url.path
+    def _front_refusal(self, request: Request) -> Response | None:
+        """A malformed Host on either listener; on the edge, anything but a
+        plain /v1 path, and a /v1 call without the client header."""
+        if not host_is_valid(request):
+            return invalid_host()
         state = request.scope.get("state") or {}
-        if state.get("edge"):
-            # Before the CORS-preflight bypass: a preflight to /api on the
-            # edge is still a 404, and a /v1 call without the client header
-            # is refused before any credential is read.
-            if not _gated(path, "/v1"):
-                return edge_not_found()
-            if state.get("edge_client_missing"):
-                _note(
-                    request,
-                    AuditAction.KEY_REFUSED,
-                    actor="-",
-                    detail={"code": AuthErrorCode.EDGE_CLIENT_UNKNOWN.value, "path": path},
-                )
-                return edge_client_unknown(request.app.state.ctx.settings.edge_client_header)
+        if not state.get("edge"):
+            return None
+        path = request.scope["path"]
+        # Before the CORS-preflight bypass and the cross-site check: a
+        # preflight or a cross-site write to /api on the edge is still a 404.
+        if _edge_path_refused(path):
+            caller = state.get("client_ip") or "-"
+            if self.edge_misses.over(caller):
+                state["quiet"] = True
+            else:
+                self.edge_misses.note(caller)
+            return edge_not_found()
+        if state.get("edge_client_missing"):
+            _note(
+                request,
+                AuditAction.KEY_REFUSED,
+                actor="-",
+                detail={"code": AuthErrorCode.EDGE_CLIENT_UNKNOWN.value, "path": path},
+            )
+            return edge_client_unknown(request.app.state.ctx.settings.edge_client_header)
+        return None
+
+    def _refusal(self, request: Request) -> Response | None:
+        """The response that refuses this request, or None to let it through.
+
+        Decides on ``scope["path"]``, the field the router dispatches on --
+        never ``request.url.path``, which Starlette rebuilds from the
+        caller's ``Host`` header and re-parses: ``Host: x#`` made it empty
+        and walked an anonymous caller past the session gate into /api."""
+        path = request.scope["path"]
         is_api = _gated(path, "/api")
         is_v1 = _gated(path, "/v1")
         if not (is_api or is_v1) or _is_cors_preflight(request):
@@ -1113,6 +1215,7 @@ class AuthGuard:
                         actor=key_actor(bearer_token(request)),
                         detail={"code": "rate_limited", "path": path},
                     )
+                    request.scope["state"]["quiet"] = True
                     return key_refusals_exceeded()
                 # Opened first, so a broken store is 503 even for a request that
                 # brought no key: the gate fails closed, never "just" 401.
@@ -1148,7 +1251,7 @@ def _cross_site_refusal(request: Request) -> Response | None:
     origin = request.headers.get("origin")
     if not is_cross_site_write(
         method=request.method,
-        path=request.url.path,
+        path=request.scope["path"],
         origin=origin,
         request_scheme=request.url.scheme,
         request_netloc=request.url.netloc,
@@ -1159,7 +1262,7 @@ def _cross_site_refusal(request: Request) -> Response | None:
         request,
         AuditAction.CROSS_ORIGIN_REFUSED,
         actor="-",
-        detail={"origin": origin, "path": request.url.path},
+        detail={"origin": origin, "path": request.scope["path"]},
     )
     return error_response(
         403,
@@ -1207,7 +1310,7 @@ def cross_site_socket(websocket) -> bool:
         return False
     refused = is_cross_site_write(
         method="POST",
-        path=websocket.url.path,
+        path=websocket.scope["path"],
         origin=origin,
         request_scheme={"ws": "http", "wss": "https"}.get(websocket.url.scheme, websocket.url.scheme),
         request_netloc=websocket.url.netloc,
@@ -1218,7 +1321,7 @@ def cross_site_socket(websocket) -> bool:
             websocket,
             AuditAction.CROSS_ORIGIN_REFUSED,
             actor="-",
-            detail={"origin": origin, "path": websocket.url.path},
+            detail={"origin": origin, "path": websocket.scope["path"]},
         )
     return refused
 
@@ -1234,7 +1337,7 @@ async def require_session(websocket, stores: AuthStores) -> Session | None:
     except AuthUnavailable:
         session = None
     if session is None:
-        _note(websocket, AuditAction.SESSION_REFUSED, actor="-", detail={"path": websocket.url.path})
+        _note(websocket, AuditAction.SESSION_REFUSED, actor="-", detail={"path": websocket.scope["path"]})
         await websocket.close(code=CLOSE_POLICY, reason=AuthErrorCode.SESSION_REQUIRED.value)
         return None
     websocket.scope["state"]["session"] = session
@@ -1260,7 +1363,7 @@ async def require_key(websocket, stores: AuthStores) -> Principal | None:
             websocket,
             AuditAction.KEY_REFUSED,
             actor=key_actor(bearer_token(websocket)),
-            detail={"code": "rate_limited", "path": websocket.url.path},
+            detail={"code": "rate_limited", "path": websocket.scope["path"]},
         )
         await websocket.close(code=CLOSE_POLICY, reason="rate_limited")
         return None
@@ -1277,7 +1380,7 @@ async def require_key(websocket, stores: AuthStores) -> Principal | None:
             websocket,
             AuditAction.KEY_REFUSED,
             actor=key_actor(bearer_token(websocket)),
-            detail={"code": exc.code.value, "path": websocket.url.path},
+            detail={"code": exc.code.value, "path": websocket.scope["path"]},
         )
         await websocket.close(code=CLOSE_POLICY, reason=exc.code.value)
         return None
