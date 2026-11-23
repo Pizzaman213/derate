@@ -2,10 +2,13 @@
 // which files changed, and a line reader that counts lines the way `wc -l` does.
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 export const git = (...a) => execFileSync('git', a, { encoding: 'utf8', maxBuffer: 1 << 28 }).trim()
 
-export const root = git('rev-parse', '--show-toplevel')
+// From this file's location, not `git rev-parse`: under a git hook GIT_DIR is set, and from
+// `npm --prefix .omp` the cwd is .omp, which git would then treat as the work tree root.
+export const root = fileURLToPath(new URL('../../../', import.meta.url)).replace(/\/$/, '')
 process.chdir(root)
 
 export const baseRef = process.env.VALIDATE_BASE || 'dev'
