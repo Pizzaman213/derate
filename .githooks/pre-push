@@ -1,0 +1,4 @@
+#!/bin/sh
+# Enable once per clone:  git config core.hooksPath .githooks
+# Runs the mechanical validation gate; a red gate blocks the push.
+exec npm --prefix "$(git rev-parse --show-toplevel)/.omp" run validate

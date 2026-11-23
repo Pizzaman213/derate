@@ -18,7 +18,11 @@ agents and `RULES.md` automatically when started in the repo root.
 | `design/DESIGN.md` | the design system: principles, colour/type/space/motion, a spec per component, how to add things | — |
 | `design/components/registry.json` | every component the pack knows: props, variants, states, tokens, icons, spec anchor | — |
 | `charts/` | the six chart types the app mounts, one file each; see `charts/README.md` | `cd charts && npm run charts:test` |
-| `agents/*.md` | `design-reviewer`, `icon-smith` | omp |
+| `agents/*.md` | `design-reviewer`, `icon-smith`, `duplication-reviewer`, `repo-steward`, `breaker` | omp |
+| `rules/validation.md` | the always-on end-of-task gate and review requirement | omp |
+| `scripts/validate.mjs` | `npm run validate`: the mechanical gate (also run by `.githooks/pre-push`) | node |
+| `line-budget.json` | files over their budget, recorded at current size; the gate stops them growing (`npm run validate -- --update-budget`) | node |
+| `validate.allow.json` | optional: `duplicate-names` and `paths` the gate must ignore | node |
 | `rules/chart-pack.md`, `RULES.md` | the maintenance rules, sticky in every session | omp |
 | `work/auth-keys/sets/*.json` | route and limit sets read by `tests/unit/` in the Python suite | — |
 
@@ -28,4 +32,8 @@ npm run tokens:check   # contrast gate + staleness; exit 1 on any failure
 npm run icons:build    # optimise svg/, regenerate icons.svg + components/icons.ts
 npm run icons:lint     # the icon spec; exit 1 on any finding
 npm run check          # tokens:check + icons:lint
+npm run validate       # end-of-task gate: static checks, generated-file staleness, typecheck, UI verifiers
+npm run validate -- --fast   # static checks only
+# A fresh worktree first needs: node_modules linked or installed in ui/, .omp/ and .omp/charts/,
+# and `npm run tokens:build` (tokens.flat.json is generated and ignored by git).
 ```

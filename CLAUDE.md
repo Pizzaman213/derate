@@ -1016,3 +1016,11 @@ else. `.omp/RULES.md` is sticky and binding in every session: check the pack
 before creating, add to the pack first, register and test what you add.
 `cd .omp && npm run check` is the UI design gate (`ui:check` alone skips the
 pack's typecheck); `.omp/README.md` is the index of every file and script.
+
+**Every task ends with `cd .omp && npm run validate` and an independent review.**
+`.omp/rules/validation.md` says which reviewer agents run on the diff
+(`duplication-reviewer` and `repo-steward` and `breaker` always, run together in one parallel batch, `design-reviewer` for UI, `security-reviewer` for
+auth and keys) and that each finding is fixed or answered in the report. The
+verifiers inside it need `DERATE_CHECK_ADMIN_USER`/`_PASSWORD` set, or they skip and
+the gate reports them red. Enable the push gate once per clone with
+`git config core.hooksPath .githooks`.
