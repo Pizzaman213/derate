@@ -18,6 +18,8 @@ agents and `RULES.md` automatically when started in the repo root.
 | `design/components/registry.json` | every component the pack knows: props, variants, states, tokens, icons, spec anchor | — |
 | `charts/` | the six chart types the app mounts, one file each; see `charts/README.md` | `cd charts && npm run charts:test` |
 | `agents/*.md` | `design-reviewer`, `icon-smith`, `duplication-reviewer`, `repo-steward`, `breaker`, `design-critic` | omp |
+| `briefs/`, `prompts/design-for-derate.md` | how to design for derate: a one-page primer, one layered brief per part (Depth 1/2/3, pitfalls, entry points), a starter prompt; every `path::symbol` is verified by the gate |
+| `scripts/functions.mjs` | `node scripts/functions.mjs <verb>`: find existing functions before writing one |
 | `OWNERSHIP.md` | generated map of every area: owner, size, imports; `node scripts/ownership.mjs`, `--headroom FILE...` |
 | `design-note.md`, `work/design-notes/` | template and the notes written before large changes; reviewed by `design-critic` |
 | `lessons.md` | what has gone wrong, and which gate step or reviewer now stops it |

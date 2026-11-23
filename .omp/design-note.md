@@ -8,6 +8,7 @@ in the note. Keep it to one page. Delete sections that do not apply, never leave
 What the user asked for, in their words, and the acceptance criteria.
 
 ## Where it goes
+- Briefs read (`.omp/briefs/`) and to what depth; any rule in them this change touches.
 - Owning area(s), from `.omp/OWNERSHIP.md`, and why that one.
 - Files that will change, with `node .omp/scripts/ownership.mjs --headroom <files>` output.
 - New files, and what each one is the single home of.

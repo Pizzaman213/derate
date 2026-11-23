@@ -20,3 +20,6 @@ is not a real step. When a reviewer reports something mechanical twice, add a ro
 | A second subscription to the same endpoint on one screen | 2026-11-23, duplication-reviewer | todo |
 | A hand-kept route list in a test that a generated coverage test already walks | 2026-11-23, duplication-reviewer | todo |
 | Zero-context patches applied to files other sessions are editing land in the wrong place | 2026-11-23 | todo (task-start/task-end scripts) |
+| A design contradicts a rule or repeats a pitfall nobody told the agent about | 2026-11-23, user | reviewer:design-critic (checks the note against `.omp/briefs/`) |
+| A helper is rewritten because nobody knew it existed | 2026-11-23, duplication-reviewer | reviewer:duplication-reviewer (briefs name `path::symbol` entry points; `scripts/functions.mjs` finds the rest) |
+| A brief names code that was renamed or deleted | 2026-11-23 | briefs have every section and name only code that exists |

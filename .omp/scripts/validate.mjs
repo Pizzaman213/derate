@@ -17,6 +17,7 @@ import { baseRef, base, changed } from './validate/context.mjs'
 import * as budget from './validate/budget.mjs'
 import * as duplicates from './validate/duplicates.mjs'
 import * as statics from './validate/static.mjs'
+import * as briefs from './validate/briefs.mjs'
 import * as designnote from './validate/designnote.mjs'
 import * as docsdrift from './validate/docsdrift.mjs'
 import * as lessons from './validate/lessons.mjs'
@@ -37,7 +38,7 @@ const suites = process.argv.includes('--fast') ? [] : [
 ]
 
 console.log(`base ${baseRef} @ ${base.slice(0, 8)}; ${changed.length} changed file(s)\n`)
-const all = [...statics.steps, ...duplicates.steps, ...budget.steps, ...ownership.steps, ...designnote.steps, ...docsdrift.steps, ...suites]
+const all = [...statics.steps, ...duplicates.steps, ...budget.steps, ...ownership.steps, ...briefs.steps, ...designnote.steps, ...docsdrift.steps, ...suites]
 all.push({ name: 'lessons.md only names gate steps that exist', run: () => lessons.check(all.map((s) => s.name)) })
 const failed = []
 for (const { name, run: check } of all) {

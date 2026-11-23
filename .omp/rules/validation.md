@@ -4,8 +4,12 @@ alwaysApply: true
 ---
 Before STARTING any non-trivial task (more than a one-file edit):
 
-0. Decide where the code goes. Read `.omp/OWNERSHIP.md` (which area owns the concern) and
+0. Understand derate before designing for it. Read `.omp/briefs/README.md` (one page), then Depth 1
+   of the brief for each part the task touches; go to Depth 2/3 only as far as needed
+   (`.omp/prompts/design-for-derate.md` is the starter prompt). Then decide where the code goes:
+   read `.omp/OWNERSHIP.md` (which area owns the concern) and
    `.omp/lessons.md` (what has gone wrong before), and run
+   `node .omp/scripts/functions.mjs <verb>` for every helper you expect to write (reuse what exists) and
    `node .omp/scripts/ownership.mjs --headroom <files you expect to change>`. A change over
    ~150 net new source lines, or any growth in a file past 70% of its budget, needs a design
    note first: copy `.omp/design-note.md` to `.omp/work/design-notes/<slug>.md`, fill it in,
