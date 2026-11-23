@@ -23,7 +23,7 @@ export const steps = [
     const out = []
     for (const f of readdirSync(DIR).filter((n) => n.endsWith('.md') && n !== 'TEMPLATE.md' && n !== 'README.md')) {
       const text = readFileSync(join(DIR, f), 'utf8')
-      for (const s of SECTIONS) if (!text.includes(s)) out.push(`${DIR}/${f}: missing section "${s}"`)
+      for (const s of SECTIONS) if (!text.split('\n').some((l) => l === s || l.startsWith(`${s} `))) out.push(`${DIR}/${f}: missing section "${s}"`)
       for (const [, ref] of text.matchAll(REF)) {
         const [path, symbol] = ref.split('::')
         if (!existsSync(path)) out.push(`${DIR}/${f}: ${ref} -- no such file`)

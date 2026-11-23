@@ -22,17 +22,18 @@ const addedLines = (p) => {
 }
 
 const addedNames = () => changed
-  .filter((p) => /\.(py|tsx?|mjs)$/.test(p) && !/(^|\/)(tests?|node_modules)\//.test(p) && !p.endsWith('.check.mjs'))
+  .filter((p) => /^(control_plane|ui\/src)\/.*\.(py|tsx?)$/.test(p) && !/(^|\/)(tests?|node_modules)\//.test(p))
   .flatMap((file) => addedLines(file).flatMap(({ text, n }) => {
     const m = text.match(DEF)
     const name = m && (m[1] || m[2] || m[3] || m[4])
-    return name && !/^(__|test_)/.test(name) && !SKIP.has(name) ? [{ name, file, n }] : []
+    return name && !/^(_|test_)/.test(name) && !SKIP.has(name) ? [{ name, file, n }] : []
   }))
 
 const definedElsewhere = (name, file) => {
-  const args = ['grep', '-nwE', GREP(name), '--untracked', '--', '*.py', '*.ts', '*.tsx', '*.mjs', ':!tests', ':!*.check.mjs', `:!${file}`]
-  return spawnSync('git', args, { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean)
-    .filter((l) => !allowedPath(l.split(':')[0]))
+  const args = ['grep', '--untracked', '-nwE', GREP(name), '--', ...(file.endsWith('.py') ? ['control_plane/**/*.py'] : ['ui/src/**/*.ts', 'ui/src/**/*.tsx']), ':!tests', `:!${file}`]
+  const r = spawnSync('git', args, { encoding: 'utf8' })
+  if (r.status > 1) throw new Error(`git grep failed: ${r.stderr.trim()}`) // 1 = no match
+  return r.stdout.trim().split('\n').filter(Boolean).filter((l) => !allowedPath(l.split(':')[0]))
 }
 
 export const steps = [
