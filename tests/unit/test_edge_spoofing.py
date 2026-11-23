@@ -224,36 +224,36 @@ def test_the_main_port_never_reads_the_client_header(world):
 # -- the refusal budget ------------------------------------------------------
 
 
-def _spend_budget(edge, address: str) -> None:
+def _spend_budget(edge, address: str, bad: str) -> None:
     from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
 
-    for i in range(KEY_REFUSALS_PER_ADDRESS_PER_MIN):
-        r = edge.get("/v1/models", headers={"CF-Connecting-IP": address, **_bearer(f"derate-{i:010d}_" + "x" * 43)})
+    for _ in range(KEY_REFUSALS_PER_ADDRESS_PER_MIN):
+        r = edge.get("/v1/models", headers={"CF-Connecting-IP": address, **_bearer(bad)})
         assert r.status_code == 401
 
 
 def test_two_spellings_of_one_address_share_one_budget(world):
-    _spend_budget(world["edge"], "203.0.113.60")
-    r = world["edge"].get("/v1/models", headers={"CF-Connecting-IP": "::ffff:203.0.113.60", **_bearer(world["key"])})
+    bad = "derate-eeeeeeeeee_" + "x" * 43
+    _spend_budget(world["edge"], "203.0.113.60", bad)
+    r = world["edge"].get("/v1/models", headers={"CF-Connecting-IP": "::ffff:203.0.113.60", **_bearer(bad)})
     assert r.status_code == 429
+    # The budget is that key id's: a valid key from the same address is served.
+    r = world["edge"].get("/v1/models", headers={"CF-Connecting-IP": "::ffff:203.0.113.60", **_bearer(world["key"])})
+    assert r.status_code == 200
 
 
 def test_rotating_inside_an_ipv6_64_does_not_buy_a_new_budget(world):
     from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
 
     edge = world["edge"]
+    bad = _bearer("derate-aaaaaaaaaa_" + "x" * 43)
     for i in range(KEY_REFUSALS_PER_ADDRESS_PER_MIN):
-        r = edge.get(
-            "/v1/models",
-            headers={"CF-Connecting-IP": f"2001:db8:1:2::{i + 1:x}", **_bearer("derate-aaaaaaaaaa_" + "x" * 43)},
-        )
+        r = edge.get("/v1/models", headers={"CF-Connecting-IP": f"2001:db8:1:2::{i + 1:x}", **bad})
         assert r.status_code == 401
-    rotated = edge.get(
-        "/v1/models", headers={"CF-Connecting-IP": "2001:db8:1:2:ffff:ffff:ffff:fffe", **_bearer(world["key"])}
-    )
+    rotated = edge.get("/v1/models", headers={"CF-Connecting-IP": "2001:db8:1:2:ffff:ffff:ffff:fffe", **bad})
     assert rotated.status_code == 429
-    next_64 = edge.get("/v1/models", headers={"CF-Connecting-IP": "2001:db8:1:3::1", **_bearer(world["key"])})
-    assert next_64.status_code == 200
+    next_64 = edge.get("/v1/models", headers={"CF-Connecting-IP": "2001:db8:1:3::1", **bad})
+    assert next_64.status_code == 401
 
 
 # -- what may be touched -----------------------------------------------------
@@ -459,6 +459,56 @@ def test_a_socket_to_an_unrouted_path_is_closed_not_a_traceback(tmp_path, monkey
         with client.websocket_connect(f"{base}/v1/nope", headers=WAN):
             pass
     assert closed.value.code == 1008
+
+
+@pytest.mark.parametrize("port", [None, EDGE_PORT])
+def test_sockets_to_an_unrouted_path_go_quiet_past_the_budget_and_are_counted(tmp_path, monkeypatch, caplog, port):
+    """A socket to an unrouted path was closed by the static mount, past every
+    budget: one access line and row per attempt, without end. On the edge it
+    is refused at the gate now (only /v1/realtime is a socket there); on the
+    LAN the mount counts it against the same noise budget."""
+    import logging
+
+    from control_plane.contracts.auth import AuditAction
+    from control_plane.gateway import GatewayDeps, GatewaySettings
+    from control_plane.gateway.authz import NOISE_PER_ADDRESS_PER_MIN
+
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<!doctype html><title>ui</title>")
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path / "data"))
+    app = create_app(GatewayDeps(), settings=GatewaySettings(ui_dir=str(ui), edge_port=EDGE_PORT))
+    base = f"ws://testserver:{port}" if port else "ws://testserver"
+    client = TestClient(app, client=LOOPBACK)
+    codes = set()
+    with caplog.at_level(logging.INFO):
+        for _ in range(NOISE_PER_ADDRESS_PER_MIN + 40):
+            with pytest.raises(WebSocketDisconnect) as closed:
+                with client.websocket_connect(f"{base}/v1/nope", headers=WAN):
+                    pass
+            codes.add(closed.value.code)
+    assert codes == {1008}
+    access = [r for r in caplog.records if r.name == "gateway.access" and "/v1/nope" in r.getMessage()]
+    assert len(access) == NOISE_PER_ADDRESS_PER_MIN
+    ctx = app.state.ctx
+    assert ctx.secevents.close()
+    entries, _ = ctx.auth_stores.auth.audit_page(action=AuditAction.EDGE_REFUSED.value)
+    caller = WAN["CF-Connecting-IP"] if port else LOOPBACK[0]
+    rows = [e for e in entries if e.ip == caller]
+    assert any(e.after.get("socket") is True for e in rows)
+    assert sum(e.after["count"] for e in rows) == 40
+
+
+def test_a_nul_in_a_static_path_is_a_404_not_a_500(tmp_path, monkeypatch):
+    """StaticFiles hands the path to os.path.realpath, which raises
+    ValueError on an embedded NUL: /%00 was a 500 and a traceback per request,
+    anonymously on the LAN and with any key on the edge."""
+    app, key = _edge_app_with_ui(tmp_path, monkeypatch)
+    lan = TestClient(app, client=LOOPBACK)
+    assert lan.get("/%00").status_code == 404
+    assert lan.get("/cluster/%00", headers={"Accept": "text/html"}).status_code == 404
+    r = _edge_client(app).get("/v1/%00", headers={**WAN, **_bearer(key)})
+    assert r.status_code == 404
 
 
 def test_socket_floods_go_quiet_past_their_budgets(world, caplog):

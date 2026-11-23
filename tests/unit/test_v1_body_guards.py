@@ -119,22 +119,119 @@ def test_n_predict_cannot_outrun_the_output_cap():
     assert "n_predict" not in backend.requests[-1]
 
 
-@pytest.mark.parametrize("n_predict", [-1, 0])
-def test_a_non_positive_ceiling_is_refused_not_ignored(n_predict):
-    """llama-server reads ``n_predict: -1`` as unbounded; a ceiling below one
-    was skipped as "no ceiling", so the body went upstream with it and the
-    key's output cap never applied."""
+def test_minus_one_is_no_ceiling_and_never_reaches_the_engine():
+    """-1 is "no ceiling" to LM Studio and llama-server, so it is taken out of
+    the forwarded body: refused, it broke those clients; forwarded beside a
+    cap, llama-server's ``n_predict: -1`` overrode it."""
     backend = FakeBackend()
     with RunningBackend(backend) as running:
         app = create_app(build_deps(deployments=FakeDeployments(
             [make_deployment("d-1", "llama", backend_url=running.base_url)]
         )))
         key = _mint(app, max_output_tokens_per_request=256)
+        bearer = {"Authorization": f"Bearer {key}"}
         with TestClient(app) as client:
-            r = client.post("/v1/chat/completions", json={**CHAT, "max_tokens": 16, "n_predict": n_predict},
+            beside = client.post("/v1/chat/completions", json={**CHAT, "max_tokens": 16, "n_predict": -1}, headers=bearer)
+            forwarded = backend.requests[-1]
+            alone = client.post("/v1/chat/completions", json={**CHAT, "max_tokens": -1}, headers=bearer)
+            zero = client.post("/v1/chat/completions", json={**CHAT, "n_predict": 0}, headers=bearer)
+    assert beside.status_code == 200, beside.text
+    assert forwarded["max_tokens"] == 16 and "n_predict" not in forwarded
+    assert alone.status_code == 200 and backend.requests[-1]["max_tokens"] == 256
+    assert zero.status_code == 400
+
+
+@pytest.mark.parametrize("stream", ["false", "0", "no", 1, "true", 0])
+def test_a_stream_that_is_not_a_boolean_is_refused(stream):
+    """The engine reads ``"false"`` as false and answers in JSON, while a
+    truthy check here metered that answer as SSE: no frames, no output
+    tokens charged, for any length of answer."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        app = create_app(build_deps(deployments=FakeDeployments(
+            [make_deployment("d-1", "llama", backend_url=running.base_url)]
+        )))
+        key = _mint(app)
+        with TestClient(app) as client:
+            r = client.post("/v1/chat/completions", json={**CHAT, "stream": stream},
                             headers={"Authorization": f"Bearer {key}"})
-    assert r.status_code == 400, r.text
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "invalid_request"), r.text
     assert backend.requests == []
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": ""}] * (openai_api.MAX_MESSAGES + 1),
+        [{"role": "user", "content": [{"type": "text", "text": ""}] * (openai_api.MAX_CONTENT_PARTS + 1)}],
+    ],
+    ids=["messages", "parts"],
+)
+def test_a_body_with_more_messages_or_parts_than_any_prompt_is_refused(messages):
+    """Every walk before forwarding is per message and per part, in Python,
+    on the event loop."""
+    app = create_app(build_deps())
+    _, key = credentials(app)
+    with TestClient(app) as client:
+        r = client.post("/v1/chat/completions", json={"model": "llama", "messages": messages},
+                        headers={"Authorization": f"Bearer {key}"})
+    assert (r.status_code, r.json()["error"]["code"]) == (413, "too_many_parts")
+
+
+def test_the_prefix_key_is_linear_in_the_message_count():
+    """It summed every part collected so far once per message: one body of
+    empty messages blocked the loop for minutes."""
+    import time
+
+    started = time.monotonic()
+    assert openai_api._prefix_key({"messages": [{"content": ""}] * 50_000}) is None
+    assert time.monotonic() - started < 0.5
+    assert openai_api._prefix_key({"messages": [{"content": "ab"}, {"content": "cd"}]}) == "abcd"
+
+
+def test_an_upload_of_too_many_parts_is_refused():
+    app = create_app(build_deps())
+    _, key = credentials(app)
+    parts = "".join(f'--b\r\nContent-Disposition: form-data; name="f{i}"\r\n\r\nx\r\n' for i in range(100))
+    raw = (parts + '--b\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper\r\n--b--\r\n').encode()
+    with TestClient(app) as client:
+        r = client.post("/v1/audio/transcriptions", content=raw,
+                        headers={"content-type": "multipart/form-data; boundary=b",
+                                 "Authorization": f"Bearer {key}"})
+    assert (r.status_code, r.json()["error"]["code"]) == (413, "too_many_parts")
+
+
+def test_every_body_counts_against_the_key_rpm_and_a_raise_applies_at_once(monkeypatch):
+    """Only requests the limit service admitted counted, so a key could have
+    the gateway parse body after body refused for some other reason (here an
+    unknown model) at whatever rate it could upload."""
+    app = create_app(build_deps())
+    cookie, _ = credentials(app)
+    r = TestClient(app).post(
+        "/api/keys",
+        json={"name": "windowed", "expiry_days": 30, "limits": {"rpm": 2}, "current_password": BOOT_PASSWORD},
+        headers={"Cookie": f"derate_session={cookie}"},
+    )
+    key, key_id = r.json()["secret_once"], r.json()["key"]["key_id"]
+    bearer = {"Authorization": f"Bearer {key}"}
+    bad = {**CHAT, "model": "no-such-model"}  # refused after parsing: 404
+    with TestClient(app) as client:
+        codes = [client.post("/v1/chat/completions", json=bad, headers=bearer).status_code for _ in range(2)]
+        reads: list[int] = []
+        real = openai_api.read_bounded_body
+
+        async def counting(request, cap):
+            reads.append(1)
+            return await real(request, cap)
+
+        monkeypatch.setattr(openai_api, "read_bounded_body", counting)
+        third = client.post("/v1/chat/completions", json=bad, headers=bearer)
+        assert (codes, third.status_code, reads) == ([404, 404], 429, [])
+        assert third.json()["error"]["limit_source"] == "key:rpm"
+        raised = client.patch(f"/api/keys/{key_id}", json={"limits": {"rpm": 10}},
+                              headers={"Cookie": f"derate_session={cookie}"})
+        assert raised.status_code == 200, raised.text
+        assert client.post("/v1/chat/completions", json=bad, headers=bearer).status_code == 404
 
 
 def _counting_loads(monkeypatch) -> list[int]:

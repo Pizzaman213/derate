@@ -164,9 +164,45 @@ SHUTDOWN_GRACE_S = 30
 WS_MAX_QUEUE = 4
 
 
+#: What uvicorn's websocket protocol, and the websockets library through the
+#: logger uvicorn hands it, say about every socket: at INFO, on
+#: ``uvicorn.error``, with the caller's raw target in it and no budget.
+#: ``gateway.access`` already records each socket once, capped, so these are
+#: only a way for an internet caller to write unbounded lines into node.log.
+_WEBSOCKET_CHATTER = frozenset(
+    {
+        '%s - "WebSocket %s" 403',
+        '%s - "WebSocket %s" [accepted]',
+        '%s - "WebSocket %s" %d',
+        "connection rejected (%d %s)",
+        "connection open",
+        "connection closed",
+    }
+)
+
+
+class _WebsocketChatterFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.msg not in _WEBSOCKET_CHATTER
+
+
+_WEBSOCKET_FILTER = _WebsocketChatterFilter()
+
+
+def _quiet_websocket_chatter() -> None:
+    """Drop :data:`_WEBSOCKET_CHATTER` from ``uvicorn.error``. Idempotent: one
+    filter, however many configs are built. On the logger, not a handler,
+    because the records are emitted by that logger itself and a handler added
+    later (the journal's, the log files') must not see them either."""
+    logger = logging.getLogger("uvicorn.error")
+    if _WEBSOCKET_FILTER not in logger.filters:
+        logger.addFilter(_WEBSOCKET_FILTER)
+
+
 def _config(app, *, host: str, port: int) -> uvicorn.Config:
     from control_plane.gateway.settings import uvicorn_proxy_kwargs
 
+    _quiet_websocket_chatter()
     # access_log=False: gateway.access (authz.on_request_done) is the access
     # line now -- request id, principal, UTC -- and uvicorn's would double it.
     return uvicorn.Config(
@@ -237,7 +273,11 @@ def _install_shutdown(
 ) -> Callable[[], None]:
     """Build the signal callback: flip ``should_exit`` on every server, and
     ``force_exit`` on a second signal -- the operator asking twice means do
-    not wait for the grace period.
+    not wait for the grace period. ``force_exit`` alone does not mean that:
+    uvicorn still awaits ``wait_closed()``, which holds until every accepted
+    connection is gone, so a client streaming a response kept the process up
+    for the full grace. The second signal therefore aborts every open
+    connection's transport too.
 
     Split out from :func:`_run_with_signals` so the shutdown behaviour is
     exercisable directly in a test, with plain fake objects, without sending
@@ -249,9 +289,18 @@ def _install_shutdown(
         for server in servers:
             if server.should_exit:
                 server.force_exit = True
+                _abort_connections(server)
             server.should_exit = True
 
     return _shutdown
+
+
+def _abort_connections(server: uvicorn.Server) -> None:
+    state = getattr(server, "server_state", None)
+    for connection in list(getattr(state, "connections", ())):
+        transport = getattr(connection, "transport", None)
+        if transport is not None and not transport.is_closing():
+            transport.abort()
 
 
 async def _run_with_signals(servers: list[uvicorn.Server]) -> None:

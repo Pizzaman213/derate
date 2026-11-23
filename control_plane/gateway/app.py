@@ -33,6 +33,7 @@ from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.requests import HTTPConnection
 from starlette.routing import Mount
 
 from . import (
@@ -46,7 +47,7 @@ from . import (
     shell_api,
     ui_api,
 )
-from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN, AuditAction
+from control_plane.contracts.auth import AuditAction
 from control_plane.deploy.autoadopt import ContainerAutoAdopter
 from control_plane.inventory import api as inventory_api
 from control_plane.paths import data_path
@@ -309,13 +310,22 @@ class _UIStatics(StaticFiles):
     async def __call__(self, scope, receive, send):
         # Mount("/") also matches websocket scopes, and StaticFiles asserts
         # http: a socket to any unrouted path was an uncaught AssertionError
-        # and a traceback in the log per attempt. Refuse it as a socket.
+        # and a traceback in the log per attempt. Refuse it as a socket,
+        # against the caller's noise budget like any other cheap refusal.
         if scope["type"] != "http":
+            conn = HTTPConnection(scope)
+            if authz.quiet_past_budget(conn):
+                authz._note(conn, AuditAction.EDGE_REFUSED, actor="-",
+                            detail={"path": scope.get("path", ""), "socket": True})
             await send({"type": "websocket.close", "code": 1008})
             return
         await super().__call__(scope, receive, send)
 
     async def get_response(self, path, scope):
+        # os.path.realpath raises ValueError on an embedded NUL, which
+        # StaticFiles does not catch: /%00 was a 500 and a traceback.
+        if "\x00" in path:
+            raise HTTPException(status_code=404)
         try:
             return await super().get_response(path, scope)
         except HTTPException as exc:
@@ -699,11 +709,12 @@ def create_app(
     # request id. Plain ASGI, not @app.middleware("http") -- see AuthGuard
     # for the measured reason. It also writes the access record for every
     # HTTP request and socket.
-    # One per-address budget of refused keys, shared by the HTTP gate and
-    # require_key on the sockets, so neither path can be used to drain the
-    # other's allowance. On app.state because the socket handlers have no
-    # handle on the guard instance (Starlette builds middleware lazily).
-    app.state.key_refusals = authz.RefusalWindow(KEY_REFUSALS_PER_ADDRESS_PER_MIN)
+    # One refused-key throttle -- per (address, key id), and per address over
+    # every key id -- shared by the HTTP gate and require_key on the sockets,
+    # so neither path can be used to drain the other's allowance. On
+    # app.state because the socket handlers have no handle on the guard
+    # instance (Starlette builds middleware lazily).
+    app.state.key_refusals = authz.KeyRefusals()
     # The noise budget: cheap anonymous refusals per address, past which they
     # are answered without an access row each (authz.quiet_past_budget).
     app.state.noise_refusals = authz.RefusalWindow(authz.NOISE_PER_ADDRESS_PER_MIN)

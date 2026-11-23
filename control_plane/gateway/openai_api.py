@@ -14,6 +14,7 @@ import logging
 import math
 import re
 import time
+from collections import deque
 from dataclasses import replace
 
 from fastapi import APIRouter, Request, WebSocket
@@ -21,9 +22,12 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from control_plane.contracts import Modality, TargetKind
 from control_plane.contracts.auth import (
+    DEFAULT_KEY_RPM,
+    AuditAction,
     AuthError,
     AuthErrorCode,
     AuthUnavailable,
+    LimitDecision,
     LimitScope,
     Principal,
     UsageActuals,
@@ -55,21 +59,74 @@ _GENERATION_PATHS = frozenset({"/chat/completions", "/completions"})
 MAX_BODIES_IN_FLIGHT_PER_KEY = 4
 
 #: JSON values (``,`` ``[`` ``{``, counted at C speed before parsing) one body
-#: may carry. Parsing and estimating run on the event loop and cost ~0.1 s per
-#: million values in a token-id prompt -- 3 s for a 23 MiB batch of one-token
-#: lists, during which every stream, every key and /healthz waits. A million
-#: values is more prompt than any context window holds.
+#: may carry, strings included. Parsing and estimating run on the event loop
+#: and cost ~0.1 s per million values in a token-id prompt -- 3 s for a 23 MiB
+#: batch of one-token lists, during which every stream, every key and
+#: /healthz waits. It bounds parse cost, not meaning: a batch past it is split.
 MAX_JSON_VALUES = 1 << 20
 
-#: Refusals that hold a key whatever model it asks for next: its own and its
-#: org's requests per minute. One of them puts the key in `rpm_cooling`, and
-#: its bodies are then refused before they are read -- a request that the rpm
-#: refuses after parsing still paid for the parse, so it was unbounded.
-_MODEL_FREE_RPM = frozenset({f"{LimitScope.KEY.value}:rpm", f"{LimitScope.ORG.value}:rpm"})
+#: Messages one chat body may carry, and content parts across all of them.
+#: Every walk before forwarding -- the prompt estimate, the media check, the
+#: prefix key -- is Python on the event loop, per message and per part; at
+#: these caps the slowest is tens of milliseconds. No conversation that fits a
+#: context window comes near either.
+MAX_MESSAGES = 10_000
+MAX_CONTENT_PARTS = 10_000
+
+#: Parts one multipart upload may carry: a file and a handful of fields.
+#: `_field_span` walks them in Python, once per field it reads.
+MAX_FORM_PARTS = 64
+
+#: The window a key's request bodies are counted in (`_hold_body_slot`). A key
+#: may have its rpm's worth of bodies read per window, whatever becomes of
+#: them: one refused after parsing (a bad model, a cap, a 0 ceiling) used to
+#: cost the gateway the whole parse and count against nothing.
+BODY_WINDOW_S = 60.0
+
+#: Runtimes whose `stream_options` take `continuous_usage_stats`: cumulative
+#: usage on every chunk, read off vLLM's and SGLang's own StreamOptions.
+#: llama-server is left out rather than sent a field it may refuse.
+_CONTINUOUS_USAGE_RUNTIMES = frozenset({"vllm", "sglang"})
 
 
 def _json_values(raw: bytes) -> int:
     return raw.count(b",") + raw.count(b"[") + raw.count(b"{")
+
+
+def _remote_rates(index, model: str) -> tuple[float, float] | None:
+    """The dearest known (input, output) USD per Mtok among *model*'s remote
+    targets -- whichever one the router picks, the reservation is not low --
+    or None when no remote target publishes both."""
+    ins: list[float] = []
+    outs: list[float] = []
+    for target in index.targets.get(model, ()):
+        remote = index.remotes.get(target.target_id) if target.kind is TargetKind.REMOTE else None
+        if remote is None:
+            continue
+        rates = remote[1]
+        if rates.input_cost_per_mtok is not None:
+            ins.append(rates.input_cost_per_mtok)
+        if rates.output_cost_per_mtok is not None:
+            outs.append(rates.output_cost_per_mtok)
+    return (max(ins), max(outs)) if ins and outs else None
+
+
+def _structure_refusal(body: dict) -> str | None:
+    """Why *body* has more messages or content parts than one request may
+    carry, or None. One pass, stopping at the cap."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    if len(messages) > MAX_MESSAGES:
+        return f"A request may carry at most {MAX_MESSAGES} messages; this one has {len(messages)}."
+    parts = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            parts += len(content)
+            if parts > MAX_CONTENT_PARTS:
+                return f"A request may carry at most {MAX_CONTENT_PARTS} content parts across its messages."
+    return None
 
 
 #: Background attributions in flight; held so the loop does not drop them.
@@ -127,17 +184,22 @@ def _prefix_key(body: dict) -> str | None:
     messages = body.get("messages")
     if isinstance(messages, list):
         parts: list[str] = []
+        # A running total: summing every part per message was quadratic in
+        # the message count -- minutes of blocked event loop for one body.
+        total = 0
         for message in messages:
             if not isinstance(message, dict):
                 continue
             content = message.get("content")
             if isinstance(content, str):
                 parts.append(content)
+                total += len(content)
             elif isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and isinstance(item.get("text"), str):
                         parts.append(item["text"])
-            if sum(len(p) for p in parts) >= _PREFIX_CHARS:
+                        total += len(item["text"])
+            if total >= _PREFIX_CHARS:
                 break
         joined = "".join(parts)
         return joined[:_PREFIX_CHARS] if joined else None
@@ -179,6 +241,11 @@ def _boundary_of(content_type: str) -> bytes | None:
 
 class _DuplicateField(ValueError):
     """A form field the gateway reads appears in more than one part."""
+
+
+class _TooManyParts(ValueError):
+    """An upload with more than `MAX_FORM_PARTS` parts: refused rather than
+    walked, since every field read walks them all."""
 
 
 #: Transcription answer formats that say how long the audio was: ``duration``
@@ -235,7 +302,7 @@ def _field_span(raw: bytes, content_type: str, name: str) -> tuple[str, int, int
     delimiter = b"--" + boundary
     cursor = 0
     found: tuple[str, int, int] | None = None
-    while True:
+    for _ in range(MAX_FORM_PARTS + 1):
         start = raw.find(delimiter, cursor)
         if start < 0:
             return found
@@ -257,6 +324,7 @@ def _field_span(raw: bytes, content_type: str, name: str) -> tuple[str, int, int
             except UnicodeDecodeError:
                 return None
         cursor = body_end
+    raise _TooManyParts(MAX_FORM_PARTS)
 
 
 def _multipart_field(raw: bytes, content_type: str, name: str) -> str | None:
@@ -376,22 +444,72 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     engine_busy: dict[str, set[_EngineSlot]] = {}
     # key_id -> its request bodies being read or parsed right now.
     bodies_in_flight: dict[str, int] = {}
-    # key_id -> (monotonic time its rpm frees, the refusal that said so).
-    rpm_cooling: dict[str, tuple[float, object]] = {}
+    # key_id -> monotonic times its bodies were accepted for reading in the
+    # last BODY_WINDOW_S, and when it was last told so (see _body_window).
+    bodies_read: dict[str, deque[float]] = {}
+    body_window_refused: dict[str, float] = {}
+
+    def _key_rpm(key_id: str, configured: float) -> float:
+        """The key's effective rpm, this cycle's raise included -- read only
+        when the cheap figure would refuse, so a raise takes effect at once
+        and a key under its limit costs no lookup."""
+        try:
+            states = ctx.auth_stores.limits.states(LimitScope.KEY, key_id)
+        except Exception:
+            return configured
+        return next((s.effective_limit for s in states if s.limit_type == "rpm"), configured)
+
+    def _body_window(request: Request, principal, key_id: str) -> Response | None:
+        """A 429 when the key has had its rpm's worth of bodies read in the
+        last window, before this one is read. Counts every body, whatever
+        becomes of it, so a refusal after parsing is bounded too; the limit
+        service still decides what is admitted. The first refusal per window
+        is recorded like any other; repeats go quiet and fold into one
+        security row, like the per-address throttle's."""
+        now = time.monotonic()
+        window = bodies_read.setdefault(key_id, deque())
+        while window and now - window[0] >= BODY_WINDOW_S:
+            window.popleft()
+        # What the key names, or DEFAULT_KEY_RPM as the limit service applies it.
+        configured = (principal.key.limits or {}).get("rpm", DEFAULT_KEY_RPM)
+        if isinstance(configured, bool) or not isinstance(configured, (int, float)):
+            configured = DEFAULT_KEY_RPM
+        if len(window) < configured or len(window) < _key_rpm(key_id, float(configured)):
+            window.append(now)
+            return None
+        wait = max(0.0, window[0] + BODY_WINDOW_S - now)
+        if now - body_window_refused.get(key_id, -BODY_WINDOW_S) < BODY_WINDOW_S:
+            request.scope.setdefault("state", {})["quiet"] = True
+            authz._note(
+                request, AuditAction.KEY_REFUSED,
+                actor=authz.key_actor(authz.bearer_token(request)),
+                detail={"code": "rate_limited", "path": request.scope["path"]},
+            )
+        else:
+            body_window_refused[key_id] = now
+        return _limit_refusal(LimitDecision(
+            allowed=False,
+            status=429,
+            code=AuthErrorCode.LIMIT_EXCEEDED.value,
+            message=(
+                f"key:rpm limit reached: {len(window)} request bodies in the last "
+                f"{int(BODY_WINDOW_S)} s, whatever became of them; the next frees in "
+                f"{math.ceil(wait)} s."
+            ),
+            limit_source=f"{LimitScope.KEY.value}:rpm",
+            used=float(len(window)),
+            limit=float(len(window)),
+            resets_at=time.time() + wait,
+        ))
 
     def _hold_body_slot(request: Request) -> str | Response | None:
         """The calling key's id, now holding one of its body slots; a 429 when
-        it has none left, or is cooling off a requests-per-minute refusal
-        (the same 429 it was given); None when the request carries no key."""
+        it has none left or its body window is full (`_body_window`); None
+        when the request carries no key."""
         principal = getattr(request.state, "principal", None)
         key_id = getattr(getattr(principal, "key", None), "key_id", None)
         if not key_id:
             return None
-        cooling = rpm_cooling.get(key_id)
-        if cooling is not None:
-            if time.monotonic() < cooling[0]:
-                return _limit_refusal(cooling[1])
-            rpm_cooling.pop(key_id, None)
         held = bodies_in_flight.get(key_id, 0)
         if held >= MAX_BODIES_IN_FLIGHT_PER_KEY:
             return errors.error_response(
@@ -403,6 +521,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 headers={"Retry-After": "1"},
                 retry_after_s=1,
             )
+        refused = _body_window(request, principal, key_id)
+        if refused is not None:
+            return refused
         bodies_in_flight[key_id] = held + 1
         return key_id
 
@@ -550,11 +671,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     "invalid_request_error",
                     "payload_too_large",
                 )
+            raw_len = len(raw)
             if _json_values(raw) > MAX_JSON_VALUES:
                 return errors.error_response(
                     413,
-                    f"The request body carries more than {MAX_JSON_VALUES} JSON values; "
-                    "no prompt that size fits a context window.",
+                    f"The request body carries more than {MAX_JSON_VALUES} JSON values "
+                    "(array elements and object members); split a batch this size "
+                    "into several requests.",
                     "invalid_request_error",
                     "too_many_json_values",
                 )
@@ -579,6 +702,29 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, "Request body must be a JSON object.",
                 "invalid_request_error", "invalid_json",
             )
+        # Before every walk over messages and parts below.
+        too_big = _structure_refusal(body)
+        if too_big is not None:
+            return errors.error_response(413, too_big, "invalid_request_error", "too_many_parts")
+        stream = body.get("stream")
+        if stream is not None and not isinstance(stream, bool):
+            # The engine reads "false" as false and answers in JSON, while a
+            # truthy check here metered that answer as an SSE stream: zero
+            # frames, zero output tokens charged.
+            return errors.error_response(
+                400, f"'stream' must be true or false, not {json.dumps(stream)[:40]}.",
+                "invalid_request_error", "invalid_request",
+            )
+        # -1 is "no ceiling" to LM Studio and llama-server. Taken out rather
+        # than refused or forwarded: forwarded beside a cap, llama-server's
+        # n_predict -1 overrode it.
+        unbounded = [
+            name for name in MAX_OUTPUT_FIELDS
+            if not isinstance(body.get(name), bool) and body.get(name) == -1
+        ]
+        if unbounded:
+            body = {k: v for k, v in body.items() if k not in unbounded}
+            raw = None
         # The model node fetches media URLs itself, from inside the LAN; a
         # URL naming that LAN is refused before anything is forwarded. The
         # raw body still goes on byte for byte when it passes.
@@ -600,8 +746,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             path,
             model=model,
             body=body,
-            raw_len=len(raw),
-            streaming=bool(body.get("stream")) and streaming_allowed,
+            raw_len=raw_len,
+            streaming=bool(stream) and streaming_allowed,
             raw_body=raw,
         )
 
@@ -656,10 +802,16 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             # Read only to refuse a second one: the gateway prices the format
             # it reads, so two would let the upstream answer in the other.
             _multipart_field(raw, content_type, "response_format")
+            _multipart_field(raw, content_type, "stream")
         except _DuplicateField as exc:
             return errors.error_response(
                 400, f"duplicate multipart field: {exc} -- send exactly one.",
                 "invalid_request_error", "invalid_request",
+            )
+        except _TooManyParts:
+            return errors.error_response(
+                413, f"An upload may carry at most {MAX_FORM_PARTS} parts.",
+                "invalid_request_error", "too_many_parts",
             )
         if not model:
             return errors.error_response(
@@ -815,6 +967,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 decision, reservation = limits.check_and_reserve(
                     principal, model=model, target_kind=target_kind, body=body or {},
                     route_limits=ctx.router.limits_for(model),
+                    # So an in-flight remote request counts as live dollars:
+                    # priced at no rate it booked $0, and every concurrent
+                    # request ran past a dollar limit at once.
+                    remote_rates=_remote_rates(index, model),
                 )
                 if (
                     not decision.allowed
@@ -851,15 +1007,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 return _refused(authz.unavailable(exc), exc.code.value)
             if not decision.allowed:
                 trace.limit_source = decision.limit_source
-                if (
-                    principal is not None
-                    and decision.limit_source in _MODEL_FREE_RPM
-                    and decision.resets_at is not None
-                ):
-                    rpm_cooling[principal.key.key_id] = (
-                        time.monotonic() + max(0.0, decision.resets_at - time.time()),
-                        decision,
-                    )
                 return _refused(_limit_refusal(decision), decision.code)
             if (
                 decision.inject_max_tokens is not None
@@ -884,6 +1031,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         # One entry per attempt, carried on every row this request writes.
         attempt_chain: list[dict] = []
+        # A target that declined this request for a reason the client can fix
+        # (a per-minute model asked for an answer that carries no duration).
+        # Another target of the name may still serve it; if none does, this
+        # is the answer, rather than "no target admitting".
+        declined: list[Response] = []
         # deployment_id -> this request's slot on that engine, for the
         # spec-decode attribution's "was it alone" question.
         engine_slots: dict[str, _EngineSlot] = {}
@@ -932,7 +1084,12 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             if record.tokens_estimated and output_bound is not None and completion > output_bound:
                 completion = output_bound
                 record = replace(record, completion_tokens=completion)
-            if not failed and record.status is not None and ctx.auth_stores is not None:
+            # An upstream 4xx was answered, if with a refusal: counted like a
+            # local one (zero tokens) so rpm and the request cycle see it. A
+            # provider's 4xx used to be voided, so a flood of malformed
+            # requests reached the provider at any rate.
+            answered = record.status is not None and (not failed or 400 <= record.status < 500)
+            if answered and ctx.auth_stores is not None:
                 provider_model = getattr(selection, "model", None)
                 try:
                     cost, cost_basis = ctx.auth_stores.pricing.cost(
@@ -1209,13 +1366,20 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                             # vLLM and SGLang only send a usage frame when
                             # asked, and a stream without one is metered on
                             # an estimate (finding H5). Asked on every local
-                            # stream, whatever the client sent.
+                            # stream, whatever the client sent -- and on every
+                            # chunk where the runtime can: a stream cut before
+                            # its last frame was charged one token per frame,
+                            # and a reader that falls behind gets many tokens
+                            # merged into each (as does a speculative step).
                             options = body.get("stream_options")
+                            usage_options = {"include_usage": True}
+                            if deployment.runtime in _CONTINUOUS_USAGE_RUNTIMES:
+                                usage_options["continuous_usage_stats"] = True
                             upstream_body = dict(
                                 body,
                                 stream_options={
                                     **(options if isinstance(options, dict) else {}),
-                                    "include_usage": True,
+                                    **usage_options,
                                 },
                             )
                             upstream_raw = None
@@ -1226,21 +1390,24 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     rate = getattr(selection.model, "price_per_minute_usd", None)
                     if rate is not None and content is not None and content_type is not None:
                         fmt = (_multipart_field(content, content_type, "response_format") or "json").lower()
-                        if fmt not in _DURATION_FORMATS:
-                            # Priced per minute, and only a JSON answer says
-                            # how many: text/srt/vtt settled free.
+                        streamed = (_multipart_field(content, content_type, "stream") or "").lower() in ("true", "1")
+                        if fmt not in _DURATION_FORMATS or streamed:
+                            # Priced per minute, and only an unstreamed JSON
+                            # answer says how many: text/srt/vtt, and an SSE
+                            # transcript, settled free. Skipped, not refused:
+                            # another target of the name may serve it.
                             ctx.breaker.abandon(target.target_id)
-                            return _refused(
-                                errors.error_response(
+                            if not declined:
+                                declined.append(errors.error_response(
                                     400,
-                                    f"Model '{model}' is priced per minute of audio and a "
-                                    f"'{fmt[:32]}' answer does not say how many minutes it was. "
-                                    "Ask for response_format 'json' or 'verbose_json'.",
+                                    f"Model '{model}' is priced per minute of audio, and a "
+                                    f"{'streamed' if streamed else repr(fmt[:32])} answer does not "
+                                    "say how many minutes it was. Ask for response_format 'json' "
+                                    "or 'verbose_json', unstreamed.",
                                     "invalid_request_error",
                                     "invalid_request",
-                                ),
-                                "invalid_request",
-                            )
+                                ))
+                            return None
                     if selection.model is not None:
                         if body is not None:
                             upstream_body = dict(body)
@@ -1525,6 +1692,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             answer = await _dispatch()
             if answer is not None:
                 return answer
+            if declined:
+                # Every target that could serve it declined for a reason the
+                # client can fix: say that, and do not park it.
+                return _refused(declined[0], "invalid_request")
 
             # Nothing was reachable. If this model was serving a moment ago and
             # no target is deliberately shedding load, hold the request briefly

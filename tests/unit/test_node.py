@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import shutil
 import socket
 import sys
@@ -463,6 +464,129 @@ class TestSignalShutdown:
         assert out.returncode == 0, out.stderr[-2000:]
         assert out.stdout.strip().splitlines()[-1] == "[False, False] ['agent', 'gateway']"
 
+    def test_a_second_sigterm_exits_while_a_response_is_still_streaming(self):
+        """force_exit stops uvicorn waiting on connections and tasks, but it
+        still awaits wait_closed(), which holds until every accepted socket is
+        gone -- so a client being streamed to kept the process up for the whole
+        grace. Asking twice has to close those sockets."""
+        import os
+        import subprocess
+
+        script = (
+            "import asyncio, os, signal, time\n"
+            "from control_plane import node\n"
+            "async def app(scope, receive, send):\n"
+            "    if scope['type'] == 'lifespan':\n"
+            "        while True:\n"
+            "            m = await receive()\n"
+            "            if m['type'] == 'lifespan.startup':\n"
+            "                await send({'type': 'lifespan.startup.complete'})\n"
+            "            elif m['type'] == 'lifespan.shutdown':\n"
+            "                await send({'type': 'lifespan.shutdown.complete'})\n"
+            "                return\n"
+            "    await send({'type': 'http.response.start', 'status': 200, 'headers': []})\n"
+            "    while True:\n"
+            "        await send({'type': 'http.response.body', 'body': b'x', 'more_body': True})\n"
+            "        await asyncio.sleep(1)\n"
+            "async def main():\n"
+            "    sock = node._bind('127.0.0.1', 0)\n"
+            "    port = sock.getsockname()[1]\n"
+            "    server = node._Server(node._config(app, host='127.0.0.1', port=0), sockets=[sock])\n"
+            "    first = []\n"
+            "    async def client():\n"
+            "        while not server.started:\n"
+            "            await asyncio.sleep(0.05)\n"
+            "        reader, writer = await asyncio.open_connection('127.0.0.1', port)\n"
+            "        writer.write(b'GET / HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n"
+            "        await reader.readuntil(b'\\r\\n\\r\\n')\n"
+            "        await reader.read(1)\n"
+            "        first.append(time.monotonic())\n"
+            "        os.kill(os.getpid(), signal.SIGTERM)\n"
+            "        await asyncio.sleep(0.5)\n"
+            "        os.kill(os.getpid(), signal.SIGTERM)\n"
+            "        while await reader.read(1024):\n"
+            "            pass\n"
+            "    task = asyncio.get_running_loop().create_task(client())\n"
+            "    await node._run_with_signals([server])\n"
+            "    print(round(time.monotonic() - first[0], 2))\n"
+            "asyncio.run(main())\n"
+        )
+        root = Path(__file__).resolve().parents[2]
+        out = subprocess.run([sys.executable, "-c", script], cwd=root, capture_output=True,
+                             text=True, timeout=60, env={**os.environ, "PYTHONPATH": str(root)})
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert "Exception in callback" not in out.stderr, out.stderr[-2000:]
+        assert float(out.stdout.strip().splitlines()[-1]) < 5.0
+
+    def test_refused_websockets_write_nothing_to_uvicorn_error(self, tmp_path, monkeypatch):
+        """uvicorn logs every websocket refused before accept, raw target and
+        all, at INFO on uvicorn.error -- and the websockets library logs its
+        rejection and close through the same logger -- with no budget, so an
+        internet caller could fill node.log. gateway.access already has the row.
+        TestClient never runs uvicorn's protocol, so this is a real server."""
+        from control_plane.gateway.settings import GatewaySettings
+
+        monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+        # A handler on the logger itself, not caplog's on the root: another
+        # test's logging.config (disable_existing_loggers) can disable it or
+        # stop it propagating, and then caplog sees nothing at all. Filters on
+        # the logger run before its handlers, so this sees what node.log would.
+        logger = logging.getLogger("uvicorn.error")
+        records: list[logging.LogRecord] = []
+
+        class Keep(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        keep = Keep(level=logging.INFO)
+        monkeypatch.setattr(logger, "disabled", False)
+        # setLevel, not the attribute: it clears isEnabledFor's cache, which
+        # otherwise keeps answering for the level an earlier server left.
+        level = logger.level
+        logger.setLevel(logging.INFO)
+        logger.addHandler(keep)
+        edge = node._bind("127.0.0.1", 0)
+        main = node._bind("127.0.0.1", 0)
+        edge_port = edge.getsockname()[1]
+        app = create_app(GatewayDeps(), settings=GatewaySettings(edge_port=edge_port))
+        server = node._Server(node._config(app, host="127.0.0.1", port=0), sockets=[main, edge])
+
+        async def scenario() -> bytes:
+            task = asyncio.create_task(server.serve())
+            try:
+                while not server.started:
+                    assert not task.done(), task.exception()
+                    await asyncio.sleep(0.05)
+                reader, writer = await asyncio.open_connection("127.0.0.1", edge_port)
+                writer.write(
+                    b"GET /api/x HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Upgrade: websocket\r\n"
+                    b"Connection: Upgrade\r\n"
+                    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    b"Sec-WebSocket-Version: 13\r\n"
+                    b"CF-Connecting-IP: 203.0.113.9\r\n\r\n"
+                )
+                status = await asyncio.wait_for(reader.readuntil(b"\r\n"), 10)
+                # Until the server closes: the close is logged too.
+                await asyncio.wait_for(reader.read(), 10)
+                writer.close()
+                return status
+            finally:
+                server.should_exit = True
+                await asyncio.wait_for(task, 30)
+
+        try:
+            status = asyncio.run(scenario())
+        finally:
+            logger.removeHandler(keep)
+            logger.setLevel(level)
+
+        assert status.startswith(b"HTTP/1.1 403")
+        said = [r.msg for r in records]
+        assert not set(said) & node._WEBSOCKET_CHATTER, said
+        assert "Application startup complete." in said
+
     def test_an_open_connection_cannot_hold_a_restart_forever(self):
         """uvicorn's defaults wait on every connection with no deadline and
         let one websocket buffer 32 x 16 MiB; an internet caller controls both."""
@@ -470,6 +594,9 @@ class TestSignalShutdown:
         assert config.timeout_graceful_shutdown == node.SHUTDOWN_GRACE_S
         assert config.ws_max_queue == node.WS_MAX_QUEUE
         assert config.ws_max_queue * config.ws_max_size <= 64 * 1024 * 1024
+        logger = logging.getLogger("uvicorn.error")
+        node._config(lambda *a: None, host="127.0.0.1", port=18001)
+        assert logger.filters.count(node._WEBSOCKET_FILTER) == 1
 
     def test_the_edge_listener_is_not_handed_to_child_processes(self):
         """The shell relay forks and execs; an inheritable listener would go

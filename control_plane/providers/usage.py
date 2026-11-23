@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 
@@ -45,7 +46,9 @@ def _cost(usage: dict) -> float | None:
     value = usage.get("cost")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if value < 0:
+    # Negative or non-finite: a NaN or Infinity in a key's USD counter would
+    # stay there, refusing (or admitting) every request after it.
+    if not math.isfinite(value) or value < 0:
         return None
     return float(value)
 
@@ -60,11 +63,17 @@ def _usage_from_obj(obj: object, *, metered: bool = False) -> Usage | None:
     completion = usage.get("completion_tokens", usage.get("output_tokens"))
     if not isinstance(prompt, (int, float)) and not isinstance(completion, (int, float)):
         return None
-    return Usage(
-        input_tokens=int(prompt or 0),
-        output_tokens=int(completion or 0),
-        cost_usd=_cost(usage) if metered else None,
-    )
+    try:
+        return Usage(
+            input_tokens=int(prompt or 0),
+            output_tokens=int(completion or 0),
+            cost_usd=_cost(usage) if metered else None,
+        )
+    except (OverflowError, ValueError):
+        # `Infinity` / `NaN` from a hostile upstream: int() raised past every
+        # caller, so the attempt never settled -- KV commitment held, the
+        # connection never closed. Not a count we can use.
+        return None
 
 
 class UsageSniffer:

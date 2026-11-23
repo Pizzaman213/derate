@@ -7,6 +7,9 @@ forwarded. ``data:`` always passes; a name is never resolved.
 
 from __future__ import annotations
 
+import time
+import urllib.parse
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -174,3 +177,36 @@ def test_a_refusal_does_not_echo_an_unbounded_url():
     """A 25 MiB URL must not come back as a 25 MiB error body."""
     why = media_url_refusal(_chat(_image("http:///" + "a" * 100_000)))
     assert why is not None and len(why) < 400
+
+
+def _timed(url) -> tuple[str | None, float]:
+    start = time.monotonic()
+    refusal = media_url_refusal(_chat(_image(url)))
+    return refusal, time.monotonic() - start
+
+
+def test_a_huge_distinct_unicode_host_is_refused_fast():
+    host = "".join(chr(0x4E00 + i) for i in range(20_000))
+    refusal, elapsed = _timed(f"http://{host}/a.png")
+    assert refusal is not None
+    assert elapsed < 0.5
+
+
+def test_an_overlong_label_short_enough_url_is_refused_before_idna():
+    host = "".join(chr(0x4E00 + i) for i in range(4_000))
+    refusal, elapsed = _timed(f"http://{host}.com/a.png")
+    assert refusal is not None and "valid name" in refusal
+    assert elapsed < 0.5
+
+
+def test_a_five_megabyte_url_is_refused_fast():
+    refusal, elapsed = _timed("http://" + "a" * 5_000_000)
+    assert refusal is not None and "at most" in refusal
+    assert elapsed < 0.5
+
+
+def test_large_urls_are_never_pinned_in_the_urlsplit_cache():
+    urllib.parse.urlsplit.cache_clear()
+    assert media_url_refusal(_chat(_image("data:image/png;base64," + "A" * (1 << 20)))) is None
+    assert media_url_refusal(_chat(_image("http://" + "a" * (1 << 20)))) is not None
+    assert urllib.parse.urlsplit.cache_info().currsize == 0

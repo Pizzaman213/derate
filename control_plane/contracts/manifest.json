@@ -2309,6 +2309,10 @@
       "module": "control_plane.contracts.auth",
       "value": "derate-"
     },
+    "KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN": {
+      "module": "control_plane.contracts.auth",
+      "value": 200
+    },
     "KEY_REFUSALS_PER_ADDRESS_PER_MIN": {
       "module": "control_plane.contracts.auth",
       "value": 20

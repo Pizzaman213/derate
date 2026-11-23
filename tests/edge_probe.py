@@ -252,6 +252,18 @@ class Probe:
             ok = b" 403 " in status + b" " or (self.via == "tunnel" and not data.startswith(b"HTTP/1.1 5"))
             self.check(f"a websocket to {target!r} is refused, not a 500", ok, repr(data[:160]))
 
+    def origins(self) -> None:
+        """A malformed Origin made `urlsplit` raise inside the gate, before any
+        key was read: a 500 and a traceback per request."""
+        for origin in ("http://[", "https://[x]", "//["):
+            data = self.raw(self.request(
+                "/v1/chat/completions", method="POST", body=b"{}",
+                extra=f"Origin: {origin}\r\nContent-Type: application/json\r\n",
+            ))
+            ok, how = self.verdict(data)
+            ok = ok and not data.startswith(b"HTTP/1.1 5")
+            self.check(f"Origin {origin!r} is refused, not a 500", ok, repr(data[:160]), how)
+
     def pipelining_and_smuggling(self) -> None:
         first = self.request("/v1/models", close=False)
         second = self.request("/api/auth/state")
@@ -398,6 +410,7 @@ class Probe:
         self.raw_targets()
         self.host_games()
         self.sockets()
+        self.origins()
         self.pipelining_and_smuggling()
         self.client_header()
         self.forged_forwarding()

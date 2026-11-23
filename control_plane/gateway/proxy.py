@@ -34,6 +34,7 @@ from control_plane.providers.errors import (
     ProviderNotAdmittingError,
     UpstreamError,
 )
+from control_plane.providers.kinds import spec_for
 from control_plane.providers.service import RESPONSE_HEADER_ALLOWLIST
 from control_plane.redaction import Redactor
 
@@ -86,6 +87,22 @@ class _Discarded(Exception):
     Throwing skips both, without the connect-time paths that would mark the
     provider unreachable -- it answered fine; we simply changed our mind.
     """
+
+
+class _ProviderHandle:
+    """What the janitor closes for a provider attempt whose body was never
+    started: the provider's own context, exited as a discard -- nothing was
+    read, so nothing is billed or vouched for."""
+
+    def __init__(self, manager) -> None:
+        self._manager = manager
+
+    async def aclose(self) -> None:
+        reason = _Discarded("never read")
+        try:
+            await self._manager.__aexit__(type(reason), reason, None)
+        except _Discarded:
+            pass
 
 
 _SYNTHETIC_TRANSPORT_PREFIX = "could not reach upstream: "
@@ -179,6 +196,10 @@ class _Usage:
     # response's small JSON body; priced per minute when the provider model
     # carries a rate (K5r). None for every other body.
     audio_duration_s: float | None = None
+    # What the upstream said it charged, when its kind meters cost in dollars
+    # (OpenRouter's `usage.cost`): the record's cost, METERED, over tokens x
+    # list price, which misses what a request's extras (web search) cost.
+    cost_usd: float | None = None
 
 
 def _int_or_none(value: object) -> int | None:
@@ -282,6 +303,7 @@ def _apply_sniffed(usage: _Usage, sniffer: "UsageSniffer") -> None:
     usage.prompt_tokens = sniffed.input_tokens
     usage.completion_tokens = sniffed.output_tokens
     usage.estimated = False
+    usage.cost_usd = sniffed.cost_usd
     if sniffed.output_tokens:
         usage.tokens = sniffed.output_tokens
 
@@ -308,7 +330,13 @@ class _StreamAccounting:
     a substring scan per chunk rather than a parse.
     """
 
-    def __init__(self, started: float, on_tokens: Callable[[int], None] | None = None) -> None:
+    def __init__(
+        self,
+        started: float,
+        on_tokens: Callable[[int], None] | None = None,
+        *,
+        metered: bool = False,
+    ) -> None:
         self.started = started
         self.usage = _Usage()
         # Tokens already handed to ``on_tokens`` as they streamed, so the
@@ -323,7 +351,7 @@ class _StreamAccounting:
         # The frame count keeps driving routing exactly as before. This reads
         # the real usage block out of the stream's tail in parallel, using the
         # implementation the provider path already trusts for spend.
-        self._sniffer = _DetailSniffer(stream=True)
+        self._sniffer = _DetailSniffer(stream=True, metered=metered)
 
     def note_chunk(self, chunk: bytes, now: float) -> None:
         if self.usage.ttft_s is None:
@@ -390,10 +418,11 @@ class _BodyAccounting:
     #: that hangs up was served all of it, and its usage block is LAST.
     wants_rest = True
 
-    def __init__(self, started: float) -> None:
+    def __init__(self, started: float, *, metered: bool = False) -> None:
         self.started = started
         self.usage = _Usage()
-        self._sniffer = _DetailSniffer(stream=False)
+        self._metered = metered
+        self._sniffer = _DetailSniffer(stream=False, metered=metered)
         self._seen = 0
         self._total = 0
         self._tail = _BodyTail()
@@ -413,7 +442,7 @@ class _BodyAccounting:
         if self.usage.estimated and self._total > self._seen:
             # The head was cut, so its `usage` (if any) was not in it.
             tail = bytes(self._tail.bytes)
-            sniffed = usage_after_key(tail)
+            sniffed = usage_after_key(tail, metered=self._metered)
             if sniffed is not None:
                 block = object_after_key(tail, "usage")
                 for name, value in _usage_details(block).items():
@@ -421,6 +450,7 @@ class _BodyAccounting:
                 self.usage.prompt_tokens = sniffed.input_tokens
                 self.usage.completion_tokens = sniffed.output_tokens
                 self.usage.estimated = False
+                self.usage.cost_usd = sniffed.cost_usd
                 if sniffed.output_tokens:
                     self.usage.tokens = sniffed.output_tokens
         if self.usage.estimated and not self.usage.tokens:
@@ -543,9 +573,13 @@ def _trace_record(
         reasoning_tokens=None if usage is None else usage.reasoning_tokens,
         cache_read_tokens=None if usage is None else usage.cache_read_tokens,
         cache_write_tokens=None if usage is None else usage.cache_write_tokens,
-        # Metered for audio when a per-minute rate exists; otherwise None and
-        # the request settles unpriced, as before (K5r).
-        cost_usd=rate * seconds / 60.0 if rate is not None and seconds is not None else None,
+        # Metered for audio when a per-minute rate exists; else what the
+        # upstream said it charged, when its kind meters cost; else None, and
+        # the request is priced from tokens or settles unpriced (K5r).
+        cost_usd=(
+            rate * seconds / 60.0 if rate is not None and seconds is not None
+            else None if usage is None else usage.cost_usd
+        ),
     )
     if error_message is not None:
         record = replace(record, attempt_chain=[{
@@ -558,6 +592,19 @@ def _trace_record(
             "retry_after_s": retry_after_s,
         }])
     return record
+
+
+def _meters_cost(selection) -> bool:
+    """Whether this provider's `usage.cost` is dollars (OpenRouter's is).
+    Off for every other kind: a stray `cost` in an unknown unit must not
+    become what a key is charged."""
+    kind = getattr(getattr(selection, "provider", None), "kind", None)
+    if kind is None:
+        return False
+    try:
+        return spec_for(kind).meters_cost
+    except (KeyError, ValueError):
+        return False
 
 
 #: What a client is shown of an upstream's response headers: the provider
@@ -702,10 +749,14 @@ async def _next_chunk(chunks, accounting) -> bytes | None:
     For a body whose rest is worth reading (`wants_rest`) the read is
     shielded: a client's hang-up otherwise cancels it mid-read, which finishes
     the upstream iterator, and `_drain_for_usage` then has nothing left to
-    read. The cancellation lands at the client send instead. A read stalled
+    read. The checkpoint first is what delivers the hang-up: anyio retries a
+    cancellation once on leaving a shielded scope, and entering the next
+    shield hid it for good -- the send after a disconnect does not suspend,
+    so without it the loop read an endless upstream for ever. A read stalled
     past `SHIELDED_READ_S` is a broken upstream."""
     if not accounting.wants_rest:
         return await anext(chunks, None)
+    await anyio.lowlevel.checkpoint_if_cancelled()
     with anyio.CancelScope(shield=True, deadline=anyio.current_time() + SHIELDED_READ_S) as scope:
         chunk = await anext(chunks, None)
     if scope.cancelled_caught:
@@ -1418,9 +1469,11 @@ class UpstreamProxy:
             # buffering the body to look for one costs a megabyte to learn nothing.
             accounting = _NoAccounting(started)
         elif streaming:
-            accounting = _StreamAccounting(started, on_tokens=target_stats.note_tokens)
+            accounting = _StreamAccounting(
+                started, on_tokens=target_stats.note_tokens, metered=_meters_cost(selection)
+            )
         else:
-            accounting = _BodyAccounting(started)
+            accounting = _BodyAccounting(started, metered=_meters_cost(selection))
         finished = False
 
         def settle(
@@ -1670,6 +1723,15 @@ class UpstreamProxy:
 
         self._note_transport_success(target.target_id)
 
+        # Tracked like a direct response: Starlette sends the response line
+        # before it first iterates the body, and a client gone in between
+        # leaves this generator unstarted -- no `finally`, so the provider's
+        # context never exited and the attempt never settled. The janitor
+        # does both (`Reaped` also gives the request's reservation back).
+        handle = _ProviderHandle(manager)
+        tracked = self._track(handle)
+        tracked.abandon = lambda: settle(None, failed=True, error_class="Reaped")
+
         sent_content_type = upstream.headers.get("content-type") if upstream.headers else None
 
         def settle_body(**fields) -> None:
@@ -1698,6 +1760,7 @@ class UpstreamProxy:
             # See `forward`: an unstreamed body the client hung up on is read
             # to its usage block before it is settled.
             readable = True
+            tracked.started = True
             try:
                 while (chunk := await _next_chunk(upstream.body, accounting)) is not None:
                     accounting.note_chunk(chunk, time.monotonic())
@@ -1804,10 +1867,12 @@ class UpstreamProxy:
                             log.debug(
                                 "provider upstream teardown failed", exc_info=True
                             )
+                self._release(handle)
 
         async def discard() -> None:
             """Undo an attempt nobody will read. See `Attempt.discard`."""
             settle(None, failed=True, error_class="Discarded")
+            self._release(handle)
             reason = _Discarded("hedge lost")
             with anyio.CancelScope(shield=True):
                 try:

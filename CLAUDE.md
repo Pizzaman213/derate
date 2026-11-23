@@ -966,15 +966,22 @@ already do.
   points at `ui/dist` -- read it off `/proc/<pid>/environ` and confirm with
   `curl -s localhost:8088/ | grep -o 'assets/index-[^"]*\.js'`. Equal hashes is
   the only proof.
-- Server-side changes do need a restart, and the process **does not exit on
-  SIGTERM**: `kill PID`, wait for the port to free, then `kill -9` -- always,
-  even when the port frees. SIGTERM closes the listening socket and leaves the
-  process alive on its established connections, and the browser here comes in
-  through VS Code Remote-SSH port forwarding, which keeps its keep-alive
-  connections open: on 2026-11-18 the old process answered the operator's
-  browser for 40 minutes after a "restart", running the old code, while the
-  new one served nothing. `[ -d /proc/PID ]` is the check, not `ss -ltn`. Never
-  `pkill -f control_plane.node` -- the pattern matches the agent's own shell.
+- Server-side changes do need a restart. A process built from PR #29 on exits
+  on SIGTERM: `kill PID`, then wait for `[ -d /proc/PID ]` to go false. It
+  gives open connections `SHUTDOWN_GRACE_S` (30 s) and then runs the
+  gateway's lifespan shutdown, which flushes the audit and security-event rows
+  and closes the stores. A second `kill PID` aborts every open connection and
+  exits at once. `kill -9` only if it is still alive after that: it skips the
+  lifespan shutdown, so the last minute's folded security counts are lost.
+  A process from before PR #29 does **not** exit on SIGTERM. It closes the
+  listening socket and stays alive on its established connections, and the
+  browser here comes in through VS Code Remote-SSH port forwarding, which keeps
+  its keep-alive connections open. On 2026-11-18 the old process answered the
+  operator's browser for 40 minutes after a "restart", running the old code,
+  while the new one served nothing. For one of those, `kill -9` after the port
+  frees, always. Either way `[ -d /proc/PID ]` is the check, not `ss -ltn`.
+  Never `pkill -f control_plane.node`: the pattern matches the agent's own
+  shell.
 - **The tts image is not published, and is faked by a local tag.**
   `deploy/flags.py` defaults the `tts` runtime to
   `ghcr.io/pizzaman213/derate/tts:latest`, which does not exist in the

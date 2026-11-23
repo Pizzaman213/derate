@@ -275,3 +275,64 @@ def test_a_plain_string_prompt_is_still_estimated():
     /v1/completions call with an ordinary prompt raised instead of estimating."""
     assert estimate_prompt_tokens({"prompt": "x" * 400}) == 100
     assert estimate_prompt_tokens({"prompt": "x" * 400, "input": [[1, 2, 3]]}) == 103
+
+
+def test_reasoning_and_documents_are_estimated_not_free():
+    """vLLM renders an assistant turn's ``reasoning`` and a top-level
+    ``documents`` into the prompt; skipping them let ~100k real tokens past
+    ``max_prompt_tokens_per_request``."""
+    for name in ("reasoning", "reasoning_content"):
+        body = {
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "", name: "r" * 400_000},
+            ]
+        }
+        assert estimate_prompt_tokens(body) >= 100_000
+    docs = [{"title": "t", "text": "d" * 400_000}]
+    assert estimate_prompt_tokens({"documents": docs}) == int(len(json.dumps(docs)) / 4)
+
+
+def test_tool_calls_are_measured_with_one_dumps_not_one_per_message(monkeypatch):
+    from control_plane.limits import service
+
+    calls: list[int] = []
+    real = service.json.dumps
+
+    def dumps(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(service.json, "dumps", dumps)
+    call = [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
+    body = {"messages": [{"role": "assistant", "tool_calls": call}] * 100_000}
+    estimate = estimate_prompt_tokens(body)
+    assert len(calls) <= 2
+    assert estimate == int(100_000 * len(real(call)) / 4) + 100_000 * 4
+
+
+def test_calls_and_schemas_together_count_the_same_as_apart():
+    """One dumps over everything must not charge the list's own brackets and
+    separators: the figure is the sum of each value's own length."""
+    call = [{"function": {"name": "f", "arguments": "{\"a\": 1}"}}]
+    tools = [{"type": "function", "function": {"name": "f"}}]
+    fmt = {"type": "json_object"}
+    body = {
+        "messages": [{"role": "assistant", "tool_calls": call, "function_call": {"name": "g"}}],
+        "tools": tools,
+        "response_format": fmt,
+    }
+    chars = sum(len(json.dumps(v)) for v in (call, {"name": "g"}, tools, fmt))
+    assert estimate_prompt_tokens(body) == int(chars / 4) + 4
+
+
+@pytest.mark.parametrize("name", ["max_tokens", "max_completion_tokens", "max_output_tokens", "n_predict"])
+def test_minus_one_is_no_ceiling_and_other_non_positive_values_are_refused(name):
+    from control_plane.limits.service import requested_output
+
+    assert requested_output({name: -1}) is None
+    assert requested_output({name: -1.0}) is None
+    assert requested_output({name: -1, "max_tokens" if name != "max_tokens" else "n_predict": 7})[1] == 7
+    for bad in (0, -2, -100):
+        with pytest.raises(ValueError):
+            requested_output({name: bad})

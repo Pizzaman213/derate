@@ -970,3 +970,63 @@ def test_an_absurd_n_is_a_400_and_leaks_no_slot(h):
         d, res = None, None
     assert d is not None and d.status == 400 and res is None
     assert h.run().allowed
+
+
+def test_a_fallback_that_lands_on_a_remote_target_still_answers_to_the_dollar_budget(h):
+    """The fallback is re-checked as LOCAL, where an unpriced model spends no
+    dollar, but a served name can also have a REMOTE target and the router may
+    pick it. Re-checking only the ``cloud_*`` pools there let remote spend run
+    past an exhausted ``budget_usd_cycle``."""
+    h.key(limits={"budget_usd_cycle": 1}, cloud_fallback_local_model=FALLBACK)
+    assert h.run(cost=1.0).allowed
+    d = h.run()
+    assert (d.allowed, d.limit_source, d.fallback_model) == (False, "key:budget_usd_cycle", FALLBACK)
+    d, res = h.check(model=FALLBACK, kind="local")
+    assert d.allowed and res is not None
+    remote = h.svc.check_target_kind(res, "remote", now=NOW)
+    assert (remote.allowed, remote.status, remote.limit_source) == (
+        False, 429, "key:budget_usd_cycle"
+    )
+
+
+def test_a_fallback_landing_remote_answers_to_the_models_dollar_limit(h):
+    name = f"model:{FALLBACK}:usd_cycle"
+    h.key(limits={name: 1}, cloud_fallback_local_model=FALLBACK)
+    assert h.run(model=FALLBACK, cost=1.0).allowed
+    d, res = h.check(model=FALLBACK, kind="local")
+    assert d.allowed and res is not None
+    remote = h.svc.check_target_kind(res, "remote", now=NOW)
+    assert (remote.allowed, remote.limit_source) == (False, f"key:{name}")
+
+
+def test_a_remote_reservation_priced_at_its_rates_counts_as_live_dollars(h):
+    """A remote reservation used to book $0, so every concurrent request saw
+    the same dollar headroom and all of them ran past ``cloud_usd_cycle``."""
+    h.key(limits={"cloud_usd_cycle": 1})
+    body = {"max_tokens": 1000}
+    principal = h.principal()
+    rates = (0.0, 1000.0)  # 1000 output tokens at $1000/Mtok is $1
+    first, res = h.svc.check_and_reserve(
+        principal, model=MODEL, target_kind="remote", body=body, now=NOW, remote_rates=rates
+    )
+    assert first.allowed and res is not None
+    second, held = h.svc.check_and_reserve(
+        principal, model=MODEL, target_kind="remote", body=body, now=NOW, remote_rates=rates
+    )
+    assert (second.allowed, second.limit_source, held) == (False, "key:cloud_usd_cycle", None)
+    # Settling the first without actuals gives its dollars back.
+    h.svc.settle(res, None, now=NOW)
+    assert h.svc.check_and_reserve(
+        principal, model=MODEL, target_kind="remote", body=body, now=NOW, remote_rates=rates
+    )[0].allowed
+
+
+def test_remote_rates_never_price_a_local_reservation(h):
+    h.key(limits={"local_usd_cycle": 1})
+    body = {"max_tokens": 1000}
+    for _ in range(3):
+        d, _res = h.svc.check_and_reserve(
+            h.principal(), model=MODEL, target_kind="local", body=body, now=NOW,
+            remote_rates=(0.0, 1000.0),
+        )
+        assert d.allowed

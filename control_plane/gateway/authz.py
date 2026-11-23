@@ -15,9 +15,12 @@ place that decides otherwise, and it decides by path, never by route:
   reaches a fresh coordinator first can claim it, so set it up before
   exposing it.
 * ``/v1/**`` needs ``Authorization: Bearer derate-...``. Never a query-string
-  key: it would land in every access log between the client and here. An
-  address that has had :data:`KEY_REFUSALS_PER_ADDRESS_PER_MIN` keys refused
-  inside a minute is answered 429 without a lookup until the window drains.
+  key: it would land in every access log between the client and here. A key
+  id refused :data:`KEY_REFUSALS_PER_ADDRESS_PER_MIN` times from one address
+  inside a minute is answered 429 without a lookup until the window drains,
+  and so is every key id from an address with
+  :data:`KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN` refusals -- except one that
+  authenticated from there inside the minute (:class:`KeyRefusals`).
 * Everything else (the built UI, ``/healthz``, ``/install.sh``) passes.
 
 A connection accepted on the EDGE socket (``DERATE_EDGE_PORT``, the one
@@ -59,6 +62,7 @@ from starlette.responses import Response
 
 from control_plane.contracts.auth import (
     KEY_PREFIX,
+    KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN,
     KEY_REFUSALS_PER_ADDRESS_PER_MIN,
     SESSION_COOKIE,
     SESSION_COOKIE_SECURE,
@@ -919,6 +923,10 @@ def _edge_path_refused(path: str) -> bool:
     return "." in segments or ".." in segments
 
 
+#: The socket routes the edge serves. Every other socket path there is closed
+#: at the gate, through the same budgeted branch as an edge 404.
+EDGE_SOCKET_PATHS = frozenset({"/v1/realtime"})
+
 #: A Host header a client could legitimately send: a name or IPv4 address, or
 #: a bracketed IPv6 address, each with an optional port. Anything else -- "/",
 #: "?", "#", "@", whitespace, a lone "[" -- is refused before any URL is built
@@ -946,12 +954,11 @@ def host_is_valid(conn: HTTPConnection) -> bool:
 
 
 class RefusalWindow:
-    """Client address -> monotonic times of its refused keys in the last
-    minute, the shape ``internal_api``'s join window has. :meth:`over` only
-    reads; :meth:`note` appends. Its own instance, never the join window: a
-    node's joins and a caller's bad keys are different budgets. ``create_app``
-    builds one and hands it to :class:`AuthGuard` and ``app.state`` so the
-    HTTP gate and :func:`require_key` share it.
+    """Client address -> monotonic times of its refusals in the last minute,
+    the shape ``internal_api``'s join window has. :meth:`over` only reads;
+    :meth:`note` appends. Its own instance per budget, never the join window:
+    a node's joins and a caller's bad keys are different budgets.
+    :class:`KeyRefusals` holds two; ``app.state.noise_refusals`` is another.
 
     :meth:`over` runs on every /v1 request, valid ones included, on the event
     loop, so it must not cost more as the number of refused addresses grows:
@@ -959,18 +966,18 @@ class RefusalWindow:
     the front only (amortised O(1)), never by scanning the whole map."""
 
     #: Buckets kept at once. Past it the least recently refused is forgotten:
-    #: a caller spread over more addresses than this gets more than 20 a
-    #: minute in total, but no one address does, and memory stays flat.
+    #: a caller spread over more addresses than this gets more than its budget
+    #: a minute in total, but no one address does, and memory stays flat.
     MAX_BUCKETS = 100_000
 
-    def __init__(self, per_minute: int, clock=time.monotonic) -> None:
+    def __init__(self, per_minute: int, clock=time.monotonic, bucket=address_bucket) -> None:
         self._limit = per_minute
         self._clock = clock
+        #: The unit one caller is counted as -- an IPv6 /64, shared with the
+        #: security-event fold so the two cannot disagree about who one
+        #: caller is -- unless the caller hands in keys already bucketed.
+        self._bucket = bucket
         self._window: collections.OrderedDict[str, collections.deque[float]] = collections.OrderedDict()
-
-    #: The unit one caller is counted as (an IPv6 /64), shared with the
-    #: security-event fold so the two cannot disagree about who one caller is.
-    _bucket = staticmethod(address_bucket)
 
     def _prune(self, cutoff: float) -> None:
         """Drop buckets whose newest refusal is older than *cutoff*. They are
@@ -1011,6 +1018,101 @@ class RefusalWindow:
         self._window.clear()
 
 
+class KeyRefusals:
+    """The refused-key throttle on /v1, two :class:`RefusalWindow` deep.
+
+    Refusals are counted per (address bucket, presented key id) -- past
+    :data:`KEY_REFUSALS_PER_ADDRESS_PER_MIN` that key id from that bucket is
+    answered 429 without a lookup -- and per bucket over every key id, past
+    :data:`KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN`, when everything from it
+    is. The first is what makes a stale client after a rotation or a disable
+    its own problem rather than every service's behind the same NAT or /64;
+    the second is what stops a guesser rotating key ids. The exception is a
+    key id that authenticated from that bucket inside the window: it is still
+    verified, and leaves the allow list on its first failed verify.
+
+    A credential with no ``derate-<id>_`` prefix counts as the one key id
+    :data:`UNNAMED_KEY`. A throttled answer is never noted: a client retrying
+    into a 429 gets its budget back when its refusals age out.
+
+    ``create_app`` builds one and hands it to :class:`AuthGuard` and
+    ``app.state.key_refusals``, so the HTTP gate and :func:`require_key`
+    share it. Every map is bounded (``RefusalWindow.MAX_BUCKETS``) and pruned
+    from the front, so a read stays O(1) on the event loop."""
+
+    #: The key id every credential that names none counts as.
+    UNNAMED_KEY = "-"
+    #: (bucket, key id) pairs remembered as authenticated at once. Past it the
+    #: least recently authenticated is forgotten, and is checked like any key.
+    MAX_ALLOWED = RefusalWindow.MAX_BUCKETS
+
+    def __init__(
+        self,
+        per_key: int = KEY_REFUSALS_PER_ADDRESS_PER_MIN,
+        any_key: int = KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN,
+        clock=time.monotonic,
+    ) -> None:
+        self._clock = clock
+        # Both windows read this instance's clock, so swapping it (a test
+        # does) moves every window at once.
+        self._per_key = RefusalWindow(per_key, clock=self._now, bucket=str)
+        self._any_key = RefusalWindow(any_key, clock=self._now)
+        #: "bucket key-id" -> monotonic time it last authenticated, oldest first.
+        self._allowed: collections.OrderedDict[str, float] = collections.OrderedDict()
+
+    def _now(self) -> float:
+        return self._clock()
+
+    @staticmethod
+    def _pair(ip: str, key_id: str) -> str:
+        # A space never occurs in an address bucket or a key id.
+        return f"{address_bucket(ip)} {key_id}"
+
+    def _known(self, pair: str) -> bool:
+        allowed = self._allowed
+        cutoff = self._clock() - 60.0
+        while allowed:
+            if next(iter(allowed.values())) >= cutoff:
+                break
+            allowed.popitem(last=False)
+        return pair in allowed
+
+    def over(self, ip: str, key_id: str) -> bool:
+        """Whether *key_id* from *ip* is answered 429 without a lookup."""
+        pair = self._pair(ip, key_id)
+        if self._known(pair):
+            return False
+        return self._any_key.over(ip) or self._per_key.over(pair)
+
+    def refused(self, ip: str, key_id: str) -> None:
+        """One refusal of *key_id* from *ip*, in both windows."""
+        pair = self._pair(ip, key_id)
+        self._allowed.pop(pair, None)
+        self._any_key.note(ip)
+        self._per_key.note(pair)
+
+    def succeeded(self, ip: str, key_id: str) -> None:
+        """*key_id* authenticated from *ip*: it keeps being verified there
+        for the next minute whatever else that address presents."""
+        pair = self._pair(ip, key_id)
+        allowed = self._allowed
+        allowed.pop(pair, None)
+        allowed[pair] = self._clock()
+        while len(allowed) > self.MAX_ALLOWED:
+            allowed.popitem(last=False)
+
+    def reset(self) -> None:
+        self._per_key.reset()
+        self._any_key.reset()
+        self._allowed.clear()
+
+
+def presented_key_id(token: str | None) -> str:
+    """The key id a credential names, or :attr:`KeyRefusals.UNNAMED_KEY`."""
+    parsed = key_format.parse(token) if token else None
+    return parsed[0] if parsed else KeyRefusals.UNNAMED_KEY
+
+
 class AuthGuard:
     """Every HTTP request's credential check. See the module docstring.
 
@@ -1025,14 +1127,14 @@ class AuthGuard:
     (a /v1 request).
     """
 
-    def __init__(self, app, key_refusals: RefusalWindow | None = None) -> None:
+    def __init__(self, app, key_refusals: KeyRefusals | None = None) -> None:
         self.app = app
         # Peers already warned about an ignored X-Forwarded-For, so the
         # warning is once per peer per process rather than once per request.
         self._xff_warned: set[str] = set()
-        # Client address -> refused keys in the last minute, read before the
-        # key store so a flood of bad keys costs no lookups.
-        self.key_refusals = key_refusals or RefusalWindow(KEY_REFUSALS_PER_ADDRESS_PER_MIN)
+        # Refused keys in the last minute, per (address, key id) and per
+        # address, read before the key store so a flood costs no lookups.
+        self.key_refusals = key_refusals or KeyRefusals()
 
     def _warn_untrusted_proxy(self, request: Request, peer: str | None) -> None:
         """F8: a proxy in front with ``DERATE_TRUSTED_PROXIES`` unset records
@@ -1078,12 +1180,13 @@ class AuthGuard:
         bad_host = not host_is_valid(conn)
         if bad_host or (
             state.get("edge")
-            and (_edge_path_refused(scope.get("path", "")) or state.get("edge_client_missing"))
+            and (scope.get("path") not in EDGE_SOCKET_PATHS or state.get("edge_client_missing"))
         ):
-            # A malformed Host anywhere, and on the edge anything but /v1 or a
-            # caller without the client header: closed rather than answered,
-            # and the finally below records it -- unless the caller is past
-            # its noise budget, when the folded security row counts it instead.
+            # A malformed Host anywhere, and on the edge any socket but the
+            # /v1 socket routes or a caller without the client header: closed
+            # rather than answered, and the finally below records it -- unless
+            # the caller is past its noise budget, when the folded security
+            # row counts it instead.
             if quiet_past_budget(conn):
                 _note(conn, AuditAction.EDGE_REFUSED, actor="-",
                       detail={"path": scope.get("path", ""), "socket": True})
@@ -1197,7 +1300,10 @@ class AuthGuard:
         """A malformed Host on either listener; on the edge, anything but a
         plain /v1 path, and a /v1 call without the client header."""
         if not host_is_valid(request):
-            quiet_past_budget(request)
+            if quiet_past_budget(request):
+                # Past the budget, like the socket branch: a count, not silence.
+                _note(request, AuditAction.EDGE_REFUSED, actor="-",
+                      detail={"code": AuthErrorCode.INVALID_HOST.value, "path": request.scope["path"]})
             return invalid_host()
         state = request.scope.get("state") or {}
         if not state.get("edge"):
@@ -1243,6 +1349,9 @@ class AuthGuard:
                 # headers and an access row -- and so the edge's 404 for /api
                 # (decided above) is never preceded by a 401 that admits it.
                 if api_token_refused(request):
+                    _note(request, AuditAction.SESSION_REFUSED, actor="-",
+                          detail={"code": "invalid_api_token", "path": path})
+                    quiet_past_budget(request)
                     return invalid_api_token()
                 route = (method, path)
                 if route in OPEN_ROUTES:
@@ -1263,15 +1372,19 @@ class AuthGuard:
                     return session_required()
                 request.state.session = session
             else:
-                # An address past its refusal budget is answered before the
-                # store is read: no lookup, no hash compare, a valid key
-                # included -- the budget is on the address, not the key.
+                # A key id past its refusal budget from this address, or an
+                # address past its budget for keys of any id, is answered
+                # before the store is read: no lookup, no hash compare. A key
+                # id that authenticated from here inside the window is still
+                # checked, so one stale client never locks its neighbours out.
                 ip = client_ip(request) or "-"
-                if self.key_refusals.over(ip):
+                token = bearer_token(request)
+                key_id = presented_key_id(token)
+                if self.key_refusals.over(ip, key_id):
                     _note(
                         request,
                         AuditAction.KEY_REFUSED,
-                        actor=key_actor(bearer_token(request)),
+                        actor=key_actor(token),
                         detail={"code": "rate_limited", "path": path},
                     )
                     request.scope["state"]["quiet"] = True
@@ -1284,14 +1397,15 @@ class AuthGuard:
                 except AuthUnavailable:
                     raise
                 except AuthError as exc:
-                    self.key_refusals.note(ip)
+                    self.key_refusals.refused(ip, key_id)
                     _note(
                         request,
                         AuditAction.KEY_REFUSED,
-                        actor=key_actor(bearer_token(request)),
+                        actor=key_actor(token),
                         detail={"code": exc.code.value, "path": path},
                     )
                     return key_refused(exc.code, exc.message)
+                self.key_refusals.succeeded(ip, key_id)
             return None
         except AuthUnavailable as exc:
             return unavailable(exc)
@@ -1417,15 +1531,17 @@ async def require_key(websocket, stores: AuthStores) -> Principal | None:
     if cross_site_socket(websocket):
         await websocket.close(code=CLOSE_POLICY, reason="cross_origin_refused")
         return None
-    # The same per-address budget the HTTP gate keeps (app.state.key_refusals,
-    # set beside the guard in create_app); absent in a bare test app.
-    window = getattr(websocket.app.state, "key_refusals", None)
+    # The same budgets the HTTP gate keeps (app.state.key_refusals, set beside
+    # the guard in create_app); absent in a bare test app.
+    throttle = getattr(websocket.app.state, "key_refusals", None)
     ip = client_ip(websocket) or "-"
-    if window is not None and window.over(ip):
+    token = bearer_token(websocket)
+    key_id = presented_key_id(token)
+    if throttle is not None and throttle.over(ip, key_id):
         _note(
             websocket,
             AuditAction.KEY_REFUSED,
-            actor=key_actor(bearer_token(websocket)),
+            actor=key_actor(token),
             detail={"code": "rate_limited", "path": websocket.scope["path"]},
         )
         websocket.scope["state"]["quiet"] = True
@@ -1433,21 +1549,23 @@ async def require_key(websocket, stores: AuthStores) -> Principal | None:
         return None
     try:
         principal = authenticate_key(stores, websocket)
-        # Left on the scope so the socket's access row (AuthGuard._socket)
-        # names the key it was opened with.
-        websocket.scope.setdefault("state", {})["principal"] = principal
-        return principal
     except AuthError as exc:
-        if window is not None:
-            window.note(ip)
+        if throttle is not None:
+            throttle.refused(ip, key_id)
         _note(
             websocket,
             AuditAction.KEY_REFUSED,
-            actor=key_actor(bearer_token(websocket)),
+            actor=key_actor(token),
             detail={"code": exc.code.value, "path": websocket.scope["path"]},
         )
         await websocket.close(code=CLOSE_POLICY, reason=exc.code.value)
         return None
+    if throttle is not None:
+        throttle.succeeded(ip, key_id)
+    # Left on the scope so the socket's access row (AuthGuard._socket)
+    # names the key it was opened with.
+    websocket.scope.setdefault("state", {})["principal"] = principal
+    return principal
 
 
 # -- serialisation -----------------------------------------------------------

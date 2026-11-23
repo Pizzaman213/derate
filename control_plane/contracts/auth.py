@@ -71,9 +71,15 @@ LOGIN_PASSWORD_MAX_LEN = 1024
 #: cannot fill the thread pool every other ``to_thread`` caller waits on.
 LOGIN_INFLIGHT_PER_IP = 2
 VERIFY_INFLIGHT_MAX = 4
-#: /v1 requests from one client address are answered 429 without a key
-#: lookup once this many were refused for a bad key inside the last minute.
+#: /v1 requests presenting one key id from one client address (an IPv6 /64
+#: counts as one) are answered 429 without a key lookup once that key id was
+#: refused this many times from there inside the last minute. The budget is
+#: the pair's, so a stale key never locks its neighbours on a NAT out.
 KEY_REFUSALS_PER_ADDRESS_PER_MIN = 20
+#: ...and EVERY key id from that address is, once this many keys of any id
+#: were refused from there inside the last minute -- except a key id that
+#: authenticated from that address inside the window, which is still checked.
+KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN = 200
 #: The rpm a key is held to when it names none (its org's rpm, if any, is
 #: still checked at the org scope). No key is unlimited by omission.
 DEFAULT_KEY_RPM = 120
@@ -675,6 +681,7 @@ class LimitPort(Protocol):
         body: dict,
         now: float | None = None,
         route_limits: dict | None = None,
+        remote_rates: tuple[float, float] | None = None,
     ) -> tuple[LimitDecision, Reservation | None]: ...
     def settle(
         self, reservation: Reservation, actuals: UsageActuals | None, *, now: float | None = None

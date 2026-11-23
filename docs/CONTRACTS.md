@@ -593,6 +593,7 @@ The interfaces components hold each other to.
 | `KEY_EXPIRY_DAYS` | `[1, 10, 20, 30, 50, 100, 365]` | `control_plane.contracts.auth` |
 | `KEY_ID_LEN` | `10` | `control_plane.contracts.auth` |
 | `KEY_PREFIX` | `derate-` | `control_plane.contracts.auth` |
+| `KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN` | `200` | `control_plane.contracts.auth` |
 | `KEY_REFUSALS_PER_ADDRESS_PER_MIN` | `20` | `control_plane.contracts.auth` |
 | `KEY_SECRET_BYTES` | `32` | `control_plane.contracts.auth` |
 | `LIMIT_TYPES` | `['tokens_total_cycle', 'tokens_input_cycle', 'tokens_output_cycle', 'requests_cycle', 'budget_usd_cycle', 'local_tokens_cycle', 'local_usd_cycle', 'cloud_tokens_cycle', 'cloud_usd_cycle', 'rpm', 'tpm', 'max_concurrent', 'max_output_tokens_per_request', 'max_prompt_tokens_per_request', 'model:<id>:tokens_cycle', 'model:<id>:usd_cycle', 'model:<id>:rpm', 'model:<id>:tpm']` | `control_plane.contracts.auth` |

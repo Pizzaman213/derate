@@ -232,8 +232,9 @@ header and refuses a request that lacks it. Name only a header the edge itself
 overwrites in `DERATE_EDGE_CLIENT_HEADER`: one a client can set would let it
 choose the address every throttle and audit row records. A `/v1` body whose
 `image_url` (or video/audio URL) names a private or LAN host is refused 400,
-and an address that presents 20 bad keys in a minute is answered 429 until
-the minute passes.
+and a key id refused 20 times from one address in a minute, or 200 bad keys
+of any id from it, is answered 429 until the minute passes. A key that
+authenticated from that address inside the minute is still served.
 
 Prefer an `https://` sink with `DERATE_AUDIT_SINK_TOKEN`. The `udp://` and
 `tcp://` syslog transports are unauthenticated: anyone who can reach the

@@ -8,7 +8,9 @@ could route to the coordinator.
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
 from control_plane.gateway.csrf import is_cross_site_write
@@ -126,3 +128,79 @@ def test_allowlisted_cross_origin_reaches_the_route():
         )
     assert reply.status_code == 404
     assert reply.json()["error"]["code"] == "provider_not_found"
+
+
+# ---------------------------------------------------------------------------
+# an Origin urlsplit cannot parse is refused, never a 500
+# ---------------------------------------------------------------------------
+
+_BAD_ORIGINS = ("http://[", "http://]", "https://[x]", "//[")
+
+
+@pytest.mark.parametrize("origin", _BAD_ORIGINS)
+def test_unparseable_origin_is_cross_site(origin):
+    assert is_cross_site_write(
+        method="POST",
+        path="/v1/chat/completions",
+        origin=origin,
+        request_scheme="http",
+        request_netloc="coordinator:8088",
+        allowed_origins=(),
+    )
+
+
+def test_unparseable_origin_named_verbatim_in_the_allowlist_is_allowed():
+    assert not is_cross_site_write(
+        method="POST",
+        path="/api/keys",
+        origin="http://[",
+        request_scheme="http",
+        request_netloc="coordinator:8088",
+        allowed_origins=("http://[",),
+    )
+
+
+@pytest.fixture
+def edge_app(tmp_path, monkeypatch):
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    return create_app(GatewayDeps(), settings=GatewaySettings(edge_port=18095))
+
+
+def _edge(app) -> TestClient:
+    return TestClient(
+        app,
+        base_url="http://testserver:18095",
+        client=("127.0.0.1", 50000),
+        headers={"CF-Connecting-IP": "203.0.113.9"},
+        raise_server_exceptions=False,
+    )
+
+
+@pytest.mark.raw_http
+@pytest.mark.parametrize("origin", _BAD_ORIGINS)
+def test_unparseable_origin_on_the_edge_is_a_403_not_a_500(edge_app, origin):
+    r = _edge(edge_app).post(
+        "/v1/chat/completions", json={"model": "m", "messages": []}, headers={"Origin": origin}
+    )
+    assert (r.status_code, r.json()["error"]["code"]) == (403, "cross_origin_write_refused")
+    assert r.headers.get("x-request-id")
+
+
+@pytest.mark.raw_http
+@pytest.mark.parametrize("origin", _BAD_ORIGINS)
+def test_unparseable_origin_on_the_lan_is_a_403(edge_app, origin):
+    r = TestClient(edge_app, raise_server_exceptions=False).post(
+        "/api/keys", json={}, headers={"Origin": origin}
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.raw_http
+@pytest.mark.parametrize("origin", _BAD_ORIGINS)
+def test_unparseable_origin_on_an_edge_socket_closes_1008(edge_app, origin):
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with _edge(edge_app).websocket_connect(
+            "/v1/realtime?model=m", headers={"Origin": origin}
+        ) as ws:
+            ws.receive_text()
+    assert closed.value.code == 1008

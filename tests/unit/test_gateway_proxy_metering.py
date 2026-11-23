@@ -268,7 +268,10 @@ def test_a_large_transcription_keeps_its_duration_for_per_minute_pricing():
 # -- (c) local streams always ask for usage ------------------------------------
 
 
-def test_a_local_stream_asks_for_usage_whatever_the_client_sent(mocked):
+def test_a_local_stream_asks_for_usage_on_every_chunk_whatever_the_client_sent(mocked):
+    """Cumulative usage on every chunk, so a stream cut before its last frame
+    is charged what it got: frames are not tokens once the engine merges the
+    deltas of a slow reader (or a speculative step) into one."""
     app, upstream, _ = mocked
     _, key = _mint(app)
     body = {"model": LOCAL, "messages": [{"role": "user", "content": "hi"}], "stream": True,
@@ -278,7 +281,19 @@ def test_a_local_stream_asks_for_usage_whatever_the_client_sent(mocked):
                             headers={"Authorization": f"Bearer {key}"})
     assert reply.status_code == 200
     sent = upstream.body()
-    assert sent["stream_options"] == {"include_usage": True, "continuous_usage_stats": False}
+    assert sent["stream_options"] == {"include_usage": True, "continuous_usage_stats": True}
+
+
+def test_a_cut_stream_with_cumulative_usage_is_charged_what_it_received():
+    from control_plane.gateway.proxy import _StreamAccounting
+
+    accounting = _StreamAccounting(0.0)
+    for i in range(1, 6):  # five frames of ten merged tokens each, then the cut
+        frame = {"choices": [{"index": 0, "delta": {"content": "x" * 10}}],
+                 "usage": {"prompt_tokens": 7, "completion_tokens": 10 * i}}
+        accounting.note_chunk(f"data: {json.dumps(frame)}\n\n".encode(), float(i))
+    usage = accounting.finish(6.0)
+    assert (usage.completion_tokens, usage.prompt_tokens, usage.estimated) == (50, 7, False)
 
 
 def test_a_remote_provider_that_supports_stream_usage_is_asked_over_the_client(tmp_path):
@@ -404,16 +419,58 @@ def test_a_body_nobody_started_gives_back_its_kv_and_its_slot_when_reaped(mocked
 
         with pytest.raises(OSError):
             await app(scope, receive, send)
+        # The case this pins: nothing ever started the body. Anything that
+        # iterates it (a BaseHTTPMiddleware did, before round 2) makes the
+        # generator's own `finally` release everything and this test vacuous.
+        assert [e.started for e in proxy._open.values()] == [False]
         assert admission.committed("d-local") > 0
         assert _state(app, key_id, "max_concurrent").used == 1
         for entry in proxy._open.values():
             entry.opened_at -= 60.0
         await proxy._reap()
+        # Inside the loop: asyncio.run's own generator cleanup cannot help.
+        assert admission.committed("d-local") == 0
+        assert _state(app, key_id, "max_concurrent").used == 0
 
     asyncio.run(run())
-    assert admission.committed("d-local") == 0
-    assert _state(app, key_id, "max_concurrent").used == 0
 
+
+def test_a_hang_up_on_an_endless_unstreamed_body_is_delivered(monkeypatch):
+    """The reads of an unstreamed body are shielded so the rest can be read
+    for its usage -- and a fresh shield per chunk swallowed the hang-up for
+    good: anyio retries a cancellation once, and the next shielded scope hid
+    it. An upstream that never finishes held its connection, the key's slot
+    and the KV commitment for as long as it liked."""
+    from control_plane.gateway import proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "USAGE_DRAIN_S", 0.3)
+
+    async def endless():
+        yield b'{"id":"c","object":"chat.completion","choices":[{"index":0,"message":{"content":"'
+        while True:
+            await asyncio.sleep(0.01)
+            yield b"7" * 4096
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request.read()
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=endless())
+
+    deps = build_deps(deployments=FakeDeployments([make_deployment("d-local", LOCAL, backend_url="http://local-backend/v1")]))
+    app = create_app(deps, http_client=httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    rows = _wire(app)
+    key_id, key = _mint(app)
+    with RunningServer(app) as gateway, httpx.Client(timeout=30) as client:
+        body = {"model": LOCAL, "messages": [{"role": "user", "content": "go"}]}
+        with client.stream("POST", f"{gateway.url}/v1/chat/completions", json=body,
+                           headers={"Authorization": f"Bearer {key}"}) as response:
+            assert response.status_code == 200
+            next(response.iter_raw())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not rows.rows:
+            time.sleep(0.05)
+        assert [r.error_class for r in rows.rows] == ["ClientDisconnected"]
+        assert app.state.ctx.admission.committed("d-local") == 0
+        assert _state(app, key_id, "max_concurrent").used == 0
 
 
 def test_a_provider_stream_the_client_walked_away_from_is_billed_to_its_day(tmp_path):

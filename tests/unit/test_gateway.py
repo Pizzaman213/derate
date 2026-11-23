@@ -7458,3 +7458,79 @@ def test_no_cap_leaves_the_remote_admitting():
     )
     assert config.targets[0].admitting is True
     assert reply.status_code == 200, reply.text
+
+
+# ---------------------------------------------------------------------------
+# admission: a batch is many sequences, not one long one (round 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [[[1] * 3000, [1] * 3000], ["x" * 12_000] * 2],
+    ids=["token-ids", "strings"],
+)
+def test_a_completions_batch_is_checked_per_prompt_against_the_context(prompt):
+    """Each prompt in a ``/v1/completions`` batch is its own sequence, and the
+    engine checks the context per prompt. Summing the batch refused an
+    lm-eval-style scoring batch whose every member fits."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(deployments=FakeDeployments([
+            make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url,
+                            context_length=4096)
+        ]))
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/completions",
+                json={"model": "llama-3.3-70b", "prompt": prompt, "max_tokens": 16},
+            )
+    assert reply.status_code == 200, reply.text
+    assert len(backend.requests) == 1
+    assert backend.requests[0]["prompt"] == prompt
+
+
+def test_a_completions_batch_with_one_prompt_over_the_context_is_still_refused():
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        deps = build_deps(deployments=FakeDeployments([
+            make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url,
+                            context_length=4096)
+        ]))
+        with TestClient(create_app(deps)) as client:
+            reply = client.post(
+                "/v1/completions",
+                json={"model": "llama-3.3-70b", "prompt": [[1] * 10, [1] * 4090],
+                      "max_tokens": 16},
+            )
+    assert reply.status_code == 400, reply.text
+    assert reply.json()["error"]["code"] == "context_length_exceeded"
+    assert backend.requests == []
+
+
+def test_n_copies_are_charged_kv_no_further_than_the_deployments_concurrency():
+    """The engine runs at most ``max_concurrent_seqs`` sequences at once, so
+    ``n: 8`` on a 4-sequence deployment never holds more than 4 sequences of
+    cache. Charging all 8 asked for twice the whole budget and answered an
+    idle deployment 429 for ever."""
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        probe = make_deployment("d-a", "llama-3.3-70b", backend_url=running.base_url)
+        app = create_app(build_deps(deployments=FakeDeployments([])))
+        admission = app.state.ctx.admission
+        per_token = admission.kv_bytes_per_token(probe.shape, GatewaySettings().default_kv_dtype)
+        dep = make_deployment(
+            "d-a", "llama-3.3-70b", backend_url=running.base_url,
+            context_length=8192, max_concurrent_seqs=4,
+            kv_cache_bytes=int(per_token * 8192 * 4),
+        )
+        app = create_app(build_deps(deployments=FakeDeployments([dep])))
+        with TestClient(app) as client:
+            reply = client.post(
+                "/v1/chat/completions",
+                json={"model": "llama-3.3-70b", "n": 8, "max_tokens": 4096,
+                      "messages": [{"role": "user", "content": "hello"}]},
+            )
+            assert app.state.ctx.admission.committed("d-a") == 0
+    assert reply.status_code == 200, reply.text
+    assert len(backend.requests) == 1

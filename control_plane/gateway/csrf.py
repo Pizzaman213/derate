@@ -60,7 +60,12 @@ def is_cross_site_write(
         return False
     if origin is None:
         return False
-    parsed = urlsplit(origin)
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        # `http://[` and friends: no parse is no proof of same origin, and an
+        # exception here would be a 500 before any credential is checked.
+        return origin not in allowed_origins
     if parsed.scheme == request_scheme and parsed.netloc == request_netloc:
         return False
     # The same escape hatch CORS already uses for "the UI is served from

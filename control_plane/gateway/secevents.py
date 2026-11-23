@@ -22,7 +22,9 @@ attempt -- the fold key is ``(action, "-", address bucket)`` and the presented
 name moves to ``after["presented"]`` (the one that opened the row). Folding on
 the chosen name let every fresh fake id cost a committed row and an fsync; the
 bucket is :func:`address_bucket`, the same IPv6 /64 the key throttle counts,
-for the same reason. A caller-supplied path is cut to :data:`_DETAIL_MAX`.
+for the same reason. Every other anonymous event folds per bucket too; an
+event with a real actor folds per full address. A caller-supplied path is cut
+to :data:`_DETAIL_MAX`.
 
 The row is written off the request path: :meth:`SecurityEvents.note` puts it
 on a bounded queue and one daemon thread drains it. A full queue drops the
@@ -101,8 +103,9 @@ class SecurityEvents:
         self._window = window_s
         self._clock = clock
         self._lock = threading.Lock()
-        #: (action, actor, address bucket) -> [monotonic time of the last row,
-        #: events folded since, the last full address seen]
+        #: (action, actor, address bucket for actor "-", else the address) ->
+        #: [monotonic time of the last row, events folded since, the last full
+        #: address seen]
         self._seen: dict[tuple[str, str, str], list] = {}
         self._queue: queue.Queue[tuple[tuple, dict]] = queue.Queue(maxsize=queue_max)
         self._dropped = 0
@@ -191,13 +194,17 @@ class SecurityEvents:
                 detail["presented"] = actor
             actor = "-"
         now = self._clock()
-        # Every action folds per address BUCKET -- an IPv6 /64, as the key
+        # An anonymous event (actor "-", which includes every caller-chosen
+        # name above) folds per address BUCKET -- an IPv6 /64, as the key
         # throttle counts it -- or one /64 would open a fresh row, two fsyncs
         # and a permanent audit entry per request by rotating its low bits
         # (a cross-origin refusal did exactly that after KEY_REFUSED was
         # fixed). The row still records the full address that opened it, and
-        # a later count row the last full address seen.
-        key = (action.value, actor, address_bucket(ip))
+        # a later count row the last full address seen. An event with a real
+        # actor (a session moving, an admin's own key) is not a flood one
+        # caller can rotate: it folds per full address, so two machines on
+        # one SLAAC /64 stay two rows with their own user agent and detail.
+        key = (action.value, actor, address_bucket(ip) if actor == "-" else (ip or ""))
         flushed: list[tuple[tuple, dict]] = []
         with self._lock:
             entry = self._seen.get(key)
@@ -260,14 +267,16 @@ class SecurityEvents:
     def _pending_row(k: tuple, entry: list) -> list[tuple[tuple, dict]]:
         """The row for events folded into *entry* since its last row, if any.
         ``ip`` is a real address -- the last one seen -- so a search by
-        address finds it; the bucket it stood for is in ``after``."""
+        address finds it. An anonymous triple's third element is the /64 it
+        stood for, carried in ``after["bucket"]`` when it differs; a named
+        actor's is the address itself, so it carries none."""
         pending, last_ip = int(entry[1]), entry[2]
         if not pending:
             return []
-        action_value, actor, bucket = k
+        action_value, actor, where = k
         after = {"count": pending}
-        if bucket and bucket != last_ip:
-            after["bucket"] = bucket
+        if actor == "-" and where and where != last_ip:
+            after["bucket"] = where
         return [(
             (actor, AuditAction(action_value), "security", ""),
             {"after": after, "ip": last_ip or None, "request_id": None, "user_agent": None},

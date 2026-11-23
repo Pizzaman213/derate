@@ -86,7 +86,7 @@ Exit 1 when the chain is broken. Sources:
 
 | source | from | says |
 |---|---|---|
-| `audit` | `auth.db` `audit` | every admin action, login, logout, lock, and every refusal (`key_refused`, `session_refused`, `setup_refused`, `cross_origin_refused`, `edge_refused` -- an address past 60 edge 404s a minute --, `join_rejected`, at most one row per actor and address a minute, with a count; an IPv6 address folds with the rest of its /64, the row keeping the first full address and a later count row the last, with the /64 in `after.bucket`); `api_write` for any `/api` write without a more specific row |
+| `audit` | `auth.db` `audit` | every admin action, login, logout, lock, and every refusal (`key_refused`, `session_refused`, `setup_refused`, `cross_origin_refused`, `edge_refused` -- an address past 60 a minute of edge 404s, malformed `Host`s or refused sockets --, `join_rejected`, at most one row per actor and address a minute, with a count). An anonymous row (actor `-`) from an IPv6 address folds with the rest of its /64, the row keeping the first full address and a later count row the last, with the /64 in `after.bucket`; a row with a real actor (`session_ip_changed`) folds per full address. `api_write` for any `/api` write without a more specific row |
 | `session` | `auth.db` `sessions` | sessions still live: who, from where, which browser, when they were last used |
 | `login` | `auth.db` `login_attempts` | only the last lockout window (15 minutes) |
 | `v1` | `telemetry/archive.db` `requests` | every `/v1` attempt: key, client address, user agent, model, status, request id; 90 days |

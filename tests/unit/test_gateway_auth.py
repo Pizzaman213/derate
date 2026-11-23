@@ -473,6 +473,22 @@ def test_disable_and_delete_are_audited_and_refuse_the_key(gw):
     assert disabled["actor"] == ADMIN["username"]
 
 
+def test_a_stale_key_does_not_lock_the_other_keys_on_its_address_out(gw):
+    """The refused-key throttle counted every refusal against the address, so
+    one worker still holding a disabled or rotated key locked every other
+    service behind the same NAT or /64 out with 429s. It is the stale key that
+    is throttled now, not its neighbours."""
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
+
+    a, b = gw.mint(name="stale"), gw.mint(name="neighbour")
+    r = gw.client.post(f"/api/keys/{a['key']['key_id']}/disable", json={"reason": "rotated"}, headers=gw.cookie)
+    assert r.status_code == 200, r.text
+    codes = [gw.chat(a["secret_once"]).json()["error"]["code"] for _ in range(KEY_REFUSALS_PER_ADDRESS_PER_MIN + 5)]
+    assert codes == ["api_key_disabled"] * KEY_REFUSALS_PER_ADDRESS_PER_MIN + ["rate_limited"] * 5
+    assert gw.chat(b["secret_once"]).status_code == 200
+    assert gw.chat().status_code == 200
+
+
 def test_adding_an_admin_mints_their_key_and_removing_one_disables_it(gw):
     r = gw.client.post(
         "/api/admins",
