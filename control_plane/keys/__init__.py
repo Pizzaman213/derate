@@ -1,4 +1,4 @@
-"""Orgs and ``drt_`` API keys: :class:`KeyService` implements ``KeyPort``."""
+"""Orgs and ``derate-`` API keys: :class:`KeyService` implements ``KeyPort``."""
 
 from .format import KEY_PATTERN, hash_secret, mint, parse, verify
 from .service import KeyService, validate_limit_name

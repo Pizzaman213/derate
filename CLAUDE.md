@@ -159,9 +159,9 @@ control_plane/planner/     TP/PP/EP from measured facts
 control_plane/deploy/      sparkrun adapter, lifecycle
 control_plane/gateway/     the one HTTP surface: /v1, /api, and the built UI.
                            authz.py is the credential gate: a session on /api,
-                           a drt_ key on /v1, everything else open by name.
+                           a derate- key on /v1, everything else open by name.
 control_plane/auth/        admins (argon2id), sessions, login lockout, audit log
-control_plane/keys/        orgs and drt_ API keys; keys/format.py is the key shape
+control_plane/keys/        orgs and derate- API keys; keys/format.py is the key shape
 control_plane/limits/      30-day cycle counters, rpm/tpm/concurrency windows,
                            per-request caps, local model pricing (limits.db)
 control_plane/providers/   remote upstreams as route targets
@@ -215,8 +215,8 @@ what to change, and rewriting it destroys the thing that made it useful.
 
 **No API key is ever rendered -- with one exception.** `ui/src/api/redact.ts`
 scrubs responses on the way in, by field name for provider keys and by value
-(`drt_<id>_<secret>`) for derate's own. Do not add an inverse. The exception,
-added 2026-11-17: a `drt_` secret is shown exactly once, in
+(`derate-<id>_<secret>`) for derate's own. Do not add an inverse. The exception,
+added 2026-11-17: a `derate-` secret is shown exactly once, in
 `components/RevealModal.tsx`, from the `secret_once` field of exactly three
 responses -- `POST /api/setup/admin`, `POST /api/keys`,
 `POST /api/keys/{id}/rotate` -- which `client.ts` fetches through
@@ -230,6 +230,24 @@ hardcoded there and read from `.omp/work/auth-keys/sets/setup_routes.json` by
 `tests/unit/test_gateway_auth_coverage.py`, which walks every route in
 routes.json and fails on one that answers without credentials. A new route is
 gated by default; opening one is an edit to that list and that set.
+
+**The gate decides on `scope["path"]`, never on `request.url`.** Starlette
+builds `request.url` from the caller's `Host` header and re-parses it, while
+the router dispatches on `scope["path"]`. Until 2026-11-23 the gate read
+`request.url.path`, so `Host: x#` made the path it checked empty and an
+anonymous LAN caller got `GET /api/keys` and every other `/api` handler that
+does not read the session itself; `Host: x/v1` put `/api/*` under the `/v1`
+key gate on the edge. Found by a blue-team review, on `:8088` since the gate
+was written. Now `authz.host_is_valid` refuses any `Host` that is not a plain
+host[:port] -- a bracketed one must be an IPv6 address, or `urlsplit` raises
+and every request is a 500 -- with 400 `invalid_host` before anything builds a
+URL, and every path decision (`_refusal`, `_cross_site_refusal`, the socket
+gates, the `DERATE_API_TOKEN` check) reads `scope["path"]`. A new check that
+reads `request.url` for a decision reintroduces it; `test_gateway_auth_coverage.py`
+walks every `/api` route with forged `Host` values to catch that. And no check
+goes in as `@app.middleware`: one registered after `AuthGuard` runs BEFORE it,
+which is how the API-token 401 answered `/api` on the edge ahead of the 404,
+with no request id, no security headers and no access row.
 
 **Live memory is an optional kwarg that degrades.** The fit gate prefers what a
 node can actually hand out now and falls back to the static ceiling when there
@@ -948,15 +966,22 @@ already do.
   points at `ui/dist` -- read it off `/proc/<pid>/environ` and confirm with
   `curl -s localhost:8088/ | grep -o 'assets/index-[^"]*\.js'`. Equal hashes is
   the only proof.
-- Server-side changes do need a restart, and the process **does not exit on
-  SIGTERM**: `kill PID`, wait for the port to free, then `kill -9` -- always,
-  even when the port frees. SIGTERM closes the listening socket and leaves the
-  process alive on its established connections, and the browser here comes in
-  through VS Code Remote-SSH port forwarding, which keeps its keep-alive
-  connections open: on 2026-11-18 the old process answered the operator's
-  browser for 40 minutes after a "restart", running the old code, while the
-  new one served nothing. `[ -d /proc/PID ]` is the check, not `ss -ltn`. Never
-  `pkill -f control_plane.node` -- the pattern matches the agent's own shell.
+- Server-side changes do need a restart. A process built from PR #29 on exits
+  on SIGTERM: `kill PID`, then wait for `[ -d /proc/PID ]` to go false. It
+  gives open connections `SHUTDOWN_GRACE_S` (30 s) and then runs the
+  gateway's lifespan shutdown, which flushes the audit and security-event rows
+  and closes the stores. A second `kill PID` aborts every open connection and
+  exits at once. `kill -9` only if it is still alive after that: it skips the
+  lifespan shutdown, so the last minute's folded security counts are lost.
+  A process from before PR #29 does **not** exit on SIGTERM. It closes the
+  listening socket and stays alive on its established connections, and the
+  browser here comes in through VS Code Remote-SSH port forwarding, which keeps
+  its keep-alive connections open. On 2026-11-18 the old process answered the
+  operator's browser for 40 minutes after a "restart", running the old code,
+  while the new one served nothing. For one of those, `kill -9` after the port
+  frees, always. Either way `[ -d /proc/PID ]` is the check, not `ss -ltn`.
+  Never `pkill -f control_plane.node`: the pattern matches the agent's own
+  shell.
 - **The tts image is not published, and is faked by a local tag.**
   `deploy/flags.py` defaults the `tts` runtime to
   `ghcr.io/pizzaman213/derate/tts:latest`, which does not exist in the

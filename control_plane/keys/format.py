@@ -1,4 +1,4 @@
-"""The ``drt_<key_id>_<secret>`` key format: mint, parse, hash, verify.
+"""The ``derate-<key_id>_<secret>`` key format: mint, parse, hash, verify.
 
 Pure and standard-library only, so the redactor, the tests and the service
 can all import it without opening a store. The secret is only ever held in
@@ -20,7 +20,7 @@ _KEY_ID_CHARS = frozenset(KEY_ID_ALPHABET)
 
 #: A whole raw key anywhere in a string. ``token_urlsafe(32)`` is 43 chars of
 #: ``[A-Za-z0-9_-]``; 32 is the floor so a truncated paste still matches.
-KEY_PATTERN = r"\bdrt_[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}"
+KEY_PATTERN = r"\bderate-[a-z0-9]{10}_[A-Za-z0-9_\-]{32,}"
 
 
 def new_key_id() -> str:

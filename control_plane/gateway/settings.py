@@ -16,6 +16,23 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_int_or_none(name: str) -> int | None:
+    """A TCP port from the environment: ``None`` when unset or empty, else the
+    integer. Anything that is not an integer in ``1..65535`` raises, the way
+    :func:`trusted_proxies` does -- a mistyped port must stop startup, not
+    bind nothing in silence."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}: {raw!r} is not a port") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name}: {raw!r} is not a port")
+    return port
+
+
 @dataclass
 class GatewaySettings:
     # --- server ---
@@ -57,6 +74,23 @@ class GatewaySettings:
     def trusted_networks(self) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
         """:attr:`trusted_proxies` as networks, parsed once per distinct value."""
         return _networks(self.trusted_proxies)
+
+    # The second socket cloudflared (or any WAN edge) connects to. None (the
+    # default) binds nothing. A connection on this port is an EDGE connection:
+    # /v1/** only, client address from `edge_client_header`, scheme https.
+    # authz.is_edge detects it per connection from scope["server"].
+    edge_port: int | None = field(default_factory=lambda: _env_int_or_none("DERATE_EDGE_PORT"))
+    edge_host: str = field(
+        default_factory=lambda: os.environ.get("DERATE_EDGE_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    )
+    # Lower-cased header name carrying the real client on an edge connection.
+    # Only a header the edge itself sets (Cloudflare overwrites CF-Connecting-IP)
+    # may be named here; a client-controlled one would let a caller pick the
+    # address every refusal window and audit row records.
+    edge_client_header: str = field(
+        default_factory=lambda: os.environ.get("DERATE_EDGE_CLIENT_HEADER", "cf-connecting-ip").strip().lower()
+        or "cf-connecting-ip"
+    )
 
     # The origin browsers reach this gateway at when a TLS terminator fronts
     # it (``https://derate.example``). The gateway itself then sees plaintext

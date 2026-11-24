@@ -281,12 +281,90 @@ Without it a benched target reads as `healthy: false` for a deployment that
 Nothing here answers an anonymous caller any more, except the five calls that
 must work before anyone can sign in (`authz.OPEN_ROUTES`). `authz.AuthGuard`
 decides by path: `/api/**` needs a `derate_session` cookie naming a live admin
-session (401 `session_required`); `/v1/**` needs `Authorization: Bearer drt_...`
+session (401 `session_required`); `/v1/**` needs `Authorization: Bearer derate-...`
 (401 `missing_api_key` / `invalid_api_key` / `api_key_disabled` /
 `api_key_expired`, each with `WWW-Authenticate`). `POST /api/setup/admin` is open
 until the first admin exists and 410 `setup_closed` forever after. A store that
 cannot be opened answers 503 `auth_unavailable` on every gated path. The two
 websocket routes check for themselves, closing 1008 before `accept`.
+
+A key id refused `KEY_REFUSALS_PER_ADDRESS_PER_MIN` (20) times from one
+address inside a minute is answered 429 `rate_limited` (`Retry-After: 60`) on
+`/v1` before the key store is read; so is every key id from an address with
+`KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN` (200) refusals, except one that
+authenticated from there inside the minute (`authz.KeyRefusals`, built in
+`create_app` and shared by the HTTP gate and `require_key` through
+`app.state.key_refusals`). The per-key-id budget is what makes a stale client
+after a rotation its own problem, not every service's behind the same NAT or
+/64; the any-key one stops a guesser rotating key ids. Minting a key
+(`POST /api/keys`), rotating any key and enabling a disabled one ask for
+`current_password` (`auth_api.reauthenticated`), so a stolen session alone
+cannot mint a credential or revive a leaked one. A `/v1` JSON body whose media
+URL names a non-public host is refused 400 `media_url_refused` (`media.py`;
+names are not resolved, so DNS rebinding is out of its reach). A media URL
+longer than 8192 characters, or a host past 253 characters or a label past 63,
+is refused before it is parsed: CPython's IDNA encoder is quadratic in a
+caller-sized host. A `data:` URL is never parsed. An `Origin` that does not
+parse is a cross-site write (403), not an exception in the gate.
+
+**The edge listener.** With `DERATE_EDGE_PORT` set, `node.py` binds a second
+socket on the same uvicorn server (one app, one lifespan); `authz.is_edge`
+tells the two apart from `scope["server"]`. On the edge everything but
+`/v1/**` is 404 `not_found` and every websocket but `/v1/realtime`
+(`authz.EDGE_SOCKET_PATHS`) closes 1008, the client address is
+`DERATE_EDGE_CLIENT_HEADER` (`cf-connecting-ip`) and nothing else --
+`X-Forwarded-For` and `DERATE_TRUSTED_PROXIES` are not consulted -- a request
+without a valid IP there is 400 `edge_client_unknown`, and the scheme is
+https, so HSTS is sent (`headers.py` reads the scheme at response time for
+that reason). On the edge, a path with a `.` or `..` segment is a 404 too:
+uvicorn decodes `%2F`, so `/v1/..%2Fcluster` arrives under `/v1` by prefix and
+the static mount would resolve it to the admin UI. The main port is unchanged.
+
+**Every listener refuses a `Host` that is not a plain host[:port]** (400
+`invalid_host`; a bracketed one must be an IPv6 address), and every path
+decision reads `scope["path"]`, the field the router dispatches on.
+`request.url` is rebuilt from `Host`, so a decision made on it can be steered
+by the caller (see CLAUDE.md). `DERATE_API_TOKEN` (`auth.py`) is checked inside
+`AuthGuard._refusal`, not as `@app.middleware`: a middleware registered after
+the guard runs before it, and that one answered the edge's `/api` with a 401
+instead of its 404. A websocket to a path no route owns is closed 1008 by
+`_UIStatics.__call__`, under the noise budget; `StaticFiles` asserts `http`
+and logged a traceback. A NUL in a static path is a 404, not a 500. uvicorn's
+and the websockets library's own per-socket INFO lines are filtered off
+`uvicorn.error` (`node._quiet_websocket_chatter`): derate's budgeted access
+row already records each socket, and theirs carried an uncapped target.
+
+**Floods are counted, not transcribed.** An address past its refused-key
+budget, or past `authz.NOISE_PER_ADDRESS_PER_MIN` (60) cheap anonymous
+refusals -- edge 404s, cross-site writes, missing sessions, malformed `Host`s,
+the `DERATE_API_TOKEN` 401, sockets to unrouted paths, over HTTP and
+websockets alike (`app.state.noise_refusals`) -- is still answered but writes
+no access line or row per request (`state["quiet"]`). A security event with no
+actor (`"-"`) folds per `secevents.address_bucket` (an IPv6 /64), one with a
+real actor (`session_ip_changed`) per full address, so its row counts them,
+and its WARNING is written once per row, not per event; edge 404s, malformed
+`Host`s and refused sockets past the budget are counted as `edge_refused`. An
+anonymous count row carries the last full address it stood for and the bucket
+in `after`. Every string in a security row's detail is cut to 256 characters,
+paths in access lines to 512. `SecurityEvents.close` writes the counts no row
+has reported yet at shutdown, before the stores close.
+
+**Parsing is bounded before any limit runs.** One key may have
+`MAX_BODIES_IN_FLIGHT_PER_KEY` (4) request bodies being read or parsed at once,
+and its rpm's worth read per `BODY_WINDOW_S` (60 s), whatever becomes of them
+(`openai_api._body_window`; the effective rpm, a cycle raise included, is read
+only when the cheap figure would refuse). A body may carry `MAX_JSON_VALUES`
+(2^20) JSON values, counted at C speed before `json.loads`, and at most
+`MAX_MESSAGES` messages and `MAX_CONTENT_PARTS` content parts (10,000 each),
+because every walk before forwarding is Python on the event loop; an upload at
+most `MAX_FORM_PARTS` (64) parts. `stream` must be a JSON boolean: the engine
+reads `"false"` as false and answers in JSON, which a truthy check metered as
+an SSE stream with no frames. Admission and the limits share one prompt
+estimator (`limits.service.estimate_prompt_tokens`); admission checks a
+`/v1/completions` batch per prompt against the context and charges KV for at
+most `max_concurrent_seqs` copies. An output ceiling of `-1` means none and is
+taken out of the forwarded body (`NO_OUTPUT_CEILING`); any other below one is
+a 400, since llama-server reads `n_predict: -1` beside a cap as unbounded.
 
 The stores (`auth.db`, `keys.db`, `limits.db`) open on first use, so building an
 app touches no disk for them. The middleware is registered before `_csrf_guard`
@@ -305,9 +383,26 @@ ever reaches the browser. `/api/chat/models` and `/api/chat/voices` mirror
 once: the attempt that answered counts its usage from its telemetry row (in
 `_on_record`, which also prices it and appends to the attempt chain), and
 whatever is still held is released when the response is complete -- at once,
-or at the end of a stream's body. The client's `Authorization` and `Cookie` are
-never forwarded upstream; a REMOTE target gets its provider's key and a LOCAL
-one gets none.
+or at the end of a stream's body. An upstream 4xx counts as answered (zero
+tokens), so rpm and the request cycle see a provider's refusals too. An
+unstreamed body is generated in full before its first byte and its usage block
+is last, so its upstream reads are shielded (`proxy._next_chunk`) and the rest
+is read for its usage (`_drain_for_usage`, at most `USAGE_DRAIN_S` and
+`USAGE_DRAIN_MAX_BYTES`) rather than settled at the first chunk's size / 4; a
+cancellation checkpoint before each shielded read is what delivers the
+client's hang-up at all -- a fresh shield per chunk hid it for good. A local
+vLLM or SGLang stream is asked for `continuous_usage_stats`, so a stream cut
+before its last frame is charged its last cumulative figure, not one token per
+frame. A remote reservation is priced at the dearest known rates of the name's
+remote targets, and an OpenRouter answer's own `usage.cost` is what the key is
+charged (METERED). An answer whose body nobody started, direct or provider, is
+settled by the janitor (`_OpenUpstream.abandon`), releasing its KV commitment
+and its reservation. A per-minute-priced transcription model answers only
+unstreamed `json` and `verbose_json`, the formats that carry `duration` or
+`usage.seconds`; asked for another, it steps aside for the name's other
+targets, and the 400 is the answer only if none serves it. The client's
+`Authorization` and `Cookie` are never forwarded upstream; a REMOTE target gets
+its provider's key and a LOCAL one gets none.
 
 ---
 
@@ -331,7 +426,7 @@ decorators.
 | `stubs.py` | 508 | the day-0 ports that serve the whole surface from fixtures |
 | `router.py` | 470 | the target index, policy resolution (and a key's override), per-name route limits, weight refresh, `parkable` |
 | `routing_store.py` | 90 | `routing.json`: policy overrides and route limits, so a restart keeps them; a bad file is an empty state |
-| `authz.py` | 399 | the credential gate: session on `/api`, `drt_` key on `/v1`, lazy auth stores, fail closed |
+| `authz.py` | 399 | the credential gate: session on `/api`, `derate-` key on `/v1`, lazy auth stores, fail closed |
 | `admission.py` | 350 | the per-request KV commitment, and the three block reasons |
 | `restart.py` | 290 | relaunching a deployment that crashed, three tries, backed off |
 | `policies.py` | 286 | the seven selectors and `hedge_candidate`. Frozen |

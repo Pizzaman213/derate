@@ -12,10 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from control_plane.contracts import Deployment, DeploymentState, ModelShape
+from control_plane.limits.service import (
+    completions_requested,
+    largest_batch_prompt,
+    requested_output,
+)
+from control_plane.limits.service import estimate_prompt_tokens as limits_estimate
 
 from .settings import GatewaySettings
 
@@ -219,60 +224,23 @@ class AdmissionController:
         return kv_bytes_per_token_fallback(shape, kv_dtype)
 
     def estimate_prompt_tokens(self, body: dict) -> int:
-        """Character-based estimate. The gateway has no tokenizer and loading
-        one per model would cost more than the estimate is worth.
-        """
-        cpt = max(1.0, self._settings.chars_per_token)
-        chars = 0
-        overhead = 0
-
-        messages = body.get("messages")
-        if isinstance(messages, list):
-            for message in messages:
-                overhead += self._settings.tokens_per_message_overhead
-                content = message.get("content") if isinstance(message, dict) else None
-                if isinstance(content, str):
-                    chars += len(content)
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and isinstance(part.get("text"), str):
-                            chars += len(part["text"])
-                elif content is not None:
-                    chars += len(str(content))
-
-        prompt = body.get("prompt")
-        if isinstance(prompt, str):
-            chars += len(prompt)
-        elif isinstance(prompt, list):
-            for item in prompt:
-                chars += len(item) if isinstance(item, str) else 0
-
-        inputs = body.get("input")
-        if isinstance(inputs, str):
-            chars += len(inputs)
-        elif isinstance(inputs, list):
-            for item in inputs:
-                chars += len(item) if isinstance(item, str) else 0
-
-        return int(chars / cpt) + overhead
+        """`limits.service.estimate_prompt_tokens` at this gateway's settings:
+        one formula, so the KV commitment, the prompt cap and the figure a
+        request settles at when no usage arrives cannot disagree."""
+        return limits_estimate(
+            body,
+            chars_per_token=self._settings.chars_per_token,
+            per_message=self._settings.tokens_per_message_overhead,
+        )
 
     @staticmethod
     def explicit_max_tokens(body: dict) -> int | None:
-        """The largest explicit output ceiling, or None. ``ValueError`` for a
-        ceiling that is not an integer: the engine coerces ``"100000"``, so
-        skipping it would admit a generation the KV budget never counted."""
-        best: int | None = None
-        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
-            value = body.get(key)
-            if value is None:
-                continue
-            if isinstance(value, float) and value.is_integer():
-                value = int(value)
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(f"{key} must be an integer, not {value!r}")
-            if value > 0 and (best is None or value > best):
-                best = value
-        return best
+        """The largest explicit output ceiling per completion, or None --
+        every spelling the engines read, ``n_predict`` included. ``-1`` is
+        "no ceiling" and reads as None. ``ValueError`` for any other value that
+        is not a positive integer: the engine coerces ``"100000"``."""
+        asked = requested_output(body)
+        return int(asked[1]) if asked is not None else None
 
     def kv_budget(self, deployment: Deployment) -> int:
         breakdown = getattr(deployment.fit, "breakdown", None)
@@ -297,16 +265,27 @@ class AdmissionController:
         prompt_tokens = self.estimate_prompt_tokens(body)
         try:
             explicit_max = self.explicit_max_tokens(body)
+            # n / best_of / a prompt batch: each copy generates its own tokens.
+            copies = completions_requested(body)
         except ValueError as exc:
             return AdmissionDecision(
                 ok=False, status=400, code="invalid_request", message=str(exc),
             )
         context_limit = deployment.context_length
+        # A /v1/completions batch is one sequence per prompt, and the engine
+        # checks the context per prompt: the context test reads the longest
+        # member, never the batch's sum, which refused every lm-eval-style
+        # scoring batch whose members each fit.
+        longest = largest_batch_prompt(body)
+        sequence_tokens = (
+            prompt_tokens if longest is None
+            else self.estimate_prompt_tokens({**body, "prompt": longest})
+        )
 
         # 400: a single request that cannot fit the context, whatever the load.
         # Only explicit numbers are used here so a client is never refused over
         # a generation length it did not ask for.
-        hard_tokens = prompt_tokens + (explicit_max or 0)
+        hard_tokens = sequence_tokens + (explicit_max or 0)
         if context_limit and hard_tokens > context_limit:
             return AdmissionDecision(
                 ok=False,
@@ -314,7 +293,7 @@ class AdmissionController:
                 code="context_length_exceeded",
                 message=(
                     f"Request needs about {hard_tokens} tokens "
-                    f"({prompt_tokens} prompt + {explicit_max or 0} completion) "
+                    f"({sequence_tokens} prompt + {explicit_max or 0} completion) "
                     f"but deployment '{deployment.served_name}' is configured for "
                     f"a context length of {context_limit}."
                 ),
@@ -322,7 +301,19 @@ class AdmissionController:
                 requested_tokens=hard_tokens,
             )
 
-        requested = prompt_tokens + (explicit_max or self._settings.assumed_max_tokens)
+        # The engine runs at most max_concurrent_seqs sequences at once, so
+        # n / best_of / batch copies past that never hold cache together.
+        # Charging every copy asked an idle deployment for more than its whole
+        # budget and answered 429 for ever, however often the client retried.
+        per_copy = explicit_max or self._settings.assumed_max_tokens
+        live = copies
+        if deployment.max_concurrent_seqs > 0:
+            live = min(copies, deployment.max_concurrent_seqs)
+        requested = prompt_tokens + per_copy * live
+        if longest is not None:
+            # A batch's members are separate sequences too: no more than
+            # `live` of them, each at most the longest, are resident at once.
+            requested = min(requested, (sequence_tokens + per_copy) * live)
         per_token = self.kv_bytes_per_token(
             deployment.shape, self._settings.default_kv_dtype
         )

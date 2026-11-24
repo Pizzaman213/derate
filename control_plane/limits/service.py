@@ -13,7 +13,9 @@ Three kinds of state, and where each lives:
 
 * cycle counters -- ``limits.db``, one row per (scope, id, cycle_start,
   metric), written once per settled request in one transaction;
-* rpm/tpm windows -- in memory, a sliding 60 s deque per (scope, id[, model]);
+* rpm/tpm windows -- in memory, a sliding 60 s deque per (scope, id[, model]).
+  A key with no ``rpm`` is held to ``DEFAULT_KEY_RPM`` and one with no
+  ``max_concurrent`` to ``DEFAULT_KEY_MAX_CONCURRENT``;
 * in-flight reservations -- in memory, which is also ``max_concurrent``.
 
 The in-memory two do not survive a restart, and do not need to: a window is
@@ -23,6 +25,7 @@ was serving it.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import secrets
@@ -35,6 +38,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from control_plane.contracts.auth import (
+    DEFAULT_KEY_MAX_CONCURRENT,
+    DEFAULT_KEY_RPM,
     NEAR_LIMIT_FRACTION,
     ApiKey,
     AuthErrorCode,
@@ -81,14 +86,20 @@ DEFAULT_OUTPUT_ESTIMATE = 256
 CHARS_PER_TOKEN = 4.0
 TOKENS_PER_MESSAGE_OVERHEAD = 4
 #: Every field a client may ask for an output ceiling in: Chat Completions
-#: (old and new spelling) and Responses.
-MAX_OUTPUT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+#: (old and new spelling), Responses, and llama.cpp's ``n_predict``, which
+#: llama-server honours over ``max_tokens`` -- unlisted, it was an uncapped
+#: output ceiling.
+MAX_OUTPUT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "n_predict")
 #: What one image part is assumed to cost in prompt tokens. Its bytes are a
 #: URL or base64 and say nothing about the vision encoder's tile count, and
 #: counting it as zero let an image-heavy prompt past every prompt cap.
 IMAGE_TOKENS_ESTIMATE = 1000
 #: Content-part types that carry an image: Chat Completions and Responses.
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
+#: Audio and video parts are tokens the template renders too; priced at the
+#: image estimate, which is the only per-part figure this module has.
+_MEDIA_PART_TYPES = _IMAGE_PART_TYPES | {"input_audio", "audio_url", "video_url", "video"}
+_MEDIA_PART_KEYS = ("image_url", "input_audio", "audio_url", "video_url")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cycle_counters (
@@ -129,61 +140,131 @@ _ORDER = {base: i for i, base in enumerate(KIND)}
 _REQUEST_COUNTED = frozenset({"requests_cycle", "rpm", "model:rpm", "max_concurrent"})
 _LOCAL = TargetKind.LOCAL.value
 _REMOTE = TargetKind.REMOTE.value
+#: Dollar limits of either target kind: what a LOCAL admission of an unpriced
+#: model drops and a REMOTE landing must check again.
+_SHARED_USD = USD_BASES - LOCAL_ONLY - CLOUD_ONLY
 
 
-def estimate_prompt_tokens(body: dict) -> int:
-    """``gateway/admission.py:221`` ``AdmissionController.estimate_prompt_tokens``.
+def estimate_prompt_tokens(
+    body: dict,
+    *,
+    chars_per_token: float = CHARS_PER_TOKEN,
+    per_message: int = TOKENS_PER_MESSAGE_OVERHEAD,
+) -> int:
+    """The one character-based prompt estimate: the prompt cap, the reservation
+    and admission's KV arithmetic all read it (admission passes its own
+    ``chars_per_token`` / ``tokens_per_message_overhead`` settings). There is
+    no tokenizer here; loading one per model would cost more than it is worth.
 
-    Reimplemented rather than called because it is an instance method that
-    reads ``self._settings``; this is that formula with the settings'
-    defaults (``CHARS_PER_TOKEN``, ``TOKENS_PER_MESSAGE_OVERHEAD``), so the
-    prompt cap and admission agree on what a prompt costs -- plus
-    ``IMAGE_TOKENS_ESTIMATE`` per image part, which admission's KV arithmetic
-    does not need and a prompt cap does.
+    Counts what the chat template renders, not only ``content``: token-id
+    prompts, ``tools``/``functions``/``response_format``/``documents``, an
+    assistant turn's ``tool_calls`` arguments and ``reasoning``, and
+    ``IMAGE_TOKENS_ESTIMATE`` per image, audio or video part. Admission used to
+    keep a second formula that counted strings only, and settled a 30k-token
+    token-id prompt as zero.
+
+    Every JSON-valued field is measured by ONE ``json.dumps`` over a list of
+    them: a call per message built a fresh encoder each time, and a body of
+    349k ``tool_calls`` turns held the event loop for seconds per estimate.
     """
-    cpt = max(1.0, CHARS_PER_TOKEN)
+    cpt = max(1.0, chars_per_token)
     chars = 0
     overhead = 0
     images = 0
+    tokens = 0
+    rendered: list = []
 
     messages = body.get("messages")
     if isinstance(messages, list):
         for message in messages:
-            overhead += TOKENS_PER_MESSAGE_OVERHEAD
-            content = message.get("content") if isinstance(message, dict) else None
+            overhead += per_message
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
             if isinstance(content, str):
                 chars += len(content)
             elif isinstance(content, list):
                 for part in content:
                     if not isinstance(part, dict):
                         continue
+                    kind = part.get("type")
                     if isinstance(part.get("text"), str):
                         chars += len(part["text"])
-                    elif part.get("type") in _IMAGE_PART_TYPES or "image_url" in part:
+                    elif (isinstance(kind, str) and kind in _MEDIA_PART_TYPES) or any(
+                        key in part for key in _MEDIA_PART_KEYS
+                    ):
                         images += 1
             elif content is not None:
                 chars += len(str(content))
+            # An assistant turn's calls and reasoning are rendered back into
+            # the prompt.
+            for name in ("tool_calls", "function_call"):
+                if message.get(name) is not None:
+                    rendered.append(message[name])
+            for name in ("reasoning", "reasoning_content"):
+                if isinstance(message.get(name), str):
+                    chars += len(message[name])
 
     prompt = body.get("prompt")
     if isinstance(prompt, str):
         chars += len(prompt)
     elif isinstance(prompt, list):
-        for item in prompt:
-            chars += len(item) if isinstance(item, str) else 0
+        chars, more = _count_list(prompt, chars)
+        tokens += more
 
     inputs = body.get("input")
     if isinstance(inputs, str):
         chars += len(inputs)
     elif isinstance(inputs, list):
-        for item in inputs:
-            chars += len(item) if isinstance(item, str) else 0
+        chars, more = _count_list(inputs, chars)
+        tokens += more
 
-    return int(chars / cpt) + overhead + images * IMAGE_TOKENS_ESTIMATE
+    # Tool schemas, a JSON-schema response_format and RAG documents are
+    # rendered into the prompt by the chat template, and can be the bulk of it.
+    for name in ("tools", "functions", "response_format", "documents"):
+        value = body.get(name)
+        if value is not None:
+            rendered.append(value)
+    if rendered:
+        # `[a, b]` is each value's own text plus the brackets and one ", "
+        # between neighbours; take those back off so the figure is the sum.
+        chars += len(json.dumps(rendered, default=str)) - 2 * len(rendered)
+
+    return int(chars / cpt) + tokens + overhead + images * IMAGE_TOKENS_ESTIMATE
+
+
+def _is_token_list(item: object) -> bool:
+    return (
+        isinstance(item, list)
+        and bool(item)
+        and all(isinstance(t, int) and not isinstance(t, bool) for t in item)
+    )
+
+
+def _count_list(items: list, chars: int) -> tuple[int, int]:
+    """``(chars, tokens)`` of a ``prompt``/``input`` list: strings are
+    characters, a list of token ids is already tokens, and a list of such lists
+    (a pre-tokenised batch) is the sum of their lengths. Counting ids as zero
+    let any prompt past ``max_prompt_tokens_per_request``."""
+    if _is_token_list(items):
+        return chars, len(items)
+    tokens = 0
+    for item in items:
+        if isinstance(item, str):
+            chars += len(item)
+        elif _is_token_list(item):
+            tokens += len(item)
+    return chars, tokens
 
 
 #: Largest output ceiling a request may name. Anything above is not a budget
 #: but an overflow waiting to happen (``int(inf)`` is a 500).
 MAX_OUTPUT_CEILING = 2**31
+#: The ceiling that means "none": LM Studio's and llama-server's spelling of
+#: unbounded. Read as absent, so the key's cap (if any) is what applies; the
+#: gateway strips the field before forwarding, because llama-server would
+#: otherwise honour it over the injected cap.
+NO_OUTPUT_CEILING = -1
 
 
 def requested_output(body: dict) -> tuple[str, float] | None:
@@ -191,8 +272,9 @@ def requested_output(body: dict) -> tuple[str, float] | None:
 
     ``ValueError`` when a ceiling is not an integer (a string such as
     ``"100000"`` is coerced by the engine and would otherwise bypass the cap),
-    is not finite, or exceeds :data:`MAX_OUTPUT_CEILING` -- JSON's ``1e999``
-    parses to ``inf``.
+    is not finite, exceeds :data:`MAX_OUTPUT_CEILING` -- JSON's ``1e999``
+    parses to ``inf`` -- or is below one. :data:`NO_OUTPUT_CEILING` is the one
+    exception and is skipped, exactly like an absent field.
     """
     best: tuple[str, float] | None = None
     for name in MAX_OUTPUT_FIELDS:
@@ -213,7 +295,11 @@ def requested_output(body: dict) -> tuple[str, float] | None:
                 f"{name} must be a finite number no greater than {MAX_OUTPUT_CEILING}, "
                 f"not {value!r}"
             )
-        if value > 0 and (best is None or value > best[1]):
+        if value == NO_OUTPUT_CEILING:
+            continue
+        if value < 1:
+            raise ValueError(f"{name} must be a positive integer, not {value!r}")
+        if best is None or value > best[1]:
             best = (name, value)
     return best
 
@@ -225,18 +311,54 @@ MAX_COMPLETIONS = 128
 
 def completions_requested(body: dict) -> int:
     """How many completions one request generates: ``n`` returned, or
-    ``best_of`` generated server-side and billed even when not returned.
-    Every output ceiling is per completion, so a request's output is that
-    ceiling times this. ``ValueError`` above :data:`MAX_COMPLETIONS`."""
+    ``best_of`` generated server-side and billed even when not returned, times
+    the number of prompts in a ``/v1/completions`` batch (a list of strings or
+    of token lists generates one set per prompt). Every output ceiling is per
+    completion, so a request's output is that ceiling times this.
+
+    ``ValueError`` above :data:`MAX_COMPLETIONS` or for a value that is not an
+    integer: the engines coerce ``"128"`` and ``128.0`` to 128, so skipping
+    them counted one copy where the engine generated 128."""
     copies = 1
     for name in ("n", "best_of"):
         value = body.get(name)
-        if isinstance(value, bool) or not isinstance(value, int):
+        if value is None:
             continue
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer, not {value!r}")
         if value > MAX_COMPLETIONS:
             raise ValueError(f"{name} must be an integer no greater than {MAX_COMPLETIONS}")
         copies = max(copies, value)
+    prompt = body.get("prompt")
+    if isinstance(prompt, list) and not _is_token_list(prompt):
+        batch = sum(1 for p in prompt if isinstance(p, str) or _is_token_list(p))
+        copies *= max(1, batch)
     return copies
+
+
+def largest_batch_prompt(body: dict) -> str | list[int] | None:
+    """The longest member of a ``/v1/completions`` batch (a list of strings
+    or of token lists), or None when ``prompt`` is not a batch. Each member is
+    its own sequence and the engine checks the context per prompt, so this,
+    not the batch's sum, is what one sequence holds. A string is weighed at
+    :data:`CHARS_PER_TOKEN` against a token list's length."""
+    prompt = body.get("prompt")
+    if not isinstance(prompt, list) or _is_token_list(prompt):
+        return None
+    best: str | list[int] | None = None
+    weight = -1.0
+    for item in prompt:
+        if isinstance(item, str):
+            size = len(item) / CHARS_PER_TOKEN
+        elif _is_token_list(item):
+            size = float(len(item))
+        else:
+            continue
+        if size > weight:
+            best, weight = item, size
+    return best
 
 
 def _limit_value(value: object) -> float:
@@ -464,6 +586,15 @@ class LimitService:
         model: str | None,
         now: float,
     ) -> _Scope:
+        # One place, so check_and_reserve, settle, states() and raise all see
+        # the same limit: a key that names no rpm is held to DEFAULT_KEY_RPM
+        # rather than being unlimited. An operator who wants more sets more.
+        if scope is LimitScope.KEY and "rpm" not in (limits or {}):
+            limits = {**(limits or {}), "rpm": DEFAULT_KEY_RPM}
+        # Same for concurrency: one key could otherwise hold every connection
+        # a backend's pool has.
+        if scope is LimitScope.KEY and "max_concurrent" not in (limits or {}):
+            limits = {**(limits or {}), "max_concurrent": DEFAULT_KEY_MAX_CONCURRENT}
         configured = self._configured(limits, model)
         start, resets_at = cycle_bounds(anchor, now)
         overrides: dict[str, float] = {}
@@ -706,6 +837,7 @@ class LimitService:
         body: dict,
         now: float | None = None,
         route_limits: dict | None = None,
+        remote_rates: tuple[float, float] | None = None,
     ) -> tuple[LimitDecision, Reservation | None]:
         """Refuse with the first limit that stops this request, or reserve it.
 
@@ -725,6 +857,12 @@ class LimitService:
         (``RoutingConfig.limits``), checked after the org as a third scope,
         ``route:<model>``. It has no cycle and no overrides: its windows are
         the only state it keeps.
+
+        ``remote_rates`` is the REMOTE target's ``(input, output)`` USD per
+        million tokens. With it a REMOTE reservation is priced, so what is in
+        flight counts as live dollars against every dollar limit; without it a
+        remote estimate books $0 and every concurrent request sees the same
+        headroom. It never prices a LOCAL request -- the local price row does.
         """
         now = self._now(now)
         key, org = principal.key, principal.org
@@ -775,14 +913,17 @@ class LimitService:
             )
             est_usd, spends_usd = 0.0, True
             if any(lim.base in USD_BASES for sc in scopes for lim in sc.limits):
+                rate_in, rate_out = (
+                    remote_rates if kind == _REMOTE and remote_rates is not None else (None, None)
+                )
                 usd, basis = self._pricing.cost(
                     model=model,
                     target_kind=kind or "",
                     prompt_tokens=est_prompt,
                     completion_tokens=est_output,
                     metered_usd=None,
-                    provider_in_per_mtok=None,
-                    provider_out_per_mtok=None,
+                    provider_in_per_mtok=rate_in,
+                    provider_out_per_mtok=rate_out,
                 )
                 priced = usd is not None and basis != CostBasis.UNPRICED
                 est_usd = usd if priced else 0.0
@@ -968,6 +1109,11 @@ class LimitService:
         so neither family is skipped for a name that has both (finding L9).
         This reservation's own estimate was booked under the other kind, so
         it counts nothing against the limits checked here.
+
+        Admitted LOCAL at no dollar estimate (an unpriced model, so the LOCAL
+        admission dropped every dollar limit) and landing REMOTE -- a fallback
+        whose name also has a provider target -- re-checks ``budget_usd_cycle``
+        and ``model:usd_cycle`` too: a remote target can spend a dollar.
         """
         now = self._now(now)
         kind = _kind(target_kind)
@@ -975,7 +1121,12 @@ class LimitService:
             held = self._held.get(reservation.reservation_id)
             if held is None or kind is None or kind == held.kind:
                 return LimitDecision(allowed=True)
-            only = LOCAL_ONLY if kind == _LOCAL else CLOUD_ONLY
+            if kind == _LOCAL:
+                only = LOCAL_ONLY
+            elif held.kind == _LOCAL and not held.estimate.get("usd"):
+                only = CLOUD_ONLY | _SHARED_USD
+            else:
+                only = CLOUD_ONLY
             key = self._keys.get_key(reservation.key_id)
             org = self._keys.get_org(reservation.org_id)
             subjects = (

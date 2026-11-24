@@ -42,6 +42,16 @@ from control_plane.auth import store as auth_store
 from control_plane.contracts.auth import KEY_PREFIX
 from control_plane.redaction import printable
 
+#: The key prefix on rows written before 2026-11-22; never minted, never
+#: parsed as a credential. Read wherever a stored actor or id is read.
+LEGACY_KEY_PREFIX = "drt_"
+_KEY_PREFIXES = (KEY_PREFIX, LEGACY_KEY_PREFIX)
+
+
+def _key_prefix_of(value: str) -> str | None:
+    """Which of the two key prefixes *value* starts with, or None."""
+    return next((p for p in _KEY_PREFIXES if value.startswith(p)), None)
+
 
 @dataclass
 class Event:
@@ -108,11 +118,13 @@ def parse_time(value: str) -> float:
 
 
 def key_id_of(value: str) -> str:
-    """``drt_<id>``, ``drt_<id>_<secret>`` or a bare id -> the bare id. Never
-    keeps a secret: only the id segment is returned."""
+    """``derate-<id>``, ``derate-<id>_<secret>``, the legacy ``drt_`` forms or
+    a bare id -> the bare id. Never keeps a secret: only the id segment is
+    returned."""
     value = value.strip()
-    if value.startswith(KEY_PREFIX):
-        value = value[len(KEY_PREFIX):]
+    prefix = _key_prefix_of(value)
+    if prefix:
+        value = value[len(prefix):]
     return value.split("_", 1)[0]
 
 
@@ -137,16 +149,16 @@ def _audit_keys(row: sqlite3.Row, have: set[str]) -> tuple[str, ...]:
     if row["target_kind"] == "key":
         keys.append(row["target_id"])
     actor = row["actor"] or ""
-    if actor.startswith(KEY_PREFIX):
+    if _key_prefix_of(actor):
         keys.append(key_id_of(actor))
     # A refused key is folded per address; the id it presented is in ``after``.
     raw = _get(row, "after_json", have)
-    if raw and KEY_PREFIX in raw:
+    if raw and any(p in raw for p in _KEY_PREFIXES):
         try:
             presented = json.loads(raw).get("presented")
         except (ValueError, AttributeError):
             presented = None
-        if isinstance(presented, str) and presented.startswith(KEY_PREFIX):
+        if isinstance(presented, str) and _key_prefix_of(presented):
             keys.append(key_id_of(presented))
     return tuple(keys)
 
@@ -265,8 +277,8 @@ def access_events(conn: sqlite3.Connection) -> Iterator[Event]:
         actor = keys = None
         if who.startswith("session:"):
             actor = who[len("session:"):]
-        elif who.startswith(f"key:{KEY_PREFIX}"):
-            keys = (who[len(f"key:{KEY_PREFIX}"):],)
+        elif who.startswith("key:") and _key_prefix_of(who[len("key:"):]):
+            keys = (key_id_of(who[len("key:"):]),)
         target = r["path"] or ""
         if r["query"]:
             target += "?" + r["query"]
@@ -345,7 +357,7 @@ def mirror_events(lines: Iterable[dict], db_hashes: dict[int, str | None]) -> It
         reason = "missing from auth.db" if row_id not in db_hashes else "differs from auth.db"
         actor = line.get("actor") or "-"
         keys = (line.get("target_id"),) if line.get("target_kind") == "key" else ()
-        if actor.startswith(KEY_PREFIX):
+        if _key_prefix_of(actor):
             keys = (*keys, key_id_of(actor))
         yield Event(
             ts=float(line.get("ts") or 0),
@@ -493,7 +505,7 @@ def main(argv: list[str] | None = None, out=None) -> int:
     parser.add_argument("--since", required=True, help="RFC 3339 or epoch seconds")
     parser.add_argument("--until", default=None, help="RFC 3339 or epoch seconds (exclusive)")
     parser.add_argument("--ip", default=None)
-    parser.add_argument("--key", default=None, help="drt_<id> or the bare key id")
+    parser.add_argument("--key", default=None, help="derate-<id>, drt_<id> or the bare key id")
     parser.add_argument("--actor", default=None, help="admin username, or the key name on /v1 rows")
     parser.add_argument("--request-id", default=None)
     parser.add_argument("--data-dir", type=Path, default=None, help="default: the data dir this process would use")

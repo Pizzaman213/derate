@@ -3027,6 +3027,10 @@ export type AuthErrorCode =
   | 'allowlist_exceeds_org'
   | 'model_not_allowed'
   | 'setup_local_only'
+  | 'not_found'
+  | 'edge_client_unknown'
+  | 'media_url_refused'
+  | 'invalid_host'
 export type AuditAction =
   | 'login'
   | 'login_failed'
@@ -3076,6 +3080,7 @@ export type AuditAction =
   | 'setup_refused'
   | 'join_rejected'
   | 'cross_origin_refused'
+  | 'edge_refused'
   | 'session_ip_changed'
   | 'audit_chain_broken'
   | 'agent_refused'
@@ -3213,6 +3218,8 @@ export interface KeyCreate {
   routing_policy?: RoutingPolicy | null
   notes?: string
   cloud_fallback_local_model?: string | null
+  /** The signed-in admin's password: minting a key re-authenticates. */
+  current_password: string
 }
 
 export type KeyPatch = Partial<

@@ -8,6 +8,7 @@ import os
 import uvicorn
 
 from control_plane import logfiles
+from control_plane.redaction import Redactor, SecretRedactingFilter
 
 from .app import create_app
 from .settings import GatewaySettings, uvicorn_proxy_kwargs
@@ -20,6 +21,7 @@ def main() -> None:
     )
     for handler in logging.getLogger().handlers:
         handler.setFormatter(logfiles.UTCFormatter(logfiles.LOG_FORMAT))
+        handler.addFilter(SecretRedactingFilter(Redactor()))
     # basicConfig sets the root level, but the journal handler is attached
     # during app startup and wants records the root logger would otherwise
     # filter out before any handler sees them.

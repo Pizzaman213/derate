@@ -156,7 +156,8 @@ class AccessRecord:
     The read side of the record: who asked for what, from which address and
     port, and what they were told. ``query`` is the first 200 characters of
     the query string after the gateway's Redactor; ``who`` is
-    ``session:<user>``, ``key:drt_<id>`` or ``-``.
+    ``session:<user>``, ``key:derate-<id>`` (``key:drt_<id>`` before
+    2026-11-22) or ``-``.
     """
 
     request_id: str

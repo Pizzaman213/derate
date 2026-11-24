@@ -163,11 +163,12 @@ const ACTION_ORDER: Record<AuditAction, number> = {
   setup_refused: 45,
   join_rejected: 46,
   cross_origin_refused: 47,
-  session_ip_changed: 48,
-  audit_chain_broken: 49,
-  agent_refused: 50,
-  cluster_token_rotated: 51,
-  node_runtime_model_changed: 52,
+  edge_refused: 48,
+  session_ip_changed: 49,
+  audit_chain_broken: 50,
+  agent_refused: 51,
+  cluster_token_rotated: 52,
+  node_runtime_model_changed: 53,
 }
 export const AUDIT_ACTIONS: readonly AuditAction[] = (Object.keys(ACTION_ORDER) as AuditAction[]).sort(
   (a, b) => ACTION_ORDER[a] - ACTION_ORDER[b],

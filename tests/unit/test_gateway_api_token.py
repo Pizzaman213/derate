@@ -123,3 +123,54 @@ def test_matching_bearer_token_reaches_the_route():
             "/api/providers", headers={**session, "Authorization": "Bearer secret"}
         )
     assert reply.status_code == 200
+
+
+@pytest.mark.raw_http
+def test_the_edge_answers_api_with_404_even_when_a_token_is_set():
+    """The token check was outer middleware, so it ran before the edge's 404
+    and told a WAN caller /api exists -- unlogged and unthrottled."""
+    settings = GatewaySettings(api_token="secret", edge_port=18096)
+    app = create_app(GatewayDeps(), settings=settings)
+    edge = TestClient(app, base_url="http://testserver:18096", client=("127.0.0.1", 50000))
+    reply = edge.get("/api/providers", headers={"CF-Connecting-IP": "203.0.113.9"})
+    assert (reply.status_code, reply.json()["error"]["code"]) == (404, "not_found")
+
+
+@pytest.mark.raw_http
+def test_a_missing_token_is_refused_inside_the_gate():
+    """Its 401 carries what every other refusal does: a request id and the
+    security headers."""
+    with _client(GatewaySettings(api_token="secret")) as client:
+        reply = client.get("/api/providers")
+    assert reply.json()["error"]["code"] == "invalid_api_token"
+    assert reply.headers["x-request-id"].startswith("r-")
+    assert reply.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.raw_http
+def test_a_flood_without_the_token_goes_quiet_and_leaves_a_security_row(caplog):
+    """With DERATE_API_TOKEN set every anonymous /api request stops at the
+    token check, which had no noise budget and noted nothing: turning the
+    hardening on turned the flood control off, and token guessing left no
+    security event."""
+    import logging
+
+    from control_plane.contracts.auth import AuditAction
+    from control_plane.gateway.authz import NOISE_PER_ADDRESS_PER_MIN
+
+    app = create_app(GatewayDeps(), settings=GatewaySettings(api_token="secret"))
+    client = TestClient(app, client=("192.0.2.80", 1))
+    with caplog.at_level(logging.INFO):
+        codes = {
+            client.get("/api/keys", headers={"Authorization": f"Bearer guess-{i}"}).status_code
+            for i in range(NOISE_PER_ADDRESS_PER_MIN + 10)
+        }
+    assert codes == {401}
+    access = [r for r in caplog.records if r.name == "gateway.access" and "ip=192.0.2.80 " in r.getMessage()]
+    assert len(access) == NOISE_PER_ADDRESS_PER_MIN
+    ctx = app.state.ctx
+    assert ctx.secevents.close()
+    entries, _ = ctx.auth_stores.auth.audit_page(action=AuditAction.SESSION_REFUSED.value)
+    rows = [e for e in entries if e.ip == "192.0.2.80"]
+    assert any(e.after.get("code") == "invalid_api_token" for e in rows)
+    assert sum(e.after["count"] for e in rows) == NOISE_PER_ADDRESS_PER_MIN + 10

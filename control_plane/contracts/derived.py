@@ -33,7 +33,7 @@ that already has a home, add the site rather than the derivation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -156,13 +156,13 @@ FACTS: tuple[DerivedFact, ...] = (
         compare="members",
     ),
     DerivedFact(
-        name="drt_key_pattern",
+        name="derate_key_pattern",
         canonical="control_plane.keys.format:KEY_PATTERN",
         why=(
             "the key format belongs to the keys package; redaction.py may "
             "import nothing from it (every node, including the worker path, "
             "imports the scrubber), so it holds a copy of the pattern it "
-            "scrubs by. ui/src/api/redact.ts DRT_KEY is a third, TypeScript, "
+            "scrubs by. ui/src/api/redact.ts KEY_PATTERN is a third, TypeScript, "
             "copy"
         ),
         copies=("control_plane.redaction:KEY_PATTERN",),

@@ -22,7 +22,7 @@ from starlette.websockets import WebSocketDisconnect
 from control_plane.contracts.auth import LimitScope
 from control_plane.gateway import create_app
 from control_plane.limits.service import estimate_prompt_tokens
-from tests.unit.conftest import credentials
+from tests.unit.conftest import BOOT_PASSWORD, credentials
 from tests.unit.test_gateway import (
     SECRET_KEY,
     FakeBackend,
@@ -111,7 +111,8 @@ def _mint(app, **limits) -> tuple[str, str]:
     cookie, _ = credentials(app)
     r = TestClient(app).post(
         "/api/keys",
-        json={"name": "metered", "expiry_days": 30, "limits": limits},
+        json={"name": "metered", "expiry_days": 30, "limits": limits,
+              "current_password": BOOT_PASSWORD},
         headers={"Cookie": f"derate_session={cookie}"},
     )
     assert r.status_code == 200, r.text
@@ -165,10 +166,112 @@ def test_a_stream_without_a_usage_frame_records_the_prompt_estimate_not_zero(moc
     assert row.completion_tokens == 4  # one per frame, with no usage block
 
 
+# -- (b) a body past the 1 MiB head is still counted (finding H1) ---------------
+
+
+def _big_body_app(payload: bytes):
+    """The gateway over one cloud target that answers every request with
+    ``payload``."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request.read()
+        return httpx.Response(200, headers={"content-type": "application/json"},
+                              stream=httpx.ByteStream(payload))
+
+    deps = build_deps(
+        deployments=FakeDeployments([]),
+        providers=FakeProviders([make_provider("openrouter", base_url="http://cloud/v1",
+                                               served_name=CLOUD, upstream_id="up/cloud")]),
+    )
+    app = create_app(deps, http_client=httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    return app, _wire(app)
+
+
+def _two_mib_choices() -> str:
+    logprobs = [{"token": "x", "logprob": -0.1, "top_logprobs": []}] * 40000
+    return json.dumps([{"index": 0, "message": {"role": "assistant", "content": "x"},
+                        "logprobs": {"content": logprobs}, "finish_reason": "length"}])
+
+
+def test_a_body_past_the_head_limit_records_its_usage_block_not_zero():
+    payload = ('{"id":"c","object":"chat.completion","choices":' + _two_mib_choices()
+               + ',"usage":{"prompt_tokens":10,"completion_tokens":5000}}').encode()
+    assert len(payload) > 2 * 1024 * 1024
+    app, rows = _big_body_app(payload)
+    key_id, key = _mint(app, cloud_tokens_cycle=10_000_000)
+    with TestClient(app) as client:
+        reply = client.post("/v1/chat/completions", json=PROMPT,
+                            headers={"Authorization": f"Bearer {key}"})
+    assert reply.status_code == 200
+    assert len(reply.content) == len(payload)
+    row = [r for r in rows.rows if r.status == 200][-1]
+    assert row.completion_tokens == 5000
+    assert row.prompt_tokens == 10
+    assert row.tokens_estimated is False
+    assert _state(app, key_id, "cloud_tokens_cycle").used == 5010
+
+
+def test_a_large_body_with_no_usage_block_settles_an_estimate_not_zero():
+    payload = ('{"id":"c","object":"chat.completion","choices":'
+               + _two_mib_choices() + "}").encode()
+    assert len(payload) > 1024 * 1024
+    app, rows = _big_body_app(payload)
+    key_id, key = _mint(app, cloud_tokens_cycle=10_000_000)
+    with TestClient(app) as client:
+        reply = client.post("/v1/chat/completions", json=PROMPT,
+                            headers={"Authorization": f"Bearer {key}"})
+    assert reply.status_code == 200
+    row = [r for r in rows.rows if r.status == 200][-1]
+    assert row.tokens_estimated is True
+    assert row.completion_tokens > 0
+    assert _state(app, key_id, "cloud_tokens_cycle").used >= row.completion_tokens
+
+
+def test_a_size_estimate_never_exceeds_what_the_request_could_produce():
+    """With no usage block the output is estimated from the body's size, which
+    counts JSON and logprobs too -- ~500k tokens for 2 MiB. When the request
+    named a ceiling the engine stopped there, so the estimate is settled at it
+    rather than charging a key's whole cycle for one call."""
+    payload = ('{"id":"c","object":"chat.completion","choices":'
+               + _two_mib_choices() + "}").encode()
+    app, rows = _big_body_app(payload)
+    key_id, key = _mint(app, cloud_tokens_cycle=10_000_000)
+    with TestClient(app) as client:
+        reply = client.post("/v1/chat/completions", json={**PROMPT, "max_tokens": 300},
+                            headers={"Authorization": f"Bearer {key}"})
+    assert reply.status_code == 200
+    row = [r for r in rows.rows if r.status == 200][-1]
+    assert (row.tokens_estimated, row.completion_tokens) == (True, 300)
+    assert _state(app, key_id, "cloud_tokens_cycle").used == (row.prompt_tokens or 0) + 300
+
+
+def test_a_large_transcription_keeps_its_duration_for_per_minute_pricing():
+    # Driven on the accounting directly: the FakeBackend's transcription route
+    # answers one fixed small body and no fixture carries a per-minute price,
+    # so the read H1 broke is pinned where it happens.
+    from control_plane.gateway.proxy import _NoAccounting
+
+    segments = json.dumps([{"id": i, "start": i, "end": i + 1, "text": "word " * 20}
+                           for i in range(3000)])
+    for body in (
+        '{"task":"transcribe","duration":3000.5,"segments":' + segments + "}",
+        '{"task":"transcribe","segments":' + segments + ',"duration":3000.5}',
+    ):
+        raw = body.encode()
+        assert len(raw) > _NoAccounting.LIMIT
+        accounting = _NoAccounting(0.0)
+        for i in range(0, len(raw), 4096):
+            accounting.note_chunk(raw[i : i + 4096], 0.0)
+        assert accounting.finish(0.0).audio_duration_s == 3000.5
+
+
 # -- (c) local streams always ask for usage ------------------------------------
 
 
-def test_a_local_stream_asks_for_usage_whatever_the_client_sent(mocked):
+def test_a_local_stream_asks_for_usage_on_every_chunk_whatever_the_client_sent(mocked):
+    """Cumulative usage on every chunk, so a stream cut before its last frame
+    is charged what it got: frames are not tokens once the engine merges the
+    deltas of a slow reader (or a speculative step) into one."""
     app, upstream, _ = mocked
     _, key = _mint(app)
     body = {"model": LOCAL, "messages": [{"role": "user", "content": "hi"}], "stream": True,
@@ -178,7 +281,19 @@ def test_a_local_stream_asks_for_usage_whatever_the_client_sent(mocked):
                             headers={"Authorization": f"Bearer {key}"})
     assert reply.status_code == 200
     sent = upstream.body()
-    assert sent["stream_options"] == {"include_usage": True, "continuous_usage_stats": False}
+    assert sent["stream_options"] == {"include_usage": True, "continuous_usage_stats": True}
+
+
+def test_a_cut_stream_with_cumulative_usage_is_charged_what_it_received():
+    from control_plane.gateway.proxy import _StreamAccounting
+
+    accounting = _StreamAccounting(0.0)
+    for i in range(1, 6):  # five frames of ten merged tokens each, then the cut
+        frame = {"choices": [{"index": 0, "delta": {"content": "x" * 10}}],
+                 "usage": {"prompt_tokens": 7, "completion_tokens": 10 * i}}
+        accounting.note_chunk(f"data: {json.dumps(frame)}\n\n".encode(), float(i))
+    usage = accounting.finish(6.0)
+    assert (usage.completion_tokens, usage.prompt_tokens, usage.estimated) == (50, 7, False)
 
 
 def test_a_remote_provider_that_supports_stream_usage_is_asked_over_the_client(tmp_path):
@@ -229,6 +344,133 @@ def test_a_client_that_hangs_up_mid_stream_is_counted_against_its_key():
             assert row.prompt_tokens > 0
             assert _state(app, key_id, "requests_cycle").used == 1
             assert _state(app, key_id, "rpm").used == 1  # the window entry was kept
+
+
+@pytest.mark.parametrize("model, limit", [(LOCAL, "local_tokens_cycle"), (CLOUD, "cloud_tokens_cycle")])
+def test_an_unstreamed_body_the_client_cut_is_settled_on_its_usage_block(model, limit):
+    """An unstreamed answer is generated in full before its first byte, so a
+    client that read one chunk and hung up was served all of it -- and used to
+    be charged its first chunk's size / 4, because the usage block is last."""
+    pieces = [b'{"id":"c","object":"chat.completion","choices":[{"index":0,"message":'
+              b'{"role":"assistant","content":"']
+    pieces += [b"7" * 65536] * 24
+    pieces += [b'"},"finish_reason":"length"}],'
+               b'"usage":{"prompt_tokens":10,"completion_tokens":150000}}']
+
+    async def slow_body():
+        for piece in pieces:
+            await asyncio.sleep(0.005)
+            yield piece
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request.read()
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=slow_body())
+
+    deps = build_deps(
+        deployments=FakeDeployments([make_deployment("d-local", LOCAL, backend_url="http://local-backend/v1")]),
+        providers=FakeProviders([make_provider("openrouter", base_url="http://cloud/v1",
+                                               served_name=CLOUD, upstream_id="up/cloud")]),
+    )
+    app = create_app(deps, http_client=httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    rows = _wire(app)
+    key_id, key = _mint(app, local_tokens_cycle=10_000_000, cloud_tokens_cycle=10_000_000)
+    with RunningServer(app) as gateway, httpx.Client(timeout=30) as client:
+        body = {"model": model, "messages": [{"role": "user", "content": "go"}]}
+        with client.stream("POST", f"{gateway.url}/v1/chat/completions", json=body,
+                           headers={"Authorization": f"Bearer {key}"}) as response:
+            assert response.status_code == 200
+            next(response.iter_raw())  # one chunk, then walk away
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not any(r.status == 200 for r in rows.rows):
+            time.sleep(0.05)
+    row = next(r for r in rows.rows if r.status == 200)
+    assert (row.completion_tokens, row.tokens_estimated) == (150_000, False)
+    assert _state(app, key_id, limit).used == 150_010
+
+
+def test_a_body_nobody_started_gives_back_its_kv_and_its_slot_when_reaped(mocked):
+    """A client gone between the response line and the first chunk leaves the
+    body generator unstarted, and an unstarted generator runs no `finally`:
+    the janitor closed the upstream but released neither the deployment's KV
+    commitment nor the key's max_concurrent slot -- for the process's life."""
+    app, _, _ = mocked
+    key_id, key = _mint(app)
+    body = json.dumps({"model": LOCAL, "messages": [{"role": "user", "content": "hi"}]}).encode()
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "scheme": "http",
+        "method": "POST", "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions",
+        "root_path": "", "query_string": b"", "server": ("testserver", 80), "client": ("127.0.0.1", 5000),
+        "headers": [(b"host", b"testserver"), (b"content-type", b"application/json"),
+                    (b"authorization", f"Bearer {key}".encode())],
+    }
+    proxy, admission = app.state.ctx.proxy, app.state.ctx.admission
+
+    async def run():
+        sent = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            if sent:
+                return sent.pop()
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                raise OSError("the client went away")
+
+        with pytest.raises(OSError):
+            await app(scope, receive, send)
+        # The case this pins: nothing ever started the body. Anything that
+        # iterates it (a BaseHTTPMiddleware did, before round 2) makes the
+        # generator's own `finally` release everything and this test vacuous.
+        assert [e.started for e in proxy._open.values()] == [False]
+        assert admission.committed("d-local") > 0
+        assert _state(app, key_id, "max_concurrent").used == 1
+        for entry in proxy._open.values():
+            entry.opened_at -= 60.0
+        await proxy._reap()
+        # Inside the loop: asyncio.run's own generator cleanup cannot help.
+        assert admission.committed("d-local") == 0
+        assert _state(app, key_id, "max_concurrent").used == 0
+
+    asyncio.run(run())
+
+
+def test_a_hang_up_on_an_endless_unstreamed_body_is_delivered(monkeypatch):
+    """The reads of an unstreamed body are shielded so the rest can be read
+    for its usage -- and a fresh shield per chunk swallowed the hang-up for
+    good: anyio retries a cancellation once, and the next shielded scope hid
+    it. An upstream that never finishes held its connection, the key's slot
+    and the KV commitment for as long as it liked."""
+    from control_plane.gateway import proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "USAGE_DRAIN_S", 0.3)
+
+    async def endless():
+        yield b'{"id":"c","object":"chat.completion","choices":[{"index":0,"message":{"content":"'
+        while True:
+            await asyncio.sleep(0.01)
+            yield b"7" * 4096
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request.read()
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=endless())
+
+    deps = build_deps(deployments=FakeDeployments([make_deployment("d-local", LOCAL, backend_url="http://local-backend/v1")]))
+    app = create_app(deps, http_client=httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    rows = _wire(app)
+    key_id, key = _mint(app)
+    with RunningServer(app) as gateway, httpx.Client(timeout=30) as client:
+        body = {"model": LOCAL, "messages": [{"role": "user", "content": "go"}]}
+        with client.stream("POST", f"{gateway.url}/v1/chat/completions", json=body,
+                           headers={"Authorization": f"Bearer {key}"}) as response:
+            assert response.status_code == 200
+            next(response.iter_raw())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not rows.rows:
+            time.sleep(0.05)
+        assert [r.error_class for r in rows.rows] == ["ClientDisconnected"]
+        assert app.state.ctx.admission.committed("d-local") == 0
+        assert _state(app, key_id, "max_concurrent").used == 0
 
 
 def test_a_provider_stream_the_client_walked_away_from_is_billed_to_its_day(tmp_path):

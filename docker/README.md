@@ -138,7 +138,7 @@ not in the container. This container also mounts the operator's `~/.ssh`
 read-only and ships `openssh-client`, because sparkrun drives the fleet over
 SSH. A shell on one node therefore reaches every machine those keys reach.
 
-`/api` needs an admin session and `/v1` a `drt_` key, but the gateway binds
+`/api` needs an admin session and `/v1` a `derate-` key, but the gateway binds
 `0.0.0.0` and speaks plain HTTP unless something terminates TLS in front of it.
 Three things stand between that and a prompt, and all are load-bearing:
 

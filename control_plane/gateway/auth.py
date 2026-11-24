@@ -28,6 +28,8 @@ single-purpose token for that step.
 
 from __future__ import annotations
 
+import hmac
+
 GUARDED_PREFIX = "/api"
 
 #: See the module docstring: a joining node presents its own enrollment
@@ -44,4 +46,6 @@ def is_unauthorized(*, path: str, authorization: str | None, token: str | None) 
     if authorization is None:
         return True
     scheme, _, value = authorization.partition(" ")
-    return scheme.lower() != "bearer" or value != token
+    # Constant time: the token is a shared secret and this answer is a 401
+    # anyone on the LAN can ask for as often as they like.
+    return scheme.lower() != "bearer" or not hmac.compare_digest(value.encode(), token.encode())

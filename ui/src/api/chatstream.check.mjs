@@ -28,7 +28,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const frame = (o) => `data: ${JSON.stringify(o)}\n\n`
 const delta = (d, finish = null) => ({ choices: [{ index: 0, delta: d, finish_reason: finish }] })
 const refusal = 'Claude refused this request.\nChoose another model: café 🛑.'
-const secret = `drt_abcdefghij_${'x'.repeat(32)}`
+const secret = `derate-abcdefghij_${'x'.repeat(32)}`
 const truncated = `Claude stream ended before message_stop.\nRequest credential: ${secret}`
 
 const SCRIPTS = {

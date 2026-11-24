@@ -17,7 +17,7 @@ from control_plane.contracts.auth import (
     SESSION_COOKIE,
     SESSION_COOKIE_SECURE,
 )
-from control_plane.gateway import auth_api, authz, create_app
+from control_plane.gateway import auth_api, create_app
 
 pytestmark = pytest.mark.raw_http
 
@@ -159,22 +159,43 @@ def test_adding_and_removing_an_admin_with_the_password(app):
     assert r.status_code == 200, r.text
 
 
-def test_rotating_an_admin_key_needs_the_password_and_a_plain_key_does_not(app):
+def test_rotating_any_key_needs_the_password(app):
     client, s = _setup(app)
     admin_key = client.get("/api/auth/me", headers=s["cookie"]).json()["admin_key_id"]
-    r = client.post(f"/api/keys/{admin_key}/rotate", headers=s["cookie"])
+    plain = s["setup"]["key"]["key_id"]  # the default org's key, not an admin key
+    for key_id in (admin_key, plain):
+        r = client.post(f"/api/keys/{key_id}/rotate", headers=s["cookie"])
+        assert r.status_code == 401, key_id
+        assert r.json()["error"]["code"] == "invalid_credentials"
+        assert "secret_once" not in r.text
+        r = client.post(
+            f"/api/keys/{key_id}/rotate", json={"current_password": ADMIN["password"]},
+            headers=s["cookie"],
+        )
+        assert r.status_code == 200 and r.json()["secret_once"], r.text
+
+
+def test_creating_a_key_needs_the_password(app):
+    client, s = _setup(app)
+    body = {"name": "minted", "expiry_days": 30}
+    r = client.post("/api/keys", json=body, headers=s["cookie"])
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "invalid_credentials"
     assert "secret_once" not in r.text
     r = client.post(
-        f"/api/keys/{admin_key}/rotate", json={"current_password": ADMIN["password"]},
-        headers=s["cookie"],
+        "/api/keys", json={**body, "current_password": "not-the-password-1"}, headers=s["cookie"]
     )
-    assert r.status_code == 200 and r.json()["secret_once"]
-
-    plain = s["setup"]["key"]["key_id"]  # the default org's key, not an admin key
-    r = client.post(f"/api/keys/{plain}/rotate", headers=s["cookie"])
+    assert r.status_code == 401
+    assert "secret_once" not in r.text
+    failed = _audit(client, s["cookie"], "login_failed")
+    assert failed and failed[-1]["actor"] == ADMIN["username"]
+    names = [k["name"] for k in client.get("/api/keys", headers=s["cookie"]).json()]
+    assert "minted" not in names
+    r = client.post(
+        "/api/keys", json={**body, "current_password": ADMIN["password"]}, headers=s["cookie"]
+    )
     assert r.status_code == 200, r.text
+    assert r.json()["secret_once"]
 
 
 # -- 4.4: headers, cookie, server banner, 503 text ---------------------------

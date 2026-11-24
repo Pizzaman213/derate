@@ -119,7 +119,7 @@ def gw():
         return {"Authorization": f"Bearer {key or g.key}"}
 
     def mint(**fields):
-        body = {"name": "k", "expiry_days": 30, **fields}
+        body = {"name": "k", "expiry_days": 30, "current_password": ADMIN["password"], **fields}
         r = client.post("/api/keys", json=body, headers=cookie)
         assert r.status_code == 200, r.text
         return r.json()
@@ -283,7 +283,7 @@ def test_the_clients_credentials_never_reach_a_local_backend(gw):
 
 def test_a_local_engine_gets_its_runtime_key_and_only_that(gw):
     """H3: the engine requires its per-deployment key, and the gateway is the
-    only holder. The client's own drt_ key still never reaches it."""
+    only holder. The client's own derate- key still never reaches it."""
     router = gw.app.state.ctx.router
     runtime_key = "e" * 64
     router._deployments.runtime_api_key = lambda deployment_id: runtime_key
@@ -355,7 +355,7 @@ def test_the_session_cookie_is_httponly_strict_and_secure_only_on_https(tmp_path
 
 def test_a_secret_is_revealed_once_and_rotation_kills_the_old_one(gw):
     key_id = gw.setup["key"]["key_id"]
-    secret = gw.key.split("_", 2)[2]
+    secret = gw.key.split("_", 1)[1]  # derate-<id>_<secret>; the secret may hold "_"
     for path in ("/api/keys", f"/api/keys/{key_id}", "/api/audit", f"/api/keys/{key_id}/requests"):
         r = gw.client.get(path, headers=gw.cookie)
         assert gw.key not in r.text and secret not in r.text, path
@@ -365,7 +365,7 @@ def test_a_secret_is_revealed_once_and_rotation_kills_the_old_one(gw):
     )
     assert rotated.status_code == 200
     new = rotated.json()["secret_once"]
-    assert new != gw.key and new.startswith(f"drt_{key_id}_")
+    assert new != gw.key and new.startswith(f"derate-{key_id}_")
     assert gw.client.get("/v1/models", headers=gw.bearer()).json()["error"]["code"] == "invalid_api_key"
     assert gw.client.get("/v1/models", headers=gw.bearer(new)).status_code == 200
     assert new not in gw.client.get(f"/api/keys/{key_id}", headers=gw.cookie).text
@@ -407,15 +407,17 @@ def test_a_key_limit_above_the_orgs_is_refused_naming_the_field(gw):
     org_id = gw.setup["org"]["org_id"]
     r = gw.client.patch(f"/api/orgs/{org_id}", json={"limits": {"rpm": 10}}, headers=gw.cookie)
     assert r.status_code == 200, r.text
+    pw = {"current_password": ADMIN["password"]}
     r = gw.client.post(
-        "/api/keys", json={"name": "big", "expiry_days": 30, "limits": {"rpm": 50}}, headers=gw.cookie
+        "/api/keys", json={"name": "big", "expiry_days": 30, "limits": {"rpm": 50}, **pw},
+        headers=gw.cookie,
     )
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "limit_exceeds_org"
     assert "rpm" in r.json()["error"]["message"]
     r = gw.client.post(
         "/api/keys",
-        json={"name": "wide", "expiry_days": 30, "allowed_models": ["nope"]},
+        json={"name": "wide", "expiry_days": 30, "allowed_models": ["nope"], **pw},
         headers=gw.cookie,
     )
     assert r.json()["error"]["code"] == "allowlist_exceeds_org"
@@ -452,7 +454,14 @@ def test_disable_and_delete_are_audited_and_refuse_the_key(gw):
     r = gw.client.post(f"/api/keys/{key_id}/disable", json={"reason": "leaked"}, headers=gw.cookie)
     assert r.json()["status"] == "disabled" and r.json()["disabled_reason"] == "leaked"
     assert gw.chat(key).json()["error"]["code"] == "api_key_disabled"
-    assert gw.client.post(f"/api/keys/{key_id}/enable", headers=gw.cookie).json()["status"] == "active"
+    # Enabling makes a leaked key a credential again: a session alone is not enough.
+    refused = gw.client.post(f"/api/keys/{key_id}/enable", headers=gw.cookie)
+    assert (refused.status_code, refused.json()["error"]["code"]) == (401, "invalid_credentials")
+    assert gw.chat(key).json()["error"]["code"] == "api_key_disabled"
+    enabled = gw.client.post(
+        f"/api/keys/{key_id}/enable", json={"current_password": ADMIN["password"]}, headers=gw.cookie
+    )
+    assert enabled.json()["status"] == "active"
     assert gw.chat(key).status_code == 200
     assert gw.client.delete(f"/api/keys/{key_id}", headers=gw.cookie).status_code == 200
     assert gw.chat(key).json()["error"]["code"] == "invalid_api_key"
@@ -462,6 +471,22 @@ def test_disable_and_delete_are_audited_and_refuse_the_key(gw):
     disabled = next(e for e in entries if e["action"] == "key_disabled")
     assert disabled["before"]["status"] == "active" and disabled["after"]["status"] == "disabled"
     assert disabled["actor"] == ADMIN["username"]
+
+
+def test_a_stale_key_does_not_lock_the_other_keys_on_its_address_out(gw):
+    """The refused-key throttle counted every refusal against the address, so
+    one worker still holding a disabled or rotated key locked every other
+    service behind the same NAT or /64 out with 429s. It is the stale key that
+    is throttled now, not its neighbours."""
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
+
+    a, b = gw.mint(name="stale"), gw.mint(name="neighbour")
+    r = gw.client.post(f"/api/keys/{a['key']['key_id']}/disable", json={"reason": "rotated"}, headers=gw.cookie)
+    assert r.status_code == 200, r.text
+    codes = [gw.chat(a["secret_once"]).json()["error"]["code"] for _ in range(KEY_REFUSALS_PER_ADDRESS_PER_MIN + 5)]
+    assert codes == ["api_key_disabled"] * KEY_REFUSALS_PER_ADDRESS_PER_MIN + ["rate_limited"] * 5
+    assert gw.chat(b["secret_once"]).status_code == 200
+    assert gw.chat().status_code == 200
 
 
 def test_adding_an_admin_mints_their_key_and_removing_one_disables_it(gw):
@@ -513,7 +538,7 @@ def test_an_unopenable_store_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("DERATE_DATA_DIR", str(not_a_dir))
     client = TestClient(create_app())
     for path in ("/v1/models", "/api/settings", "/api/auth/state"):
-        r = client.get(path, headers={"Authorization": "Bearer drt_aaaaaaaaaa_" + "b" * 43})
+        r = client.get(path, headers={"Authorization": "Bearer derate-aaaaaaaaaa_" + "b" * 43})
         assert r.status_code == 503, path
         assert r.json()["error"]["code"] == "auth_unavailable"
     assert client.get("/healthz").status_code == 200
@@ -685,6 +710,6 @@ def test_setup_still_answers_the_secret_when_its_own_sign_in_is_locked(monkeypat
     r = client.post("/api/setup/admin", json=ADMIN)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["secret_once"].startswith("drt_") and body["signed_in"] is False
+    assert body["secret_once"].startswith("derate-") and body["signed_in"] is False
     assert "set-cookie" not in r.headers
     assert client.get("/api/auth/state").json()["admin_exists"] is True

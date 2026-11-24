@@ -1,4 +1,4 @@
-"""A raw ``drt_`` key appears nowhere it was not handed out.
+"""A raw ``derate-`` key appears nowhere it was not handed out.
 
 A real key is sent over every /v1 route against an app whose data and log
 directories are this test's own, with the log files installed and telemetry
@@ -85,7 +85,7 @@ def test_a_raw_key_is_written_nowhere_and_listed_nowhere(isolated):
         setup = client.post("/api/setup/admin", json=ADMIN)
         assert setup.status_code == 200
         raw = setup.json()["secret_once"]
-        secret = raw.split("_", 2)[2]
+        secret = raw.split("_", 1)[1]  # derate-<id>_<secret>; the secret may hold "_"
         key_id = setup.json()["key"]["key_id"]
         cookie = {"Cookie": f"derate_session={setup.cookies['derate_session']}"}
         client.cookies.clear()

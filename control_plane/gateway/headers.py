@@ -116,7 +116,6 @@ class SecurityHeaders:
             return
 
         gated = scope["path"].startswith(("/api/", "/v1/")) or scope["path"] in ("/api", "/v1")
-        https = scope.get("scheme") == "https" or self._public_https
 
         async def with_headers(message) -> None:
             if message["type"] == "http.response.start":
@@ -137,6 +136,10 @@ class SecurityHeaders:
                             headers.append((b"content-disposition", b"inline"))
                 if gated and b"cache-control" not in present:
                     headers.append((b"cache-control", b"no-store"))
+                # Read at response time, not on entry: AuthGuard (inside this
+                # middleware) sets the scheme to https on an edge connection,
+                # where the edge terminated TLS.
+                https = scope.get("scheme") == "https" or self._public_https
                 if https and b"strict-transport-security" not in present:
                     headers.append((b"strict-transport-security", HSTS))
                 message = {**message, "headers": headers}

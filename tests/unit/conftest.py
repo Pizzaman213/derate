@@ -1,7 +1,7 @@
 """Every gateway in this suite is secured; this is how its tests get in.
 
 The gateway refuses ``/api`` without an admin session and ``/v1`` without a
-``drt_`` key (``control_plane/gateway/authz.py``), and there is no switch that
+``derate-`` key (``control_plane/gateway/authz.py``), and there is no switch that
 turns that off -- the stub app ``create_app()`` builds is secured exactly like
 the real one. So the ~150 ``TestClient(create_app(...))`` call sites in this
 directory sign in the way a person does.
@@ -45,7 +45,7 @@ BOOT_PASSWORD = "suite-boot-pw-123456"
 BOOT_KEY_NAME = "test-bootstrap"
 
 _raw = {"on": False}
-#: str(auth.db path) -> (session cookie value, raw drt_ key)
+#: str(auth.db path) -> (session cookie value, raw derate- key)
 _creds: dict[str, tuple[str, str]] = {}
 
 
@@ -160,7 +160,7 @@ def _boot_sync(client: TestClient, stores) -> tuple[str, str]:
         k = post(
             "POST",
             "/api/keys",
-            json={"name": BOOT_KEY_NAME, "expiry_days": 365},
+            json={"name": BOOT_KEY_NAME, "expiry_days": 365, "current_password": BOOT_PASSWORD},
             headers={"Cookie": f"{SESSION_COOKIE}={cookie}"},
         )
         if k.status_code != 200:
@@ -177,7 +177,7 @@ def _boot_sync(client: TestClient, stores) -> tuple[str, str]:
 
 
 def credentials(app) -> tuple[str, str]:
-    """``(session cookie, drt_ key)`` for a gateway app, signed in through it.
+    """``(session cookie, derate- key)`` for a gateway app, signed in through it.
 
     For a test that reaches the gateway over a real socket (uvicorn in a
     thread), where neither patched client is in the path: it attaches these
@@ -303,7 +303,7 @@ async def _boot_async(transport, stores, base: httpx.URL) -> tuple[str, str]:
         cookie = _cookie_from(r.headers.get_list("set-cookie"))
         k = await post(
             "/api/keys",
-            {"name": BOOT_KEY_NAME, "expiry_days": 365},
+            {"name": BOOT_KEY_NAME, "expiry_days": 365, "current_password": BOOT_PASSWORD},
             {"Cookie": f"{SESSION_COOKIE}={cookie}"},
         )
         if k.status_code != 200:

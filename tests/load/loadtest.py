@@ -2160,7 +2160,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--drain", type=float, default=15.0,
                    help="seconds to let in-flight requests finish after the run stops")
     p.add_argument("--api-key", default=os.environ.get("DERATE_API_KEY", ""),
-                   help="the drt_ key /v1 requires (Keys screen); sent as a bearer token")
+                   help="the derate- key /v1 requires (Keys screen); sent as a bearer token")
     p.add_argument("--admin-user", default="",
                    help="an admin to sign in as, for the /api calls the policy pin makes")
     p.add_argument("--admin-password", default="")

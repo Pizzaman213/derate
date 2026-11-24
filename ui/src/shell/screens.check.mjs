@@ -108,10 +108,10 @@ const secretScan = (text) =>
     'print(json.dumps({"known": len(values), "leaked": r.contains_secret(text)}))',
   ].join('\n')], { input: text, cwd: repoRoot, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }))
 
-/** derate's own key shape. Mirrors api/redact.ts DRT_KEY. Unlike a provider
+/** derate's own key shape. Mirrors api/redact.ts KEY_PATTERN. Unlike a provider
  *  key this one has a fixed, unmistakable shape, so a shape test over the
  *  rendered text cannot cry wolf the way the one above did. */
-const DRT_KEY = /\bdrt_[a-z0-9]{10}_[A-Za-z0-9_-]{32,}/
+const KEY_PATTERN = /\bderate-[a-z0-9]{10}_[A-Za-z0-9_-]{32,}/
 
 // One per destination, read out of the scheme rather than written down here.
 // This was a literal array of seven paths under a header that already claimed
@@ -207,7 +207,7 @@ for (const [name, path] of SCREENS) {
     const scan = secretScan(text)
     if (scan.known === 0) note(`${name}: no stored secrets on this box to look for`)
     else check(!scan.leaked, `${name}: none of the ${scan.known} stored secrets is on the screen`)
-    check(!DRT_KEY.test(text), `${name}: no drt_ API key is on the screen`)
+    check(!KEY_PATTERN.test(text), `${name}: no derate- API key is on the screen`)
     // Controls in one row share a centre line, a table row's cells one
     // baseline -- check/alignment.mjs. Every offender is listed: the first one
     // alone hides whether a fix moved the whole row or one control.

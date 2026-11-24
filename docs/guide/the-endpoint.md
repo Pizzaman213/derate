@@ -11,7 +11,7 @@ a coordinator you can reach and at least one model serving.
 `/v1` answers only to an API key, sent as a bearer token:
 
 ```
-Authorization: Bearer drt_<key_id>_<secret>
+Authorization: Bearer derate-<key_id>_<secret>
 ```
 
 The header is the only place a key is read, the `/v1/realtime` websocket
@@ -198,7 +198,7 @@ The same thing through the OpenAI SDK — `base_url` and `api_key` change:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://<coordinator>:8080/v1", api_key="drt_<key_id>_<secret>")
+client = OpenAI(base_url="http://<coordinator>:8080/v1", api_key="derate-<key_id>_<secret>")
 
 for model in client.models.list():
     print(model.id)
@@ -210,7 +210,7 @@ answer = client.chat.completions.create(
 print(answer.choices[0].message.content)
 ```
 
-`api_key` is the `drt_` key itself; the SDK sends it as the bearer token. An
+`api_key` is the `derate-` key itself; the SDK sends it as the bearer token. An
 SDK that reads `OPENAI_API_KEY` from the environment works with the key put
 there.
 

@@ -319,7 +319,7 @@ selected (`aria-current` /
 ### RevealModal
 
 `components/RevealModal.tsx`: `secret`, `keyId`, `onDone`. The only place a
-`drt_` API key is ever on screen, and only once: the coordinator keeps a
+`derate-` API key is ever on screen, and only once: the coordinator keeps a
 hash, not the key, so there is no second reveal — a lost key is rotated. It
 is shown for the three `secret_once` responses (`POST /api/setup/admin`,
 `POST /api/keys`, `POST /api/keys/{id}/rotate`); the caller holds the secret

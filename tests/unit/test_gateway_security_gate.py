@@ -50,14 +50,14 @@ def _rows(app, action: AuditAction):
 
 def test_key_refusals_are_one_row_per_minute_per_source_with_a_count(gate):
     app, client, _ = gate
-    bad = "drt_abcdefghij_" + "x" * 43
+    bad = "derate-abcdefghij_" + "x" * 43
     for _ in range(3):
         r = client.get("/v1/models", headers={"Authorization": f"Bearer {bad}"})
         assert r.status_code == 401
     rows = _rows(app, AuditAction.KEY_REFUSED)
     assert len(rows) == 1
     assert rows[0].actor == "-"
-    assert rows[0].after["presented"] == "drt_abcdefghij"
+    assert rows[0].after["presented"] == "derate-abcdefghij"
     assert rows[0].ip == "127.0.0.1"
     assert "x" * 43 not in str(rows[0].after)
     # The next row for the same source carries what was folded in since.
@@ -71,14 +71,117 @@ def test_key_refusals_are_one_row_per_minute_per_source_with_a_count(gate):
 def test_a_fresh_fake_key_id_per_request_is_still_one_row_per_address(gate):
     app, client, _ = gate
     for i in range(200):
-        bad = f"drt_{i:010d}_" + "x" * 43
-        assert client.get("/v1/models", headers={"Authorization": f"Bearer {bad}"}).status_code == 401
+        bad = f"derate-{i:010d}_" + "x" * 43
+        # Each id is refused once, well inside both budgets; all 200 are
+        # KEY_REFUSED events from one address and fold into one row.
+        status = client.get("/v1/models", headers={"Authorization": f"Bearer {bad}"}).status_code
+        assert status == 401
     rows = _rows(app, AuditAction.KEY_REFUSED)
     assert len(rows) == 1 and rows[0].after["count"] == 1
     app.state.ctx.secevents._window = 0.0
-    client.get("/v1/models", headers={"Authorization": "Bearer drt_zzzzzzzzzz_" + "x" * 43})
+    client.get("/v1/models", headers={"Authorization": "Bearer derate-zzzzzzzzzz_" + "x" * 43})
     rows = _rows(app, AuditAction.KEY_REFUSED)
     assert sorted(r.after["count"] for r in rows) == [1, 200]
+
+
+def _count_lookups(monkeypatch) -> list[str]:
+    from control_plane.keys.service import KeyService
+
+    lookups: list[str] = []
+    real = KeyService.authenticate
+
+    def counting(self, token, **kw):
+        lookups.append(token)
+        return real(self, token, **kw)
+
+    monkeypatch.setattr(KeyService, "authenticate", counting)
+    return lookups
+
+
+def _mint(client, cookie, name: str) -> tuple[str, dict]:
+    minted = client.post(
+        "/api/keys",
+        json={"name": name, "expiry_days": 30, "current_password": ADMIN["password"]},
+        headers=cookie,
+    )
+    assert minted.status_code == 200, minted.text
+    body = minted.json()
+    return body["key"]["key_id"], {"Authorization": f"Bearer {body['secret_once']}"}
+
+
+def _bad(i: int) -> dict:
+    return {"Authorization": f"Bearer derate-{i:010d}_" + "x" * 43}
+
+
+def test_a_refused_key_id_is_throttled_without_a_lookup_and_no_other_key_is(gate, monkeypatch):
+    """Past KEY_REFUSALS_PER_ADDRESS_PER_MIN refusals of one key id from one
+    address, that id from there is answered 429 before the key store is read.
+    The budget is the (address, key id) pair's: a valid key from the same
+    address, another bad id, and the same id from another address are still
+    looked up, and the budget comes back once the window drains."""
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_PER_MIN
+
+    app, client, cookie = gate
+    now = [1000.0]
+    app.state.key_refusals._clock = lambda: now[0]
+    lookups = _count_lookups(monkeypatch)
+    _, good = _mint(client, cookie, "throttle")
+
+    for _ in range(KEY_REFUSALS_PER_ADDRESS_PER_MIN):
+        assert client.get("/v1/models", headers=_bad(1)).status_code == 401
+    seen = len(lookups)
+    for _ in range(5):
+        r = client.get("/v1/models", headers=_bad(1))
+        assert r.status_code == 429, r.text
+    assert r.json()["error"]["code"] == "rate_limited"
+    assert r.headers["retry-after"] == "60"
+    assert "WWW-Authenticate" not in r.headers
+    assert len(lookups) == seen  # no store read for a throttled answer
+    assert client.get("/v1/models", headers=good).status_code == 200
+    assert client.get("/v1/models", headers=_bad(2)).status_code == 401
+    other = TestClient(app, client=("10.0.0.7", 50000))
+    assert other.get("/v1/models", headers=_bad(1)).status_code == 401
+    # The socket gate shares the window.
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/v1/realtime", headers=_bad(1)):
+            pass
+    assert (caught.value.code, caught.value.reason) == (1008, "rate_limited")
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/v1/realtime", headers=_bad(3)):
+            pass
+    assert (caught.value.code, caught.value.reason) == (1008, "invalid_api_key")
+    # A throttled 429 is not itself a refusal: once the 20 age out, the id is
+    # looked up again, however many 429s it was answered in between.
+    now[0] += 61.0
+    assert client.get("/v1/models", headers=_bad(1)).status_code == 401
+
+
+def test_a_flood_of_key_ids_closes_the_address_but_not_a_key_it_already_knows(gate, monkeypatch):
+    """Past KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN refusals of any keys
+    from one address, every key id from there is answered 429 without a
+    lookup -- except one that authenticated from that address inside the
+    window, which is still verified."""
+    from control_plane.contracts.auth import KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN
+
+    app, client, cookie = gate
+    lookups = _count_lookups(monkeypatch)
+    _, known = _mint(client, cookie, "known")
+    _, fresh = _mint(client, cookie, "fresh")
+    assert client.get("/v1/models", headers=known).status_code == 200
+
+    for i in range(KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN):
+        assert client.get("/v1/models", headers=_bad(i)).status_code == 401
+    seen = len(lookups)
+    r = client.get("/v1/models", headers=_bad(KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN))
+    assert (r.status_code, r.json()["error"]["code"]) == (429, "rate_limited")
+    assert client.get("/v1/models", headers={"Authorization": "Bearer not-a-key"}).status_code == 429
+    assert client.get("/v1/models", headers=fresh).status_code == 429
+    assert len(lookups) == seen
+    assert client.get("/v1/models", headers=known).status_code == 200
+    # A failed verify of a known id drops it from the allow list.
+    known_id = known["Authorization"].removeprefix("Bearer ").split("_", 1)[0]
+    assert client.get("/v1/models", headers={"Authorization": f"Bearer {known_id}_" + "y" * 43}).status_code == 401
+    assert client.get("/v1/models", headers=known).status_code == 429
 
 
 def test_a_refusal_returns_before_its_row_is_written():
@@ -94,7 +197,7 @@ def test_a_refusal_returns_before_its_row_is_written():
         written.append(kwargs["after"])
 
     events = SecurityEvents(slow_audit, queue_max=1)
-    events.note(AuditAction.KEY_REFUSED, actor="drt_aaaaaaaaaa", ip="10.0.0.1")
+    events.note(AuditAction.KEY_REFUSED, actor="derate-aaaaaaaaaa", ip="10.0.0.1")
     assert written == []  # note() did not wait for the slow write
     # A full queue drops and counts; the next written row says how many.
     events.note(AuditAction.KEY_REFUSED, actor="-", ip="10.0.0.2")
@@ -335,3 +438,132 @@ def test_password_checks_in_flight_are_capped_per_address_and_in_total(tmp_path,
     assert [r.status_code for r in finished] == [401] * VERIFY_INFLIGHT_MAX
     assert after.status_code == 401  # the slots were given back
     assert "u99" not in calls and "u98" not in calls
+
+
+def test_the_refusal_window_is_bounded_and_drains_without_scanning(monkeypatch):
+    """over() runs on every /v1 request, valid ones included. It used to copy
+    and scan every tracked address each time, so a spread-out flood made every
+    caller's request slower. Now a read creates nothing, the map has a hard
+    bound, and expired buckets leave from the front."""
+    from control_plane.gateway.authz import RefusalWindow
+
+    now = [0.0]
+    window = RefusalWindow(20, clock=lambda: now[0])
+    monkeypatch.setattr(RefusalWindow, "MAX_BUCKETS", 100)
+    for i in range(150):
+        window.note(f"198.18.{i // 250}.{i % 250 + 1}")
+    assert len(window._window) == 100
+    assert window.over("203.0.113.1") is False
+    assert "203.0.113.1" not in window._window  # a read creates no bucket
+    now[0] = 61.0
+    window.over("203.0.113.1")
+    assert len(window._window) == 0
+
+
+@pytest.mark.parametrize("action", [AuditAction.KEY_REFUSED, AuditAction.CROSS_ORIGIN_REFUSED, AuditAction.SESSION_REFUSED])
+def test_security_events_fold_per_64_and_cut_caller_strings(action):
+    """Every anonymous event folds per /64 and every caller-chosen string is
+    cut: a cross-origin refusal folded per full address and kept its Origin
+    uncut, so rotating the low bits wrote a permanent row per request as
+    large as the header."""
+    from control_plane.gateway.secevents import _DETAIL_MAX, SecurityEvents
+
+    rows: list[tuple] = []
+    events = SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
+    for i in range(500):
+        events.note(action, actor="-", ip=f"2001:db8:1:2::{i + 1:x}",
+                    detail={"path": "/v1/" + "a" * 20_000, "origin": "https://" + "b" * 20_000})
+    assert events.flush()
+    assert len(rows) == 1
+    args, kwargs = rows[0]
+    assert len(kwargs["after"]["path"]) <= _DETAIL_MAX and len(args[3]) <= _DETAIL_MAX
+    assert len(kwargs["after"]["origin"]) <= _DETAIL_MAX
+
+
+def test_an_attributed_event_folds_per_address_not_per_64():
+    """A named actor's events are not a flood from one caller: on a SLAAC LAN
+    every machine is in one /64, and folding per /64 put a stolen cookie
+    replayed from machine B into the row for the admin's own move on A, its
+    user agent and session lost."""
+    from control_plane.gateway.secevents import SecurityEvents
+
+    rows: list[tuple] = []
+    events = SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
+    for ip, session in (("2001:db8::1", "s1"), ("2001:db8::2", "s2")):
+        events.note(AuditAction.SESSION_IP_CHANGED, actor="gate-admin", ip=ip,
+                    user_agent=f"ua-{session}", detail={"session": session})
+    events.note(AuditAction.SESSION_IP_CHANGED, actor="gate-admin", ip="2001:db8::2",
+                detail={"session": "s2"})  # folded into its own address's row
+    assert events.close()
+    opened = [(k["ip"], k["after"].get("session"), k["user_agent"]) for _, k in rows if "session" in k["after"]]
+    assert opened == [("2001:db8::1", "s1", "ua-s1"), ("2001:db8::2", "s2", "ua-s2")]
+    folded = [k for _, k in rows if "session" not in k["after"]]
+    assert [(k["ip"], k["after"]) for k in folded] == [("2001:db8::2", {"count": 1})]
+
+
+def test_a_malformed_host_past_the_budget_is_still_counted(gate):
+    """Past the noise budget a malformed Host was quiet and noted nothing, so
+    a probe for the Host-steering class left no trace at all."""
+    app, _, _ = gate
+    client = TestClient(app, client=("192.0.2.77", 1))
+    for _ in range(authz.NOISE_PER_ADDRESS_PER_MIN + 10):
+        r = client.get("/healthz", headers={"Host": "x#"})
+        assert (r.status_code, r.json()["error"]["code"]) == (400, "invalid_host")
+    ctx = app.state.ctx
+    assert ctx.secevents.close()
+    entries, _ = ctx.auth_stores.auth.audit_page(action=AuditAction.EDGE_REFUSED.value)
+    rows = [e for e in entries if e.ip == "192.0.2.77"]
+    assert any(e.after.get("code") == "invalid_host" for e in rows)
+    assert sum(e.after["count"] for e in rows) >= 10
+
+
+def test_a_folded_count_row_names_a_real_address():
+    """The count row a prune writes for a /64 used to carry the CIDR as its
+    ip, which no search by address ever matches."""
+    import ipaddress
+
+    from control_plane.gateway import secevents
+
+    now = [0.0]
+    rows: list[tuple] = []
+    events = secevents.SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: now[0])
+    events.note(AuditAction.KEY_REFUSED, actor="-", ip="2001:db8:5:6::1")
+    events.note(AuditAction.KEY_REFUSED, actor="-", ip="2001:db8:5:6::2")  # folded
+    events._pruned_at = -1e9
+    now[0] = 11 * secevents.WINDOW_S
+    for i in range(secevents._PRUNE_AT + 1):
+        events.note(AuditAction.KEY_REFUSED, actor="-", ip=f"10.1.{i // 256}.{i % 256}")
+    assert events.flush()
+    pending = [k for _, k in rows if k["after"].get("bucket") == "2001:db8:5:6::/64"]
+    assert len(pending) == 1 and pending[0]["after"]["count"] == 1
+    assert ipaddress.ip_address(pending[0]["ip"]) == ipaddress.ip_address("2001:db8:5:6::2")
+
+
+def test_closing_writes_the_counts_no_row_has_reported():
+    """Folded repeats were reported only by a prune or an eviction, and the
+    writer is a daemon thread: a flood that stopped before a restart lost its
+    last minute's count."""
+    from control_plane.gateway.secevents import SecurityEvents
+
+    rows: list[tuple] = []
+    events = SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
+    for _ in range(3):
+        events.note(AuditAction.SESSION_REFUSED, actor="-", ip="10.0.0.1")
+    assert events.close()
+    assert [k["after"]["count"] for _, k in rows] == [1, 2]
+
+
+def test_tracked_triples_are_capped_and_a_pending_count_survives_eviction(monkeypatch):
+    from control_plane.gateway import secevents
+
+    monkeypatch.setattr(secevents, "_SEEN_MAX", 10)
+    rows: list[tuple] = []
+    events = secevents.SecurityEvents(lambda *a, **k: rows.append((a, k)), clock=lambda: 0.0)
+    for i in range(10):
+        events.note(AuditAction.SESSION_REFUSED, actor="-", ip=f"10.0.0.{i}")
+        events.note(AuditAction.SESSION_REFUSED, actor="-", ip=f"10.0.0.{i}")  # folded
+    events.note(AuditAction.SESSION_REFUSED, actor="-", ip="10.0.1.1")  # evicts 10.0.0.0
+    assert events.flush()
+    assert len(events._seen) == 10
+    first = [k["after"]["count"] for _, k in rows if k["ip"] == "10.0.0.0"]
+    assert first == [1, 1]  # its row, then the folded repeat reported on eviction

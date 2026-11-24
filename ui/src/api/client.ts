@@ -511,11 +511,13 @@ export interface Backend {
   orgs(): Promise<OrgRow[]>
   /** Disable every active key of the org, admin keys included. */
   disableOrgKeys(orgId: string, reason?: string): Promise<{ disabled: string[] }>
-  enableKey(keyId: string): Promise<ApiKeyRow>
+  /** Needs the signed-in admin's `currentPassword`: a key disabled because it
+   *  leaked is a credential again the moment it is enabled. */
+  enableKey(keyId: string, currentPassword: string): Promise<ApiKeyRow>
   /** Replaces the secret and reveals the new one, once. The old one stops
-   *  working immediately. An admin key also needs the signed-in admin's
-   *  `currentPassword`; other keys ignore it. */
-  rotateKey(keyId: string, currentPassword?: string): Promise<MintedKey>
+   *  working immediately. Needs the signed-in admin's `currentPassword` for
+   *  every key: a stolen session alone must not mint a credential. */
+  rotateKey(keyId: string, currentPassword: string): Promise<MintedKey>
   /** This cycle only: the override is gone when the cycle ends. */
   raiseLimit(keyId: string, limitType: string, value: number): Promise<LimitState>
   resetCycle(keyId: string): Promise<void>
@@ -644,7 +646,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 /** `req` without `scrub()`. Used by exactly three calls -- `setupAdmin`,
- *  `createKey`, `rotateKey` -- because their whole answer is a `drt_` secret
+ *  `createKey`, `rotateKey` -- because their whole answer is a `derate-` secret
  *  shown once (redact.ts names the exception). Nothing else may use it. */
 async function reqUnscrubbed<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetchOk(path, init)
@@ -1665,11 +1667,12 @@ export const httpBackend: Backend = {
   orgs: () => req<OrgRow[]>('/api/orgs'),
   disableOrgKeys: (orgId, reason) =>
     req<{ disabled: string[] }>(`/api/orgs/${seg(orgId)}/keys/disable`, post(reason ? { reason } : {})),
-  enableKey: (keyId) => req<ApiKeyRow>(`/api/keys/${seg(keyId)}/enable`, post()),
+  enableKey: (keyId, currentPassword) =>
+    req<ApiKeyRow>(`/api/keys/${seg(keyId)}/enable`, post({ current_password: currentPassword })),
   rotateKey: (keyId, currentPassword) =>
     reqUnscrubbed<MintedKey>(
       `/api/keys/${seg(keyId)}/rotate`,
-      post(currentPassword ? { current_password: currentPassword } : undefined),
+      post({ current_password: currentPassword }),
     ),
   raiseLimit: (keyId, limitType, value) =>
     req<LimitState>(`/api/keys/${seg(keyId)}/raise`, post({ limit_type: limitType, value })),

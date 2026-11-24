@@ -43,8 +43,13 @@ def data_dir(tmp_path):
     svc.audit("root", AuditAction.SETTINGS_CHANGED, "settings", "routing_policy", ip="10.0.0.5",
               request_id="r-bbbbbbbbbbbb", user_agent="drill/1", session_id=sess.session_id[:12], status=200)
     clock.t += 10
-    svc.audit("drt_badbadbadb", AuditAction.KEY_REFUSED, "security", "", ip="203.0.113.9",
+    svc.audit("derate-badbadbadb", AuditAction.KEY_REFUSED, "security", "", ip="203.0.113.9",
               request_id="r-cccccccccccc", after={"count": 1})
+    clock.t += 1
+    # Rows written before the prefix changed name the key as ``drt_<id>``
+    # (an audit actor) and ``key:drt_<id>`` (an access row's who, below).
+    svc.audit("drt_abcdefghij", AuditAction.KEY_REFUSED, "security", "", ip="203.0.113.9",
+              request_id="r-ffffffffffff", after={"count": 1})
     svc.close()
 
     (tmp_path / "telemetry").mkdir()
@@ -60,6 +65,16 @@ def data_dir(tmp_path):
             ("r-dddddddddddd", T0 + 15, 200, "abcdefghij", "10.0.0.7", "drill/2"),
             ("r-eeeeeeeeeeee", T0 + 25, 200, "abcdefghij", "10.0.0.7", "drill/2"),
         ],
+    )
+    archive.execute(
+        "CREATE TABLE access(request_id TEXT, ts REAL, client_ip TEXT, client_port INTEGER,"
+        " peer_ip TEXT, who TEXT, method TEXT, path TEXT, query TEXT, status INTEGER,"
+        " user_agent TEXT, node_id TEXT)"
+    )
+    archive.execute(
+        "INSERT INTO access VALUES('r-gggggggggggg', ?, '10.0.0.7', 41000, '10.0.0.7',"
+        " 'key:drt_abcdefghij', 'GET', '/v1/models', '', 200, 'drill/2', 'n1')",
+        (T0 + 26,),
     )
     archive.commit()
     archive.close()
@@ -91,8 +106,10 @@ def test_filters_by_ip_key_actor_and_request_id(data_dir):
         return [json.loads(x) for x in _run(*base, *extra)[1].splitlines()][:-1]
 
     assert {e["ip"] for e in events("--ip", "10.0.0.7")} == {"10.0.0.7"}
-    assert [e["request_id"] for e in events("--key", "drt_abcdefghij")] == ["r-dddddddddddd", "r-eeeeeeeeeeee"]
-    assert [e["source"] for e in events("--key", "drt_badbadbadb")] == ["audit"]
+    assert [e["request_id"] for e in events("--key", "derate-abcdefghij")] == [
+        "r-dddddddddddd", "r-eeeeeeeeeeee", "r-gggggggggggg", "r-ffffffffffff",
+    ]
+    assert [e["source"] for e in events("--key", "derate-badbadbadb")] == ["audit"]
     assert {e["actor"] for e in events("--actor", "root")} == {"root"}
     assert [e["what"] for e in events("--request-id", "r-bbbbbbbbbbbb")] == [
         "settings_changed settings:routing_policy -> 200"
@@ -119,4 +136,15 @@ def test_text_report_ends_with_the_chain_and_a_tampered_row_fails(data_dir):
 def test_parse_time_accepts_rfc3339_and_epoch():
     assert forensics.parse_time("1800000000") == T0
     assert forensics.parse_time("2027-01-15T08:00:00Z") == forensics.parse_time("2027-01-15T08:00:00+00:00")
+    assert forensics.key_id_of("derate-abcdefghij_secretpart") == "abcdefghij"
     assert forensics.key_id_of("drt_abcdefghij_secretpart") == "abcdefghij"
+
+
+def test_a_legacy_drt_actor_is_found_by_either_spelling_of_the_key(data_dir):
+    """Rows written before 2026-11-22 name ``drt_<id>`` / ``key:drt_<id>``;
+    the investigator has a ``derate-`` key or a bare id, and must find them."""
+    base = ("--since", str(T0 - 1), "--data-dir", str(data_dir), "--format", "jsonl")
+    for key in ("derate-abcdefghij", "abcdefghij", "drt_abcdefghij"):
+        rows = [json.loads(x) for x in _run(*base, "--key", key)[1].splitlines()][:-1]
+        found = {e["request_id"] for e in rows}
+        assert {"r-ffffffffffff", "r-gggggggggggg"} <= found, key

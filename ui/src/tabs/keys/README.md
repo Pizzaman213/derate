@@ -1,6 +1,6 @@
 # keys
 
-The Keys pane of Usage: `/usage/keys` lists every `drt_` API key, `/usage/keys/<key id>` is one
+The Keys pane of Usage: `/usage/keys` lists every `derate-` API key, `/usage/keys/<key id>` is one
 key's page. Everything comes from `GET /api/keys` and `GET /api/keys/{key_id}`
 (limit states, 30-day requests/tokens/cost), `GET /api/usage` and
 `GET /api/keys/{key_id}/requests`; nothing here computes a figure the server
@@ -8,7 +8,10 @@ did not send.
 
 A secret is drawn in exactly one place, `components/RevealModal`, after
 `POST /api/keys` or `POST /api/keys/{key_id}/rotate` -- the two key responses
-`client.ts` fetches unscrubbed. It is dropped on "I saved it".
+`client.ts` fetches unscrubbed. It is dropped on "I saved it". Both ask for the
+signed-in admin's password (`current_password`) on every call, so a stolen
+session alone cannot mint a credential: the create form, every rotate and the
+Models screen's "Create a key for this model" each carry a password field.
 
 ## Layout
 

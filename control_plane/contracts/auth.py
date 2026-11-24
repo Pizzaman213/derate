@@ -2,7 +2,7 @@
 
 The gateway used to answer anyone who could reach it. These are the shapes the
 four services that close that agree on -- ``control_plane/auth`` (admins,
-sessions, the audit log), ``control_plane/keys`` (orgs and ``drt_`` keys),
+sessions, the audit log), ``control_plane/keys`` (orgs and ``derate-`` keys),
 ``control_plane/limits`` (cycle counters, rate windows, local pricing) -- and
 the ``Principal`` the gateway attaches to every request it lets through.
 
@@ -27,9 +27,10 @@ from typing import Protocol, runtime_checkable
 from .routing import RoutingPolicy
 from .telemetry import CostBasis
 
-#: ``drt_<key_id>_<secret>``: the prefix, a 10-char ``[a-z0-9]`` id to look the
-#: row up by, and ``secrets.token_urlsafe(KEY_SECRET_BYTES)`` stored as sha256.
-KEY_PREFIX = "drt_"
+#: ``derate-<key_id>_<secret>``: the prefix, a 10-char ``[a-z0-9]`` id to look
+#: the row up by, and ``secrets.token_urlsafe(KEY_SECRET_BYTES)`` stored as
+#: sha256. Keys minted as ``drt_...`` before 2026-11-22 no longer parse.
+KEY_PREFIX = "derate-"
 KEY_ID_LEN = 10
 KEY_SECRET_BYTES = 32
 #: The only expiries a key can be created with. ``None`` (never) is reserved
@@ -70,6 +71,21 @@ LOGIN_PASSWORD_MAX_LEN = 1024
 #: cannot fill the thread pool every other ``to_thread`` caller waits on.
 LOGIN_INFLIGHT_PER_IP = 2
 VERIFY_INFLIGHT_MAX = 4
+#: /v1 requests presenting one key id from one client address (an IPv6 /64
+#: counts as one) are answered 429 without a key lookup once that key id was
+#: refused this many times from there inside the last minute. The budget is
+#: the pair's, so a stale key never locks its neighbours on a NAT out.
+KEY_REFUSALS_PER_ADDRESS_PER_MIN = 20
+#: ...and EVERY key id from that address is, once this many keys of any id
+#: were refused from there inside the last minute -- except a key id that
+#: authenticated from that address inside the window, which is still checked.
+KEY_REFUSALS_PER_ADDRESS_ANY_KEY_PER_MIN = 200
+#: The rpm a key is held to when it names none (its org's rpm, if any, is
+#: still checked at the org scope). No key is unlimited by omission.
+DEFAULT_KEY_RPM = 120
+#: The concurrent requests a key is held to when it names none. One key
+#: otherwise could hold every connection a backend's pool has (64).
+DEFAULT_KEY_MAX_CONCURRENT = 16
 
 #: A limit at or above this fraction of its effective value is "near".
 NEAR_LIMIT_FRACTION = 0.8
@@ -138,6 +154,14 @@ class AuthErrorCode(str, Enum):
     MODEL_NOT_ALLOWED = "model_not_allowed"
     #: ``POST /api/setup/admin`` from anywhere but the coordinator's loopback.
     SETUP_LOCAL_ONLY = "setup_local_only"
+    #: Anything but ``/v1/**`` on the edge listener (``DERATE_EDGE_PORT``).
+    EDGE_NOT_FOUND = "not_found"
+    #: An edge request whose ``DERATE_EDGE_CLIENT_HEADER`` holds no IP address.
+    EDGE_CLIENT_UNKNOWN = "edge_client_unknown"
+    #: A chat body's media URL names a non-public host.
+    MEDIA_URL_REFUSED = "media_url_refused"
+    #: A ``Host`` header that is not a host[:port], on either listener.
+    INVALID_HOST = "invalid_host"
 
 
 class AuditAction(str, Enum):
@@ -194,6 +218,9 @@ class AuditAction(str, Enum):
     SETUP_REFUSED = "setup_refused"
     JOIN_REJECTED = "join_rejected"
     CROSS_ORIGIN_REFUSED = "cross_origin_refused"
+    #: An address past its noise budget kept asking the edge for something it
+    #: does not serve; one folded row per address bucket per minute counts it.
+    EDGE_REFUSED = "edge_refused"
     #: A live session was used from an address or user agent it was not last seen on.
     SESSION_IP_CHANGED = "session_ip_changed"
     #: The audit hash chain failed verification (actor ``system``).
@@ -654,6 +681,7 @@ class LimitPort(Protocol):
         body: dict,
         now: float | None = None,
         route_limits: dict | None = None,
+        remote_rates: tuple[float, float] | None = None,
     ) -> tuple[LimitDecision, Reservation | None]: ...
     def settle(
         self, reservation: Reservation, actuals: UsageActuals | None, *, now: float | None = None
