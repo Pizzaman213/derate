@@ -86,8 +86,18 @@ FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb
 # it. This layer already resolves to whatever is current, so the upgrade costs
 # no reproducibility it had.
 #
+# APT_REFRESH busts this layer: CI builds with `cache-from: type=gha`, and a
+# cached layer never resolves packages again -- krb5 (pulled in by the
+# installs below) sat at deb13u1 after deb13u2 shipped and the scan failed on
+# it. The workflows pass the UTC day, so the layer re-resolves at most once a
+# day. Unset locally, which caches as before. A fix Debian ships after the
+# day's first CI build is picked up the next UTC day; re-running a workflow
+# the same day reuses the same layer.
+#
 # The base image's own pip goes too, for the reason given in the deps stage.
-RUN apt-get update \
+ARG APT_REFRESH=""
+RUN : "apt refresh ${APT_REFRESH}" \
+ && apt-get update \
  && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
       openssh-client \

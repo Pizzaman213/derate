@@ -1,4 +1,10 @@
 #!/bin/sh
 # Enable once per clone:  git config core.hooksPath .githooks
 # Runs the mechanical validation gate; a red gate blocks the push.
-exec npm --prefix "$(git rev-parse --show-toplevel)/.omp" run validate
+top="$(git rev-parse --show-toplevel)"
+# Git exports GIT_DIR to a hook run from a linked worktree. Inherited by the
+# gate, it makes every `git` there treat the cwd (.omp) as the top level: the
+# base diff names 1298 files and every step fails in a second. The gate finds
+# the repository from its own cwd, so let it.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+exec npm --prefix "$top/.omp" run validate
