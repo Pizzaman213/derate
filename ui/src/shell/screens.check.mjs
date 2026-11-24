@@ -1,4 +1,4 @@
-// requires: browser coordinator -- it opens the real screens in a real browser
+// requires: browser coordinator python -- it opens the real screens in a real browser
 //
 // The first verifier in this repo that looks at a screen.
 //

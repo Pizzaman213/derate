@@ -1,0 +1,8 @@
+{
+  "budget": {
+    "tests/unit/test_gateway.py": {
+      "max": 7544,
+      "reason": "CI-flake fix for test_memory_pressure_never_kills_in_flight_work (wait for the held request, try/finally): record 7536 + 8 lines of this change"
+    }
+  }
+}

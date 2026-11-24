@@ -654,19 +654,24 @@ and two mockup trees that are tracked in git, never built and never served.
 ## `check.mjs`
 
 The runner, and the reason `npm run check` means something. `walk(src)` recurses
-for `*.check.mjs` and sorts what it finds -- 24 verifiers today -- because a
+for `*.check.mjs` and sorts what it finds -- 59 verifiers today -- because a
 hard-coded list stops covering a verifier the moment somebody adds or renames
 one, which is the same failure as not having the verifier at all. The list it
 replaced lived in the project's working notes and had drifted to naming ten of
 the seventeen then in the tree, several of which were not in the repo.
 
-`requirement()` reads the first 4096 bytes of each file for a `// requires:`
-line. `coordinator` fetches `$DERATE_CHECK_ORIGIN/api/topology` (default
+`requirements()` reads the first 4096 bytes of each file for a `// requires:`
+line and `src/check/requires.mjs` parses it (pinned by `requires.check.mjs`).
+Every word before a `--` is a requirement (`browser coordinator` is two), and
+the first one that is not met decides, with an unknown word, which is fatal,
+winning over a skip; an empty line or a bare `fixtures` is such a word.
+`coordinator` fetches `$DERATE_CHECK_ORIGIN/api/topology` (default
 `http://localhost:8088`) on a 2 s `AbortSignal.timeout`; `python` runs
 `python3 -c 'import sys'`; `browser` calls `findBrowser()`; `fixtures $NAME`
-asks whether that variable is set; no line at all means hermetic. Ten verifiers
-declare something, fourteen declare nothing. Each requirement is probed once and
-memoised by key, so six coordinator verifiers cost one request.
+asks whether that variable is set; no line at all means hermetic. Sixteen
+verifiers declare something, forty-three declare nothing. Each requirement is
+probed once and memoised by key, so thirteen coordinator verifiers cost one
+request.
 
 Three behaviours are load-bearing. **An unknown requirement is `fatal` -- a
 FAIL, never a skip**: somebody invented a word, and quietly not running the file
@@ -859,14 +864,13 @@ peer's in-flight type error in a file you never touched. Running the bundler
 alone tells you whether the breakage is yours. It is not a substitute for the
 gate -- it emits a `dist/` from code `tsc -b` would refuse.
 
-**A verifier declares one requirement, and `screens.check.mjs` needs three.**
-The `// requires:` grammar is one word plus an optional argument, and the
-argument is only read by `fixtures`. `// requires: browser coordinator` at the
-top of `src/shell/screens.check.mjs` therefore probes the browser and caches the
-answer under the key `browser:coordinator`; the coordinator half is never
-probed, and the python3 it shells out to for the server's own `Redactor` is not
-declared at all. On a machine with a browser and no gateway that verifier fails
-from its own `fetch` rather than skipping.
+**A verifier may declare several requirements, and must declare all of them.**
+Until 2026-11-24 the grammar was one word plus an argument, so
+`// requires: browser coordinator` probed only the browser and the coordinator
+half never ran: with no login those verifiers failed from their own `fetch`
+rather than skipping. `src/shell/screens.check.mjs` now declares
+`browser coordinator python`, the last for the python3 it shells out to for the
+server's own `Redactor`.
 
 **The `screens/` PNGs are the only thing here that sees what shipped.** Every
 other verifier checks a pure function -- the URL scheme, the graph layout, the

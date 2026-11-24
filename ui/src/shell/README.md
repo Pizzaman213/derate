@@ -116,7 +116,7 @@ effect on every destination and not only on the one that owns the control.
 
 ## `screens.check.mjs`
 
-`// requires: browser coordinator` -- the first verifier in this repo that
+`// requires: browser coordinator python` -- the first verifier in this repo that
 looks at a screen, and the only thing in the project that sees what shipped
 rather than inferring it from source. Every other `*.check.mjs` checks a pure
 function: the URL scheme, the graph layout, the quantization ladder, the QR

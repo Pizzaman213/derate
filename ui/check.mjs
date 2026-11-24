@@ -39,6 +39,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { findBrowser } from './src/check/browser.mjs'
+import { parseRequires } from './src/check/requires.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const roots = [join(here, 'src'), join(here, '..', '.omp', 'tests', 'ui')].filter(existsSync)
@@ -62,16 +63,8 @@ function walk(dir) {
 
 const all = roots.flatMap(walk).sort()
 
-/** The `// requires:` line, if the file has one. No line means hermetic --
- *  needs nothing but this checkout -- which is the safe default: a verifier
- *  that forgets to declare a dependency FAILS loudly on a machine without it,
- *  rather than being silently skipped everywhere forever. */
-function requirement(file) {
-  const head = readFileSync(file, 'utf8').slice(0, 4096)
-  const m = head.match(/^\/\/ requires:\s*(\S+)(?:\s+(\S+))?/m)
-  if (!m) return { kind: 'hermetic' }
-  return { kind: m[1], arg: m[2] }
-}
+/** The `// requires:` line as a list; the grammar is in src/check/requires.mjs. */
+const requirements = (file) => parseRequires(readFileSync(file, 'utf8').slice(0, 4096))
 
 // ── probes: asked once, not once per verifier ────────────────────────────────
 
@@ -79,7 +72,9 @@ const probes = {}
 
 async function probe(kind, arg) {
   const key = arg ? `${kind}:${arg}` : kind
-  if (key in probes) return probes[key]
+  // Own keys only: `// requires: constructor` must reach the unknown-word
+  // branch, not find Object.prototype.constructor here and skip.
+  if (Object.hasOwn(probes, key)) return probes[key]
 
   let result
   if (kind === 'hermetic') {
@@ -115,7 +110,7 @@ async function probe(kind, arg) {
     const b = findBrowser()
     result = b.path ? { ok: true } : { ok: false, why: b.why }
   } else if (kind === 'fixtures') {
-    result = process.env[arg]
+    result = Object.hasOwn(process.env, arg) && process.env[arg]
       ? { ok: true }
       : { ok: false, why: `$${arg} is not set` }
   } else {
@@ -152,8 +147,10 @@ const skipped = []
 
 for (const file of chosen) {
   const rel = relative(here, file)
-  const req = requirement(file)
-  const p = await probe(req.kind, req.arg)
+  const met = []
+  for (const r of requirements(file)) met.push(await probe(r.kind, r.arg))
+  // A fatal one (an unknown word) wins over a skippable one.
+  const p = met.find((x) => x.fatal) ?? met.find((x) => !x.ok) ?? { ok: true }
 
   if (!p.ok && !strict && !p.fatal) {
     skipped.push({ rel, why: p.why })

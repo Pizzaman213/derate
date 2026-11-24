@@ -22,7 +22,7 @@ agents and `RULES.md` automatically when started in the repo root.
 | `rules/validation.md` | the always-on end-of-task gate and review requirement | omp |
 | `scripts/validate.mjs` | `npm run validate`: the mechanical gate (also run by `.githooks/pre-push`) | node |
 | `line-budget.json` | files over their budget, recorded at current size; the gate stops them growing (`npm run validate -- --update-budget`) | node |
-| `validate.allow.json` | optional: `duplicate-names` and `paths` the gate must ignore | node |
+| `validate.allow.json` | optional: `duplicate-names` and `paths` the gate must ignore, and `budget` caps for a change's own deliberate growth (record + this change's lines, with a reason) | node |
 | `rules/chart-pack.md`, `RULES.md` | the maintenance rules, sticky in every session | omp |
 | `work/auth-keys/sets/*.json` | route and limit sets read by `tests/unit/` in the Python suite | — |
 
