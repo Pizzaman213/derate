@@ -53,6 +53,10 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # The UTC day, so the Dockerfile's cached apt layer re-runs its upgrade.
+      - id: day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
       # amd64, native on the runner. SKIP_UI=1 because the UI stage ships only
       # static files into the final image -- no packages for a scanner to find
       # -- and skipping it saves the npm install.
@@ -65,6 +69,7 @@ jobs:
           tags: derate-node:scan
           build-args: |
             SKIP_UI=1
+            APT_REFRESH=${{ steps.day.outputs.day }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

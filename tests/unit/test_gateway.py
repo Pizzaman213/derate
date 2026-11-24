@@ -3522,19 +3522,27 @@ def test_memory_pressure_never_kills_in_flight_work():
 
             worker = threading.Thread(target=in_flight)
             worker.start()
-            time.sleep(0.3)  # let it reach the backend and block there
+            try:
+                # Wait until the backend HAS it, never a fixed sleep: on a slow
+                # runner 0.3 s was not enough, the pressure arrived first, and
+                # the request was refused at admission -- a 503 read as a kill.
+                deadline = time.time() + 10
+                while not any(HOLD_MARKER in json.dumps(b) for b in backend.requests):
+                    if time.time() > deadline:
+                        raise AssertionError("the held request never reached the backend")
+                    time.sleep(0.01)
 
-            registry.set_memory_pct("spark-01", 97.0)
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                if client.post("/v1/chat/completions", json=payload).status_code == 503:
-                    break
-                time.sleep(0.02)
-            else:
-                raise AssertionError("new admissions were not stopped")
-
-            backend.hold.set()  # release the in-flight request
-            worker.join(timeout=15)
+                registry.set_memory_pct("spark-01", 97.0)
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    if client.post("/v1/chat/completions", json=payload).status_code == 503:
+                        break
+                    time.sleep(0.02)
+                else:
+                    raise AssertionError("new admissions were not stopped")
+            finally:
+                backend.hold.set()  # release the in-flight request, even on failure
+                worker.join(timeout=15)
 
     assert results == [200], "an in-flight request was killed by memory pressure"
 

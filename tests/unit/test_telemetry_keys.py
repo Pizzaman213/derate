@@ -8,7 +8,6 @@ import csv
 import io
 import json
 import sqlite3
-import subprocess
 from dataclasses import fields
 from pathlib import Path
 
@@ -152,12 +151,8 @@ def test_reemitted_row_replaces(tmp_path):
 
 
 def _v1_schema() -> str:
-    src = subprocess.run(
-        ["git", "show", "HEAD:control_plane/telemetry/archive.py"],
-        cwd=ROOT, capture_output=True, text=True, check=True,
-    ).stdout
-    start = src.index('_SCHEMA = """') + len('_SCHEMA = """')
-    return src[start: src.index('"""', start)]
+    # Frozen copy of the v1 schema; see the fixture's header.
+    return (ROOT / "tests/fixtures/telemetry_archive_v1.sql").read_text()
 
 
 def test_migration_from_v1_keeps_rows_and_adds_columns(tmp_path):
