@@ -15,7 +15,7 @@ inspector here owns its own header row: the lamp, the label, and Close.
 | File | Lines | What it owns |
 |---|---|---|
 | `DeploymentInspector.tsx` | 546 | what a launch is doing, and what a serving model is doing — the whole deployment sheet |
-| `DeploymentLog.tsx` | 155 | the backend's own log, in its own sticky column of that sheet |
+| `DeploymentLog.tsx` | 161 | the backend's own log, in its own sticky column of that sheet |
 | `node/` | 13 files, 1890 lines | the node page, rendered as sheet contents. Its own README |
 
 ## `DeploymentInspector.tsx`
@@ -116,7 +116,10 @@ a 2000 ms `setTimeout`. `read` is one bounded `sparkrun logs` against a
 deployment nothing is following any more; that command tails *and follows*, so
 it has to be cut off rather than waited out, and putting it on a timer would
 mean a subprocess every two seconds for as long as the sheet is open. It is
-fetched once and refreshed by hand. `unavailable` is a third answer entirely —
+fetched once and refreshed by hand. A failed request (a 502, a coordinator
+restarting) keeps the 2000 ms beat when the last good answer was `buffer`, or
+when there has been none yet on a pane that opened itself (`autoOpen`), rather
+than stopping under a footer that still says "Live". `unavailable` is a third answer entirely —
 `internal_api.py` returns it when the deployments port has no callable
 `log_tail` — and it renders as "This control plane cannot read a backend log.",
 which is not the same fact as "the backend printed nothing".
@@ -206,9 +209,10 @@ knows whether the stop failed in `set_draining` or in the launcher.
   The bar draws open.
 - **`row.fraction` is not finite.** Treated as absent; the bar draws open.
   Finite values are clamped to `[0, 1]`.
-- **The log request throws.** The error replaces the `<pre>` and the poll stops
-  — `load()` sets `error` and does not reschedule, so a failing endpoint is not
-  hammered every two seconds.
+- **The log request throws.** The error replaces the `<pre>`. The poll carries
+  on at 2 s only if the last good answer was `buffer` (or, before any answer,
+  the pane opened itself); after a `read` it stops, so a `sparkrun logs` is
+  never retried on a timer.
 - **The sheet closes or the deployment id changes mid-fetch.** The effect's
   `live` flag drops the answer and `clearTimeout` cancels the pending poll,
   so a stale response cannot land in a pane that has moved on.

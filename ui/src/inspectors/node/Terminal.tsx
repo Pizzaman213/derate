@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
+import type { DeploymentDTO } from '../../api/types'
 import type { FitAddon } from '@xterm/addon-fit'
 import type { Terminal as Xterm } from '@xterm/xterm'
 import { wsUrl } from '../../api/origin'
 import { useShellStatus } from '../../state/history'
 import { Verbatim } from '../../components/Verbatim'
 import { tokens } from '../../../../.omp/design/tokens/tokens.ts'
+import { DeploymentLog } from '../DeploymentLog'
 
 // The one dependency this UI takes that it could not have written, and it is
 // **loaded on demand**, not bundled. Both halves of that matter.
@@ -41,7 +43,20 @@ function keyIsCarriable(key: string): boolean {
   return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(key)
 }
 
-export function NodeTerminal({ nodeId }: { nodeId: string }) {
+/** `launching`: this node's deployments still on their way in (planned or
+ *  launching). Their launch log -- the launcher's output, the weight
+ *  download's bar and rate included, then the container's -- leads this
+ *  section whether or not the shell is switched on, because "what is it doing"
+ *  is the question that sends somebody here, and it needs no shell to answer.
+ *  Each is named: every pane is headed "backend log", and two launches on one
+ *  machine would otherwise be indistinguishable. */
+export function NodeTerminal({
+  nodeId,
+  launching = [],
+}: {
+  nodeId: string
+  launching?: Pick<DeploymentDTO, 'deployment_id' | 'served_name'>[]
+}) {
   const status = useShellStatus()
   const [phase, setPhase] = useState<Phase>('closed')
   const [key, setKey] = useState('')
@@ -184,10 +199,20 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
     setError(null)
   }
 
+  const launchLogs = launching.map((d) => (
+    <div key={d.deployment_id}>
+      <div className="unit mono" style={{ marginBottom: 'var(--space-4)' }}>
+        {d.served_name}
+      </div>
+      <DeploymentLog deploymentId={d.deployment_id} />
+    </div>
+  ))
+
   if (status.data && !status.data.enabled) {
     return (
       <>
         <div className="sub">terminal</div>
+        {launchLogs}
         <div className="unit">
           {status.data.reason ||
             'The shell is switched off. Set DERATE_SHELL=1 on the coordinator and on the node to turn it on.'}
@@ -199,6 +224,7 @@ export function NodeTerminal({ nodeId }: { nodeId: string }) {
   return (
     <>
       <div className="sub">terminal</div>
+      {launchLogs}
 
       {phase === 'closed' || phase === 'loading' ? (
         <>

@@ -51,6 +51,7 @@ test are readable, and it is the one convention a new file must keep.
 | `test_integration_kv.py` | 70 | three packages must charge the same MLA cache width |
 | `test_inventory.py` | 476 | the model registry's five-source merge and the ways it could quietly lie |
 | `test_inventory_api.py` | 167 | `GET /api/models` on the wire, and what it must not shadow |
+| `test_launch_log_lines.py` | 199 | the launch log a screen polls mid-download: the byte bar with its rate, one clean frame per bar, a step header glued onto a frame kept, a second download not erasing the first, a bar at 99.5% still one line, `buffer` before the first line, and a failure's output without the frames |
 | `test_links.py` | 930 | link measurement: a subtly wrong figure, and a figure honest about guessing |
 | `test_live_memory.py` | 806 | the live-memory budget, from the gate to the capacity answer |
 | `test_load.py` | 109 | three SLO guards derived from what the load harness measured |

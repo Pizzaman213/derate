@@ -64,6 +64,7 @@ guessed:
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 #: The phases a launch goes through, in order. `serving` is not set from a log
@@ -328,7 +329,7 @@ _RUNTIME_FATAL: tuple[str, ...] = (
 
 #: One sentence naming the cause of a launch failure and the fix, chosen by a
 #: literal marker in the launcher's output -- same stance as _RUNTIME_FATAL:
-#: markers, never inference. The raw output is kept beneath it, verbatim.
+#: markers, never inference. The output is kept beneath it, frames collapsed.
 DOCKER_UNREACHABLE = (
     "Docker is not reachable from this node, so sparkrun cannot start the runtime "
     "container. In a container, mount the host's socket and restart: "
@@ -366,6 +367,106 @@ def _lines(text: str) -> list[str]:
         if stripped:
             out.append(stripped)
     return out
+
+
+#: A CSI escape. Forced onto a pipe (`TQDM_POSITION=-1`, sparkrun.py
+#: `_launch_env`), tqdm ends every frame with a cursor-up `\x1b[A` and no
+#: newline, so the next print -- `[3/6] Distributing model` -- lands on the
+#: same line. The cursor-up is therefore a line END, and every other escape
+#: is a stray glyph on a screen.
+_CURSOR_UP_RE = re.compile(r"\x1b\[\d*A")
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+#: tqdm's closing `[{elapsed}<{remaining}, {rate}]`, or `[{elapsed}, {rate}]`
+#: for a bar with no total yet -- huggingface_hub's byte bar starts as
+#: `Downloading (incomplete total...): 0.00B [00:00, ?B/s]` and ends as
+#: `Download complete: : 998MB [00:10, 145MB/s]`, neither with a `%|`.
+_TQDM_TAIL_RE = re.compile(r"\[\d+:\d{2}(?::\d{2})?(?:<[^\],\[]*)?, [^\]\[]*\]")
+
+
+def clean_lines(text: str) -> list[str]:
+    """*text* as the lines a terminal showed: split at newlines and at tqdm's
+    cursor-up, other escapes and trailing whitespace stripped, blanks gone."""
+    out: list[str] = []
+    for part in _CURSOR_UP_RE.split(text):
+        for raw in part.splitlines():
+            line = _CSI_RE.sub("", raw).rstrip()
+            if line.strip():
+                out.append(line)
+    return out
+
+
+def bar_desc(line: str) -> str | None:
+    """The description in front of a tqdm frame, or None if this is not one.
+
+    `Fetching 16 files:  19%|...` and `Downloading (incomplete total...):
+    45%|...` are bars redrawn frame after frame; everything before the first
+    colon is what identifies which bar it is. The closing bracket is found
+    with `rfind` and matched from there, so a hostile line costs one pass.
+    """
+    line = line.rstrip()
+    if "%|" not in line:
+        start = line.rfind("[")
+        if start < 0 or not line.endswith("]") or not _TQDM_TAIL_RE.fullmatch(line, start):
+            return None
+    head, sep, _ = line.partition(":")
+    return head.strip() if sep else None
+
+
+#: How far back a frame may look for the earlier frame of its own bar.
+#: huggingface_hub draws two at once -- the file count and, forced onto a
+#: pipe, the bytes -- so the previous line is usually the OTHER bar.
+BAR_LOOKBACK = 4
+
+#: tqdm's elapsed field, the first thing inside a frame's closing bracket.
+_ELAPSED_RE = re.compile(r"\[(?:(\d+):)?(\d+):(\d{2})[<,]")
+
+
+def _elapsed(frame: str) -> int:
+    """Seconds in a frame's `[elapsed<...` / `[elapsed, ...`, or 0."""
+    m = _ELAPSED_RE.match(frame, max(0, frame.rfind("[")))
+    return int(m[1] or 0) * 3600 + int(m[2]) * 60 + int(m[3]) if m else 0
+
+
+def frame_slot(kept: Sequence[str], line: str) -> int | None:
+    """Where in *kept* the newest *line* overwrites an earlier frame of the
+    same bar, or None to append it.
+
+    Walks back through a run of bar frames only: a frame never jumps above a
+    line that was printed after it, so the log still reads in order. A bar
+    that is done -- at 100%, or past its total so tqdm dropped the percent,
+    which is how huggingface_hub's byte bar always ends (gzip-served files
+    add bytes and no total) -- whose elapsed clock then RESTARTS is a new bar
+    under the same name: a target and its speculative head download back to
+    back with nothing printed between, and the first one's totals survive.
+    `100%|` mid-download (tqdm prints it from 99.5%) keeps collapsing.
+    """
+    bar = bar_desc(line)
+    if bar is None:
+        return None
+    for i in range(len(kept) - 1, max(-1, len(kept) - 1 - BAR_LOOKBACK), -1):
+        held = bar_desc(kept[i])
+        if held is None:
+            return None
+        if held == bar:
+            done = "100%|" in kept[i] or "%|" not in kept[i]
+            return None if done and _elapsed(line) < _elapsed(kept[i]) else i
+    return None
+
+
+def collapse_frames(text: str) -> str:
+    """*text* as `frame_slot` would keep it: `clean_lines`, then each bar at
+    its newest frame. For a launcher's WHOLE output kept as a failure's
+    evidence -- with the byte bar on, an 1800 s download is ~2 MB of frames
+    that would otherwise land verbatim in `last_error`."""
+    kept: list[str] = []
+    for line in clean_lines(text):
+        slot = frame_slot(kept, line)
+        if slot is None:
+            kept.append(line)
+        else:
+            kept[slot] = line
+    return "\n".join(kept)
 
 
 def _fraction(line: str) -> float | None:

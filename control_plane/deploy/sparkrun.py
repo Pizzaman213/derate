@@ -189,7 +189,7 @@ class LaunchError(RuntimeError):
     """A launch that did not produce a usable backend.
 
     Carries the raw sparkrun output so it can go into Deployment.last_error
-    unedited; an unparseable launch is a failure whose evidence we keep.
+    (bar frames collapsed, nothing else edited); a failure's evidence is kept.
     """
 
     def __init__(self, message: str, *, raw: str = "", oom: bool = False) -> None:
@@ -319,7 +319,7 @@ class SparkrunAdapter:
         env = self._subprocess_env()
         if trust_remote_code and not self.gated_probe(model_id):
             env = {k: v for k, v in env.items() if k not in HUB_TOKEN_NAMES}
-        return env
+        return {**env, "TQDM_POSITION": "-1"}  # the MB/s byte bar on a pipe: deploy/README.md
 
     # -- availability -----------------------------------------------------
 

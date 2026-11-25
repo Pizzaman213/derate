@@ -59,6 +59,11 @@ export function DeploymentLog({
     if (!open) return
     let live = true
     let timer = 0
+    // Whether to come back in 2 s: decided by the last good answer's source
+    // (only `buffer` is free). Until one arrives, a pane opened on its own is
+    // a launch being followed, so a failed request -- a 502, a coordinator
+    // restarting -- retries rather than leaving "Live" over a stopped pane.
+    let polling = autoOpen && nonce === 0
 
     const load = async () => {
       setPending(true)
@@ -68,20 +73,21 @@ export function DeploymentLog({
         setLogs(answer)
         setError(null)
         // Only the free source is polled. See the note above.
-        if (answer.source === 'buffer') timer = window.setTimeout(load, 2000)
+        polling = answer.source === 'buffer'
       } catch (e) {
         if (!live) return
         setError(e instanceof Error ? e.message : String(e))
       } finally {
         if (live) setPending(false)
       }
+      if (live && polling) timer = window.setTimeout(load, 2000)
     }
     void load()
     return () => {
       live = false
       window.clearTimeout(timer)
     }
-  }, [backend, deploymentId, open, nonce])
+  }, [backend, deploymentId, open, nonce, autoOpen])
 
   // Follow the tail, unless the reader has scrolled off it.
   useEffect(() => {
