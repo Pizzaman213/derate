@@ -362,10 +362,14 @@ total: multiplying the rate by the context is right for a dense model and
 over-charges a windowed one by multiples, which is why every term in
 `calculator.py` goes through the total.
 
-`kv_elem_bytes` reads `"auto"` as the model's own dtype only when that dtype is
-something a cache can be stored in; a model whose weights are mxfp4 still caches
-in bf16 or fp8. An unrecognised dtype falls back to `KV_FALLBACK_DTYPE` (bf16),
-over-estimating on purpose — the alternative is a gate that lets an OOM through.
+`kv_elem_bytes` prices `"auto"` -- the model's own -- at 16 bits and never reads
+`shape.dtype`, which is the WEIGHT scheme: an fp8- or int8-weight checkpoint
+still caches at bfloat16, and pricing it at one byte (as this did until
+2026-11-25) approved twice the context the engine could hold. A KV scheme the
+checkpoint's quantization config declares is not `auto` by the time it gets
+here: `gateway/kv_widths.py` names it explicitly. An unrecognised dtype falls
+back to `KV_FALLBACK_DTYPE` (bf16), over-estimating on purpose — the
+alternative is a gate that lets an OOM through.
 
 **The packed layouts are priced from the image's own page formulas, not from a
 width.** `int8/fp8/int4_per_token_head`, `nvfp4`, `nvfp4_4over6`, the four

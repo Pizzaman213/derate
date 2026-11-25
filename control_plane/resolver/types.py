@@ -234,6 +234,16 @@ class Resolution:
     #: GGUF, or one nobody read. The silicon gate looks it up in the probed
     #: image's minimum capabilities, and "" falls back to `QUANT_INFO`.
     quant_method: str = ""
+    #: The dtype the config says the model computes in (`bfloat16`,
+    #: `float16`, `float32`), from `quant_detect.compute_dtype`. Not `dtype`
+    #: above, which is the WEIGHT scheme: an fp8 checkpoint computes, and
+    #: caches, in bfloat16. "" when the config does not say, or for a GGUF.
+    compute_dtype: str = ""
+    #: The `--kv-cache-dtype` vLLM applies when told nothing, because the
+    #: checkpoint's quantization config declares a KV scheme (`fp8_e4m3`,
+    #: `nvfp4`, `fp8`), from `quant_detect.checkpoint_kv_dtype`; "" when it
+    #: declares none. `gateway/kv_widths.py` is what reads it.
+    checkpoint_kv_dtype: str = ""
     elapsed_ms: float = 0.0
 
     @property

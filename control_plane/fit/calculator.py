@@ -797,7 +797,7 @@ def memory_breakdown(
     if not is_known_kv_dtype(kv_dtype):
         warnings.append(
             f"unknown KV cache dtype {kv_dtype!r}; charging "
-            f"{kv_elem_bytes(kv_dtype, shape):.0f} bytes per element"
+            f"{kv_elem_bytes(kv_dtype):.0f} bytes per element"
         )
 
     tp = max(1, plan.tensor_parallel)

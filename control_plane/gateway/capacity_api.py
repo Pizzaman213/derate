@@ -1275,7 +1275,7 @@ def _runtimes_payload() -> list[dict]:
             # PLAIN width. A packed layout (per_token_head, nvfp4,
             # turboquant_*, *_ds_mla) has no per-element width -- its scales
             # and boundary layers depend on the model -- so it is absent here
-            # and priced per model in `/api/plan`'s `kv_dtype_ratios`.
+            # and priced per model by `gateway/kv_widths.py::choices` on /api/plan.
             "kv_dtype_bytes": {
                 name: KV_ELEM_BYTES[name]
                 for name in sorted(flags.VLLM_KV_CACHE_DTYPES)

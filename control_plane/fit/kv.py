@@ -38,7 +38,10 @@ from .constants import (
     RECURRENT_STATES_PER_SEQUENCE,
 )
 
-_MODEL_OWN = ("auto", "", "none", "model")
+#: Every spelling of "the model's own width, pass no flag". `fp16`/`bf16`/
+#: `half` are derate's own words for it (`settings.default_kv_dtype`,
+#: autoadopt); `float16`/`bfloat16` name a width (`gateway/kv_widths.py`).
+MODEL_OWN_KV_DTYPES = ("auto", "", "none", "model", "fp16", "bf16", "half")
 
 #: Every packed layout `per_layer_per_token_bytes` prices.
 PACKED_KV_DTYPES: frozenset[str] = frozenset(
@@ -57,24 +60,26 @@ def _key(kv_dtype: str | None) -> str:
     return (kv_dtype or "auto").strip().lower()
 
 
-def kv_elem_bytes(kv_dtype: str, shape: ModelShape | None = None) -> float:
+def kv_elem_bytes(kv_dtype: str) -> float:
     """Bytes per cached element.
 
-    ``auto`` follows the model's own dtype when that dtype is something a cache
-    can actually be stored in, and falls back to bf16 otherwise: a model whose
-    *weights* are mxfp4 still caches in bf16 or fp8.
+    ``auto`` -- the model's own -- is the compute width, 16 bits, and never
+    ``shape.dtype``: that is the WEIGHT scheme, and an fp8- or int8-weight
+    checkpoint still caches at bfloat16 (pricing it at one byte approved twice
+    the context the engine could hold). An fp32 checkpoint is downcast to 16
+    bits by vLLM and SGLang, and llama.cpp's default cache is f16. A KV scheme
+    the checkpoint itself declares is not ``auto`` here: `gateway/kv_widths.py`
+    names it explicitly, so the gate prices it (vLLM applies it itself).
     """
     key = _key(kv_dtype)
-    if key in _MODEL_OWN:
-        if shape is not None and shape.dtype.lower() in KV_ELEM_BYTES:
-            return KV_ELEM_BYTES[shape.dtype.lower()]
+    if key in MODEL_OWN_KV_DTYPES:
         return KV_ELEM_BYTES[KV_FALLBACK_DTYPE]
     return KV_ELEM_BYTES.get(key, KV_ELEM_BYTES[KV_FALLBACK_DTYPE])
 
 
 def is_known_kv_dtype(kv_dtype: str) -> bool:
     key = _key(kv_dtype)
-    return key in _MODEL_OWN or key in KV_ELEM_BYTES or key in PACKED_KV_DTYPES
+    return key in MODEL_OWN_KV_DTYPES or key in KV_ELEM_BYTES or key in PACKED_KV_DTYPES
 
 
 def kv_dtype_refusal(shape: ModelShape, kv_dtype: str) -> str | None:
@@ -167,7 +172,7 @@ def per_layer_per_token_bytes(shape: ModelShape, kv_dtype: str) -> float:
         key_bits, value_bits = KV_TURBOQUANT_BITS[key]
         slot = _turboquant_slot_bytes(key_bits, value_bits, shape.effective_head_dim)
         return float(shape.num_kv_heads * slot)
-    elem = kv_elem_bytes(kv_dtype, shape)
+    elem = kv_elem_bytes(kv_dtype)
     if mla:
         # One compressed latent plus the decoupled RoPE component cached
         # alongside it, not per-head K and V. The RoPE half is not optional:

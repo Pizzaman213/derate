@@ -78,7 +78,7 @@ from control_plane.humanize import binary_bytes
 
 from control_plane.contracts.auth import AuditAction, AuthUnavailable
 
-from . import errors, gpu_procs, livefit, serialize, states, ui_detail
+from . import errors, gpu_procs, kv_widths, livefit, serialize, states, ui_detail
 from .authz import audit_request, client_ip, is_loopback, request_context, stores_of
 from .body import BodyTooLarge, optional_json_object, payload_too_large, read_json_object
 from .loopback import LoopbackCallback
@@ -223,9 +223,9 @@ class _PlanOutcome:
     #: byte budget filled with full-width entries -- half the context the
     #: gate promised, no error anywhere.
     kv_dtype: str = DEFAULT_KV_DTYPE
-    #: `_kv_dtype_ratios` for this plan: every width its runtime and machines
-    #: would launch, over the 16-bit rate. What the picker may offer.
-    kv_dtype_ratios: dict = dataclasses.field(default_factory=dict)
+    #: `kv_widths.choices` for this plan: what the picker may offer, the
+    #: model's own row, and why each other width is refused.
+    kv_choices: kv_widths.KvChoices = dataclasses.field(default_factory=kv_widths.KvChoices)
     #: The weight quantization the CALLER forced, or None to let the runtime
     #: read it off the checkpoint. Distinct from `shape.dtype`, which is the
     #: forced value once an override was applied and the checkpoint's own
@@ -263,52 +263,6 @@ class _PlanOutcome:
     #: which refuses an architecture only another machine's image loads.
     runtime_supported: bool = True
     runtime_unsupported_reason: str | None = None
-
-
-def _kv_dtype_ratios(shape, runtime: str, nodes, quant_method: str) -> dict[str, float]:
-    """Every `--kv-cache-dtype` this plan could be launched with, as its cache
-    bytes per token over the 16-bit rate.
-
-    Absent: a name the gate does not price, cannot render, or refuses for this
-    attention geometry -- and, since 2026-11-23, one *runtime* cannot be told
-    (`flags.kv_cache_dtype_refusal`) or that the image a planned machine runs
-    has no attention backend for (`support.silicon_check`, asked exactly as
-    `_plan_and_fit` asks it of the width it was sent). Without the last two the
-    picker offered `nvfp4` on a GB10 and the plan answered it with a 400, which
-    unmounts the card the picker lives in. Every width offered is accepted.
-    """
-    from control_plane.deploy.flags import (
-        VLLM_KV_CACHE_DTYPES,
-        kv_cache_dtype_refusal,
-        render_kv_cache_dtype,
-    )
-    from control_plane.fit.kv import is_known_kv_dtype, kv_bytes_per_token, kv_dtype_refusal
-
-    base = kv_bytes_per_token(shape, "bf16")
-    if base <= 0:
-        return {}
-    judge_silicon = runtime == "vllm" and bool(nodes) and not getattr(shape, "mla_latent_dim", 0)
-    out: dict[str, float] = {}
-    for name in sorted(VLLM_KV_CACHE_DTYPES):
-        if name == "auto" or not is_known_kv_dtype(name):
-            continue
-        try:
-            rendered = render_kv_cache_dtype(name)
-        except ValueError:
-            continue
-        if kv_dtype_refusal(shape, name) is not None:
-            continue
-        if kv_cache_dtype_refusal(runtime, name) is not None:
-            continue
-        if judge_silicon and rendered is not None:
-            refused, _ = _silicon_per_node(
-                runtime, nodes, dtype=shape.dtype, quant_method=quant_method,
-                kv_cache_dtype=rendered, kv_label=name,
-            )
-            if refused:
-                continue
-        out[name] = kv_bytes_per_token(shape, name) / base
-    return out
 
 
 _ENGINE_ENV_VALUE = re.compile(r"^[A-Za-z0-9_.,:/=+-]*$")
@@ -1727,6 +1681,7 @@ def _launch_options(payload: dict) -> dict:
             raise ValueError(
                 "%s could not be parsed as a CLI argument string: %s" % (field, exc)
             ) from None
+        kv_widths.refuse_kv_arg(field, out[field])
     for field in ("trust_remote_code", "enforce_eager"):
         value = payload.get(field, False)
         if value is None:
@@ -1826,7 +1781,6 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     raw_concurrency = payload.get("concurrency")
     concurrency = int(raw_concurrency) if raw_concurrency else None
     target = payload.get("target") or "throughput"
-    kv_dtype = payload.get("kv_dtype") or ctx.settings.default_kv_dtype
     dtype = payload.get("dtype")
     runtime = payload.get("runtime") or "vllm"
     # A width the caller NAMED is refused here, before a resolve, on the terms
@@ -1834,12 +1788,13 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     # the launch asked, so `/api/plan` priced `int8` at half width, `fp8_inc`
     # (Gaudi's) and `nonsense` at full width, and answered `serve.allowed`
     # for every one: a Verdict card and a Serve button for a launch that 400s.
-    # The settings default is resolved above and never refused here.
+    # A body with no kv_dtype means the model's own (`kv_widths.settle`); never refused here.
     raw_kv_dtype = payload.get("kv_dtype")
     if raw_kv_dtype is not None:
         if not isinstance(raw_kv_dtype, str):
             raise ValueError("kv_dtype must be a string naming a KV cache element width.")
-        refusal = kv_dtype_launch_refusal(runtime, raw_kv_dtype)
+        # A 16-bit name may be the model's own; `kv_widths.settle` judges what is passed.
+        refusal = None if kv_widths._sixteen(raw_kv_dtype) else kv_dtype_launch_refusal(runtime, raw_kv_dtype)
         if refusal is not None:
             raise ValueError(refusal)
     requested_nodes = _parse_node_ids(payload)
@@ -1942,11 +1897,11 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     if runtime == "tts" and callable(resolve_full):
         shape = _with_codec_working_set(shape, resolution.architectures)
 
-    # A packed KV layout is a kernel for one attention geometry; asked of the
-    # other one there is no page the gate could size honestly.
-    from control_plane.fit.kv import kv_dtype_refusal
-
-    kv_refusal = kv_dtype_refusal(shape, kv_dtype)
+    # The width the model's own resolves to on this runtime, a 16-bit name
+    # that would not launch as itself, and a packed layout built for the
+    # other attention geometry, all answered in one place.
+    checkpoint = resolution if callable(resolve_full) else None
+    kv_dtype, kv_refusal = kv_widths.settle(shape, checkpoint, runtime, raw_kv_dtype)
     if kv_refusal is not None:
         raise ValueError(kv_refusal)
 
@@ -2182,7 +2137,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
             dtype=shape.dtype,
             quant_method=quant_method,
             kv_cache_dtype=kv_cache_dtype,
-            kv_label=kv_dtype,
+            kv_label=kv_widths.label(kv_dtype, checkpoint, runtime),
         )
         if silicon_refused and (
             requested_nodes is not None or len(silicon_refused) == len(nodes)
@@ -2361,7 +2316,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     )
     # What the planner was asked, before the two derivations below replace
     # the figures it never saw.
-    asked = (context_length, concurrency)
+    asked = (context_length, concurrency or 1)  # what the planner was actually given
     if concurrency is None:
         concurrency = await asyncio.to_thread(
             partial(
@@ -2551,7 +2506,9 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         speculative_options, shape.model_id, plan_nodes
     )
 
-    kv_dtype_ratios = _kv_dtype_ratios(shape, runtime, plan_nodes, quant_method)
+    kv_choices = kv_widths.choices(shape, checkpoint, runtime, partial(
+        _silicon_per_node, runtime, plan_nodes, dtype=shape.dtype, quant_method=quant_method,
+    ) if plan_nodes else None)
 
     return _PlanOutcome(
         shape=shape,
@@ -2576,7 +2533,7 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         speculative_options=speculative_options,
         speculative=speculative,
         kv_dtype=kv_dtype,
-        kv_dtype_ratios=kv_dtype_ratios,
+        kv_choices=kv_choices,
         quantization=dtype,
         revision=(getattr(resolution, "revision", None) if callable(resolve_full) else None),
         engine_options=engine_options,
@@ -4941,12 +4898,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # What a vllm launch of a hub GGUF loads beside it.
                 "gguf_base": out.gguf_base,
                 "gguf_projector": out.gguf_projector,
-                # Cache bytes per token at each KV width this image takes,
-                # over this model's 16-bit rate. Per model, because a packed
-                # layout's overhead depends on head_dim and its boundary
-                # layers on the layer count. A width refused for this
-                # geometry, runtime or plan's machines is absent.
-                "kv_dtype_ratios": out.kv_dtype_ratios,
+                # Each KV width this plan takes over the model's 16-bit rate
+                # (per model: a packed layout's overhead depends on head_dim),
+                # the model's own row, and the reason for every other width.
+                **out.kv_choices.wire(),
                 # Whose choice the machines and the degrees were.
                 "placement": out.placement,
                 "degrees": out.degrees,
@@ -5028,7 +4983,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 503, "the fit calculator is not wired; there is no budget to render",
                 "server_error", "fit_unavailable",
             )
-        from control_plane.deploy.flags import render_kv_cache_dtype, render_quantization
+        from control_plane.deploy.flags import render_quantization
 
         try:
             result = await asyncio.to_thread(
@@ -5043,9 +4998,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     modality=out.modality,
                     speculative=out.speculative,
                     # The same spreads create_deployment applies.
-                    kv_dtype=(
-                        out.kv_dtype if render_kv_cache_dtype(out.kv_dtype) is not None else None
-                    ),
+                    kv_dtype=kv_widths.launch_kv_dtype(out.kv_dtype, out.kv_choices),
                     quantization=(
                         out.quantization
                         if out.quantization and render_quantization(out.quantization) is not None
@@ -5512,10 +5465,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         # Local, like `sharding_refusal` and `speculative_refusal` above:
         # the gateway does not import deploy internals at module scope.
-        from control_plane.deploy.flags import (
-            render_kv_cache_dtype,
-            render_quantization,
-        )
+        from control_plane.deploy.flags import render_quantization
 
         # A FIT-GATE input, heavier than kv_dtype: `_plan_and_fit`
         # passes it to the resolver as a dtype override, so every weight
@@ -5850,7 +5800,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     # matters, the ones the fit gate has already sized narrow.
                     **(
                         {"kv_dtype": out.kv_dtype}
-                        if render_kv_cache_dtype(out.kv_dtype) is not None
+                        if kv_widths.launch_kv_dtype(out.kv_dtype, out.kv_choices)
                         else {}
                     ),
                     # Spread on exactly the same terms, and this is the one

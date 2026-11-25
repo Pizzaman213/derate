@@ -43,6 +43,9 @@
 | `SizingSliders.tsx` | 178 | Serve's context-per-user and users-at-once sliders, and the KV cache they cost |
 | `speculative.ts` | 180 | the speculative field's pure decisions |
 | `SpeculativeField.tsx` | 697 | which speculative method to serve with; `null` means one token per step |
+| `kvWidths.ts` | 100 | the KV width picker's rows, every fact the server's (`gateway/kv_widths.py`) |
+| `KvWidthField.tsx` | 72 | which KV cache width to serve with; '' means the model's own |
+| `kvWidths.check.mjs` | 65 | the picker's rows: own width named, flags and dash reasons verbatim, nothing re-derived |
 | `CustomServes.tsx` | 59 | replaying a hand-written launch command |
 | `rows.check.mjs` | 987 | the browser-side fold against the live coordinator's real payloads |
 | `registry.check.mjs` | 215 | `GET /api/models`, the fold that moved to the server, and the boundary |

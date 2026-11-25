@@ -455,6 +455,7 @@ decorators.
 | `setup_api.py` | 263 | first run: has anyone set this cluster up yet, and the first admin |
 | `targets.py` | 252 | merging local deployments and remote provider models into one target list |
 | `livefit.py` | 250 | calling the fit gate twice -- static ceiling and live allocatable |
+| `kv_widths.py` | 375 | the KV width a plan actually stores for this checkpoint (compute dtype, or a scheme its quant config declares, priced and never passed), what the picker may offer with its flag, and why each other width is refused |
 | `errors.py` | 224 | OpenAI-shaped error bodies, and the redacted exception detail |
 | `ui_detail.py` | 222 | the pure computations behind the additive UI fields; `None` never becomes `0` |
 | `settings_store.py` | 221 | the four operator-settable fields, persisted; file beats env beats default |

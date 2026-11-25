@@ -109,7 +109,11 @@ from .types import (
 #: were sized as F32, so a GGUF with NVFP4 experts weighed 5x its file (80.7
 #: GiB for Inkling 2 Mini's 15.5 GiB Q4_K_M); and `inkling2_loop` joined the
 #: llama.cpp architectures, so the cached "llamacpp cannot load it" is stale.
-SCHEMA_VERSION = 14
+#:
+#: 15 adds `compute_dtype` and `checkpoint_kv_dtype`. An older entry decodes
+#: both to "", which reads as "declares no KV scheme" -- so an fp8-KV NVFP4
+#: checkpoint would be offered at 16-bit while vLLM stores it at fp8_e4m3.
+SCHEMA_VERSION = 15
 
 DEFAULT_TTL_SECONDS = float(os.environ.get("DERATE_RESOLVER_TTL", 24 * 3600))
 
@@ -182,6 +186,8 @@ def to_dict(res: Resolution) -> dict[str, Any]:
         "resolved_at": res.resolved_at,
         "remote_code": res.remote_code,
         "quant_method": res.quant_method,
+        "compute_dtype": res.compute_dtype,
+        "checkpoint_kv_dtype": res.checkpoint_kv_dtype,
     }
 
 
@@ -222,6 +228,8 @@ def from_dict(data: dict[str, Any]) -> Resolution:
         resolved_at=data.get("resolved_at", 0.0),
         remote_code=bool(data.get("remote_code", False)),
         quant_method=str(data.get("quant_method", "")),
+        compute_dtype=str(data.get("compute_dtype", "")),
+        checkpoint_kv_dtype=str(data.get("checkpoint_kv_dtype", "")),
     )
 
 
@@ -326,4 +334,6 @@ def _as_hit(res: Resolution) -> Resolution:
         from_cache=True,
         remote_code=res.remote_code,
         quant_method=res.quant_method,
+        compute_dtype=res.compute_dtype,
+        checkpoint_kv_dtype=res.checkpoint_kv_dtype,
     )

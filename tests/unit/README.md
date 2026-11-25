@@ -53,11 +53,13 @@ test are readable, and it is the one convention a new file must keep.
 | `test_integration_kv.py` | 70 | three packages must charge the same MLA cache width |
 | `test_inventory.py` | 476 | the model registry's five-source merge and the ways it could quietly lie |
 | `test_inventory_api.py` | 167 | `GET /api/models` on the wire, and what it must not shadow |
+| `test_kv_widths.py` | 287 | the KV width a plan stores is the one vLLM stores for this checkpoint: compute dtype, a declared scheme priced and never passed, the corrupting 16-bit name refused |
 | `test_launch_log_lines.py` | 199 | the launch log a screen polls mid-download: the byte bar with its rate, one clean frame per bar, a step header glued onto a frame kept, a second download not erasing the first, a bar at 99.5% still one line, `buffer` before the first line, and a failure's output without the frames |
 | `test_links.py` | 930 | link measurement: a subtly wrong figure, and a figure honest about guessing |
 | `test_live_memory.py` | 806 | the live-memory budget, from the gate to the capacity answer |
 | `test_load.py` | 109 | three SLO guards derived from what the load harness measured |
 | `test_loadtest.py` | 609 | the `tests/load/loadtest.py` client's own gates |
+| `test_plan_restate.py` | 43 | the planner is re-asked only when a derived context or concurrency changed the question |
 | `test_logfiles.py` | 318 | one log folder, two files, nothing leaked |
 | `test_model_corpus.py` | 349 | every captured config, every run, compared against the record |
 | `test_modelcache.py` | 420 | seeing downloaded weights, and deleting them safely |

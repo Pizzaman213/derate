@@ -6272,12 +6272,12 @@ def test_launch_with_extra_args_reaches_the_deployment_manager():
             "/api/deployments",
             json={
                 "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-                "extra_args": "--quantization modelopt_fp4 --trust-remote-code",
+                "extra_args": "--disable-log-stats --trust-remote-code",
             },
         )
     assert reply.status_code == 201, reply.text
     assert reply.json()["extra_args"] == [
-        "--quantization", "modelopt_fp4", "--trust-remote-code",
+        "--disable-log-stats", "--trust-remote-code",
     ]
 
 
@@ -6481,7 +6481,7 @@ def test_sending_extra_args_and_custom_command_together_is_a_400():
             "/api/deployments",
             json={
                 "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-                "extra_args": "--quantization modelopt_fp4",
+                "extra_args": "--disable-log-stats",
                 "custom_command": "--gpu-memory-utilization 0.5",
             },
         )
