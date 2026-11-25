@@ -168,6 +168,8 @@ because one call fans out to every node agent and walks a directory on each --
 mounting it unconditionally would make every dashboard visitor trigger a
 cluster-wide disk walk every 30s to populate a menu they may never open -- and
 `useNodeProcesses(nodeId)`, where each poll costs an `nvidia-smi` on that node.
+The node sheet and each `/cluster` machine block mount it (keyed per call site), so
+an open machine costs one poll per 5 s per mount.
 
 Model detail and the variant ladder are deliberately **not** here: `useResource`
 refires on every `revision` bump, so an open model would re-run its hub calls

@@ -120,11 +120,11 @@ export const useActivity = () => useResource((b) => b.activity(), 2000)
 // place -- the sidebar's Alerts section -- because `useResource` does not
 // deduplicate.
 export const useAlerts = () => useResource((b) => b.alerts(), 5000)
-// What is resident on one node's GPU. Only mounted while a node sheet is open,
-// and every poll costs an nvidia-smi call on that node, so it matches the
-// telemetry cadence rather than the 2s memory poll. `nodeId` empty means no
-// node is open; the hook still has to be called unconditionally, so it fetches
-// an empty list instead of being skipped.
+// What is resident on one node's GPU. Mounted by an open node sheet and by each
+// machine block on /cluster (its memory bar is split by process), and every poll
+// costs an nvidia-smi call on that node, so it matches the telemetry cadence
+// rather than the 2s memory poll. `nodeId` empty means nothing to read; the hook
+// still has to be called unconditionally, so it fetches an empty list.
 export const useNodeProcesses = (nodeId: string) =>
   useKeyedResource(
     // Keyed, not plain: opening a second node while the sheet stays open used

@@ -41,6 +41,7 @@ spill-on-saturation, change the one constant `LB_POLICY` in `sockets.ts`.
 | `BalancerDialog.tsx` | one served name's dialog: policy, its rate limit, its live targets, Remove this load balancer |
 | `SelectionRail.tsx` | the Links card: measured pairs, Measure, reachability |
 | `loading.ts` | a launch's phase (preparing, downloading, loading, serving) and its clock |
+| `memory.ts` | a machine's used memory split by the GPU processes holding it, derate's or not, plus the unattributed remainder. Pure |
 | `providerLogo.ts` | a provider's logo URL, or none (the monogram tile is always painted under it) |
 | `blocks/editor.tsx` | `EditorContext` (the edit callbacks blocks call) and `Socket`, the one handle component |
 | `blocks/Terminals.tsx` | `InputBlock`, `OutputBlock`, `LimitBlock` |

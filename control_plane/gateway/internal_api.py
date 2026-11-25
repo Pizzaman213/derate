@@ -2419,9 +2419,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 handles = handles_fn()
             except Exception:
                 log.exception("handle listing failed")
-        payload["processes"] = gpu_procs.attribute(
-            payload.get("processes") or [], deployments, handles, node_id
-        )
+        payload["processes"] = await gpu_procs.attribute_with_lineage(
+            payload.get("processes") or [], deployments, handles, node_id,
+            lambda: gpu_procs.agent_containers(agent_url, token, _AGENT_TIMEOUT_S))
         return payload, None
 
     @router.get("/api/nodes/{node_id}/processes")

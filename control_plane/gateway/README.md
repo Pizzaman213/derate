@@ -450,7 +450,7 @@ decorators.
 | `strength.py` | 144 | measured, then predicted, then bandwidth -- and the weight normalization |
 | `deps.py` | 119 | `GatewayDeps` / `GatewayContext`, and `strict=True` |
 | `stats.py` | 110 | per-target EWMA counters: decode tok/s, TTFT, outstanding |
-| `gpu_procs.py` | 92 | attributing a resident GPU process to the deployment that launched it |
+| `gpu_procs.py` | 172 | attributing a resident GPU process to the deployment that launched it, through its container lineage when its argv was renamed |
 | `budget.py` | 92 | the retry budget |
 | `engine_targets.py` | 63 | what the spec-decode poller scrapes, reached through the proxy's clients |
 | `headers.py` | 76 | nosniff, no framing, same-origin referrer on every answer; the CSP on HTML |
@@ -1100,6 +1100,18 @@ at, which errs toward a Kill button on something we launched (guarded by a
 confirm) rather than a missing one on a stray holding the whole pool. `handles=None`
 means the port exposes no launch handles, as the stubs do not, and every process
 is then unattributed -- degrade, never refuse.
+
+vLLM's EngineCore renames its own argv to `VLLM::EngineCore`, and it holds nearly
+all of a deployment's memory, so its command line carries neither handle.
+`attribute_with_lineage(...)` wraps `attribute` for the route: when some process is still
+unattributed and a deployment (live or terminal) with a launch cluster id is placed on
+the node, it reads `/agent/containers` once (`agent_containers`) and retries with each
+pid's container name and ancestor command lines as `lineage`. Only a cluster id may
+cross from lineage to a process; a port matches the process's own command line, since
+a stray container can serve on the same port on its own network. Live records are tried
+first: sparkrun's cluster id is deterministic and a terminal record's port is reused, so
+a relaunch shares its old record's handle. A node derate never launched on never pays the
+second nvidia-smi and `docker ps`, and a failed read keeps the command-line answer.
 
 ## `budget.py`
 

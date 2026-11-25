@@ -124,6 +124,21 @@ check(
   'the other machine shows rank 2 of 2',
 )
 check(machine('spark-01').rows[0].title === 'Llama-3.3-70B-Instruct', 'a row is titled by its model, not its deployment id')
+{
+  // The machine memory bar is the /api/cluster sample in bytes, over the basis memory_used_pct divides by.
+  const s = structuredClone(setup)
+  s.cluster.nodes.push(
+    { profile: { node_id: 'spark-01', total_memory: 137438953472 }, memory_total: 129454977024, memory_used: 48092270592, sample_ts: 1 },
+    { profile: { node_id: 'ws-3090', total_memory: 0 }, memory_total: 8 * 2 ** 30, memory_used: 2 * 2 ** 30, sample_ts: 1 },
+  )
+  const b = D.blocks(D.fromServer(s), s)
+  const mem = (id) => b.find((x) => x.id === `machine:${id}`).memory
+  check(JSON.stringify(mem('spark-01')) === JSON.stringify({ total: 137438953472, used: 48092270592 }), 'a GPU node measures memory against its physical total')
+  check(JSON.stringify(mem('ws-3090')) === JSON.stringify({ total: 8 * 2 ** 30, used: 2 * 2 ** 30 }), 'a GPU-less node falls back to the sampled host total')
+  check(mem('spark-02').total === null && mem('spark-02').used === null, 'a machine /api/cluster has not reported keeps no bar')
+  s.cluster.nodes[0].sample_ts = null
+  check(D.blocks(D.fromServer(s), s).find((x) => x.id === 'machine:spark-01').memory.total === null, 'a node with no memory sample yet draws no bar, not a zero')
+}
 const localWires = ws.filter((w) => w.kind === 'local' && w.served === 'llama-3.3-70b')
 check(
   localWires.length === 2 && localWires.every((w) => !w.to.block.endsWith('spark-02')),

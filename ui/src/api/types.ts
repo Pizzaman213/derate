@@ -71,8 +71,6 @@ export interface TopologyNode {
   sample_ts?: number | null
   strength: number
   deployments: string[]
-  /** bytes; present on /api/nodes, echoed here by the stub for the roster line */
-  total_memory?: number
   address?: string
   last_error?: string | null
 }
@@ -297,9 +295,9 @@ export interface NodeStateDTO {
    *  `last_seen` and a frozen `sample_ts`. */
   sample_ts?: number | null
   memory_used: number
-  /** What `memory_used` is a fraction of, measured rather than probed. On a GPU
-   *  node prefer `profile.addressable_memory`; this is what a machine with no
-   *  GPU has instead, and 0 when nothing has been sampled. */
+  /** The sampled host total, and 0 when nothing has been sampled. The server's
+   *  `memory_used_pct` divides `memory_used` by `profile.total_memory || memory_total`,
+   *  so this is the basis on a machine with no GPU memory. */
   memory_total: number
   /** null when the node has never reported telemetry. A live-looking zero is
    *  worse than an honest blank, so this is never defaulted on the way in. */

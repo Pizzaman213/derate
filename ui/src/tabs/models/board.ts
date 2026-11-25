@@ -13,8 +13,9 @@ export interface Occupant {
   model_id: string
   bytes: number | null
 }
-/** Below this, used memory nobody's verdict accounts for is not drawn. */
-const OTHER_USE_FLOOR = 0.5 * 1024 ** 3
+/** Below this, used memory nobody's verdict accounts for is not drawn.
+ *  `tabs/cluster/memory.ts` applies the same floor to its remainder. */
+export const OTHER_USE_FLOOR = 0.5 * 1024 ** 3
 
 /** The node bar's used span, one segment per occupant with known bytes and a
  *  remainder titled "other use on this node" when the machine reports more

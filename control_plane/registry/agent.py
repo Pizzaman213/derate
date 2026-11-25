@@ -196,8 +196,8 @@ class NodeAgent:
 
         Not served from the ring: the 5s sample deliberately keeps only a
         sum and a count, so a process list never reaches the durable
-        journal. This costs one nvidia-smi call per request, and only while
-        an operator has a node sheet open.
+        journal. This costs one nvidia-smi call per request, polled while an
+        operator has a node sheet or the ``/cluster`` screen open.
         """
         return processes_to_dict(self.node_id, await read_gpu_processes())
 

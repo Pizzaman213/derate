@@ -1009,14 +1009,14 @@ export function blocks(doc: Doc, s: ServerSnapshot): Block[] {
         }
       })
     const descs: RowDesc[] = rows.map((r) => ({ id: r.id, title: r.title, served: r.served, rank: r.rank ?? undefined }))
-    const total = n.total_memory ?? null
+    const live = s.cluster.nodes.find((c) => c.profile.node_id === n.node_id && c.sample_ts != null)
     out.push({
       id,
       kind: 'machine',
       title,
       node_id: n.node_id,
       signal: n.state === 'healthy' ? 'live' : n.state === 'degraded' ? 'warn' : 'fault',
-      memory: { total, used: total != null && Number.isFinite(n.memory_used_pct) ? (total * n.memory_used_pct) / 100 : null },
+      memory: { total: live ? live.profile.total_memory || live.memory_total || null : null, used: live ? live.memory_used : null },
       rows,
       sockets: socketsOf('machine', id, title, descs),
     })

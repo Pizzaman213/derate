@@ -13,11 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -393,6 +391,91 @@ def test_no_handles_degrades_to_unattributed_rather_than_refusing():
     assert out[0]["deployment_id"] is None and out[0]["killable"] is True
 
 
+_ENGINE = {"pid": 9, "name": "VLLM::EngineCore", "command": "VLLM::EngineCore", "gpu_memory": 60 * GIB}
+_STRAY = {"pid": 5, "name": "python", "command": "python train.py", "gpu_memory": 7 * GIB}
+
+
+def _annotate(containers, placed=True):
+    calls = []
+
+    async def read():
+        calls.append(1)
+        if isinstance(containers, Exception):
+            raise containers
+        return {"containers": containers}
+
+    deps = [_Dep("d-1", "qwen", DeploymentState.READY, ["spark-01" if placed else "spark-02"])]
+    handles = {"d-1": {"cluster_id": "sparkrun_e6ff01", "port": 8101}}
+    out = asyncio.run(gpu_procs.attribute_with_lineage([_ENGINE, _STRAY], deps, handles, "spark-01", read))
+    return out, calls
+
+
+def test_a_renamed_engine_core_is_ours_by_its_container_and_ancestors():
+    """vLLM renames the process holding the weights to `VLLM::EngineCore`;
+    the command line alone made derate's own engine a killable stray."""
+    out, calls = _annotate([{"pid": 9, "container_name": "sparkrun_e6ff01_solo",
+                             "ancestor_commands": ["VLLM::EngineCore", "vllm serve x --port 8101"]}])
+    engine, stray = out
+    assert calls == [1]
+    assert engine["served_name"] == "qwen" and engine["killable"] is False
+    assert stray["deployment_id"] is None and stray["killable"] is True
+
+
+def test_lineage_is_not_read_when_nothing_of_ours_is_placed_on_the_node():
+    out, calls = _annotate([], placed=False)
+    assert calls == [] and all(r["deployment_id"] is None for r in out)
+
+
+def test_a_failed_lineage_read_keeps_the_command_line_answer():
+    out, calls = _annotate(RuntimeError("agent down"))
+    assert calls == [1] and [r["deployment_id"] for r in out] == [None, None]
+
+
+def test_a_cluster_id_outranks_another_deployments_port_in_a_flag():
+    """`--max-model-len 8192` names no port, but a deployment listed first on
+    port 8192 used to claim the engine whose own cluster id is in lineage."""
+    deps = [_Dep("dB", "b", DeploymentState.READY, ["spark-01"]), _Dep("dA", "a", DeploymentState.READY, ["spark-01"])]
+    handles = {"dB": {"cluster_id": "sparkrun_bbbbbb", "port": 8192}, "dA": {"cluster_id": "sparkrun_aaaaaa", "port": 8101}}
+    lineage = {9: ["sparkrun_aaaaaa_solo", "vllm serve m --port 8101 --max-model-len 8192"]}
+    out = gpu_procs.attribute([_ENGINE], deps, handles, "spark-01", lineage)
+    assert out[0]["deployment_id"] == "dA"
+
+
+def test_a_relaunch_is_attributed_to_the_live_record_not_its_stopped_twin():
+    """sparkrun's cluster id is deterministic and the port is reused, so the
+    stopped record listed first used to claim the live engine -- killable."""
+    deps = [_Dep("old", "q", DeploymentState.STOPPED, ["spark-01"]), _Dep("new", "q", DeploymentState.READY, ["spark-01"])]
+    same = {"cluster_id": "sparkrun_aaaaaa", "port": 8101}
+    rows = [{"pid": 9, "name": "vllm", "command": "vllm serve q --port 8101"}]
+    out = gpu_procs.attribute(rows, deps, {"old": same, "new": same}, "spark-01")
+    assert out[0]["deployment_id"] == "new" and out[0]["killable"] is False
+
+
+def test_a_stray_container_on_the_same_port_is_not_claimed_through_its_lineage():
+    """Its own bridge network can serve on 8101 too; only a cluster id may
+    cross from an ancestor to the process."""
+    deps = [_Dep("d-1", "q", DeploymentState.READY, ["spark-01"])]
+    handles = {"d-1": {"cluster_id": "sparkrun_aaaaaa", "port": 8101}}
+    lineage = {9: ["inkvllm", "vllm serve x --port 8101"]}
+    assert gpu_procs.attribute([_ENGINE], deps, handles, "spark-01", lineage)[0]["deployment_id"] is None
+
+
+def test_an_orphaned_engine_core_of_a_stopped_record_is_named_through_lineage():
+    async def read():
+        return {"containers": [{"pid": 9, "container_name": "sparkrun_aaaaaa_solo", "ancestor_commands": []}]}
+
+    deps = [_Dep("d-1", "q", DeploymentState.STOPPED, ["spark-01"])]
+    handles = {"d-1": {"cluster_id": "sparkrun_aaaaaa", "port": 8101}}
+    out = asyncio.run(gpu_procs.attribute_with_lineage([_ENGINE], deps, handles, "spark-01", read))
+    assert out[0]["deployment_id"] == "d-1" and out[0]["killable"] is True
+
+
+def test_a_row_without_a_usable_pid_is_reported_not_a_500():
+    deps = [_Dep("d-1", "q", DeploymentState.READY, ["spark-01"])]
+    out = gpu_procs.attribute([{"pid": "abc", "command": "x"}, {"pid": None, "command": "y"}], deps, {}, "spark-01", {9: ["z"]})
+    assert [r["deployment_id"] for r in out] == [None, None]
+
+
 # ---------------------------------------------------------------------------
 # a node agent on a socket, for the coordinator and manager tiers
 # ---------------------------------------------------------------------------
@@ -401,7 +484,8 @@ def test_no_handles_degrades_to_unattributed_rather_than_refusing():
 class FakeAgent:
     """A real HTTP node agent, so the coordinator's httpx hop is exercised."""
 
-    def __init__(self, processes, *, kill_status=200):
+    def __init__(self, processes, *, kill_status=200, containers=None):
+        self.containers = containers
         self.processes = processes
         self.kill_status = kill_status
         self.killed: list[int] = []
@@ -434,6 +518,8 @@ class FakeAgent:
                             "reason": None,
                         },
                     )
+                elif self.path == "/agent/containers" and outer.containers is not None:
+                    self._send(200, {"node_id": "spark-01", "containers": outer.containers})
                 else:
                     self._send(404, {"detail": "no"})
 
@@ -529,6 +615,24 @@ def test_route_refuses_to_kill_a_backend_the_router_is_still_using():
     assert res.status_code == 409
     assert "gpt-oss-120b" in res.json()["error"]["message"]
     assert agent.killed == []  # never reached the machine
+
+
+def test_route_refuses_to_kill_an_engine_core_it_names_through_its_container():
+    """The acceptance case for lineage: vLLM's renamed engine, served by the
+    agent's /agent/containers, is ours on the route the Kill button calls."""
+    from tests.unit.test_gateway import make_deployment
+
+    dep = make_deployment("d-1", "qwen", backend_url="http://127.0.0.1:8101/v1",
+                          state=DeploymentState.READY, node_ids=("spark-01",))
+    procs_wire = [dict(_ENGINE, user="root")]
+    containers = [{"pid": 9, "container_name": "sparkrun_aaaaaa_solo", "ancestor_commands": []}]
+    with FakeAgent(procs_wire, containers=containers) as agent:
+        app = _gateway(agent.url, [dep], handles={"d-1": {"cluster_id": "sparkrun_aaaaaa", "port": 8101}})
+        with TestClient(app) as client:
+            listed = client.get("/api/nodes/spark-01/processes").json()["processes"]
+            res = client.delete("/api/nodes/spark-01/processes/9")
+    assert listed[0]["deployment_id"] == "d-1" and listed[0]["killable"] is False
+    assert res.status_code == 409 and agent.killed == []
 
 
 def test_route_kills_a_stray_and_presents_the_agent_token():

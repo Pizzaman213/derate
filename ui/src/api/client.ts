@@ -279,8 +279,8 @@ export interface Backend {
    *  is why the reply says which of the two answered. Poll only the first. */
   deploymentLogs(deploymentId: string, tail?: number): Promise<DeploymentLogs>
   /** What is holding GPU memory on a node right now. Read on demand — this
-   *  costs an nvidia-smi call on the node, so it is only polled while a node
-   *  sheet is open. */
+   *  costs an nvidia-smi call on the node, so it is polled only while a node
+   *  sheet or a `/cluster` machine block shows it. */
   nodeProcesses(nodeId: string): Promise<NodeProcessList>
   /** `GET /api/nodes/{id}/logs`. A tail of that node's own `node.log` or
    *  `proxy.log` -- the control plane's process log, not a deployment's

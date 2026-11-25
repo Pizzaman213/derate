@@ -441,7 +441,7 @@ Everything else crosses outward:
   design so that nothing arriving over the network can switch the route on.
 - **`state/resources.ts`** supplies the shared polls this folder rides rather
   than duplicating: `useCluster` and `useTopology` at 5 s, `useMemoryReport` at
-  2 s, `useNodeProcesses`.
+  2 s, `useNodeProcesses` at 5 s (also mounted by each `/cluster` machine block).
 - **`state/backend.tsx`** is every write this folder makes. Four of them
   invalidate the shared polls, because what they changed is on a screen other
   than this one: `measureLink`, `renameNode`, `killProcess`, `adoptNodeRuntime`.

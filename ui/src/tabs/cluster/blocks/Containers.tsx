@@ -6,12 +6,13 @@ import { Icon } from '../../../components/Icon'
 import { Lamp } from '../../../components/Lamp'
 import { fmt, gbytes } from '../../../format'
 import { useMetrics } from '../../../state/metrics'
-import { useActivity } from '../../../state/resources'
+import { useActivity, useNodeProcesses } from '../../../state/resources'
 import type { DeploymentState, ProviderBackendOption } from '../../../api/types'
 import { HostTable } from '../../../components/HostTable'
 import { useBackend } from '../../../state/backend'
 import type { ProviderPin } from '../doc'
 import { clock, isArriving, launchView } from '../loading'
+import { memoryParts } from '../memory'
 import { markProviderLogoMissing, providerLogoMissing, providerLogoUrl, providerMonogram } from '../providerLogo'
 import { rowIn, rowOut } from '../sockets'
 import { Socket, SocketLabel, socket, toneOf, useEditor } from './editor'
@@ -24,6 +25,12 @@ export function MachineBlock({ data, selected }: NodeProps<BlockNode<'machine'>>
   const editor = useEditor()
   const { frame, stale } = useMetrics()
   const activity = useActivity()
+  // What holds the memory, process by process, whether or not derate launched it. Polled only
+  // while there is a bar and the node answers; a failed refresh reads as unread, though the
+  // store keeps its last list.
+  const asked = data.block.memory.total != null && data.block.signal !== 'fault'
+  const procRes = useNodeProcesses(asked ? data.block.node_id : '')
+  const procs = asked && !procRes.error ? procRes.data : null
   const b = data.block
   const deploy = socket(b.sockets, 'deploy')
   const planned = Object.entries(editor.plans).reduce((sum, [id, p]) => {
@@ -31,6 +38,7 @@ export function MachineBlock({ data, selected }: NodeProps<BlockNode<'machine'>>
     const model = id.includes('#') ? null : p.result?.placement?.node_ids ?? null
     return model?.includes(b.node_id) && total ? sum + total / model.length : sum
   }, 0)
+  const parts = memoryParts(b.memory.used ?? 0, procs?.available ? procs.processes : null)
   // A launching row says which of the four slow things it is on, never a rate.
   const arriving = (r: { deployment_id: string; model_id: string; state: DeploymentState }) => {
     const launch = activity.data?.launches.find((l) => l.deployment_id === r.deployment_id) ?? null
@@ -55,19 +63,28 @@ export function MachineBlock({ data, selected }: NodeProps<BlockNode<'machine'>>
           </div>
         }
       >
-        {b.memory.total != null ? (
-          <div title="memory: used, planned, total">
-            <SegmentBar
-              segments={[
-                { key: 'used', label: 'used', bytes: b.memory.used ?? 0 },
-                { key: 'planned', label: 'planned', bytes: planned },
-              ]}
-              usable={b.memory.total}
-              height={8}
-            />
+        {b.memory.total != null && b.memory.used != null ? (
+          <div>
+            <div role="img" aria-label={`memory by process, ${gbytes(b.memory.used, 1)} of ${gbytes(b.memory.total, 1)} GB used`}>
+              <SegmentBar
+                segments={[
+                  ...parts.filter((p) => p.bytes > 0).map((p) => ({ key: p.key, label: `${p.label}: ${gbytes(p.held, 1)} GB`, bytes: p.bytes })),
+                  ...(planned > 0 ? [{ key: 'planned', label: `planned: ${gbytes(planned, 1)} GB`, bytes: planned }] : []),
+                ]}
+                usable={b.memory.total}
+                height={8}
+              />
+            </div>
             <span className="unit mono">
-              {gbytes(b.memory.used ?? 0, 1)} used{planned > 0 ? ` · ${gbytes(planned, 1)} planned` : ''} of {gbytes(b.memory.total, 1)} GB
+              {gbytes(b.memory.used, 1)} used{planned > 0 ? ` · ${gbytes(planned, 1)} planned` : ''} of {gbytes(b.memory.total, 1)} GB
             </span>
+            {parts.some((p) => p.managed !== null)
+              ? parts.map((p) => (
+                  <div key={p.key} className="unit mono mdl-ellipsis" title={p.label}>
+                    {gbytes(p.held, 1)} · {p.label}
+                  </div>
+                ))
+              : null}
           </div>
         ) : null}
         {b.rows.length === 0 ? <span className="unit">Nothing running here.</span> : null}
