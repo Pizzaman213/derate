@@ -443,16 +443,16 @@ VLLM_KV_CACHE_DTYPES: frozenset[str] = frozenset({
 #: the image's own formula (`fit/constants.py`, `KV_PER_TOKEN_HEAD_BITS` and
 #: below).
 #:
-#: Everything mapping to None is "the model's own dtype" -- the gate's default,
-#: and the case where passing no flag is exactly right. `int8`/`fp32` are
-#: deliberately ABSENT rather than mapped: the gate can price them and this
-#: image cannot serve them, and that gap is a refusal, not a silent
-#: substitution. So is `fp8_inc`, which is Intel Gaudi's kernel and loads on
-#: no GPU derate places on.
+#: Everything mapping to None is "the model's own dtype" (`fit/kv.py::
+#: MODEL_OWN_KV_DTYPES`). `float16`/`bfloat16` name a width and render; the
+#: plan reaches the engine with one only to override a scheme the checkpoint
+#: declares (`gateway/kv_widths.py`). `int8`/`fp32` are ABSENT rather than
+#: mapped: priced, not servable -- a refusal, not a silent substitution. So
+#: is `fp8_inc`, Intel Gaudi's kernel, which loads on no GPU derate places on.
 _KV_DTYPE_TO_VLLM: dict[str, str | None] = {
     "": None, "auto": None, "model": None, "none": None,
-    "fp16": None, "float16": None, "half": None,
-    "bf16": None, "bfloat16": None,
+    "fp16": None, "float16": "float16", "half": None,
+    "bf16": None, "bfloat16": "bfloat16",
     "fp8": "fp8", "float8": "fp8",
     "fp8_e4m3": "fp8_e4m3",
     "fp8_e5m2": "fp8_e5m2",
@@ -862,8 +862,6 @@ def kv_cache_dtype_refusal(runtime: str, kv_dtype: str | None) -> str | None:
     context the gate promised.
     """
     key = (kv_dtype or "auto").strip().lower()
-    if key in ("", "auto", "model", "none"):
-        return None
     try:
         rendered = render_kv_cache_dtype(key)
     except ValueError as exc:

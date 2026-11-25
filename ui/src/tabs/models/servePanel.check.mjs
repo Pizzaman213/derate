@@ -181,7 +181,11 @@ try {
   const kvGroup = page.getByRole('radiogroup', { name: 'KV cache precision' })
   const base = plans.filter((p) => p.status === 200 && !p.body.kv_dtype && p.body.runtime !== 'sglang').at(-1)
   const ratios = base?.json?.kv_dtype_ratios ?? {}
-  const sixteen = base?.json?.fit?.breakdown?.kv_cache
+  const refused = base?.json?.kv_dtype_refused ?? {}
+  // The default plan is priced at the model's own width, which is not 16-bit
+  // when the checkpoint declares one: divide it back out.
+  const own = base?.json?.kv_dtype_own?.ratio ?? 1
+  const sixteen = base?.json?.fit?.breakdown?.kv_cache / own
   const rows = kvGroup.locator('label')
   const count = await rows.count()
   let offered = 0
@@ -194,6 +198,7 @@ try {
     if (name.startsWith('The model')) continue
     if (dashed) {
       check(!(await radio.isEnabled()), `KV ${name}: dashed, so it cannot be picked`)
+      check(Boolean(refused[name]) && text.includes(refused[name]), `KV ${name}: dashed with the server's reason`)
       continue
     }
     offered += 1

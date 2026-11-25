@@ -259,10 +259,7 @@ def detect(
         if key:
             return key, QuantSource.HF_QUANT_CONFIG, warnings
 
-    raw_dtype = config.get("torch_dtype") or config.get("dtype")
-    if isinstance(raw_dtype, dict):  # some composite configs nest per-tower dtypes
-        raw_dtype = raw_dtype.get("") or next(iter(raw_dtype.values()), None)
-    key = normalize_dtype(raw_dtype if isinstance(raw_dtype, str) else None)
+    key = normalize_dtype(_raw_dtype(config))
     if key:
         return key, QuantSource.TORCH_DTYPE, warnings
 
@@ -307,9 +304,7 @@ def vllm_quant_method(
     overrides (`gptq` -> `gptq_marlin`, `awq` -> `awq_marlin`) are not
     followed because both names carry the same floor.
     """
-    qc = config.get("quantization_config") or config.get("compression_config")
-    if not isinstance(qc, dict) or not qc:
-        qc = hf_quant_config if isinstance(hf_quant_config, dict) else None
+    qc = _quant_config(config, hf_quant_config)
     if not qc:
         return ""
     method = str(qc.get("quant_method") or "").strip().lower()
@@ -332,3 +327,99 @@ def vllm_quant_method(
             return "modelopt_mixed"
         return method or "modelopt"
     return method
+
+
+def _quant_config(
+    config: dict[str, Any], hf_quant_config: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The quantization config vLLM reads: `quantization_config` (or
+    `compression_config`), else the ModelOpt `hf_quant_config.json` sidecar."""
+    qc = config.get("quantization_config") or config.get("compression_config")
+    if not isinstance(qc, dict) or not qc:
+        qc = hf_quant_config if isinstance(hf_quant_config, dict) else None
+    return qc or None
+
+
+#: ModelOpt's KV algorithm names, as `utils/torch_utils.py::
+#: MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP` maps them to a `--kv-cache-dtype`.
+_MODELOPT_KV: dict[str, str] = {"fp8": "fp8_e4m3", "nvfp4": "nvfp4"}
+
+
+def checkpoint_kv_dtype(
+    config: dict[str, Any], hf_quant_config: dict[str, Any] | None = None
+) -> str:
+    """The `--kv-cache-dtype` vLLM stores this checkpoint's cache at when it
+    is told nothing, because the checkpoint declares one; "" when it does not.
+
+    Mirrors the pinned image (0.28.1rc1): `resolve_kv_cache_dtype_string`
+    turns `auto` into a ModelOpt checkpoint's `kv_cache_scheme` /
+    `kv_cache_quant_algo` (8-bit float static -> fp8_e4m3, 4-bit float ->
+    nvfp4, anything else -> auto), and `Attention.__init__` turns it into
+    fp8 for any quant config carrying `kv_cache_scheme`, which only
+    compressed-tensors does. The weight scheme says nothing about the cache:
+    an fp8-weight DeepSeek-V3 caches at the model's compute width. A scheme
+    nested under `text_config` (Qwen3-Omni) is not read: whether vLLM applies
+    it depends on which config its quant object is built from, and "" prices
+    16 bits -- an over-charge, the safe direction.
+    """
+    qc = _quant_config(config, hf_quant_config)
+    if not qc:
+        return ""
+    method = vllm_quant_method(config, hf_quant_config)
+    if method.startswith("modelopt"):
+        inner = qc.get("quantization")
+        inner = inner if isinstance(inner, dict) else qc
+        algo = (
+            inner.get("kv_cache_scheme") or qc.get("kv_cache_scheme")
+            or inner.get("kv_cache_quant_algo") or qc.get("kv_cache_quant_algo")
+        )
+        if isinstance(algo, dict):
+            floating = algo.get("type") == "float"
+            if floating and algo.get("num_bits") == 8 and algo.get("dynamic") is False:
+                algo = "fp8"
+            elif floating and algo.get("num_bits") == 4:
+                algo = "nvfp4"
+        return _MODELOPT_KV.get(algo.lower(), "") if isinstance(algo, str) else ""
+    if method == "compressed-tensors" and qc.get("kv_cache_scheme") is not None:
+        return "fp8"
+    return ""
+
+
+#: The compute dtypes, from `normalize_dtype`'s keys (the one home of their
+#: spellings) onto torch's name, which is how `--kv-cache-dtype` spells them.
+#: `gateway/kv_widths.py` tells a 16-bit KV width from the rest with it.
+TORCH_NAMES: dict[str, str] = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+
+
+def _raw_dtype(sub: dict[str, Any]) -> str | None:
+    """A config's `torch_dtype` (or `dtype`), a per-tower dict read through."""
+    raw = sub.get("torch_dtype") or sub.get("dtype")
+    if isinstance(raw, dict):  # some composite configs nest per-tower dtypes
+        raw = raw.get("") or next(iter(raw.values()), None)
+    return raw if isinstance(raw, str) else None
+
+
+def compute_dtype(config: dict[str, Any]) -> str:
+    """The dtype the checkpoint says it computes in, by torch's name: the
+    config's own, then its text, vision and encoder sub-configs, as vLLM
+    looks; "" when none says. vLLM then reads the weights' own dtype, which a
+    config cannot tell, so absent stays unknown rather than becoming float32."""
+    for key in (None, "text_config", "vision_config", "encoder_config"):
+        sub = config if key is None else config.get(key)
+        raw = _raw_dtype(sub) if isinstance(sub, dict) else None
+        if raw:
+            return TORCH_NAMES.get(normalize_dtype(raw) or "", "")
+    return ""
+
+
+def loader_facts(
+    config: dict[str, Any], hf_quant_config: dict[str, Any] | None = None
+) -> dict[str, str]:
+    """What the engine reads off the checkpoint beyond its weight scheme, as
+    `Resolution` keyword arguments: the loader, the compute dtype and the
+    cache width it declares."""
+    return {
+        "quant_method": vllm_quant_method(config, hf_quant_config),
+        "compute_dtype": compute_dtype(config),
+        "checkpoint_kv_dtype": checkpoint_kv_dtype(config, hf_quant_config),
+    }

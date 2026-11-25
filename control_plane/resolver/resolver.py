@@ -449,7 +449,7 @@ class ModelResolver:
                 "from the config rather than from the weight index"
             )
 
-        dtype, quant_source, quant_warnings, quant_method = self._detect_quant(
+        dtype, quant_source, quant_warnings, loader = self._detect_quant(
             config, model_id, info, dtype_override, revision
         )
         warnings.extend(quant_warnings)
@@ -511,7 +511,7 @@ class ModelResolver:
             speculators=speculators,
             resolved_at=time.time(),
             remote_code=bool(remote_code),
-            quant_method=quant_method,
+            **loader,
         )
 
     def _detect_quant(
@@ -521,9 +521,9 @@ class ModelResolver:
         info: ModelInfo | None,
         override: str | None,
         revision: str,
-    ) -> tuple[str, QuantSource, list[str], str]:
-        """`quant_detect.detect`'s answer, plus vLLM's name for the loader
-        (`quant_detect.vllm_quant_method`), read off the same files."""
+    ) -> tuple[str, QuantSource, list[str], dict[str, str]]:
+        """`quant_detect.detect`'s answer, plus what the engine reads off the
+        same files beyond it (`quant_detect.loader_facts`)."""
         sidecar = None
         needs_sidecar = not isinstance(config.get("quantization_config"), dict)
         if needs_sidecar and info is not None and info.has_file("hf_quant_config.json"):
@@ -536,7 +536,7 @@ class ModelResolver:
         dtype, source, warnings = quant_detect.detect(
             config, model_id, override=override, hf_quant_config=sidecar
         )
-        return dtype, source, warnings, quant_detect.vllm_quant_method(config, sidecar)
+        return dtype, source, warnings, quant_detect.loader_facts(config, sidecar)
 
     def _measure_params(
         self,

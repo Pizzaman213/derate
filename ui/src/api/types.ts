@@ -929,15 +929,14 @@ export interface PlanResponse {
    *  beside it. Null otherwise; absent on an older gateway. */
   gguf_base?: string | null
   gguf_projector?: string | null
-  /** Cache bytes per token at each `--kv-cache-dtype` this plan could launch
-   *  with, over the model's 16-bit rate (`fit/kv.py`). Includes the packed
-   *  layouts, whose scales and boundary layers depend on the model. Absent
-   *  per name when the gate does not price it, this build cannot render it,
-   *  this attention geometry refuses it, the runtime cannot be told it, or the
-   *  image a planned machine runs has no attention backend for it
-   *  (`internal_api.py::_kv_dtype_ratios`): every width listed is one the plan
-   *  accepts. `auto` is never listed. Absent on an older gateway. */
+  /** `gateway/kv_widths.py`; absent on an older gateway. `ratios`: each accepted width's cache over
+   *  the model's 16-bit rate (scales, wide layers included; never `auto`). `own`: what the model's
+   *  own row stores -- `name` null when unstated, `declared` when the checkpoint's quant config sets
+   *  it (vLLM reads it; nothing is passed). `flags`: what the launch passes per accepted width. */
   kv_dtype_ratios?: Record<string, number>
+  kv_dtype_own?: { name: string | null; declared: boolean; ratio: number | null }
+  kv_dtype_flags?: Record<string, string>
+  kv_dtype_refused?: Record<string, string>
 }
 
 export interface LaunchRequest {
@@ -3594,7 +3593,7 @@ export interface RuntimeInfo {
   kv_dtypes: string[]
   /** Bytes per cached element for the PLAIN widths among `kv_dtypes` only
    *  (`fit/kv.py`); a packed layout's cost depends on the model and is in
-   *  `/api/plan`'s `kv_dtype_ratios` instead. */
+   *  `/api/plan`'s `kv_dtype_ratios` (`gateway/kv_widths.py::KvChoices`) instead. */
   kv_dtype_bytes: Record<string, number>
   engine_options: string[]
   reasoning_parsers: string[]

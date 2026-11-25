@@ -901,6 +901,21 @@ layers on a non-hybrid model -- never as a per-element width, which would
 under-charge every one of them. The picker's multiplier for those is per
 model (`/api/plan`'s `kv_dtype_ratios`). `fp8_inc` is Gaudi's and stays refused.
 
+**"The model's own" KV width is not `shape.dtype`, and on vLLM it may not be
+16-bit.** `shape.dtype` is the WEIGHT scheme; `fit/kv.py` priced `auto` from
+it until 2026-11-25, so an fp8-weight checkpoint's cache cost one byte against
+the two vLLM stores. And a checkpoint whose quantization config declares a KV
+scheme (ModelOpt `kv_cache_scheme`/`kv_cache_quant_algo`, compressed-tensors
+`kv_cache_scheme`) is stored at fp8_e4m3/nvfp4/fp8 when vLLM is told nothing
+(`resolve_kv_cache_dtype_string`). `gateway/kv_widths.py` owns both:
+`Resolution.compute_dtype`/`checkpoint_kv_dtype` in; the declared width PRICED
+by name and never passed (vLLM reads it itself; MLA ignores a compressed-tensors
+scheme, so there it is not declared); `float16`/`bfloat16` rendered by name only
+to override a declared scheme; and the 16-bit name that is not the compute
+width REFUSED -- measured on the GB10 here, `reshape_and_cache_flash` writes a
+bfloat16 key into a float16 cache by copying its bits. Widths that do not work
+for the model are hidden from the picker.
+
 **`gpu_memory_utilization` is a claim on the whole device, not a limit.** vLLM
 refuses to start unless that share of the GPU is *free*, then fills it with KV
 cache. A constant therefore asks for the same slice of the machine for a 0.5B

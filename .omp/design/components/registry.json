@@ -1883,6 +1883,13 @@
       "icons": []
     },
     {
+      "name": "KvWidthField",
+      "kind": "screen",
+      "path": "ui/src/tabs/models/KvWidthField.tsx",
+      "tokens": [],
+      "icons": []
+    },
+    {
       "name": "InstalledModelsCard",
       "kind": "screen",
       "path": "ui/src/tabs/models/InstalledModelsCard.tsx",

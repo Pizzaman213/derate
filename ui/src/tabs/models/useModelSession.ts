@@ -42,6 +42,7 @@ import {
   type LaunchInputs,
 } from './launchRequest'
 import { changedKeys, preloadChoice } from './profiles'
+import type { KvWidths } from './kvWidths'
 import {
   cacheIndex,
   providerRowsFor,
@@ -100,11 +101,10 @@ export interface ModelSession {
 
   // ── The verdict ───────────────────────────────────────────────────────────
   result: PlanResponse | null
-  /** The last `kv_dtype_ratios` a plan answered for this model id. Kept across
-   *  a plan error -- a refused width nulls `result`, and blanking every packed
-   *  row would read as "refused" -- and dropped only when the model changes.
-   *  Null until a plan for this id has answered. */
-  kvRatios: Record<string, number> | null
+  /** The last KV picker answer a plan gave for this model id on this runtime (the own width
+   *  depends on the runtime). Kept across a plan error -- a refused width nulls `result`, and
+   *  blanking every packed row would read as "refused" -- and dropped when either changes. */
+  kvWidths: KvWidths | null
   checking: boolean
   error: string | null
   gates: ServeRequirement[]
@@ -458,8 +458,8 @@ export function useModelSession(p: {
 
   // ── Launch knobs ──────────────────────────────────────────────────────────
   const [result, setResult] = useState<PlanResponse | null>(null)
-  const [keptRatios, setKeptRatios] = useState<{ id: string; ratios: Record<string, number> } | null>(null)
-  const kvRatios = keptRatios?.id === subjectId ? keptRatios.ratios : null
+  const [keptWidths, setKeptWidths] = useState<{ id: string; widths: PlanResponse } | null>(null)
+  const kvWidths = keptWidths?.id === `${subjectId} ${runtime}` ? keptWidths.widths : null
   const [checking, setChecking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [launching, setLaunching] = useState(false)
@@ -639,14 +639,14 @@ export function useModelSession(p: {
     setChecking(true)
     setGranted({})
     setExtraGates([])
-    const planFor = subjectId
+    const planFor = `${subjectId} ${runtime}`
     const id = window.setTimeout(() => {
       backend
         .plan(planBody)
         .then((r) => {
           if (planSeq.current !== mine) return
           setResult(r)
-          if (r.kv_dtype_ratios) setKeptRatios({ id: planFor, ratios: r.kv_dtype_ratios })
+          if (r.kv_dtype_ratios) setKeptWidths({ id: planFor, widths: r })
           setError(null)
         })
         .catch((e: unknown) => {
@@ -1063,7 +1063,7 @@ export function useModelSession(p: {
     setDestination,
     routing,
     result,
-    kvRatios,
+    kvWidths,
     checking,
     error,
     gates,
