@@ -550,7 +550,7 @@ const board = B.buildBoard({
   chosen: null,
 })
 for (const r of board.rows) {
-  console.log(`  ${r.nodeId}: selectable=${r.selectable} alloc=${r.allocatable} ceil=${r.ceiling} cached=${r.cached} running=[${r.occupants.map((o) => o.served_name)}]`)
+  console.log(`  ${r.nodeId}: selectable=${r.selectable} alloc=${r.allocatable} ceil=${r.ceiling} cached=${r.cached} running=[${r.occupants}]`)
 }
 check(board.rows.length === clusterNodes.length, 'every machine in the cluster gets a row')
 
@@ -787,23 +787,6 @@ check(neighbour.rows.find((r) => r.nodeId === 'a').selectable === true,
   'a machine running a different model is still offered')
 check(neighbour.rows.find((r) => r.nodeId === 'a').occupants.length === 1,
   'and is still reported as occupied, which is a different question')
-{
-  const GB = 1024 ** 3
-  const sized = synth(three, [], null, {
-    deployments: [{ ...DEP('d-1', 'other/model', 'a'), fit: { breakdown: { total: 4 * GB } } }, DEP('d-2', 'p/q', 'a')],
-  })
-  const occ = sized.rows.find((r) => r.nodeId === 'a').occupants
-  check(occ.length === 2 && occ[0].served_name === 'd-1' && occ[0].model_id === 'other/model' && occ[0].bytes === 4 * GB,
-    'an occupant carries its served name, repository and the per-node bytes its verdict sized')
-  check(occ[1].bytes === null, 'and an occupant with no verdict carries null bytes, not a guess')
-  const segs = B.usedSegments({ occupants: occ }, 10 * GB)
-  check(segs.length === 2 && segs[0].title === 'd-1' && segs[0].bytes === 4 * GB,
-    'the bar draws one named segment per occupant with known bytes')
-  check(segs[1].other && segs[1].title === 'other use on this node' && segs[1].bytes === 6 * GB,
-    'and the rest of the reading as "other use on this node"')
-  check(B.usedSegments({ occupants: occ }, 4.2 * GB).length === 1, 'a remainder under half a GiB is not drawn')
-  check(B.usedSegments({ occupants: occ }, 2 * GB)[0].bytes === 2 * GB, 'segments never exceed the measured use')
-}
 
 // History occupies no GPU. `/api/deployments` lists stopped and failed records
 // too, and the manager relaunches straight over them.

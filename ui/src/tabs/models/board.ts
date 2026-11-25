@@ -7,35 +7,6 @@ import type {
 } from '../../api/types'
 import { TERMINAL, type CacheIndex } from './rows'
 import { canCarryRank, memoryPool, type Runtime } from '../../state/runtime'
-/** One deployment on a machine, as the node bar draws its segment. */
-export interface Occupant {
-  served_name: string
-  model_id: string
-  bytes: number | null
-}
-/** Below this, used memory nobody's verdict accounts for is not drawn. */
-const OTHER_USE_FLOOR = 0.5 * 1024 ** 3
-
-/** The node bar's used span, one segment per occupant with known bytes and a
- *  remainder titled "other use on this node" when the machine reports more
- *  in use than the occupants' verdicts sized. Segments are clamped so their
- *  sum never exceeds `used`: the bar draws a reading, not a claim. */
-export function usedSegments(
-  row: Pick<BoardRow, 'occupants'>,
-  used: number,
-): { title: string; bytes: number; other: boolean }[] {
-  const out: { title: string; bytes: number; other: boolean }[] = []
-  let left = Math.max(0, used)
-  for (const o of row.occupants) {
-    if (o.bytes == null || o.bytes <= 0 || left <= 0) continue
-    const bytes = Math.min(o.bytes, left)
-    out.push({ title: o.served_name, bytes, other: false })
-    left -= bytes
-  }
-  if (left > OTHER_USE_FLOOR) out.push({ title: 'other use on this node', bytes: left, other: true })
-  return out
-}
-
 // The machine board's arithmetic, with no DOM and no React in it: it is the
 // part that can be wrong in a way types cannot catch, so it is the part
 // `rows.check.mjs` bundles and asserts against the live cluster.
@@ -90,11 +61,10 @@ export interface BoardRow {
   /** Are the weights already here. */
   cached: boolean
   cachedBytes: number | null
-  /** What is already running on this machine: served name, repository, and
-   *  the per-node bytes its own fit verdict sized (null when it carries none).
-   *  Deployments that are over are not on it: `/api/deployments` lists FAILED
-   *  and STOPPED records too, and history occupies no GPU. */
-  occupants: Occupant[]
+  /** Served names of what is already running on this machine. Deployments
+   *  that are over are not on it: `/api/deployments` lists FAILED and STOPPED
+   *  records too, and history occupies no GPU. */
+  occupants: string[]
   /** Worst measured all-reduce from here to the other ticked machines, or null
    *  when any of those pairs was never probed. Only meaningful while more than
    *  one machine is ticked. */
@@ -213,7 +183,7 @@ export function buildBoard(input: BoardInput): Board {
   const mem = new Map(memory.map((m) => [m.node_id, m]))
   const edgeAt = new Map(edges.map((e) => [edgeKey(e.src, e.dst), e]))
 
-  const occupants = new Map<string, Occupant[]>()
+  const occupants = new Map<string, string[]>()
   // Machines already running THIS repository, by the name they serve it as.
   // The gateway refuses a second copy on one of them (409 already_deployed),
   // so the board must not offer the tick.
@@ -221,10 +191,9 @@ export function buildBoard(input: BoardInput): Board {
   for (const d of deployments) {
     if (TERMINAL.has(d.state)) continue
     for (const id of d.node_ids ?? []) {
-      const who: Occupant = { served_name: d.served_name, model_id: d.model_id, bytes: d.fit?.breakdown?.total ?? null }
       const list = occupants.get(id)
-      if (list) list.push(who)
-      else occupants.set(id, [who])
+      if (list) list.push(d.served_name)
+      else occupants.set(id, [d.served_name])
       if (d.model_id === repoId && !runningThisModel.has(id)) {
         runningThisModel.set(id, d.served_name)
       }
