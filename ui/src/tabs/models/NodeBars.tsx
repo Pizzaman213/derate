@@ -3,8 +3,7 @@ import type { FitResult, ParallelismRequest, PlanAlternative } from '../../api/t
 import { Lamp } from '../../components/Lamp'
 import { Select, type SelectOption } from '../../components/Select'
 import { Verbatim, VerbatimList } from '../../components/Verbatim'
-import { toggle, usedSegments, type BoardRow } from './board'
-import { repoOf } from './owner'
+import { toggle, type BoardRow } from './board'
 import type { ModelSession } from './useModelSession'
 import { gib } from './verdictView'
 
@@ -35,24 +34,13 @@ const TERMS: { key: keyof FitResult['breakdown']; label: string }[] = [
   { key: 'framework_overhead', label: 'framework overhead' },
 ]
 
-/** Below this share of the bar a segment draws no label: at ~400px a 5%
- *  segment holds three characters of a name, which reads as a glitch. */
-const LABEL_MIN_SHARE = 0.12
-
-/** Whether a machine's bar has memory in use that no deployment accounts for,
- *  so the legend only names the hatching when one is drawn. */
-function hasOtherUse(r: BoardRow): boolean {
-  const used = r.ceiling != null && r.allocatable != null ? Math.max(0, r.ceiling - r.allocatable) : 0
-  return usedSegments(r, used).some((s) => s.other)
-}
-
-/** Which machines this model would be served on, as memory bars.
+/** Which machines this model would be served on.
  *
  *  It ranks nothing. The rows are in cluster order, and the verdict comes
  *  from the fit gate over whatever ends up ticked: a score computed here
- *  would be a second answer with no arithmetic behind it. What a bar draws is
- *  three facts the server already reported -- what the machine could hold
- *  idle, what is in use now, and what this plan charges per node. */
+ *  would be a second answer with no arithmetic behind it. Each row says what
+ *  the server already reported: what the machine has free, and what this plan
+ *  would leave or lack there. */
 export function NodeBars({ s }: { s: ModelSession }) {
   const [why, setWhy] = useState(false)
   const { board, result } = s
@@ -110,8 +98,6 @@ export function NodeBars({ s }: { s: ModelSession }) {
     }
   }
 
-  const name = repoOf(s.variant?.repo_id ?? s.subjectId) || s.subjectId
-
   return (
     <div className="mdl-nodes">
       <div className="mdl-nodes-head">
@@ -133,21 +119,6 @@ export function NodeBars({ s }: { s: ModelSession }) {
         </span>
       </div>
 
-      <div className="mdl-legend unit">
-        <span>
-          <i className="mdl-swatch mdl-swatch-used" aria-hidden="true" /> already running
-        </span>
-        <span>
-          <i className="mdl-swatch mdl-swatch-model" aria-hidden="true" />{' '}
-          {`this model, ${gib(perNode)} per node`}
-        </span>
-        {board.rows.some(hasOtherUse) ? (
-          <span>
-            <i className="mdl-swatch mdl-swatch-other" aria-hidden="true" /> in use, not by a model here
-          </span>
-        ) : null}
-      </div>
-
       {board.rows.map((r) => (
         <NodeBar
           key={r.nodeId}
@@ -155,7 +126,6 @@ export function NodeBars({ s }: { s: ModelSession }) {
           checked={r.ticked || (s.nodeIds == null && r.inPlan)}
           onlyTicked={r.ticked && board.effective.length === 1}
           perNode={perNode}
-          name={name}
           onToggle={(on) => {
             // Unticking the last machine would mean "plan on nothing", which
             // the gateway can only answer with a 400; the box is disabled for
@@ -223,22 +193,16 @@ function NodeBar({
   checked,
   onlyTicked,
   perNode,
-  name,
   onToggle,
 }: {
   row: BoardRow
   checked: boolean
   onlyTicked: boolean
   perNode: number | null
-  name: string
   onToggle: (on: boolean) => void
 }) {
   const id = `${useId()}-node`
-  const track = row.ceiling ?? row.allocatable
-  const used = row.ceiling != null && row.allocatable != null ? Math.max(0, row.ceiling - row.allocatable) : 0
-  const model = row.inPlan && perNode != null ? perNode : 0
-  const over = row.allocatable != null && model > row.allocatable
-  const pct = (bytes: number) => (track ? `${Math.min(100, (bytes / track) * 100)}%` : '0%')
+  const over = row.allocatable != null && perNode != null && perNode > row.allocatable
 
   let note: JSX.Element
   if (row.allocatable == null) note = <span className="unit">not read yet</span>
@@ -271,35 +235,6 @@ function NodeBar({
           {row.name}
         </span>
       </label>
-      <div className="mdl-nbar" aria-hidden="true">
-        {track ? (
-          <>
-            {usedSegments(row, used).map((seg, i) => (
-              <i
-                key={`${seg.title}-${i}`}
-                className={`mdl-nbar-used${seg.other ? ' other' : i % 2 ? ' alt' : ''}`}
-                style={{ width: pct(seg.bytes) }}
-                title={seg.other ? `in use, not by a model here: ${gib(seg.bytes)}` : `${seg.title}: ${gib(seg.bytes)}`}
-              >
-                {/* A sliver cannot hold its name; it only showed the first
-                    three letters. The title carries it either way. */}
-                {seg.other || seg.bytes / track < LABEL_MIN_SHARE ? null : (
-                  <span>{`${seg.title} ${gib(seg.bytes)}`}</span>
-                )}
-              </i>
-            ))}
-            {model > 0 ? (
-              <i
-                className={`mdl-nbar-model${over ? ' over' : ''}`}
-                style={{ width: pct(Math.min(model, Math.max(0, track - used))) }}
-                title={`${name}: ${gib(model)}${over ? ', more than is free' : ''}`}
-              >
-                <span>{`${name} ${gib(model)}${over ? ' ✕' : ''}`}</span>
-              </i>
-            ) : null}
-          </>
-        ) : null}
-      </div>
       {note}
       {/* The registry's own sentence for why it cannot vouch for this machine,
           and the board's for why it cannot carry a rank. Shown, never hidden:

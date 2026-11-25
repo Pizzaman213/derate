@@ -14,7 +14,7 @@
 | `useModelSession.ts` | 815 | the ONE owner of everything the plan request and the launch request share |
 | `ModelPane.tsx` | 300 | one model: header, Serve / Advanced / History / Hugging Face, sticky footer |
 | `VerdictBox.tsx` | 328 | the verdict word, where, per-node GiB, the primary button, both budgets |
-| `NodeBars.tsx` | 295 | "Where it runs": per-machine memory bars, the split select, Why X? |
+| `NodeBars.tsx` | 254 | "Where it runs": one row per machine (tick, name, free/left/short), the split select, Why X? |
 | `QuantSection.tsx` | 244 | Recommended picks, precision tiers, format filter; selecting re-plans |
 | `LivePanel.tsx` | 143 | a running deployment's engine metrics and log tail |
 | `AdvancedTab.tsx` | 527 | engine, speed, memory, context, parallelism, API name, custom flags |
@@ -24,7 +24,7 @@
 | `verdictView.ts` | 89 | the words a verdict is drawn with: `bandWord`, `planWord`, `formatParams`, `gib` |
 | `quantPicks.ts` | 180 | tiers, formats and picks over server-judged ladder rows |
 | `ladder.ts` | 81 | the ladder's two pure derivations, out where a verifier can reach them |
-| `board.ts` | 332 | the machine board's arithmetic, with no DOM in it |
+| `board.ts` | 331 | the machine board's arithmetic, with no DOM in it |
 | `owner.ts` | 230 | publisher accent, initials, and the avatar lookup through the coordinator |
 | `OwnerMark.tsx` | 70 | the publisher mark, drawn from `owner.ts` |
 | `dominant.ts` | 103 | the accent taken from the avatar's own pixels |
@@ -43,7 +43,7 @@
 | `speculative.ts` | 180 | the speculative field's pure decisions |
 | `SpeculativeField.tsx` | 697 | which speculative method to serve with; `null` means one token per step |
 | `CustomServes.tsx` | 59 | replaying a hand-written launch command |
-| `rows.check.mjs` | 931 | the browser-side fold against the live coordinator's real payloads |
+| `rows.check.mjs` | 947 | the browser-side fold against the live coordinator's real payloads |
 | `registry.check.mjs` | 215 | `GET /api/models`, the fold that moved to the server, and the boundary |
 | `serve.check.mjs` | 123 | launch permissions from `gates.ts`, including branches a live cluster cannot reach |
 | `query.check.mjs` | 55 | link parsing, typed filters, suggestion sections |

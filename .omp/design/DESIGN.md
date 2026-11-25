@@ -293,7 +293,7 @@ against the line the verdict used; past `usable` is painted `--fault`;
 `usable: null` draws no fault region. `ProportionBar({value, width, height,
 tone, label})`: `value: null` is a dashed hollow track, distinct from 0.
 **Tokens:** `--bar-track/keyline/limiting/fill`. `--bar-fill` is a filled
-share outside a SegmentBar: the Models tab's node bars and download progress.
+share outside a SegmentBar: download progress and the Models tab's live bars.
 
 ### Models tab tiles and rows
 
