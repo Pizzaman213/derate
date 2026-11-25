@@ -66,7 +66,10 @@ from .progress import (
     MAX_LINE_CHARS,
     LaunchProgress,
     advance as advance_progress,
+    clean_lines,
+    collapse_frames,
     explain_failure,
+    frame_slot,
     from_launcher,
     from_runtime_log,
 )
@@ -304,19 +307,6 @@ PROBE_OVERHEAD_S = 0.3
 #: control plane watching this many deployments at once is already far
 #: outside today's expected scale.
 MAX_PROBE_WORKERS = 64
-
-
-def _bar_desc(line: str) -> str | None:
-    """The description in front of a tqdm bar, or None if this is not one.
-
-    `Fetching 16 files:  19%|...` and `Loading safetensors checkpoint shards:
-    45%|...` are the same bar redrawn, frame after frame; everything before
-    the first colon is what identifies which bar it is.
-    """
-    if "%|" not in line:
-        return None
-    head, sep, _ = line.partition(":")
-    return head if sep else None
 
 
 class LaunchRefused(RuntimeError):
@@ -1591,7 +1581,11 @@ class DeploymentManager:
             # empty and lose the one thing worth keeping.
             following = record.deployment.state in (S.PLANNED, S.LAUNCHING)
             terminal = record.deployment.state in TERMINAL
-        if lines and (following or terminal):
+        # A deployment we are following answers from memory even before it
+        # has printed anything -- one held behind another launch on its node,
+        # or adopted by reconcile() and not yet refilled -- so a screen keeps
+        # polling for free rather than freezing on `none` or paying a `read`.
+        if following or (lines and terminal):
             return {"lines": lines, "source": "buffer", "cluster_id": cluster_id}
         # The buffer is memory, so a coordinator that has restarted since the
         # failure has the record and none of the lines -- and, for a
@@ -1831,23 +1825,27 @@ class DeploymentManager:
         output and the backend's log -- because they are one story to whoever
         is reading it, and they never overlap in time.
 
-        Progress-bar frames collapse onto the previous line rather than
-        stacking up. tqdm redraws several times a second, so a download would
-        otherwise fill the whole buffer with its own bar and push out the lines
-        that say what happened; keeping the newest frame is both what a reader
-        wants and what stops a log from being nothing but a bar.
+        Progress-bar frames collapse onto the earlier frame of the same bar
+        rather than stacking up. tqdm redraws several times a second, so a
+        download would otherwise fill the whole buffer with its own bar and
+        push out the lines that say what happened. The search walks back only
+        through a run of bar frames: huggingface_hub interleaves its file-count
+        and byte bars, and a frame must never jump above a line printed after
+        it. Blank lines -- tqdm's spacers between frames -- are not kept, and
+        tqdm's cursor-up ends a line (`progress.clean_lines`).
         """
         # sparkrun echoes its `docker run -e ...` line; the runtime key is in it.
         # Capped first: a runtime can print one unbounded line (R-4).
-        line = _scrub_key(record, line[:MAX_LINE_CHARS])
-        with self._lock:
-            buffer = record.log_lines
-            bar = _bar_desc(line)
-            if bar is not None and buffer and _bar_desc(buffer[-1]) == bar:
-                buffer[-1] = line
-            else:
-                buffer.append(line)
-        self._note_progress(record, read(line))
+        for piece in clean_lines(line[:MAX_LINE_CHARS]):
+            piece = _scrub_key(record, piece)
+            with self._lock:
+                buffer = record.log_lines
+                slot = frame_slot(buffer, piece)
+                if slot is None:
+                    buffer.append(piece)
+                else:
+                    buffer[slot] = piece
+            self._note_progress(record, read(piece))
 
     #: Headroom added on top of `fit.breakdown.kv_cache` before it becomes
     #: `--kv-cache-memory-bytes`. Two measured shortfalls, both real, neither
@@ -2467,11 +2465,10 @@ class DeploymentManager:
     ) -> None:
         deployment = record.deployment
         detail = str(exc)
-        if exc.raw:
-            detail = "%s\n--- sparkrun output ---\n%s" % (
-                detail, _scrub_key(record, exc.raw.strip())
-            )
-        why = explain_failure(exc.raw or "")
+        raw = collapse_frames(exc.raw or "")
+        if raw:
+            detail = "%s\n--- sparkrun output ---\n%s" % (detail, _scrub_key(record, raw))
+        why = explain_failure(raw)
         if why:
             detail = f"{why}\n{detail}"
         with self._lock:

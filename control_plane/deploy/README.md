@@ -115,7 +115,24 @@ past the tail. A traceback that tells you to look above is worthless if the
 buffer starts below it, and this is one transfer per launch rather than a poll.
 `LOG_BUFFER_LINES` (500) is the other window and not the same one: it is the
 per-deployment ring `log_tail()` serves from, sized to hold a whole vLLM
-startup.
+startup. A `PLANNED`/`LAUNCHING` record answers `buffer` even while that ring
+is empty (held behind another launch on its node, or just adopted): it is
+being followed, so the free source is the true one, and `none` or `read` there
+froze a polling screen or cost a `sparkrun logs`.
+
+The download's rate reaches that ring only because `_launch_env` sets
+`TQDM_POSITION=-1`: huggingface_hub's byte bar is `disable=None`, which tqdm
+turns off on a pipe, and the file-count bar printed alone carries `s/it`, not
+MB/s. That holds when sparkrun downloads in its own process (`local` transfer
+mode, the control machine in the cluster); `delegated` runs the download over
+ssh, where the variable does not travel. Forced on, the two bars interleave
+and end every frame in a cursor-up `\x1b[A` with no newline, so `_note_line`
+splits each chunk with `progress.clean_lines` (the cursor-up ends a line) and
+keeps it through `progress.frame_slot`, which collapses a frame onto
+its own bar's last frame through a run of bar frames only, never above a line
+printed after it. `_fail_launch` keeps the launcher's whole output as
+`last_error`, so it goes through `progress.collapse_frames` first: an 1800 s
+download is ~2 MB of frames otherwise.
 
 `_emit_fit_miss` is described in the file as the most valuable telemetry the
 system produces: a launch that OOMs after passing the gate means the estimate was

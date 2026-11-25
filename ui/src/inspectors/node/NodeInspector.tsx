@@ -207,8 +207,14 @@ export function NodeInspector({ node, deployments, routing, frame, stale, onClos
           <EventsAndLogs nodeId={p.node_id} window={window} />
 
           {/* Last in the column, and the escalation from everything above
-              it: the recorded lines did not say enough, so go and look. */}
-          <NodeTerminal nodeId={p.node_id} />
+              it: the recorded lines did not say enough, so go and look. A
+              launch still in flight leads it with its own live log. */}
+          <NodeTerminal
+            nodeId={p.node_id}
+            // On its way in: DeploymentInspector's `arriving` allowlist, the
+            // one /api/activity uses -- STOPPING is leaving, not arriving.
+            launching={here.filter((d) => d.state === 'planned' || d.state === 'launching')}
+          />
         </div>
       </div>
     </div>

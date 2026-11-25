@@ -20,7 +20,7 @@ bottom, then the right.
 
 | File | Lines | What it owns |
 |---|---|---|
-| `NodeInspector.tsx` | 222 | the frame: identity, lamp, four readouts, and the composition of everything else |
+| `NodeInspector.tsx` | 243 | the frame: identity, lamp, four readouts, and the composition of everything else |
 | `WindowChips.tsx` | 26 | the window selector, and the claim that `live` is a different kind of answer |
 | `NodeCharts.tsx` | 113 | power, temperature, utilisation and memory over the selected window, on one shared cursor |
 | `Provenance.tsx` | 72 | where the numbers above the line came from |
@@ -33,7 +33,7 @@ bottom, then the right.
 | `NodeRuntimeCard.tsx` | 296 | a runtime already listening here, and the one click that makes it a target |
 | `EventsAndLogs.tsx` | 173 | what happened on this machine, in its own words, capped and saying so |
 | `NodeLogFiles.tsx` | — | `node.log`/`proxy.log`, tailed over `GET /api/nodes/{id}/logs` -- not rendered by `NodeInspector` itself; Settings -> Instance is its only caller so far |
-| `Terminal.tsx` | 300 | xterm over a WebSocket to the node, loaded on demand |
+| `Terminal.tsx` | 329 | xterm over a WebSocket to the node, loaded on demand; a launch's live log above it |
 
 ## `NodeInspector.tsx`
 
@@ -374,9 +374,20 @@ other panels for the node/deployment an operator picks there.
 
 ## `Terminal.tsx`
 
-`NodeTerminal({ nodeId })` is xterm over a WebSocket to
+`NodeTerminal({ nodeId, launching })` is xterm over a WebSocket to
 `/api/nodes/{id}/shell`, and it is the last thing in the right column — the
 escalation from everything above it, when the recorded lines did not say enough.
+
+**A launch in flight leads the section with its own log.** `launching` is this
+node's deployments in `planned` or `launching` (`NodeInspector` filters `here`
+with `DeploymentInspector`'s `arriving` allowlist -- `stopping` is leaving, not
+arriving), and each gets its served name and a `DeploymentLog` under the
+heading — the launcher's output with the weight download's tqdm bar and rate,
+then the container's. It renders whether or not the shell is on: watching a
+download is the usual reason somebody scrolls here, and before this the answer
+was "DERATE_SHELL is not set on the coordinator" with the log one click away on
+the deployment sheet. `DeploymentLog` polls only the free `buffer` source, so it
+costs nothing on the machine.
 
 **The one dependency this UI takes that it could not have written, and it is
 loaded on demand.** Rendering a pty means implementing VT100 — alternate screen
