@@ -22,11 +22,13 @@ from .calculator import (
     weight_bytes_per_rank,
 )
 from .kv import (
+    cache_bytes_per_rank,
     cached_layer_tokens,
     kv_bytes_per_token,
     kv_cache_bytes,
     kv_divisor,
     kv_elem_bytes,
+    kv_read_bytes,
     per_layer_per_token_bytes,
     stage_fraction,
 )
@@ -36,12 +38,14 @@ __all__ = [
     "FitCalculator",
     "StubFit",
     "activation_bytes",
+    "cache_bytes_per_rank",
     "cached_layer_tokens",
     "comm_buffer_bytes",
     "kv_bytes_per_token",
     "kv_cache_bytes",
     "kv_divisor",
     "kv_elem_bytes",
+    "kv_read_bytes",
     "memory_breakdown",
     "min_nodes_required",
     "per_layer_per_token_bytes",

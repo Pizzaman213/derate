@@ -11,6 +11,8 @@ import { LinkState, ParallelismPicker } from './ParallelismPicker'
 import { ProviderPicker } from './ProviderPicker'
 import { SpeculativeField } from './SpeculativeField'
 import type { ModelSession } from './useModelSession'
+import { gib } from './verdictView'
+import { ctxLabel } from './usersChart'
 import llamacppLogo from '../../../../.omp/design/logos/llamacpp.png'
 import ollamaLogo from '../../../../.omp/design/logos/ollama.svg'
 import sglangLogo from '../../../../.omp/design/logos/sglang.png'
@@ -47,37 +49,65 @@ const ENGINE: Record<Runtime, { tile: string; logo?: string; note: string }> = {
     note: 'Radix prefix cache; strong when many requests share a long prompt. No speculative decoding here.',
   },
   tts: { tile: 'TT', note: 'derate’s own speech server, one checkpoint, one process.' },
-  llamacpp: { tile: 'LC', logo: llamacppLogo, note: 'GGUF on a machine with no GPU.' },
+  llamacpp: {
+    tile: 'LC',
+    logo: llamacppLogo,
+    note: 'GGUF from host RAM: a machine with no GPU, or a discrete-GPU box serving off its CPU.',
+  },
   ollama: { tile: 'OL', logo: ollamaLogo, note: 'Pull a GGUF onto a provider machine; the gateway routes to it.' },
 }
 
 /** The KV cache widths the gate prices AND the pinned engine accepts. */
 const KV_OPTIONS: { value: string; label: string }[] = [
   { value: '', label: 'The model’s own (default)' },
-  { value: 'fp8', label: 'fp8 — half the bytes per token' },
+  { value: 'fp8', label: 'fp8, half the bytes per token' },
   { value: 'fp8_e4m3', label: 'fp8_e4m3' },
   { value: 'fp8_e5m2', label: 'fp8_e5m2' },
 ]
 
+/** The names `flags.render_kv_cache_dtype` maps to no flag: the 16-bit
+ *  widths are the model's own, so the launch passes nothing. */
+const NO_KV_FLAG: Record<string, true> = { auto: true, float16: true, bfloat16: true }
+
 /** Only the schemes a runtime can actually be told to load. The resolver
  *  prices 33 and most are llama.cpp's GGUF formats, which nothing here can be
- *  told to load into a safetensors checkpoint. nvfp4 is Blackwell-only and
- *  mxfp4 is emulated below it, which the coordinator refuses on the node
- *  rather than this list pretending to know the hardware. */
+ *  told to load into a safetensors checkpoint. nvfp4 and mxfp4 are native on
+ *  Blackwell and emulated below it; what a given machine's GPU and image can
+ *  load is the coordinator's question (`support.silicon_check`), answered per
+ *  node, rather than this list pretending to know the hardware. */
 const QUANT_OPTIONS: SelectOption<string>[] = [
   { value: '', label: 'As the checkpoint ships (default)' },
   { value: 'fp8', label: 'fp8 — 8 bits per weight' },
-  { value: 'nvfp4', label: 'nvfp4 — 4.5 bits, Blackwell only' },
+  { value: 'nvfp4', label: 'nvfp4 — 4.5 bits' },
   { value: 'mxfp4', label: 'mxfp4 — 4.25 bits' },
   { value: 'awq_int4', label: 'awq_int4 — 4.5 bits' },
   { value: 'gptq_int4', label: 'gptq_int4 — 4.5 bits' },
 ]
 
-const CONTEXT_CHIPS: { label: string; value: number }[] = [
-  { label: '8k', value: 8192 },
-  { label: '32k', value: 32768 },
-  { label: '128k', value: 131072 },
-]
+const CONTEXT_CHIPS = [8192, 32768, 131072, 262144, 524288, 1048576].map((value) => ({ label: ctxLabel(value), value }))
+
+/** A positive whole number that can be emptied while typing. The box shows
+ *  its own text while focused, so deleting the first digit leaves it blank
+ *  instead of snapping back; only a number above 0 is committed, and leaving
+ *  the box puts back whatever was last committed. */
+function CountInput({ id, value, onCommit }: { id: string; value: number; onCommit: (n: number) => void }) {
+  const [draft, setDraft] = useState<string | null>(null)
+  return (
+    <input
+      id={id}
+      className="mono"
+      type="number"
+      min={1}
+      value={draft ?? value}
+      onChange={(e) => {
+        setDraft(e.target.value)
+        const n = Math.round(Number(e.target.value))
+        if (e.target.value !== '' && Number.isFinite(n) && n > 0) onCommit(n)
+      }}
+      onBlur={() => setDraft(null)}
+    />
+  )
+}
 
 type Group = 'engine' | 'speed' | 'memory' | 'context' | 'parallel' | 'multimodal' | 'api' | 'lifecycle' | 'flags'
 
@@ -108,13 +138,28 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
   const onCluster = servesOnCluster(s.runtime)
   const overridden = route.context !== null || route.concurrency !== null
   const result = s.result
+  // What the cache pool costs, read off the verdict rather than recomputed:
+  // the server's kv_cache term already holds the attention cache and a
+  // hybrid's linear-attention state. Only when that verdict was taken at the
+  // numbers in the boxes, or the figure would describe a different pool.
+  const judged = result?.fit_live ?? result?.fit ?? null
+  const poolBytes =
+    judged && result?.context === s.liveContext && (result?.concurrency ?? 1) === s.liveConcurrency
+      ? judged.breakdown.kv_cache
+      : null
   const runtimes = useRuntimes().data ?? null
   const info = runtimes?.find((r) => r.name === s.runtime) ?? null
   // The variant's own format, which a runtime either loads or does not.
   const format = s.variant?.gguf_file ? 'gguf' : 'safetensors'
+  // `auto` is the default row already; listing it again would show a second
+  // "model's own" with nothing to price.
   const kvOptions = info
-    ? [{ value: '', label: 'The model’s own (default)' }, ...info.kv_dtypes.map((d) => ({ value: d, label: d }))]
+    ? [
+        { value: '', label: 'The model’s own (default)' },
+        ...info.kv_dtypes.filter((d) => d !== 'auto').map((d) => ({ value: d, label: d })),
+      ]
     : KV_OPTIONS
+  const kvRatios = s.kvRatios
 
   const measure = async (a: string, b: string) => {
     const key = `${a} ${b}`
@@ -280,29 +325,80 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
               {/* KV cache width. Unlike a launch-only flag this changes what
                   the gate APPROVES: the verdict re-plans when it moves, so
                   every number above is already the number for this width. */}
-              <div className="mdl-kvgrid" role="radiogroup" aria-label="KV cache precision">
+              <div
+                className="mdl-kvgrid"
+                role="radiogroup"
+                aria-label="KV cache precision"
+                aria-describedby={`${uid}-kvnote`}
+              >
                 {kvOptions.map((o) => {
-                  const bytes = o.value ? info?.kv_dtype_bytes?.[o.value] : undefined
+                  // This model's own ratio when a plan has carried one: a
+                  // packed layout's scales and wide boundary layers depend on
+                  // the model, so only the plain widths have a model-free one.
+                  // Kept across a refused plan (`s.kvRatios`), so picking a
+                  // width the gate refuses does not blank the others.
+                  const flat = o.value ? info?.kv_dtype_bytes?.[o.value] : undefined
+                  // The model-free 16-bit ratio stands in only until the server
+                  // has answered; after that an absent width is one this plan
+                  // cannot launch, and a multiplier beside it would offer it.
+                  const ratio = o.value
+                    ? kvRatios != null
+                      ? kvRatios[o.value]
+                      : flat != null
+                        ? flat / 2
+                        : undefined
+                    : undefined
+                  // A dash only once the server has answered for this model:
+                  // before that an absent ratio means "not asked yet".
+                  const unpriced = o.value !== '' && ratio == null && kvRatios != null
+                  // `render_kv_cache_dtype` passes no flag for the 16-bit names
+                  // and cannot render a name it does not price.
+                  const flag =
+                    o.value && !NO_KV_FLAG[o.value] && (kvRatios == null || o.value in kvRatios)
+                      ? `--kv-cache-dtype ${o.value}`
+                      : ''
                   return (
                     <label key={o.value || 'default'} className="mdl-check label">
                       <input
                         type="radio"
                         name={`${uid}-kv`}
                         checked={s.kvDtype === o.value}
+                        // A dashed width is one the plan answers with a 400,
+                        // which nulls the verdict this picker is drawn in.
+                        // The selected one stays reachable so it can be left.
+                        disabled={unpriced && s.kvDtype !== o.value}
                         onChange={() => s.setKvDtype(o.value)}
                       />
                       <span>{o.label}</span>
-                      <span className="mono unit">{bytes != null ? `×${bytes / 2}` : o.value ? '—' : ''}</span>
-                      <span className="mono unit">{o.value ? `--kv-cache-dtype ${o.value}` : ''}</span>
+                      <span className="mono unit mdl-kvgrid-ratio">
+                        {ratio != null ? (
+                          <>
+                            {`×${ratio.toFixed(2)}`}
+                            <span className="sr-only"> times the 16-bit cache</span>
+                          </>
+                        ) : unpriced ? (
+                          <>
+                            <span aria-hidden="true">—</span>
+                            <span className="sr-only">not available for this plan</span>
+                          </>
+                        ) : (
+                          ''
+                        )}
+                      </span>
+                      <span className="mono unit">{flag}</span>
                     </label>
                   )
                 })}
               </div>
-              <p className="unit">
-                Stores each cached key and value in one byte instead of two. The verdict above is recomputed for
-                it, so the context and the memory figures shown are already the ones for this width — and the
-                engine is told the same width the gate sized with, which is the only way those two numbers can be
-                the same number.
+              <p className="unit" id={`${uid}-kvnote`}>
+                Stores each cached key and value narrower than the model's own 16 bits. The multiplier is this
+                model's cache against 16-bit, scales and any layers the kernel keeps wide included. A dash is a
+                width this model's attention cannot use, this build cannot pass to the engine, this runtime
+                cannot be told, or the machines this plan lands on have no kernel for; the plan and the launch
+                refuse it. The verdict above is recomputed for
+                the choice, so the context and the memory figures shown are already the ones for this width, and
+                the engine is told the same width the gate sized with, which is the only way those two numbers
+                can be the same number.
               </p>
               <PrefixAndShare s={s} />
               {s.forcedQuantApplies ? (
@@ -333,7 +429,8 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
         <Disclosure
           summary={
             overridden
-              ? `Context — you set ${s.liveContext.toLocaleString()} × ${s.liveConcurrency}`
+              ? `Context — you set ${s.liveContext.toLocaleString()} × ${s.liveConcurrency} = ` +
+                `${(s.liveContext * s.liveConcurrency).toLocaleString()}-token pool`
               : 'Context — chosen for you'
           }
           open={open.context === true || (open.context === undefined && overridden)}
@@ -342,31 +439,11 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
           <div className="mdl-ctx">
             <div className="fld mdl-numfld">
               <label htmlFor={`${uid}-ctx`}>Context</label>
-              <input
-                id={`${uid}-ctx`}
-                className="mono"
-                type="number"
-                min={1}
-                value={s.liveContext}
-                onChange={(e) => {
-                  const n = Number(e.target.value)
-                  if (Number.isFinite(n) && n > 0) navigate({ context: Math.round(n) }, { replace: true })
-                }}
-              />
+              <CountInput id={`${uid}-ctx`} value={s.liveContext} onCommit={(n) => navigate({ context: n }, { replace: true })} />
             </div>
             <div className="fld mdl-numfld">
               <label htmlFor={`${uid}-seq`}>Sequences</label>
-              <input
-                id={`${uid}-seq`}
-                className="mono"
-                type="number"
-                min={1}
-                value={s.liveConcurrency}
-                onChange={(e) => {
-                  const n = Number(e.target.value)
-                  if (Number.isFinite(n) && n > 0) navigate({ concurrency: Math.round(n) }, { replace: true })
-                }}
-              />
+              <CountInput id={`${uid}-seq`} value={s.liveConcurrency} onCommit={(n) => navigate({ concurrency: n }, { replace: true })} />
             </div>
             <span className="chips mdl-chips-inline" role="group" aria-label="Context presets">
               {CONTEXT_CHIPS.map((c) => (
@@ -402,6 +479,10 @@ export function AdvancedTab({ s }: { s: ModelSession }) {
                   'the largest window that fits here, capped at this model’s own.'
                 : 'The coordinator picks the largest window that fits, capped at this model’s own.'
               : 'Every verdict on this screen is taken at these numbers.'}
+            {poolBytes != null
+              ? ` The pool holds ${(s.liveContext * s.liveConcurrency).toLocaleString()} tokens ` +
+                `and costs ${gib(poolBytes)} of cache per node, linear-attention state included.`
+              : ''}
           </p>
           {!s.customCommand ? <YarnField s={s} /> : null}
         </Disclosure>

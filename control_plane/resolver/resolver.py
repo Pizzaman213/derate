@@ -18,7 +18,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from control_plane.contracts import ModelShape, NodeProfile
 from control_plane.contracts.quant import (
@@ -30,10 +30,10 @@ from control_plane.contracts.quant import (
 )
 
 from . import gguf as gguf_mod
-from . import gguf_names, imageprobe, quant_detect, support
+from . import gguf_names, imageprobe, quant_detect, recurrent, support
 from . import speculators as spec_detect
 from .cache import ShapeCache
-from .config_map import Mapped, map_config, vision_config
+from .config_map import Mapped, loop_cache_layers, map_config, vision_config
 from .hf import (
     HubClient,
     ModelInfo,
@@ -43,6 +43,7 @@ from .hf import (
 )
 from .params import ParamBreakdown, analytic_breakdown, reconcile
 from .types import (
+    GGUFLaunchFacts,
     QuantVariant,
     MetadataUnavailable,
     ModelNotFound,
@@ -121,6 +122,10 @@ def _remote_code_sources(
 #: and being 40 percent wrong about a 70B model is not a rounding error.
 _TALLY_DISAGREEMENT_LIMIT = 0.15
 
+#: How often the per-architecture images are re-asked on their own machines.
+#: A pass that hits the image-id cache is one `docker image inspect` over SSH.
+ARCH_PROBE_INTERVAL_S = 300.0
+
 
 class ModelResolver:
     """Implements ``ResolverPort``. Safe to share; the cache is thread safe enough."""
@@ -132,6 +137,8 @@ class ModelResolver:
         *,
         offline: bool = False,
         runtime_images: dict[str, str] | None = None,
+        arch_images: dict[tuple[str, str], str] | None = None,
+        arch_hosts: Callable[[str], list[str]] | None = None,
     ) -> None:
         self.client = client or HubClient()
         self.cache = cache if cache is not None else ShapeCache()
@@ -141,6 +148,16 @@ class ModelResolver:
         # from its static lists, which is the state on any machine without
         # docker -- see `start` and `imageprobe`.
         self.runtime_images = dict(runtime_images or {})
+        # {(runtime, arch): image} for the images a machine of another
+        # architecture runs, and arch -> the docker hosts (`ssh://addr`) of
+        # healthy machines of that architecture to ask them on. The
+        # coordinator cannot start an image built for an architecture it is
+        # not, so these are probed THERE -- on whichever one holds the image.
+        self.arch_images = dict(arch_images or {})
+        self.arch_hosts = arch_hosts
+        # repo -> what vllm needs beside a GGUF from it, or a refusal sentence.
+        # Transient hub failures are never stored, so they are retried.
+        self._gguf_facts: dict[str, GGUFLaunchFacts | str] = {}
 
     # ---- startup -------------------------------------------------------
 
@@ -156,11 +173,16 @@ class ModelResolver:
         Until it lands, the static tables answer. That is the same result as
         a machine with no docker, which is why nothing here waits on it.
         """
-        if not self.runtime_images:
+        if not self.runtime_images and not self.arch_images:
             return
         threading.Thread(
             target=self._probe_runtime_images, name="derate-imageprobe", daemon=True
         ).start()
+        if self.arch_images and self.arch_hosts is not None:
+            threading.Thread(
+                target=self._probe_arch_images_forever, name="derate-imageprobe-arch",
+                daemon=True,
+            ).start()
 
     def _probe_runtime_images(self) -> None:
         cache_dir = self.cache.directory.parent / "runtimes"
@@ -184,6 +206,68 @@ class ModelResolver:
                 len(found.architectures),
                 found.provenance,
             )
+
+    def _probe_arch_image(self, runtime: str, arch: str, image: str, cache_dir):
+        """One image of another architecture: the coordinator's own copy from
+        the cache first (it holds one so sparkrun can ship it, and cannot run
+        it), then each healthy machine of that architecture until one has it.
+        A machine that just joined has nothing until its first launch, and
+        any other machine of its architecture can answer for it: the cache is
+        keyed by the image's layers, not by where it was asked.
+
+        Only an answer that landed in that SHARED entry is returned: a remote
+        daemon's answer reaches it only when the coordinator's own copy has the
+        same layers (`imageprobe.probe`). An unconfirmed one stays cached for
+        its host alone, and is not adopted here -- `support` keys probes by
+        image, so adopting it would let one machine say what the image loads
+        on every machine of its architecture. The static table answers instead."""
+        found = imageprobe.probe(runtime, image, cache_dir=cache_dir, run=False)
+        if found is not None:
+            return found, "the coordinator's cache"
+        for host in self.arch_hosts(arch) if self.arch_hosts else []:
+            if imageprobe.probe(runtime, image, cache_dir=cache_dir, host=host) is None:
+                continue
+            found = imageprobe.probe(runtime, image, cache_dir=cache_dir, run=False)
+            if found is not None:
+                return found, host
+            log.info(
+                "runtime probe: %s (%s) answered on %s, but the coordinator holds "
+                "no copy with the same layers to confirm it; not adopted for %s",
+                runtime, image, host, arch,
+            )
+        return None, None
+
+    def _probe_arch_images_once(self) -> None:
+        """Ask each per-architecture image on a machine of that architecture.
+
+        Every pass, not once: the machine may join after startup, the image
+        may be pulled or rebuilt later, and a pass that hits the cache costs
+        one `docker image inspect` per place asked."""
+        cache_dir = self.cache.directory.parent / "runtimes"
+        for (runtime, arch), image in self.arch_images.items():
+            try:
+                found, where = self._probe_arch_image(runtime, arch, image, cache_dir)
+            except Exception:  # pragma: no cover - probe is best effort
+                log.exception("runtime probe of %s on %s failed", image, arch)
+                continue
+            if found is None:
+                log.info(
+                    "runtime probe: %s (%s) not readable here or on any %s machine",
+                    runtime, image, arch,
+                )
+                continue
+            known = support.probed_image(runtime, image)
+            support.record_image_probe(found)
+            if known is None or known.image_id != found.image_id:
+                log.info(
+                    "runtime probe: %s on %s loads %d architectures, gguf=%s, per %s (asked %s)",
+                    runtime, arch, len(found.architectures), found.gguf, found.provenance, where,
+                )
+
+    def _probe_arch_images_forever(self) -> None:
+        while True:
+            self._probe_arch_images_once()
+            time.sleep(ARCH_PROBE_INTERVAL_S)
 
     # ---- ResolverPort --------------------------------------------------
 
@@ -365,7 +449,7 @@ class ModelResolver:
                 "from the config rather than from the weight index"
             )
 
-        dtype, quant_source, quant_warnings = self._detect_quant(
+        dtype, quant_source, quant_warnings, quant_method = self._detect_quant(
             config, model_id, info, dtype_override, revision
         )
         warnings.extend(quant_warnings)
@@ -427,6 +511,7 @@ class ModelResolver:
             speculators=speculators,
             resolved_at=time.time(),
             remote_code=bool(remote_code),
+            quant_method=quant_method,
         )
 
     def _detect_quant(
@@ -436,7 +521,9 @@ class ModelResolver:
         info: ModelInfo | None,
         override: str | None,
         revision: str,
-    ) -> tuple[str, QuantSource, list[str]]:
+    ) -> tuple[str, QuantSource, list[str], str]:
+        """`quant_detect.detect`'s answer, plus vLLM's name for the loader
+        (`quant_detect.vllm_quant_method`), read off the same files."""
         sidecar = None
         needs_sidecar = not isinstance(config.get("quantization_config"), dict)
         if needs_sidecar and info is not None and info.has_file("hf_quant_config.json"):
@@ -446,9 +533,10 @@ class ModelResolver:
                 )
             except ResolverError:
                 sidecar = None
-        return quant_detect.detect(
+        dtype, source, warnings = quant_detect.detect(
             config, model_id, override=override, hf_quant_config=sidecar
         )
+        return dtype, source, warnings, quant_detect.vllm_quant_method(config, sidecar)
 
     def _measure_params(
         self,
@@ -577,6 +665,12 @@ class ModelResolver:
         res = self.resolve_gguf_full(model_id, dtype=dtype)
         res.elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.cache.put(model_id, revision, dtype, res)
+        # `_architectures_for` looks up `shape.model_id`, which
+        # `resolve_gguf_full` writes WITHOUT the `hf://` scheme. Without this
+        # second key every hub GGUF read "no architecture on record" on
+        # llamacpp, which is the runtime that exists to serve them.
+        if res.shape.model_id != model_id:
+            self.cache.put(res.shape.model_id, revision, dtype, res)
         return res
 
     def resolve_gguf(self, path: str) -> ModelShape:
@@ -612,6 +706,13 @@ class ModelResolver:
             )
             header = gguf_mod.read_header(reader)
             name = f"{repo}/{filename}"
+
+            def read_sibling(sibling: str) -> gguf_mod.GGUFHeader:
+                return gguf_mod.read_header(gguf_mod.RangeReader(
+                    lambda start, length: self.client.read_range(repo, sibling, start, length)
+                ))
+
+            shard_of = filename
         else:
             local = _local_model_path(path)
             if local is None or not local.is_file():
@@ -619,20 +720,161 @@ class ModelResolver:
             header = gguf_mod.read_gguf_file(str(local))
             name = str(local)
 
+            def read_sibling(sibling: str) -> gguf_mod.GGUFHeader:
+                if not Path(sibling).is_file():
+                    raise ModelNotFound(_LOCAL_REFUSED)
+                return gguf_mod.read_gguf_file(sibling)
+
+            shard_of = str(local)
+
+        # A split GGUF is one build in several files, and the header of the
+        # first carries only ITS tensors -- summing it alone under-counted
+        # every split build by the rest of the files, on every runtime.
+        family = gguf_names.shard_family(shard_of)
+        if family is not None:
+            _, index, total = family
+            if index != 1:
+                raise ModelNotFound(
+                    f"{path!r} is shard {index} of {total}; name the first shard, "
+                    f"-00001-of-{total:05d}.gguf"
+                )
+            for k in range(2, total + 1):
+                header.tensors.extend(read_sibling(gguf_names.shard_name(shard_of, k)).tensors)
+
         res = _resolution_from_gguf(header, name, dtype)
         res.elapsed_ms = (time.perf_counter() - started) * 1000.0
         return res
 
+    def gguf_launch_facts(self, model_id: str) -> GGUFLaunchFacts:
+        """What vllm needs beside a hub GGUF blob, or a refusal as ValueError.
+
+        vllm-gguf-plugin reads the GGUF's weights and nothing else: the config
+        and the tokenizer come from the repository the file was quantized
+        from, and a vision-language model's projector is a second ``.gguf``.
+        The hub states the first in a ``base_model:quantized:<id>`` tag, which
+        every GGUF publisher checked carries exactly once; a repo that names
+        none, or two, is refused rather than guessed at.
+
+        Accepts ``hf://owner/repo/file.gguf`` or the resolved ``owner/repo/
+        file.gguf``. A refusal is memoised per repository; a hub failure
+        (`MetadataUnavailable`) is not, so it is retried.
+        """
+        ref = model_id.strip()
+        if ref.startswith("hf://"):
+            ref = ref[len("hf://") :]
+        repo = "/".join(ref.split("/")[:2])
+        if self.offline:
+            raise MetadataUnavailable(
+                f"{repo!r} base model lookup needs the hub and the resolver is offline"
+            )
+        known = self._gguf_facts.get(repo)
+        if isinstance(known, str):
+            raise ValueError(known)
+        if known is not None:
+            return known
+        try:
+            facts = self._gguf_launch_facts_uncached(repo)
+        except ValueError as exc:
+            self._gguf_facts[repo] = str(exc)
+            raise
+        self._gguf_facts[repo] = facts
+        return facts
+
+    def _gguf_launch_facts_uncached(self, repo: str) -> GGUFLaunchFacts:
+        info = self.client.model_info(repo)
+        prefix = "base_model:quantized:"
+        bases = sorted({t[len(prefix) :] for t in info.tags if t.startswith(prefix)})
+        if len(bases) != 1:
+            raise ValueError(
+                f"{repo} does not name exactly one model it was quantized from "
+                f"(hub tags list {len(bases)}); vllm loads a GGUF only beside its "
+                "original model's config.json and tokenizer, so serve this file "
+                "on llamacpp"
+            )
+        base = bases[0]
+        if self.client.is_gated(base):
+            raise ValueError(
+                f"{base} is gated, and the vllm container fetches its config.json "
+                "and tokenizer at startup without a token; serve this GGUF on "
+                "llamacpp, or a safetensors build"
+            )
+        try:
+            base_res = self.resolve_full(base)
+        except (ModelNotFound, UnsupportedArchitecture, ValueError) as exc:
+            raise ValueError(
+                f"{base}, the model {repo} was quantized from, did not resolve: {exc}"
+            ) from exc
+
+        projector = projector_bytes = None
+        if base_res.shape.vision_params > 0:
+            candidates = [
+                s for s in info.siblings
+                if s.lower().endswith(".gguf") and gguf_names.is_mmproj(s.rsplit("/", 1)[-1])
+            ]
+            if not candidates:
+                raise ValueError(
+                    f"{base} is a vision-language model and {repo} publishes no "
+                    "mmproj projector, which vllm needs beside the GGUF; serve it "
+                    "on llamacpp or a safetensors build"
+                )
+            name = None
+            # bf16 before f16: "bf16" contains "f16".
+            for width in ("bf16", "f16", "f32"):
+                name = next(
+                    (c for c in candidates if width in c.rsplit("/", 1)[-1].lower()), None
+                )
+                if name is not None:
+                    break
+            if name is None:
+                name = sorted(candidates)[0]
+            size = info.file_sizes.get(name)
+            if size is None:
+                raise ValueError(
+                    f"the hub did not report the size of {repo}/{name}, and the "
+                    "fit gate does not launch what it cannot budget"
+                )
+            projector, projector_bytes = f"{repo}/{name}", size
+
+        return GGUFLaunchFacts(
+            base, base_res.architectures, projector=projector, projector_bytes=projector_bytes
+        )
+
     # ---- support ---------------------------------------------------------
 
-    def supported_by(self, shape: ModelShape, runtime: str) -> tuple[bool, str]:
+    def supported_by(
+        self, shape: ModelShape, runtime: str, image: str | None = None
+    ) -> tuple[bool, str]:
         """Whether a runtime can load this shape, architecture and quant both.
 
         ``ModelShape`` carries no architecture field, so the architecture comes
         from the cached resolution for this model id when there is one.
+
+        *image* is the image the placed machines run; its own probe answers
+        when there is one (`support.evaluate_runtime`). Without it the default
+        image's probe answers; an image nothing has asked is unknown and the
+        static table answers (`support.probe_for`).
         """
         architectures = self._architectures_for(shape)
-        return support.evaluate_runtime(runtime, architectures, shape.dtype).as_tuple()
+        if runtime.strip().lower() == "vllm" and gguf_names.is_hub_gguf_blob(shape.model_id):
+            # A GGUF on vllm is judged on the model it was quantized from: the
+            # plugin loads that repository's config.json, so its architecture
+            # is the one the image must register, and the GGUF header's ggml
+            # name (`qwen35`) may map to nothing at all.
+            found = support.probe_for("vllm", image)
+            if found is None or not found.gguf:
+                return support.evaluate_runtime(
+                    runtime, architectures, shape.dtype, image=image
+                ).as_tuple()
+            try:
+                facts = self.gguf_launch_facts(shape.model_id)
+            except (ValueError, MetadataUnavailable) as exc:
+                return False, str(exc)
+            return support.evaluate_runtime(
+                runtime, facts.architectures, shape.dtype, image=image
+            ).as_tuple()
+        return support.evaluate_runtime(
+            runtime, architectures, shape.dtype, image=image
+        ).as_tuple()
 
     def supported_on(
         self, shape: ModelShape, runtime: str, nodes: list[NodeProfile]
@@ -955,6 +1197,16 @@ class ModelResolver:
             return variants
 
         needle = self._quant_stem(model_id)
+        # bartowski names a requantization `<source-org>_<model>-GGUF` and
+        # DevQuasar `<source-org>.<model>-GGUF`, which the exact-stem guard
+        # below would drop. Only the source model's OWN org is accepted as a
+        # prefix: a general "strip any leading word" rule would let
+        # `Someone_Abliterated...` finetunes in, which that guard exists to stop.
+        owner_key = (
+            model_id.split("/")[0].lower().replace("-", "").replace("_", "").replace(".", "")
+            if model_id.count("/") == 1
+            else ""
+        )
         gguf_repos: list[tuple[int, str]] = []
         for hit in hits:
             hit_id = str(hit.get("id") or hit.get("modelId") or "")
@@ -968,40 +1220,52 @@ class ModelResolver:
             # 21 GB download as a smaller build of the thing you asked for. So
             # the hit has to reduce to exactly the stem once its own quantization
             # suffix is removed.
-            if needle and self._quant_stem(hit_id) != needle:
+            hit_stem = self._quant_stem(hit_id)
+            if needle and hit_stem != needle and not (
+                owner_key and hit_stem == owner_key + needle
+            ):
                 continue
             if "mlx" in lowered:
                 continue  # Apple silicon format; nothing in this cluster loads it
             downloads = hit.get("downloads")
             downloads = int(downloads) if isinstance(downloads, int) else None
-            if self._looks_like_gguf_repo(hit_id, hit.get("tags") or ()):
+            gguf_repo = self._looks_like_gguf_repo(hit_id, hit.get("tags") or ())
+            # A GGUF repository's name and tags describe its FILES (`mxfp4_moe`
+            # is the `MXFP4_MOE.gguf` build), so a repository-level row read off
+            # them with a non-GGUF scheme would claim a launchable safetensors
+            # build that does not exist. Its files are enumerated below by
+            # `_gguf_file_variants` when it is within `_MAX_GGUF_REPOS`.
+            if gguf_repo:
                 # Ordered by popularity below rather than by the order the hub
                 # happened to return them, so a truncated list keeps the
                 # ladders people actually use.
                 gguf_repos.append((downloads if downloads is not None else -1, hit_id))
             key = quant_detect.from_name(hit_id)
             if key:
-                add(
-                    QuantVariant(
-                        dtype=key,
-                        label=hit_id.split("/")[-1],
-                        repo_id=hit_id,
-                        source="repo_name",
-                        downloads=downloads,
-                        launchable=quant_info(key).family != "gguf",
-                        note=(
-                            "scheme read from the repository name; open it and "
-                            "choose a .gguf build, which is what a launch needs "
-                            "to name"
-                            if quant_info(key).family == "gguf"
-                            else "scheme read from the repository name"
-                        ),
+                if not (gguf_repo and quant_info(key).family != "gguf"):
+                    add(
+                        QuantVariant(
+                            dtype=key,
+                            label=hit_id.split("/")[-1],
+                            repo_id=hit_id,
+                            source="repo_name",
+                            downloads=downloads,
+                            launchable=quant_info(key).family != "gguf",
+                            note=(
+                                "scheme read from the repository name; open it and "
+                                "choose a .gguf build, which is what a launch needs "
+                                "to name"
+                                if quant_info(key).family == "gguf"
+                                else "scheme read from the repository name"
+                            ),
+                        )
                     )
-                )
                 continue
             for tag in hit.get("tags", []) or ():
                 key = normalize_dtype(str(tag))
                 if key and key in BYTES_PER_PARAM:
+                    if gguf_repo and quant_info(key).family != "gguf":
+                        break
                     add(
                         QuantVariant(
                             dtype=key,
@@ -1238,8 +1502,20 @@ class ModelResolver:
                 note="; ".join(notes),
             )
             out.append(variant)
-            if add_to is not None:
-                add_to(variant)
+
+        # Per repository, which is the scope a `(repo_id, label)` key needs:
+        # `quant_token` drops publisher qualifiers, so two builds of one scheme
+        # would otherwise share a label.
+        labels = gguf_names.distinct_labels(
+            [v.label for v in out], [v.gguf_file or "" for v in out]
+        )
+        out = [
+            v if v.label == label else dataclasses.replace(v, label=label)
+            for v, label in zip(out, labels)
+        ]
+        if add_to is not None:
+            for v in out:
+                add_to(v)
         return out
 
 
@@ -1301,7 +1577,9 @@ def _weight_byte_warnings(
 def _shape_from(model_id: str, mapped: Mapped, accounting, dtype: str) -> ModelShape:
     return ModelShape(
         model_id=model_id,
-        num_layers=mapped.num_layers,
+        # The KV cache's layer count: a looped core's extra visits included
+        # (`Mapped.cache_layers`). The weights are measured, not derived from it.
+        num_layers=mapped.cache_layers or mapped.num_layers,
         hidden_size=mapped.hidden_size,
         num_attention_heads=mapped.num_attention_heads,
         num_kv_heads=mapped.num_kv_heads,
@@ -1314,11 +1592,14 @@ def _shape_from(model_id: str, mapped: Mapped, accounting, dtype: str) -> ModelS
         active_params=accounting.active_params,
         sliding_window=mapped.sliding_window,
         layers_with_full_attention=mapped.layers_with_full_attention,
+        attention_free_layers=mapped.attention_free_layers,
+        recurrent_state_bytes=mapped.recurrent_state_bytes,
         mla_latent_dim=mapped.mla_latent_dim,
         mla_rope_dim=mapped.qk_rope_head_dim,
         vision_params=accounting.vision_params,
         is_encoder_decoder=mapped.is_encoder_decoder,
         routed_expert_params=accounting.routed_expert_params,
+        decode_read_params=accounting.decode_read_params,
     )
 
 
@@ -1329,7 +1610,28 @@ def _resolution_from_gguf(
     warnings: list[str] = []
     layers = int(header.get("block_count") or 0)
     hidden = int(header.get("embedding_length") or 0)
-    heads = int(header.get("attention.head_count") or 0)
+
+    # Hybrid checkpoints (qwen35, qwen3next, nemotron_h, granitehybrid, lfm2,
+    # jamba, falcon-h1, mamba) keep a fixed-size state on their recurrent
+    # layers and a KV cache only on the rest. Every layer was once charged a
+    # full-context cache -- 713 GiB for a 6.3 GiB Qwen3.8-27B GGUF -- and then
+    # a 4096-token window on the linear ones, which still priced a constant
+    # as if it grew with the context: 9 GiB at 12 sequences against under 4.
+    hybrid = recurrent.from_gguf(header, layers, hidden) if layers and hidden else None
+    attention_free = hybrid is not None and hybrid.attention_free_layers >= layers
+
+    raw_heads = header.get("attention.head_count")
+    if isinstance(raw_heads, (list, tuple)):
+        # Per layer, 0 on the recurrent ones (llama.cpp's hybrids).
+        raw_heads = max((int(h or 0) for h in raw_heads), default=0)
+    heads = int(raw_heads or 0)
+    if attention_free and not heads:
+        # A pure state-space GGUF (mamba, mamba2) has no attention to count.
+        heads = 1
+        warnings.append(
+            "no attention layer: every layer is recurrent, so no KV cache is "
+            "charged and the head count is recorded as 1"
+        )
     if not (layers and hidden and heads):
         raise UnsupportedArchitecture(
             f"GGUF header for {name!r} is missing block_count, embedding_length "
@@ -1337,7 +1639,19 @@ def _resolution_from_gguf(
         )
 
     kv_heads = header.get("attention.head_count_kv")
-    if kv_heads is None:
+    # A hybrid writes one KV head count per layer, 0 where a layer has no
+    # attention; the attention layers are the nonzero ones.
+    per_layer_kv = recurrent.per_layer_kv_heads(kv_heads, layers)
+    if per_layer_kv is not None:
+        kv_heads = max(per_layer_kv) or None
+    elif isinstance(kv_heads, (list, tuple)):
+        raise UnsupportedArchitecture(
+            f"GGUF header for {name!r} lists {len(kv_heads)} per-layer KV head "
+            f"counts for {layers} layers"
+        )
+    if kv_heads is None and attention_free:
+        kv_heads = 1
+    elif kv_heads is None:
         kv_heads = heads
         warnings.append(
             "GGUF header has no attention.head_count_kv; assuming multi-head "
@@ -1369,12 +1683,50 @@ def _resolution_from_gguf(
     window = header.get("attention.sliding_window")
     sliding_window = int(window) if window else None
     layers_full = None
-    if sliding_window:
+    # llama.cpp writes one flag per layer, True where the layer is windowed --
+    # Inkling 2 Mini's 20 local layers and its 4 global ones (5, 11, 17, 23).
+    # An integer pattern is a period whose phase llama.cpp sets per
+    # architecture in code, so only the list is read as a per-layer answer.
+    raw_pattern = header.get("attention.sliding_window_pattern")
+    pattern = (
+        [bool(v) for v in raw_pattern]
+        if isinstance(raw_pattern, (list, tuple)) and len(raw_pattern) == layers
+        else None
+    )
+    if sliding_window and pattern is not None:
+        layers_full = pattern.count(False)
+    elif sliding_window:
         layers_full = 0
         warnings.append(
             f"GGUF header declares a {sliding_window}-token window but not which "
             "layers use it; charged every layer as windowed"
         )
+
+    # A looped core (`inkling2_loop`): blocks loop.start..loop.end run
+    # loop.count times per token and llama.cpp keeps a KV cache per visit, so
+    # 24 blocks are 48 cache slots. The tensors stay physical and are measured.
+    cache_layers = layers
+    loop_count = int(header.get("loop.count") or 0)
+    if loop_count > 1:
+        flags = pattern if (sliding_window and pattern is not None) else [False] * layers
+        unrolled = loop_cache_layers(
+            flags,
+            int(header.get("loop.start") or 0),
+            int(header.get("loop.end") or 0),
+            loop_count,
+        )
+        if unrolled is None:
+            warnings.append(
+                "GGUF header declares a loop that does not fit its "
+                f"{layers} blocks; charged the physical blocks only"
+            )
+        else:
+            cache_layers, full_slots = unrolled
+            if sliding_window and pattern is not None:
+                layers_full = full_slots
+
+    if hybrid is not None:
+        warnings.append(hybrid.note)
 
     total_params = header.total_params
     weight_bytes = header.total_bytes
@@ -1411,9 +1763,18 @@ def _resolution_from_gguf(
             int(total_params * 0.01),
         )
 
+    # What one decoded token streams. A file with its own `output.weight` has
+    # an untied head, so the input table is a row gather and drops out; without
+    # one the embedding IS the head and every token reads it.
+    untied = any(t.name == "output.weight" for t in header.tensors)
+    decode_read = total_params - (header.embedding_params() if untied else 0)
+    if experts and expert_params:
+        decode_read -= int(expert_params * (1 - experts_used / experts))
+    decode_read = max(int(decode_read), int(total_params * 0.01))
+
     shape = ModelShape(
         model_id=name,
-        num_layers=layers,
+        num_layers=cache_layers,
         hidden_size=hidden,
         num_attention_heads=heads,
         num_kv_heads=kv_heads,
@@ -1426,16 +1787,15 @@ def _resolution_from_gguf(
         active_params=active,
         sliding_window=sliding_window,
         layers_with_full_attention=layers_full,
+        attention_free_layers=hybrid.attention_free_layers if hybrid else 0,
+        recurrent_state_bytes=hybrid.state_bytes if hybrid else 0,
         mla_latent_dim=None,
         vision_params=0,
+        decode_read_params=decode_read,
     )
 
     architecture = header.architecture
     verdict = support.build_verdict((architecture,) if architecture else (), dtype)
-    warnings.append(
-        "GGUF is llama.cpp's format; neither vLLM nor SGLang loads it reliably, "
-        "so this shape is for planning, not for a launch through either runtime"
-    )
 
     return Resolution(
         shape=shape,

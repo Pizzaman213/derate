@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass
 
 from control_plane.contracts import Deployment, DeploymentState, ModelShape
+from control_plane.fit.constants import RECURRENT_STATES_PER_SEQUENCE
 from control_plane.limits.service import (
     completions_requested,
     largest_batch_prompt,
@@ -72,11 +73,11 @@ def kv_bytes_per_token_fallback(shape: ModelShape, kv_dtype: str) -> float:
         # the RoPE half under-counts a DeepSeek-family cache by about 11
         # percent, in the OOM direction (M-10).
         return (
-            shape.num_layers
+            shape.attention_layers
             * (shape.mla_latent_dim + shape.effective_mla_rope_dim)
             * elem
         )
-    return 2.0 * shape.num_layers * shape.num_kv_heads * shape.effective_head_dim * elem
+    return 2.0 * shape.attention_layers * shape.num_kv_heads * shape.effective_head_dim * elem
 
 
 class AdmissionController:
@@ -317,7 +318,10 @@ class AdmissionController:
         per_token = self.kv_bytes_per_token(
             deployment.shape, self._settings.default_kv_dtype
         )
-        kv_cost = int(per_token * requested / self.kv_divisor(deployment))
+        # A hybrid's recurrent layers cost a fixed state per request on top,
+        # whatever its length.
+        state = max(0, deployment.shape.recurrent_state_bytes) * RECURRENT_STATES_PER_SEQUENCE
+        kv_cost = int((per_token * requested + state) / self.kv_divisor(deployment))
 
         budget = self.kv_budget(deployment)
         used = self.committed(deployment.deployment_id)

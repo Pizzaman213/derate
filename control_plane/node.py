@@ -82,7 +82,7 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     from control_plane.links.service import LinkService
     from control_plane.planner.planner import Planner
     from control_plane.providers.service import ProviderService
-    from control_plane.deploy.flags import RUNTIMES as RUNTIME_SPECS
+    from control_plane.deploy.flags import RUNTIMES as RUNTIME_SPECS, image_for_arch
     from control_plane.deploy.recipes import container_image
     from control_plane.resolver import imageprobe
     from control_plane.resolver.resolver import ModelResolver
@@ -101,14 +101,54 @@ def build_gateway_deps(runtime: NodeRuntime, config: RegistryConfig):
     # being a hand-copied list of somebody else's architectures -- see
     # resolver/imageprobe.py. An image that is not on this machine is not
     # pulled and not waited for; the static table answers instead.
+    def arch_hosts(arch: str) -> list[str]:
+        """Docker hosts on every healthy machine of *arch*: the addresses a
+        launch already SSHes to (`SparkrunAdapter.hosts_for`), so asking an
+        image there needs no trust a launch does not already have. All of
+        them, because only a machine that holds the image can answer."""
+        from control_plane.registry.net import valid_host
+
+        try:
+            states = registry.healthy_nodes()
+        except Exception:
+            return []
+        return [
+            f"ssh://{state.profile.address}"
+            for state in states
+            if getattr(state.profile, "arch", "") == arch and valid_host(state.profile.address)
+        ]
+
     resolver = ModelResolver(
         runtime_images={
             name: container_image(spec)
             for name, spec in RUNTIME_SPECS.items()
             if name in imageprobe.SCRIPTS
-        }
+        },
+        # The image each other architecture runs, asked on a machine of it.
+        arch_images={
+            (name, arch): image
+            for name, spec in RUNTIME_SPECS.items()
+            if name in imageprobe.SCRIPTS
+            for arch, *_ in spec.arch_images
+            if (image := image_for_arch(spec, arch))
+        },
+        arch_hosts=arch_hosts,
     )
-    fit = FitCalculator()
+    # The gate prices a cross-node plan's interconnect from the same link
+    # store the planner ranks with, and calibrates its decode efficiency from
+    # the rates the metrics hub records off live traffic -- read under the
+    # version of the image the judged machine runs, never the default image's.
+    from control_plane import measurements
+
+    fit = FitCalculator(
+        links=links,
+        decode_samples=lambda model_id, gpu, bandwidth, arch: measurements.decode_samples(
+            model_id,
+            gpu,
+            bandwidth,
+            runtime_version=measurements.image_version("vllm", arch),
+        ),
+    )
     # Never Planner(fit=FitCalculator()): the planner's fit argument is its
     # own FitHelpers protocol (min_nodes_required/kv_bytes_per_token), which
     # FitCalculator does not implement. The no-arg default resolves to
@@ -295,6 +335,32 @@ def _install_shutdown(
     return _shutdown
 
 
+def _refuse_if_taken(host: str, port: int, variable: str) -> None:
+    """Exit with the variable that moves a port, not a traceback.
+
+    Host networking shares the host's ports, so a collision is with something
+    already running and the fix is one environment variable -- which uvicorn's
+    own ``[Errno 98]`` followed by ``SystemExit`` does not say. Bound the way
+    uvicorn binds (``SO_REUSEADDR``), so a port this refuses is a port its
+    own bind would have refused; the race between this and that bind is
+    still uvicorn's to report.
+    """
+    probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            return
+        raise SystemExit(
+            "[derate] port %d is already in use on this host.\n"
+            "[derate] Host networking shares the host's ports, so this is a "
+            "collision with something already running.\n"
+            "[derate] Pick another one:  docker run --network host -e %s=<port> ..."
+            % (port, variable)
+        ) from None
+    finally:
+        probe.close()
 def _abort_connections(server: uvicorn.Server) -> None:
     state = getattr(server, "server_state", None)
     for connection in list(getattr(state, "connections", ())):
@@ -326,6 +392,7 @@ async def _run_with_signals(servers: list[uvicorn.Server]) -> None:
 
 async def _serve_worker(runtime: NodeRuntime, config: RegistryConfig) -> None:
     """The entire worker: the node agent, on the agent port. Nothing else."""
+    _refuse_if_taken("0.0.0.0", config.agent_port, "DERATE_AGENT_PORT")
     server = _make_server(runtime.agent_app(), host="0.0.0.0", port=config.agent_port)
     await _run_with_signals([server])
 
@@ -352,6 +419,8 @@ async def _serve_coordinator(runtime: NodeRuntime, config: RegistryConfig) -> No
     # package's own module docstring asks for.
     gateway_app = create_app(deps, settings=deps.settings, telemetry=runtime.telemetry)
 
+    _refuse_if_taken("0.0.0.0", config.agent_port, "DERATE_AGENT_PORT")
+    _refuse_if_taken(deps.settings.host, deps.settings.port, "DERATE_PORT")
     agent_server = _make_server(
         runtime.agent_app(), host="0.0.0.0", port=config.agent_port
     )
@@ -361,22 +430,12 @@ async def _serve_coordinator(runtime: NodeRuntime, config: RegistryConfig) -> No
     else:
         if settings.edge_port == settings.port:
             raise SystemExit("[derate] DERATE_EDGE_PORT must differ from DERATE_PORT")
-        # Bound first, so a taken edge port stops startup before the main
-        # listener exists, and says which variable moves it.
-        try:
-            edge = _bind(settings.edge_host, settings.edge_port)
-        except OSError as exc:
-            if exc.errno != errno.EADDRINUSE:
-                raise
-            raise SystemExit(
-                f"[derate] DERATE_EDGE_PORT {settings.edge_port} is already in use on "
-                f"{settings.edge_host}; pick another one."
-            ) from None
+        _refuse_if_taken(settings.edge_host, settings.edge_port, "DERATE_EDGE_PORT")
         config = _config(gateway_app, host=settings.host, port=settings.port)
         gateway_server = _Server(
             config,
             # bind_socket logs the main listener the way uvicorn always has.
-            sockets=[_not_inheritable(config.bind_socket()), edge],
+            sockets=[_not_inheritable(config.bind_socket()), _bind(settings.edge_host, settings.edge_port)],
         )
         log.info(
             "edge listener on %s:%d: /v1 only, client address from %s",

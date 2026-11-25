@@ -598,6 +598,161 @@ def test_requests_provider_filter_applies_to_json_and_csv(gw, tmp_path):
         assert all(r["provider_id"] == "claude_code" and r["status"] == "429" for r in rows)
 
 
+def _origins_archive(gw, tmp_path):
+    from control_plane.telemetry.archive import Archive
+    from tests.unit.test_telemetry_keys import T0, _ingest, _rec
+
+    arc = Archive(tmp_path / "origins.db")
+    seeded = (
+        [("8.8.8.8", "k1")] * 3
+        + [("8.8.4.4", "k2")]
+        + [("127.0.0.1", "k2")] * 2
+        + [(None, "k2")]
+    )
+    _ingest(arc, [
+        _rec(request_id=f"r{i}", ts=T0 + i, client_ip=ip, key_id=key, status=200)
+        for i, (ip, key) in enumerate(seeded)
+    ])
+    gw.app.state.ctx.telemetry.archive = arc
+    return {"start": str(T0), "end": str(T0 + 100)}
+
+
+def test_request_origins_group_addresses_by_place_and_count_the_rest(gw, tmp_path, monkeypatch):
+    from control_plane.telemetry.geoip import Location
+
+    window = _origins_archive(gw, tmp_path)
+    here = Location(lat=37.4, lon=-122.1, city="Mountain View", region="California", country="US")
+    places = {"8.8.8.8": here, "8.8.4.4": here}
+    monkeypatch.setattr(gw.app.state.ctx.geoip, "lookup", lambda ip: places.get(ip))
+
+    r = gw.client.get("/api/requests/origins", params=window, headers=gw.cookie)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(p["city"], p["requests"], p["ips"]) for p in body["points"]] == [
+        ("Mountain View", 4, 2)
+    ]
+    assert (body["located"], body["local"], body["unknown"], body["unlocated"]) == (4, 2, 1, 0)
+    assert body["database"]["state"] == "missing"  # nothing downloaded under test
+    assert body["attribution"]["text"] == "IP Geolocation by DB-IP"
+
+    narrowed = gw.client.get(
+        "/api/requests/origins", params={**window, "key_id": "k1"}, headers=gw.cookie
+    ).json()
+    assert [(p["requests"], p["ips"]) for p in narrowed["points"]] == [(3, 1)]
+    assert (narrowed["local"], narrowed["unknown"]) == (0, 0)
+
+
+def test_request_origins_without_an_archive_is_history_unavailable(gw):
+    gw.app.state.ctx.telemetry.archive = None
+    r = gw.client.get("/api/requests/origins", headers=gw.cookie)
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "history_unavailable"
+
+
+def test_geoip_classifies_one_address_and_requires_one(gw):
+    r = gw.client.get("/api/geoip", params={"ip": "127.0.0.1"}, headers=gw.cookie)
+    assert r.status_code == 200, r.text
+    assert (r.json()["kind"], r.json()["location"]) == ("local", None)
+    missing = gw.client.get("/api/geoip", params={"ip": ""}, headers=gw.cookie)
+    assert missing.status_code == 400
+    assert missing.json()["error"]["code"] == "missing_ip"
+
+
+def test_a_known_place_beats_the_database_and_places_the_local_network(gw, tmp_path):
+    from control_plane.telemetry.places import KnownPlaces
+
+    # Its own file, so no other test sees the table.
+    gw.app.state.ctx.geoip_places = KnownPlaces(tmp_path / "places.json")
+    window = _origins_archive(gw, tmp_path)
+    lab = {"cidr": "127.0.0.0/8", "label": "Lab", "lat": 45.5, "lon": -73.6}
+
+    put = gw.client.put("/api/geoip/places", json={"places": [lab]}, headers=gw.cookie)
+    assert put.status_code == 200, put.text
+    assert (tmp_path / "places.json").exists()
+    listed = gw.client.get("/api/geoip/places", headers=gw.cookie).json()
+    assert [p["cidr"] for p in listed["places"]] == ["127.0.0.0/8"]
+    assert listed["error"] is None
+
+    one = gw.client.get("/api/geoip", params={"ip": "127.0.0.1"}, headers=gw.cookie).json()
+    assert one["kind"] == "local"
+    assert (one["location"]["label"], one["location"]["source"]) == ("Lab", "place")
+
+    body = gw.client.get("/api/requests/origins", params=window, headers=gw.cookie).json()
+    assert [(p["label"], p["requests"], p["ips"]) for p in body["points"]] == [("Lab", 2, 1)]
+    assert (body["local"], body["unknown"]) == (0, 1)
+
+    bad = gw.client.put(
+        "/api/geoip/places",
+        json={"places": [{"cidr": "nope", "label": "x", "lat": 0, "lon": 0}]},
+        headers=gw.cookie,
+    )
+    assert bad.status_code == 400
+    assert bad.json()["error"]["code"] == "invalid_place"
+    assert bad.json()["error"]["message"].startswith("places[0].cidr:")
+    north = gw.client.put(
+        "/api/geoip/places", json={"places": [{**lab, "lat": 91}]}, headers=gw.cookie
+    )
+    assert north.status_code == 400
+    assert north.json()["error"]["message"] == "places[0].lat: latitude must be between -90 and 90"
+    # A refused table leaves the stored one alone.
+    assert gw.client.get("/api/geoip/places", headers=gw.cookie).json()["places"] == [lab]
+
+    entries = gw.client.get("/api/audit", headers=gw.cookie).json()["entries"]
+    changed = [e for e in entries if e["action"] == "settings_changed" and e["target_kind"] == "geoip_places"]
+    assert len(changed) == 1
+    assert (changed[0]["before"], changed[0]["after"]) == ({"places": 0}, {"places": 1})
+
+
+def test_the_route_names_every_server_a_request_passed_and_places_each(gw, tmp_path, monkeypatch):
+    from control_plane.gateway import request_route
+    from control_plane.telemetry.archive import Archive
+    from control_plane.telemetry.geoip import Location
+    from control_plane.telemetry.places import KnownPlaces, parse_places
+    from tests.unit.test_telemetry_keys import _ingest, _rec
+
+    arc = Archive(tmp_path / "route.db")
+    _ingest(arc, [_rec(
+        request_id="r-route", ts=time.time(), node_id="spark-01", client_ip="8.8.8.8",
+        target_id="openrouter:up/cloud", status=200,
+        attempt_chain=[
+            {"target_id": "d-local", "status": 503, "ms": 5.0},
+            {"target_id": "openrouter:up/cloud", "status": 200, "ms": 40.0},
+        ],
+    )])
+    ctx = gw.app.state.ctx
+    ctx.telemetry.archive = arc
+    ctx.geoip_places = KnownPlaces(tmp_path / "places.json")
+    ctx.geoip_places.save(parse_places([{"cidr": "192.168.11.0/24", "label": "Lab", "lat": 45.5, "lon": -73.6}]))
+    database = {
+        "8.8.8.8": Location(37.4, -122.1, "Mountain View", "California", "US"),
+        "203.0.113.9": Location(37.77, -122.42, "San Francisco", "California", "US"),
+    }
+    monkeypatch.setattr(ctx.geoip, "lookup", database.get)
+    # The provider's base_url is http://cloud/v1; no test may reach real DNS.
+    monkeypatch.setattr(request_route, "resolve_host", {"cloud": "203.0.113.9"}.get)
+
+    r = gw.client.get("/api/requests/route", params={"request_id": "r-route"}, headers=gw.cookie)
+    assert r.status_code == 200, r.text
+    hops = r.json()["hops"]
+    assert [(h["role"], h["name"], h["attempt"], h["status"]) for h in hops] == [
+        ("client", "8.8.8.8", None, None),
+        ("gateway", "spark-01", None, None),
+        ("node", "spark-01", 1, 503),
+        ("provider", "openrouter", 2, 200),
+    ]
+    assert hops[0]["location"]["city"] == "Mountain View"
+    assert (hops[1]["address"], hops[1]["location"]["label"]) == ("192.168.11.13", "Lab")
+    assert (hops[3]["host"], hops[3]["address"]) == ("cloud", "203.0.113.9")
+    assert hops[3]["location"]["city"] == "San Francisco"
+    assert hops[3]["note"] == request_route.PROVIDER_NOTE
+
+    missing = gw.client.get("/api/requests/route", params={"request_id": ""}, headers=gw.cookie)
+    assert missing.status_code == 400 and missing.json()["error"]["code"] == "missing_request_id"
+    unknown = gw.client.get("/api/requests/route", params={"request_id": "r-nope"}, headers=gw.cookie)
+    assert unknown.status_code == 404
+
+
+
 def test_spec_decode_counters_are_attributed_after_settle(gw):
     from control_plane.telemetry.engine_metrics import SpecSample
 

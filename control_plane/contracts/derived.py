@@ -180,6 +180,18 @@ FACTS: tuple[DerivedFact, ...] = (
         copies=(),
         restated_at=("control_plane/auth/README.md", "docs/FORENSICS.md"),
     ),
+    DerivedFact(
+        name="recurrent_states_per_sequence",
+        canonical="control_plane.fit.constants:RECURRENT_STATES_PER_SEQUENCE",
+        why=(
+            "how many copies of a hybrid's recurrent state the pinned image "
+            "reserves per request is a fact about the runtime's cache manager, "
+            "and the fit gate is what prices it. The planner's fallback bridge "
+            "must not import control_plane.fit -- it exists for when that "
+            "package cannot answer -- so it keeps its own spelling"
+        ),
+        copies=("control_plane.planner.fit_bridge:RECURRENT_STATES_PER_SEQUENCE",),
+    ),
 )
 
 

@@ -1551,6 +1551,11 @@ svg text.m {
 
 .mdl-tab {
   display: grid;
+  /* One column that may shrink below its content's minimum. Without it the
+     implicit `auto` column grew to the toolbar's no-wrap width (~500px), and
+     at 390px both panes were laid out at that width and clipped, with the
+     whole page scrolling sideways. Same move as `.mdl-split-solo`. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-12);
 }
 /* The panes already run to the window's bottom edge (`--mdl-chrome`), so on
@@ -1697,6 +1702,20 @@ main:has(> section:not([hidden]) > .mdl-tab) {
   background: var(--toggle-on-bg);
   color: var(--toggle-on-fg);
   border-color: var(--toggle-on-bg);
+}
+/* A phone cannot hold search, two menus and three buttons on one line: the
+   search gets its own row and the controls wrap under it, still one height. */
+@media (max-width: 760px) {
+  .mdl-search {
+    flex-wrap: wrap;
+    height: auto;
+  }
+  .mdl-search > * {
+    height: var(--control-h);
+  }
+  .mdl-search-box {
+    flex-basis: 100%;
+  }
 }
 .mdl-badge {
   display: inline-flex;
@@ -2386,6 +2405,11 @@ main:has(> section:not([hidden]) > .mdl-tab) {
   text-align: right;
   white-space: nowrap;
 }
+/* "49.6 GiB host RAM free" wraps at narrow widths rather than run past the
+   card; every other figure stays on one line. */
+.mdl-node > .unit.mdl-node-pool {
+  white-space: normal;
+}
 .mdl-node-note {
   grid-column: 2 / -1;
 }
@@ -2704,6 +2728,10 @@ main:has(> section:not([hidden]) > .mdl-tab) {
   align-items: center;
   gap: var(--space-8);
 }
+.mdl-kvgrid-ratio {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
 .mdl-subdetails > summary {
   cursor: pointer;
 }
@@ -2889,46 +2917,35 @@ main:has(> section:not([hidden]) > .mdl-tab) {
 .mdl-users-head .mdl-seg {
   margin-left: auto;
 }
-/* "Context per user" and its chips, read as part of the chart rather than a
-   control bolted under it: no box, the chart's small type, centred under the
-   plot like an axis caption, the chosen one underlined the way the precision
-   tabs mark theirs. */
-.mdl-users-ctx {
-  display: flex;
-  align-items: baseline;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: var(--space-2) var(--space-8);
-  margin-top: calc(-1 * var(--space-6));
-  font-size: var(--size-micro);
+/* Context per user and Users at once (SizingSliders): label, slider, a
+   fixed-width figure and Auto, so the tracks never resize as the figure
+   changes length under a drag. */
+.mdl-size {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr) 7ch max-content;
+  align-items: center;
+  gap: var(--space-8);
+}
+.mdl-size > label {
   color: var(--ink-muted);
 }
-.mdl-users-ctx > .unit:first-child {
-  font-size: inherit;
-  cursor: help;
+.mdl-size-val {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
 }
-.mdl-users-chips {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
+/* Narrow: each label takes its own row so the track gets the full width. */
+@media (max-width: 760px) {
+  .mdl-size {
+    grid-template-columns: minmax(0, 1fr) 7ch max-content;
+  }
+  .mdl-size > label {
+    grid-column: 1 / -1;
+  }
 }
-.mdl-users-chips button {
-  padding: var(--space-1) var(--space-4);
-  border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
-  background: none;
-  font-size: inherit;
-  color: var(--ink-muted);
-  font-variant-numeric: tabular-nums;
-}
-.mdl-users-chips button:hover {
-  color: var(--ink);
-}
-.mdl-users-chips button[aria-checked='true'] {
-  color: var(--ink);
-  font-weight: 500;
-  border-bottom-color: var(--ink);
+.mdl-size-sum {
+  grid-column: 1 / -1;
+  margin: 0;
 }
 .mdl-users-measure {
   display: flex;
@@ -3419,11 +3436,12 @@ button.wrow-title:focus-visible {
   text-decoration: line-through;
   opacity: var(--opacity-45);
 }
-/* What Save will do to a row: relaunch it, or stop it. */
-.pill.wpending {
-  color: var(--warn);
-  border-color: var(--warn);
-}
+/* State tones for a pill: text and border in the state's text token, never a
+   filled surface. `.wpending` is the warn tone under Balancer's name: what
+   Save will do to a row, relaunch it or stop it. */
+.pill.live { color: var(--live); border-color: var(--live); }
+.pill.warn, .pill.wpending { color: var(--warn); border-color: var(--warn); }
+.pill.fault { color: var(--fault); border-color: var(--fault); }
 /* An OpenRouter row's host table inside a provider block: the block is
    narrower than the table, so it scrolls sideways rather than clipping. */
 .whosts {
@@ -3474,8 +3492,6 @@ button.wrow-title:focus-visible {
 }
 .wshare input[type='range'] {
   flex: 1;
-  min-width: 0;
-  accent-color: var(--ink);
 }
 .wshare .mono {
   width: 4ch;
@@ -3592,3 +3608,68 @@ button.wrow-title:focus-visible {
   background: none !important;
   box-shadow: none;
 }
+
+/* RequestMap (components/RequestMap.tsx). Marker colour is the class, never
+   Leaflet's colour option: a presentation attribute cannot hold a token. */
+/* `isolation` keeps Leaflet's own z-indexes (panes 400, controls 1000) inside
+   the map: without it a map that overlaps its neighbours mid-animation paints
+   over them, the request detail's summary strip included. */
+.req-map { border: 1px solid var(--rule); border-radius: var(--card-radius); overflow: hidden; background: var(--panel-sunk); isolation: isolate; }
+.req-map.leaflet-container { background: var(--panel-sunk); font: inherit; }
+.req-map .leaflet-tile { filter: var(--map-tile-filter); }
+.req-map-marker { stroke: var(--accent); fill: var(--accent); fill-opacity: .35; }
+/* The client's position is approximate: a fixed-size dashed ring, not a distance. */
+.req-map-ring { stroke: var(--accent); stroke-dasharray: 4 4; fill: var(--accent); fill-opacity: .12; }
+/* A request's route: dashed, so it reads as a path between places, not a border. */
+.req-map-route { stroke: var(--accent); fill: none; stroke-dasharray: 6 6; }
+.req-map .leaflet-control-attribution, .req-map .leaflet-bar a { background: var(--panel-raised); color: var(--ink-secondary); }
+.req-map .leaflet-control-attribution { font-size: var(--size-unit); line-height: 1.3; padding: 0 var(--space-4); }
+.req-map .leaflet-control-scale-line { background: var(--panel-raised); color: var(--ink-secondary); border-color: var(--ink-secondary); font-family: var(--font-mono); font-size: var(--size-unit); }
+.req-map .leaflet-bar a { border-color: var(--rule); }
+
+/* Request detail (tabs/requests/RequestDetail.tsx) */
+.rq-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: var(--space-16); }
+.rq-title { display: flex; align-items: center; gap: var(--space-12); flex-wrap: wrap; }
+.rq-head-main { flex: 1 1 320px; min-width: 0; }
+.rq-head-map { flex: 0 1 440px; min-width: 260px; display: flex; flex-direction: column; gap: var(--space-8); }
+.rq-map-caption { display: flex; justify-content: space-between; align-items: center; gap: var(--space-8); }
+/* The enlarged map scales up out of the header map's corner (top right) and
+   back down into it; the header map then settles in from slightly larger. */
+.rq-map-big {
+  margin-top: var(--space-16); display: flex; flex-direction: column; gap: var(--space-8);
+  transform-origin: top right; animation: rq-map-grow var(--dur) var(--ease) both;
+}
+.rq-map-big.rq-map-closing { animation: rq-map-shrink var(--dur-mid) var(--ease-inout) both; }
+.rq-map-back { transform-origin: top right; animation: rq-map-settle var(--dur) var(--ease) both; }
+@keyframes rq-map-grow { from { transform: scale(.35); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes rq-map-shrink { from { transform: none; opacity: 1; } to { transform: scale(.35); opacity: 0; } }
+@keyframes rq-map-settle { from { transform: scale(.92); opacity: 0; } to { transform: none; opacity: 1; } }
+/* Above every map: the strip never sits under one, whatever it animates. */
+.rq-strip {
+  position: relative; z-index: 1;
+  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: var(--space-12);
+  background: var(--panel-raised); border: 1px solid var(--rule); border-radius: var(--radius);
+  padding: var(--space-12) var(--space-16); margin-top: var(--space-16);
+}
+.rq-strip p { margin: 0; flex: 1 1 480px; line-height: 1.5; }
+/* Buttons only, no margins: the alignment audit measures this row. */
+.rq-actions { display: flex; gap: var(--space-8); flex-wrap: wrap; }
+.rq-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: var(--space-12); margin-top: var(--space-16); }
+@media (max-width: 1024px) { .rq-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .rq-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.rq-stat {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); padding: var(--space-16);
+  display: flex; flex-direction: column; gap: var(--space-4);
+}
+.rq-cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-12); margin-top: var(--space-16); }
+@media (max-width: 640px) { .rq-cols { grid-template-columns: 1fr; } }
+.rq-col { border-top: 1px solid var(--rule-strong); padding-top: var(--space-12); display: flex; flex-direction: column; gap: var(--space-10); }
+.rq-fact { display: flex; flex-direction: column; gap: var(--space-2); overflow-wrap: anywhere; }
+/* Tick labels centre on their mark; the first is left-anchored and the last
+   (the total, drawn with no `left`) right-anchored so neither overflows. */
+.rq-ticks { position: relative; height: 16px; font-family: var(--font-mono); font-size: var(--size-unit); color: var(--ink-muted); }
+.rq-ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.rq-ticks span:first-child { transform: none; }
+.rq-ticks span:last-child { right: 0; transform: none; }
+.rq-swatch { width: 10px; height: 10px; display: inline-block; border-radius: var(--radius-sm); margin-right: var(--space-4); }
+.rq-raw td { white-space: pre-wrap; overflow-wrap: anywhere; }

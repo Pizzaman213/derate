@@ -349,7 +349,7 @@ class TestPrivateAndUTC:
         logfiles.install(directory=tmp_path, level="DEBUG")
         logging.getLogger("gateway.proxy").warning("stamp")
         logfiles.uninstall()
-        line = next(l for l in _read(tmp_path, logfiles.NODE_LOG).splitlines() if l.endswith("stamp"))
+        line = next(ln for ln in _read(tmp_path, logfiles.NODE_LOG).splitlines() if ln.endswith("stamp"))
         assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z WARNING gateway.proxy stamp$", line), line
 
 

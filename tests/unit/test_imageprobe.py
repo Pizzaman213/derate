@@ -11,6 +11,7 @@ static table instead of raising.
 from __future__ import annotations
 
 import json
+import os
 import stat
 
 import pytest
@@ -19,6 +20,14 @@ from control_plane.resolver import imageprobe, support
 from control_plane.resolver.imageprobe import ImageProbe
 
 IMAGE = "ghcr.io/example/vllm:latest"
+
+
+def _digest(ch: str) -> str:
+    """A docker content digest: the only shape the probe accepts from a daemon."""
+    return "sha256:" + ch * 64
+
+
+ID_A = _digest("a")
 
 
 @pytest.fixture(autouse=True)
@@ -31,9 +40,13 @@ def _no_probes_leak():
     support.clear_probes()
 
 
-def _fake_docker(tmp_path, *, image_id="sha256:aaa", architectures=("LlamaForCausalLM",),
-                 version="0.28.0", inspect_rc=0, run_rc=0, removed=None, out_of_tree=None):
-    """A `docker` that answers `image inspect` and `run`, and logs its calls."""
+def _fake_docker(tmp_path, *, image_id=ID_A, architectures=("LlamaForCausalLM",),
+                 version="0.28.0", inspect_rc=0, run_rc=0, removed=None, out_of_tree=None,
+                 gguf=False, gpus_rc=0, quant_min_capability=None, kv_capabilities=None,
+                 layers=None):
+    """A `docker` that answers `image inspect` and `run`, and logs its calls.
+    *gpus_rc* is what a `run --gpus all` exits with: a daemon with no NVIDIA
+    runtime refuses the flag before the container starts."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     log = tmp_path / "calls.log"
     payload = json.dumps({
@@ -41,6 +54,9 @@ def _fake_docker(tmp_path, *, image_id="sha256:aaa", architectures=("LlamaForCau
         "architectures": list(architectures),
         "removed": removed or {},
         "out_of_tree": out_of_tree or {},
+        "gguf": gguf,
+        "quant_min_capability": quant_min_capability or {},
+        "kv_capabilities": kv_capabilities,
     })
     script = tmp_path / "docker"
     script.write_text(
@@ -48,10 +64,11 @@ def _fake_docker(tmp_path, *, image_id="sha256:aaa", architectures=("LlamaForCau
 echo "$@" >> {log}
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   [ {inspect_rc} -ne 0 ] && exit {inspect_rc}
-  echo "{image_id}"
+  echo "{image_id}{'|' + json.dumps(layers).replace('"', chr(92) + '"') if layers else ''}"
   exit 0
 fi
 if [ "$1" = "run" ]; then
+  case "$*" in *--gpus*) [ {gpus_rc} -ne 0 ] && exit {gpus_rc};; esac
   [ {run_rc} -ne 0 ] && exit {run_rc}
   echo "INFO 00:00:00 [importing.py:74] Triton is installed but 0 drivers found"
   echo 'derate-imageprobe:{payload}'
@@ -114,6 +131,32 @@ class TestProbe:
         assert found is not None
         assert "Gemma4ForConditionalGeneration" in found.architectures
 
+    def test_a_probe_answers_for_the_same_layers_under_another_daemons_id(self, tmp_path):
+        """The amd64 image is ``sha256:db08...`` on the RTX box (containerd
+        store) and ``sha256:1d61...`` on the coordinator after save/load
+        (overlay2). Keyed by that id, a probe made on one machine could never
+        answer for another, and a machine that has not launched yet could not
+        be judged at all. Keyed by the layers, the coordinator's own copy
+        answers from the cache -- without starting an image it cannot run."""
+        layers = [_digest("1"), _digest("2")]
+        cache = tmp_path / "c"
+        on_box, _ = _fake_docker(tmp_path / "box", image_id=_digest("d"), layers=layers,
+                                 architectures=("LlamaForCausalLM",))
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=on_box) is not None
+
+        here, log = _fake_docker(tmp_path / "here", image_id=_digest("e"), layers=layers,
+                                 run_rc=1)
+        found = imageprobe.probe("vllm", "derate/vllm-audio:amd64", cache_dir=cache,
+                                 docker=here, run=False)
+        assert found is not None
+        assert found.image == "derate/vllm-audio:amd64" and found.image_id == _digest("e")
+        assert " run " not in f" {log.read_text()} "
+
+        other, log = _fake_docker(tmp_path / "other", image_id=_digest("e"),
+                                  layers=[_digest("1"), _digest("3")])
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=other, run=False) is None
+        assert " run " not in f" {log.read_text()} "
+
     def test_a_container_that_fails_degrades(self, tmp_path):
         docker, _ = _fake_docker(tmp_path, run_rc=1)
         assert imageprobe.probe("vllm", IMAGE, cache_dir=tmp_path / "c", docker=docker) is None
@@ -162,9 +205,9 @@ class TestProbeCache:
         would keep answering for last week's image -- which is precisely the
         staleness this module exists to end."""
         cache = tmp_path / "c"
-        old, _ = _fake_docker(tmp_path / "a", image_id="sha256:111",
+        old, _ = _fake_docker(tmp_path / "a", image_id=_digest("1"),
                               architectures=("LlamaForCausalLM",))
-        new, _ = _fake_docker(tmp_path / "b", image_id="sha256:222",
+        new, _ = _fake_docker(tmp_path / "b", image_id=_digest("2"),
                               architectures=("LlamaForCausalLM", "Gemma4ForConditionalGeneration"))
         before = imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=old)
         after = imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=new)
@@ -185,19 +228,194 @@ class TestProbeCache:
         cache = tmp_path / "c"
         cache.mkdir()
         stale = {
-            "runtime": "vllm", "image": IMAGE, "image_id": "sha256:aaa",
+            "runtime": "vllm", "image": IMAGE, "image_id": ID_A,
             "version": "0.27.0", "architectures": ["LlamaForCausalLM"],
             "speculators": [],
             # `removed` / `out_of_tree` deliberately absent.
         }
-        (cache / "vllm-sha256-aaa.json").write_text(json.dumps(stale))
+        (cache / f"vllm-{ID_A.replace(':', '-')}.json").write_text(json.dumps(stale))
         docker, log = _fake_docker(
-            tmp_path, image_id="sha256:aaa",
+            tmp_path, image_id=ID_A,
             removed={"MllamaForConditionalGeneration": "v0.10.2"},
         )
         found = imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker)
         assert "run --rm" in log.read_text()
         assert found.removed == {"MllamaForConditionalGeneration": "v0.10.2"}
+
+    def test_a_cache_entry_missing_gguf_re_probes(self, tmp_path):
+        """Served from cache, an entry written before the field existed would
+        claim this image has no GGUF loader -- and refuse every GGUF on vllm
+        on an image that carries the plugin."""
+        cache = tmp_path / "c"
+        cache.mkdir()
+        stale = {
+            "runtime": "vllm", "image": IMAGE, "image_id": ID_A,
+            "version": "0.28.0", "architectures": ["LlamaForCausalLM"],
+            "speculators": [], "removed": {}, "out_of_tree": {},
+            # `gguf` deliberately absent.
+        }
+        (cache / f"vllm-{ID_A.replace(':', '-')}.json").write_text(json.dumps(stale))
+        docker, log = _fake_docker(tmp_path, image_id=ID_A, gguf=True)
+        found = imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker)
+        assert "run --rm" in log.read_text()
+        assert found.gguf is True
+
+    def test_a_cache_entry_missing_the_silicon_facts_re_probes(self, tmp_path):
+        """Served from cache, an entry written before these fields existed
+        would read as "this image states no minimum capability for anything"
+        -- and the GPU gate would fall back to the static table on an image
+        that had already answered."""
+        cache = tmp_path / "c"
+        cache.mkdir()
+        stale = {
+            "runtime": "vllm", "image": IMAGE, "image_id": ID_A,
+            "version": "0.28.0", "architectures": ["LlamaForCausalLM"],
+            "speculators": [], "removed": {}, "out_of_tree": {}, "gguf": False,
+            # `quant_min_capability` / `kv_capabilities` deliberately absent.
+        }
+        (cache / f"vllm-{ID_A.replace(':', '-')}.json").write_text(json.dumps(stale))
+        docker, log = _fake_docker(
+            tmp_path, image_id=ID_A, quant_min_capability={"fp_quant": 100}
+        )
+        found = imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker)
+        assert "run --rm" in log.read_text()
+        assert found.quant_min_capability == {"fp_quant": 100}
+
+
+def _daemons(tmp_path, local: str, remotes: dict[str, str]) -> str:
+    """A `docker` that is the coordinator's own daemon without `-H` and the
+    named host's with it -- each one a `_fake_docker` script."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cases = "".join(f'  {host}) shift 2; exec {path} "$@";;\n' for host, path in remotes.items())
+    script = tmp_path / "docker"
+    script.write_text(
+        f'#!/bin/sh\nif [ "$1" = "-H" ]; then\n case "$2" in\n{cases}  *) exit 1;;\n'
+        f' esac\nfi\nexec {local} "$@"\n'
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return str(script)
+
+
+class TestUntrustedDaemons:
+    """An image id and its layers come from a daemon that may be another
+    machine's -- one a compromised node controls."""
+
+    @pytest.mark.parametrize("image_id, layers", [
+        ("sha256:x/../../escaped", None),
+        (ID_A, ["sha256:x/../../escaped"]),
+        ("../escaped", None),
+    ])
+    def test_a_crafted_identity_writes_nothing_and_is_not_probed(
+        self, tmp_path, image_id, layers
+    ):
+        """Keyed by the raw id, `sha256:x/../../escaped` made the cache write
+        land outside the cache folder -- `mkdir(parents=True)` + `os.replace`
+        overwriting whatever the daemon named."""
+        docker, log = _fake_docker(tmp_path / "bin", image_id=image_id, layers=layers)
+        cache = tmp_path / "data" / "runtimes"
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker) is None
+        assert "run --rm" not in log.read_text()
+        assert list((tmp_path / "data").rglob("*")) in ([], [cache])
+        assert not list(tmp_path.rglob("escaped*"))
+
+    def test_an_unconfirmed_remote_answer_speaks_only_for_its_host(self, tmp_path):
+        """The coordinator holds no copy of the image, so nothing confirms what
+        host A's daemon said. It must not become what host B, or the
+        coordinator's cache-only lookup, is judged by."""
+        layers = [_digest("1"), _digest("2")]
+        liar, _ = _fake_docker(tmp_path / "a", image_id=_digest("b"), layers=layers,
+                               architectures=("PoisonForCausalLM",))
+        honest, b_log = _fake_docker(tmp_path / "b", image_id=_digest("b"), layers=layers,
+                                     run_rc=1)
+        absent, _ = _fake_docker(tmp_path / "coord", inspect_rc=1)
+        docker = _daemons(tmp_path / "bin", absent, {"ssh://a": liar, "ssh://b": honest})
+        cache = tmp_path / "c"
+
+        found = imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker, host="ssh://a")
+        assert found is not None and "PoisonForCausalLM" in found.architectures
+        # Host A's own re-ask is answered from its own entry.
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker,
+                                host="ssh://a", run=False) is not None
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker, run=False) is None
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker,
+                                host="ssh://b") is None
+        assert "run --rm" in b_log.read_text()  # B was really asked, not answered for
+        entries = [json.loads(p.read_text()) for p in cache.glob("*.json")]
+        assert [e["source"] for e in entries] == ["ssh://a, unconfirmed: that host only"]
+
+    def test_a_remote_answer_the_coordinators_copy_confirms_is_shared(self, tmp_path):
+        """The case that must keep working: the coordinator holds the amd64
+        image (so sparkrun can ship it) and cannot run it; a machine of that
+        architecture answers, and the answer speaks for every such machine."""
+        layers = [_digest("1"), _digest("2")]
+        remote, _ = _fake_docker(tmp_path / "a", image_id=_digest("d"), layers=layers)
+        mine, _ = _fake_docker(tmp_path / "coord", image_id=_digest("e"), layers=layers,
+                               run_rc=1)
+        docker = _daemons(tmp_path / "bin", mine, {"ssh://a": remote})
+        cache = tmp_path / "c"
+
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker,
+                                host="ssh://a") is not None
+        found = imageprobe.probe("vllm", IMAGE, cache_dir=cache, docker=docker, run=False)
+        assert found is not None and found.image_id == _digest("e")
+        entries = [json.loads(p.read_text()) for p in cache.glob("*.json")]
+        assert [e["source"] for e in entries] == [
+            "ssh://a, confirmed by the coordinator's copy"
+        ]
+
+    @pytest.mark.parametrize("coordinator_holds_it", [False, True])
+    def test_the_resolver_adopts_only_a_confirmed_answer(
+        self, tmp_path, monkeypatch, coordinator_holds_it
+    ):
+        """`support` keys a probe by image, so whatever the arch loop adopts
+        judges every machine of that architecture. An answer only its own
+        host vouches for is not adopted; a confirmed one is."""
+        from control_plane.resolver.resolver import ModelResolver
+
+        layers = [_digest("1"), _digest("2")]
+        remote, _ = _fake_docker(tmp_path / "a", image_id=_digest("d"), layers=layers)
+        mine, _ = (
+            _fake_docker(tmp_path / "coord", image_id=_digest("e"), layers=layers, run_rc=1)
+            if coordinator_holds_it else _fake_docker(tmp_path / "coord", inspect_rc=1)
+        )
+        _daemons(tmp_path / "bin", mine, {"ssh://a": remote})
+        monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+        resolver = ModelResolver(
+            arch_images={("vllm", "amd64"): IMAGE}, arch_hosts=lambda arch: ["ssh://a"]
+        )
+        found, where = resolver._probe_arch_image("vllm", "amd64", IMAGE, tmp_path / "c")
+        assert (found is not None) is coordinator_holds_it
+        assert where == ("ssh://a" if coordinator_holds_it else None)
+
+
+class TestTheSiliconFacts:
+    """The probe asks vLLM for its quantization floors and the KV widths its
+    attention selector has a kernel for, and needs a GPU driver to ask the
+    second -- which a GPU-less coordinator does not have."""
+
+    def test_it_asks_with_the_gpu_driver_mounted(self, tmp_path):
+        docker, log = _fake_docker(
+            tmp_path,
+            quant_min_capability={"fp8": 75, "fp_quant": 100},
+            kv_capabilities={"auto": ["8.6", "12.1"], "fp8": ["8.6", "12.1"], "nvfp4": []},
+        )
+        found = imageprobe.probe("vllm", IMAGE, cache_dir=tmp_path / "c", docker=docker)
+        assert "--gpus all" in log.read_text()
+        assert found.quant_min_capability == {"fp8": 75, "fp_quant": 100}
+        assert found.kv_capabilities["nvfp4"] == ()
+        assert found.kv_asked() == frozenset({"8.6", "12.1"})
+
+    def test_a_daemon_that_refuses_the_gpu_still_gets_the_architectures(self, tmp_path):
+        """Refused `--gpus all` used to be the whole probe failing: no
+        architecture list on a coordinator with no NVIDIA runtime. It is
+        retried without, and the KV half reads as unknown, never as none."""
+        docker, log = _fake_docker(tmp_path, gpus_rc=125)
+        found = imageprobe.probe("vllm", IMAGE, cache_dir=tmp_path / "c", docker=docker)
+        assert found is not None
+        assert found.architectures == frozenset({"LlamaForCausalLM"})
+        assert found.kv_capabilities is None
+        runs = [line for line in log.read_text().splitlines() if line.startswith("run")]
+        assert len(runs) == 2 and "--gpus" in runs[0] and "--gpus" not in runs[1]
 
 
 class TestImageProbeRoundTrip:
@@ -208,9 +426,56 @@ class TestImageProbeRoundTrip:
             speculators=frozenset({"Gemma4MTPModel"}),
             removed={"MllamaForConditionalGeneration": "v0.10.2"},
             out_of_tree={"BartForConditionalGeneration": "https://example.com/bart-plugin"},
+            gguf=True,
+            quant_min_capability={"fp_quant": 100},
+            kv_capabilities={"auto": ("8.6",), "nvfp4": ()},
         )
         restored = ImageProbe.from_dict(original.as_dict())
         assert restored == original
+
+    def test_from_dict_without_gguf_is_a_miss_not_a_no(self):
+        data = ImageProbe(
+            runtime="vllm", image=IMAGE, image_id="sha256:aaa", version="0.28.0",
+            architectures=frozenset({"LlamaForCausalLM"}),
+        ).as_dict()
+        del data["gguf"]
+        with pytest.raises(KeyError):
+            ImageProbe.from_dict(data)
+
+
+class TestTheGGUFLoader:
+    """vLLM loads GGUF only through vllm-gguf-plugin, so the image decides."""
+
+    def _probe(self, gguf: bool) -> ImageProbe:
+        return ImageProbe(
+            runtime="vllm", image=IMAGE, image_id="sha256:aaa", version="0.28.0",
+            architectures=frozenset({"Qwen3ForCausalLM"}), gguf=gguf,
+        )
+
+    def test_the_probe_reads_whether_the_image_carries_the_plugin(self, tmp_path):
+        docker, _ = _fake_docker(tmp_path, gguf=True)
+        assert imageprobe.probe("vllm", IMAGE, cache_dir=tmp_path / "c", docker=docker).gguf
+        bare, _ = _fake_docker(tmp_path / "bare")
+        assert not imageprobe.probe("vllm", IMAGE, cache_dir=tmp_path / "c2", docker=bare).gguf
+
+    def test_an_unprobed_image_is_unverified_not_refused(self):
+        verdict = support.evaluate_runtime("vllm", ("Qwen3ForCausalLM",), "q4_k_m")
+        assert verdict.level.value == "unverified" and not verdict.ok
+        assert support.gguf_loader("vllm") is None
+
+    def test_an_image_without_the_plugin_refuses_and_names_it(self):
+        support.record_probe(self._probe(gguf=False))
+        verdict = support.evaluate_runtime("vllm", ("Qwen3ForCausalLM",), "q4_k_m")
+        assert verdict.level.value == "unsupported"
+        assert "vllm-gguf-plugin" in verdict.reason and IMAGE in verdict.reason
+
+    def test_an_image_with_the_plugin_supports_a_registered_architecture(self):
+        support.record_probe(self._probe(gguf=True))
+        verdict = support.evaluate_runtime("vllm", ("Qwen3ForCausalLM",), "q4_k_m")
+        assert verdict.level.value == "supported" and verdict.ok
+        # The loader is not a free pass: the architecture still has to be in
+        # the image's registry.
+        assert not support.evaluate_runtime("vllm", ("NoSuchForCausalLM",), "q4_k_m").ok
 
 
 class TestTheProbeWins:
@@ -404,7 +669,7 @@ class TestSglangClassificationHeuristic:
                 else:
                     sys.modules[name] = mod
 
-        line = next(l for l in out.splitlines() if l.startswith("derate-imageprobe:"))
+        line = next(ln for ln in out.splitlines() if ln.startswith("derate-imageprobe:"))
         return json.loads(line[len("derate-imageprobe:"):])
 
     def test_classifies_every_tricky_case_correctly(self):

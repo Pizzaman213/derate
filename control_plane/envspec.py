@@ -98,6 +98,15 @@ _DECLARED = (
        "seconds; a pinned commit sha never expires whatever this says"),
     _v("DERATE_OFFLINE", None, "control_plane/resolver/resolver.py",
        "answer from cache and fixtures, never reach the network"),
+    _v("DERATE_GEOIP_DB", None, "control_plane/gateway/settings.py",
+       "path to an IP-to-city .mmdb (DB-IP or GeoLite2 layout) to use instead "
+       "of downloading DB-IP City Lite"),
+    _v("DERATE_GEOIP_DOWNLOAD", "1", "control_plane/gateway/settings.py",
+       "0 = never download the IP location database; the request map then "
+       "says it is missing"),
+    _v("DERATE_GEOIP_TAILSCALE", "1", "control_plane/gateway/settings.py",
+       "0 = never ask this machine's tailscaled where it and its tailnet peers "
+       "are; LAN and tailnet requests then stay off the request map"),
     _v("DERATE_MODEL_DIRS", None, "control_plane/resolver/resolver.py",
        "colon-separated directories a local model path may resolve under, "
        "beside the HF cache and the data dir; anything else is refused"),
@@ -108,7 +117,13 @@ _DECLARED = (
        "the vllm image for an x86 (amd64) machine; DERATE_VLLM_IMAGE is the "
        "arm64 one the DGX Sparks run"),
     _v("DERATE_SGLANG_IMAGE", None, "control_plane/deploy/flags.py", ""),
+    _v("DERATE_SGLANG_IMAGE_AMD64", None, "control_plane/deploy/flags.py",
+       "the sglang image for an x86 (amd64) machine; DERATE_SGLANG_IMAGE is "
+       "the arm64 one the DGX Sparks run"),
     _v("DERATE_TTS_IMAGE", None, "control_plane/deploy/flags.py", ""),
+    _v("DERATE_TTS_IMAGE_AMD64", None, "control_plane/deploy/flags.py",
+       "the tts image for an x86 (amd64) machine; there is no published one, "
+       "build docker/tts.Dockerfile on that machine (see its header)"),
     _v("DERATE_LLAMACPP_IMAGE", None, "control_plane/deploy/flags.py",
        "the CPU runtime's image; the default is a CPU build, so a CUDA "
        "llama.cpp tag has to be named here to be used"),
@@ -250,11 +265,17 @@ _DECLARED = (
     _v("DERATE_GALLERY_ONLY", None, ".omp/tests/ui/layout.check.mjs",
        "comma-separated component names; run.mjs sets it to scope the gallery "
        "layout matrix to the components a ui:check path names"),
+    _v("DERATE_REVIEW_GATE", None, ".omp/hooks/pre/review-gate.ts",
+       "off keeps the omp review gate out of a session; the headless reviewer "
+       "(.omp/evals/reviewer/headless.mjs) sets it, having no task tool to satisfy it"),
     _v("DERATE_TTS_DEFAULT_VOICES", "1", "control_plane/runtimes/tts.py",
        "0 leaves an empty voice directory empty instead of fetching a "
        "starter library"),
     _v("DERATE_E2E_ORIGIN", "http://localhost:8088", "tests/unit/test_gateway.py",
        "which coordinator the audio round trip launches real models on"),
+    _v("DERATE_E2E_AGENT_ORIGIN", None, "tests/unit/test_route_smoke.py",
+       "the agent port of the coordinator the route smoke drives; unset skips "
+       "the /agent rows"),
     _v("DERATE_TEST_AUDIO", None, "tests/unit/test_gateway.py",
        "cache the tts runtime's reference clip here, so rerunning the "
        "transcription half does not launch the speech model again"),

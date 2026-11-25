@@ -19,7 +19,6 @@ editing at once.
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 from control_plane.contracts.providers import Provider, ProviderKind, ProviderModel

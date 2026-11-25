@@ -582,6 +582,27 @@ def test_client_routing_headers_are_not_forwarded_and_upstream_cookies_not_retur
     assert reply.headers["x-request-id"] != "upstream-own-id"
 
 
+def test_the_shared_upstream_clients_keep_no_cookie():
+    """Each client serves every key holder: a jar that kept the upstream's
+    ``Set-Cookie`` replayed it on the next key holder's request."""
+    from control_plane.gateway.proxy import UpstreamProxy
+    from control_plane.gateway.settings import GatewaySettings
+    from control_plane.providers.service import ProviderService
+
+    url = "http://10.0.0.5:8000/v1/chat/completions"
+    clients = (
+        UpstreamProxy(GatewaySettings()).client_for(url),
+        ProviderService._default_client_factory(),
+    )
+    for client in clients:
+        answered = httpx.Response(
+            200, headers={"set-cookie": "sid=1; Path=/"}, request=client.build_request("POST", url)
+        )
+        client.cookies.extract_cookies(answered)
+        assert len(client.cookies.jar) == 0
+        assert "cookie" not in client.build_request("POST", url).headers
+
+
 # -- (d) a realtime session holds a concurrency slot -------------------------------
 
 

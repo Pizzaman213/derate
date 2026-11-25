@@ -21,7 +21,7 @@ real numbers, just about something else.
 | `router.tsx` | 99 | The React half: `RouterProvider`, `useRouter`, `plainClick` |
 | `selection.tsx` | 230 | Node, link, deployment and sheet, read and written through the URL |
 | `placement.ts` | 78 | `?on=` and `?tp=`/`?pp=` -- the shape a model is being planned at |
-| `backend.tsx` | 145 | `BackendProvider`, `useBackend`, `useResource`, `useKeyedResource` |
+| `backend.tsx` | 145 | `BackendProvider`, `useBackend`, `useResource`, `useKeyedResource`, `useSharedResource`, `ResourceScope` |
 | `resources.ts` | 192 | Every polled endpoint as a hook, with its interval argued once |
 | `history.ts` | 393 | The `/api/history/*` client, and the adapters for its two row shapes |
 | `useMetrics.ts` | 56 | The SSE subscription itself, and `SafeMetricsFrame` |
@@ -150,6 +150,20 @@ Another machine's processes, under this machine's heading, for up to a full
 interval -- and nothing about it reads as stale, because the numbers are real.
 The coordinator origin is folded into the key whether the caller thought about
 it or not.
+
+`useSharedResource(name, read, intervalMs)` shares one read and one timer per
+NAME across every component, through the `ResourceStore`
+(`resourceStore.ts`) that `BackendProvider` holds -- one store per backend, so
+per coordinator origin. The interval is the shortest any live subscriber asked
+for; a name with no live subscriber does not poll and keeps its last answer.
+Every fixed hook in `resources.ts` goes through it; the keyed ones and inline
+`useResource` calls stay per call site. `invalidate()` refetches live names now
+and the rest on their next subscription.
+
+`ResourceScope({active})` wraps every pane that stays mounted while hidden.
+Inside an inactive scope nothing polls, shared or per-instance; the pane keeps
+its state and last data and refetches the moment it is shown. A background
+browser tab polls nothing either.
 
 ## `resources.ts`
 
@@ -512,9 +526,12 @@ being the route that was written down.
 picks" -- what every URL written before the field existed meant. The empty list
 is a 400 with no honest answer, so unticking the last machine writes null.
 
-**`useResource` does not deduplicate.** Two components calling the same hook
-poll twice. `useActivity` is mounted in exactly one place for that reason, and
-`useMetrics`/`useTelemetry` are hoisted into contexts for the same one.
+**`useResource` and `useKeyedResource` do not deduplicate; `useSharedResource`
+does.** Two components calling `useCluster()` make one request per interval,
+because every fixed hook in `resources.ts` is shared by name. Two inline
+`useResource` calls, or two keyed hooks, still poll twice.
+`useMetrics`/`useTelemetry` are an SSE stream, not a poll, and are hoisted into
+contexts so there is one subscription.
 
 **The coordinator origin is part of every resource key.** Two coordinators
 answering the same path are not answering the same question, and without it,

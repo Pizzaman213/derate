@@ -132,13 +132,17 @@ spreading it across them, so charging it a stage's share would under-budget
 precisely the rank that holds it — and a warning says so, beside the
 uneven-stages one that exists for the same reason.
 
-`speculative_decode_tps_range` returns a floor and a ceiling and never a single
-number:
+`speculative_decode_tps_range(base_tps, shape, spec)` returns a floor and a
+ceiling and never a single number:
 
     ceiling = base * (k + 1) / (1 + k * draft_ratio)   every draft accepted
     floor   = base         / (1 + k * draft_ratio)     none accepted
 
-where `draft_ratio` is the draft's parameters over the model's active ones. The
+where `base` is the card's own `predicted_decode_tps` -- plan, wire and
+calibration included -- and `draft_ratio` is the draft's parameters over the
+model's per-token ones. The wire scales with the rest of the step rather than
+being amortised over the k+1 positions, so all-ones acceptance still reproduces
+the ceiling exactly. The
 draft's own bandwidth cost is subtracted from both ends, which makes the ceiling
 tighter than a bare `(k+1)x` — and makes the **floor lower than the ordinary
 rate**, which is the half of the trade a recommendation is tempted to leave out:
@@ -185,14 +189,57 @@ same pool on GB10. `language_model_only` and YaRN's `rope_factor` act upstream
 in the gateway's `_plan_and_fit` (a shape without its vision tower; a window
 stretched by the factor), so the calculator only ever sees their result.
 
-### `bandwidth_ceiling_tps` is `predict_decode_tps` with more caches
+### One decode step, every decode rate
 
-`bandwidth_ceiling_tps(shape, bw, kv_read_bytes, users)` calls
-`predict_decode_tps` with the per-sequence cache read multiplied by `users`, so
-at one user it IS the Verdict card's number -- by construction, and pinned by a
-test. `/api/plan/concurrency` draws the users chart with it. It is per user and
-a ceiling: past a few users decode turns compute-bound, which nothing here
-models.
+`decode_step(shape, bw, kv_read_bytes, efficiency, *, plan, link,
+crosses_nodes, weight_bytes, users, tflops)` is the only decode model, and
+`predict_decode_tps` is its `tps`. One step on the busiest rank is
+`max(memory, compute) + wire`:
+
+- **memory** is the rank's share of what one token streams over the bandwidth,
+  over the efficiency. What streams is `ModelShape.effective_decode_params`
+  (the input embedding out when untied, the tied head in, the vision tower and
+  the experts the router skipped out) at `decode_bytes_per_param` -- the
+  measured checkpoint average, never below the dtype's nominal width. Tensor
+  parallel divides the weights and the cache (by head, capped at the KV heads);
+  expert parallel divides the routed experts the token chose; **pipeline
+  parallel divides nothing**, because at one sequence the stages run in turn.
+- **compute** is `prefill_floor_seconds` at `users` tokens, and only with a
+  measured matrix rate: the roofline the users chart needs and the card never
+  hits (one user is about one FLOP per byte).
+- **wire** is `planner/comm.py::wire_seconds_per_step`, the same figure the
+  planner ranks with, charged when the plan crosses nodes. Without a link
+  measurement it is the exchanges at `UNMEASURED_COLLECTIVE_LATENCY_US` and no
+  transfer time, and a warning names the nodes.
+
+`FitCalculator._decode` is where `check` gets both ends of the card's range,
+and `decode_tps_each(req, nodes, users, tflops=)` asks the same method for the
+users chart -- so at one user `/api/plan/concurrency` IS the card's number.
+
+### Measured traffic calibrates the efficiency
+
+`FitCalculator(decode_samples=...)` is handed `measurements.decode_samples` by
+`node.py`: the single-stream, single-rank `DecodeRecord`s the metrics hub
+writes off live vLLM traffic for this model on this GPU, bandwidth and image.
+The seconds `decode_step` says every measured token should have taken at
+efficiency 1.0 (each sample at its own context and cache width), over the
+seconds they actually took, is the efficiency; clamped to `[0.05, 1.0]`, it
+replaces BOTH constants, and
+`FitResult.decode_basis` reads `"measured"`. The reason string names the tokens
+it rests on. Nothing stores the efficiency: it is re-derived from the current
+byte model on every check, so a change to the byte model cannot leave a stale
+calibration behind. A provider that raises falls back to the constants.
+
+It is a ratio of sums, never a mean of per-sample rates. A scrape window counts
+in-flight requests' tokens but only finished requests' decode seconds, so on
+this box one window read 98.7 tok/s and the next 220.5 for one steady ~105
+tok/s stream -- and the clipping moved each window's mean context, so the two
+landed in different context bands where accumulation cannot merge them.
+Summing seconds across records cancels it; averaging the rates does not.
+
+Every decode figure downstream moves with it -- the degraded verdict, routing
+strength, list rows (`capacity_api` passes the coordinator's calculator into
+`largest_runnable`), and the speculative range.
 
 ## `capacity.py`
 
@@ -276,7 +323,7 @@ function's to pre-empt.
 ## `kv.py`
 
 The one calculation everything else here leans on, and the one the field most
-often gets wrong. Three rules, in order of how much damage getting them wrong
+often gets wrong. Four rules, in order of how much damage getting them wrong
 does:
 
 1. **`num_kv_heads`, never `num_attention_heads`.** Llama 3.3 70B has 64 query
@@ -290,6 +337,18 @@ does:
    suggests. `per_layer_per_token_bytes` charges the latent *plus* the decoupled
    RoPE component: dropping that half under-counts DeepSeek-family caches by
    about 11 percent, in the OOM direction.
+4. **A recurrent layer caches no token.** Linear attention (Gated DeltaNet,
+   KDA), Mamba and short convolutions keep a fixed-size state per sequence,
+   so they are charged per SEQUENCE: `ModelShape.recurrent_state_bytes` times
+   `RECURRENT_STATES_PER_SEQUENCE` (2 -- the pair the pinned image reserves
+   under prefix caching's `align` mode), never a per-token rate and never a
+   stand-in window. Qwen3.8-27B is 48 such layers of 64: at 12 x 4096 the
+   cache is 6.4 GiB, where charging those layers a 4096-token window said 12.
+   `kv_cache_bytes` holds both halves because the image allocates them from
+   one pool; `cache_bytes_per_rank` shards them apart (attention by KV head,
+   capped; the state by the full TP degree); `kv_read_bytes` reads one copy.
+   The per-family byte counts come from `resolver/recurrent.py` and match the
+   image's own `get_mamba_state_shape_from_config` to the byte.
 
 `kv_divisor` is where TP and PP sharding is kept honest rather than optimistic.
 TP cannot shard past `num_kv_heads` — a runtime asked for TP=8 on a model with 4
@@ -307,6 +366,22 @@ over-charges a windowed one by multiples, which is why every term in
 something a cache can be stored in; a model whose weights are mxfp4 still caches
 in bf16 or fp8. An unrecognised dtype falls back to `KV_FALLBACK_DTYPE` (bf16),
 over-estimating on purpose — the alternative is a gate that lets an OOM through.
+
+**The packed layouts are priced from the image's own page formulas, not from a
+width.** `int8/fp8/int4_per_token_head`, `nvfp4`, `nvfp4_4over6`, the four
+`turboquant_*` presets and the two `*_ds_mla` blobs have no bytes-per-element:
+each stores scales beside its data (two fp32 per head per token, one fp8 per
+16 elements, an fp16 norm and a scale/zero pair), and TurboQuant keeps the
+first and last two layers of a non-hybrid model at the model's own width.
+`per_layer_per_token_bytes` applies the formulas in `constants.py`; for the
+Llama-3.3-70B geometry they equal, byte for byte, what each backend's
+`customize_spec` returns inside the pinned image, and
+`tests/unit/test_integration_kv.py` pins those numbers. `kv_dtype_refusal`
+refuses a layout for the attention geometry it was not built for (`*_ds_mla`
+without MLA; nvfp4 or TurboQuant with it) and TurboQuant beside sliding-window
+layers, where the image pads the wide layers' pages in a way nothing here
+derives. Whether the GPU can run a kernel (nvfp4 needs Blackwell) is not
+checked here.
 
 ## `stub.py`
 
@@ -362,8 +437,9 @@ fit on the box while it was taken.
 `KV_FALLBACK_DTYPE` and `QUANT_SUGGESTION_ORDER` are local outright.
 
 `KV_ELEM_BYTES` is deliberately not `BYTES_PER_PARAM`: sub-byte weight
-quantization schemes do not apply to the cache, and runtimes cache in fp8 at the
-smallest. `QUANT_SUGGESTION_ORDER` is the twelve schemes this package is willing
+quantization schemes do not apply to the cache, and a plain cache width is fp8
+at the smallest; the sub-byte caches are the packed layouts above, which carry
+their own scales. `QUANT_SUGGESTION_ORDER` is the twelve schemes this package is willing
 to suggest, best quality first, and it is also the default ladder
 `largest_runnable` walks.
 

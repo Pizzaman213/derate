@@ -151,3 +151,33 @@ def test_a_raw_key_is_written_nowhere_and_listed_nowhere(isolated):
         assert secret.encode() not in blob, path
     node_log = (logs / "node.log").read_text()
     assert re.search(r"upstream said: invalid key \*\*\*", node_log)
+
+
+def test_a_key_pasted_into_the_path_is_written_nowhere(isolated):
+    """A misconfigured SDK base_url puts the key in the path. The query went
+    through the Redactor; the path went to node.log, the access archive, the
+    security-event rows and an admin's api_write audit row as it came."""
+    data, logs = isolated
+    app = create_app(build_deps())
+    with TestClient(app) as client:
+        setup = client.post("/api/setup/admin", json=ADMIN)
+        assert setup.status_code == 200
+        raw = setup.json()["secret_once"]
+        secret = raw.split("_", 1)[1]
+        cookie = {"Cookie": f"derate_session={setup.cookies['derate_session']}"}
+        client.cookies.clear()
+        # A session's write to a path no handler audits lands in the audit log.
+        client.post(f"/api/{raw}", headers=cookie)
+        client.delete(f"/api/keys/{raw}", headers=cookie)
+        for bearer in (f"Bearer {raw}", "Bearer derate-zzzzzzzzzz_" + "x" * 43):
+            for path in (f"/v1/models/{raw}", f"/v1/{raw}", f"/api/{raw}"):
+                client.get(path, headers={"Authorization": bearer})
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    written = [p for root in (data, logs) for p in root.rglob("*") if p.is_file()]
+    assert {"node.log", "archive.db"} <= {p.name for p in written}
+    assert "/v1/models/" in (logs / "node.log").read_text()  # the access lines were written
+    for path in written:
+        blob = path.read_bytes()
+        assert raw.encode() not in blob, path
+        assert secret.encode() not in blob, path

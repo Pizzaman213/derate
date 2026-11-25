@@ -86,7 +86,8 @@ const python = JSON.parse(
       [
         'import inspect, json, re, sys',
         'from control_plane.providers.secrets import looks_like_secret',
-        'from control_plane.providers.service import ProviderService, minted_ref',
+        'from control_plane.providers.refs import minted_ref',
+        'from control_plane.providers.service import ProviderService',
         'from control_plane.providers.serialization import kinds_public',
         'cases = json.load(sys.stdin)',
         'status = inspect.getsource(ProviderService.key_status)',
@@ -133,10 +134,12 @@ check('an empty ref is a name', looksLikeRefName(''), true)
 check('a pasted key is not a name', looksLikeRefName('sk-or-v1-0123456789abcdef0123456789abcdef'), false)
 check('a non-string is not a name', looksLikeRefName(null), false)
 
-// _mint_id, mirrored: the kind, then the first free -N.
+// _mint_id, mirrored: the kind, then the first -N no existing id already mints.
 check('first provider of a kind takes the bare id', predictedProviderId('openrouter', []), 'openrouter')
 check('a taken id steps to -2', predictedProviderId('openrouter', ['openrouter']), 'openrouter-2')
 check('and keeps stepping', predictedProviderId('openrouter', ['openrouter', 'openrouter-2']), 'openrouter-3')
+check('an id that mints the same reference counts as taken',
+  predictedProviderId('openai', ['openai', 'openai_2']), 'openai-3')
 
 // Warnings: each mode catches the other's input, and neither fires on its own.
 check('ref mode warns on a pasted key',

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { useAuth } from '../state/auth'
-import { useBackend } from '../state/backend'
+import { ResourceScope, useBackend } from '../state/backend'
 import { MetricsProvider } from '../state/metrics'
 import { SelectionProvider } from '../state/selection'
 import { TelemetryProvider } from '../state/telemetry'
@@ -194,28 +194,42 @@ function Frame({ dest }: { dest: Dest }) {
         {/* Sections rather than tabpanels: the header's destinations are links
             to their own URLs now, not tabs, and a tabpanel with no tab pointing
             at it is a promise to a screen reader that nothing keeps. Each one
-            still stays mounted while hidden, which is what keeps a destination's
-            in-flight polls and scroll position across a visit elsewhere. */}
+            still stays mounted while hidden, which keeps a destination's
+            filters, drafts and scroll position across a visit elsewhere; its
+            `ResourceScope` stops it polling while hidden, and it refetches when
+            shown. */}
         <main>
           <section aria-label="Dashboard" hidden={dest !== 'dash'}>
-            <DashboardTab />
+            <ResourceScope active={dest === 'dash'}>
+              <DashboardTab />
+            </ResourceScope>
           </section>
           <section aria-label="Models" hidden={dest !== 'models'}>
-            <ModelsTab />
+            <ResourceScope active={dest === 'models'}>
+              <ModelsTab />
+            </ResourceScope>
           </section>
           <section aria-label="Cluster" hidden={dest !== 'cluster'}>
-            {/* React Flow measures its viewport; under `hidden` it measures
-                zero, so the canvas mounts only while this is on screen. */}
-            <ClusterTab active={dest === 'cluster'} />
+            <ResourceScope active={dest === 'cluster'}>
+              {/* React Flow measures its viewport; under `hidden` it measures
+                  zero, so the canvas mounts only while this is on screen. */}
+              <ClusterTab active={dest === 'cluster'} />
+            </ResourceScope>
           </section>
           <section aria-label="Chat" hidden={dest !== 'chat'}>
-            <ChatTab />
+            <ResourceScope active={dest === 'chat'}>
+              <ChatTab />
+            </ResourceScope>
           </section>
           <section aria-label="Usage" hidden={dest !== 'usage'}>
-            <UsageTab />
+            <ResourceScope active={dest === 'usage'}>
+              <UsageTab />
+            </ResourceScope>
           </section>
           <section aria-label="Settings" hidden={dest !== 'settings'}>
-            <SettingsTab />
+            <ResourceScope active={dest === 'settings'}>
+              <SettingsTab />
+            </ResourceScope>
           </section>
         </main>
 

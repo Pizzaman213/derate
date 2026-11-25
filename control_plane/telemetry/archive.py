@@ -174,7 +174,8 @@ CREATE TABLE IF NOT EXISTS access(
   status      INTEGER,
   duration_ms REAL,
   user_agent  TEXT,
-  peer_ip     TEXT
+  peer_ip     TEXT,
+  count       INTEGER
 );
 CREATE INDEX IF NOT EXISTS access_ip_ts ON access(client_ip, ts);
 CREATE INDEX IF NOT EXISTS access_ts ON access(ts);
@@ -580,6 +581,9 @@ class Archive:
         access_cols = {r["name"] for r in conn.execute("PRAGMA table_info(access)")}
         if "peer_ip" not in access_cols:
             conn.execute("ALTER TABLE access ADD COLUMN peer_ip TEXT")
+        # Folded rows (gateway/accessfold.py); NULL in an older row means 1.
+        if "count" not in access_cols:
+            conn.execute("ALTER TABLE access ADD COLUMN count INTEGER")
         # Request/access rows a member shipped and may not write (N-6).
         cursor_cols = {r["name"] for r in conn.execute("PRAGMA table_info(cursors)")}
         if "rejected" not in cursor_cols:

@@ -19,6 +19,7 @@ destination-to-panel mapping, the sheet's mechanics, and the boundary between
 | `Header.tsx` | 116 | the monogram, the roster pill, the six nav anchors, and the stored theme |
 | `screens.check.mjs` | 215 | the only verifier that opens a browser; writes `ui/screens/<dest>.png` |
 | `Sheet.tsx` | 249 | the one modal: portal, scrim, scroll lock, focus trap, and the kind dispatch |
+| `stubui.check.mjs` | 144 | drives the `derate-stub-ui` MCP tool (`.omp/stubui/`) over stdio: signed in, PNG, badge, writes blocked, `READ_POSTS` matches `client.ts`, no process or temp dir left after `kill -9` |
 
 ## `AppShell.tsx`
 
@@ -27,8 +28,10 @@ destination at once, each in a `<section aria-label>` that is `hidden` unless
 it is the current one. They are sections and not tabpanels on purpose: the
 header's destinations are anchors to real URLs rather than tabs, and a tabpanel
 with no tab pointing at it is a promise to a screen reader that nothing keeps.
-Staying mounted while hidden is what preserves a destination's in-flight polls
-and its scroll position across a visit elsewhere.
+Staying mounted while hidden is what preserves a destination's filters, drafts,
+last data and scroll position across a visit elsewhere; each `<section>` is
+wrapped in a `ResourceScope`, so a hidden destination polls nothing and
+refetches the moment it is shown.
 
 `SelectionProvider` is mounted here rather than in `main.tsx`. Selection --
 which node, which link, which deployment, which sheet -- is shell state, needed
@@ -116,7 +119,7 @@ effect on every destination and not only on the one that owns the control.
 
 ## `screens.check.mjs`
 
-`// requires: browser coordinator python` -- the first verifier in this repo that
+`// requires: browser coordinator` -- the first verifier in this repo that
 looks at a screen, and the only thing in the project that sees what shipped
 rather than inferring it from source. Every other `*.check.mjs` checks a pure
 function: the URL scheme, the graph layout, the quantization ladder, the QR

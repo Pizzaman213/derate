@@ -185,10 +185,19 @@ class FitResult:
     #
     # Trailing and defaulted, so every existing construction is unchanged, and
     # deliberately NOT read by the degraded threshold, by routing strength, or
-    # by any list view: those keep the conservative end. See
-    # ``fit/calculator.py`` and ``head_scan.py``, which already computes this
-    # exact figure as its scan baseline.
+    # by any list view: those read ``predicted_decode_tps``, the conservative
+    # end -- which is no longer a constant's guess once ``decode_basis`` is
+    # "measured": it is then calibrated on decode rates measured for this
+    # model on this hardware, and the threshold and routing move with it.
     predicted_decode_tps_empty: float | None = None
+    # What the two decode rates rest on: "constant" is the efficiency pair in
+    # ``fit/constants.py``; "measured" is an efficiency calibrated from stored
+    # decode records for this model on this GPU (``measurements.py``).
+    decode_basis: str = "constant"
+    # The efficiency behind ``predicted_decode_tps``. None without a rate.
+    decode_efficiency: float | None = None
+    # Interconnect seconds per decoded token. None for a single-node plan.
+    decode_wire_seconds: float | None = None
 
     @property
     def ok(self) -> bool:

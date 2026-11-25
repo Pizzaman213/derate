@@ -70,6 +70,20 @@ def test_a_loopback_hop_from_a_lan_peer_is_not_believed():
     assert forwarded_client("127.0.0.1", "203.0.113.9", loop) == "203.0.113.9"
 
 
+def test_an_ipv4_mapped_hop_is_judged_as_its_ipv4_address():
+    """``::ffff:127.0.0.1`` is not ``is_loopback`` on Python 3.12, so the mapped
+    spelling passed for the operator's shell in rows and throttle buckets."""
+    from control_plane.gateway.authz import forwarded_client
+    from control_plane.gateway.settings import GatewaySettings
+
+    nets = GatewaySettings(trusted_proxies=("10.0.0.0/8",)).trusted_networks
+    assert forwarded_client("10.0.0.5", "::ffff:127.0.0.1", nets) == "10.0.0.5"
+    assert forwarded_client("10.0.0.5", "::ffff:203.0.113.9", nets) == "203.0.113.9"
+    # A mapped hop inside a trusted network is skipped like the plain one.
+    assert forwarded_client("10.0.0.5", "203.0.113.9, ::ffff:10.0.0.7", nets) == "203.0.113.9"
+
+
+
 class _Recorder:
     def __init__(self) -> None:
         self.rows = []

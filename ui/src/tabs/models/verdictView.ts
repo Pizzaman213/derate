@@ -40,7 +40,12 @@ export function bandWord(band: Band, checking: boolean): Word {
 
 /** The detail pane's verdict word. First rule wins, and the order matters:
  *  reality (running) outranks any prediction, and the STATIC verdict refusing
- *  is a fault while only the live one refusing is "free a node". */
+ *  is a fault while only the live one refusing is "free a node".
+ *
+ *  `hostPool` is a runtime that spends host RAM (llamacpp). There is no static
+ *  host ceiling to read -- the server's static verdict for it is a refusal
+ *  against 0 by design -- so a live verdict, when there is one, is the only
+ *  basis, and the static refusal would put "Won't fit" over a live "fits". */
 export function planWord(i: {
   running: boolean
   routing: boolean
@@ -48,6 +53,7 @@ export function planWord(i: {
   variant: QuantVariant | null
   result: PlanResponse | null
   checking: boolean
+  hostPool?: boolean
 }): Word {
   if (i.running) return { label: 'Running', signal: 'live' }
   if (i.routing) return { label: 'Provider', signal: 'idle' }
@@ -60,8 +66,8 @@ export function planWord(i: {
     return { label: i.checking ? 'Checking…' : 'Not checked', signal: 'idle' }
   const fit = i.result.fit
   if (fit == null) return { label: 'Not checked', signal: 'idle' }
-  if (fit.verdict === 'wont_fit') return { label: 'Won’t fit', signal: 'fault' }
   const live = i.result.fit_live
+  if (fit.verdict === 'wont_fit' && !(i.hostPool && live)) return { label: 'Won’t fit', signal: 'fault' }
   if (live?.verdict === 'wont_fit') return { label: 'Not now', signal: 'warn' }
   if ((live ?? fit).verdict === 'fits_degraded') return { label: 'Slow', signal: 'warn' }
   return { label: 'Fits', signal: 'live' }

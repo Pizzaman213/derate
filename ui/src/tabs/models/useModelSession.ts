@@ -21,11 +21,11 @@ import type {
 } from '../../api/types'
 import { ApiError } from '../../api/client'
 import type { Runtime } from '../../state/runtime'
-import { runtimeFor, servesOnCluster } from '../../state/runtime'
+import { formatsOf, runtimeFor, servesOnCluster } from '../../state/runtime'
 import { useBackend } from '../../state/backend'
 import { usePlacement } from '../../state/placement'
 import { useRouter } from '../../state/router'
-import { useCluster, useMemoryReport, useProfiles, useStorage, useTopology } from '../../state/resources'
+import { useCluster, useMemoryReport, useProfiles, useRuntimes, useStorage, useTopology } from '../../state/resources'
 import { recordCustomServe } from '../../state/customServes'
 import { DEFAULT_CONCURRENCY, DEFAULT_CONTEXT } from '../../state/routes'
 import { buildBoard, type Board } from './board'
@@ -36,7 +36,7 @@ import { defaultVariant } from './quantPicks'
 import type { RouteTargetFacts } from './RouteCard'
 import {
   buildLaunchRequest,
-  engineOptionsOf,
+  buildPlanRequest,
   knobsFromRequest,
   type FlagRow,
   type LaunchInputs,
@@ -79,6 +79,8 @@ export interface ModelSession {
   // ── How ───────────────────────────────────────────────────────────────────
   runtime: Runtime
   setRuntime: (r: Runtime) => void
+  /** The file formats `runtime` loads, native first -- `/api/runtimes`. */
+  formats: readonly string[]
   runtimeBecause: string | null
   target: 'throughput' | 'latency'
   setTarget: (t: 'throughput' | 'latency') => void
@@ -98,6 +100,11 @@ export interface ModelSession {
 
   // ── The verdict ───────────────────────────────────────────────────────────
   result: PlanResponse | null
+  /** The last `kv_dtype_ratios` a plan answered for this model id. Kept across
+   *  a plan error -- a refused width nulls `result`, and blanking every packed
+   *  row would read as "refused" -- and dropped only when the model changes.
+   *  Null until a plan for this id has answered. */
+  kvRatios: Record<string, number> | null
   checking: boolean
   error: string | null
   gates: ServeRequirement[]
@@ -181,13 +188,35 @@ export interface ModelSession {
   cluster: Cluster | null
   liveContext: number
   liveConcurrency: number
+  /** The override the session is planning with (`null` = the planner picks).
+   *  Trails the URL while the list settles input, so URL ≠ these means a
+   *  plan for the URL's value has not been asked for yet. */
+  plannedContext: number | null
+  plannedConcurrency: number | null
 
   // ── What happened ─────────────────────────────────────────────────────────
   /** This model's deployments, any variant, newest first (launching ones,
    *  which have no `started_at` yet, before all of them). */
   deployments: DeploymentDTO[]
+  /** Every live deployment of this model, newest first. More than one when
+   *  it runs as separate copies on different machines. */
+  live: DeploymentDTO[]
+  /** The deployment the pane describes: the newest live one, or null while
+   *  `addingCopy` puts the pane back into planning a launch. */
   running: DeploymentDTO | null
+  /** The "Where it runs" board while copies exist: a machine running one
+   *  shows it, any other plans a copy onto that machine alone. */
+  pickNode: (nodeId: string) => void
   lastFailure: DeploymentDTO | null
+  /** Planning another copy of a model that already runs. The coordinator
+   *  refuses a second copy on a machine already running it, and a second
+   *  deployment under a name already answering, so this mode starts on the
+   *  machines the model is NOT on and launches under `copyName`. */
+  addingCopy: boolean
+  startCopy: () => void
+  cancelCopy: () => void
+  /** The served name a copy launches under when none was typed. */
+  copyName: string | null
   launching: boolean
   pulled: PullAccepted | null
   serve: () => Promise<void>
@@ -202,9 +231,8 @@ export function useModelSession(p: {
    *  the plan body rather than sent, exactly like `node_ids`. */
   context: number | null
   concurrency: number | null
-  /** Polled by the screen that owns this pane -- `useResource` does not
-   *  deduplicate, so mounting `useProviders()` here would fan a second poll
-   *  for a list already in memory. */
+  /** Polled by the screen that owns this pane and handed down, so every
+   *  consumer renders the same list. */
   providers?: Provider[] | null
   providerKinds?: ProviderKindSpec[] | null
   /** Each provider's WHOLE catalogue, keyed by provider id. It says which
@@ -245,6 +273,8 @@ export function useModelSession(p: {
   // the verdict describe one shape while the Serve button starts another.
   const [target, setTarget] = useState<'throughput' | 'latency'>('throughput')
   const [runtime, setRuntimeState] = useState<Runtime>('vllm')
+  const runtimes = useRuntimes().data ?? null
+  const formats = useMemo(() => formatsOf(runtime, runtimes), [runtime, runtimes])
   // Why the runtime above is what it is, when the answer was not the default.
   // Rendered next to the picker rather than inferred from it: a control that
   // moved on its own has to say what moved it, or it reads as a bug.
@@ -264,10 +294,9 @@ export function useModelSession(p: {
     pullTargets.find((t) => t.provider_id === providerPick) ?? pullTargets[0] ?? null
   const providerId = provider?.provider_id ?? ''
 
-  // Polled once here and handed to every tab. `useResource` does not
-  // deduplicate -- every call is its own interval and its own request -- so a
-  // second `useStorage` would fan a second cluster-wide disk walk out every
-  // 30s for one answer.
+  // Polled once here and handed to every tab, so each renders the same
+  // answer. `useStorage` is shared by name, so a second call would not be a
+  // second disk walk either.
   const storage = useStorage(true)
   const clusterRes = useCluster()
   const cluster = clusterRes.data
@@ -422,13 +451,15 @@ export function useModelSession(p: {
   const variant = useMemo(
     () =>
       ladder?.variants.find((v) => variantKey(v) === variantKeyChosen) ??
-      defaultVariant(ladder, runtime, p.preferQuant ?? null),
-    [ladder, variantKeyChosen, runtime, p.preferQuant],
+      defaultVariant(ladder, runtime, p.preferQuant ?? null, formats),
+    [ladder, variantKeyChosen, runtime, p.preferQuant, formats],
   )
   const subjectId = variant ? launchId(variant) : modelId
 
   // ── Launch knobs ──────────────────────────────────────────────────────────
   const [result, setResult] = useState<PlanResponse | null>(null)
+  const [keptRatios, setKeptRatios] = useState<{ id: string; ratios: Record<string, number> } | null>(null)
+  const kvRatios = keptRatios?.id === subjectId ? keptRatios.ratios : null
   const [checking, setChecking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [launching, setLaunching] = useState(false)
@@ -555,34 +586,37 @@ export function useModelSession(p: {
   )
 
   // ── The plan ──────────────────────────────────────────────────────────────
-  // Keyed on its JSON so a fresh-but-equal object does not refire the plan.
-  const engineJson = usingCustomCommand
-    ? ''
-    : JSON.stringify(engineOptionsOf({ engineOptions, envRows }) ?? null)
-  const planBody = useMemo<PlanRequest>(() => {
-    const engine = engineJson ? (JSON.parse(engineJson) as EngineOptions | null) : null
-    return {
-      model_id: subjectId,
+  // Built by the same function launch is, so the card judges the runtime and
+  // sizing the button will send. Context and concurrency stay absent when
+  // unset ("the planner picks"); a custom command suppresses kv_dtype, dtype,
+  // speculation and engine options exactly as it does on launch. Keyed on
+  // its JSON so a fresh-but-equal object does not refire the plan.
+  const planJson = JSON.stringify(
+    buildPlanRequest({
+      modelId: subjectId,
       target,
-      // Spread, never sent as null: absence is the contract for "the
-      // planner picks", and an explicit null is a different request.
-      ...(context ? { context } : {}),
-      ...(concurrency ? { concurrency } : {}),
-      ...(nodeIds ? { node_ids: nodeIds } : {}),
-      ...(degrees ? { parallelism: degrees } : {}),
-      // Same rule: absent means one token per step. Sent, the fit gate
-      // charges the draft's weights and its extra cache.
-      ...(speculative ? { speculative } : {}),
-      // Sent here AND on launch, deliberately -- see the state above.
-      // Suppressed under a custom command, which replaces every
-      // plan-derived flag and so could not carry either.
-      ...(kvDtype && !usingCustomCommand ? { kv_dtype: kvDtype } : {}),
-      ...(sentQuant && !usingCustomCommand ? { dtype: sentQuant } : {}),
-      // Several engine options size the fit (YaRN, text only, batched
-      // tokens, the processor cache), so the plan sees what launch sends.
-      ...(engine ? { engine_options: engine } : {}),
-    }
-  }, [subjectId, target, context, concurrency, nodeIds, degrees, speculative, kvDtype, sentQuant, usingCustomCommand, engineJson])
+      runtime,
+      context: context ?? 0,
+      concurrency: concurrency ?? 0,
+      nodeIds,
+      degrees,
+      speculative,
+      customCommand,
+      customCommandText,
+      flags: [],
+      servedName: '',
+      enforceEager: false,
+      cudagraphCaptureSizes: null,
+      kvDtype,
+      forcedQuant: sentQuant,
+      speculativeTokens: 0,
+      trustRemoteCode: false,
+      engineOptions,
+      envRows,
+      lifecycle: null,
+    }),
+  )
+  const planBody = useMemo<PlanRequest>(() => JSON.parse(planJson) as PlanRequest, [planJson])
 
   const noLocalVerdict = detailError != null && servedBy.length > 0
   const planSeq = useRef(0)
@@ -605,12 +639,14 @@ export function useModelSession(p: {
     setChecking(true)
     setGranted({})
     setExtraGates([])
+    const planFor = subjectId
     const id = window.setTimeout(() => {
       backend
         .plan(planBody)
         .then((r) => {
           if (planSeq.current !== mine) return
           setResult(r)
+          if (r.kv_dtype_ratios) setKeptRatios({ id: planFor, ratios: r.kv_dtype_ratios })
           setError(null)
         })
         .catch((e: unknown) => {
@@ -623,31 +659,7 @@ export function useModelSession(p: {
         })
     }, 450)
     return () => window.clearTimeout(id)
-  }, [backend, planBody, runtime, noLocalVerdict])
-
-  // The command derate would run, only while the Advanced tab is showing it.
-  // Fetched after the plan settles, so a refusal reads the same as the
-  // verdict's and is never a half-typed field's.
-  const previewSeq = useRef(0)
-  useEffect(() => {
-    const mine = ++previewSeq.current
-    if (!wantPreview || !result || checking || !servesOnCluster(runtime)) return
-    const id = window.setTimeout(() => {
-      backend
-        .planCommand({ ...planBody, runtime })
-        .then((r) => {
-          if (previewSeq.current !== mine) return
-          setCommandPreview(r)
-          setCommandPreviewError(null)
-        })
-        .catch((e: unknown) => {
-          if (previewSeq.current !== mine) return
-          setCommandPreview(null)
-          setCommandPreviewError(e instanceof Error ? e.message : String(e))
-        })
-    }, 600)
-    return () => window.clearTimeout(id)
-  }, [backend, planBody, wantPreview, result, checking, runtime])
+  }, [backend, planBody, runtime, noLocalVerdict, subjectId])
 
   // A ticked machine can leave the cluster. Drop it rather than planning
   // against a name nothing answers to. The `every` short-circuit is not an
@@ -713,8 +725,47 @@ export function useModelSession(p: {
             : b.started_at - a.started_at,
       )
   }, [cluster, ladder, modelId])
-  const running = deployments.find((d) => !TERMINAL.has(d.state)) ?? null
-  const lastFailure = running ? null : (deployments.find((d) => d.state === 'failed') ?? null)
+  const live = useMemo(() => deployments.filter((d) => !TERMINAL.has(d.state)), [deployments])
+  const [addingCopy, setAddingCopy] = useState(false)
+  // Which copy the pane describes, by deployment id. Null, or an id that has
+  // since stopped, falls back to the newest.
+  const [shownId, setShownId] = useState<string | null>(null)
+  // Nothing left to copy: the mode has no subject.
+  if (addingCopy && live.length === 0) setAddingCopy(false)
+  const running = addingCopy ? null : (live.find((d) => d.deployment_id === shownId) ?? live[0] ?? null)
+  const lastFailure = live.length ? null : (deployments.find((d) => d.state === 'failed') ?? null)
+  const copyName = useMemo(() => {
+    // The oldest copy's name is the base, so copies read `<name>-2`, `-3`.
+    const base = live[live.length - 1]?.served_name
+    if (!base) return null
+    const taken = new Set(
+      (cluster?.deployments ?? []).filter((d) => !TERMINAL.has(d.state)).map((d) => d.served_name),
+    )
+    for (let k = 2; ; k++) if (!taken.has(`${base}-${k}`)) return `${base}-${k}`
+  }, [cluster, live])
+  const startCopy = () => {
+    const busy = new Set(live.flatMap((d) => d.node_ids))
+    const free = nodes.map((n) => n.profile.node_id).filter((id) => !busy.has(id))
+    setNodeIds(free.length ? free : null)
+    setAddingCopy(true)
+  }
+  const cancelCopy = () => {
+    setAddingCopy(false)
+    setNodeIds(null)
+  }
+  // One machine on the board: its copy if it runs one, otherwise a copy
+  // planned onto exactly it.
+  const pickNode = (nodeId: string) => {
+    const copy = live.find((d) => d.node_ids.includes(nodeId))
+    if (copy) {
+      setShownId(copy.deployment_id)
+      setAddingCopy(false)
+      setNodeIds(null)
+    } else {
+      setNodeIds([nodeId])
+      setAddingCopy(true)
+    }
+  }
 
   // A 409 whose code names an override is a permission to ask for, not an
   // error: the request was legal and an unchanged retry succeeds once memory
@@ -808,6 +859,35 @@ export function useModelSession(p: {
 
   const currentRequest = () => buildLaunchRequest(launchInputs(parsedSizes(), []))
 
+  // The command derate would run, only while the Advanced tab is showing it.
+  // Fetched after the plan settles, so a refusal reads the same as the
+  // verdict's and is never a half-typed field's. The body is the LAUNCH's,
+  // not the plan's: the plan body leaves out the launch-only settings (eager
+  // mode, trimmed graph sizes, custom flags, the served name), so a preview
+  // built from it showed a command without them under a heading that says
+  // it is the command derate will run.
+  const previewJson = JSON.stringify(currentRequest())
+  const previewSeq = useRef(0)
+  useEffect(() => {
+    const mine = ++previewSeq.current
+    if (!wantPreview || !result || checking || !servesOnCluster(runtime)) return
+    const id = window.setTimeout(() => {
+      backend
+        .planCommand(JSON.parse(previewJson) as LaunchRequest)
+        .then((r) => {
+          if (previewSeq.current !== mine) return
+          setCommandPreview(r)
+          setCommandPreviewError(null)
+        })
+        .catch((e: unknown) => {
+          if (previewSeq.current !== mine) return
+          setCommandPreview(null)
+          setCommandPreviewError(e instanceof Error ? e.message : String(e))
+        })
+    }, 600)
+    return () => window.clearTimeout(id)
+  }, [backend, previewJson, wantPreview, result, checking, runtime])
+
   const launch = async () => {
     if (!result) return
     const cudagraphCaptureSizes = parsedSizes()
@@ -821,16 +901,21 @@ export function useModelSession(p: {
     setLaunching(true)
     setError(null)
     try {
-      const dep = await backend.launch(
-        buildLaunchRequest(
-          launchInputs(
-            cudagraphCaptureSizes,
-            // Filtered against the current gates, so a key granted against a
-            // previous plan cannot ride along with this one.
-            gates.filter((g) => granted[g.param] === true).map((g) => g.param),
-          ),
+      const request = buildLaunchRequest(
+        launchInputs(
+          cudagraphCaptureSizes,
+          // Filtered against the current gates, so a key granted against a
+          // previous plan cannot ride along with this one.
+          gates.filter((g) => granted[g.param] === true).map((g) => g.param),
         ),
       )
+      // A copy under the first one's name is refused cluster-wide, so a copy
+      // nobody named gets the next free `<name>-N`. Not stored in `servedName`:
+      // a profile saved from this pane must not inherit it.
+      const dep = await backend.launch(
+        addingCopy && !servedName.trim() && copyName ? { ...request, served_name: copyName } : request,
+      )
+      setAddingCopy(false)
       invalidate()
       // Worth replaying only once the backend has accepted it, and only if
       // the box was ticked -- exactly the condition that decided whether it
@@ -958,6 +1043,7 @@ export function useModelSession(p: {
     selectVariant: setVariantKeyChosen,
     subjectId,
     runtime,
+    formats,
     setRuntime: (r) => {
       setRuntimeState(r)
       // The note explains a default this screen chose. Once somebody has
@@ -977,6 +1063,7 @@ export function useModelSession(p: {
     setDestination,
     routing,
     result,
+    kvRatios,
     checking,
     error,
     gates,
@@ -1012,9 +1099,17 @@ export function useModelSession(p: {
     cluster,
     liveContext,
     liveConcurrency,
+    plannedContext: context,
+    plannedConcurrency: concurrency,
     deployments,
+    live,
     running,
     lastFailure,
+    addingCopy,
+    startCopy,
+    cancelCopy,
+    copyName,
+    pickNode,
     launching,
     pulled,
     serve,

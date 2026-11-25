@@ -159,6 +159,14 @@ input {
   background: color-mix(in srgb, var(--ink) 18%, transparent);
 }
 
+/* Every slider: the ink accent rather than the browser's, a thumb row tall
+   enough to hit (24px), and free to shrink inside a flex or grid track. */
+input[type='range'] {
+  min-width: 0;
+  block-size: var(--space-24);
+  accent-color: var(--ink);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

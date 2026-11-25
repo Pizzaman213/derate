@@ -570,8 +570,7 @@ def _usage_measures(g) -> dict[str, Any]:
 _JSON_REQUEST_COLS = ("attempt_chain", "spec_accepted_per_position")
 
 
-def requests_list(
-    archive: Archive,
+def _request_scope(
     *,
     start: float,
     end: float,
@@ -583,21 +582,12 @@ def requests_list(
     target_id: str | None = None,
     provider_id: str | None = None,
     retried: bool = False,
-    page: int = 1,
-    page_size: int = 100,
-) -> dict[str, Any]:
-    """One row per client request, newest first, paged.
-
-    Each row is the request's final attempt (highest ``attempt_no``) with
-    ``attempts`` replaced by the true attempt count. ``model`` matches the
-    served name; ``error`` matches error_class or error_code; ``status`` is
-    an int, ``"ok"`` (2xx/3xx) or ``"failed"``; ``target_id`` and
-    ``provider_id`` match the final attempt's target and provider; ``retried``
-    keeps requests that took more than one attempt. Reaches back only as far
-    as the raw window.
-    """
-    page = max(1, int(page))
-    page_size = max(1, min(int(page_size), config.QUERY_MAX_ROWS))
+) -> tuple[str, list[Any]]:
+    """The ``FROM ... WHERE ...`` that selects one row per client request -- its
+    final attempt, as ``r``, with ``final.n_attempts`` -- under these filters,
+    and its arguments. Shared by :func:`requests_list` and
+    :func:`request_origins`, so the map and the table can never disagree about
+    which requests a filter means."""
     inner = "ts >= ? AND ts < ?"
     args: list[Any] = [start, end]
     if request_id:
@@ -635,6 +625,49 @@ def requests_list(
         "ON r.request_id = final.request_id AND r.attempt_no = final.attempt_no "
         f"WHERE {where}"
     )
+    return body, args
+
+
+def requests_list(
+    archive: Archive,
+    *,
+    start: float,
+    end: float,
+    request_id: str | None = None,
+    key_id: str | None = None,
+    model: str | None = None,
+    status: int | str | None = None,
+    error: str | None = None,
+    target_id: str | None = None,
+    provider_id: str | None = None,
+    retried: bool = False,
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    """One row per client request, newest first, paged.
+
+    Each row is the request's final attempt (highest ``attempt_no``) with
+    ``attempts`` replaced by the true attempt count. ``model`` matches the
+    served name; ``error`` matches error_class or error_code; ``status`` is
+    an int, ``"ok"`` (2xx/3xx) or ``"failed"``; ``target_id`` and
+    ``provider_id`` match the final attempt's target and provider; ``retried``
+    keeps requests that took more than one attempt. Reaches back only as far
+    as the raw window.
+    """
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), config.QUERY_MAX_ROWS))
+    body, args = _request_scope(
+        start=start,
+        end=end,
+        request_id=request_id,
+        key_id=key_id,
+        model=model,
+        status=status,
+        error=error,
+        target_id=target_id,
+        provider_id=provider_id,
+        retried=retried,
+    )
     cols = ", ".join(
         "final.n_attempts AS attempts" if c == "attempts" else f"r.{c}"
         for c in REQUEST_RECORD_FIELDS
@@ -656,6 +689,45 @@ def requests_list(
                 except ValueError:
                     pass
     return {"rows": rows, "total": int(total), "page": page, "page_size": page_size}
+
+
+def request_origins(
+    archive: Archive,
+    *,
+    start: float,
+    end: float,
+    key_id: str | None = None,
+    model: str | None = None,
+    status: int | str | None = None,
+    error: str | None = None,
+    target_id: str | None = None,
+    provider_id: str | None = None,
+    retried: bool = False,
+) -> list[dict[str, Any]]:
+    """Client requests per client address under the same filters as
+    :func:`requests_list`: ``{ip, requests, last_ts}``, most requests first.
+    ``ip`` is None for requests that recorded no address. The address is the
+    final attempt's, which is the client's on every attempt."""
+    body, args = _request_scope(
+        start=start,
+        end=end,
+        key_id=key_id,
+        model=model,
+        status=status,
+        error=error,
+        target_id=target_id,
+        provider_id=provider_id,
+        retried=retried,
+    )
+    with archive.lock:
+        return [
+            dict(r)
+            for r in archive.conn.execute(
+                "SELECT r.client_ip AS ip, COUNT(*) AS requests, MAX(r.ts) AS last_ts "
+                f"{body} GROUP BY r.client_ip ORDER BY requests DESC",
+                args,
+            )
+        ]
 
 
 #: A spreadsheet runs a cell that starts with one of these as a formula, and

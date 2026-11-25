@@ -55,7 +55,30 @@ def _derate_data_dir(tmp_path_factory, monkeypatch):
     # tmp_path holds must find only what it put there.
     if not os.environ.get("DERATE_DATA_DIR"):
         monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path_factory.mktemp("derate-data")))
+    # No test may reach download.db-ip.com: every app the suite builds reads
+    # this when create_app constructs its GatewaySettings.
+    monkeypatch.setenv("DERATE_GEOIP_DOWNLOAD", "0")
+    # Nor ask this machine's tailscaled: a box that runs Tailscale would place
+    # every loopback client the suite sends, and differently on every box.
+    monkeypatch.setenv("DERATE_GEOIP_TAILSCALE", "0")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_port_preflight(monkeypatch):
+    # Every DeploymentManager dials each plan node before a launch
+    # (manager._preflight_port). The suite's nodes are fixture addresses
+    # on somebody's LAN, so the real SYN would time out -- and refuse -- on
+    # every launch test. Answered "closed" (free, and reachable) here; a test
+    # about the check passes its own `port_reach_fn`, and one about the real
+    # function asks for this fixture by name, which yields it.
+    import control_plane.deploy.manager as manager
+
+    real = manager.port_reachable
+    monkeypatch.setattr(
+        manager, "port_reachable", lambda host, port: (manager.PORT_CLOSED, "")
+    )
+    yield real
 
 
 @pytest.fixture(autouse=True)

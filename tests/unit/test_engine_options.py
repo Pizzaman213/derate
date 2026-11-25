@@ -302,21 +302,27 @@ def test_the_store_round_trips_every_field():
         engine_options=EVERYTHING,
         lifecycle=Lifecycle(idle_unload_s=3600, priority="pinned", start_at_boot=True),
         original_window=32768,
+        gguf_base="Qwen/Qwen3.5-4B",
+        gguf_projector="unsloth/Qwen3.5-4B-GGUF/mmproj-BF16.gguf",
     )
     back = decode(json.loads(json.dumps(encode(dep))))
     assert back.engine_options == EVERYTHING
     assert back.lifecycle == dep.lifecycle
     assert back.original_window == 32768
+    # A relaunch after a restart that dropped these is a GGUF with no config.
+    assert back.gguf_base == "Qwen/Qwen3.5-4B"
+    assert back.gguf_projector == "unsloth/Qwen3.5-4B-GGUF/mmproj-BF16.gguf"
 
 
 def test_a_record_without_the_fields_decodes_to_defaults():
     from tests.unit.test_relaunch import _deployment
 
     raw = encode(_deployment())
-    for key in ("engine_options", "lifecycle", "original_window"):
+    for key in ("engine_options", "lifecycle", "original_window", "gguf_base", "gguf_projector"):
         raw.pop(key)
     back = decode(raw)
     assert back.engine_options == EngineOptions()
     assert back.lifecycle == Lifecycle()
     assert back.original_window is None
+    assert back.gguf_base is None and back.gguf_projector is None
     assert isinstance(back, Deployment) and back.state is DeploymentState.STOPPED

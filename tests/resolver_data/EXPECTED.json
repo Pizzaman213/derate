@@ -2,6 +2,8 @@
   "audio8-tts-preview-0.6b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 64,
       "intermediate_size": 4864,
@@ -14,6 +16,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": true,
@@ -30,6 +33,8 @@
   "deepseek-v3": {
     "experts": 256,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 18432,
@@ -42,6 +47,7 @@
       "num_shared_experts": 1,
       "qk_nope_head_dim": 128,
       "qk_rope_head_dim": 64,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -58,6 +64,8 @@
   "deepseek-v4-flash": {
     "experts": 256,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 512,
       "intermediate_size": 16384,
@@ -70,6 +78,7 @@
       "num_shared_experts": 1,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": 128,
       "tie_word_embeddings": false,
@@ -86,6 +95,8 @@
   "diffusiongemma-26b": {
     "experts": 128,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 256,
       "intermediate_size": 2112,
@@ -98,6 +109,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": 1024,
       "tie_word_embeddings": true,
@@ -111,12 +123,45 @@
       8
     ]
   },
+  "falcon-h1-7b": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": 128,
+      "intermediate_size": 12288,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 70152192,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": false,
+      "v_head_dim": null,
+      "vocab_size": 130049
+    },
+    "shape": [
+      44,
+      3072,
+      12,
+      2
+    ]
+  },
   "faster-whisper-base": {
     "refused": "no transformer stack"
   },
   "gemma-3-27b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 21504,
@@ -129,6 +174,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": 1024,
       "tie_word_embeddings": true,
@@ -145,6 +191,8 @@
   "gpt-oss-120b": {
     "experts": 128,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 64,
       "intermediate_size": 2880,
@@ -157,6 +205,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": 128,
       "tie_word_embeddings": false,
@@ -173,6 +222,8 @@
   "gpt-oss-20b": {
     "experts": 32,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 64,
       "intermediate_size": 2880,
@@ -185,6 +236,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": 128,
       "tie_word_embeddings": false,
@@ -201,6 +253,8 @@
   "gpt2": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": false,
       "head_dim": null,
       "intermediate_size": 3072,
@@ -213,6 +267,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": true,
@@ -226,9 +281,135 @@
       12
     ]
   },
+  "granite-4.0-h-tiny": {
+    "experts": 64,
+    "fit": {
+      "attention_free_layers": 36,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": null,
+      "intermediate_size": 512,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 512,
+      "num_experts_per_token": 6,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 29030400,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "v_head_dim": null,
+      "vocab_size": 100352
+    },
+    "shape": [
+      40,
+      1536,
+      12,
+      4
+    ]
+  },
+  "inkling-2-mini": {
+    "experts": 128,
+    "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": 48,
+      "gated_mlp": true,
+      "head_dim": 128,
+      "intermediate_size": 1152,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": 8,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 1152,
+      "num_experts_per_token": 8,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": 1024,
+      "tie_word_embeddings": true,
+      "v_head_dim": null,
+      "vocab_size": 201024
+    },
+    "shape": [
+      24,
+      2304,
+      24,
+      8
+    ]
+  },
+  "jamba-reasoning-3b": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 26,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": null,
+      "intermediate_size": 8192,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 5058560,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "v_head_dim": null,
+      "vocab_size": 65536
+    },
+    "shape": [
+      28,
+      2560,
+      20,
+      1
+    ]
+  },
+  "kimi-linear-48b-a3b": {
+    "experts": 256,
+    "fit": {
+      "attention_free_layers": 20,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": 72,
+      "intermediate_size": 9216,
+      "kv_lora_rank": 512,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": 512,
+      "moe_intermediate_size": 1024,
+      "num_experts_per_token": 2,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 1,
+      "qk_nope_head_dim": 128,
+      "qk_rope_head_dim": 64,
+      "recurrent_state_bytes": 43417600,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": false,
+      "v_head_dim": 128,
+      "vocab_size": 163840
+    },
+    "shape": [
+      27,
+      2304,
+      32,
+      32
+    ]
+  },
   "kokoro-82m": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 2048,
@@ -241,6 +422,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": true,
@@ -254,14 +436,16 @@
       12
     ]
   },
-  "lfm2.5-350m": {
+  "lfm2-1.2b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 10,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
-      "intermediate_size": 6656,
+      "intermediate_size": 8192,
       "kv_lora_rank": null,
-      "layers_with_full_attention": 6,
+      "layers_with_full_attention": null,
       "mla_latent_dim": null,
       "moe_intermediate_size": 0,
       "num_experts_per_token": 0,
@@ -269,8 +453,40 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 81920,
       "shared_expert_intermediate_size": 0,
-      "sliding_window": 4096,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "v_head_dim": null,
+      "vocab_size": 65536
+    },
+    "shape": [
+      16,
+      2048,
+      32,
+      8
+    ]
+  },
+  "lfm2.5-350m": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 10,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": null,
+      "intermediate_size": 6656,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 40960,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
       "tie_word_embeddings": true,
       "v_head_dim": null,
       "vocab_size": 65536
@@ -285,6 +501,8 @@
   "llama-3.1-8b-awq": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 14336,
@@ -297,6 +515,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -313,6 +532,8 @@
   "llama-3.1-8b-fp8-ct": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 14336,
@@ -325,6 +546,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -341,6 +563,8 @@
   "llama-3.3-70b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 28672,
@@ -353,6 +577,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -366,9 +591,73 @@
       8
     ]
   },
+  "mamba-2.8b": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 64,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": null,
+      "intermediate_size": 5120,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 12451840,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "v_head_dim": null,
+      "vocab_size": 50280
+    },
+    "shape": [
+      64,
+      2560,
+      1,
+      1
+    ]
+  },
+  "mamba-codestral-7b": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 64,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": 64,
+      "intermediate_size": 8192,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 138149888,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": false,
+      "v_head_dim": null,
+      "vocab_size": 32768
+    },
+    "shape": [
+      64,
+      4096,
+      128,
+      1
+    ]
+  },
   "mixtral-8x7b": {
     "experts": 8,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 14336,
@@ -381,6 +670,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -394,9 +684,42 @@
       8
     ]
   },
+  "nemotron-nano-9b-v2": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 52,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": 128,
+      "intermediate_size": 15680,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 143548416,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": false,
+      "v_head_dim": null,
+      "vocab_size": 131072
+    },
+    "shape": [
+      56,
+      4480,
+      40,
+      8
+    ]
+  },
   "nvfp4-llama-70b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 28672,
@@ -409,6 +732,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -422,9 +746,42 @@
       8
     ]
   },
+  "olmo-hybrid-7b": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 24,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": null,
+      "intermediate_size": 11008,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 28200960,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": false,
+      "v_head_dim": null,
+      "vocab_size": 100352
+    },
+    "shape": [
+      32,
+      3840,
+      30,
+      30
+    ]
+  },
   "parakeet-tdt-0.6b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 4096,
@@ -437,6 +794,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": true,
@@ -456,6 +814,8 @@
   "qwen2.5-7b-gptq": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 18944,
@@ -468,6 +828,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -484,6 +845,8 @@
   "qwen2.5-vl-7b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 18944,
@@ -496,6 +859,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -512,6 +876,8 @@
   "qwen3-30b-a3b": {
     "experts": 128,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 6144,
@@ -524,6 +890,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -540,6 +907,8 @@
   "qwen3-embedding-0.6b": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 3072,
@@ -552,6 +921,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": true,
@@ -565,14 +935,16 @@
       8
     ]
   },
-  "qwen3-next-80b-nvfp4": {
+  "qwen3-next-80b-a3b": {
     "experts": 512,
     "fit": {
+      "attention_free_layers": 36,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 256,
       "intermediate_size": 5120,
       "kv_lora_rank": null,
-      "layers_with_full_attention": 12,
+      "layers_with_full_attention": null,
       "mla_latent_dim": null,
       "moe_intermediate_size": 512,
       "num_experts_per_token": 10,
@@ -580,8 +952,40 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 39518208,
       "shared_expert_intermediate_size": 512,
-      "sliding_window": 4096,
+      "sliding_window": null,
+      "tie_word_embeddings": false,
+      "v_head_dim": null,
+      "vocab_size": 151936
+    },
+    "shape": [
+      48,
+      2048,
+      16,
+      2
+    ]
+  },
+  "qwen3-next-80b-nvfp4": {
+    "experts": 512,
+    "fit": {
+      "attention_free_layers": 36,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": 256,
+      "intermediate_size": 5120,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 512,
+      "num_experts_per_token": 10,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 39518208,
+      "shared_expert_intermediate_size": 512,
+      "sliding_window": null,
       "tie_word_embeddings": false,
       "v_head_dim": null,
       "vocab_size": 151936
@@ -596,6 +1000,8 @@
   "qwen3-omni-30b-a3b": {
     "experts": 128,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 768,
@@ -608,6 +1014,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": false,
@@ -624,6 +1031,8 @@
   "qwen3-tts-custom-voice": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": 128,
       "intermediate_size": 6144,
@@ -636,6 +1045,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": true,
@@ -649,9 +1059,42 @@
       8
     ]
   },
+  "qwen3.5-27b": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 48,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": 256,
+      "intermediate_size": 17408,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 153944064,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": false,
+      "v_head_dim": null,
+      "vocab_size": 248320
+    },
+    "shape": [
+      64,
+      5120,
+      24,
+      4
+    ]
+  },
   "whisper-large-v3": {
     "experts": 0,
     "fit": {
+      "attention_free_layers": 0,
+      "cache_layers": null,
       "gated_mlp": true,
       "head_dim": null,
       "intermediate_size": 5120,
@@ -664,6 +1107,7 @@
       "num_shared_experts": 0,
       "qk_nope_head_dim": null,
       "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 0,
       "shared_expert_intermediate_size": 0,
       "sliding_window": null,
       "tie_word_embeddings": true,
@@ -675,6 +1119,37 @@
       1280,
       20,
       20
+    ]
+  },
+  "zamba2-7b": {
+    "experts": 0,
+    "fit": {
+      "attention_free_layers": 68,
+      "cache_layers": null,
+      "gated_mlp": true,
+      "head_dim": 224,
+      "intermediate_size": 14336,
+      "kv_lora_rank": null,
+      "layers_with_full_attention": null,
+      "mla_latent_dim": null,
+      "moe_intermediate_size": 0,
+      "num_experts_per_token": 0,
+      "num_nextn_predict_layers": 0,
+      "num_shared_experts": 0,
+      "qk_nope_head_dim": null,
+      "qk_rope_head_dim": null,
+      "recurrent_state_bytes": 77925888,
+      "shared_expert_intermediate_size": 0,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "v_head_dim": null,
+      "vocab_size": 32000
+    },
+    "shape": [
+      81,
+      3584,
+      32,
+      32
     ]
   }
 }

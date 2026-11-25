@@ -30,6 +30,7 @@ import time
 from urllib.parse import urlencode, urlparse, urlunparse
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
+from websockets.asyncio.client import connect as _connect
 
 from control_plane.contracts import TargetKind
 from control_plane.contracts.auth import KeyStatus
@@ -52,6 +53,16 @@ ENDED_KEY_DISABLED = "key_disabled"
 #: Sub-protocols a client may offer. Passed through untouched when the upstream
 #: accepts one; realtime clients use these to carry auth in browsers.
 _PASSTHROUGH_HEADERS = ("openai-beta",)
+
+
+class _NoRedirect(_connect):
+    """``websockets.connect`` that follows no redirect. The library follows a
+    3xx handshake up to ten times and re-sends ``additional_headers`` -- the
+    provider's bearer -- on every hop, to whatever host ``Location`` names.
+    Returning the exception makes the handshake fail with it instead."""
+
+    def process_redirect(self, exc: Exception) -> Exception:
+        return exc
 
 
 def realtime_url(base_url: str, model: str) -> str:
@@ -235,13 +246,7 @@ async def relay(ctx, websocket: WebSocket, *, still_valid=None) -> str | None:
             headers[name] = value
 
     try:
-        import websockets
-    except ImportError:  # pragma: no cover - websockets ships with uvicorn[standard]
-        await websocket.close(code=CLOSE_UPSTREAM, reason="websocket client library unavailable")
-        return
-
-    try:
-        connection = await websockets.connect(url, additional_headers=headers)
+        connection = await _NoRedirect(url, additional_headers=headers)
     except Exception as exc:
         log.warning("realtime upstream unreachable: %s (%s)", url, type(exc).__name__)
         await websocket.close(

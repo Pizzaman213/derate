@@ -69,7 +69,47 @@ from .types import (
 #: rank, which is exactly the over-count the field was added to end. Unlike
 #: the three above this one errs toward refusing rather than inviting, but a
 #: cached MoE checkpoint would still be told it needs nodes it does not.
-SCHEMA_VERSION = 7
+#:
+#: 8 changes no field and three GGUF facts at once. A cached GGUF resolution
+#: carries the removed "not for a launch through either runtime" warning, a
+#: weight figure summed over the FIRST shard of a split build only, and only
+#: the `hf://` key -- so `supported_by` could not find its architecture. All
+#: three must miss rather than be served for another day.
+#:
+#: 9 changes a GGUF shape again: a hybrid checkpoint's header names
+#: `full_attention_interval`, and an entry written before it was read charges
+#: every layer a full-context KV cache (713 GiB for a 6.3 GiB Qwen3.8 file).
+#:
+#: 10 adds `attention_free_layers` and `recurrent_state_bytes`. Both decode to
+#: 0 on an older entry, which is the "no recurrent layers" answer -- so a
+#: cached hybrid would keep charging its linear-attention, Mamba and conv
+#: layers a KV cache (the 4096-token stand-in window, or the full context):
+#: 12 GiB of cache for Qwen3.8-27B at 12 x 4096 that is really 6.5.
+#:
+#: 11 adds `decode_read_params`. It decodes to 0 on an older entry, which is
+#: "not derived", and decode then falls back to `effective_active_params` --
+#: charging a dense model its input embedding and vision tower per token and
+#: a tied MoE nothing for its head. The rate on every card would be the old
+#: one while the gate claimed the new byte basis, so older entries must miss.
+#:
+#: 12 adds `quant_method`, vLLM's name for the checkpoint's loader. It decodes
+#: to "" on an older entry, which sends the silicon gate to the static table:
+#: a `fp_quant` checkpoint (vLLM's floor sm_100) would be judged by its dtype
+#: and offered to an sm_86 machine. The same entries also carry a copy of the
+#: `nvfp4` QuantRequirement saying "no pre-Blackwell kernel", which stopped
+#: being true the day NVFP4 ran on a 3090.
+#:
+#: 13 changes no field and two values: a looped core's extra visits are now
+#: cache layers (`num_layers` 48, not 24, for Inkling 2 Mini) and a per-layer
+#: window list is read, from config.json's `local_layer_ids` and the GGUF
+#: header's `sliding_window_pattern`. An older entry charges that model 12 GiB
+#: of KV at 131k (config) or 0.09 GiB (GGUF) against a real 4.2, so it must miss.
+#:
+#: 14 changes no field and two GGUF values. ggml types 40..43 (NVFP4 above all)
+#: were sized as F32, so a GGUF with NVFP4 experts weighed 5x its file (80.7
+#: GiB for Inkling 2 Mini's 15.5 GiB Q4_K_M); and `inkling2_loop` joined the
+#: llama.cpp architectures, so the cached "llamacpp cannot load it" is stale.
+SCHEMA_VERSION = 14
 
 DEFAULT_TTL_SECONDS = float(os.environ.get("DERATE_RESOLVER_TTL", 24 * 3600))
 
@@ -141,6 +181,7 @@ def to_dict(res: Resolution) -> dict[str, Any]:
         "speculators": [opt.as_dict() for opt in res.speculators],
         "resolved_at": res.resolved_at,
         "remote_code": res.remote_code,
+        "quant_method": res.quant_method,
     }
 
 
@@ -180,6 +221,7 @@ def from_dict(data: dict[str, Any]) -> Resolution:
         ),
         resolved_at=data.get("resolved_at", 0.0),
         remote_code=bool(data.get("remote_code", False)),
+        quant_method=str(data.get("quant_method", "")),
     )
 
 
@@ -283,4 +325,5 @@ def _as_hit(res: Resolution) -> Resolution:
         resolved_at=res.resolved_at,
         from_cache=True,
         remote_code=res.remote_code,
+        quant_method=res.quant_method,
     )

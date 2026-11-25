@@ -48,6 +48,14 @@ class FitPort(Protocol):
         allocatable: Mapping[str, int] | None = None,
     ) -> FitResult: ...
     def max_context(self, shape, plan, nodes, max_seqs, kv_dtype) -> int: ...
+    def decode_tps_each(
+        self,
+        req: FitRequest,
+        nodes: list[NodeProfile],
+        users: int = 1,
+        *,
+        tflops: float | None = None,
+    ) -> float | None: ...
 
 
 @runtime_checkable
@@ -80,12 +88,13 @@ class DeploymentPort(Protocol):
     # `extra_args` is caller-supplied CLI tokens appended to the generated
     # serve command; `custom_command` replaces it instead of appending, and
     # the two are mutually exclusive. `speculative_tokens` (0..8, 0 = off)
-    # turns on MTP speculative decoding, vllm only.
+    # turns on MTP speculative decoding, vllm only. `gguf_base`/`gguf_projector`
+    # are what vllm needs beside a hub GGUF blob.
     def launch(
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
         modality=..., extra_args=(), custom_command=(), revision=None,
         speculative_tokens=0, engine_options=..., original_window=None,
-        lifecycle=...,
+        gguf_base=None, gguf_projector=None, lifecycle=...,
     ) -> Deployment: ...
     # `reason`, when given, rides the STOPPED state_changed event.
     def stop(self, deployment_id: str, *, reason: str | None = None) -> None: ...

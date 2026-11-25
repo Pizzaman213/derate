@@ -181,6 +181,18 @@ class SupportVerdict:
         return any(entry.ok for entry in self.runtimes)
 
 
+@dataclass(frozen=True)
+class GGUFLaunchFacts:
+    """What vllm needs beside a hub GGUF blob: the repository it was quantized
+    from (config.json and tokenizer), that repository's architectures, and the
+    vision projector when the base is multimodal."""
+
+    base: str
+    architectures: tuple[str, ...]
+    projector: str | None = None  # "owner/repo/mmproj-BF16.gguf"
+    projector_bytes: int | None = None
+
+
 @dataclass
 class Resolution:
     """A ``ModelShape`` plus everything a human needs to trust it."""
@@ -216,6 +228,12 @@ class Resolution:
     #: The repository ships Python (``auto_map`` in config.json, or a ``.py``
     #: file) that ``--trust-remote-code`` would execute inside the container.
     remote_code: bool = False
+    #: vLLM's name for the loader this checkpoint's packing needs
+    #: (`modelopt_fp4`, `compressed-tensors`, ...), from
+    #: `quant_detect.vllm_quant_method`; "" for an unquantized checkpoint, a
+    #: GGUF, or one nobody read. The silicon gate looks it up in the probed
+    #: image's minimum capabilities, and "" falls back to `QUANT_INFO`.
+    quant_method: str = ""
     elapsed_ms: float = 0.0
 
     @property

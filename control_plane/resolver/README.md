@@ -27,6 +27,7 @@ full  = resolver.resolve_full("openai/gpt-oss-120b")  # + warnings, support, rea
 | `support.py` | 639 | the architecture and quantization tables, per runtime, and the refusal wording |
 | `config_map.py` | 634 | `config.json` keys to shape fields, explicitly rather than cleverly |
 | `gguf.py` | 330 | the GGUF header and tensor directory, summed per tensor |
+| `recurrent.py` | 470 | a hybrid's recurrent layers: how many cache no tokens, and the fixed state per sequence |
 | `hf.py` | 305 | hub access: metadata only, never weights |
 | `avatars.py` | 291 | publisher marks, resolved coordinator-side and cached forever |
 | `quant_detect.py` | 282 | which quantization scheme a repo ships, in order of trust |
@@ -130,7 +131,12 @@ the world. That server calls exactly `processor(...)`, `generate() -> codes`
 and `decode_audio(codes)`, so a name belongs here once somebody has run that
 checkpoint through that server — never because the model card says TTS. It
 holds `ArkttsModel`, verified on a GB10 against
-`Audio8/Audio8-TTS-Preview-0.6b`.
+`Audio8/Audio8-TTS-Preview-0.6b`. It is the key set of `TTS_WORKING_SETS`,
+so a name goes in together with that run's measured allocator footprint (the
+resident codec and its decode bytes per frame), which the gateway charges in
+the fit gate's `activations` for a tts launch. A name with no measurement
+cannot be listed, so the runtime never loads an architecture the gate has
+to guess the price of.
 
 `AUDIO_ARCHITECTURES` decides the route rather than the loading. Loadable and
 answerable on `/v1/chat/completions` are separate claims, and keeping them
@@ -175,8 +181,13 @@ against the stack named there.
 
 `_map_sliding_window` reads every convention published for the same fact —
 `layer_types`, `sliding_window_pattern`, gemma2's implicit half, Qwen2's
-`max_window_layers`, Llama 4's `no_rope_layers` — and prefers an explicit
-`layer_types` list over all of them, since it is the only unambiguous source. `_map_mla` reads
+`max_window_layers`, Llama 4's `no_rope_layers`, Inkling 2's `local_layer_ids`
+(with `sliding_window_size`, read only beside that list) — and prefers an
+explicit `layer_types` list over all of them, since it is the only unambiguous source.
+Only a type that names a window (`sliding`, `chunked`, `local`) is windowed: a
+recurrent type is priced by `_map_recurrent`, and one nothing recognises is
+charged as full attention rather than the 4096-token stand-in it used to get,
+which under-priced it the moment a context ran past 4096. `_map_mla` reads
 DeepSeek's own numbers rather than deriving them: its query heads are 192 wide
 against 128-wide value heads and neither equals `hidden_size /
 num_attention_heads`. A config with `is_encoder_decoder: true` falls back to the
@@ -184,6 +195,41 @@ decoder's own layer and head counts and says so — Whisper large-v3 publishes
 `max_target_positions: 448` and nothing under any of the usual window names, so
 without that key the planner would offer a context vLLM then refuses to start
 with.
+
+`_map_loop` unrolls a looped core (Inkling 2's `loop_config`: layers 6..17 run
+three times per token). Each visit keeps its own KV cache — llama.cpp expands 24
+blocks to 48 cache slots, 8 of them global — so `Mapped.cache_layers` (48)
+becomes the shape's `num_layers` while `Mapped.num_layers` stays physical,
+because the expert accounting reads it. The GGUF path does the same from
+`loop.count`/`loop.start`/`loop.end`, and reads the header's per-layer
+`attention.sliding_window_pattern` list instead of charging every layer as
+windowed; `loop_cache_layers` is the one expansion both use. Before this the
+same model was 12 GiB of KV at 131k from its config and 0.09 GiB from its GGUF,
+against llama-server's measured 4.16.
+
+## `recurrent.py`
+
+Linear attention, Mamba and short-convolution layers keep a fixed-size state
+per sequence instead of a KV cache. `from_config` and `from_gguf` return how
+many layers keep no KV cache (`attention_free_layers` -- not always the
+recurrent count: Falcon-H1 runs both in every layer, Nemotron-H has MLP-only
+blocks with neither) and one sequence's state over every layer that keeps one
+(`recurrent_state_bytes`). Six families: Gated DeltaNet (Qwen3-Next, Qwen3.5,
+Olmo-Hybrid, MiniCPM-V 4.6), KDA (Kimi Linear, Bailing V3), Mamba-1 (Jamba,
+Mamba, Falcon-Mamba), Mamba-2 (Nemotron-H, Granite-4.0-H, Falcon-H1, Zamba2,
+Bamba, Mamba-2) and short convolutions (LFM2).
+
+Every formula is the pinned image's `MambaStateShapeCalculator` fed from the
+keys that model's own `get_mamba_state_shape_from_config` reads, and the
+widths are its defaults -- including the two that are not 16-bit:
+Qwen3.5's `mamba_ssm_dtype: float32` and Nemotron-H's float32 default. Checked
+on 2026-11-21 against the image itself for 20 real checkpoints: every one
+matched to the byte, and the corpus records them. A GGUF is priced in
+float32 (what llama.cpp holds the state in) from its `ssm.*`/`shortconv.*`
+keys, with llama.cpp's own layer rules: per-layer `head_count_kv` zeros,
+`attention.recurrent_layers` when written, and a period of 4 for a
+`qwen3next` header that states none. A pure state-space model has no head
+count and is no longer refused for it.
 
 ## `gguf.py`
 
@@ -338,7 +384,9 @@ dense model like Qwen3-8B answerable on its own screen rather than blank.
 layers the model already has, so it is not a decoder layer's worth of new
 weights the way the MTP module is — but "not that" is not a figure, and this
 build has not read the rank-256 markov head's parameterisation out of a
-checkpoint. It is detected, named, and refused. The whole product is a gate
+checkpoint. It is detected, named, and refused. Inkling 2 declares the same
+design as `mtp_config` (block size, markov rank, target layers);
+`config_map._map_nested_dspark` maps it onto the same fields. The whole product is a gate
 that refuses launches which will run out of memory, and a method whose weight
 cost is unknown is a launch nothing has checked.
 
@@ -382,7 +430,7 @@ non-positive TTL does not mean "cache forever"; it means the cache is disabled
 and every read counts as stale, because 0-as-infinite is the trap a caller
 reaches for when they mean "no TTL configured".
 
-`SCHEMA_VERSION` is 4, and the last bump moved no field. A cached resolution
+`SCHEMA_VERSION` is 14; `cache.py` says why each bump happened. A cached resolution
 stores facts about the model *and* this build's opinions about it — the support
 verdict per runtime and the warnings derived from it — so a build that adds a
 runtime would read yesterday's answer and report that nothing can load a model
@@ -447,9 +495,11 @@ written by an older build still reports the current answer.
 key this codebase prices with, `label` is what the publisher called it, and
 rendering "q4_k_m" for a file named "UD-Q4_K_XL" would paraphrase a string
 somebody else chose. `file_bytes` is a measurement or it is `None`, never a
-table estimate. `QuantRequirement.check(compute_capability)` is the silicon
-question, and it returns a sentence either way — NVFP4 needs Blackwell outright,
-MXFP4 runs emulated below it.
+table estimate. `QuantRequirement.check(compute_capability)` is the static
+silicon question and the fallback; `support.silicon_check` asks the image the
+machine runs (its probed per-method floors and KV-dtype kernels) first. Both
+return a sentence either way -- NVFP4 runs emulated (Marlin, weight-only)
+below Blackwell, MXFP4 runs emulated below it too.
 
 ## `gguf_names.py`
 
@@ -637,10 +687,22 @@ of claim. `ImageProbe.provenance` renders
 on every verdict — not only the ones whose reason mentions it — so a screen can
 show which build okayed a model that was never refused.
 
-**A GGUF shape is for planning, not for a launch.** `_resolution_from_gguf`
-appends that warning to every resolution it builds, and every `QuantVariant`
-naming a single `.gguf` file is `launchable=False`: both serve command templates
-take a repository path, and no runtime here claims to load llama.cpp's format.
+**A GGUF on vllm is judged on the model it was quantized from.** vLLM loads GGUF
+only through vllm-gguf-plugin, so `ImageProbe.gguf` records whether the image
+carries it and `support.evaluate_runtime` answers from that: unverified with no
+probe, a refusal naming the plugin without it, the image's registry with it.
+The plugin reads the GGUF's weights and nothing else, so
+`ModelResolver.gguf_launch_facts` reads the hub's one
+`base_model:quantized:<id>` tag for the config and tokenizer source, refuses a
+gated base (the container fetches it with no token), and for a vision base picks
+the repo's `mmproj` projector (BF16, then F16, then F32) with its measured size.
+`supported_by` checks the BASE's architectures for vllm, because the GGUF's ggml
+name (`qwen35`) may map to nothing. A resolved hub GGUF is cached under both
+its `hf://` id and the scheme-less `shape.model_id`, which is what
+`_architectures_for` looks up; a split build is resolved from its first shard
+and every sibling's tensors are summed, and naming a later shard is refused.
+File-level `QuantVariant` rows are `launchable=True`; which runtime may take one
+is the `formats` list `/api/runtimes` derives from the same probe.
 
 ## Failure behaviour
 

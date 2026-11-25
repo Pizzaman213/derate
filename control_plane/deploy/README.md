@@ -85,8 +85,16 @@ socket operation and not the call's wall time.
 `_allocate_port` counts its own records and then *binds* each candidate through
 `port_is_free` over a 200-port window, because the counter knows only what this
 control plane started. Nothing free falls back to the counter's answer and logs
-it rather than refusing: the check is an improvement on a guess, and the identity
-probe is what actually protects the deployment.
+it rather than refusing: a bind sees only this machine. `_reserve_checked_port`
+is what asks the plan's nodes: `port_reachable` dials the candidate on each and
+tells a SYN-ACK (`PORT_LISTENING` -- a server already holds it there) from an
+RST (`PORT_CLOSED`, free) and silence (`PORT_DROPPED`, `PortUnreachable`). A
+held port is released and the next one tried, up to `_PORT_SEARCH`, and all of
+them held is `PortsTaken`, a 400 naming the node. It used to fold accepted and
+refused into one "reachable": on 2026-11-21 a launch went onto 8103 on the 3090
+while a stranger's vLLM held it, the new engine could not bind, and the
+stranger answered the ready probe. The port checked is the port launched on --
+it stays in `_reserved_ports` until the record holds it.
 
 `reconcile()` is the only place a state is set without an FSM check, once per
 record, and `_evidence` chooses it. Three branches are load-bearing. A healthy
@@ -504,7 +512,12 @@ Ollama and llama-server emit) and `serves()` is the comparison. `_tail` matches
 on the last path segment, so a runtime reporting the repository it loaded is agreeing with
 us rather than contradicting us. A port that answers but names nothing readable
 falls back to liveness: that is the pre-existing situation, and refusing it would
-kill deployments behind proxies that never spoke this dialect. `wrong_model()`
+kill deployments behind proxies that never spoke this dialect. The one exception
+is a port that answers 401 or 403 to `api_key`: every engine derate launches is
+started with that key (a runtime that checks none answers 200), so the refusal
+is a stranger's server and is a mismatch, never a fall-through to `/health`,
+which ignores keys -- that fall-through is how the stranger above went READY.
+Without a key, 401/403 stays "nothing learned". `wrong_model()`
 and `_MISMATCH_MARK` keep the distinction greppable in one place -- a dead port
 is a deployment to restart, a stranger's port is a deployment whose url is a lie,
 and restarting that one just re-adopts the stranger.

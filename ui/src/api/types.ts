@@ -235,9 +235,6 @@ export interface ProviderKindSpec {
    *  asked which ones (`GET /api/providers/{id}/backends`), and told to pin
    *  one (`PATCH ... {backend_pins}`). True only for OpenRouter. */
   supports_backend_routing: boolean
-  /** Whether the kind has an authenticated call that proves a key works
-   *  (`POST /api/providers/{id}/key-check`, "Test key"). */
-  supports_key_check: boolean
   /** Set when this build cannot talk to the kind at all. The server's own
    *  sentence; render it verbatim and do not offer the kind. */
   unsupported_reason: string | null
@@ -570,6 +567,14 @@ export interface FitResult {
    *  Optional: absent on a gateway that predates it, in which case the card
    *  falls back to the single figure it has always shown. */
   predicted_decode_tps_empty?: number | null
+  /** What both decode rates rest on: `constant` is the efficiency pair in
+   *  `fit/constants.py`, `measured` an efficiency calibrated from decode rates
+   *  recorded for this model on this hardware. */
+  decode_basis?: 'constant' | 'measured'
+  /** The efficiency behind `predicted_decode_tps`; null without a rate. */
+  decode_efficiency?: number | null
+  /** Interconnect seconds per decoded token; null for a single-node plan. */
+  decode_wire_seconds?: number | null
 }
 
 /** One speculative-decoding method a checkpoint declares, from
@@ -750,6 +755,11 @@ export interface MemoryReport {
   memory_severity?: 'ok' | 'warning' | 'critical' | null
   sampled_at?: number
   allocatable?: number | null
+  /** What a host-pool runtime (llamacpp) is budgeted against on this machine:
+   *  MemAvailable less the CPU reserve. Null on a unified-memory or
+   *  unidentified machine, where host RAM is not a pool of its own, and when
+   *  nothing has measured it. Optional: an older coordinator omits it. */
+  host_allocatable?: number | null
   static_ceiling?: number | null
   addressable?: number | null
   pool_used?: number | null
@@ -914,6 +924,20 @@ export interface PlanResponse {
    *  YaRN is on -- and the model's trained one. Absent on an older gateway. */
   native_window?: number | null
   original_window?: number | null
+  /** A vllm launch of a hub GGUF: the base repository vllm reads config.json
+   *  and the tokenizer from, and the mmproj projector blob a VL GGUF loads
+   *  beside it. Null otherwise; absent on an older gateway. */
+  gguf_base?: string | null
+  gguf_projector?: string | null
+  /** Cache bytes per token at each `--kv-cache-dtype` this plan could launch
+   *  with, over the model's 16-bit rate (`fit/kv.py`). Includes the packed
+   *  layouts, whose scales and boundary layers depend on the model. Absent
+   *  per name when the gate does not price it, this build cannot render it,
+   *  this attention geometry refuses it, the runtime cannot be told it, or the
+   *  image a planned machine runs has no attention backend for it
+   *  (`internal_api.py::_kv_dtype_ratios`): every width listed is one the plan
+   *  accepts. `auto` is never listed. Absent on an older gateway. */
+  kv_dtype_ratios?: Record<string, number>
 }
 
 export interface LaunchRequest {
@@ -1184,6 +1208,10 @@ export interface DeploymentDTO {
   engine_options?: EngineOptions
   /** The model's trained window when YaRN stretched it, else null. */
   original_window?: number | null
+  /** Base repository (config.json, tokenizer) and mmproj projector blob of a
+   *  vllm GGUF launch; null for every other deployment. */
+  gguf_base?: string | null
+  gguf_projector?: string | null
 }
 
 // ── Routing: GET /api/routing, PUT /api/routing/{served_name} ────────────────
@@ -1375,22 +1403,6 @@ export interface Provider {
    *  field that could carry one. `null` whenever `key_state` is `missing` --
    *  and for a port that knows the state without knowing the source. */
   key_source: 'environment' | 'secrets.json' | 'oauth' | null
-  /** What the last key check found, for the key that resolves NOW: a check
-   *  made with an earlier key reads as null ("not checked yet"). `detail` is
-   *  the upstream's own sentence on a refusal or an inconclusive check. */
-  key_check: {
-    state: 'ok' | 'rejected' | 'inconclusive'
-    checked_at: number
-    detail: string | null
-  } | null
-  /** When the upstream says this key expires (epoch seconds; OpenRouter
-   *  only), or null when it did not say. */
-  key_expires_at: number | null
-  /** Days ahead of `key_expires_at` the row warns. 0 turns that off. */
-  key_expiry_warn_days: number | null
-  /** The server's one warning sentence for this key -- refused, expired or
-   *  about to expire -- shared with the sidebar alert. Render verbatim. */
-  key_warning: string | null
   /** The account a sign-in kind is signed in as (its email), or null for a
    *  key-based kind. An identity, never a token. */
   sign_in_account: string | null
@@ -1483,9 +1495,6 @@ export interface ProviderSpec {
    *  a key at a time; `null` clears one. A finite number >= 0 or the patch is
    *  a 400. Read back as each model's `price_per_minute_usd`. PATCH only. */
   audio_prices?: Record<string, number | null>
-  /** Days ahead of a reported key expiry to warn, 0..365; 0 turns the early
-   *  warning off. A whole number or the patch is a 400. PATCH only. */
-  key_expiry_warn_days?: number
 }
 
 /** `PATCH /api/providers/{id}` body (providers/service.py `update`). */
@@ -1504,7 +1513,6 @@ export type ProviderPatch = Partial<
     | 'backend_pins'
     | 'backend_fallbacks'
     | 'audio_prices'
-    | 'key_expiry_warn_days'
   >
 >
 
@@ -1603,7 +1611,7 @@ export interface SpeculativeCounters {
  *  is a separate surface from `/api/history/events`. */
 export interface Alert {
   key: string
-  kind: 'node_down' | 'cap_reached' | 'oom' | 'key_warning'
+  kind: 'node_down' | 'cap_reached' | 'oom'
   /** The `Lamp` vocabulary, deliberately: a severity that did not map onto
    *  something drawable would be a third spelling of the same idea. */
   severity: 'warn' | 'fault'
@@ -1943,6 +1951,17 @@ export interface CapacitySide {
   best: CapacityRow | null
 }
 
+/** `CapacityReport.host_pool`: one machine, live only. */
+export interface CapacityHostPool extends CapacitySide {
+  /** The host-pool runtimes this answers for, e.g. `["llamacpp"]`. */
+  runtimes: string[]
+  node_id: string
+  /** The KV width the rows were priced at: the requested one if the runtime
+   *  can be told it, else fp16. */
+  kv_dtype: string
+  allocatable_per_node: number
+}
+
 export interface CapacityReport {
   probed_node: string
   /** The context every row was taken at, or null when the gate chose one per
@@ -1981,6 +2000,17 @@ export interface CapacityReport {
    *  from addressable memory, which is 0 on a machine with no GPU on purpose,
    *  so the whole side would read 0.0 GiB beside rows that say "fits". */
   static?: CapacitySide | null
+  /** The same walk for the runtimes that serve from HOST RAM (llamacpp),
+   *  beside the GPU sides and never instead of them: on a discrete box host
+   *  RAM is a pool of its own. Sized on `probed_node` against its live host
+   *  budget with the card taken out -- what that launch's own gate uses.
+   *  Null when the machine's host RAM is not its own pool (GB10, Apple,
+   *  unknown), when nothing measured it, or for `basis=static`; absent from a
+   *  coordinator older than the field. */
+  host_pool?: CapacityHostPool | null
+  /** Why `host_pool` is null on a machine that would qualify -- the launch
+   *  gate's own sentence. Null otherwise. */
+  host_pool_unavailable_reason?: string | null
 }
 
 export interface MemoryReportList {
@@ -2392,8 +2422,9 @@ export interface VariantLadder {
   model_id: string
   variants: QuantVariant[]
   /** The largest variant that both fits and can be served here, or null when
-   *  nothing does. */
-  recommended: { repo_id: string; label: string; dtype: string; reason: string } | null
+   *  nothing does. `gguf_file` is part of the row's identity: one repository
+   *  can publish two builds under one label. */
+  recommended: { repo_id: string; label: string; dtype: string; reason: string; gguf_file: string | null } | null
   /** Always true, and shown: names are the only signal most quantizers leave. */
   heuristic: boolean
   note: string
@@ -3374,6 +3405,39 @@ export interface RequestRow {
         retry_after_s?: number | null
       }[]
     | null
+  /** Where the routing strength came from (`predicted`, `measured`, ...). */
+  strength_source: string
+  tokens: number
+  /** True when the prompt count is the gateway's estimate, not the upstream's
+   *  own `usage`. The archive stores 0/1, the live journal a boolean. */
+  tokens_estimated: boolean | number
+  streaming: boolean | number
+  body_bytes: number
+  kv_bytes: number
+  fallback_used: boolean | number
+  fallback_reason: string | null
+  cancelled: boolean | number
+  generation_ms: number | null
+  tpot_mean_ms: number | null
+  tail_ms: number | null
+  reasoning_tokens: number | null
+  max_tokens_requested: number | null
+  message_count: number | null
+  context_bucket: string | null
+  /** cache_read_tokens over prompt_tokens, as the server computed it. */
+  prefix_cache_hit_rate: number | null
+  spec_num_drafts: number | null
+  spec_draft_tokens: number | null
+  spec_accepted_tokens: number | null
+  spec_acceptance_rate: number | null
+  spec_mean_accepted_len: number | null
+  spec_accepted_per_position: number[] | null
+  /** `not_enabled` when the deployment does not speculate. */
+  spec_decode_error: string | null
+  /** `metered` | `estimated` | `unpriced`; null when the attempt failed and
+   *  nothing was priced. */
+  cost_basis: 'metered' | 'estimated' | 'unpriced' | null
+  client_port: number | null
   [field: string]: unknown
 }
 
@@ -3398,6 +3462,39 @@ export interface RequestsQuery {
   page?: number
   page_size?: number
 }
+
+/** `source` is where the point came from: `place` is a range the operator
+ *  pinned (`/api/geoip/places`), exact; `database` is the IP database, city
+ *  level; `coordinator` is a LAN, loopback or tailnet address placed at this
+ *  coordinator's own public address, city level; `relay` is a tailnet device
+ *  placed at its Tailscale relay region, region level (telemetry/tailnet.py). */
+export type GeoSource = 'place' | 'database' | 'coordinator' | 'relay'
+export interface GeoLocation { lat: number; lon: number; city: string | null; region: string | null; country: string | null; label: string | null; source: GeoSource }
+export interface GeoDatabaseStatus { state: 'ready' | 'missing' | 'failed' | 'downloading'; source: string; build: string | null; path: string; detail: string | null; downloading: boolean; last_error: string | null; retry_in_s: number; pinned?: boolean }
+export interface OriginPoint extends GeoLocation { requests: number; ips: number; last_ts: number }
+export interface OriginsResult { points: OriginPoint[]; located: number; local: number; unlocated: number; unknown: number; database: GeoDatabaseStatus; attribution: { text: string; url: string } }
+export interface GeoLookup { ip: string; kind: 'public' | 'local' | 'invalid'; location: GeoLocation | null; database: GeoDatabaseStatus }
+/** One row of the operator's CIDR -> place table. */
+export interface KnownPlace { cidr: string; label: string; lat: number; lon: number }
+/** `error` is why the stored file could not be read; the table is then empty. */
+export interface KnownPlaces { places: KnownPlace[]; path: string; error: string | null }
+/** One server a request passed through (`/api/requests/route`), in order:
+ *  the client, the gateway node that took it, then each attempt's nodes or
+ *  provider. `location` is null when nothing places `address`; `note` says
+ *  what is not known, or why a provider's point is not where the model ran. */
+export interface RouteHop {
+  role: 'client' | 'gateway' | 'node' | 'provider' | 'target'
+  name: string
+  address: string | null
+  host: string | null
+  location: GeoLocation | null
+  attempt: number | null
+  status: number | null
+  ms: number | null
+  target_id: string | null
+  note: string | null
+}
+export interface RequestRoute { request_id: string; hops: RouteHop[]; database: GeoDatabaseStatus }
 
 export interface AuditEntry {
   id: number
@@ -3495,13 +3592,19 @@ export interface RuntimeInfo {
     shards: boolean
   }
   kv_dtypes: string[]
-  /** Bytes per cached element for each of `kv_dtypes` (`fit/kv.py`). */
+  /** Bytes per cached element for the PLAIN widths among `kv_dtypes` only
+   *  (`fit/kv.py`); a packed layout's cost depends on the model and is in
+   *  `/api/plan`'s `kv_dtype_ratios` instead. */
   kv_dtype_bytes: Record<string, number>
   engine_options: string[]
   reasoning_parsers: string[]
   tool_call_parsers: string[]
   nccl_tunables: string[]
   version: string | null
+  /** Per CPU architecture, the version the image that architecture runs
+   *  reported when probed, or null when nothing has probed it. Measurements
+   *  are keyed by the measured machine's entry, never by `version`. */
+  image_versions: Record<string, string | null>
 }
 
 /** `POST /api/plan/command`. */

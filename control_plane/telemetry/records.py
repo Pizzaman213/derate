@@ -175,6 +175,8 @@ class AccessRecord:
     # The socket's own peer. Differs from client_ip only when that peer is a
     # proxy in DERATE_TRUSTED_PROXIES and X-Forwarded-For named the client.
     peer_ip: str | None = None
+    # How many identical requests this row stands for (gateway/accessfold.py); 1 for every unfolded row.
+    count: int = 1
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -342,7 +342,7 @@ def test_a_remote_gguf_file_is_launchable_and_a_local_one_is_not():
     The other fact is still true and is not about formats at all: a `.gguf`
     PATH names a file on the coordinator, and the container starts on the node
     the plan placed it on. That one has to keep refusing, and it is the same
-    refusal `flags.llamacpp_model_refusal` makes at the door -- said here early
+    refusal `flags.local_gguf_refusal` makes at the door -- said here early
     enough that the button is never drawn."""
     from dataclasses import replace
 
@@ -366,6 +366,19 @@ def test_a_remote_gguf_file_is_launchable_and_a_local_one_is_not():
         )
     )
     assert payload["launchable"]["ok"] is True
+    # ...and spelled the way a resolve actually hands it back: no scheme. The
+    # `startswith("hf://")` test this used to be read that as a local path.
+    resolved = replace(shape, model_id=shape.model_id[len("hf://"):])
+    resolved_payload = resolution_payload(
+        Resolution(
+            shape=resolved,
+            revision="gguf",
+            param_source=ParamSource.GGUF_TENSORS,
+            quant_source=QuantSource.GGUF_FILE_TYPE,
+            support=build_verdict(("LlamaForCausalLM",), resolved.dtype),
+        )
+    )
+    assert resolved_payload["launchable"]["ok"] is True
 
     local = replace(shape, model_id="/home/somebody/models/Qwen3-30B-A3B.gguf")
     local_payload = resolution_payload(
@@ -703,6 +716,17 @@ class TestVariantOrdering:
 
         rows = [self._row("gguf", "fits", 17.7, launchable=False)]
         assert _recommend(rows) is None
+
+    def test_the_recommendation_names_its_file(self):
+        """One repository can publish two builds under one label, so
+        `(repo_id, label)` alone points at both and the UI cannot tell which."""
+        from control_plane.gateway.capacity_api import _ranked, _recommend
+
+        small = {**self._row("Q6_K", "fits", 4.0, launchable=True), "gguf_file": "W-Q6_K.gguf"}
+        large = {**self._row("Q6_K", "fits", 9.0, launchable=True), "gguf_file": "W-AD-Q6_K.gguf"}
+        rows = [small, large]
+        _ranked(rows)
+        assert _recommend(rows)["gguf_file"] == "W-AD-Q6_K.gguf"
 
 
 class TestVariantFailureCaching:
@@ -1487,3 +1511,31 @@ class TestLadderIsSizedOnTheMachinesThatWereNamed:
         _, rows = self._sized_on(client)
         judged = [r["context"] for r in rows if r["context"] is not None]
         assert judged and max(judged) >= MIN_USEFUL_CONTEXT, judged
+
+    def test_unlike_machines_are_not_pooled_unless_named(self):
+        """One Spark and a busy RTX 3090, nobody ticked anything.
+
+        The planner plans within its strongest group of like hardware unless
+        `allow_mixed_hardware` is given, and a launch across both is refused.
+        The ladder pooled them anyway, at TP=2, so the 3090's free memory
+        governed every row: live, on `thinkingmachines/inkling-2-mini`, a
+        21.8 GiB Q6_K read "will not fit right now" with 44 GiB free on the
+        Spark, beside a Verdict card for the same build saying it fits.
+        """
+        from control_plane.planner import Planner
+
+        registry = FakeRegistry()
+        registry.states = [s for s in registry.states if s.profile.node_id != "spark-02"]
+        registry.set_memory_pct("ws-3090", 90.0)
+        deps = build_deps(registry=registry)
+        deps.resolver = _LadderResolver()
+        deps.planner = Planner()
+        with TestClient(create_app(deps)) as c:
+            sized_on, rows = self._sized_on(c)
+            named, _ = self._sized_on(c, "&on=spark-01,ws-3090")
+        assert sized_on["nodes"] == ["spark-01"]
+        assert sized_on["tensor_parallel"] == 1
+        q4 = next(r for r in rows if r["label"] == "Q4_K_M")
+        assert q4["fits"] is True, q4["reason"]
+        # Named machines are the operator's pool and stay pooled.
+        assert named["nodes"] == ["spark-01", "ws-3090"]

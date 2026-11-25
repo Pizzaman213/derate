@@ -53,6 +53,11 @@ _KV_ELEM_BYTES: dict[str, float] = {
 # authoritative value; 2048 is the figure the fit specification names.
 _ACTIVATION_CHUNK_TOKENS = 2048
 
+# Copies of a recurrent layer's state each sequence holds. The fit package
+# owns it (fit/constants.py says why it is 2); contracts/derived.py holds the
+# two together.
+RECURRENT_STATES_PER_SEQUENCE = 2
+
 
 class FitHelpers(Protocol):
     """The slice of `control_plane.fit` the planner depends on."""
@@ -83,9 +88,11 @@ def kv_bytes_per_token(shape: ModelShape, kv_dtype: str = DEFAULT_KV_DTYPE) -> f
     For a sliding-window model this returns the marginal cost of one more token
     of context, which is the full-attention layers only: windowed layers stop
     growing once the window is full. The windowed layers' fixed cost is charged
-    by ``kv_total_bytes``, which knows the context length.
+    by ``kv_total_bytes``, which knows the context length. A recurrent layer
+    caches no token at all; its fixed state is charged there too.
     """
     elem = kv_elem_bytes(kv_dtype)
+    layers = shape.attention_layers
 
     if shape.mla_latent_dim:
         # Multi-head latent attention caches one compressed vector per layer per
@@ -93,51 +100,56 @@ def kv_bytes_per_token(shape: ModelShape, kv_dtype: str = DEFAULT_KV_DTYPE) -> f
         # the latent alone. Dropping the RoPE half under-counts a DeepSeek-family
         # cache by roughly 11 percent, in the OOM direction.
         return (
-            shape.num_layers
+            layers
             * (shape.mla_latent_dim + shape.effective_mla_rope_dim)
             * elem
         )
 
     per_layer = 2 * shape.num_kv_heads * shape.effective_head_dim * elem
     if shape.sliding_window and shape.layers_with_full_attention is not None:
-        return per_layer * shape.layers_with_full_attention
-    return per_layer * shape.num_layers
+        return per_layer * min(shape.layers_with_full_attention, layers)
+    return per_layer * layers
 
 
 def kv_total_bytes(
     shape: ModelShape, kv_dtype: str, context: int, batch: int
 ) -> float:
-    """Total KV cache for ``batch`` sequences at ``context`` tokens, unsharded."""
+    """Total KV cache for ``batch`` sequences at ``context`` tokens, unsharded,
+    with a hybrid's recurrent state included."""
     elem = kv_elem_bytes(kv_dtype)
+    layers = shape.attention_layers
+    state = shape.recurrent_state_bytes * RECURRENT_STATES_PER_SEQUENCE * batch
 
     if shape.mla_latent_dim:
         # Same correction as kv_bytes_per_token: latent plus decoupled RoPE,
         # never the latent alone.
         per_token = (
-            shape.num_layers
+            layers
             * (shape.mla_latent_dim + shape.effective_mla_rope_dim)
             * elem
         )
-        return per_token * context * batch
+        return per_token * context * batch + state
 
     per_layer_per_token = 2 * shape.num_kv_heads * shape.effective_head_dim * elem
 
     if shape.sliding_window and shape.layers_with_full_attention is not None:
-        full = shape.layers_with_full_attention
-        windowed = max(0, shape.num_layers - full)
+        full = min(shape.layers_with_full_attention, layers)
+        windowed = max(0, layers - full)
         # Full layers cache the whole context; windowed layers cache the window.
         # Treating a windowed model as fully cached over-estimates by multiples.
         layer_tokens = full * context + windowed * min(shape.sliding_window, context)
-        return per_layer_per_token * layer_tokens * batch
+        return per_layer_per_token * layer_tokens * batch + state
 
-    return per_layer_per_token * shape.num_layers * context * batch
+    return per_layer_per_token * layers * context * batch + state
 
 
-def activation_bytes(shape: ModelShape, batch: int) -> float:
-    """Logits buffer plus compute scratch. Replicated on every node."""
+def activation_bytes(shape: ModelShape, batch: int, context: int = 0) -> float:
+    """Logits buffer plus compute scratch, plus a speech codec's working set
+    at *context* frames (`ModelShape.codec_working_set`). Replicated on every
+    node."""
     logits = shape.vocab_size * batch * 4
     scratch = _ACTIVATION_CHUNK_TOKENS * shape.hidden_size * 4 * 6
-    return logits + scratch
+    return logits + scratch + shape.codec_working_set(context)
 
 
 def min_nodes_required(
@@ -178,7 +190,7 @@ def min_nodes_required(
     # Dividing experts would make it optimistic, which is the one direction a
     # floor may not move.
     kv = kv_total_bytes(shape, kv_dtype, context, max_seqs)
-    activations = activation_bytes(shape, max_seqs)
+    activations = activation_bytes(shape, max_seqs, context)
     layers = max(1, shape.num_layers)
 
     for n in range(1, MAX_NODES_CONSIDERED + 1):

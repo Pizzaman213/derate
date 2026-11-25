@@ -40,6 +40,7 @@ from control_plane.redaction import Redactor
 
 from control_plane.limits.service import CHARS_PER_TOKEN
 from control_plane.providers.config import USAGE_TAIL_BYTES
+from control_plane.providers.httpclient import no_cookies
 from control_plane.providers.usage import (
     UsageSniffer,
     audio_duration_of,
@@ -859,9 +860,11 @@ class UpstreamProxy:
             max_keepalive_connections=self._settings.upstream_per_origin_limit,
         )
         # identity: an upstream error body is scrubbed for key material before
-        # a client sees it, and a scrubber cannot read gzip (finding K4).
+        # a client sees it, and a scrubber cannot read gzip (finding K4). No
+        # cookie jar: this client serves every key holder (no_cookies).
         client = httpx.AsyncClient(
-            timeout=timeout, limits=limits, headers={"accept-encoding": "identity"}
+            timeout=timeout, limits=limits, headers={"accept-encoding": "identity"},
+            cookies=no_cookies(),
         )
         self._clients[origin] = (client, now)
         return client

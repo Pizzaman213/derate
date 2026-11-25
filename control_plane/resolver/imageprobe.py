@@ -35,10 +35,12 @@ better number is used when it is there and its absence is never a refusal.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 #: Read vLLM's own model registry and print the servable set.
@@ -69,6 +71,28 @@ from pathlib import Path
 #: missing instead of just that it is: dropped in v0.10.2, or moved to
 #: https://github.com/vllm-project/bart-plugin, rather than one dead-end
 #: sentence for every miss.
+#:
+#: Two silicon facts ride along, both from vLLM's own code rather than from a
+#: table here, because a GPU generation the image cannot serve is a launch that
+#: clears every other gate and dies at load:
+#:
+#: ``quant_min_capability`` is each quantization method's
+#: ``get_min_capability()`` (75 for ``fp8``, 100 for ``fp_quant``) -- the floor
+#: vLLM itself refuses below. A classmethod: nothing is allocated.
+#:
+#: ``kv_capabilities`` is, per KV cache dtype, the compute capabilities at which
+#: vLLM's own attention selector (``CudaPlatform.get_valid_backends``) finds a
+#: backend for an ordinary (non-MLA) layer at head size 128, 64 or 256. Measured
+#: on 0.28.1 and 0.31.0: the plain widths and fp8 are valid everywhere from
+#: sm_75 to sm_121, and ``nvfp4`` is valid NOWHERE -- FlashInfer itself answers
+#: "kv_cache_dtype not supported" at sm_100 and sm_121. ``auto`` is valid at
+#: every capability that was asked, so its list doubles as the set asked: a
+#: capability absent from it is one nobody has evidence about. Importing
+#: ``vllm.platforms.cuda`` needs libcuda, which is why the probe runs with
+#: ``--gpus all`` (a driver mount; nothing is allocated) -- and the field is
+#: null when it could not be imported, which means "unknown", never "none".
+#: The MLA variant of the same question raised on both images, so MLA layers
+#: are not asked at all: no evidence is no refusal.
 _VLLM_SCRIPT = """
 import json
 import vllm
@@ -83,12 +107,64 @@ generative = cat("_TEXT_GENERATION_MODELS") | cat("_MULTIMODAL_MODELS")
 speculators = cat("_SPECULATIVE_DECODING_MODELS")
 servable = (set(r._VLLM_MODELS) - speculators
             - cat("_TRANSFORMERS_BACKEND_MODELS") - (pooling - generative))
+from vllm.plugins import load_general_plugins
+load_general_plugins()
+from vllm.model_executor.layers.quantization import (
+    QUANTIZATION_METHODS, get_quantization_config)
+
+qmin = {}
+for m in sorted(QUANTIZATION_METHODS):
+    try:
+        qmin[m] = int(get_quantization_config(m).get_min_capability())
+    except Exception:
+        pass
+
+kv = None
+try:
+    import typing
+    import torch
+    from vllm.platforms.cuda import CudaPlatform
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    try:
+        from vllm.config.cache import CacheDType
+        dtypes = typing.get_args(CacheDType)
+    except ImportError:
+        from vllm.config import CacheConfig
+        dtypes = typing.get_args(CacheConfig.__annotations__["cache_dtype"])
+    caps = [(7, 5), (8, 0), (8, 6), (8, 7), (8, 9), (9, 0), (10, 0), (10, 3),
+            (11, 0), (12, 0), (12, 1)]
+    defaults = AttentionSelectorConfig._field_defaults
+    kv = {}
+    for d in dtypes:
+        ok = []
+        for c in caps:
+            for hs in (128, 64, 256):
+                kw = dict(head_size=hs, dtype=torch.bfloat16, kv_cache_dtype=d,
+                          block_size=None, use_mla=False)
+                for f in AttentionSelectorConfig._fields:
+                    kw.setdefault(f, defaults.get(f, False))
+                try:
+                    valid, _ = CudaPlatform.get_valid_backends(
+                        DeviceCapability(*c), AttentionSelectorConfig(**kw))
+                except Exception:
+                    valid = []
+                if valid:
+                    ok.append("%d.%d" % c)
+                    break
+        kv[d] = ok
+except Exception:
+    kv = None
+
 print("derate-imageprobe:" + json.dumps({
     "version": vllm.__version__,
     "architectures": sorted(servable),
     "speculators": sorted(speculators),
     "removed": dict(getattr(r, "_PREVIOUSLY_SUPPORTED_MODELS", {})),
     "out_of_tree": dict(getattr(r, "_OOT_SUPPORTED_MODELS", {})),
+    "gguf": "gguf" in QUANTIZATION_METHODS,
+    "quant_min_capability": qmin,
+    "kv_capabilities": kv,
 }))
 """
 
@@ -195,6 +271,29 @@ class ImageProbe:
     #: ``_OOT_SUPPORTED_MODELS``. Lets a refusal name the plugin rather than
     #: just say the architecture is missing.
     out_of_tree: dict[str, str] = field(default_factory=dict)
+    #: vLLM's GGUF loader is a plugin since 0.27; whether this image carries
+    #: it. Read off ``QUANTIZATION_METHODS`` after vLLM's own plugin loader
+    #: has run, which is exactly what a launch does. Always False for an
+    #: SGLang probe, whose script does not ask.
+    gguf: bool = False
+    #: Quantization method -> the lowest compute capability vLLM loads it at,
+    #: as vLLM spells both (``"fp8": 75``, ``"fp_quant": 100``). Read off each
+    #: method's own ``get_min_capability()``, which is the check vLLM itself
+    #: raises on at load. Empty for an SGLang probe, whose script does not ask.
+    quant_min_capability: dict[str, int] = field(default_factory=dict)
+    #: vLLM KV cache dtype -> the capabilities (``"8.6"``) at which the image's
+    #: own attention selector finds a backend for a non-MLA layer. None when
+    #: the probe could not import the CUDA platform (no GPU driver mounted),
+    #: which is "unknown" and must never be read as "valid nowhere". The list
+    #: for ``auto`` is every capability that was asked.
+    kv_capabilities: dict[str, tuple[str, ...]] | None = None
+
+    def kv_asked(self) -> frozenset[str]:
+        """Every capability the KV selector was asked about. A capability
+        outside it is one this probe has no evidence for, either way."""
+        if not self.kv_capabilities:
+            return frozenset()
+        return frozenset(c for caps in self.kv_capabilities.values() for c in caps)
 
     @property
     def provenance(self) -> str:
@@ -217,18 +316,28 @@ class ImageProbe:
             "speculators": sorted(self.speculators),
             "removed": dict(self.removed),
             "out_of_tree": dict(self.out_of_tree),
+            "gguf": self.gguf,
+            "quant_min_capability": dict(self.quant_min_capability),
+            "kv_capabilities": (
+                None
+                if self.kv_capabilities is None
+                else {k: list(v) for k, v in self.kv_capabilities.items()}
+            ),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "ImageProbe":
-        # `speculators`, `removed` and `out_of_tree` are required, not
+        # `speculators`, `removed`, `out_of_tree`, `gguf`,
+        # `quant_min_capability` and `kv_capabilities` are required, not
         # defaulted, and that is the point. The cache is keyed by image id, so
         # an entry written before one of these fields existed would otherwise
         # be served forever as "this image registers no speculators" / "vLLM
-        # never dropped or moved anything" -- false for every vLLM build there
-        # has ever been, and would silently withdraw evidence on a box that had
-        # probed once already. A KeyError here is a cache miss in
-        # `_read_cache`, which re-probes; that is the correct outcome.
+        # never dropped or moved anything" / "this image has no GGUF loader"
+        # / "nothing is known about this image's silicon floors" -- false for
+        # every vLLM build there has ever been (or, for `gguf`, for any image
+        # that carries the plugin), and would silently withdraw evidence on a
+        # box that had probed once already. A KeyError here is a cache miss
+        # in `_read_cache`, which re-probes; that is the correct outcome.
         return cls(
             runtime=data["runtime"],
             image=data["image"],
@@ -238,7 +347,32 @@ class ImageProbe:
             speculators=frozenset(data["speculators"]),
             removed=dict(data["removed"]),
             out_of_tree=dict(data["out_of_tree"]),
+            gguf=bool(data["gguf"]),
+            quant_min_capability=_min_capabilities(data["quant_min_capability"]),
+            kv_capabilities=_kv_capabilities(data["kv_capabilities"]),
         )
+
+
+def _min_capabilities(raw) -> dict[str, int]:
+    """`{method: int}`, dropping anything that is not one."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(k): int(v)
+        for k, v in raw.items()
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+
+
+def _kv_capabilities(raw) -> dict[str, tuple[str, ...]] | None:
+    """`{kv dtype: ("8.6", ...)}`, or None for "the probe could not ask"."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        str(k): tuple(str(c) for c in v)
+        for k, v in raw.items()
+        if isinstance(v, (list, tuple))
+    }
 
 
 def _run(args: list[str], timeout: float) -> str | None:
@@ -250,33 +384,116 @@ def _run(args: list[str], timeout: float) -> str | None:
     distinguishing at the call site -- they all mean "no better answer than
     the static table" -- and none of them may propagate.
     """
-    try:
-        done = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout, check=False
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if done.returncode != 0:
+    done = _exec(args, timeout)
+    if done is None or done.returncode != 0:
         return None
     return done.stdout
 
 
-def image_id(image: str, *, docker: str = "docker", timeout: float = 30.0) -> str | None:
-    """The local image's content id, or None when it is not on this machine.
+def _exec(args: list[str], timeout: float) -> subprocess.CompletedProcess | None:
+    """The finished process, or None when it never ran or ran out of time."""
+    try:
+        return subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _docker(docker: str, host: str | None) -> list[str]:
+    """The docker argv prefix: this machine's daemon, or *host*'s over SSH."""
+    return [docker, "-H", host] if host else [docker]
+
+
+def image_id(
+    image: str, *, docker: str = "docker", timeout: float = 30.0, host: str | None = None
+) -> str | None:
+    """The image's content id, or None when it is not on the machine asked.
 
     This is also the "do we probe at all" gate. It never pulls: ``inspect``
     fails on a missing image rather than fetching it, which is the whole
     point on a coordinator that may not be the machine that serves models.
     """
-    out = _run([docker, "image", "inspect", "--format", "{{.Id}}", image], timeout)
+    out = _run([*_docker(docker, host), "image", "inspect", "--format", "{{.Id}}", image], timeout)
     if out is None:
         return None
     line = out.strip().splitlines()[0].strip() if out.strip() else ""
     return line or None
 
 
-def _cache_path(cache_dir: Path, runtime: str, ident: str) -> Path:
-    return cache_dir / f"{runtime}-{ident.replace(':', '-')}.json"
+def _identity(
+    image: str, *, docker: str, timeout: float, host: str | None
+) -> tuple[str, str] | None:
+    """``(docker id, content key)`` of the image on the machine asked, or None.
+
+    The content key is what the probe cache is keyed by, and it is NOT the
+    docker id: that id depends on the daemon's image store. The same image is
+    ``sha256:db08...`` on the RTX box (containerd store, where the id is the
+    manifest digest) and ``sha256:1d61...`` on the coordinator after `docker
+    save | docker load` (overlay2, where it is the config digest). Keyed by the
+    id, a probe run on one amd64 machine could never answer for the next one.
+    The ordered layer diff ids are identical in both stores, so their digest
+    is the key; the id stays as the fallback for an image that reports none.
+
+    Both come from a daemon that may be another machine's, so neither is
+    trusted as a string: the id and every layer must be a ``sha256:`` digest
+    or there is no identity and no probe. The key is then built only from
+    those validated hex digits, because it becomes a file name.
+    """
+    out = _run(
+        [*_docker(docker, host), "image", "inspect", "--format",
+         "{{.Id}}|{{json .RootFS.Layers}}", image],
+        timeout,
+    )
+    if not out or not out.strip():
+        return None
+    ident, _, layers_json = out.strip().splitlines()[0].partition("|")
+    ident = ident.strip()
+    if not _DIGEST.fullmatch(ident):
+        return None
+    try:
+        layers = json.loads(layers_json) if layers_json else None
+    except ValueError:
+        return None
+    if not layers:
+        return ident, ident.replace(":", "-")
+    if not isinstance(layers, list) or not all(
+        isinstance(layer, str) and _DIGEST.fullmatch(layer) for layer in layers
+    ):
+        return None
+    digest = hashlib.sha256("\n".join(layers).encode()).hexdigest()
+    return ident, "layers-" + digest
+
+
+#: A docker content digest, the only shape an image id or a layer may have.
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+#: The only shapes `_identity` produces as a cache key.
+_KEY = re.compile(r"(?:sha256|layers)-[0-9a-f]{64}")
+
+
+def _cache_path(
+    cache_dir: Path, runtime: str, key: str, host: str | None = None
+) -> Path | None:
+    """Where the probe of *key* is cached, or None when that would not be a
+    plain file directly inside *cache_dir*.
+
+    With *host*, the entry is that host's alone: an answer from another
+    machine's daemon that the coordinator could not confirm against its own
+    copy. The host is hashed rather than spelled, so no daemon- or
+    roster-supplied text is ever part of a path.
+    """
+    if not _KEY.fullmatch(key) or not runtime.isidentifier():
+        return None
+    scope = ""
+    if host is not None:
+        scope = "host-" + hashlib.sha256(host.encode()).hexdigest()[:16] + "-"
+    path = cache_dir / f"{runtime}-{scope}{key}.json"
+    try:
+        if path.resolve().parent != cache_dir.resolve():
+            return None
+    except OSError:
+        return None
+    return path
 
 
 def probe(
@@ -286,32 +503,73 @@ def probe(
     cache_dir: Path | None = None,
     docker: str = "docker",
     timeout: float = 300.0,
+    host: str | None = None,
+    run: bool = True,
 ) -> ImageProbe | None:
     """What *image* can load, from the image itself. None when it cannot be asked.
 
-    Cached under *cache_dir* by image id, so this costs one container start
-    the first time a given image is seen and nothing afterwards. A moved tag
-    changes the id and re-probes; that is the whole reason the id is the key.
+    Cached under *cache_dir* by the image's layer digests (``_identity``), so
+    this costs one container start the first time a given image is seen,
+    anywhere, and nothing afterwards. A moved tag changes the layers and
+    re-probes; that is the whole reason content is the key.
+
+    *host* (``ssh://10.0.0.5``) runs it on another machine's daemon instead,
+    which is the only way to ask an image built for an architecture the
+    coordinator is not: an amd64 image cannot start on an arm64 coordinator.
+    That answer comes from somebody else's daemon, so it becomes the SHARED
+    content-keyed entry -- the one every machine of that architecture, and the
+    ``run=False`` lookup, is judged by -- only when the coordinator holds its
+    own copy of the image with the same layer key. Otherwise it is cached for
+    that host alone, and one compromised node cannot define what an image
+    loads for the rest of the cluster. Each entry records where it came from.
+
+    ``run=False`` answers from the cache only. That is how the coordinator
+    asks about an image it holds for ANOTHER architecture (so sparkrun can
+    ship it): it can inspect it and look its layers up, but starting it would
+    only fail with ``exec format error``.
     """
     script = SCRIPTS.get(runtime)
     if script is None:
         return None
 
-    ident = image_id(image, docker=docker, timeout=min(timeout, 30.0))
-    if ident is None:
+    inspect_timeout = min(timeout, 30.0)
+    identity = _identity(image, docker=docker, timeout=inspect_timeout, host=host)
+    if identity is None:
         return None
+    ident, key = identity
 
+    shared = scoped = None
     if cache_dir is not None:
-        hit = _read_cache(_cache_path(cache_dir, runtime, ident))
-        if hit is not None:
-            return hit
-
-    out = _run(
-        [docker, "run", "--rm", "--entrypoint", "python3", image, "-c", script],
-        timeout,
-    )
-    if out is None:
+        shared = _cache_path(cache_dir, runtime, key)
+        scoped = _cache_path(cache_dir, runtime, key, host) if host is not None else None
+        if shared is None or (host is not None and scoped is None):
+            return None
+        for path in (shared, scoped):
+            hit = _read_cache(path) if path is not None else None
+            if hit is not None:
+                # Content-keyed, so the same layers may have been probed under
+                # another tag or on another daemon; answer for the one asked.
+                return replace(hit, image=image, image_id=ident)
+    if not run:
         return None
+
+    # `--gpus all` first: the KV-selector half of the vllm script imports
+    # vllm's CUDA platform, which needs the driver library mounted (nothing is
+    # allocated). A daemon with no NVIDIA runtime refuses that flag outright,
+    # and a GPU-less coordinator must still get the architecture list, so a
+    # refusal is retried without it -- the payload's `kv_capabilities` is then
+    # null, which reads as "unknown". A timeout is not retried: the same
+    # container would time out again.
+    base = [*_docker(docker, host), "run", "--rm"]
+    tail = ["--entrypoint", "python3", image, "-c", script]
+    done = _exec([*base, "--gpus", "all", *tail], timeout)
+    if done is None:
+        return None
+    if done.returncode != 0:
+        done = _exec([*base, *tail], timeout)
+        if done is None or done.returncode != 0:
+            return None
+    out = done.stdout
 
     payload = None
     for line in out.splitlines():
@@ -339,9 +597,19 @@ def probe(
         speculators=frozenset(payload.get("speculators") or ()),
         removed=dict(payload.get("removed") or {}),
         out_of_tree=dict(payload.get("out_of_tree") or {}),
+        gguf=bool(payload.get("gguf")),
+        quant_min_capability=_min_capabilities(payload.get("quant_min_capability")),
+        kv_capabilities=_kv_capabilities(payload.get("kv_capabilities")),
     )
-    if cache_dir is not None:
-        _write_cache(_cache_path(cache_dir, runtime, ident), found)
+    if shared is not None:
+        if host is None:
+            _write_cache(shared, found, source="local")
+        else:
+            local = _identity(image, docker=docker, timeout=inspect_timeout, host=None)
+            if local is not None and local[1] == key:
+                _write_cache(shared, found, source=f"{host}, confirmed by the coordinator's copy")
+            elif scoped is not None:
+                _write_cache(scoped, found, source=f"{host}, unconfirmed: that host only")
     return found
 
 
@@ -352,12 +620,15 @@ def _read_cache(path: Path) -> ImageProbe | None:
         return None
 
 
-def _write_cache(path: Path, found: ImageProbe) -> None:
-    """Best effort. An unwritable cache costs a container start, not a probe."""
+def _write_cache(path: Path, found: ImageProbe, *, source: str) -> None:
+    """Best effort. An unwritable cache costs a container start, not a probe.
+
+    *source* says which daemon answered and whether it may speak for others;
+    `from_dict` ignores it, so it is for whoever reads the file."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(found.as_dict(), indent=2))
+        tmp.write_text(json.dumps({**found.as_dict(), "source": source}, indent=2))
         os.replace(tmp, path)
     except OSError:
         pass

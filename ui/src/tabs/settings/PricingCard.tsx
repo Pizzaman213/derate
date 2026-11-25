@@ -1,8 +1,9 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { LocalPrice } from '../../api/types'
 import { Verbatim } from '../../components/Verbatim'
 import { useBackend, useResource } from '../../state/backend'
 import { useModels } from '../../state/resources'
+import { useRouter } from '../../state/router'
 import { isPriced, parseRate, pricingRows, rateText, type PricingRow } from './pricing'
 
 /** What a local model costs, for dollar limits and the per-key cost column.
@@ -14,11 +15,13 @@ import { isPriced, parseRate, pricingRows, rateText, type PricingRow } from './p
  *
  *  Rows are every model a local target serves now plus every model that
  *  already has a price, so a price outlives the deployment it was set for and
- *  can still be cleared. */
+ *  can still be cleared. A link to `/settings?price=<model>` (a request's Cost
+ *  column) adds that model's row when it has none, and focuses its input rate. */
 export function PricingCard() {
+  const { route } = useRouter()
   const models = useModels()
   const prices = useResource<LocalPrice[]>((b) => b.pricing(), 30000)
-  const rows = pricingRows(models.data, prices.data)
+  const rows = pricingRows(models.data, prices.data, route.price)
   const ready = models.data != null && prices.data != null
   const error = prices.error ?? models.error
 
@@ -58,7 +61,7 @@ export function PricingCard() {
             </thead>
             <tbody>
               {rows.map((r) => (
-                <PriceRow key={r.model} row={r} />
+                <PriceRow key={r.model} row={r} focus={r.model === route.price} />
               ))}
             </tbody>
           </table>
@@ -68,13 +71,22 @@ export function PricingCard() {
   )
 }
 
-function PriceRow({ row }: { row: PricingRow }) {
+function PriceRow({ row, focus }: { row: PricingRow; focus: boolean }) {
   const { backend, invalidate } = useBackend()
   const [inText, setInText] = useState(rateText(row.price?.input_usd_per_mtok))
   const [outText, setOutText] = useState(rateText(row.price?.output_usd_per_mtok))
   const [fieldError, setFieldError] = useState<string | null>(null)
   const [serverError, setServerError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const rowRef = useRef<HTMLTableRowElement>(null)
+  const inRef = useRef<HTMLInputElement>(null)
+  // An effect rather than `autoFocus`: Settings stays mounted while hidden, so
+  // the row may already exist when a link asks for it.
+  useEffect(() => {
+    if (!focus) return
+    rowRef.current?.scrollIntoView({ block: 'center' })
+    inRef.current?.focus({ preventScroll: true })
+  }, [focus])
 
   const errId = `price-err-${row.model}`
   const savedIn = rateText(row.price?.input_usd_per_mtok)
@@ -121,7 +133,7 @@ function PriceRow({ row }: { row: PricingRow }) {
   }
 
   return (
-    <tr>
+    <tr ref={rowRef}>
       <td>
         <span className="mono">{row.model}</span>
         <div className="unit">
@@ -137,6 +149,7 @@ function PriceRow({ row }: { row: PricingRow }) {
       </td>
       <td style={{ textAlign: 'right' }}>
         <input
+          ref={inRef}
           form={`price-${row.model}`}
           className="mono"
           inputMode="decimal"

@@ -18,7 +18,6 @@ import re
 import shutil
 import subprocess
 import sys
-import json
 import threading
 import time
 from pathlib import Path
@@ -1378,7 +1377,6 @@ def test_launch_refuses_graph_capture_options_on_a_runtime_that_cannot_take_them
 
 def test_illegal_transition_raises(tmp_path):
     manager = make_manager(tmp_path)
-    probe = manager._probe
     deployment = manager.launch(fx.GPT_OSS_120B, fx.pp2_plan(), fx.fits(), "vllm", 65536, 256)
     assert wait_for(lambda: manager.get(deployment.deployment_id).state is S.READY)
 
@@ -2839,6 +2837,63 @@ def test_a_port_that_names_nothing_is_probed_on_liveness_alone():
         "http://x/v1/models is serving a, not b -- something else is already "
         "on this port. Stop that server"
     )
+
+
+def _keyed_engine(their_key: str, serves: str, refusal: int = 401):
+    """A vLLM-shaped server started with *their_key*: `/v1/models` refuses
+    any other bearer with *refusal*, `/health` answers 200 to anybody."""
+    import http.server
+    import json as _json
+    import threading as _t
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path == "/health":
+                status, body = 200, b""
+            elif self.headers.get("Authorization") != "Bearer %s" % their_key:
+                status, body = refusal, b'{"error":"Unauthorized"}'
+            else:
+                status, body = 200, _json.dumps({"data": [{"id": serves}]}).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    _t.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("refusal", [401, 403])
+def test_a_port_that_refuses_this_deployments_key_is_somebody_elses(refusal):
+    """2026-11-21, on the 3090: a launch's engine could not bind 8103, a
+    stranger's vLLM held it with its own --api-key, `/v1/models` answered 401
+    to this deployment's key and the probe read that as "nothing learned",
+    fell through to `/health` -- which ignores keys -- and went READY in 30s
+    pointing at the stranger. Every engine derate launches is started with
+    the key it is probed with, so a refusal is a mismatch."""
+    server = _keyed_engine("theirs", "Qwen3.8-27B-Q2K-3090", refusal)
+    try:
+        url = "http://127.0.0.1:%d/v1" % server.server_port
+        healthy, reason = health.probe(url, timeout=2.0, expect_model="Qwen3-0.6B", api_key="ours")
+        assert healthy is False
+        assert health.wrong_model(reason), reason
+        assert "HTTP %d" % refusal in reason and "Qwen3-0.6B" in reason
+        # Without a key there is nothing to be refused: a pre-key deployment
+        # (or reap's keyless probe) is still judged on liveness, as before.
+        healthy, reason = health.probe(url, timeout=2.0, expect_model="Qwen3-0.6B")
+        assert (healthy, reason) == (True, None)
+        # And the deployment's own engine, holding the key it is probed with,
+        # answers its model list and stays healthy.
+        healthy, reason = health.probe(
+            url, timeout=2.0, expect_model="Qwen3.8-27B-Q2K-3090", api_key="theirs"
+        )
+        assert (healthy, reason) == (True, None)
+    finally:
+        server.shutdown()
 
 
 def test_default_served_name_is_the_tail_of_the_model_id():
@@ -4455,14 +4510,31 @@ def test_image_starts_on_host_networking_and_answers_agent_health():
 
         from control_plane.deploy.health import probe as real_probe
 
-        # /agent/health exists in both roles and lives on the agent port.
+        # /agent/health exists in both roles and lives on the agent port. The
+        # agent answers nothing at the engine-style /health the probe tries by
+        # default, so name its own path.
         agent_url = "http://127.0.0.1:%d" % agent_port
-        assert wait_for(lambda: real_probe(agent_url, timeout=2.0)[0], timeout=60.0), logs()
+
+        def agent_up() -> bool:
+            return real_probe(agent_url, timeout=2.0, health_path="/agent/health")[0]
+
+        assert wait_for(agent_up, timeout=60.0), logs()
         with urllib.request.urlopen("%s/agent/health" % agent_url, timeout=5) as response:
             assert json.load(response)["status"] == "ok"
 
         # The UI is served from the same origin as the API. No second service.
-        with urllib.request.urlopen("http://127.0.0.1:%d/" % ui_port, timeout=5) as response:
+        # Its listener comes up after the agent's, so wait for it as well.
+        ui_url = "http://127.0.0.1:%d/" % ui_port
+
+        def ui_up() -> bool:
+            try:
+                with urllib.request.urlopen(ui_url, timeout=2) as reply:
+                    return reply.status == 200
+            except OSError:
+                return False
+
+        assert wait_for(ui_up, timeout=60.0), logs()
+        with urllib.request.urlopen(ui_url, timeout=5) as response:
             assert response.status == 200
 
         # Preflight confirmed host networking rather than skipping the check.
@@ -4477,9 +4549,24 @@ def test_image_starts_on_host_networking_and_answers_agent_health():
         assert "deployments" in listing and "recipes" in listing
         assert "/data/sparkrun-cache" in listing
 
+        # The label and the runtime env are one build arg, so they cannot
+        # disagree. Empty on a local build, the stamped id on CI's -- the
+        # workflow asserts it is non-empty; this asserts they are the same
+        # fact, which is what version.py reports on the node.
+        label = subprocess.run(
+            ["docker", "inspect", "--format",
+             '{{index .Config.Labels "org.opencontainers.image.revision"}}', name],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        stamped = subprocess.run(
+            ["docker", "exec", name, "printenv", "DERATE_BUILD"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        assert label == stamped, (label, stamped)
+
         # A restarted container re-resolves its role.
         subprocess.run(["docker", "restart", name], capture_output=True, timeout=90)
-        assert wait_for(lambda: real_probe(agent_url, timeout=2.0)[0], timeout=60.0), logs()
+        assert wait_for(agent_up, timeout=60.0), logs()
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
 
@@ -5825,6 +5912,187 @@ def test_containers_are_unprivileged(tmp_path):
     assert "executor_config:\n  privileged: false\n  cap_add: [IPC_LOCK]\n" in content
 
 
+def test_a_one_node_launch_does_not_require_an_infiniband_device(tmp_path):
+    """sparkrun adds `--device /dev/infiniband` to every rootless launch, and
+    `docker run` refuses a missing device before the container exists. The
+    3090 has none, so every launch there was created and destroyed unstarted.
+    One node runs no cross-node collective; a multi-node plan keeps the fabric."""
+    import dataclasses
+
+    one = _recipe(tmp_path).content
+    assert "  devices: []\n" in one
+    assert one.count("executor_config:") == 1
+    two = recipes.synthesize(
+        fx.GPT_OSS_120B,
+        dataclasses.replace(
+            fx.single_node_plan(), node_ids=["spark-01", "spark-02"], pipeline_parallel=2
+        ),
+        "vllm", 4096, 8, "m",
+        port=8100, gpu_memory_utilization=0.5, recipe_dir=tmp_path / "recipes2",
+    ).content
+    assert "devices:" not in two
+
+
+def _two_node_recipe(tmp_path, a_ib, b_ib) -> str:
+    """A pp=2 recipe rendered by the adapter over a registry whose two
+    machines report *a_ib* and *b_ib* -- the path a real launch takes."""
+    import dataclasses
+
+    registry = FakeRegistry(
+        dataclasses.replace(fx.SPARK_01, infiniband=a_ib),
+        dataclasses.replace(fx.SPARK_02, infiniband=b_ib),
+    )
+    adapter = FakeAdapter(registry, recipe_dir=tmp_path / "recipes")
+    plan = dataclasses.replace(
+        fx.single_node_plan(), node_ids=["spark-01", "spark-02"], pipeline_parallel=2
+    )
+    return adapter.recipe_for(plan, fx.GPT_OSS_120B, "vllm", 4096, 8).content
+
+
+def test_a_multi_node_launch_drops_the_infiniband_device_when_any_machine_lacks_it(tmp_path):
+    """The recipe names the device for every host or for none. Two amd64
+    boxes without InfiniBand -- or one beside a Spark -- were a `docker run`
+    that refused the missing device before any container existed."""
+    assert "  devices: []\n" in _two_node_recipe(tmp_path, True, False)
+    assert "  devices: []\n" in _two_node_recipe(tmp_path, False, False)
+
+
+def test_a_multi_node_launch_keeps_the_device_when_no_machine_says_it_lacks_one(tmp_path):
+    """None is an agent older than the field: it keeps today's behaviour,
+    because NCCL over RoCE needs the device and silently drops to TCP without it."""
+    assert "devices:" not in _two_node_recipe(tmp_path, True, True)
+    assert "devices:" not in _two_node_recipe(tmp_path, True, None)
+    assert "devices:" not in _two_node_recipe(tmp_path, None, None)
+
+
+def test_the_plan_says_the_link_is_tcp_exactly_when_the_recipe_drops_the_device():
+    import dataclasses
+
+    spark = dataclasses.replace(fx.SPARK_01, infiniband=True)
+    rtx = dataclasses.replace(fx.WS_3090, infiniband=False)
+    note = recipes.tcp_fabric_note([spark, rtx])
+    assert note is not None and fx.WS_3090.node_id in note and "TCP" in note
+    assert recipes.tcp_fabric_note([spark, dataclasses.replace(fx.SPARK_02, infiniband=None)]) is None
+    # One machine has no collective to run over anything.
+    assert recipes.tcp_fabric_note([rtx]) is None
+
+
+def test_a_node_whose_firewall_drops_the_model_port_is_refused_before_anything_starts(tmp_path):
+    """ufw on the 3090 dropped 8100 from the coordinator: the engine came up
+    healthy there and derate waited the full launch timeout. A timeout on
+    the preflight SYN refuses up front, with the rule that fixes it."""
+    from control_plane.deploy.manager import PORT_CLOSED, PORT_DROPPED, PortUnreachable
+
+    dialed = []
+
+    def dropped(host, port):
+        dialed.append((host, port))
+        return (PORT_DROPPED, "192.168.0.10") if host == fx.SPARK_02.address else (PORT_CLOSED, "")
+
+    manager = make_manager(tmp_path, port_reach_fn=dropped)
+    plan = fx.pp2_plan()
+    with pytest.raises(PortUnreachable) as excinfo:
+        manager.launch(fx.GPT_OSS_120B, plan, fx.fits(), "vllm", 65536, 256)
+    message = str(excinfo.value)
+    assert "spark-02" in message and "8100" in message
+    assert "sudo ufw allow from 192.168.0.10 to any port 8100:8199 proto tcp" in message
+    assert isinstance(excinfo.value, ValueError)  # the gateway's 400 path
+    assert manager.list() == []
+    assert manager.adapter.launches == []
+    assert {h for h, _ in dialed} == {fx.SPARK_01.address, fx.SPARK_02.address}
+    manager.close()
+
+
+def test_a_refused_connection_proves_the_path_and_the_launch_goes_on(tmp_path):
+    """A free port answers RST, which proves the packet arrived. Anything but
+    a timeout or a listener (None) is not this check's to judge."""
+    from control_plane.deploy.manager import PORT_CLOSED
+
+    for i, answer in enumerate(((PORT_CLOSED, ""), (None, ""))):
+        manager = make_manager(tmp_path / str(i), port_reach_fn=lambda host, port, a=answer: a)
+        d = manager.launch(fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8)
+        assert wait_for(lambda: manager.adapter.launches)
+        assert manager._records[d.deployment_id].handle["port"] == manager.adapter.base_port
+        manager.close()
+
+
+def test_a_port_a_plan_node_already_serves_on_is_skipped(tmp_path):
+    """2026-11-21: `_allocate_port` handed out 8103 while a stranger's vLLM
+    held 8103 on the 3090. The preflight connected, and a connection
+    ACCEPTED was read as "reachable" like a refusal, so the launch went onto
+    a held port. A listener now means the port is taken on that machine: it
+    is released, the next one is checked, and the record holds that one."""
+    from control_plane.deploy.manager import PORT_CLOSED, PORT_LISTENING
+
+    dialed = []
+
+    def stranger_on_the_base(host, port):
+        dialed.append(port)
+        return (PORT_LISTENING if port == 8100 else PORT_CLOSED), ""
+
+    manager = make_manager(tmp_path, port_reach_fn=stranger_on_the_base)
+    assert manager.adapter.base_port == 8100
+    d = manager.launch(fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8)
+    assert manager._records[d.deployment_id].handle["port"] == 8101
+    assert dialed == [8100, 8101]
+    assert manager._reserved_ports == set()
+    assert wait_for(lambda: manager.adapter.launches)
+    manager.close()
+
+
+def test_a_plan_node_holding_every_port_refuses_the_launch(tmp_path):
+    """Bounded: every candidate held refuses, naming the node, rather than
+    launching onto a port somebody else's server already answers on."""
+    from control_plane.deploy.manager import PORT_LISTENING, PortsTaken
+
+    manager = make_manager(tmp_path, port_reach_fn=lambda host, port: (PORT_LISTENING, ""))
+    with pytest.raises(PortsTaken) as excinfo:
+        manager.launch(fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8)
+    message = str(excinfo.value)
+    assert isinstance(excinfo.value, ValueError)  # the gateway's 400 path
+    assert fx.SPARK_01.node_id in message and fx.SPARK_01.address in message
+    assert "8100" in message and str(8100 + manager._PORT_SEARCH - 1) in message
+    assert manager.list() == [] and manager.adapter.launches == []
+    assert manager._reserved_ports == set()
+    manager.close()
+
+
+def test_a_dropped_port_past_a_held_one_still_refuses(tmp_path):
+    """Skipping a held port does not skip the firewall check on the next."""
+    from control_plane.deploy.manager import PORT_DROPPED, PORT_LISTENING, PortUnreachable
+
+    def reach(host, port):
+        return (PORT_LISTENING, "") if port == 8100 else (PORT_DROPPED, "192.168.0.10")
+
+    manager = make_manager(tmp_path, port_reach_fn=reach)
+    with pytest.raises(PortUnreachable) as excinfo:
+        manager.launch(fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8)
+    assert excinfo.value.port == 8101
+    assert manager.list() == [] and manager._reserved_ports == set()
+    manager.close()
+
+
+def test_the_real_preflight_tells_a_listener_from_a_closed_port(_no_port_preflight):
+    """`port_reachable` itself, against loopback: accepted is LISTENING,
+    refused is CLOSED. The two used to be one `True`. The suite stubs the
+    module attribute, so the real function comes from the fixture."""
+    import socket as _socket
+
+    from control_plane.deploy.manager import PORT_CLOSED, PORT_LISTENING
+
+    port_reachable = _no_port_preflight
+
+    with _socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        held = server.getsockname()[1]
+        assert port_reachable("127.0.0.1", held)[0] == PORT_LISTENING
+    with _socket.socket() as probe_sock:
+        probe_sock.bind(("127.0.0.1", 0))
+        free = probe_sock.getsockname()[1]
+    assert port_reachable("127.0.0.1", free)[0] == PORT_CLOSED
+
+
 def test_the_compile_cache_is_one_per_model():
     from control_plane.deploy.flags import cache_env_for, runtime_spec
 
@@ -6027,3 +6295,66 @@ def test_remote_code_launch_withholds_the_hub_token_for_an_ungated_repo():
     gated = SparkrunAdapter(env=dict(environ), gated_probe=lambda model_id: True)
     assert gated._launch_env("org/remote", trust_remote_code=True)["HF_TOKEN"] == "hf"
     assert adapter._launch_env("org/remote", trust_remote_code=False)["HF_TOKEN"] == "hf"
+
+
+def test_a_launch_runs_on_exactly_the_port_its_preflight_checked(tmp_path):
+    """The firewall preflight used to check a candidate, drop the lock, and
+    let the record allocate again: a second launch in that gap preflighted
+    the same 8100 and took it, and the first launched on an 8101 nobody had
+    checked. The checked port is reserved until the record holds it."""
+    import threading
+
+    from control_plane.deploy.manager import PORT_CLOSED
+
+    first_dialing = threading.Event()
+    release = threading.Event()
+    checked = {}
+
+    def reach(host, port):
+        name = threading.current_thread().name
+        checked.setdefault(name, set()).add(port)
+        if name == "first":
+            first_dialing.set()
+            release.wait(5)
+        return PORT_CLOSED, ""
+
+    manager = make_manager(tmp_path, port_reach_fn=reach)
+    out = {}
+
+    def first():
+        out["first"] = manager.launch(
+            fx.GPT_OSS_120B, fx.single_node_plan(), fx.fits(), "vllm", 4096, 8
+        )
+
+    t = threading.Thread(target=first, name="first")
+    t.start()
+    assert first_dialing.wait(5)
+    second = manager.launch(
+        fx.AUDIO8_TTS_0_6B, fx.single_node_plan(), fx.fits(), "tts", 4096, 8
+    )
+    release.set()
+    t.join(5)
+    ports = {
+        "first": manager._records[out["first"].deployment_id].handle["port"],
+        "MainThread": manager._records[second.deployment_id].handle["port"],
+    }
+    assert ports["first"] != ports["MainThread"]
+    for who, port in ports.items():
+        assert checked[who] == {port}, (who, checked, ports)
+    manager.close()
+
+
+def test_the_firewall_rule_covers_a_port_checked_past_the_usual_span(tmp_path):
+    """`_allocate_port` searches up to base+199; a rule that opened only
+    base..base+99 for a launch checked on base+150 fixed nothing."""
+    from control_plane.deploy.manager import PORT_DROPPED, PortUnreachable
+
+    def dropped(host, port):
+        return (PORT_DROPPED, "192.168.0.10")
+
+    manager = make_manager(tmp_path, port_reach_fn=dropped)
+    base = manager.adapter.base_port
+    with pytest.raises(PortUnreachable) as excinfo:
+        manager._preflight_port(fx.single_node_plan(), base + 150)
+    assert "port %d:%d proto tcp" % (base, base + 150) in str(excinfo.value)
+    manager.close()

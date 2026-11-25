@@ -268,6 +268,8 @@ def encode(d: Deployment) -> dict[str, Any]:
         "engine_options": asdict(d.engine_options),
         "lifecycle": asdict(d.lifecycle),
         "original_window": d.original_window,
+        "gguf_base": d.gguf_base,
+        "gguf_projector": d.gguf_projector,
     }
 
 
@@ -342,6 +344,10 @@ def decode(raw: dict[str, Any]) -> Deployment:
         original_window=(
             int(raw["original_window"]) if raw.get("original_window") else None
         ),
+        # Absent from every record written before these existed, which was
+        # not a vllm GGUF launch -- there was no such thing.
+        gguf_base=raw.get("gguf_base") or None,
+        gguf_projector=raw.get("gguf_projector") or None,
     )
 
 

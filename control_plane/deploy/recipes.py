@@ -23,7 +23,7 @@ import unicodedata
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from control_plane.contracts import (
     EngineOptions,
@@ -42,8 +42,10 @@ from .flags import (
     llamacpp_model_spec,
     render_cudagraph_capture_sizes,
     render_kv_cache_dtype,
+    render_gguf_loader_config,
     render_quantization,
     render_speculative_config,
+    vllm_gguf_refusal,
     image_executor_config,
     image_for_arch,
     runtime_spec,
@@ -301,6 +303,8 @@ def _serve_command(
     revision: str | None = None,
     api_key: bool = False,
     trust_remote_code: bool = False,
+    gguf_base: bool = False,
+    gguf_projector: bool = False,
     speculative_tokens: int = 0,
     engine_options_fragment: str = "",
 ) -> str:
@@ -372,6 +376,7 @@ def _serve_command(
     return _append_pins(
         spec, command, revision=revision, api_key=api_key,
         trust_remote_code=trust_remote_code,
+        gguf_base=gguf_base, gguf_projector=gguf_projector,
     )
 
 
@@ -382,10 +387,20 @@ def _append_pins(
     revision: str | None,
     api_key: bool,
     trust_remote_code: bool = False,
+    gguf_base: bool = False,
+    gguf_projector: bool = False,
 ) -> str:
     """The revision pin, the opt-in remote-code flag and the API-key flag,
     last so they win over any repeat of the same flag in operator text
-    (argparse keeps the last)."""
+    (argparse keeps the last).
+
+    The GGUF config source and projector ride here too, ahead of the rest,
+    because a GGUF cannot load without them -- so a custom command keeps them
+    exactly as it keeps the served name."""
+    if gguf_base and spec.gguf_config_arg:
+        command += " \\\n    %s" % spec.gguf_config_arg
+    if gguf_projector and spec.gguf_projector_arg:
+        command += " \\\n    %s" % spec.gguf_projector_arg
     if trust_remote_code and spec.trust_remote_code_arg:
         command += " \\\n    %s" % spec.trust_remote_code_arg
     if revision and spec.revision_arg:
@@ -402,6 +417,8 @@ def _custom_serve_command(
     revision: str | None = None,
     api_key: bool = False,
     trust_remote_code: bool = False,
+    gguf_base: bool = False,
+    gguf_projector: bool = False,
 ) -> str:
     """The command when the operator supplies the whole runtime invocation
     in place of the plan-derived flags ``_serve_command`` builds.
@@ -437,7 +454,32 @@ def _custom_serve_command(
     return _append_pins(
         spec, command, revision=revision, api_key=api_key,
         trust_remote_code=trust_remote_code,
+        gguf_base=gguf_base, gguf_projector=gguf_projector,
     )
+
+
+def fabric_on_every_node(profiles: Sequence[Any]) -> bool:
+    """Whether every one of *profiles* may be handed `/dev/infiniband`.
+
+    Only an explicit False counts against it: None is an agent older than
+    the field, and keeps the device the way every launch did before."""
+    return all(getattr(p, "infiniband", None) is not False for p in profiles)
+
+
+def tcp_fabric_note(profiles: Sequence[Any]) -> str | None:
+    """The plan's sentence for a multi-node plan whose recipe clears the
+    device, or None when it keeps it. Same predicate as `synthesize`, so the
+    screen and the launch cannot disagree about which link NCCL runs on."""
+    if len(profiles) <= 1 or fabric_on_every_node(profiles):
+        return None
+    missing = sorted(p.node_id for p in profiles if getattr(p, "infiniband", None) is False)
+    return (
+        f"{', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no "
+        "InfiniBand device, so this launch runs without one on every machine "
+        "and NCCL talks over TCP sockets on the ordinary network, which is "
+        "slower than RoCE."
+    )
+
 
 
 def synthesize(
@@ -467,8 +509,15 @@ def synthesize(
     trust_remote_code: bool = False,
     engine_options: EngineOptions = EngineOptions(),
     original_window: int | None = None,
+    gguf_base: str | None = None,
+    gguf_projector: str | None = None,
+    infiniband: bool = True,
 ) -> RecipeSpec:
-    """Build the recipe for one deployment. Pure: touches no filesystem."""
+    """Build the recipe for one deployment. Pure: touches no filesystem.
+
+    *infiniband* is whether every machine in the plan may be handed
+    `/dev/infiniband` -- `fabric_on_every_node` over their profiles. The
+    caller passes it because this function does not see the registry."""
     # M-22: shape.model_id and served_name both flow from an API request
     # (served_name may also just be default_served_name(shape), i.e. still
     # derived from model_id) and both land verbatim in the YAML body below,
@@ -477,14 +526,25 @@ def synthesize(
     # through defaults below. check_recipe_identifiers runs both the YAML
     # check and the stricter command-grammar check on each.
     # The id that reaches the recipe is not always the id derate resolved.
-    # `llamacpp_model_spec` rewrites an `hf://owner/repo/file.gguf` reference
-    # into the `owner/repo:QUANT` spelling sparkrun's llama-cpp plugin parses,
-    # and returns everything else untouched -- so for the other three runtimes
-    # this line is the identity.
+    # `llamacpp_model_spec` rewrites a hub GGUF blob -- `hf://owner/repo/
+    # file.gguf` or the scheme-less form the resolver hands back -- into the
+    # `owner/repo:QUANT` spelling sparkrun parses, and returns everything
+    # else untouched. That spelling is sparkrun's GGUF form for EVERY runtime,
+    # not only llama-cpp: on vllm too it downloads only the `*QUANT*` files
+    # and substitutes `{model}` with the container path of the first match.
     #
     # Translated BEFORE the safety check, never after: the check exists to
     # protect the command sparkrun builds, so it has to run on the string that
     # actually gets there.
+    refusal = vllm_gguf_refusal(
+        runtime,
+        shape.model_id,
+        gguf_base=gguf_base,
+        gguf_projector=gguf_projector,
+        speculative=speculative is not None or speculative_tokens > 0,
+    )
+    if refusal is not None:
+        raise ValueError(refusal)
     launch_model_id = llamacpp_model_spec(shape.model_id)
     check_recipe_identifiers(launch_model_id, served_name)
     # extra_args and custom_command are the third M-22 surface: caller-supplied
@@ -605,6 +665,19 @@ def synthesize(
         defaults.append(("revision", json.dumps(revision)))
     if runtime_api_key and spec.api_key_arg:
         defaults.append(("api_key", json.dumps(runtime_api_key)))
+    if gguf_base:
+        # A repository id from the hub's own base_model tag -- but it reaches
+        # both the YAML and `bash -c`, so it is held to both grammars, like
+        # shape.model_id.
+        _check_yaml_safe(gguf_base, "gguf_base")
+        _check_command_safe(gguf_base, "gguf_base")
+        defaults.append(("gguf_base", gguf_base))
+    if gguf_projector:
+        # JSON-quoted for speculative_config's reason: the value starts with
+        # `{`, which plain-scalar YAML would parse into a mapping.
+        defaults.append(
+            ("gguf_loader_config", json.dumps(render_gguf_loader_config(gguf_projector)))
+        )
     engine_fragment = ""
     if not custom_command:
         refusal = engine_options_refusal(
@@ -672,6 +745,9 @@ def synthesize(
     if runtime_api_key and spec.api_key_env:
         # Checked above; JSON-quoted so the value is a YAML string whatever it holds.
         env_pairs.append((spec.api_key_env, json.dumps(runtime_api_key)))
+    if gguf_base:
+        # Quoted so YAML keeps the string "0" rather than an integer.
+        env_pairs += [(k, json.dumps(v)) for k, v in spec.gguf_env]
     if env_pairs:
         lines += ["\n", "env:\n"]
         lines += ["  %s: %s\n" % (k, v) for k, v in env_pairs]
@@ -707,12 +783,31 @@ def synthesize(
     executor = image_executor_config(spec, img)
     if executor:
         lines += ["  %s: %s\n" % (k, json.dumps(v)) for k, v in executor]
+    # sparkrun's rootless branch adds `--device /dev/infiniband` to EVERY
+    # launch ("TODO: confirm existence" in its launcher.py), and `docker run`
+    # refuses a device that is not there -- "error gathering device
+    # information" -- before the container exists. A Spark has the device; the
+    # 3090 does not, so every launch there was created and destroyed without
+    # starting, and sparkrun reported it as "Container died unexpectedly".
+    # One machine runs no cross-node collective, so it never needs the fabric:
+    # cleared here (the recipe outranks sparkrun's adjustments) for any plan on
+    # one node. A multi-node plan keeps it only when every machine in it may
+    # have the device (`infiniband`, from `fabric_on_every_node`) -- NCCL over
+    # RoCE needs it. The recipe is one `executor_config` for every host, so a
+    # single machine without the device clears it everywhere, and NCCL then
+    # runs TCP sockets on every rank, which is consistent rather than a mix;
+    # the plan says so on screen (`tcp_fabric_note`). Unknown (an agent older
+    # than the field) keeps the device, which is what every launch did before.
+    if len(plan.node_ids) <= 1 or not infiniband:
+        lines.append("  devices: []\n")
 
     lines += ["\n", "command: |\n"]
     pins = {
         "revision": revision,
         "api_key": bool(runtime_api_key),
         "trust_remote_code": trust_remote_code,
+        "gguf_base": bool(gguf_base),
+        "gguf_projector": bool(gguf_projector),
     }
     body = (
         _custom_serve_command(spec, custom_command, **pins)

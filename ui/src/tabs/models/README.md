@@ -14,7 +14,7 @@
 | `useModelSession.ts` | 815 | the ONE owner of everything the plan request and the launch request share |
 | `ModelPane.tsx` | 300 | one model: header, Serve / Advanced / History / Hugging Face, sticky footer |
 | `VerdictBox.tsx` | 328 | the verdict word, where, per-node GiB, the primary button, both budgets |
-| `NodeBars.tsx` | 254 | "Where it runs": one row per machine (tick, name, free/left/short), the split select, Why X? |
+| `NodeBars.tsx` | 282 | "Where it runs": one row per machine (tick, name, free/left/short), the split select, Why X? |
 | `QuantSection.tsx` | 244 | Recommended picks, precision tiers, format filter; selecting re-plans |
 | `LivePanel.tsx` | 143 | a running deployment's engine metrics and log tail |
 | `AdvancedTab.tsx` | 527 | engine, speed, memory, context, parallelism, API name, custom flags |
@@ -24,7 +24,7 @@
 | `verdictView.ts` | 89 | the words a verdict is drawn with: `bandWord`, `planWord`, `formatParams`, `gib` |
 | `quantPicks.ts` | 180 | tiers, formats and picks over server-judged ladder rows |
 | `ladder.ts` | 81 | the ladder's two pure derivations, out where a verifier can reach them |
-| `board.ts` | 331 | the machine board's arithmetic, with no DOM in it |
+| `board.ts` | 357 | the machine board's arithmetic, with no DOM in it |
 | `owner.ts` | 230 | publisher accent, initials, and the avatar lookup through the coordinator |
 | `OwnerMark.tsx` | 70 | the publisher mark, drawn from `owner.ts` |
 | `dominant.ts` | 103 | the accent taken from the avatar's own pixels |
@@ -40,10 +40,11 @@
 | `ParamBreakdownTable.tsx` | 82 | where the parameters are, and why two totals differ |
 | `QuantTableCard.tsx` | 86 | the quantization table exactly as the gateway reports it |
 | `DegreeFields.tsx` | 114 | TP, PP and EP, owned as a set; `null` means the planner picks |
+| `SizingSliders.tsx` | 178 | Serve's context-per-user and users-at-once sliders, and the KV cache they cost |
 | `speculative.ts` | 180 | the speculative field's pure decisions |
 | `SpeculativeField.tsx` | 697 | which speculative method to serve with; `null` means one token per step |
 | `CustomServes.tsx` | 59 | replaying a hand-written launch command |
-| `rows.check.mjs` | 947 | the browser-side fold against the live coordinator's real payloads |
+| `rows.check.mjs` | 987 | the browser-side fold against the live coordinator's real payloads |
 | `registry.check.mjs` | 215 | `GET /api/models`, the fold that moved to the server, and the boundary |
 | `serve.check.mjs` | 123 | launch permissions from `gates.ts`, including branches a live cluster cannot reach |
 | `query.check.mjs` | 55 | link parsing, typed filters, suggestion sections |
@@ -347,6 +348,24 @@ dashed wall marker per series and the newest matching benchmark as points. The
 line is a bandwidth CEILING per user; at one user it equals the card's tok/s.
 The server's `caveat` renders through Verbatim. Hidden for a provider runtime or
 when no series has room for a user.
+
+## `SizingSliders.tsx`
+
+Context per user and Users at once, as two sliders above the chart; they
+replaced its context chips. A drag is held locally and written to
+`?ctx=`/`?seq=` once, on pointer or key release (or blur): Chrome stops
+applying `replaceState` past ~200 writes in 10 s, and then the address bar
+and the screen disagree. Stops are `contextStops(native_window)` and
+`USER_STOPS` (`usersChart.ts`), with the COMMITTED value inserted by
+`withValue` so a planner pick between stops is a stop of its own and the track
+never changes length mid-drag. Each slider has Auto, which clears its key. The
+line under them is the gate's own `breakdown.kv_cache`, never extrapolated,
+and "Re-planning…" while the URL differs from `plannedContext`/
+`plannedConcurrency` (what the session plans with) or a plan is in flight.
+Headroom is stated only from `fit_live` (the static ceiling is not room to
+spare). A slider is disabled, its figure "—", until a plan has said its
+value (and, for context, the model's window). The sliders outlive a failed plan (the window is remembered) and
+are hidden while the model runs, when the card describes the deployment.
 
 ## `launchRequest.ts`, `profiles.ts`, `folders.ts`
 
@@ -801,9 +820,10 @@ toggled, and the split — the list pane (`UnchosenBanner`, `CustomServesCard`,
 then `HubCards` or `ModelRows` plus `WorthTrying`) beside `ModelPane`. Its data
 comes from `useModelList`, which polls once through `state/resources.ts`
 (`useModelRegistry`, `useCapacity`, `useStorage`, `useProviders`,
-`useProviderKinds`, `useProviderCatalogues`) and hands the payloads down, because
-`useResource` does not deduplicate — every call is its own interval and its own
-request.
+`useProviderKinds`, `useProviderCatalogues`) and hands the payloads down, so
+every consumer renders the same answer. The fixed hooks are shared by name and
+would not double their requests; `useCapacity` and `useProviderCatalogues` are
+keyed and would.
 
 ```ts
 const rows = decorate(

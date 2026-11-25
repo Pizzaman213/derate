@@ -234,17 +234,21 @@ def estimate_prompt_tokens(
 
 
 def _is_token_list(item: object) -> bool:
+    """A non-empty list of scalars: one pre-tokenised prompt. Not only ints --
+    the engines' validators coerce ``1.0``, ``True`` and the like to token ids,
+    so an int-only test counted such a prompt as zero tokens and zero prompts."""
     return (
         isinstance(item, list)
         and bool(item)
-        and all(isinstance(t, int) and not isinstance(t, bool) for t in item)
+        and not any(isinstance(t, (str, list, dict)) for t in item)
     )
 
 
 def _count_list(items: list, chars: int) -> tuple[int, int]:
     """``(chars, tokens)`` of a ``prompt``/``input`` list: strings are
     characters, a list of token ids is already tokens, and a list of such lists
-    (a pre-tokenised batch) is the sum of their lengths. Counting ids as zero
+    (a pre-tokenised batch) is the sum of their lengths -- any inner list,
+    whatever its elements, since the engine coerces them. Counting ids as zero
     let any prompt past ``max_prompt_tokens_per_request``."""
     if _is_token_list(items):
         return chars, len(items)
@@ -252,8 +256,15 @@ def _count_list(items: list, chars: int) -> tuple[int, int]:
     for item in items:
         if isinstance(item, str):
             chars += len(item)
-        elif _is_token_list(item):
+        elif isinstance(item, list):
+            # One token per element at least (vLLM coerces `"1"` to an id); a
+            # string inside also counts its characters, since llama-server
+            # tokenizes a mixed prompt's text.
             tokens += len(item)
+            chars += sum(len(t) for t in item if isinstance(t, str))
+        elif isinstance(item, dict):
+            # llama-server's `{"prompt_string": ...}` and multimodal prompts.
+            chars += len(json.dumps(item, default=str))
     return chars, tokens
 
 
@@ -307,6 +318,13 @@ def requested_output(body: dict) -> tuple[str, float] | None:
 #: Most completions one request may ask for (``n``/``best_of``). Beyond this
 #: the estimate is not a budget but an overflow (K-4).
 MAX_COMPLETIONS = 128
+#: Most prompts one ``/v1/completions`` batch may carry. Every prompt is its
+#: own generation, so ``n`` times the batch is held to :data:`MAX_COMPLETIONS`
+#: too; this caps the raw list before anything is counted.
+MAX_BATCH_PROMPTS = 128
+#: Most entries one ``/v1/embeddings`` ``input`` list may carry, OpenAI's own
+#: per-request cap. No generation, but each is still a sequence the engine runs.
+MAX_EMBEDDING_INPUTS = 2048
 
 
 def completions_requested(body: dict) -> int:
@@ -318,7 +336,13 @@ def completions_requested(body: dict) -> int:
 
     ``ValueError`` above :data:`MAX_COMPLETIONS` or for a value that is not an
     integer: the engines coerce ``"128"`` and ``128.0`` to 128, so skipping
-    them counted one copy where the engine generated 128."""
+    them counted one copy where the engine generated 128. Also above
+    :data:`MAX_BATCH_PROMPTS` prompts, ``n`` x prompts above
+    :data:`MAX_COMPLETIONS`, or :data:`MAX_EMBEDDING_INPUTS` entries in an
+    ``input`` list (embeddings: checked here because both admission and the
+    limits already call this on every body): admission charges at most a
+    node's concurrency, so an uncapped batch passed it and queued a million
+    prompts behind one request."""
     copies = 1
     for name in ("n", "best_of"):
         value = body.get(name)
@@ -333,32 +357,36 @@ def completions_requested(body: dict) -> int:
         copies = max(copies, value)
     prompt = body.get("prompt")
     if isinstance(prompt, list) and not _is_token_list(prompt):
-        batch = sum(1 for p in prompt if isinstance(p, str) or _is_token_list(p))
-        copies *= max(1, batch)
+        if len(prompt) > MAX_BATCH_PROMPTS:
+            raise ValueError(f"prompt may carry at most {MAX_BATCH_PROMPTS} entries per request; split the batch")
+        # Every entry is a prompt to the engine, whatever it validated it as.
+        copies *= max(1, len(prompt))
+        if copies > MAX_COMPLETIONS:
+            raise ValueError(f"n x prompts may be at most {MAX_COMPLETIONS} generations per request; split the batch")
+    inputs = body.get("input")
+    if isinstance(inputs, list) and not _is_token_list(inputs) and len(inputs) > MAX_EMBEDDING_INPUTS:
+        raise ValueError(f"input may carry at most {MAX_EMBEDDING_INPUTS} entries per request; split the batch")
     return copies
 
 
-def largest_batch_prompt(body: dict) -> str | list[int] | None:
-    """The longest member of a ``/v1/completions`` batch (a list of strings
-    or of token lists), or None when ``prompt`` is not a batch. Each member is
-    its own sequence and the engine checks the context per prompt, so this,
-    not the batch's sum, is what one sequence holds. A string is weighed at
-    :data:`CHARS_PER_TOKEN` against a token list's length."""
+def largest_batch_prompt(body: dict) -> str | list | None:
+    """The longest member of a ``/v1/completions`` batch, or None when
+    ``prompt`` is not a batch. Each member is its own sequence and the engine
+    checks the context per prompt, so this, not the batch's sum, is what one
+    sequence holds. Members are weighed as :func:`_count_list` counts them; a
+    non-string member comes back wrapped (``[member]``), so re-estimating it as
+    ``prompt`` counts it as one prompt, never a batch of strings."""
     prompt = body.get("prompt")
     if not isinstance(prompt, list) or _is_token_list(prompt):
         return None
-    best: str | list[int] | None = None
+    best: object = None
     weight = -1.0
     for item in prompt:
-        if isinstance(item, str):
-            size = len(item) / CHARS_PER_TOKEN
-        elif _is_token_list(item):
-            size = float(len(item))
-        else:
-            continue
+        chars, tokens = _count_list([item], 0)
+        size = chars / CHARS_PER_TOKEN + tokens
         if size > weight:
             best, weight = item, size
-    return best
+    return best if best is None or isinstance(best, str) else [best]
 
 
 def _limit_value(value: object) -> float:

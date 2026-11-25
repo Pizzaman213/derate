@@ -31,8 +31,11 @@ because the edge terminated TLS. :func:`is_edge` decides from
 ``scope["server"]``, which uvicorn fills from the accepted listener.
 
 Every refusal is a security event (``secevents.py``); every gated request
-ends in one ``gateway.access`` line and, for an /api write no handler
-audited itself, one ``api_write`` audit row (:func:`on_request_done`).
+is counted on a ``gateway.access`` line and, for an /api write no handler
+audited itself, one ``api_write`` audit row (:func:`on_request_done`). A
+session's successful /api reads are folded per minute (``accessfold.py``):
+one line per (session, address, method, path, query, status) carrying
+``n=``, so the UI's own polling does not bury everything else.
 
 A store that cannot be opened makes every gated path answer 503
 ``auth_unavailable``: the gate fails closed, never open.
@@ -80,6 +83,7 @@ from control_plane.contracts.auth import (
 from control_plane.contracts.auth import AuditAction
 from control_plane.keys import format as key_format
 
+from . import accessfold
 from .auth import is_unauthorized
 from .csrf import is_cross_site_write, trusted_origins
 from .errors import error_response
@@ -335,6 +339,8 @@ def _note(conn: HTTPConnection, action, *, actor: str, detail: dict) -> None:
     try:
         ctx = conn.app.state.ctx
         state = conn.scope.get("state", {})
+        if "path" in detail:
+            detail = {**detail, "path": _scrubbed(conn.scope, str(detail["path"]), 256)}
         ctx.secevents.note(
             action,
             actor=actor,
@@ -441,7 +447,8 @@ def forwarded_client(peer: str | None, xff: str | None, trusted) -> str | None:
     A loopback hop from a peer that is not itself loopback is not believed
     either: no other machine can have been reached from this one's loopback,
     and naming it is exactly how a LAN client inside a trusted CIDR would
-    pass for the operator's own shell (GA-1)."""
+    pass for the operator's own shell (GA-1). An IPv4-mapped hop is judged,
+    and answered, as its IPv4 address, as ``_edge_client`` does."""
     if not peer or not trusted or not xff or not _in_networks(peer, trusted):
         return peer
     hops = [part.strip() for part in xff.split(",")]
@@ -451,6 +458,9 @@ def forwarded_client(peer: str | None, xff: str | None, trusted) -> str | None:
         except ValueError:
             return peer
     for hop in reversed(hops):
+        address = ipaddress.ip_address(hop)
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            hop = str(address.ipv4_mapped)
         if not _in_networks(hop, trusted):
             if is_loopback(hop) and not is_loopback(peer):
                 return peer
@@ -552,79 +562,92 @@ def _who(state: dict) -> str:
     return f"key:{KEY_PREFIX}{key_id}" if key_id else "-"
 
 
+def has_actor(scope) -> bool:
+    """Whether the gate attached a key principal or a session to *scope*."""
+    state = scope.get("state") or {}
+    return state.get("principal") is not None or state.get("session") is not None
+
+
 _PATTERN_REDACTOR = Redactor()
 
 
-def _query_of(scope) -> str:
-    """The first 200 characters of the query string, through the shared
-    provider Redactor (a key pasted into ``?api_key=`` must not reach the
-    log or the archive). Never raises."""
-    query = (scope.get("query_string") or b"").decode("latin-1")
-    if not query:
-        return ""
+def _redactor_of(scope) -> Redactor:
+    """The shared provider Redactor, or one that knows only the patterns."""
     try:
         redactor = getattr(scope["app"].state.ctx.deps.providers, "redactor", None)
     except Exception:
         redactor = None
     # Without the shared one, a fresh Redactor still applies the pattern
     # rules (derate- keys, sk-..., bearer ...); only remembered values are lost.
+    return redactor or _PATTERN_REDACTOR
+
+
+def _scrubbed(scope, text: str, limit: int) -> str:
+    """*text* through the shared Redactor and cut to *limit*: a key pasted into
+    a path or ``?api_key=`` must not reach the log or the archive. Never raises."""
     try:
-        query = (redactor or _PATTERN_REDACTOR).scrub(query)
+        text = _redactor_of(scope).scrub(text)
     except Exception:
-        log.error("could not scrub a query string", exc_info=True)
-        query = "<unscrubbed>"
-    return query[:200]
+        log.error("could not scrub a path or query string", exc_info=True)
+        text = "<unscrubbed>"
+    return text[:limit]
 
 
-def _emit_access(scope, state: dict, *, method: str, path: str, query: str,
-                 status: int | None, duration_ms: float) -> None:
-    """The durable twin of the ``gateway.access`` line: an ``access`` row on
-    the telemetry sink, which ``DERATE_TELEMETRY=0`` does not switch off.
-    Never raises."""
+def _query_of(scope) -> str:
+    """The first 200 characters of the query string, scrubbed."""
+    query = (scope.get("query_string") or b"").decode("latin-1")
+    return _scrubbed(scope, query, 200) if query else ""
+
+
+def write_access(hit: accessfold.AccessHit, count: int) -> None:
+    """Write the ``gateway.access`` line and its durable twin, an ``access``
+    row on the telemetry sink (which ``DERATE_TELEMETRY=0`` does not switch
+    off), for *count* identical requests. Never raises."""
     try:
-        ctx = scope["app"].state.ctx
+        # The path is printable()-escaped: Starlette decodes %0A into it, and a
+        # raw newline would let a URL write a whole forged line into node.log.
+        access_log.info(
+            "rid=%s ip=%s port=%d peer=%s who=%s %s %s q=%r %d %dms ua=%r n=%d",
+            hit.request_id,
+            hit.client_ip or "-",
+            hit.client_port or 0,
+            hit.peer_ip or "-",
+            hit.who,
+            hit.method,
+            printable(hit.path),
+            hit.query,
+            hit.status or 0,
+            int(hit.duration_ms),
+            hit.user_agent or "",
+            count,
+        )
+    except Exception:
+        log.error("could not log access for %s %s", hit.method, printable(hit.path), exc_info=True)
+    try:
+        ctx = hit.ctx
         sink = getattr(ctx, "sink", None)
         if sink is None or not hasattr(sink, "access"):
             return
         sink.access(
             AccessRecord(
-                request_id=state.get("request_id") or "-",
-                ts=time.time(),
-                client_ip=state.get("client_ip"),
-                client_port=state.get("client_port"),
-                peer_ip=state.get("peer_ip"),
-                who=_who(state),
-                method=method,
-                path=path,
-                query=query,
-                status=status,
-                duration_ms=round(duration_ms, 3),
-                user_agent=state.get("user_agent") or None,
-                node_id=getattr(ctx.settings, "coordinator_node_id", "") or "",
+                request_id=hit.request_id,
+                ts=hit.ts,
+                client_ip=hit.client_ip,
+                client_port=hit.client_port,
+                peer_ip=hit.peer_ip,
+                who=hit.who,
+                method=hit.method,
+                path=hit.path,
+                query=hit.query,
+                status=hit.status,
+                duration_ms=round(hit.duration_ms, 3),
+                user_agent=hit.user_agent or None,
+                node_id=getattr(getattr(ctx, "settings", None), "coordinator_node_id", "") or "",
+                count=count,
             )
         )
     except Exception:
-        log.error("could not record access for %s %s", method, path, exc_info=True)
-
-
-def _log_access(state: dict, *, method: str, path: str, query: str,
-                status: int | None, duration_ms: float) -> None:
-    # The path is printable()-escaped: Starlette decodes %0A into it, and a
-    # raw newline would let a URL write a whole forged line into node.log.
-    access_log.info(
-        "rid=%s ip=%s port=%d peer=%s who=%s %s %s q=%r %d %dms ua=%r",
-        state.get("request_id", "-"),
-        state.get("client_ip") or "-",
-        state.get("client_port") or 0,
-        state.get("peer_ip") or "-",
-        _who(state),
-        method,
-        printable(path),
-        query,
-        status or 0,
-        int(duration_ms),
-        state.get("user_agent", ""),
-    )
+        log.error("could not record access for %s %s", hit.method, printable(hit.path), exc_info=True)
 
 
 #: An access line or row keeps this much of a path. A URL can be ~16 KB through
@@ -672,11 +695,34 @@ async def on_request_done(scope, status: int | None, duration_ms: float) -> None
     # of its own: the folded security-event row counts it, and one access
     # entry per flooded request is what would rotate real history out.
     if not state.get("quiet"):
-        logged = path[:_LOGGED_PATH_MAX]
-        _log_access(state, method=method, path=logged, query=query, status=status,
-                    duration_ms=duration_ms)
-        _emit_access(scope, state, method=method, path=logged, query=query, status=status,
-                     duration_ms=duration_ms)
+        logged = _scrubbed(scope, path, _LOGGED_PATH_MAX)
+        try:
+            ctx = scope["app"].state.ctx
+        except Exception:
+            ctx = None
+        hit = accessfold.AccessHit(
+            ctx=ctx,
+            request_id=state.get("request_id") or "-",
+            ts=time.time(),
+            client_ip=state.get("client_ip"),
+            client_port=state.get("client_port"),
+            peer_ip=state.get("peer_ip"),
+            who=_who(state),
+            user_agent=state.get("user_agent") or None,
+            method=method,
+            path=logged,
+            query=query,
+            status=status,
+            duration_ms=duration_ms,
+        )
+        fold = getattr(ctx, "access_fold", None)
+        try:
+            if fold is not None and accessfold.foldable(hit):
+                fold.offer(hit)
+            else:
+                write_access(hit, 1)
+        except Exception:
+            log.error("could not fold access for %s %s", method, printable(logged), exc_info=True)
     session = state.get("session")
     if (
         session is None
@@ -686,6 +732,7 @@ async def on_request_done(scope, status: int | None, duration_ms: float) -> None
         or (method, path) in _NOT_MUTATIONS
     ):
         return
+    target = _scrubbed(scope, path, _LOGGED_PATH_MAX)
     try:
         auth = scope["app"].state.ctx.auth_stores.auth
         await asyncio.to_thread(
@@ -693,7 +740,7 @@ async def on_request_done(scope, status: int | None, duration_ms: float) -> None
             session.username,
             AuditAction.API_WRITE,
             "route",
-            f"{method} {path}",
+            f"{method} {target}",
             after={"status": status, "query": query},
             ip=state.get("client_ip"),
             request_id=state.get("request_id"),
@@ -702,7 +749,7 @@ async def on_request_done(scope, status: int | None, duration_ms: float) -> None
             status=status,
         )
     except Exception:
-        log.error("could not write the api_write row for %s %s", method, path, exc_info=True)
+        log.error("could not write the api_write row for %s %s", method, printable(target), exc_info=True)
 
 
 def bearer_token(conn: HTTPConnection) -> str | None:
@@ -794,7 +841,7 @@ def authenticate_key(stores: AuthStores, conn: HTTPConnection) -> Principal:
         org=org,
         via=PrincipalVia.API_KEY,
         ip=ip,
-        user_agent=conn.headers.get("user-agent"),
+        user_agent=conn.headers.get("user-agent", "")[:512] or None,
     )
 
 
@@ -901,7 +948,7 @@ def session_principal(stores: AuthStores, request: Request, session: Session) ->
         org=org,
         via=PrincipalVia.SESSION,
         ip=client_ip(request),
-        user_agent=request.headers.get("user-agent"),
+        user_agent=request.headers.get("user-agent", "")[:512] or None,
     )
 
 
@@ -1455,7 +1502,11 @@ def _is_cors_preflight(request: Request) -> bool:
     ``DERATE_ALLOWED_ORIGINS`` names an origin (otherwise no CORS middleware
     exists to answer it). Any other ``OPTIONS`` goes through the gate like
     every method, so it is not an anonymous route-existence oracle."""
-    if request.method != "OPTIONS" or "access-control-request-method" not in request.headers:
+    if (
+        request.method != "OPTIONS"
+        or "origin" not in request.headers
+        or "access-control-request-method" not in request.headers
+    ):
         return False
     try:
         return bool(request.app.state.ctx.settings.allowed_origins)

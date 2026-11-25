@@ -25,8 +25,6 @@ import time
 
 import httpx
 
-from . import report
-from .report import merge
 
 class HarnessError(RuntimeError):
     """The harness could not establish or confirm its own preconditions."""

@@ -303,10 +303,11 @@ component will never have is a control that shows the current key.
 
 The pure half, and a port of the server's own screen.
 
-`mintedRef` mirrors `minted_ref` in `providers/service.py`: a `DERATE_` prefix,
+`mintedRef` mirrors `minted_ref` in `providers/refs.py`: a `DERATE_` prefix,
 an `_API_KEY` suffix, and the id uppercased into the 64-character budget
 between them. `predictedProviderId` mirrors `_mint_id` — the kind, then the
-first free `-N` — predicted rather than known so the form can name the
+first `-N` whose minted reference no existing provider already mints —
+predicted rather than known so the form can name the
 reference it is about to create instead of describing one in the abstract.
 
 `keyPlaceholder` returns a per-kind hint for `openrouter`, `openai`,

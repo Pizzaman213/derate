@@ -113,6 +113,17 @@ class GatewayContext:
     # Spec-decode counters scraped from local engines, attributed to a request
     # after it settles. Optional: None means every row says not_reported.
     engine_metrics: "object" = None
+    # The request map's IP-to-city database and the task that keeps it current
+    # (telemetry/geoip.py). None only on a GatewayContext built by hand.
+    geoip: "object" = None
+    geoip_updater: "object" = None
+    # The operator's own CIDR -> place table (telemetry/places.py).
+    geoip_places: "object" = None
+    # This machine's tailscaled: where it and its tailnet peers are
+    # (telemetry/tailnet.py). Off without Tailscale.
+    tailnet: "object" = None
+    # The UI's routine reads folded per minute (gateway/accessfold.py).
+    access_fold: "object" = None
     degraded_startup: list[str] = field(default_factory=list)
     # Refused keys, sessions, joins and origins, as warnings and rate-limited
     # audit rows (gateway/secevents.py). Built here, writing through

@@ -52,8 +52,9 @@ from control_plane.deploy.autoadopt import ContainerAutoAdopter
 from control_plane.inventory import api as inventory_api
 from control_plane.paths import data_path
 from control_plane.providers.autoadopt import RuntimeAutoAdopter
+from control_plane.telemetry import geoip, places, tailnet
 
-from . import auth_api, authz, chainwatch, engine_targets, keys_api
+from . import accessfold, auth_api, authz, chainwatch, engine_targets, keys_api
 from .admission import AdmissionController
 from .breaker import CircuitBreaker
 from .budget import RetryBudget
@@ -268,6 +269,17 @@ async def _sweep_expired_keys(ctx: GatewayContext) -> None:
             raise
         except Exception as exc:
             log.warning("key expiry sweep failed: %s", exc)
+
+
+async def _flush_access_fold(ctx: GatewayContext) -> None:
+    while True:
+        await asyncio.sleep(accessfold.WINDOW_S)
+        try:
+            ctx.access_fold.flush_due()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("access fold flush failed: %s", exc)
 
 
 class _UIStatics(StaticFiles):
@@ -519,6 +531,25 @@ def create_app(
         data_path("auth.db"), data_path("keys.db"), data_path("limits.db")
     )
     ctx.engine_metrics = engine_targets.build_poller(ctx)
+    # Where a request's client address is on a map: the DB-IP City Lite file,
+    # read at query time, downloaded and refreshed by the updater unless the
+    # operator pinned a file or switched downloads off (telemetry/geoip.py).
+    ctx.geoip = geoip.GeoDatabase(
+        Path(settings.geoip_db)
+        if settings.geoip_db
+        else data_path(geoip.DB_SUBDIR, geoip.DB_FILENAME)
+    )
+    ctx.geoip.open()
+    ctx.geoip_updater = geoip.GeoUpdater(
+        ctx.geoip, enabled=settings.geoip_download, pinned=settings.geoip_db is not None
+    )
+    # Always under data_dir(), even when DERATE_GEOIP_DB pins the database
+    # elsewhere: it is the operator's table, not part of the downloaded file.
+    ctx.geoip_places = places.KnownPlaces(data_path(geoip.DB_SUBDIR, places.PLACES_FILENAME))
+    ctx.geoip_places.load()
+    ctx.tailnet = tailnet.Tailnet.from_path(settings.geoip_tailscale)
+    # The UI's routine reads, folded per minute (gateway/accessfold.py).
+    ctx.access_fold = accessfold.AccessFold(authz.write_access)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -568,7 +599,9 @@ def create_app(
         # request after it settles; and the sweep that marks lapsed keys
         # expired without waiting for one to be used.
         await ctx.engine_metrics.start()
+        await ctx.geoip_updater.start()
         key_sweep_task = asyncio.create_task(_sweep_expired_keys(ctx))
+        access_fold_task = asyncio.create_task(_flush_access_fold(ctx))
         # The audit store opens here rather than on the first request, so the
         # remote sink and its heartbeat run from boot; the chain is verified
         # now and every SINK_HEARTBEAT_S after (gateway/chainwatch.py).
@@ -629,12 +662,18 @@ def create_app(
             parking.close()
             await container_autoadopt.stop()
             await autoadopt.stop()
-            for task in (key_sweep_task, chain_watch_task):
+            for task in (key_sweep_task, chain_watch_task, access_fold_task):
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+            # While the telemetry sink is still open: the pending counts.
+            try:
+                ctx.access_fold.flush_all()
+            except Exception:
+                log.exception("flushing the access fold failed")
+            await ctx.geoip_updater.stop()
             # Before the proxy: the poller scrapes through its clients.
             await ctx.engine_metrics.stop()
             await metrics.stop()

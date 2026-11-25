@@ -12,7 +12,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from control_plane.gateway import GatewayDeps, GatewaySettings, create_app
-from control_plane.gateway import ui_api
 from control_plane.gateway.settings_store import MUTABLE_FIELDS, SettingsStore
 
 

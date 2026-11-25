@@ -278,7 +278,7 @@ Without it a benched target reads as `healthy: false` for a deployment that
 
 ## Inbound auth
 
-Nothing here answers an anonymous caller any more, except the five calls that
+Nothing here answers an anonymous caller any more, except the six calls that
 must work before anyone can sign in (`authz.OPEN_ROUTES`). `authz.AuthGuard`
 decides by path: `/api/**` needs a `derate_session` cookie naming a live admin
 session (401 `session_required`); `/v1/**` needs `Authorization: Bearer derate-...`
@@ -366,11 +366,30 @@ most `max_concurrent_seqs` copies. An output ceiling of `-1` means none and is
 taken out of the forwarded body (`NO_OUTPUT_CEILING`); any other below one is
 a 400, since llama-server reads `n_predict: -1` beside a cap as unbounded.
 
+`model` is at most `body.MAX_MODEL_CHARS` (512) characters, refused before any
+trace exists because the name lands verbatim in every telemetry row; a JSON body
+nests at most `body.MAX_JSON_DEPTH` (64) containers; a `/v1/completions`
+`prompt` batch carries at most `limits.service.MAX_BATCH_PROMPTS` (128) entries
+and `n` x entries at most `MAX_COMPLETIONS` (128) generations, every entry
+counted whatever the engine would coerce it from; an `input` list carries at
+most `MAX_EMBEDDING_INPUTS` (2048). An upload another multipart parser could
+split or name differently is a 400 (`multipart.MalformedPart`,
+`AmbiguousBoundary`): a lone CR or LF, a folded line or a `name*=` in a part's
+headers, whitespace or RFC 2231 forms around the boundary, a delimiter out of
+place or the boundary inside a part. Every `/v1` handler refuses 401 when the
+gate attached neither a key nor a session (`/v1/key` wants the key).
+
+Outbound, the shared httpx clients keep no cookie jar (`providers/httpclient.py`)
+and follow no redirect, and `/v1/realtime` refuses a 3xx handshake rather than
+re-sending the provider's bearer to `Location`. All of them honour
+`HTTP(S)_PROXY`/`WSS_PROXY` from the coordinator's environment: set `NO_PROXY`
+for the LAN, or provider keys and per-deployment engine keys transit that proxy.
+
 The stores (`auth.db`, `keys.db`, `limits.db`) open on first use, so building an
-app touches no disk for them. The middleware is registered before `_csrf_guard`
-in `app.py`, which makes CSRF the outer of the two checks; `SecurityHeaders`
-(`headers.py`) is registered last of all and so wraps both, which is how their
-refusals carry the headers too.
+app touches no disk for them. The cross-site check runs inside `AuthGuard`
+(`authz._cross_site_refusal`), ahead of the credential check, so its refusal
+carries the request id; `SecurityHeaders` (`headers.py`) is registered last of
+all and so wraps the guard, which is how every refusal carries the headers too.
 
 **Chat from the UI runs as the admin's own key.** Every admin owns an admin key
 (minted with the admin, secret discarded, never expires); `/api/chat/*` run the
@@ -445,6 +464,7 @@ decorators.
 | `shell_api.py` | 182 | the browser-to-node terminal relay, behind a session; the shell key is never ours |
 | `breaker.py` | 167 | the per-target circuit. Subtracts from health, never adds |
 | `ui_api.py` | 166 | `GET`/`PATCH /api/settings`, on its own uncontended router |
+| `multipart.py` | 189 | the few form fields read out of a transcription upload, and every refusal that keeps gateway and upstream reading the same one |
 | `setup_state.py` | 154 | one fact on disk, outranked by the derived signals |
 | `parking.py` | 151 | the bounded waiting room |
 | `strength.py` | 144 | measured, then predicted, then bandwidth -- and the weight normalization |
@@ -455,7 +475,8 @@ decorators.
 | `engine_targets.py` | 63 | what the spec-decode poller scrapes, reached through the proxy's clients |
 | `headers.py` | 76 | nosniff, no framing, same-origin referrer on every answer; the CSP on HTML |
 | `csrf.py` | 59 | refusing a cross-site write before it reaches any route |
-| `main.py` | 54 | `python -m control_plane.gateway.main`, the stub surface, banner and all |
+| `main.py` | 81 | `python -m control_plane.gateway.main`, the stub surface, banner and all |
+| `isolated.py` | 139 | `main.py --isolated`: the stub sealed off for the agents' stub-UI tool; see `.omp/stubui/README.md` |
 | `states.py` | 40 | which deployment states mean what, spelled without importing `deploy` |
 | `__init__.py` | 11 | four names: `create_app`, `GatewayContext`, `GatewayDeps`, `GatewaySettings` |
 
@@ -535,6 +556,17 @@ endpoint answerable on a fresh install with nothing configured. Each row reports
 the numbers it was judged at, because with a derived context one figure at the
 top of the table no longer describes every row in it.
 
+`host_pool` is the same walk for the runtimes that serve from host RAM
+(llamacpp), BESIDE the GPU sides rather than instead of them: on a discrete box
+VRAM and host RAM are separate pools, and counting only the card never said
+what llamacpp could serve there. It is sized on `probed_node` exactly as that
+launch's own gate sizes it -- `allocatable_bytes(pool="host")` through
+`livefit.allocatable_map(pool="host")`, against `flags.budget_profile` (the box
+with its card taken out) -- and it is live only, because host RAM has no static
+ceiling here. Null on GB10/Apple/unknown machines, where a host-pool launch is
+refused; `host_pool_unavailable_reason` carries `placement_refusal`'s sentence
+for a machine that would qualify but has no host reading.
+
 ## Models tab routes (second pass)
 
 Everything the Models tab's mockup contract needed, all gated, all registered
@@ -546,7 +578,11 @@ above the `StaticFiles` mount.
   COORDINATOR only, cached 60 s), `supports` booleans read off the
   `RuntimeSpec`, `kv_dtypes`, `engine_options` (the spec's
   `engine_options_supported`), the two vLLM parser lists, `nccl_tunables` and
-  the pinned vLLM `version`.
+  the pinned vLLM `version`, and `image_versions`: per architecture, the
+  version the image that architecture runs reported when probed (null when
+  nothing probed it). Measurements are keyed by the MEASURED machine's entry
+  (`measurements.image_version`), never by the default image's version -- a
+  3090 on vLLM 0.31 filed under the Spark's 0.28.1 would answer a Spark lookup.
 - **`POST /api/plan/command`** -- the `/api/plan` body, run through
   `_plan_and_fit` and then `DeploymentManager.preview_launch`, which shares the
   launch's refusal block. Returns `argv`, `recipe`, the derived
@@ -556,8 +592,11 @@ above the `StaticFiles` mount.
   >= 512 and within `native_window`) and `max_users` (1..256, default 64). Per
   context it plans at `concurrency=1`, takes `wall = (usable_per_node - (total -
   kv_cache)) // kv_per_seq`, and prices users 1, 2, 4, ... plus the wall with
-  `fit.calculator.bandwidth_ceiling_tps`. `basis` is `live` when any context had
-  a live fit. The `caveat` string is part of the response, not UI copy.
+  `FitPort.decode_tps_each` on the plan's own `FitRequest` -- the card's decode
+  step, so one user equals `predicted_decode_tps`, with the `compute` record's
+  `tflops` as a roofline when there is one. `basis` is `live` when any context
+  had a live fit. The `caveat` string (two literals, by whether `compute` is
+  present) is part of the response, not UI copy.
   `compute` is the newest `measurements.matching_compute` record for the
   plan's GPU and the vllm image (null on mixed GPUs or none stored); each series
   carries `prompt_tokens = context` and each point `ttft_floor_s =
@@ -715,7 +754,7 @@ restart, router, admission and proxy stop next, the ports themselves follow
 through `_best_effort_shutdown`, and telemetry stops last, so anything the
 shutdown path emits is still recorded.
 
-`_csrf_guard` is installed unconditionally, unlike CORS, which appears only when
+The cross-site check is unconditional, unlike CORS, which appears only when
 `DERATE_ALLOWED_ORIGINS` names an origin. That asymmetry is the point: the
 default same-origin deployment installs no CORS middleware at all, and without
 the guard any page open on the LAN could blind-POST to every unauthenticated
@@ -1152,7 +1191,7 @@ session.
 failure this whole package guards against. `log_config=None` is not incidental:
 without it uvicorn replaces the logging configuration after the fact, two formats
 share one stream, and its access logger stops propagating to the root handler the
-telemetry journal is attached to.
+telemetry journal is attached to. `--isolated` belongs to `isolated.py` (`.omp/stubui/README.md`).
 
 ## `states.py`
 

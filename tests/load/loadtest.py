@@ -501,8 +501,8 @@ def build_upload(model: Model, args) -> tuple[dict, dict]:
     """(form fields, files) for one transcription request.
 
     The model arrives as a form field here rather than a JSON key -- the
-    gateway reads it back out of the raw multipart body (openai_api.py::
-    _multipart_field) and never re-encodes the form, so what is built here is
+    gateway reads it back out of the raw multipart body (gateway/multipart.py::
+    read_field) and never re-encodes the form, so what is built here is
     what the runtime receives.
     """
     clip = upload_clip(args)

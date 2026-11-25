@@ -15,6 +15,7 @@ which one.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -31,13 +32,14 @@ from control_plane.deploy.adopt import parse_serve_command
 from control_plane.deploy.flags import (
     RUNTIMES,
     SUPPORTED_RUNTIMES,
-    is_hub_gguf_blob,
-    llamacpp_model_refusal,
+    budget_profile,
     llamacpp_model_spec,
+    local_gguf_refusal,
     placement_refusal,
     runtime_spec,
     sharding_refusal,
 )
+from control_plane.resolver.gguf_names import is_hub_gguf_blob
 
 GGUF_REF = "hf://unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf"
 #: The SAME blob as GGUF_REF, spelled the way it comes back out of a resolve.
@@ -326,16 +328,19 @@ def test_the_translated_id_is_what_lands_in_the_recipe(tmp_path):
 def test_a_local_gguf_path_is_refused_rather_than_launched():
     """It resolves here and names nothing on the node the container starts on,
     which is the whole point of a CPU runtime: that node is somewhere else."""
-    refusal = llamacpp_model_refusal("llamacpp", "/home/somebody/models/x.gguf")
+    refusal = local_gguf_refusal("llamacpp", "/home/somebody/models/x.gguf")
     assert refusal and "repository" in refusal
-    # And the refusal is this runtime's, not a general rule: the other three
-    # launch onto machines a model is distributed to first.
-    assert llamacpp_model_refusal("vllm", "/home/somebody/models/x.gguf") is None
-    assert llamacpp_model_refusal("llamacpp", GGUF_REF) is None
+    # vllm loads GGUF too now, and sparkrun distributes it from the hub, so a
+    # path on the coordinator names nothing on its nodes either.
+    vllm_refusal = local_gguf_refusal("vllm", "/home/somebody/models/x.gguf")
+    assert vllm_refusal and vllm_refusal.startswith("vllm cannot launch")
+    # sglang has no GGUF path at all; that refusal is the support table's.
+    assert local_gguf_refusal("sglang", "/home/somebody/models/x.gguf") is None
+    assert local_gguf_refusal("llamacpp", GGUF_REF) is None
     # Relative and home-anchored paths are paths too, and neither carries a
     # scheme to tell them apart from a hub reference.
     for local in ("./x.gguf", "../models/x.gguf", "~/models/x.gguf"):
-        assert llamacpp_model_refusal("llamacpp", local), local
+        assert local_gguf_refusal("llamacpp", local), local
 
 
 def test_a_resolved_hub_gguf_is_not_mistaken_for_a_local_path():
@@ -346,7 +351,8 @@ def test_a_resolved_hub_gguf_is_not_mistaken_for_a_local_path():
     what the refusal is for and the first thing that fires on a llamacpp
     launch. `is_hub_gguf_blob` is the distinction; it is narrow on purpose,
     because the thing it must not swallow is a genuine local path."""
-    assert llamacpp_model_refusal("llamacpp", RESOLVED_GGUF_REF) is None
+    assert local_gguf_refusal("llamacpp", RESOLVED_GGUF_REF) is None
+    assert local_gguf_refusal("vllm", RESOLVED_GGUF_REF) is None
     assert is_hub_gguf_blob(RESOLVED_GGUF_REF)
     # A path that also ends in .gguf and also has three segments, but is a
     # path. The leading sigil is what separates them.
@@ -395,47 +401,119 @@ PI = NodeProfile(
 )
 
 
+SPARK = NodeProfile(
+    node_id="spark-01",
+    hostname="spark-01",
+    address="10.0.0.11",
+    device_class=DeviceClass.GB10,
+    gpu_name="NVIDIA GB10",
+    gpu_count=1,
+    total_memory=128 * 1024**3,
+    addressable_memory=120 * 1024**3,
+    memory_bandwidth_gbps=273.0,
+    compute_capability="12.1",
+    driver_version="580.95",
+    arch="arm64",
+)
+
+#: The RTX 3090 Ti that joined this estate: VRAM of its own, host RAM of its own.
+RTX = NodeProfile(
+    node_id="connor3090-system-product-name",
+    hostname="connor3090-system-product-name",
+    address="192.168.0.69",
+    device_class=DeviceClass.DISCRETE,
+    gpu_name="NVIDIA GeForce RTX 3090 Ti",
+    gpu_count=1,
+    total_memory=24 * 1024**3,
+    addressable_memory=23 * 1024**3,
+    memory_bandwidth_gbps=1008.0,
+    compute_capability="8.6",
+    driver_version="580.95",
+    arch="amd64",
+)
+
+
 def test_a_gpu_runtime_is_refused_on_a_machine_with_no_gpu():
-    refusal = placement_refusal("vllm", PI.node_id, PI.addressable_memory, None)
+    refusal = placement_refusal("vllm", PI, None)
     assert refusal and "no addressable GPU memory" in refusal
 
 
-def test_a_cpu_runtime_is_refused_on_a_machine_that_has_a_gpu():
-    """Both directions are refusals, which is the half a single
-    `addressable_memory > 0` test cannot express.
+def test_a_cpu_runtime_is_refused_on_a_unified_memory_machine():
+    """The refusal that survives the narrowing, with the reason that justifies it.
 
-    And the REASON is asserted, not just the refusal, because the tempting
-    reason is the wrong one. "llama.cpp would not use the GPU" is a preference,
-    and a preference is not grounds for a refusal in this project -- it would
-    run on a Spark's CPU perfectly well, just slowly, and nothing would break.
-
-    What derate cannot do is budget it there. `registry.allocatable_bytes`
-    returns host memory only for `DeviceClass.CPU` and a GPU figure for every
-    other class, so the fit gate would compare a host-RAM demand against a GPU
-    number -- wrong in both directions, able to approve a launch that exhausts
-    RAM as easily as refuse one that would have fitted.
+    Not "llama.cpp would not use the GPU" -- a preference, and it would run on a
+    Spark's CPU perfectly well. It is that the GPU and the server would spend ONE
+    pool, which derate budgets as GPU memory, so the gate could approve a launch
+    that exhausts RAM. Refused even with a live reading in hand: the reading is
+    of the wrong pool.
     """
-    refusal = placement_refusal("llamacpp", "spark-01", 120 * 1024**3, None)
-    assert refusal and "vllm" in refusal
-    # The mechanism, not the preference.
-    assert "host RAM" in refusal
-    assert "wrong pool" in refusal
-    assert "would not use" not in refusal
+    refusal = placement_refusal("llamacpp", SPARK, 50 * 1024**3)
+    assert refusal and "unified memory" in refusal
+    assert "vllm" in refusal, "it names the runtimes that do run there"
+    apple = dataclasses.replace(SPARK, device_class=DeviceClass.APPLE)
+    assert placement_refusal("llamacpp", apple, 50 * 1024**3)
+    unknown = dataclasses.replace(SPARK, device_class=DeviceClass.UNKNOWN)
+    assert placement_refusal("llamacpp", unknown, 50 * 1024**3)
 
 
-def test_a_cpu_runtime_refuses_a_machine_nothing_has_measured():
+def test_a_cpu_runtime_is_placed_on_a_discrete_gpu_box_with_a_host_reading():
+    """Narrowed from a blanket "has a GPU" refusal: a discrete box's host RAM is
+    its own pool, so `allocatable_bytes(pool="host")` answers for it and the
+    launch is budgetable. Refusing it was an accounting gap, not a fact."""
+    assert placement_refusal("llamacpp", RTX, 40 * 1024**3) is None
+    # And it is still a GPU machine to the GPU runtimes.
+    assert placement_refusal("vllm", RTX, None) is None
+
+
+@pytest.mark.parametrize("profile", [PI, RTX], ids=["cpu", "discrete"])
+def test_a_cpu_runtime_refuses_a_machine_nothing_has_measured(profile):
     """The one place in derate where a missing live reading refuses instead of
     degrading, and it does so because degrading would mean fabricating.
 
     A GPU node with no sample falls back to its nameplate, which describes a
-    real device. A CPU node has no nameplate -- `addressable_memory` is 0 and
-    always will be -- so there is nothing to fall back to.
+    real device. Host RAM has no nameplate here -- on a discrete box the
+    nameplate that exists is the CARD's, which is exactly the number this
+    runtime must never be sized against.
     """
-    refusal = placement_refusal("llamacpp", PI.node_id, 0, None)
+    refusal = placement_refusal("llamacpp", profile, None)
     assert refusal and "measured" in refusal
 
     # With a reading, it is a serving node like any other.
-    assert placement_refusal("llamacpp", PI.node_id, 0, 5 * 1024**3) is None
+    assert placement_refusal("llamacpp", profile, 5 * 1024**3) is None
+
+
+def test_the_fit_gate_sees_a_discrete_box_without_its_card_under_llamacpp():
+    """What the planner and the gate are handed for a host-pool launch.
+
+    With the card left in, the static ceiling is VRAM, the remedy sentence
+    names a GPU, and decode is predicted at ~1 TB/s for a server reading host
+    RAM -- every term about hardware the container never touches (its recipe
+    clears `--gpus`). The live host budget is then the only memory in force.
+    """
+    seen = budget_profile("llamacpp", RTX)
+    assert seen.addressable_memory == 0 and seen.usable_memory() == 0
+    assert seen.memory_bandwidth_gbps == 0.0
+    assert seen.device_class is DeviceClass.CPU
+    # Identity and architecture survive: the image and the links need them.
+    assert (seen.node_id, seen.address, seen.arch) == (RTX.node_id, RTX.address, "amd64")
+    # A GPU runtime sees the card, and a machine with no GPU is already itself.
+    assert budget_profile("vllm", RTX) is RTX
+    assert budget_profile("llamacpp", PI) == PI
+
+
+def test_a_host_pool_runtime_decodes_at_the_measured_host_bandwidth():
+    """The agent measures host RAM (`probe.measure_host_bandwidth`); a
+    llamacpp launch is planned at THAT figure, on a discrete box with its card
+    cleared and on a CPU node alike, so the decode prediction and the routing
+    fallback have a real number. A GPU runtime never reads it."""
+    rtx = dataclasses.replace(RTX, host_memory_bandwidth_gbps=46.3)
+    pi = dataclasses.replace(PI, host_memory_bandwidth_gbps=4.1)
+    assert budget_profile("llamacpp", rtx).memory_bandwidth_gbps == 46.3
+    assert budget_profile("llamacpp", rtx).device_class is DeviceClass.CPU
+    assert budget_profile("llamacpp", pi).memory_bandwidth_gbps == 4.1
+    assert budget_profile("vllm", rtx).memory_bandwidth_gbps == RTX.memory_bandwidth_gbps
+    spark = dataclasses.replace(SPARK, host_memory_bandwidth_gbps=99.0)
+    assert budget_profile("llamacpp", spark) is spark  # unified: refused upstream, never repriced
 
 
 def test_it_refuses_to_shard_rather_than_launching_one_rank_of_two():
@@ -485,3 +563,229 @@ def test_the_flags_table_and_the_resolver_table_know_the_same_runtimes():
     from control_plane.resolver.support import RUNTIMES as RESOLVER_RUNTIMES
 
     assert set(RUNTIMES) == set(RESOLVER_RUNTIMES)
+
+
+# ---- the gate, end to end, on the estate this was narrowed for ---------------
+
+
+def _pooled_client(gpu: dict[str, int], host: dict[str, int], resolver=None, ws=None):
+    """The real planner and fit gate behind a registry that answers BOTH pools,
+    each with a different number, so a budget taken from the wrong one shows.
+    *ws* replaces the 3090's profile."""
+    from fastapi.testclient import TestClient
+
+    from control_plane.fit import FitCalculator
+    from control_plane.gateway.app import create_app
+    from control_plane.planner import Planner
+    from control_plane.resolver.stub import StubResolver
+    from tests.fixtures import SPARK_01, WS_3090, node_state
+    from tests.unit.test_gateway import FakeRegistry, build_deps
+
+    class PooledRegistry(FakeRegistry):
+        def allocatable_or_none(self, node_id, guardrail=0.90, pool="gpu"):
+            return (host if pool == "host" else gpu).get(node_id)
+
+    registry = PooledRegistry([node_state(SPARK_01), node_state(ws or WS_3090)])
+    deps = dataclasses.replace(
+        build_deps(registry=registry),
+        fit=FitCalculator(),
+        resolver=resolver or StubResolver(),
+        planner=Planner(),
+    )
+    return TestClient(create_app(deps))
+
+
+def test_a_llamacpp_plan_predicts_decode_at_the_measured_host_bandwidth():
+    """With no host figure a llamacpp plan on the 3090 had no decode
+    prediction (the card's bandwidth is cleared with the card) and its users
+    chart reported the CARD's bandwidth. With the agent's measured host figure
+    both read host RAM; unmeasured stays as it was."""
+    from control_plane.resolver.stub import StubResolver
+    from tests.fixtures import SPARK_01, WS_3090
+
+    class GGUFResolver(StubResolver):
+        def resolve(self, model_id, dtype=None):
+            return _shape(model_id)
+
+        def supported_by(self, shape, runtime, image=None):
+            return True, "llama.cpp reads this GGUF"
+
+    GIB = 1024**3
+    body = {
+        "model_id": GGUF_REF,
+        "runtime": "llamacpp",
+        "context": 4096,
+        "concurrency": 1,
+        "node_ids": [WS_3090.node_id],
+    }
+    gpu = {SPARK_01.node_id: 15 * GIB, WS_3090.node_id: 20 * GIB}
+    host = {WS_3090.node_id: 40 * GIB}
+    measured = dataclasses.replace(WS_3090, host_memory_bandwidth_gbps=46.3)
+    with _pooled_client(gpu, host, GGUFResolver(), ws=measured) as client:
+        plan = client.post("/api/plan", json=body)
+        chart = client.post("/api/plan/concurrency", json={**body, "contexts": [4096]})
+    with _pooled_client(gpu, host, GGUFResolver()) as client:
+        blind = client.post("/api/plan", json=body)
+        blind_chart = client.post("/api/plan/concurrency", json={**body, "contexts": [4096]})
+
+    assert plan.status_code == 200, plan.text
+    shape = _shape(GGUF_REF)
+    ceiling = 46.3e9 / (shape.effective_active_params * shape.bytes_per_param())
+    predicted = plan.json()["fit_live"]["predicted_decode_tps"]
+    assert predicted is not None and 0 < predicted < ceiling
+    assert chart.status_code == 200, chart.text
+    assert chart.json()["bandwidth_gbps"] == 46.3, "host RAM, never the card's"
+
+    assert blind.status_code == 200, blind.text
+    assert blind.json()["fit_live"]["predicted_decode_tps"] is None
+    assert blind_chart.json()["bandwidth_gbps"] is None
+
+
+def test_a_llamacpp_plan_on_a_discrete_box_is_budgeted_against_host_ram():
+    """The acceptance for the narrowing: on the 3090 the gate compares a
+    llamacpp launch against host RAM, never against the card -- and the Spark
+    beside it is still refused, by name, for the unified pool."""
+    from tests.fixtures import SPARK_01, WS_3090
+
+    GIB = 1024**3
+    gpu = {SPARK_01.node_id: 15 * GIB, WS_3090.node_id: 20 * GIB}
+    host = {WS_3090.node_id: 90 * GIB}
+    body = {
+        "model_id": "Qwen/Qwen3-30B-A3B",
+        "runtime": "llamacpp",
+        "context": 4096,
+        "concurrency": 1,
+    }
+    with _pooled_client(gpu, host) as client:
+        named = client.post("/api/plan", json={**body, "node_ids": [WS_3090.node_id]})
+        spark = client.post("/api/plan", json={**body, "node_ids": [SPARK_01.node_id]})
+        picked = client.post("/api/plan", json=body)
+
+    assert named.status_code == 200, named.text
+    out = named.json()
+    assert out["capacity"]["allocatable_per_node"] == 90 * GIB
+    assert out["fit_live"]["usable_per_node"] == 90 * GIB, "the host budget, not the card's 20 GiB"
+    assert out["fit_live"]["verdict"] != "wont_fit", out["fit_live"]["reason"]
+    assert out["serve"]["basis"] == "live"
+    # The card's ceiling is not a static budget for a server that never sees it.
+    assert out["fit"]["usable_per_node"] == 0
+
+    assert spark.status_code == 400, spark.text
+    assert spark.json()["error"]["code"] == "node_has_no_memory"
+    assert "unified memory" in spark.json()["error"]["message"]
+
+    # Left to the planner, the Spark is left out and said so.
+    assert picked.status_code == 200, picked.text
+    assert picked.json()["plan"]["node_ids"] == [WS_3090.node_id]
+    assert any(SPARK_01.node_id in w for w in picked.json()["placement"]["warnings"])
+
+
+def test_a_llamacpp_launch_is_gated_on_the_host_budget_it_was_planned_against():
+    """Found live on the RTX box: /api/plan said `fits` against 47 GiB of host
+    RAM and the launch refused with "0.0 GiB usable", because the launch gate
+    read the STATIC verdict, and a host-pool runtime's static budget is 0 by
+    design. That refused every llamacpp launch on every machine. The live
+    verdict is the gate; too little host RAM is a plain wont_fit, never the
+    409 that offers to override against an idle-machine ceiling that does not
+    exist for host memory."""
+    from control_plane.resolver.stub import StubResolver
+    from tests.fixtures import SPARK_01, WS_3090
+
+    class GGUFResolver(StubResolver):
+        def resolve(self, model_id, dtype=None):
+            return _shape(model_id)
+
+        def supported_by(self, shape, runtime, image=None):
+            return True, "llama.cpp reads this GGUF"
+
+    GIB = 1024**3
+    body = {
+        "model_id": GGUF_REF,
+        "runtime": "llamacpp",
+        "context": 4096,
+        "concurrency": 1,
+        "node_ids": [WS_3090.node_id],
+    }
+    gpu = {SPARK_01.node_id: 15 * GIB, WS_3090.node_id: 20 * GIB}
+    with _pooled_client(gpu, {WS_3090.node_id: 90 * GIB}, GGUFResolver()) as client:
+        roomy = client.post("/api/deployments", json=body)
+    with _pooled_client(gpu, {WS_3090.node_id: GIB // 4}, GGUFResolver()) as client:
+        tight = client.post("/api/deployments", json=body)
+
+    assert roomy.status_code == 201, roomy.text
+    assert tight.status_code == 400, tight.text
+    assert tight.json()["error"]["code"] == "wont_fit"
+
+
+def test_capacity_reports_what_llamacpp_could_serve_from_a_discrete_boxs_host_ram():
+    """`/api/capacity` counted only the card on a discrete box, so "the largest
+    model that runs here" never said what llamacpp could serve from its host
+    RAM -- 90 GiB beside a 20 GiB card. Reported BESIDE the GPU sides, sized
+    the way that launch's own gate sizes it (host budget, card taken out); a
+    Spark's unified pool gets nothing, and a box nothing measured says why."""
+    from tests.fixtures import SPARK_01, WS_3090
+
+    GIB = 1024**3
+    gpu = {SPARK_01.node_id: 15 * GIB, WS_3090.node_id: 20 * GIB}
+    params = {"context": 4096, "concurrency": 1, "models": "Qwen/Qwen3-30B-A3B"}
+    with _pooled_client(gpu, {WS_3090.node_id: 90 * GIB}) as client:
+        box = client.get("/api/capacity", params={**params, "on": WS_3090.node_id})
+        spark = client.get("/api/capacity", params={**params, "on": SPARK_01.node_id})
+    with _pooled_client(gpu, {}) as client:
+        unmeasured = client.get("/api/capacity", params={**params, "on": WS_3090.node_id})
+
+    assert box.status_code == 200, box.text
+    out = box.json()
+    assert out["live"]["allocatable_per_node"] == 20 * GIB, "the GPU answer is unchanged"
+    pool = out["host_pool"]
+    assert pool is not None, out.get("host_pool_unavailable_reason")
+    assert pool["runtimes"] == ["llamacpp"] and pool["node_id"] == WS_3090.node_id
+    assert pool["allocatable_per_node"] == 90 * GIB, "the host budget, not the card's"
+    (row,) = pool["rows"]
+    assert row["fits"] and row["dtype"] == row["native_dtype"], row["reason"]
+    assert row["predicted_decode_tps"] is None, "never priced at the card's bandwidth"
+    (gpu_row,) = out["live"]["rows"]
+    assert gpu_row["dtype"] != gpu_row["native_dtype"] or not gpu_row["fits"]
+
+    assert spark.status_code == 200, spark.text
+    assert spark.json()["host_pool"] is None
+    assert spark.json()["host_pool_unavailable_reason"] is None
+
+    assert unmeasured.status_code == 200, unmeasured.text
+    assert unmeasured.json()["host_pool"] is None
+    assert "measured" in unmeasured.json()["host_pool_unavailable_reason"]
+
+
+def test_routing_strength_never_scores_a_llamacpp_deployment_by_the_card_it_cleared():
+    """Before ~100 requests give a measured rate, a local target is scored by
+    `predicted_decode_tps`, else by bandwidth. A host-pool launch has no
+    prediction (it is planned on the box with its card taken out), and the
+    bandwidth fallback read the RAW profile -- the 3090's ~936 GB/s for a
+    server whose recipe cleared `--gpus`, which could hand it most of the
+    traffic. It is judged on the same card-less profile, so it gets the
+    neutral default; a GPU runtime on the same box still gets the card."""
+    from control_plane.gateway.settings import GatewaySettings
+    from control_plane.gateway.stats import StatsRegistry
+    from control_plane.gateway.strength import (
+        SOURCE_BANDWIDTH, SOURCE_DEFAULT, local_strength,
+    )
+    from tests.unit.test_gateway import make_deployment
+
+    assert RTX.memory_bandwidth_gbps > 0
+    base = make_deployment("d", "m", backend_url=None, node_ids=(RTX.node_id,), predicted_tps=None)
+    profiles = {RTX.node_id: RTX}
+    args = (StatsRegistry(), profiles, GatewaySettings())
+
+    cpu = local_strength(dataclasses.replace(base, runtime="llamacpp"), *args)
+    assert (cpu.raw, cpu.source) == (1.0, SOURCE_DEFAULT)
+    gpu = local_strength(base, *args)
+    assert gpu.source == SOURCE_BANDWIDTH and gpu.raw == RTX.memory_bandwidth_gbps * max(1, RTX.gpu_count)
+
+    # Measured host RAM: the same fallback has a real number, and it is the
+    # host's, never the card's.
+    measured = {RTX.node_id: dataclasses.replace(RTX, host_memory_bandwidth_gbps=46.3)}
+    host = local_strength(
+        dataclasses.replace(base, runtime="llamacpp"), StatsRegistry(), measured, GatewaySettings()
+    )
+    assert (host.raw, host.source) == (46.3, SOURCE_BANDWIDTH)
+    assert host.raw > cpu.raw

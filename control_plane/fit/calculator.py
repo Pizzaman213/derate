@@ -13,9 +13,10 @@ is a bug in this file.
 
 from __future__ import annotations
 
+import logging
 import math
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from collections.abc import Mapping, Sequence
 
 from control_plane.humanize import binary_bytes
 from control_plane.contracts import (
@@ -26,8 +27,11 @@ from control_plane.contracts import (
     DeviceClass,
     EP_EXTRA_BUFFER_BYTES,
     FRAMEWORK_OVERHEAD,
+    UNMEASURED_COLLECTIVE_LATENCY_US,
     FitRequest,
     FitResult,
+    LinkMeasurement,
+    LinkPort,
     MemoryBreakdown,
     ModelShape,
     NodeProfile,
@@ -36,6 +40,7 @@ from control_plane.contracts import (
     SpeculativeSpec,
     Verdict,
 )
+from control_plane.planner import comm
 
 from .constants import (
     ACTIVATION_CHUNK_TOKENS,
@@ -47,17 +52,23 @@ from .constants import (
     QUANT_SUGGESTION_ORDER,
 )
 from .kv import (
+    attention_cache_bytes_per_rank,
+    cache_bytes_per_rank,
     is_known_kv_dtype,
+    is_packed_kv_dtype,
     kv_bytes_per_token,
-    kv_cache_bytes,
-    kv_divisor,
     kv_elem_bytes,
+    kv_read_bytes,
+    kv_tp_divisor,
+    recurrent_divisor,
     stage_fraction,
 )
 
 GIB = 1024**3
 MIB = 1024**2
 KIB = 1024
+
+log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
@@ -145,60 +156,158 @@ def _dedup(items: list[str]) -> list[str]:
 # --------------------------------------------------------------------------
 
 
+def decode_bytes_per_param(shape: ModelShape, weight_bytes: int | None = None) -> float:
+    """Bytes one decoded parameter costs to read.
+
+    The measured checkpoint average when there is one, never below the dtype's
+    nominal width: quantization scales, a bf16 head and unquantized norms all
+    sit in the measured figure and none of them are in the nominal one, while a
+    measured average BELOW nominal would make the rate optimistic, which is
+    the direction no estimate here may err in.
+    """
+    if weight_bytes and shape.total_params > 0:
+        return max(shape.bytes_per_param(), weight_bytes / shape.total_params)
+    return shape.bytes_per_param()
+
+
+def decode_read_bytes(shape: ModelShape, weight_bytes: int | None = None) -> float:
+    """Weight bytes one decoded token streams on a single rank."""
+    return shape.effective_decode_params * decode_bytes_per_param(shape, weight_bytes)
+
+
+@dataclass(frozen=True)
+class DecodeStep:
+    """One decode step on the busiest rank, in its three costs.
+
+    Memory and compute overlap, so the step is the slower of the two; the wire
+    does not overlap either of them at a batch this small, so it is added.
+    """
+
+    #: Bytes one rank streams per step: its share of the weights plus every
+    #: sequence's share of the cache.
+    rank_bytes: float
+    #: ``rank_bytes`` over the bandwidth, divided by the efficiency.
+    memory_s: float
+    #: 0.0 without a measured matmul rate.
+    compute_s: float
+    #: 0.0 unless the plan crosses nodes.
+    wire_s: float
+
+    @property
+    def seconds(self) -> float:
+        return max(self.memory_s, self.compute_s) + self.wire_s
+
+    @property
+    def tps(self) -> float:
+        s = self.seconds
+        return 1.0 / s if 0 < s < math.inf else 0.0
+
+
+def decode_step(
+    shape: ModelShape,
+    bandwidth_gbps: float,
+    kv_read_bytes: float,
+    efficiency: float,
+    *,
+    plan: ParallelismPlan | None = None,
+    link: LinkMeasurement | None = None,
+    crosses_nodes: bool = False,
+    weight_bytes: int | None = None,
+    users: int = 1,
+    tflops: float | None = None,
+) -> DecodeStep | None:
+    """What one decode step costs under ``plan``. None for an unknown bandwidth.
+
+    Decoding one token reads every weight the token touches plus the whole
+    cache for every sequence in the step. **Active** parameters, not total, and
+    of those only what streams -- see ``ModelShape.decode_read_params``.
+    GPT-OSS-120B moves a few GB per token, a dense 70B moves 140.
+
+    Tensor parallel divides both the weights and the cache each rank reads
+    (the cache by head, capped at the KV heads). Expert parallel divides the
+    routed experts the token selected. Pipeline parallel divides NOTHING: at
+    one sequence the stages run one after another, so the token still waits
+    on every layer's read -- ``planner/comm.py`` states the same thing about
+    the bubble. Each of those plans that crosses nodes pays
+    ``comm.wire_seconds_per_step`` on top, the same figure the planner ranks
+    with.
+
+    ``users`` is how many sequences share the step: the weights are read once
+    for all of them and the cache once each. ``kv_read_bytes`` is ONE
+    sequence's unsharded cache. ``tflops``, when measured, adds a compute
+    roofline: ``2 x params x users`` FLOPs over the matmul rate, which only
+    binds once enough users share one weight read.
+    """
+    if bandwidth_gbps <= 0:
+        return None
+    tp = max(1, plan.tensor_parallel) if plan else 1
+    pp = max(1, plan.pipeline_parallel) if plan else 1
+    ep = max(1, plan.expert_parallel) if plan else 1
+    n = max(1, int(users))
+
+    read = float(shape.effective_decode_params)
+    routed_active = 0.0
+    if shape.is_moe and shape.routed_expert_params > 0 and shape.num_experts > 0:
+        routed_active = min(
+            read,
+            shape.routed_expert_params * shape.num_experts_per_token / shape.num_experts,
+        )
+    weights = decode_bytes_per_param(shape, weight_bytes) * (
+        (read - routed_active) / tp + routed_active / max(tp, ep)
+    )
+    kv = max(0.0, kv_read_bytes) * n / kv_tp_divisor(shape, plan)
+    rank_bytes = weights + kv
+    memory_s = (
+        rank_bytes / (bandwidth_gbps * 1e9) / efficiency if efficiency > 0 else math.inf
+    )
+    compute_s = prefill_floor_seconds(shape, n, tflops or 0.0, tp) or 0.0
+    wire_s = (
+        comm.wire_seconds_per_step(shape, link, tp, pp, ep, batch=n)
+        if crosses_nodes and plan is not None
+        else 0.0
+    )
+    return DecodeStep(
+        rank_bytes=rank_bytes, memory_s=memory_s, compute_s=compute_s, wire_s=wire_s
+    )
+
+
 def predict_decode_tps(
     shape: ModelShape,
     bandwidth_gbps: float,
     kv_read_bytes: float,
     efficiency: float = DECODE_EFFICIENCY,
+    *,
+    plan: ParallelismPlan | None = None,
+    link: LinkMeasurement | None = None,
+    crosses_nodes: bool = False,
+    weight_bytes: int | None = None,
+    users: int = 1,
+    tflops: float | None = None,
 ) -> float:
-    """Decode tokens per second, single stream, memory-bandwidth bound.
-
-    Decoding one token reads every active weight plus the whole cache for that
-    sequence. **Active** parameters, not total: GPT-OSS-120B moves 2.7 GB per
-    token off 5.1B active params, a dense 70B moves 140 GB. That difference is
-    an order of magnitude of decode speed on identical hardware, and it is the
-    most useful thing we can say before someone waits five minutes for a load.
-
-    ``kv_read_bytes`` is the unsharded cache for one sequence, matching the
-    unsharded weight term: tensor parallel divides both the bytes and multiplies
-    the aggregate bandwidth, so the ratio holds.
+    """Decode tokens per second EACH, from ``decode_step``. 0.0 for an unknown
+    bandwidth.
 
     ``efficiency`` defaults to the conservative constant, which is what every
     caller wanted before there was a choice. The fit gate passes
-    ``DECODE_EFFICIENCY_BEST`` for the optimistic end of the range it reports;
-    see ``fit/constants.py``, which carries the measured corpus behind both
-    numbers. Nothing else should pass it -- a caller that wants the honest
+    ``DECODE_EFFICIENCY_BEST`` for the optimistic end of the range it reports,
+    or the efficiency calibrated from measured traffic when there is some; see
+    ``fit/constants.py``, which carries the measured corpus behind both
+    constants. Nothing else should pass it -- a caller that wants the honest
     spread wants both ends, not the flattering one.
     """
-    if bandwidth_gbps <= 0:
-        return 0.0
-    weight_bytes_per_token = shape.effective_active_params * shape.bytes_per_param()
-    bytes_per_token = weight_bytes_per_token + max(0.0, kv_read_bytes)
-    if bytes_per_token <= 0:
-        return 0.0
-    ceiling = (bandwidth_gbps * 1e9) / bytes_per_token
-    return ceiling * efficiency
-
-
-def bandwidth_ceiling_tps(
-    shape: ModelShape,
-    bandwidth_gbps: float,
-    kv_read_bytes: float,
-    users: int,
-    efficiency: float = DECODE_EFFICIENCY,
-) -> float:
-    """Decode tok/s EACH, for `users` sequences decoding together, from
-    memory bandwidth alone.
-
-    One step reads the active weights once and every sequence's cache, so
-    ``bandwidth / (weights + kv_read_bytes * users) * efficiency``. At one
-    user this IS `predict_decode_tps` -- it is computed by it -- which is what
-    ties the users chart to the number on the Verdict card. A ceiling only:
-    past a few users decode turns compute-bound, and nothing here models that.
-    """
-    return predict_decode_tps(
-        shape, bandwidth_gbps, max(0.0, kv_read_bytes) * max(1, int(users)), efficiency
+    step = decode_step(
+        shape,
+        bandwidth_gbps,
+        kv_read_bytes,
+        efficiency,
+        plan=plan,
+        link=link,
+        crosses_nodes=crosses_nodes,
+        weight_bytes=weight_bytes,
+        users=users,
+        tflops=tflops,
     )
+    return step.tps if step else 0.0
 
 
 def prefill_floor_seconds(
@@ -209,24 +318,25 @@ def prefill_floor_seconds(
 ) -> float | None:
     """Seconds to prefill one prompt, as a FLOOR, from measured compute.
 
-    ``2 * active_params * prompt_tokens`` FLOPs over the measured matmul rate,
-    split across the tensor-parallel ranks. Dense weights only -- attention
+    ``2 * params * prompt_tokens`` FLOPs over the measured matmul rate, split
+    across the tensor-parallel ranks, over the parameters a token actually
+    multiplies (``effective_decode_params``). Dense weights only -- attention
     FLOPs, scheduling and queueing are excluded -- and no efficiency constant,
     so the real first token is never sooner than this. The compute counterpart
-    of the decode ceiling. None when there is no rate to divide by.
+    of the decode ceiling, and the decode step's compute roofline at
+    ``prompt_tokens`` users. None when there is no rate to divide by.
     """
     if not tflops or tflops <= 0:
         return None
     return (
-        2 * shape.effective_active_params * prompt_tokens
+        2 * shape.effective_decode_params * prompt_tokens
         / (tflops * 1e12 * max(1, int(tensor_parallel)))
     )
 
 
 def speculative_decode_tps_range(
+    base_tps: float,
     shape: ModelShape,
-    bandwidth_gbps: float,
-    kv_read_bytes: float,
     spec: SpeculativeSpec,
 ) -> tuple[float, float]:
     """Decode tokens per second under speculative decoding, floor and ceiling.
@@ -234,7 +344,7 @@ def speculative_decode_tps_range(
     One verify step reads every active weight once, exactly as an ordinary
     decode step does, and settles up to ``k + 1`` positions instead of one. It
     also reads the draft's own weights ``k`` times to produce those tokens. So
-    against the ordinary rate:
+    against the ordinary rate ``base_tps``:
 
     * **ceiling** -- every drafted token accepted::
 
@@ -244,12 +354,17 @@ def speculative_decode_tps_range(
 
           base / (1 + k * draft_ratio)
 
-    where ``draft_ratio`` is the draft's parameters over the model's active
+    where ``draft_ratio`` is the draft's parameters over the model's per-token
     ones, so the draft's own bandwidth cost is already subtracted from both
     ends. That makes the ceiling tighter than a bare ``(k+1)x``, and it makes
     the floor **lower than the ordinary rate**, which is the half of this that
     a recommendation must not hide: speculative decoding on a workload that
     never accepts a draft is slower than not using it.
+
+    The whole step scales, wire included. Amortising the interconnect over the
+    k+1 positions would be a fairer ceiling across nodes and would break the
+    one invariant that ties ``speculative_best_k`` to this range: all-ones
+    acceptance reproduces the ceiling exactly.
 
     What decides where in that range a real workload lands is the acceptance
     rate, and derate does not measure acceptance rate. There is deliberately no
@@ -261,7 +376,7 @@ def speculative_decode_tps_range(
     ngram has ``draft_params == 0``, so its floor is the ordinary rate exactly
     and its ceiling is ``(k + 1)x``: it reads no weights to draft with.
     """
-    base = predict_decode_tps(shape, bandwidth_gbps, kv_read_bytes)
+    base = base_tps
     k = max(0, int(spec.num_speculative_tokens))
     if base <= 0 or k == 0:
         return base, base
@@ -276,7 +391,7 @@ def draft_ratio(shape: ModelShape, draft_params: int) -> float:
     that reports no active parameters -- in both cases the draft costs no
     bandwidth and the overhead term below collapses to 1.
     """
-    active = shape.effective_active_params or 0
+    active = shape.effective_decode_params or 0
     return (max(0, draft_params) / active) if active > 0 else 0.0
 
 
@@ -398,20 +513,45 @@ def speculative_kv_bytes_per_rank(
     """
     if spec is None:
         return 0.0
-    divisor = kv_divisor(shape, plan)
+    # Both attention terms are charged as the busiest rank holds them, through
+    # `attention_cache_bytes_per_rank`: TurboQuant's wide boundary layers sit
+    # at both ends of the model, so dividing a whole-model figure by the
+    # pipeline divisor under-charged the stage that holds two of them.
     drafted = 0.0
     k = max(0, int(spec.num_speculative_tokens))
+    seqs = max(0, int(max_seqs))
     if k > 0:
-        drafted = kv_bytes_per_token(shape, kv_dtype) * k * max(0, int(max_seqs))
+        # k positions per sequence at the full-attention rate; k is far below
+        # any sliding window, so every layer caches all k.
+        drafted = attention_cache_bytes_per_rank(shape, plan, k, seqs, kv_dtype)
+        # A recurrent layer keeps one state slot per drafted token
+        # (`num_speculative_blocks` in the image's MambaSpec), not a token.
+        drafted += (
+            max(0, shape.recurrent_state_bytes) * k * seqs
+            / recurrent_divisor(shape, plan)
+        )
     own = 0.0
     ratio = max(0.0, float(getattr(spec, "draft_kv_ratio", 0.0) or 0.0))
     if ratio > 0:
-        # The target's whole cache at this context, scaled by the head's share.
-        # Sharded by the target's divisor: tensor parallel splits the draft
-        # alongside the model, and a head is built to the target's attention
-        # geometry, which is what lets one ratio answer for both.
-        own = kv_cache_bytes(shape, context, max_seqs, kv_dtype) * ratio
-    return (drafted + own) / divisor
+        # The target's attention cache at this context on the busiest rank,
+        # scaled by the head's share. Sharded alongside the target: tensor
+        # parallel splits the draft with the model, and a head is built to
+        # the target's attention geometry, which is what lets one ratio
+        # answer for both.
+        #
+        # A packed width is the exception. TurboQuant keeps a fixed number of
+        # boundary layers at full width whatever the depth, so a 5-layer head
+        # may be 4/5 wide while 5/80 of the target's packed cache carries
+        # 5/80 of its boundary overhead -- and the other packed layouts carry
+        # per-layer overheads a ratio does not scale either. Nothing here
+        # knows the head's own geometry, so it is charged at the model's own
+        # (unpacked) width: an upper bound, never an under-charge.
+        own_dtype = "auto" if is_packed_kv_dtype(kv_dtype) else kv_dtype
+        own = (
+            attention_cache_bytes_per_rank(shape, plan, context, seqs, own_dtype)
+            * ratio
+        )
+    return drafted + own
 
 
 def _candidate_shards(n: int, shape: ModelShape) -> list[ParallelismPlan]:
@@ -594,17 +734,24 @@ def activation_bytes(
     context: int,
     chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
 ) -> float:
-    """Logits buffer plus compute scratch.
+    """Logits buffer plus compute scratch, plus a speech codec's working set.
 
     The logits term is charged for tokens actually emitted per step, one per
     sequence in flight, not for the full context. It still dominates on a large
     vocabulary: GPT-OSS's 201k vocab is 12.9 MB per emitted token in fp32.
+
+    The codec term is 0 except on a tts launch, where it is the measured
+    resident codec plus its decode buffers for a clip as long as the window
+    (``ModelShape.codec_working_set``). It is the largest thing that server
+    allocates -- 4.4 GB reserved at the default 512 frames on a 0.6B
+    checkpoint whose weights are 1.2 GB -- and it is charged here so the
+    refusals, the derived context and the launch's allocator cap all see it.
     """
     batch = max(1, int(max_seqs))
     chunk = min(max(1, int(chunk_tokens)), max(1, int(context)))
     logits = shape.vocab_size * batch * 4
     scratch = chunk * shape.hidden_size * 4 * 6
-    return float(logits + scratch)
+    return float(logits + scratch + shape.codec_working_set(context))
 
 
 def comm_buffer_bytes(plan: ParallelismPlan) -> float:
@@ -666,7 +813,7 @@ def memory_breakdown(
             f"pipeline stages are uneven: {shape.num_layers} layers over {pp} "
             f"stages puts {busiest} on the busiest rank; budgeting against that one"
         )
-    if not shape.mla_latent_dim and tp > shape.num_kv_heads:
+    if shape.attention_layers and not shape.mla_latent_dim and tp > shape.num_kv_heads:
         warnings.append(
             f"TP={tp} exceeds {shape.num_kv_heads} KV heads; the runtime "
             f"replicates KV heads rather than splitting them, so the cache "
@@ -690,6 +837,13 @@ def memory_breakdown(
             "cross-attention cache over the encoder's own output is not "
             "modeled"
         )
+    if shape.codec_resident_bytes or shape.codec_bytes_per_frame:
+        warnings.append(
+            f"activations include {_gib(shape.codec_working_set(context))} for "
+            f"the speech codec: {_gib(shape.codec_resident_bytes)} resident, "
+            f"plus decode buffers for a clip as long as the {context}-frame "
+            f"window; a smaller context lowers it"
+        )
 
     spec_weights = speculative_weight_bytes_per_rank(plan, speculative)
     spec_kv = speculative_kv_bytes_per_rank(
@@ -711,16 +865,65 @@ def memory_breakdown(
                 f"PP={plan.pipeline_parallel}"
             )
 
-    kv_total = kv_cache_bytes(shape, context, max_seqs, kv_dtype)
     breakdown = MemoryBreakdown(
         weights=int(weight_bytes_per_rank(shape, plan, weight_bytes) + spec_weights),
-        kv_cache=int(kv_total / kv_divisor(shape, plan) + spec_kv),
+        kv_cache=int(
+            cache_bytes_per_rank(shape, plan, context, max_seqs, kv_dtype) + spec_kv
+        ),
         activations=int(activation_bytes(shape, max_seqs, context, chunk_tokens)),
         comm_buffers=int(comm_buffer_bytes(plan)),
         replicated=int(replicated_bytes_per_rank(shape)) + int(extra_replicated_bytes),
         framework_overhead=int(FRAMEWORK_OVERHEAD),
     )
     return breakdown, warnings
+
+
+@dataclass(frozen=True)
+class DecodeSample:
+    """One measured decode rate, as the calibration reads it.
+
+    ``measurements.decode_samples`` builds these from stored ``DecodeRecord``s;
+    the fit package never imports ``measurements`` itself.
+    """
+
+    decode_tps: float
+    #: Mean cache length over the measured decode steps, in tokens.
+    context_tokens: float
+    #: The cache width the rate was measured at; "" means unknown.
+    kv_dtype: str
+    #: Decoded tokens behind the rate: the weight the sample carries.
+    tokens: float
+
+
+#: model_id, gpu_name, memory bandwidth, arch -> the measured single-stream
+#: samples for that model on that hardware, under the image a machine of that
+#: arch runs (a record keyed by another image's version is a miss).
+DecodeSamples = Callable[[str, str, float, str], Sequence[DecodeSample]]
+
+#: A calibrated efficiency is clamped to this band. Below it a sample measured
+#: something other than bandwidth-bound decode; above 1.0 is faster than the
+#: memory can move the bytes, which means the byte model is wrong, not the box.
+_MEASURED_EFFICIENCY_FLOOR = 0.05
+_MEASURED_EFFICIENCY_CEILING = 1.0
+
+
+@dataclass(frozen=True)
+class _Basis:
+    """What the decode rates in one check rest on."""
+
+    #: Efficiency behind the full-context rate.
+    low: float
+    #: Efficiency behind the empty-cache rate.
+    high: float
+    #: "constant" or "measured".
+    kind: str
+    #: Decoded tokens the calibration rests on; None for the constants.
+    measured_tokens: float | None
+    #: A link measurement covers the plan's nodes.
+    link_measured: bool
+    #: The plan spans more than one node.
+    crosses: bool
+
 
 
 # --------------------------------------------------------------------------
@@ -750,9 +953,164 @@ class FitCalculator:
         self,
         guardrail: float = DEFAULT_GUARDRAIL,
         chunk_tokens: int = ACTIVATION_CHUNK_TOKENS,
+        *,
+        links: LinkPort | None = None,
+        decode_samples: DecodeSamples | None = None,
     ) -> None:
+        """``links`` prices the interconnect a cross-node plan decodes over;
+        without it such a plan is charged the unmeasured per-exchange latency.
+        ``decode_samples`` calibrates the decode efficiency from measured
+        traffic; without it the two constants in ``fit/constants.py`` apply.
+        Both are optional so a bare calculator still answers everything."""
         self.guardrail = guardrail
         self.chunk_tokens = chunk_tokens
+        self._links = links
+        self._decode_samples = decode_samples
+
+    def decode_tps_each(
+        self,
+        req: FitRequest,
+        nodes: list[NodeProfile],
+        users: int = 1,
+        *,
+        tflops: float | None = None,
+    ) -> float | None:
+        """Decode tok/s for EACH of ``users`` sequences sharing a step, at the
+        request's full context. None when nothing knows the bandwidth.
+
+        The users chart reads this, and ``check`` computes its
+        ``predicted_decode_tps`` through the same ``_decode`` -- so at one user
+        the chart IS the card's number, calibration, plan and wire included.
+        """
+        if not nodes:
+            return None
+        used, _ = self._participating(req.plan, nodes)
+        full, _, _ = self._decode(req, used, users=users, tflops=tflops)
+        return full.tps if full else None
+
+    def _link_for(self, plan: ParallelismPlan) -> tuple[LinkMeasurement | None, bool]:
+        """The slowest measured link across the plan's nodes, and whether the
+        plan crosses nodes at all. A link lookup that fails is an absence."""
+        ids = list(dict.fromkeys(plan.node_ids))
+        crosses = len(ids) > 1
+        link: LinkMeasurement | None = None
+        if crosses and self._links is not None:
+            try:
+                link = self._links.worst_all_reduce(ids)
+            except Exception:
+                log.warning("link lookup for %s failed", ids, exc_info=True)
+        return link, crosses
+
+    def _efficiency(
+        self, req: FitRequest, used: list[NodeProfile], bandwidth: float
+    ) -> tuple[float, float, str, float | None]:
+        """Low and high efficiency, their kind, and the tokens behind them.
+
+        Measured when there are samples for this model on this GPU at this
+        bandwidth: the seconds ``decode_step`` says every measured token
+        should have taken at efficiency 1.0 (each sample priced at its own
+        context and cache width), over the seconds they actually took.
+
+        A ratio of SUMS, not a token-weighted mean of per-sample ratios, and
+        the difference was measured on this box. A scrape window counts the
+        tokens of requests still in flight but only the decode seconds of the
+        ones that finished, so one window read 98.7 tok/s and the next 220.5
+        for the same steady 105 tok/s stream. The clipped tokens and their
+        missing seconds land in DIFFERENT records -- the clipping moves the
+        window's mean context and with it the band -- so only summing seconds
+        across records cancels it; a mean of the two rates does not.
+
+        Recomputed on every check from the current byte model, never stored
+        -- a change to the byte model then re-derives the efficiency instead
+        of leaving a stale constant behind. One efficiency then serves both
+        ends, so what range is left is the context axis alone.
+        """
+        constant = (DECODE_EFFICIENCY, DECODE_EFFICIENCY_BEST, "constant", None)
+        gpus = {n.gpu_name for n in used}
+        if self._decode_samples is None or bandwidth <= 0 or len(gpus) != 1:
+            return constant
+        shape = req.shape
+        try:
+            samples = list(self._decode_samples(
+                shape.model_id, used[0].gpu_name, bandwidth,
+                getattr(used[0], "arch", "") or "",
+            ))
+        except Exception:
+            log.warning(
+                "decode samples for %s unavailable; using the constant efficiency",
+                shape.model_id,
+                exc_info=True,
+            )
+            return constant
+        ideal_s = 0.0
+        measured_s = 0.0
+        tokens = 0.0
+        for s in samples:
+            if s.tokens <= 0 or s.decode_tps <= 0:
+                continue
+            ideal = decode_step(
+                shape,
+                bandwidth,
+                kv_read_bytes(
+                    shape, max(1, round(s.context_tokens)), s.kv_dtype or req.kv_dtype
+                ),
+                1.0,
+                weight_bytes=req.weight_bytes,
+            )
+            if ideal is None or ideal.tps <= 0:
+                continue
+            ideal_s += s.tokens / ideal.tps
+            measured_s += s.tokens / s.decode_tps
+            tokens += s.tokens
+        if tokens <= 0 or measured_s <= 0:
+            return constant
+        eff = min(
+            _MEASURED_EFFICIENCY_CEILING,
+            max(_MEASURED_EFFICIENCY_FLOOR, ideal_s / measured_s),
+        )
+        return eff, eff, "measured", tokens
+
+    def _decode(
+        self,
+        req: FitRequest,
+        used: list[NodeProfile],
+        *,
+        users: int = 1,
+        tflops: float | None = None,
+    ) -> tuple[DecodeStep | None, DecodeStep | None, _Basis]:
+        """The full-context step, the empty-cache step, and what they rest on.
+
+        Every decode rate the gate states comes through here, so the card, the
+        degraded verdict, routing and the users chart cannot disagree.
+        """
+        shape = req.shape
+        bandwidth = min(n.memory_bandwidth_gbps for n in used)
+        link, crosses = self._link_for(req.plan)
+        low, high, kind, tokens = self._efficiency(req, used, bandwidth)
+        common = dict(
+            plan=req.plan,
+            link=link,
+            crosses_nodes=crosses,
+            weight_bytes=req.weight_bytes,
+            users=users,
+            tflops=tflops,
+        )
+        full = decode_step(
+            shape,
+            bandwidth,
+            kv_read_bytes(shape, req.context_length, req.kv_dtype),
+            low,
+            **common,
+        )
+        empty = decode_step(shape, bandwidth, 0.0, high, **common)
+        return full, empty, _Basis(
+            low=low,
+            high=high,
+            kind=kind,
+            measured_tokens=tokens,
+            link_measured=link is not None,
+            crosses=crosses,
+        )
 
     # -- FitPort ----------------------------------------------------------
 
@@ -813,53 +1171,56 @@ class FitCalculator:
         headroom = usable - breakdown.total
 
         # ONE sequence, deliberately and regardless of `req.max_concurrent_seqs`:
-        # `predict_decode_tps` is a single-stream, bandwidth-bound model, and
-        # the cache it must be handed is therefore one sequence's. Passing the
+        # the card's rate is a single-stream, bandwidth-bound figure, and the
+        # cache it must be handed is therefore one sequence's. Passing the
         # plan's concurrency here would not produce an aggregate rate -- it
         # would produce a slower per-sequence one and label it neither. What
         # this figure IS gets stated on screen instead; see `_speculative_range`
-        # for the same boundary drawn around the speculative range.
-        kv_read = kv_cache_bytes(shape, req.context_length, 1, req.kv_dtype)
+        # for the same boundary drawn around the speculative range. The users
+        # chart asks `decode_tps_each` for more than one.
+        #
+        # `full` is the cache for a sequence at the FULL requested context, so
+        # its rate is the slowest this will ever decode. Decoding reads the
+        # tokens actually present, so a fresh request is faster: `empty` is the
+        # other end of the same range, at an empty cache rather than some
+        # notional typical length, because a typical is a guess and this is
+        # not. Measured on this hardware the gap was roughly 2x: 61.5 predicted
+        # against 120.3 measured for Qwen3-0.6B at 8192 with ~320-token
+        # requests -- and once a measurement exists for this model here, both
+        # ends rest on it instead of on the two constants.
+        full, empty, decode = self._decode(req, used)
         # `None` rather than 0.0 when nothing knows this hardware's memory
-        # bandwidth. `predict_decode_tps` returns 0.0 for an unknown bandwidth,
-        # which is the right answer for a function returning a float and the
-        # wrong one to put on the wire: `FitResult.predicted_decode_tps` is
+        # bandwidth. A finite 0 on the wire would advertise "predicted decode
+        # 0.0 tok/s" -- a rate, stated with a decimal point, that no
+        # measurement produced: `FitResult.predicted_decode_tps` is
         # `float | None`, every renderer tests `!= null`, and `Readout` prints
-        # a finite 0 as "0.0". So a machine nobody has measured would have
-        # advertised "predicted decode 0.0 tok/s" -- a rate, stated with a
-        # decimal point, that no measurement produced.
+        # a finite 0 as "0.0".
         #
         # A CPU node is the first hardware here that reaches this: `probe.py`
         # leaves `memory_bandwidth_gbps` at 0.0 for anything not in its known
         # table, on the stated grounds that "guessing a number here would be
         # indistinguishable from a measurement". None carries that same
         # position one layer out, and the card drops the line instead.
-        tps = predict_decode_tps(shape, bandwidth, kv_read) if bandwidth > 0 else None
-        # The other end of the same range, and the honest half of the answer.
-        # `kv_read` above is the cache for a sequence at the FULL requested
-        # context, so `tps` is the rate once the context is full -- the slowest
-        # this will ever decode. Decoding reads the tokens actually present, so
-        # a fresh request is faster, and measured on this hardware the gap is
-        # roughly 2x: 61.5 predicted against 120.3 measured for Qwen3-0.6B at
-        # 8192 with ~320-token requests.
-        #
-        # An empty cache rather than some notional typical length, because a
-        # typical is a guess and this is not: it is the same call `head_scan`
-        # makes for its own baseline, so the card and the scan now agree on one
-        # number instead of quietly disagreeing about two.
-        tps_empty = (
-            predict_decode_tps(
-                shape, bandwidth, 0.0, efficiency=DECODE_EFFICIENCY_BEST
-            )
-            if bandwidth > 0
-            else None
+        tps = full.tps if full else None
+        tps_empty = empty.tps if empty else None
+        decode_fields = dict(
+            decode_basis=decode.kind,
+            decode_efficiency=decode.low if full else None,
+            decode_wire_seconds=full.wire_s if full and decode.crosses else None,
         )
+        if full is not None and full.wire_s > 0 and not decode.link_measured:
+            ids = list(dict.fromkeys(plan.node_ids))
+            warnings.append(
+                f"No interconnect measurement covers {', '.join(ids)}; the decode "
+                f"rate charges {UNMEASURED_COLLECTIVE_LATENCY_US:g} us per "
+                f"cross-node exchange and no transfer time."
+            )
         # Computed once and attached to every return below, refusals included:
         # a launch that will not fit is exactly when somebody wants to know
         # what they would have got, and the range is the same arithmetic
         # whichever verdict the memory produces.
         spec_floor, spec_ceiling, spec_reason = self._speculative_range(
-            req, shape, bandwidth, kv_read, tps
+            req, shape, tps
         )
         max_ctx = self._largest_context(
             shape,
@@ -910,6 +1271,7 @@ class FitCalculator:
                 speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
+                **decode_fields,
             )
 
         if headroom < 0:
@@ -937,6 +1299,7 @@ class FitCalculator:
                 speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
+                **decode_fields,
             )
 
         # Memory has nothing against this request, but a context past the
@@ -977,6 +1340,7 @@ class FitCalculator:
                 speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
+                **decode_fields,
             )
 
         # `tps is not None` and not a truthiness test, and the difference is
@@ -991,10 +1355,7 @@ class FitCalculator:
         # its bandwidth. That is the same direction every other unmeasured
         # quantity in this project errs, and the alternative is a degraded
         # badge derived from an absence.
-        if tps is not None and tps < DEGRADED_TPS_THRESHOLD:
-            bytes_per_token = (
-                shape.effective_active_params * shape.bytes_per_param() + kv_read
-            )
+        if tps is not None and full is not None and tps < DEGRADED_TPS_THRESHOLD:
             return FitResult(
                 verdict=Verdict.FITS_DEGRADED,
                 breakdown=breakdown,
@@ -1004,10 +1365,16 @@ class FitCalculator:
                     f"Loads with {_gib(headroom)} to spare, but predicted decode "
                     f"is {tps:.1f} tok/s, under the "
                     f"{DEGRADED_TPS_THRESHOLD:.0f} tok/s usability threshold. "
-                    f"Bandwidth bound: {bytes_per_token / 1e9:.1f} GB moves per "
-                    f"decoded token at {bandwidth:.0f} GB/s. Adding nodes will "
-                    f"not fix this — a smaller quantization, a smaller model, or "
-                    f"an MoE with fewer active parameters will."
+                    f"Bandwidth bound: {full.rank_bytes / 1e9:.1f} GB moves per "
+                    f"decoded token on each rank at {bandwidth:.0f} GB/s"
+                    + (
+                        f", plus {full.wire_s * 1e3:.2f} ms per token on the "
+                        f"interconnect"
+                        if full.wire_s > 0
+                        else ""
+                    )
+                    + ". A smaller quantization, a smaller model, or an MoE "
+                    "with fewer active parameters will fix this."
                 ),
                 limiting_term="bandwidth",
                 max_context_that_fits=max_ctx,
@@ -1018,6 +1385,7 @@ class FitCalculator:
                 speculative_reason=spec_reason,
                 warnings=_dedup(warnings),
                 budget_basis=basis,
+                **decode_fields,
             )
 
         ceiling = "at least " if max_ctx >= MAX_CONTEXT_SEARCH else ""
@@ -1040,6 +1408,26 @@ class FitCalculator:
                     f"Predicted decode {tps_empty:.0f} tok/s at short context, "
                     f"falling to {tps:.0f} tok/s at {req.context_length}. "
                     f"Per sequence. "
+                    + (
+                        f"Calibrated on {decode.measured_tokens:,.0f} decoded "
+                        f"tokens measured for this model on this machine. "
+                        if decode.kind == "measured"
+                        and decode.measured_tokens is not None
+                        else ""
+                    )
+                    + (
+                        f"Includes {full.wire_s * 1e3:.2f} ms per token on the "
+                        f"interconnect"
+                        + (
+                            ""
+                            if decode.link_measured
+                            else f", at an unmeasured "
+                            f"{UNMEASURED_COLLECTIVE_LATENCY_US:g} us per exchange"
+                        )
+                        + ". "
+                        if full is not None and full.wire_s > 0
+                        else ""
+                    )
                     if tps is not None and tps_empty is not None
                     else "Nothing has measured this machine's memory bandwidth, "
                     "so no decode rate is predicted. "
@@ -1056,14 +1444,13 @@ class FitCalculator:
             speculative_reason=spec_reason,
             warnings=_dedup(warnings),
             budget_basis=basis,
+            **decode_fields,
         )
 
     def _speculative_range(
         self,
         req: FitRequest,
         shape: ModelShape,
-        bandwidth: float,
-        kv_read: float,
         base_tps: float | None,
     ) -> tuple[float | None, float | None, str]:
         """The two ends of the speculative range, and the sentence for them.
@@ -1092,7 +1479,7 @@ class FitCalculator:
                 "Nothing has measured this machine's memory bandwidth, so the "
                 "speculative range cannot be computed for it.",
             )
-        floor, ceiling = speculative_decode_tps_range(shape, bandwidth, kv_read, spec)
+        floor, ceiling = speculative_decode_tps_range(base_tps, shape, spec)
         k = spec.num_speculative_tokens
         drafted = f"{k} drafted token{'s' if k != 1 else ''}"
         if spec.draft_params <= 0:
@@ -1105,8 +1492,8 @@ class FitCalculator:
                 f"The floor is BELOW the {base_tps:.0f} tok/s above: nothing "
                 f"accepted means the draft head was read for nothing"
             )
-        # Both ends are PER SEQUENCE, because `predict_decode_tps` is single
-        # stream and `kv_read` above is deliberately computed for one sequence.
+        # Both ends are PER SEQUENCE, because `base_tps` is the single-stream
+        # rate, computed deliberately for one sequence's cache.
         # At a batch the arithmetic stops describing the machine: the target's
         # weights are read once for the whole batch either way, so drafting k
         # extra positions per sequence buys back no bandwidth and costs a
@@ -1198,6 +1585,8 @@ class FitCalculator:
         *,
         allocatable: Mapping[str, int] | None = None,
         speculative: SpeculativeSpec | None = None,
+        chunk_tokens: int | None = None,
+        extra_replicated_bytes: int = 0,
     ) -> int:
         """Largest context that fits this plan on these nodes, on a
         ``CONTEXT_ROUNDING`` grain. Verified, never extrapolated. 0 means not
@@ -1211,7 +1600,9 @@ class FitCalculator:
         ``speculative`` is additive on the same terms, and it has to be here
         rather than only in ``evaluate``: this is what a request with no
         context is judged at, so deriving one without the draft's weights would
-        pick a window the very next fit check then refuses.
+        pick a window the very next fit check then refuses. ``chunk_tokens``
+        and ``extra_replicated_bytes`` (the batched-token and image-cache
+        engine options) for the same reason.
         """
         used, _ = self._participating(plan, nodes)
         _, usable, _, _ = self._budget(used, allocatable)
@@ -1223,6 +1614,8 @@ class FitCalculator:
             kv_dtype,
             weight_bytes=weight_bytes,
             speculative=speculative,
+            chunk_tokens=chunk_tokens,
+            extra_replicated_bytes=extra_replicated_bytes,
         )
 
     def max_seqs(
@@ -1236,6 +1629,9 @@ class FitCalculator:
         weight_bytes: int | None = None,
         *,
         allocatable: Mapping[str, int] | None = None,
+        speculative: SpeculativeSpec | None = None,
+        chunk_tokens: int | None = None,
+        extra_replicated_bytes: int = 0,
     ) -> int:
         """Most concurrent sequences that fit at this context. The public seam
         onto the search ``_largest_max_seqs`` already performs.
@@ -1248,12 +1644,16 @@ class FitCalculator:
         time and a decode step's weight read produced a single token.
 
         0 means not even one sequence fits, which is a refusal for the gate to
-        phrase, not a concurrency to launch at.
+        phrase, not a concurrency to launch at. The keyword inputs are the
+        ones ``max_context`` takes, for its reason.
         """
         used, _ = self._participating(plan, nodes)
         _, usable, _, _ = self._budget(used, allocatable)
         return self._largest_max_seqs(
-            shape, plan, usable, context, kv_dtype, ceiling, weight_bytes
+            shape, plan, usable, context, kv_dtype, ceiling, weight_bytes,
+            speculative=speculative,
+            chunk_tokens=chunk_tokens,
+            extra_replicated_bytes=extra_replicated_bytes,
         )
 
     # -- internals --------------------------------------------------------
@@ -1318,15 +1718,19 @@ class FitCalculator:
         kv_dtype: str,
         ceiling: int,
         weight_bytes: int | None = None,
+        *,
+        speculative: SpeculativeSpec | None = None,
+        chunk_tokens: int | None = None,
+        extra_replicated_bytes: int = 0,
     ) -> int:
         """Most concurrent sequences that fit at this context. Verified, like
         the context search: both KV and the logits buffer scale with it."""
 
         def fits(seqs: int) -> bool:
-            breakdown, _ = memory_breakdown(
-                shape, plan, context, seqs, kv_dtype, self.chunk_tokens, weight_bytes
+            return self._fits_at(
+                shape, plan, context, seqs, kv_dtype, usable, weight_bytes, speculative,
+                chunk_tokens=chunk_tokens, extra_replicated_bytes=extra_replicated_bytes,
             )
-            return breakdown.total <= usable
 
         if ceiling < 1 or not fits(1):
             return 0
@@ -1423,7 +1827,7 @@ class FitCalculator:
             )
 
         return "combined", self._combined_reason(
-            req, breakdown, usable, node, over, basis
+            req, breakdown, usable, node, over, basis, max_ctx=max_ctx
         )
 
     def _nodes_phrase(
@@ -1673,8 +2077,6 @@ class FitCalculator:
         basis: str = "static",
     ) -> str:
         shape, plan = req.shape, req.plan
-        divisor = kv_divisor(shape, plan)
-        per_seq = kv_cache_bytes(shape, req.context_length, 1, req.kv_dtype) / divisor
         kv_budget = usable - (breakdown.total - breakdown.kv_cache)
 
         fixes: list[str] = []
@@ -1683,12 +2085,17 @@ class FitCalculator:
         seqs = self._largest_max_seqs(
             shape, plan, usable, req.context_length, req.kv_dtype,
             req.max_concurrent_seqs - 1, req.weight_bytes,
+            speculative=req.speculative, chunk_tokens=req.chunk_tokens,
+            extra_replicated_bytes=req.extra_replicated_bytes,
         )
         if seqs >= 1:
             fixes.append(f"reduce concurrency to {seqs} sequences")
-        elem = kv_elem_bytes(req.kv_dtype, shape)
-        if elem > 1.0:
-            kv_fp8 = breakdown.kv_cache * (1.0 / elem)
+        # Against the width actually chosen, which may be packed: fp8 is only
+        # suggested when it is narrower for THIS model.
+        chosen = kv_bytes_per_token(shape, req.kv_dtype)
+        fp8_ratio = kv_bytes_per_token(shape, "fp8") / chosen if chosen else 1.0
+        if fp8_ratio < 1.0:
+            kv_fp8 = breakdown.kv_cache * fp8_ratio
             if (breakdown.total - breakdown.kv_cache) + kv_fp8 <= usable:
                 fixes.append(
                     f"quantize the KV cache to fp8 ({_gib(kv_fp8)}, which fits)"
@@ -1723,6 +2130,8 @@ class FitCalculator:
         node: NodeProfile,
         over: int,
         basis: str = "static",
+        *,
+        max_ctx: int = 0,
     ) -> str:
         named = [
             ("weights", breakdown.weights),
@@ -1749,9 +2158,15 @@ class FitCalculator:
             lead = "no single term dominates"
 
         fixes = [self._nodes_phrase(req, node, usable if basis == "live" else None)]
+        # A speech codec decodes a clip as long as the window, so its share of
+        # `activations` shrinks with the context and not with concurrency.
+        if req.shape.codec_bytes_per_frame and 0 < max_ctx < req.context_length:
+            fixes.append(f"lower context to {max_ctx} frames")
         seqs = self._largest_max_seqs(
             req.shape, req.plan, usable, req.context_length, req.kv_dtype,
             req.max_concurrent_seqs - 1, req.weight_bytes,
+            speculative=req.speculative, chunk_tokens=req.chunk_tokens,
+            extra_replicated_bytes=req.extra_replicated_bytes,
         )
         if seqs >= 1:
             fixes.append(f"reduce concurrency to {seqs} sequences")

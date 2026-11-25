@@ -111,7 +111,7 @@ request time and nowhere else.
 
 Only two names are accepted: the one derate mints for *this* provider
 (`DERATE_<PROVIDER_ID>_API_KEY`) and an operator's `DERATE_SECRET_<NAME>`;
-anything else is a 400 (`service.ref_allowed`), and `SecretStore` will not read
+anything else is a 400 (`refs.ref_allowed`), and `SecretStore` will not read
 any other environment variable at all (`secrets.env_resolvable`). Before this, a
 session could name `DERATE_TOKEN` and point `base_url` at itself, and the
 refresh sent the cluster token as a bearer. A stored record still holding an
@@ -124,8 +124,11 @@ before any screen below can raise, and — after every other screen has passed,
 so a refused spec leaves no secret behind — writes it through
 `SecretStore.put`. What lands on the record is the name. With no
 `api_key_ref` beside it the name is minted as `DERATE_<PROVIDER_ID>_API_KEY`,
-which is also what marks the entry as ours to delete when the provider is
-removed; an operator's own name is never deleted. Because the environment is
+which is also what marks the entry as ours: `remove` deletes it whether or not
+the provider still referenced it, and `_register` drops whatever secrets.json
+still holds under a new id's minted name before anything else, so a key left
+behind for some other host is never revived by naming the reference. An
+operator's own name is never deleted. Because the environment is
 read first, writing to a name an environment variable already holds with a
 different value is refused — otherwise the stored key would be shadowed at
 resolution and the provider would authenticate as somebody else.
@@ -329,6 +332,8 @@ per-file map of the provider subsystem and the failures that shaped it.
 | `config.py` | 121 | timeouts, backoff bounds, the refresh interval, the cost blend weights, the sign-in endpoints |
 | `serialization.py` | 117 | the public JSON shapes; `api_key` is present and always `"***"` |
 | `errors.py` | 111 | the exception set the status table above maps from |
+| `refs.py` | 129 | which secret reference a provider may hold: the minted name, `ref_allowed`, `ref_holder`, `add_refusal`, `patch_refusal` and their sentences |
+| `httpclient.py` | 20 | `no_cookies()`: the jar every shared upstream client is built with, which stores nothing |
 | `__init__.py` | 76 | the package's export surface, 26 names |
 
 ## `service.py`
@@ -365,12 +370,16 @@ The write is last, after every other screen has passed, so a refused spec leaves
 no secret behind. `_store_key` refuses to write to a name an environment
 variable already holds with a different value: `SecretStore.get` reads the
 environment first, so the key would be stored and then shadowed, and the
-provider would authenticate as somebody else. `minted_ref` builds
+provider would authenticate as somebody else. `refs.minted_ref` builds
 `DERATE_<PROVIDER_ID>_API_KEY`, capped at `_MAX_REF_LEN` (64) because
 `ui/src/api/redact.ts` renders anything longer as key material — derate's own
 reference, hidden from the operator as though it had leaked. That prefix is also
 the only thing that makes `remove` safe to delete a secret: an operator's own
-reference may be shared and is never touched.
+reference may be shared and is never touched. Two ids that differ only in case
+or punctuation (`openai-1`, `openai_1`) mint one name, so `_register` refuses
+the second (`refs.ref_holder`) and `_mint_id` steps past a name already taken:
+a second provider holding that name would resolve the first's key and send it
+to its own host.
 
 ### The forward path
 
@@ -422,8 +431,16 @@ unless the kind is `ollama` or `custom`; an IP-literal host that is link-local
 (`169.254.0.0/16`, `fe80::/10`), multicast or unspecified is refused without a
 DNS lookup; a kind with a fixed home keeps that home's hostname. Moving the
 `base_url` of a provider whose key derate stored (a minted reference) drops the
-reference and deletes the key unless the same patch brings a new one -- the key
-was pasted for the old host (finding K3).
+reference and deletes the key; the same patch may bring a new key as `api_key`
+or name an operator's `DERATE_SECRET_*` instead -- the key was pasted for the
+old host (finding K3). The move and a pasted key are written together, after
+every other field of the patch has passed, and `update` puts the reference and
+the URL back if the patch is refused anyway -- so a refusal leaves neither half
+behind. Naming the provider's own minted reference in a patch that moves the
+URL, without pasting a key, is refused (`refs.KEY_NOT_CARRIED`); naming it
+later, on a provider that holds another reference, drops whatever secrets.json
+still holds under it, so only the environment can answer for that name. A key
+left there was pasted for a host the provider may no longer point at.
 
 ## `logos.py`
 
@@ -668,7 +685,7 @@ of those imports still resolves.
 - **`gateway/runtime_api.py`** takes `detect_runtime` and `set_resident` for
   `GET`/`POST /api/nodes/{id}/runtime` and `POST /api/nodes/{id}/runtime/model`.
 - **`gateway/serialize.py`** takes `REDACTED`; **`gateway/stubs.py`** takes
-  `looks_like_secret`, `spec_for`, `minted_ref` and `KEY_IN_REF_FIELD`, so the
+  `looks_like_secret`, `spec_for`, and from `refs.py` `minted_ref` and `KEY_IN_REF_FIELD`, so the
   day-0 store refuses the same paste with the same sentence — a stub that
   accepts what the coordinator refuses teaches the add form the opposite of the
   rule.

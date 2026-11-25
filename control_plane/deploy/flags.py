@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from control_plane.contracts.deployment import EngineOptions
+from control_plane.contracts.hardware import DeviceClass, NodeProfile
 from control_plane.contracts.quant import BYTES_PER_PARAM
 
 #: The launcher's name on PATH, and the fallback when nothing overrides it.
@@ -350,10 +351,11 @@ class RuntimeSpec:
     #: node says is free RAM right now.
     #:
     #: It is a claim about what `registry.allocatable_bytes` can ANSWER for,
-    #: not about what the runtime prefers. That function branches on device
-    #: class -- host memory for `DeviceClass.CPU`, a GPU figure for everything
-    #: else -- so a host-pool runtime is placeable exactly where a host answer
-    #: exists. Everywhere else the gate would size it against the wrong pool.
+    #: not about what the runtime prefers. That function takes this value as
+    #: its `pool`: `"host"` answers from MemAvailable on a machine whose host
+    #: RAM is its own pool (CPU, DISCRETE) and 0 on a unified one, so a
+    #: host-pool runtime is placeable exactly where a host answer exists.
+    #: Everywhere else the gate would size it against the wrong pool.
     #:
     #: This is the field that used to be implicit in `addressable_memory <= 0`.
     #: While every runtime needed a GPU, "has no GPU memory" and "cannot serve"
@@ -401,6 +403,18 @@ class RuntimeSpec:
     #: container with `sleep infinity` and execs the command after, so that
     #: entrypoint has to be cleared -- the same reason llamacpp clears its own.
     arch_images: tuple[tuple[str, str, str, tuple[tuple[str, str], ...]], ...] = ()
+    #: Appended, with `{gguf_base}`, when this launch is a hub GGUF blob. The
+    #: GGUF carries weights and nothing a runtime can build a model config or
+    #: a tokenizer from in a form vllm-gguf-plugin reads, so both come from
+    #: the repository it was quantized from (`resolver.gguf_launch_facts`).
+    gguf_config_arg: str | None = None
+    #: Appended, with `{gguf_loader_config}` from `render_gguf_loader_config`,
+    #: when that GGUF's base is a vision-language model and the launch names
+    #: its mmproj projector. Single-quoted JSON, for `speculative_config_arg`'s
+    #: reasons.
+    gguf_projector_arg: str | None = None
+    #: Environment a GGUF launch adds to `env:`. See the vllm spec.
+    gguf_env: tuple[tuple[str, str], ...] = ()
 
 
 #: What `--kv-cache-dtype` accepts, read off the pinned image's own
@@ -422,15 +436,19 @@ VLLM_KV_CACHE_DTYPES: frozenset[str] = frozenset({
     "int4_per_token_head", "int8_per_token_head", "fp8_per_token_head",
 })
 
-#: derate's KV vocabulary (`fit/kv.py::KV_ELEM_BYTES`) is not vLLM's, because
-#: one names a WIDTH the gate prices and the other names a KERNEL the engine
-#: runs. These are the only ones where the two mean the same thing.
+#: derate's KV vocabulary (`fit/kv.py`) is not vLLM's, because one names a
+#: WIDTH the gate prices and the other names a KERNEL the engine runs. These
+#: are the names where the two mean the same thing: the plain widths, and the
+#: packed kernels whose page `fit/kv.py::per_layer_per_token_bytes` sizes with
+#: the image's own formula (`fit/constants.py`, `KV_PER_TOKEN_HEAD_BITS` and
+#: below).
 #:
 #: Everything mapping to None is "the model's own dtype" -- the gate's default,
 #: and the case where passing no flag is exactly right. `int8`/`fp32` are
 #: deliberately ABSENT rather than mapped: the gate can price them and this
 #: image cannot serve them, and that gap is a refusal, not a silent
-#: substitution.
+#: substitution. So is `fp8_inc`, which is Intel Gaudi's kernel and loads on
+#: no GPU derate places on.
 _KV_DTYPE_TO_VLLM: dict[str, str | None] = {
     "": None, "auto": None, "model": None, "none": None,
     "fp16": None, "float16": None, "half": None,
@@ -438,6 +456,17 @@ _KV_DTYPE_TO_VLLM: dict[str, str | None] = {
     "fp8": "fp8", "float8": "fp8",
     "fp8_e4m3": "fp8_e4m3",
     "fp8_e5m2": "fp8_e5m2",
+    "int8_per_token_head": "int8_per_token_head",
+    "fp8_per_token_head": "fp8_per_token_head",
+    "int4_per_token_head": "int4_per_token_head",
+    "nvfp4": "nvfp4",
+    "nvfp4_4over6": "nvfp4_4over6",
+    "turboquant_k8v4": "turboquant_k8v4",
+    "turboquant_4bit_nc": "turboquant_4bit_nc",
+    "turboquant_k3v4_nc": "turboquant_k3v4_nc",
+    "turboquant_3bit_nc": "turboquant_3bit_nc",
+    "fp8_ds_mla": "fp8_ds_mla",
+    "nvfp4_ds_mla": "nvfp4_ds_mla",
 }
 
 
@@ -711,10 +740,10 @@ VLLM_QUANTIZATION_METHODS: frozenset[str] = frozenset({
 #: Deliberately NOT all 33 schemes `contracts/quant.py` prices. This table is
 #: what the operator may FORCE, and forcing is only meaningful where the
 #: runtime has a loader that reads that packing:
-#:
-#:   * the GGUF ladder (21 of the 33) is llama.cpp's format. `resolver.py`
-#:     already marks every GGUF variant unlaunchable, so a forced GGUF
-#:     quantization is a launch nothing could serve.
+#:   * the GGUF ladder (21 of the 33) is never a forced `--quantization`
+#:     value. A GGUF launch names the `.gguf` blob itself, and vllm loads it
+#:     through vllm-gguf-plugin when the image carries that plugin; there is
+#:     no flag that turns safetensors weights into a GGUF packing.
 #:   * `nf4` is bitsandbytes, and **`bitsandbytes` is not in this image's
 #:     registry** -- read above, not assumed. Absent rather than mapped, so it
 #:     refuses by name instead of dying at load.
@@ -766,9 +795,11 @@ def render_quantization(dtype: str | None) -> str | None:
             f"runtime would load this repository's own weights at their real "
             f"precision while the fit check budgeted for something smaller. "
             f"Forceable: {', '.join(forceable_quantizations())}. A GGUF "
-            f"scheme is llama.cpp's format and is not launchable here at all; "
-            f"nf4 needs a bitsandbytes loader this image does not carry. For "
-            f"those, pass that quantization's own repository id as model_id "
+            f"scheme is never a flag: launch the .gguf file itself "
+            f"(hf://owner/repo/file.gguf), which vllm loads through "
+            f"vllm-gguf-plugin when the image carries it; nf4 needs a "
+            f"bitsandbytes loader this image does not carry. For either, pass "
+            f"that quantization's own repository id as model_id "
             f"-- it is a different repository, not a flag"
         )
     rendered = _QUANT_TO_VLLM[key]
@@ -1052,6 +1083,18 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         engine_options_supported=frozenset(
             f.name for f in dataclasses.fields(EngineOptions)
         ),
+        # A hub GGUF blob: config and tokenizer from the repository it was
+        # quantized from, and the vision projector beside it for a VL model.
+        gguf_config_arg="--hf-config-path {gguf_base} --tokenizer {gguf_base}",
+        gguf_projector_arg="--model-loader-extra-config '{gguf_loader_config}'",
+        # sparkrun runs the container offline (HF_HUB_OFFLINE=1,
+        # TRANSFORMERS_OFFLINE=1) because it pre-fetches the model -- but it
+        # fetches only the `*TOKEN*` GGUF files, and the plugin and vLLM fetch
+        # the base model's config.json and tokenizer, and the projector, at
+        # startup into the /cache/huggingface mount. A recipe's `env:` wins
+        # over sparkrun's default (runtimes/base.py: merge_env(common, solo,
+        # recipe_env, extra)), so a GGUF launch turns the hub back on.
+        gguf_env=(("HF_HUB_OFFLINE", "0"), ("TRANSFORMERS_OFFLINE", "0")),
     ),
     "sglang": RuntimeSpec(
         name="sglang",
@@ -1063,6 +1106,20 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         default_image=(
             "scitrera/dgx-spark-sglang:0.5.9-t5"
             "@sha256:a055011be7feb2e43ad8dbc365e3903f869c63b992864691f7edf83015bb941d"
+        ),
+        # x86 machines run upstream SGLang, which publishes amd64 (the scitrera
+        # build above is a DGX Spark one). Digest-pinned 2026-11-21; verified on
+        # an RTX 3090 Ti (sm_86): Qwen3-0.6B loaded and answered. Its
+        # ENTRYPOINT is NVIDIA's wrapper, cleared like every image sparkrun
+        # execs a serve command into.
+        arch_images=(
+            (
+                "amd64",
+                "DERATE_SGLANG_IMAGE_AMD64",
+                "lmsysorg/sglang:v0.5.23-runtime"
+                "@sha256:3ce6da3e5ea0fee2dac6a23b528cb294fedd31ca74a55a4511f709c5e01e8652",
+                (("entrypoint", ""),),
+            ),
         ),
         max_seqs_key="max_running_requests",
         command_template=_SGLANG_COMMAND,
@@ -1136,6 +1193,14 @@ RUNTIMES: dict[str, RuntimeSpec] = {
         default_image_env="DERATE_TTS_IMAGE",
         default_image="ghcr.io/pizzaman213/derate/tts:latest",
         default_image_arch="arm64",
+        # There is no published amd64 tts image: docker/tts.Dockerfile built
+        # ON an x86 machine from upstream vllm/vllm-openai:v0.31.0, tagged
+        # locally (see the Dockerfile header). Verified on an RTX 3090 Ti with
+        # Audio8/Audio8-TTS-Preview-0.6b. The base's ENTRYPOINT is `vllm serve`,
+        # which would swallow sparkrun's `sleep infinity`, so it is cleared.
+        arch_images=(
+            ("amd64", "DERATE_TTS_IMAGE_AMD64", "derate/tts:amd64", (("entrypoint", ""),)),
+        ),
         max_seqs_key="max_num_seqs",
         command_template=_TTS_COMMAND,
         custom_command_prefix=_TTS_CUSTOM_PREFIX,
@@ -1323,6 +1388,143 @@ def render_speculative_config(
     return rendered
 
 
+#: The JSON `--model-loader-extra-config` may carry, as a whole-string grammar:
+#: one key, and a projector blob spelled `owner/repo/<path>.gguf`. Same stance
+#: as `_SPECULATIVE_CONFIG_SAFE` -- an allowlist over the rendered string,
+#: which admits no quote that could close the single quote around it.
+_GGUF_LOADER_CONFIG_SAFE = re.compile(
+    r'^\{"mm_proj": "[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*'
+    r'/[A-Za-z0-9._/-]+\.gguf"\}$'
+)
+
+
+def render_gguf_loader_config(projector: str) -> str:
+    """The JSON vllm-gguf-plugin reads its vision projector from.
+
+    ``--model-loader-extra-config '{"mm_proj": "owner/repo/mmproj-BF16.gguf"}'``
+    -- the plugin fetches that blob with ``hf_hub_download``. *projector*
+    comes from the hub's own file listing (`resolver.gguf_launch_facts`), but
+    the string this returns is substituted into a command that runs under
+    ``bash -c``, so the check is on the RENDERED result, for
+    `render_speculative_config`'s reason: that is the string that reaches the
+    shell, and validating anything else leaves a gap between what was
+    approved and what runs.
+    """
+    if ".." in projector:
+        raise ValueError(
+            "refusing projector %r: a hub path never walks upward" % projector
+        )
+    rendered = json.dumps({"mm_proj": projector}, separators=(", ", ": "))
+    if not _GGUF_LOADER_CONFIG_SAFE.match(rendered):
+        raise ValueError(
+            "refusing to substitute %r into the launch command: it is not the "
+            "one-key projector object this flag is allowed to carry" % rendered
+        )
+    return rendered
+
+
+#: Why a GGUF on vllm launches without speculative decoding.
+VLLM_GGUF_SPECULATIVE_REFUSAL = (
+    "speculative decoding is not offered for a GGUF build on vllm: "
+    "vllm-gguf-plugin replaces vLLM's speculator probe and loads only a GGUF's "
+    "own embedded MTP block, which derate has not priced. Launch without it, "
+    "or use a safetensors build."
+)
+
+_GGUF_NEEDS_BASE = (
+    "vllm loads a GGUF only beside its original model's config.json and "
+    "tokenizer, and this launch names no base repository"
+)
+
+
+def vllm_gguf_refusal(
+    runtime: str,
+    model_id: str,
+    *,
+    gguf_base: str | None,
+    gguf_projector: str | None,
+    speculative: bool,
+) -> str | None:
+    """Why a launch's GGUF facts and its runtime do not belong together, or None.
+
+    A vllm GGUF launch without a base repository is a container that dies
+    looking for a config.json; facts on any other launch are a record that
+    says something about a model it does not serve. Asked at synthesis and
+    again by the manager, so a crash relaunch of a record written before
+    these fields existed is refused rather than started without its config.
+    """
+    hub_blob = False
+    if runtime == "vllm" or gguf_base or gguf_projector:
+        from control_plane.resolver.gguf_names import is_hub_gguf_blob
+
+        hub_blob = is_hub_gguf_blob(model_id)
+    if (gguf_base or gguf_projector) and (runtime != "vllm" or not hub_blob):
+        return (
+            f"gguf_base/gguf_projector belong to a vllm launch of a hub GGUF "
+            f"blob, and this is {runtime} serving {model_id}"
+        )
+    if runtime != "vllm" or not hub_blob:
+        return None
+    if not gguf_base:
+        return _GGUF_NEEDS_BASE
+    if speculative:
+        return VLLM_GGUF_SPECULATIVE_REFUSAL
+    return None
+
+
+def gguf_image_refusal(
+    runtime: str, model_id: str, arch: str, node_ids: Sequence[str]
+) -> str | None:
+    """Why the image a vllm GGUF launch would run on *arch* machines is not
+    known to load GGUF, or None.
+
+    vllm reads GGUF only through vllm-gguf-plugin, and the only evidence that
+    an image carries it is a probe of THAT image. A machine of another
+    architecture runs a different image (`arch_images`: upstream
+    `vllm/vllm-openai` on amd64 by default), probed on a machine of that
+    architecture (`ModelResolver.arch_host`) because the coordinator cannot
+    start it. Offering GGUF there on the default image's say-so launched a
+    17-minute download that ended with stock vLLM refusing `owner/repo:QUANT`
+    as a repository id.
+    """
+    if runtime != "vllm":
+        return None
+    from control_plane.resolver import support
+    from control_plane.resolver.gguf_names import is_hub_gguf_blob
+
+    if not is_hub_gguf_blob(model_id):
+        return None
+    spec = runtime_spec(runtime)
+    image = image_for_arch(spec, arch)
+    if image is None:
+        return None  # `arch_refusal` says why; nothing runs there at all
+    # The variable that picks the image this architecture runs.
+    var = next(
+        (v for a, v, _, _ in spec.arch_images if a == arch), spec.default_image_env
+    )
+    where = ", ".join(f"'{n}'" for n in node_ids) or "these machines"
+    found = support.probed_image(runtime, image)
+    if found is not None:
+        if found.gguf:
+            return None
+        return (
+            f"{where} would run {found.provenance}, which has no "
+            f"vllm-gguf-plugin, so vllm cannot load a GGUF file there. Serve a "
+            f"safetensors checkpoint, or point {var} at an image built from "
+            f"docker/audio.Dockerfile."
+        )
+    return (
+        f"{where} would run {image}, and nothing has asked that image whether "
+        f"it can load a GGUF file (vllm reads GGUF only through "
+        f"vllm-gguf-plugin). derate asks an image on a healthy machine of its "
+        f"own architecture ({arch or 'unknown'}) every few minutes, and adopts "
+        f"the answer once that machine has the image and the coordinator holds "
+        f"a copy with the same layers to confirm it. Pull or build it there and "
+        f"on the coordinator -- docker/audio.Dockerfile, selected by {var} -- "
+        f"or serve a safetensors checkpoint."
+    )
+
+
 def render_cudagraph_capture_sizes(sizes: Sequence[int]) -> str:
     """The space-separated list `--cudagraph-capture-sizes` takes.
 
@@ -1387,88 +1589,153 @@ def graph_capture_refusal(
 #: question is asked before a launch rather than discovered by one.
 def placement_refusal(
     runtime: str,
-    node_id: str,
-    addressable_memory: int,
+    profile: NodeProfile,
     live_budget: int | None,
 ) -> str | None:
     """Why this runtime cannot be placed on this machine, or None.
 
-    One function because there are two directions and six call sites, and for
-    most of this project's life there was only one direction: every runtime
+    *live_budget* is `registry.allocatable_or_none(node_id, pool=...)` for the
+    runtime's own `memory_pool`; it is read only for a host-pool runtime.
+
+    One function because there are two directions and several call sites, and
+    for most of this project's life there was only one direction: every runtime
     needed a GPU, so `addressable_memory <= 0` answered the whole question and
     the answer was spelled out by hand wherever it was needed. A CPU runtime
     splits that into a pair, and a pair spelled out by hand in six places is a
     pair that disagrees within a month.
 
-    The three cases:
+    The cases:
 
     * a GPU runtime on a machine with no GPU memory -- the original refusal,
       unchanged, still the common one;
-    * a host runtime on a machine that HAS a GPU. The reason is an accounting
-      one and not a preference, which matters because a preference is not
-      grounds for a refusal in this project. llama.cpp would RUN on such a
-      machine -- slowly, on its CPU, and nothing would break. What derate
-      cannot do is BUDGET it: `registry.allocatable_bytes` returns host memory
-      only for `DeviceClass.CPU`, and a GPU figure for everything else, so the
-      fit gate would compare a host-RAM demand against a GPU number. That is
-      wrong in both directions -- it can approve a launch that exhausts RAM
-      and refuse one that would have fitted.
+    * a host runtime on a machine whose host RAM is not a pool of its own --
+      GB10 and APPLE, where the GPU and the operating system spend the same
+      bytes, and UNKNOWN, where nothing identified the machine. The reason is
+      an accounting one and not a preference, which matters because a
+      preference is not grounds for a refusal in this project: llama.cpp would
+      RUN on a Spark's CPU and nothing would break. What derate cannot do is
+      BUDGET it there. `registry.allocatable_bytes` budgets a unified pool as
+      GPU memory, so a host-RAM server would be sized against bytes the GPU is
+      counting on too -- able to approve a launch that exhausts RAM.
 
-      Two things follow. The refusal is about THIS BUILD rather than about
-      llama.cpp, so it names what would have to change. And it is wider than
-      it strictly needs to be: on a discrete-GPU box VRAM and host RAM are
-      separate pools and a host-pool runtime there is perfectly budgetable --
-      it is refused anyway, because `allocatable_bytes` has no branch that
-      would answer for it. Narrowing that is a change to that function, not to
-      this one;
-    * a host runtime on a CPU machine nothing has sampled. A GPU node with no
-      sample falls back to its nameplate, because a nameplate describes a real
-      device. A CPU node has no nameplate -- `addressable_memory` is 0 and
-      always will be -- so there is nothing to fall back TO, and the honest
-      answer is to say the measurement is missing rather than invent a budget.
-      This is the one place in derate where a missing live reading refuses
-      instead of degrading, and it does so because degrading would mean
-      fabricating.
+      A DISCRETE box is NOT refused, and used to be. Its VRAM and its host RAM
+      are separate pools, so `allocatable_bytes(pool="host")` answers for it
+      from MemAvailable exactly as it does for a CPU node, and the gate sizes
+      the launch against host RAM -- never against the card;
+    * a host runtime on a machine nothing has measured host memory on. A GPU
+      node with no sample falls back to its nameplate, because a nameplate
+      describes a real device. Host RAM has no nameplate here, so there is
+      nothing to fall back TO, and the honest answer is to say the
+      measurement is missing rather than invent a budget. This is the one
+      place in derate where a missing live reading refuses instead of
+      degrading, and it does so because degrading would mean fabricating.
     """
+    from control_plane.registry.telemetry import HOST_POOL_CLASSES
+
     spec = RUNTIMES.get(runtime)
     if spec is None:
         return None
+    node_id = profile.node_id
     if spec.memory_pool == "host":
-        if addressable_memory > 0:
+        if profile.device_class not in HOST_POOL_CLASSES:
             others = ", ".join(
                 name for name, other in RUNTIMES.items() if other.memory_pool == "gpu"
             )
+            if profile.device_class.unified_memory:
+                why = (
+                    f"'{node_id}' has unified memory: its GPU and its operating "
+                    f"system spend one pool, and derate budgets that pool as GPU "
+                    f"memory. The {runtime} runtime serves from host RAM, so the "
+                    f"fit gate would size it against bytes the GPU is counting "
+                    f"on too -- a budget that can approve a launch that exhausts "
+                    f"RAM."
+                )
+            else:
+                why = (
+                    f"Nothing identified what kind of machine '{node_id}' is, so "
+                    f"derate cannot tell whether its host RAM is a pool of its "
+                    f"own, and the {runtime} runtime is budgeted against exactly "
+                    f"that."
+                )
             return (
-                f"the {runtime} runtime serves from host RAM, and derate only "
-                f"measures host RAM on a machine with no GPU. On '{node_id}' the "
-                f"fit gate would size this launch against GPU memory the server "
-                f"never touches -- a budget for the wrong pool, which can approve "
-                f"a launch that exhausts RAM as easily as refuse one that would "
-                f"have fitted. Serve it on a machine with no GPU, or use one of "
-                f"the GPU runtimes here ({others})."
+                f"{why} Serve it on a machine whose host RAM is its own pool -- "
+                f"one with a discrete GPU or none -- or use one of the GPU "
+                f"runtimes here ({others})."
             )
         if live_budget is None:
+            stale_agent = (
+                " A discrete-GPU machine's agent has to be a build that reports "
+                "host memory; an older one sends none."
+                if profile.device_class is DeviceClass.DISCRETE
+                else ""
+            )
             return (
-                f"Nothing has measured how much memory '{node_id}' has free, "
-                f"and {runtime} is budgeted against that reading rather than "
-                f"against a specification -- a machine with no GPU has no "
-                f"memory figure to fall back on. Wait for it to report, or "
-                f"check that its agent is running."
+                f"Nothing has measured how much host memory '{node_id}' has "
+                f"free, and {runtime} is budgeted against that reading rather "
+                f"than against a specification -- host RAM has no figure here "
+                f"to fall back on. Wait for it to report, or check that its "
+                f"agent is running.{stale_agent}"
             )
         if live_budget <= 0:
             return (
-                f"'{node_id}' reports no free memory to serve from right now. "
-                f"It is a cluster member; it cannot carry this launch until "
-                f"something on it releases memory."
+                f"'{node_id}' reports no free host memory to serve from right "
+                f"now. It is a cluster member; it cannot carry this launch "
+                f"until something on it releases memory."
             )
         return None
-    if addressable_memory <= 0:
+    if profile.addressable_memory <= 0:
         return (
             f"The machine '{node_id}' reports no addressable GPU memory, so "
             f"{runtime} cannot be placed on it. It can still be a cluster "
             f"member; it cannot be a serving node for this runtime."
         )
     return None
+
+
+def budget_profile(runtime: str, profile: NodeProfile) -> NodeProfile:
+    """*profile* as the planner and the fit gate must see it for *runtime*.
+
+    Unchanged for a GPU-pool runtime. For a host-pool runtime on a DISCRETE
+    box it is the box with its card taken out -- what
+    `registry/probe.py::_probe_cpu` writes for a machine with no GPU: no
+    addressable memory, no GPU name or count.
+
+    That is what the launch actually is. llamacpp's recipe clears `--gpus`, so
+    the card is not in the container, and every term the gate and the planner
+    read off the GPU would be about hardware the server never touches: the
+    static ceiling would be VRAM, the "no number of these holds it" remedy
+    would name a GPU, and a decode rate would be predicted at the card's
+    ~1 TB/s. With the card taken out, the live budget
+    (`allocatable_bytes(pool="host")`) is the only memory figure in force and
+    the gate says it serves from host memory, exactly as it does on a CPU
+    node. Identity, address and architecture are kept: the image and the link
+    lookup still need them.
+
+    The bandwidth, on a discrete box and on a CPU node alike, is the agent's
+    measured `host_memory_bandwidth_gbps`, so the decode prediction and the
+    routing fallback price a host-RAM decode at what host RAM moves.
+    Unmeasured is 0.0, which both read as "no figure": no prediction, a
+    neutral score.
+    """
+    spec = RUNTIMES.get(runtime)
+    if spec is None or spec.memory_pool != "host":
+        return profile
+    host = profile.host_memory_bandwidth_gbps or 0.0
+    if profile.device_class is DeviceClass.CPU:
+        return dataclasses.replace(profile, memory_bandwidth_gbps=host)
+    if profile.device_class is not DeviceClass.DISCRETE:
+        return profile
+    return dataclasses.replace(
+        profile,
+        device_class=DeviceClass.CPU,
+        gpu_name="",
+        gpu_count=0,
+        total_memory=0,
+        addressable_memory=0,
+        memory_bandwidth_gbps=host,
+        compute_capability="",
+        driver_version="",
+    )
 
 
 def image_for_arch(
@@ -1520,60 +1787,27 @@ def arch_refusal(runtime: str, node_id: str, arch: str) -> str | None:
     )
 
 
-
-def is_hub_gguf_blob(model_id: str) -> bool:
-    """Whether this is derate's own post-resolve spelling for a hub GGUF blob.
-
-    ``hf://owner/repo/file.gguf`` is what an operator passes and what the
-    resolver is documented to take. It is NOT what comes back:
-    ``ModelResolver.resolve_gguf_full`` sets ``name = f"{repo}/{filename}"``
-    and drops the scheme, so every consumer downstream of a resolve sees
-    ``owner/repo/file.gguf``.
-
-    That mattered because two functions below were written against the scheme
-    and are both called with the resolved id -- `llamacpp_model_refusal` from
-    `manager.launch` and `llamacpp_model_spec` from `recipes.synthesize`. One
-    refused every legitimate hub GGUF as a local path; the other declined to
-    translate it and left sparkrun an id it cannot parse. Same root cause, so
-    one predicate rather than two copies of the same `startswith`.
-
-    The test is deliberately narrow, because the thing it must not swallow is
-    a genuine local path -- which also ends in ``.gguf`` and also has slashes.
-    A hub reference has at least three segments (owner, repo, and a filename
-    that may sit under a quant subdirectory) and does not begin with a path
-    sigil. ``/home/me/x.gguf`` and ``./x.gguf`` are therefore not hub blobs
-    and stay refusable; ``owner/repo-GGUF`` has two segments and no ``.gguf``
-    suffix, so sparkrun's own spelling is untouched.
-    """
-    name = model_id.strip()
-    if name.startswith(("/", "~", ".")):
-        return False
-    if not name.lower().endswith(".gguf"):
-        return False
-    return len(name.split("/")) >= 3
-
-
-def llamacpp_model_refusal(runtime: str, model_id: str) -> str | None:
-    """Refuse a model id that names a file on THIS machine, for a CPU launch.
+def local_gguf_refusal(runtime: str, model_id: str) -> str | None:
+    """Refuse a model id that names a GGUF file on THIS machine.
 
     derate's resolver happily takes a local directory or a local ``.gguf``
     path, and for every question the resolver answers -- what shape is this,
     what does it weigh -- a local file is a perfectly good answer. A launch is
-    a different question, and this is the one runtime where the difference
-    bites: the container starts on the node the plan placed it on, which is
-    the whole point of a CPU runtime (that node is a Pi, and this one is not).
-    A path that resolves here names nothing there.
+    a different question, and the two runtimes that load GGUF are where the
+    difference bites: the container starts on the node the plan placed it on
+    (for llamacpp, a Pi, and this machine is not), and sparkrun distributes a
+    GGUF by fetching ``owner/repo:QUANT`` from the hub on every node. A path
+    that resolves here names nothing there.
 
-    The other three runtimes do not need this said. They launch onto machines
-    that are the same kind of machine as the coordinator, and sparkrun's vLLM
-    plugins distribute a model before they start -- but nothing distributes a
-    loose file the operator happens to have in a home directory, and no gate
-    in this project has ever checked for one. So this refuses rather than
-    launching something that fails at open() several minutes later, inside a
-    container, on another machine.
+    Nothing distributes a loose file the operator happens to have in a home
+    directory, and no other gate in this project checks for one. So this
+    refuses rather than launching something that fails at open() several
+    minutes later, inside a container, on another machine.
     """
-    if runtime != "llamacpp":
+    if runtime not in ("llamacpp", "vllm"):
         return None
+    from control_plane.resolver.gguf_names import is_hub_gguf_blob
+
     name = model_id.strip()
     if (
         name.lower().endswith(".gguf")
@@ -1585,11 +1819,11 @@ def llamacpp_model_refusal(runtime: str, model_id: str) -> str | None:
         and not is_hub_gguf_blob(name)
     ):
         return (
-            "llamacpp cannot launch %r: that is a path to a file on this "
+            "%s cannot launch %r: that is a path to a file on this "
             "machine, and the server starts on the node the plan placed it "
             "on. Name the repository it came from instead "
             "(owner/repo-GGUF:Q4_K_M, or hf://owner/repo/file.gguf) and the "
-            "node will fetch it itself." % model_id
+            "node will fetch it itself." % (runtime, model_id)
         )
     return None
 
@@ -1631,13 +1865,17 @@ def llamacpp_model_spec(model_id: str) -> str:
     regex over a filename.
     """
     name = model_id.strip()
+    if not name.lower().endswith(".gguf"):
+        # Nothing to translate, and no reason to import the resolver for it.
+        return name
+    from control_plane.resolver.gguf_names import is_hub_gguf_blob, quant_token
+
     if name.startswith("hf://"):
         ref = name[len("hf://") :]
     elif is_hub_gguf_blob(name):
         ref = name
     else:
         return name
-    from control_plane.resolver.gguf_names import quant_token
 
     parts = ref.split("/")
     if len(parts) < 3:

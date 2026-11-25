@@ -114,3 +114,13 @@ class StubFit:
         kv_dtype: str,
     ) -> int:
         return 8192
+
+    def decode_tps_each(
+        self,
+        req: FitRequest,
+        nodes: list[NodeProfile],
+        users: int = 1,
+        *,
+        tflops: float | None = None,
+    ) -> float | None:
+        return 25.0

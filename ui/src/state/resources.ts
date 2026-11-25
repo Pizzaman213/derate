@@ -1,21 +1,26 @@
 import type { ProviderCatalogueModel } from '../api/types'
 import { useEffect, useState } from 'react'
-import { useKeyedResource, useResource } from './backend'
+import { useKeyedResource, useSharedResource } from './backend'
 
 // Poll intervals. Structure changes slowly; discovery is the one thing a person
 // is actively waiting on, so it is checked most often. Live numbers do not come
 // from here at all — they come from the stream.
+//
+// Every fixed read here is SHARED by name (`useSharedResource`): `useCluster`
+// is called from more than twenty components, and each one used to poll on
+// its own. A name is one read and one timer for the whole page, and a hidden
+// pane or a background browser tab does not poll it. The keyed hooks stay
+// per call site -- their keys are not unique across the app.
 
-export const useCluster = () => useResource((b) => b.cluster(), 5000)
-export const useTopology = () => useResource((b) => b.topology(), 5000)
-export const useCandidates = () => useResource((b) => b.candidates(), 3000)
-export const useRouting = () => useResource((b) => b.routing(), 5000)
-export const useProviders = () => useResource((b) => b.providers(), 15000)
+export const useCluster = () => useSharedResource('cluster', (b) => b.cluster(), 5000)
+export const useTopology = () => useSharedResource('topology', (b) => b.topology(), 5000)
+export const useCandidates = () => useSharedResource('candidates', (b) => b.candidates(), 3000)
+export const useRouting = () => useSharedResource('routing', (b) => b.routing(), 5000)
+export const useProviders = () => useSharedResource('providers', (b) => b.providers(), 15000)
 // A static table compiled into the server, not cluster state. Polled at the
-// laziest interval the hook offers rather than fetched once, because that is
-// the only shape useResource has -- the server marks it cacheable and the
-// browser will not re-ask on most of these ticks.
-export const useProviderKinds = () => useResource((b) => b.providerKinds(), 300000)
+// laziest interval the hook offers rather than fetched once -- the server
+// marks it cacheable and the browser will not re-ask on most of these ticks.
+export const useProviderKinds = () => useSharedResource('provider-kinds', (b) => b.providerKinds(), 300000)
 
 /** How one served name's recent requests were CALLED: streamed, or waited for
  *  whole. Only the cluster graph reads it, and only to colour the return leg.
@@ -91,35 +96,34 @@ export const useProviderCatalogues = (providerIds: string[]) => {
 // What is already in secrets.json, for the add-provider reference field to
 // offer. Names only. Polled lazily and re-fetched on invalidate(), which is
 // what makes a reference minted by the previous add show up in the next one.
-export const useProviderSecretRefs = () => useResource((b) => b.providerSecretRefs(), 300000)
-export const useSettings = () => useResource((b) => b.getSettings(), 5000)
+export const useProviderSecretRefs = () =>
+  useSharedResource('provider-secret-refs', (b) => b.providerSecretRefs(), 300000)
+export const useSettings = () => useSharedResource('settings', (b) => b.getSettings(), 5000)
+export const useGeoipPlaces = () => useSharedResource('geoip-places', (b) => b.geoipPlaces(), 30_000)
 // Only ever a row or two, and only while somebody is mid-install. Polled
 // rather than held in the card's own state so a second browser -- or a
 // refresh -- still sees the token that is currently live.
-export const useEnrollments = () => useResource((b) => b.enrollments(), 10000)
+export const useEnrollments = () => useSharedResource('enrollments', (b) => b.enrollments(), 10000)
 // The Chat tab's model list. `/v1/models` changes only when a deployment
 // crosses into or out of READY, or a provider refreshes its catalogue, so it
 // is polled at the lazy end -- but it is polled, because a model finishing its
 // launch while you are looking at the list is the case worth catching.
-export const useModels = () => useResource((b) => b.models(), 10000)
+export const useModels = () => useSharedResource('models', (b) => b.models(), 10000)
 
 // What the Serve button gates on, so it is polled fast: a two-second-old
 // allocatable figure is a different decision from a five-second-old one.
-export const useMemoryReport = () => useResource((b) => b.memory(), 2000)
+export const useMemoryReport = () => useSharedResource('memory', (b) => b.memory(), 2000)
 
 // A download's bar has to move, so this matches the memory poll rather than
 // the five-second cadence around it. Affordable at that rate for a reason the
 // storage hook below spells out in reverse: this endpoint reads a
 // process-local dict and the in-memory deployment list, with no fan-out to the
-// node agents and no syscalls. `useResource` does not deduplicate, so this is
-// mounted in exactly one place -- the sidebar's Activity section.
-export const useActivity = () => useResource((b) => b.activity(), 2000)
+// node agents and no syscalls.
+export const useActivity = () => useSharedResource('activity', (b) => b.activity(), 2000)
 // Standing conditions. 5s rather than the Activity section's 2s: an alert is
 // not a bar that has to move, and a node that has been down for three hours
-// does not become more true at a higher poll rate. Mounted in exactly one
-// place -- the sidebar's Alerts section -- because `useResource` does not
-// deduplicate.
-export const useAlerts = () => useResource((b) => b.alerts(), 5000)
+// does not become more true at a higher poll rate.
+export const useAlerts = () => useSharedResource('alerts', (b) => b.alerts(), 5000)
 // What is resident on one node's GPU. Only mounted while a node sheet is open,
 // and every poll costs an nvidia-smi call on that node, so it matches the
 // telemetry cadence rather than the 2s memory poll. `nodeId` empty means no
@@ -150,7 +154,11 @@ export const useNodeProcesses = (nodeId: string) =>
 // Same shape as `useNodeProcesses` below: resolve an empty payload rather than
 // skip the hook, since hooks cannot be called conditionally.
 export const useStorage = (enabled = true) =>
-  useResource((b) => (enabled ? b.storage() : Promise.resolve(null)), 30000)
+  useSharedResource(
+    enabled ? 'storage' : 'storage:off',
+    (b) => (enabled ? b.storage() : Promise.resolve(null)),
+    30000,
+  )
 
 // The capacity walk resolves models against the hub and is memoised server
 // side; polling it hard would buy nothing and cost the hub.
@@ -178,9 +186,9 @@ export const useCapacity = (
 
 // Static for the life of the process: it is the contract's own table, and it
 // answers with no ports wired. Fetched once, effectively.
-export const useQuantTable = () => useResource((b) => b.quantTable(), 3_600_000)
+export const useQuantTable = () => useSharedResource('quant-table', (b) => b.quantTable(), 3_600_000)
 // The curated shortlist changes only when someone edits fit/catalog.py.
-export const useCatalog = () => useResource((b) => b.catalog(), 3_600_000)
+export const useCatalog = () => useSharedResource('catalog', (b) => b.catalog(), 3_600_000)
 
 /** One list, one request.
  *
@@ -191,7 +199,7 @@ export const useCatalog = () => useResource((b) => b.catalog(), 3_600_000)
  *  the server holds the merge in SQLite and refreshes each source on its own
  *  cadence, so a poll here is one SELECT rather than four fetches and a
  *  cluster-wide disk walk. */
-export const useModelRegistry = () => useResource((b) => b.modelRegistry(), 10000)
+export const useModelRegistry = () => useSharedResource('model-registry', (b) => b.modelRegistry(), 10000)
 
 // Model detail and the variant ladder are deliberately NOT here. `useResource`
 // refires on every `revision` bump, so an open model would re-run its hub calls
@@ -202,7 +210,7 @@ export const useModelRegistry = () => useResource((b) => b.modelRegistry(), 1000
 
 // The runtime table is compiled into the server, plus whether each image is
 // on the coordinator. Fetched once per session, effectively.
-export const useRuntimes = () => useResource((b) => b.runtimes(), 3_600_000)
+export const useRuntimes = () => useSharedResource('runtimes', (b) => b.runtimes(), 3_600_000)
 
 // Profiles and pins are shared across browsers and admins, so they are polled
 // -- lazily: a second admin's save showing up within half a minute is enough,
@@ -213,7 +221,7 @@ export const useProfiles = (modelId: string | null) =>
     (b) => b.profiles(modelId ?? undefined).then((r) => r.profiles),
     30000,
   )
-export const usePins = () => useResource((b) => b.pins().then((r) => r.pins), 30000)
+export const usePins = () => useSharedResource('pins', (b) => b.pins().then((r) => r.pins), 30000)
 
 /** Benchmark records for one model, newest first. Polled every 3 s while any
  *  of them is launching or measuring -- a run moves through its states in

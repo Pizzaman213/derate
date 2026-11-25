@@ -21,7 +21,6 @@ from control_plane.contracts import NodeProfile
 from .client import AgentClient, HttpAgentClient
 from .config import (
     MDNS_BROWSE_SECONDS,
-    ROLE_AUTO,
     ROLE_COORDINATOR,
     ROLE_WORKER,
     RegistryConfig,

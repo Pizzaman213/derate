@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from control_plane.gateway import body as body_mod
 from control_plane.gateway import create_app, openai_api
 from tests.unit.conftest import BOOT_PASSWORD, credentials
 from tests.unit.test_gateway import (
@@ -280,3 +281,91 @@ def test_a_key_over_its_rpm_is_refused_before_its_body_is_parsed(monkeypatch):
     assert cooled.status_code == 429 and cooled.json()["error"]["code"] == "limit_exceeded"
     assert cooled.json()["error"]["limit_source"] == "key:rpm"
     assert len(raw) not in calls
+
+
+LONG_MODEL = "a" * (body_mod.MAX_MODEL_CHARS + 88)
+
+
+def _requests_rows(app) -> list:
+    rows: list = []
+    app.state.ctx.sink.request = rows.append
+    return rows
+
+
+def test_a_model_name_past_the_cap_is_refused_before_any_row_is_written():
+    """`model` landed verbatim in the trace's three name columns: a 25 MiB
+    name wrote a ~75 MiB journal row per refused request."""
+    from starlette.websockets import WebSocketDisconnect
+
+    app = create_app(build_deps())
+    with TestClient(app) as client:
+        rows = _requests_rows(app)
+        chat = client.post("/v1/chat/completions", json={**CHAT, "model": LONG_MODEL})
+        upload = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": LONG_MODEL}, files={"file": ("a.mp3", b"\x00\x01")},
+        )
+        voices = client.get("/v1/audio/voices", params={"model": LONG_MODEL})
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect(f"/v1/realtime?model={LONG_MODEL}") as ws:
+                ws.receive()
+        assert rows == []
+        at_cap = client.post("/v1/chat/completions", json={**CHAT, "model": "b" * body_mod.MAX_MODEL_CHARS})
+    for reply in (chat, upload, voices):
+        assert (reply.status_code, reply.json()["error"]["code"]) == (400, "invalid_request"), reply.text[:200]
+        assert LONG_MODEL not in reply.text
+    assert (caught.value.code, caught.value.reason) == (1008, "model_too_long")
+    # A name at the cap is an ordinary unknown model, recorded like any other.
+    assert at_cap.status_code == 404, at_cap.text[:200]
+    assert len(rows) == 1
+
+
+def test_a_prompt_batch_past_the_cap_is_a_400_and_leaks_no_slot():
+    backend = FakeBackend()
+    with RunningBackend(backend) as running:
+        app = create_app(build_deps(deployments=FakeDeployments(
+            [make_deployment("d-1", "llama", backend_url=running.base_url)]
+        )))
+        key = _mint(app, max_concurrent=1)
+        bearer = {"Authorization": f"Bearer {key}"}
+        with TestClient(app) as client:
+            over = client.post("/v1/completions", json={"model": "llama", "prompt": ["a"] * 129}, headers=bearer)
+            after = client.post("/v1/chat/completions", json=CHAT, headers=bearer)
+    assert over.status_code == 400, over.text[:200]
+    assert "at most 128" in over.json()["error"]["message"]
+    assert after.status_code == 200, after.text[:200]
+
+
+def _nested(levels: int) -> list:
+    value: list = []
+    for _ in range(levels - 1):
+        value = [value]
+    return value
+
+
+@pytest.mark.parametrize(
+    "levels, code",
+    [(body_mod.MAX_JSON_DEPTH - 1, 404), (body_mod.MAX_JSON_DEPTH, 400), (900, 400)],
+    ids=["at-the-cap", "one-past", "near-the-recursion-limit"],
+)
+def test_a_body_nested_past_the_depth_cap_is_a_400(levels, code):
+    """The body is level 1 and ``tools`` level 2, so *levels* of lists put the
+    deepest at 1 + levels. The estimates re-serialise ``tools`` recursively,
+    and a body one level under the C recursion limit used to be a 500."""
+    with TestClient(create_app(build_deps())) as client:
+        r = client.post("/v1/chat/completions", json={**CHAT, "model": "nope", "tools": _nested(levels)})
+    assert r.status_code == code, r.text[:200]
+    if code == 400:
+        assert r.json()["error"]["code"] == "invalid_json"
+
+
+def test_an_api_body_nested_near_the_recursion_limit_is_a_400():
+    """`read_json_object` caught ValueError only: a session's `POST
+    /api/downloads` nested just under the recursion limit parsed, then
+    `_refuse_non_finite` recursed past it, and the answer was a 500."""
+    import sys
+
+    raw = '{"a": ' + "[" * (sys.getrecursionlimit() - 30) + "]" * (sys.getrecursionlimit() - 30) + "}"
+    with TestClient(create_app(build_deps())) as client:
+        r = client.post("/api/downloads", content=raw, headers={"content-type": "application/json"})
+    assert r.status_code == 400, r.text[:200]

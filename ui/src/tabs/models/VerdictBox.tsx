@@ -4,7 +4,7 @@ import { Lamp } from '../../components/Lamp'
 import { OverrideGate } from '../../components/OverrideGate'
 import { Verbatim } from '../../components/Verbatim'
 import { useRouter } from '../../state/router'
-import { servesOnCluster } from '../../state/runtime'
+import { memoryPool, servesOnCluster } from '../../state/runtime'
 import { gbytes } from '../../format'
 import { claimFor } from './gates'
 import { NodeBars } from './NodeBars'
@@ -59,7 +59,7 @@ export function VerdictBox({ s, onAdvancedTab }: { s: ModelSession; onAdvancedTa
   const shown: FitResult | null = live ?? fit
   // Whether the picked runtime loads this file at all -- the same split the
   // quantization list draws, so the button and the list cannot disagree.
-  const loadable = variant ? partitionForRuntime([variant], s.runtime).servable.length > 0 : true
+  const loadable = variant ? partitionForRuntime([variant], s.runtime, s.formats).servable.length > 0 : true
   const word = planWord({
     running: running != null,
     routing: s.routing != null,
@@ -67,6 +67,7 @@ export function VerdictBox({ s, onAdvancedTab }: { s: ModelSession; onAdvancedTa
     variant,
     result,
     checking: s.checking,
+    hostPool: memoryPool(s.runtime) === 'host',
   })
 
   // Where, in words. A running deployment is a fact and wins over any plan.
@@ -330,7 +331,7 @@ export function VerdictBox({ s, onAdvancedTab }: { s: ModelSession; onAdvancedTa
 
       {s.pulled && !onCluster ? <Pulled reply={s.pulled} /> : null}
 
-      {onCluster && !s.routing && !running ? <NodeBars s={s} /> : null}
+      {onCluster && !s.routing ? <NodeBars s={s} /> : null}
     </section>
   )
 }

@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import recurrent
+
 # Sub-config keys that hold the language model when the top level is a wrapper
 # around a multimodal composite (Gemma 3, Llama 4, Llava, Qwen-Omni).
 #
@@ -273,6 +275,18 @@ class Mapped:
     # Sliding window
     sliding_window: int | None = None
     layers_with_full_attention: int | None = None
+    #: KV cache layers when a looped core is unrolled, or None for
+    #: ``num_layers``. A looped transformer (Inkling 2's `loop_config`) runs its
+    #: core several times per token and keeps a cache per VISIT -- llama.cpp
+    #: expands 24 blocks to 48 cache slots -- while the weights stay physical,
+    #: which is why this is not `num_layers`: the expert accounting reads that.
+    #: ``layers_with_full_attention`` counts slots too when this is set.
+    cache_layers: int | None = None
+
+    # Recurrent layers (resolver/recurrent.py): how many cache no tokens, and
+    # one sequence's fixed state over every layer that keeps one.
+    attention_free_layers: int = 0
+    recurrent_state_bytes: int = 0
 
     # MLA
     mla_latent_dim: int | None = None
@@ -404,6 +418,21 @@ def map_config(config: dict[str, Any]) -> Mapped:
             note += ". KV cache per token is charged against the stack named here"
             warnings.append(note)
 
+    # A pure state-space model (Mamba, Mamba-2, Falcon-Mamba) has no attention
+    # to count heads for, and refusing it for that would be refusing it for
+    # not having the one thing it does not need. Only when EVERY layer is
+    # recurrent: a hybrid missing its head count is still unreadable.
+    attention_free = False
+    if num_layers and hidden_size:
+        found = recurrent.from_config(cfg, num_layers, hidden_size)
+        attention_free = found is not None and found.attention_free_layers >= num_layers
+    if attention_free and num_heads is None:
+        num_heads = 1
+        warnings.append(
+            "no attention layer: every layer is recurrent, so no KV cache is "
+            "charged and the head count is recorded as 1"
+        )
+
     if num_layers is None or hidden_size is None or num_heads is None:
         missing = [
             name
@@ -432,7 +461,9 @@ def map_config(config: dict[str, Any]) -> Mapped:
     # Grouped-query attention. Absent means multi-head with no grouping, which
     # is num_kv_heads == num_attention_heads, not 1.
     kv_heads = _int(_first(cfg, _KV_HEAD_KEYS))
-    if kv_heads is None:
+    if kv_heads is None and attention_free:
+        kv_heads = 1
+    elif kv_heads is None:
         if cfg.get("multi_query") is True or cfg.get("multi_query_attention") is True:
             kv_heads = 1
             warnings.append(
@@ -528,9 +559,36 @@ def map_config(config: dict[str, Any]) -> Mapped:
     )
 
     _map_moe(cfg, mapped)
+    _map_recurrent(cfg, mapped)
     _map_sliding_window(cfg, mapped)
+    _map_loop(cfg, mapped)
     _map_mla(cfg, mapped)
+    _map_nested_dspark(root, mapped)
     return mapped
+
+
+def _map_nested_dspark(root: dict[str, Any], m: Mapped) -> None:
+    """A DSpark head declared in its own sub-config (Inkling 2's ``mtp_config``).
+
+    Same design as DeepSeek-V4's top-level ``dspark_*`` keys -- a block of
+    drafted tokens, a rank-256 markov head, the target layers it reads -- under
+    another name, so it was never detected and the speculative options said
+    nothing about it. Mapped onto the same fields, it is named and refused for
+    the same reason: nothing here has derived what the module weighs. The block
+    size and markov rank together are the signature; an ``mtp_config`` without
+    them is not this design and is left alone.
+    """
+    if m.dspark_block_size or m.dspark_target_layer_ids:
+        return
+    head = root.get("mtp_config")
+    if not isinstance(head, dict):
+        return
+    block, rank = _int(head.get("block_size")), _int(head.get("markov_rank"))
+    if not block or not rank:
+        return
+    m.dspark_block_size = block
+    m.dspark_markov_rank = rank
+    m.dspark_target_layer_ids = _int_tuple(head.get("target_layer_ids"))
 
 
 
@@ -597,6 +655,26 @@ def _map_moe(cfg: dict[str, Any], m: Mapped) -> None:
     m.moe_layer_indices = tuple(indices)
 
 
+def _map_recurrent(cfg: dict[str, Any], m: Mapped) -> None:
+    """Layers that keep a fixed-size state instead of a KV cache."""
+    found = recurrent.from_config(cfg, m.num_layers, m.hidden_size)
+    if found is None:
+        return
+    m.attention_free_layers = found.attention_free_layers
+    m.recurrent_state_bytes = found.state_bytes
+    m.warnings.append(found.note)
+
+
+_WINDOW_TYPE_TAGS = ("sliding", "window", "chunk", "local")
+
+
+def _is_windowed_type(layer_type: Any) -> bool:
+    """A `layer_types` entry for attention over a bounded window: Gemma and
+    GPT-OSS `sliding_attention`, Llama 4 `chunked_attention`."""
+    name = str(layer_type).lower()
+    return any(tag in name for tag in _WINDOW_TYPE_TAGS)
+
+
 def _map_sliding_window(cfg: dict[str, Any], m: Mapped) -> None:
     """Sliding window size and how many layers still cache the full context.
 
@@ -607,19 +685,39 @@ def _map_sliding_window(cfg: dict[str, Any], m: Mapped) -> None:
     layer_types = cfg.get("layer_types")
 
     # An explicit per-layer list is the only unambiguous source; use it first.
+    # Only a layer type that names a window is windowed. A recurrent type
+    # (linear_attention, mamba, conv) caches no tokens at all and is priced by
+    # `_map_recurrent`; one this build does not recognise is charged as full
+    # attention, which is the over-count in the refusing direction.
     if isinstance(layer_types, list) and layer_types:
-        full = sum(1 for t in layer_types if "full" in str(t).lower())
-        if full != len(layer_types):
-            m.sliding_window = window
-            m.layers_with_full_attention = full
-            if window is None:
-                m.sliding_window = 4096
-                m.warnings.append(
-                    "config interleaves windowed attention but names no window size; "
-                    "assumed 4096"
-                )
-            return
-        return  # every layer is full attention
+        windowed = sum(1 for t in layer_types if _is_windowed_type(t))
+        if not windowed:
+            return  # every attention layer caches the full context
+        m.sliding_window = window
+        m.layers_with_full_attention = max(
+            0, len(layer_types) - windowed - m.attention_free_layers
+        )
+        if window is None:
+            m.sliding_window = 4096
+            m.warnings.append(
+                "config interleaves windowed attention but names no window size; "
+                "assumed 4096"
+            )
+        return
+
+    # Inkling 2: the windowed ("local") layers by index; every other is global.
+    # Its window key is read only beside that list: a bare `sliding_window_size`
+    # would fall through to "every layer windowed" below, the under-charge.
+    local = cfg.get("local_layer_ids")
+    local_window = window or _int(cfg.get("sliding_window_size"))
+    if isinstance(local, list) and local and local_window:
+        window = local_window
+        flags = windowed_flags_from_ids(local, m.num_layers)
+        m.sliding_window = window
+        m.layers_with_full_attention = max(
+            0, flags.count(False) - m.attention_free_layers
+        )
+        return
 
     if cfg.get("use_sliding_window") is False:
         return  # key present but disabled, e.g. Qwen2.5
@@ -655,6 +753,72 @@ def _map_sliding_window(cfg: dict[str, Any], m: Mapped) -> None:
     # A bare sliding_window with no pattern means every layer is windowed.
     m.sliding_window = window
     m.layers_with_full_attention = 0
+
+
+def windowed_flags_from_ids(ids: list, num_layers: int) -> list[bool]:
+    """One windowed flag per layer from a list of windowed layer indices."""
+    local = {i for i in (_int(v) for v in ids) if i is not None}
+    return [i in local for i in range(num_layers)]
+
+
+def loop_cache_layers(
+    windowed: list[bool], start: int, end: int, passes: int
+) -> tuple[int, int] | None:
+    """(cache layers, full-attention cache layers) once a looped core is unrolled.
+
+    ``windowed`` is one flag per PHYSICAL layer; layers ``start`` to ``end``
+    (exclusive) run ``passes`` times per token and each visit keeps its own KV
+    cache. llama.cpp's own expansion: Inkling 2 Mini is 24 blocks with 6..17
+    looped three times, 48 cache slots, of which the 8 visits to its 4 global
+    layers cache the context and the other 40 the 1024-token window. None when
+    the loop does not describe these layers, so the caller keeps the physical
+    count rather than inventing one.
+    """
+    if passes < 1 or not 0 <= start < end <= len(windowed):
+        return None
+    extra = passes - 1
+    core = windowed[start:end]
+    return (
+        len(windowed) + extra * len(core),
+        windowed.count(False) + extra * core.count(False),
+    )
+
+
+def _map_loop(cfg: dict[str, Any], m: Mapped) -> None:
+    """A looped core's extra cache slots (Inkling 2's ``loop_config``).
+
+    Without it the 24 physical layers were charged, half the slots llama.cpp
+    allocates. The windowed flags come from ``local_layer_ids`` when the config
+    names them; otherwise every looped layer is charged the full context, which
+    over-counts in the refusing direction rather than under.
+    """
+    loop = cfg.get("loop_config")
+    if not isinstance(loop, dict):
+        return
+    start, end = _int(loop.get("core_start")), _int(loop.get("core_end"))
+    passes = _int(loop.get("num_passes"))
+    if start is None or end is None or passes is None or passes <= 1:
+        return
+    local = cfg.get("local_layer_ids")
+    if m.sliding_window and isinstance(local, list) and local:
+        flags = windowed_flags_from_ids(local, m.num_layers)
+    else:
+        flags = [False] * m.num_layers
+        if m.sliding_window:
+            m.warnings.append(
+                "looped core with a window but no per-layer list; every extra "
+                "pass is charged the full context"
+            )
+    unrolled = loop_cache_layers(flags, start, end, passes)
+    if unrolled is None:
+        m.warnings.append(
+            f"loop_config core {start}..{end} does not fit {m.num_layers} layers; "
+            "charged the physical layers only"
+        )
+        return
+    m.cache_layers, full = unrolled
+    if m.sliding_window:
+        m.layers_with_full_attention = full
 
 
 def _map_mla(cfg: dict[str, Any], m: Mapped) -> None:

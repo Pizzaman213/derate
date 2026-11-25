@@ -168,7 +168,12 @@ class TelemetrySample:
     utilization_pct: float
     gpu_memory_used: int = 0  # bytes attributable to GPU contexts
     gpu_process_count: int = 0
-    host_memory_total: int = 0  # unified pool, GB10 only
+    # Host RAM. On GB10 it IS the pool this node plans against; on a discrete
+    # box it is the separate host pool a host-pool runtime (llamacpp) spends,
+    # and it never enters the GPU figures above; on a CPU node it is the only
+    # memory there is. 0 = not read (an agent that predates the discrete read,
+    # or /proc/meminfo unreadable), never "full".
+    host_memory_total: int = 0
     host_memory_available: int = 0  # kernel's own "allocatable without swapping"
     swap_used: int = 0
     # Everything below defaults to None, never 0. On a machine with no GPU there
@@ -578,8 +583,8 @@ def read_memory_pressure() -> float | None:
     for line in text.splitlines():
         if not line.startswith("full "):
             continue
-        for field in line.split()[1:]:
-            key, _, value = field.partition("=")
+        for fld in line.split()[1:]:
+            key, _, value = fld.partition("=")
             if key == "avg10":
                 try:
                     return float(value)
@@ -884,6 +889,16 @@ async def read_telemetry(
             memory_total = memory_total or host.total
         elif not used_mib:
             memory_used = gpu_memory_used
+    elif profile.device_class is DeviceClass.DISCRETE:
+        # A separate pool, read so a host-pool runtime (llamacpp) can be
+        # budgeted against it -- `allocatable_bytes(pool="host")`. The GPU
+        # figures above are untouched: VRAM is still what this node plans a
+        # GPU runtime against, and host RAM does not constrain it.
+        host = read_host_memory()
+        if host is not None:
+            host_total = host.total
+            host_available = host.available
+            swap_used = host.swap_used
 
     return TelemetrySample(
         ts=ts,
@@ -904,13 +919,47 @@ async def read_telemetry(
     )
 
 
+#: The two values `RuntimeSpec.memory_pool` takes. Repeated here rather than
+#: imported: nothing in `registry/` imports `control_plane.deploy`, and every
+#: node runs this module.
+POOL_GPU = "gpu"
+POOL_HOST = "host"
+
+#: Device classes whose host RAM is a pool a host-pool runtime can be budgeted
+#: against. GB10 and APPLE are absent on purpose: there the GPU and the
+#: server would spend the same bytes, and this module budgets that pool as GPU
+#: memory. UNKNOWN is absent because nothing about it was identified.
+HOST_POOL_CLASSES = frozenset({DeviceClass.CPU, DeviceClass.DISCRETE})
+
+
+def _host_pool_bytes(profile: NodeProfile, sample: TelemetrySample | None) -> int:
+    """MemAvailable less ``cpu_host_reserve``, on a machine whose host RAM is
+    its own pool. 0 without a host reading: there is no host nameplate to
+    fall back to, so nothing is invented."""
+    if profile.device_class not in HOST_POOL_CLASSES:
+        return 0
+    if sample is None or sample.host_memory_available <= 0:
+        return 0
+    return max(
+        0, sample.host_memory_available - cpu_host_reserve(sample.host_memory_available)
+    )
+
+
 def allocatable_bytes(
     profile: NodeProfile,
     sample: TelemetrySample | None,
     guardrail: float = DEFAULT_GUARDRAIL,
     host_reserve: int = HOST_MEMORY_RESERVE,
+    pool: str = POOL_GPU,
 ) -> int:
     """How much memory a new model could actually get on this node, right now.
+
+    ``pool`` is the runtime's ``RuntimeSpec.memory_pool``: which memory the
+    model would be placed in. The answer is a different number for each, and
+    asking the wrong one is the bug this parameter exists to prevent -- a
+    llamacpp launch on a discrete box sized against VRAM it never touches.
+
+    ``pool="gpu"`` (every CUDA runtime) is what this function always was.
 
     ``NodeProfile.usable_memory`` answers a different and static question: what
     this hardware could ever spend, with nothing else running. That is the right
@@ -929,31 +978,35 @@ def allocatable_bytes(
     function needed a new branch rather than a new field. ``usable_memory`` is
     ``addressable_memory * guardrail``, which is 0 for a CPU node by
     construction and deliberately so -- ``addressable_memory`` means "bytes
-    reachable by the GPU" and there is no GPU. That 0 used to end the story:
-    every fit against such a node refused, which was correct while no runtime
-    here could run on one.
+    reachable by the GPU" and there is no GPU. So a CPU node's budget is
+    MemAvailable less a reserve -- the same shape as the GB10 line below, with
+    a reserve sized for the hardware (``config.cpu_host_reserve``; 8 GiB is
+    ~6% of a Spark's pool and the whole of a small Pi's). It answers that under
+    either pool, as it did before there was a pool to ask about.
 
-    The ``llamacpp`` runtime can, and it spends host RAM. So a CPU node's
-    budget is MemAvailable less a reserve -- the same shape as the GB10 line
-    below, with a reserve sized for the hardware (``config.cpu_host_reserve``;
-    8 GiB is ~6% of a Spark's pool and the whole of a small Pi's).
+    ``pool="host"`` (llamacpp) is host RAM, and only where host RAM is a pool
+    of its own (``HOST_POOL_CLASSES``): a CPU node, and a DISCRETE box, whose
+    VRAM and host RAM are separate, so MemAvailable less the same
+    ``cpu_host_reserve`` is exactly what a server on its CPU can spend. GB10,
+    APPLE and UNKNOWN answer 0 -- on a unified part the server and the GPU
+    would spend the same bytes, budgeted here as GPU memory, and
+    ``flags.placement_refusal`` refuses the pairing rather than accept 0.
 
-    Note what this does NOT do: it never reads a static ceiling. A GPU node
-    with no sample falls back to its nameplate, because a nameplate is a real
-    fact about a device that exists. A CPU node has no such number -- its
-    ceiling is 0 -- so an unsampled CPU node returns 0 and the live path drops
-    it, which is the honest answer. "Live memory degrades to static" is the
-    rule everywhere else in this project; here there is nothing to degrade to,
-    and the refusal says so rather than inventing a budget.
+    Note what the host answer does NOT do: it never reads a static ceiling. A
+    GPU node with no sample falls back to its nameplate, because a nameplate is
+    a real fact about a device that exists. Host RAM has no such number here,
+    so an unsampled host pool returns 0 and the live path drops it, which is
+    the honest answer. "Live memory degrades to static" is the rule everywhere
+    else in this project; here there is nothing to degrade to, and the refusal
+    says so rather than inventing a budget.
     """
+    if pool == POOL_HOST:
+        return _host_pool_bytes(profile, sample)
+
     ceiling = profile.usable_memory(guardrail)
 
     if profile.device_class is DeviceClass.CPU:
-        if sample is None or sample.host_memory_available <= 0:
-            return 0
-        return max(
-            0, sample.host_memory_available - cpu_host_reserve(sample.host_memory_available)
-        )
+        return _host_pool_bytes(profile, sample)
 
     if sample is None:
         return ceiling
@@ -975,6 +1028,7 @@ def allocatable_bytes_or_none(
     sample: TelemetrySample | None,
     guardrail: float = DEFAULT_GUARDRAIL,
     host_reserve: int = HOST_MEMORY_RESERVE,
+    pool: str = POOL_GPU,
 ) -> int | None:
     """:func:`allocatable_bytes`, with "nobody has measured this" left sayable.
 
@@ -991,10 +1045,16 @@ def allocatable_bytes_or_none(
     back to the ceiling *and says that is what it did* -- the branch
     ``FitCalculator._budget`` has always carried and nothing could reach,
     because the ceiling arrived as a number rather than as an absence.
+
+    Under ``pool="host"`` a sample that carries no host reading is absence
+    too: a discrete box's agent from before it read host RAM sends 0, and
+    answering 0 would report "no free memory" about a machine nobody asked.
     """
     if sample is None:
         return None
-    return allocatable_bytes(profile, sample, guardrail, host_reserve)
+    if pool == POOL_HOST and sample.host_memory_available <= 0:
+        return None
+    return allocatable_bytes(profile, sample, guardrail, host_reserve, pool)
 
 
 @dataclass

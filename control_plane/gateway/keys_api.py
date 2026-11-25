@@ -21,6 +21,7 @@ import asyncio
 import logging
 import math
 import time
+from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -35,9 +36,10 @@ from control_plane.contracts.auth import (
 )
 from control_plane.contracts import RoutingPolicy, TargetKind
 from control_plane.providers import UnknownProviderError
+from control_plane.telemetry import geoip, places, tailnet
 from control_plane.telemetry import query as tquery
 
-from . import authz, errors, serialize
+from . import authz, errors, request_route, serialize
 from .auth_api import (
     bad_request,
     json_object,
@@ -72,6 +74,8 @@ ORG_FIELDS = (
 
 #: The most ops one ``POST /api/wiring`` may carry.
 WIRING_MAX_OPS = 200
+#: How long a provider host's resolved address is reused by the route view.
+ROUTE_DNS_TTL_S = 600.0
 
 
 class WiringRefusal(Exception):
@@ -658,9 +662,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if arc is None:
             return _no_archive()
         frm, to = tquery.resolve_window(start or "-30d", end or None)
-        status_arg: int | str | None = _int(status)
-        if status_arg is None and status in ("ok", "failed"):
-            status_arg = status
+        status_arg = _status_arg(status)
         result = await asyncio.to_thread(
             tquery.requests_list,
             arc,
@@ -680,6 +682,187 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if format == "csv":
             return _csv_response(tquery.requests_csv(result["rows"]), "requests.csv")
         return JSONResponse(result)
+
+    @router.get("/api/requests/origins")
+    async def request_origins(
+        start: str = "",
+        end: str = "",
+        key_id: str = "",
+        model: str = "",
+        status: str = "",
+        error: str = "",
+        target_id: str = "",
+        provider_id: str = "",
+        retried: str = "",
+    ) -> Response:
+        """Where the requests ``/api/requests`` would list came from: one point
+        per place, and what could not be placed and why. Located at read time,
+        never stored. A missing database is a state in the body, never a 5xx."""
+        arc = archive()
+        if arc is None:
+            return _no_archive()
+        frm, to = tquery.resolve_window(start or "-30d", end or None)
+        ctx.geoip.reload_if_changed()
+        ctx.geoip_updater.ensure()
+        await ctx.tailnet.refresh()
+        rows = await asyncio.to_thread(
+            tquery.request_origins,
+            arc,
+            start=frm,
+            end=to,
+            key_id=key_id or None,
+            model=model or None,
+            status=_status_arg(status),
+            error=error or None,
+            target_id=target_id or None,
+            provider_id=provider_id or None,
+            retried=retried in ("1", "true"),
+        )
+        summary = geoip.summarize_origins(rows, _locate)
+        return JSONResponse(
+            {
+                **summary,
+                "database": ctx.geoip_updater.status(),
+                "attribution": {"text": geoip.ATTRIBUTION_TEXT, "url": geoip.ATTRIBUTION_URL},
+            },
+            headers={"cache-control": "no-store"},
+        )
+
+    def _locate(ip: str) -> geoip.Location | None:
+        """The one resolution order: a known place, then the database, then --
+        for a LAN or tailnet address the database cannot place -- what this
+        machine's tailscaled knows about where it and its peers are."""
+        found = ctx.geoip_places.match(ip) or ctx.geoip.lookup(ip)
+        if found is None and geoip.classify(ip) == "local":
+            found = tailnet.locate_local(ip, ctx.tailnet.snapshot, ctx.geoip.lookup)
+        return found
+
+    @router.get("/api/geoip")
+    async def geoip_lookup(ip: str = "") -> Response:
+        """Where one address is: a known place, else the database the request
+        map reads."""
+        ip = ip.strip()
+        if not ip:
+            return error_response(400, "ip is required.", "invalid_request_error", "missing_ip")
+        ctx.geoip.reload_if_changed()
+        await ctx.tailnet.refresh()
+        loc = _locate(ip)
+        return JSONResponse(
+            {
+                "ip": ip,
+                "kind": geoip.classify(ip),
+                "location": asdict(loc) if loc is not None else None,
+                "database": ctx.geoip_updater.status(),
+            },
+            headers={"cache-control": "no-store"},
+        )
+
+    # host -> (address or None, expiry). A route page resolves its providers'
+    # hosts on every view; a provider's address does not move that fast.
+    _resolved: dict[str, tuple[str | None, float]] = {}
+
+    def _resolve(host: str) -> str | None:
+        now = time.monotonic()
+        hit = _resolved.get(host)
+        if hit is None or hit[1] < now:
+            hit = (request_route.resolve_host(host), now + ROUTE_DNS_TTL_S)
+            _resolved[host] = hit
+        return hit[0]
+
+    def _node_address(node_id: str) -> str | None:
+        state = ctx.deps.registry.get_node(node_id)
+        return state.profile.address if state is not None else None
+
+    def _deployment_nodes(target_id: str) -> list[str] | None:
+        dep = ctx.deps.deployments.get(target_id)
+        if dep is None:
+            return None
+        return list(dep.plan.node_ids) if dep.plan else []
+
+    def _provider_url(provider_id: str) -> str | None:
+        try:
+            return ctx.deps.providers.get(provider_id).base_url
+        except UnknownProviderError:
+            return None
+
+    @router.get("/api/requests/route")
+    async def request_route_view(request_id: str = "") -> Response:
+        """The servers one request passed through, in order -- client, the
+        gateway node, each attempt's nodes or provider -- each placed the way
+        the request map places a client. A hop that cannot be placed says why."""
+        request_id = request_id.strip()
+        if not request_id:
+            return error_response(
+                400, "request_id is required.", "invalid_request_error", "missing_request_id"
+            )
+        arc = archive()
+        if arc is None:
+            return _no_archive()
+        # By id, at any time: an id names one request whatever window it is in.
+        found = await asyncio.to_thread(
+            tquery.requests_list, arc, start=0.0, end=math.inf, request_id=request_id, page_size=1
+        )
+        if not found["rows"]:
+            return not_found("request", request_id)
+        hops = request_route.route_hops(
+            found["rows"][0],
+            node_address=_node_address,
+            deployment_nodes=_deployment_nodes,
+            provider_url=_provider_url,
+        )
+        await asyncio.to_thread(request_route.resolve_hosts, hops, _resolve)
+        ctx.geoip.reload_if_changed()
+        await ctx.tailnet.refresh()
+        request_route.place_hops(hops, _locate)
+        return JSONResponse(
+            {"request_id": request_id, "hops": hops, "database": ctx.geoip_updater.status()},
+            headers={"cache-control": "no-store"},
+        )
+
+    def _places_response() -> Response:
+        known = ctx.geoip_places
+        return JSONResponse(
+            {"places": known.as_dicts(), "path": str(known.path), "error": known.error},
+            headers={"cache-control": "no-store"},
+        )
+
+    @router.get("/api/geoip/places")
+    async def geoip_places_get() -> Response:
+        """The operator's CIDR -> place table, and why it is empty when the
+        file could not be read."""
+        return _places_response()
+
+    @router.put("/api/geoip/places")
+    async def geoip_places_put(request: Request) -> Response:
+        """Replace the whole table: ``{"places": [{cidr, label, lat, lon}]}``.
+        A refusal names the row and the field."""
+        body = await json_object(request)
+        if isinstance(body, Response):
+            return body
+        try:
+            parsed = places.parse_places(body.get("places"))
+        except places.PlaceError as exc:
+            return error_response(400, str(exc), "invalid_request_error", "invalid_place")
+        known = ctx.geoip_places
+        before = len(known.places)
+        try:
+            known.save(parsed)
+        except OSError as exc:
+            return error_response(
+                503, f"Could not write {known.path}: {exc}", "server_error", "places_unwritable"
+            )
+        audit(
+            request, AuditAction.SETTINGS_CHANGED, "geoip_places", str(len(parsed)),
+            before={"places": before}, after={"places": len(parsed)},
+        )
+        return _places_response()
+
+    def _status_arg(status: str) -> int | str | None:
+        """``status`` as ``requests_list`` takes it: an int, ``"ok"``, ``"failed"``."""
+        value: int | str | None = _int(status)
+        if value is None and status in ("ok", "failed"):
+            value = status
+        return value
 
     # -- usage, audit ----------------------------------------------------------
 

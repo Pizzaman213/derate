@@ -59,6 +59,8 @@ class MetricsHub:
         # The engine's own load. Same body, same clock, third parse -- see
         # _sample_prefix_cache, which already fetches once and parses twice.
         self._load_prev: dict[str, metrics_scrape.EngineLoad] = {}
+        # When each baseline above was read, so a window knows its wall time.
+        self._load_prev_at: dict[str, float] = {}
         self._load: dict[str, dict[str, Any]] = {}
 
     # -- lifecycle ---------------------------------------------------------
@@ -128,6 +130,7 @@ class MetricsHub:
         """
         targets: list[tuple[str, str]] = []
         served: dict[str, str] = {}
+        deps: dict[str, Any] = {}
         for dep in self._deployments.list():
             # Only vLLM exports these series, and only a READY backend is
             # listening. sglang and tts would answer nothing useful and cost a
@@ -137,6 +140,7 @@ class MetricsHub:
             if dep.backend_url:
                 targets.append((dep.deployment_id, dep.backend_url))
                 served[dep.deployment_id] = dep.served_name
+                deps[dep.deployment_id] = dep
 
         # Concurrently, so one slow engine costs one timeout rather than
         # delaying every engine behind it.
@@ -150,6 +154,7 @@ class MetricsHub:
         seen_spec: dict[str, metrics_scrape.SpecDecode] = {}
         spec_frame: dict[str, dict[str, Any]] = {}
         seen_load: dict[str, metrics_scrape.EngineLoad] = {}
+        seen_load_at: dict[str, float] = {}
         load_frame: dict[str, dict[str, Any]] = {}
         prefix_hit: dict[str, float] = {}
 
@@ -177,20 +182,24 @@ class MetricsHub:
                     )
 
             load = metrics_scrape.engine_load(body)
+            now = time.monotonic()
             seen_load[deployment_id] = load
+            seen_load_at[deployment_id] = now
             previous_load = self._load_prev.get(deployment_id)
-            load_frame[deployment_id] = self._load_window(
-                load,
+            window = (
                 metrics_scrape.load_delta(previous_load, load)
                 if previous_load is not None
-                else None,
+                else None
             )
+            load_frame[deployment_id] = self._load_window(load, window)
 
-            if previous_load is not None:
-                self._remember_workload(
-                    served.get(deployment_id),
-                    metrics_scrape.load_delta(previous_load, load),
-                )
+            if window is not None:
+                self._remember_workload(served.get(deployment_id), window)
+                previous_at = self._load_prev_at.get(deployment_id)
+                if previous_at is not None:
+                    self._remember_decode(
+                        deps[deployment_id], window, now - previous_at
+                    )
 
             spec = metrics_scrape.spec_decode(body)
             seen_spec[deployment_id] = spec
@@ -208,6 +217,7 @@ class MetricsHub:
         self._spec_prev = seen_spec
         self._spec = spec_frame
         self._load_prev = seen_load
+        self._load_prev_at = seen_load_at
         self._load = load_frame
         self._prefix_hit = prefix_hit
         self._cache_hit_pct = (
@@ -250,6 +260,83 @@ class MetricsHub:
             )
         except Exception:
             log.debug("could not record the workload shape", exc_info=True)
+
+    def _remember_decode(self, dep, window, wall_s: float) -> None:
+        """File this window's decode rate as a ``DecodeRecord``.
+
+        The engine reports its own rate on every request and nothing used to
+        write it down; this is what the fit gate calibrates its efficiency
+        from. Only windows that measure ORDINARY decode on hardware the record
+        can be keyed to are written: a speculative deployment settles several
+        tokens per step, an eager one skips graph capture, and an image that
+        is not the default one is a runtime version nobody probed. A plan
+        across unlike GPUs has no single GPU to file it under.
+
+        The concurrency band is MEASURED: summed per-request decode seconds
+        over wall seconds is how many sequences were decoding at once, on
+        average, across the window.
+
+        Best effort and never raised into the metrics loop, same as
+        :meth:`_remember_workload`.
+        """
+        try:
+            rate = window.decode_tps
+            tokens = window.generation_tokens - window.decode_count
+            if rate is None or tokens < MIN_DECODE_TOKENS or wall_s <= 0:
+                return
+            if dep.speculative is not None or dep.speculative_tokens > 0:
+                return
+            if dep.enforce_eager or dep.image is not None:
+                return
+            plan = dep.plan
+            profiles = [
+                n.profile
+                for n in self._registry.list_nodes()
+                if n.profile.node_id in plan.node_ids
+            ]
+            if not profiles or len({p.gpu_name for p in profiles}) != 1:
+                return
+            bandwidth = min(p.memory_bandwidth_gbps for p in profiles)
+            if bandwidth <= 0:
+                return
+            # The version of the image THESE machines run, never the default
+            # image's: a 3090 window filed under the Spark's version would
+            # answer a Spark lookup. Unprobed, or machines on different images,
+            # is nothing to key it by, so nothing is written.
+            versions = {
+                measurements.image_version(dep.runtime or "vllm", p.arch)
+                for p in profiles
+            }
+            if len(versions) != 1 or "" in versions:
+                return
+            (version,) = versions
+
+            context = window.mean_decode_context_tokens or 0.0
+            measurements.save_decode(
+                measurements.DecodeRecord(
+                    model_id=dep.shape.model_id,
+                    gpu_name=profiles[0].gpu_name,
+                    memory_bandwidth_gbps=bandwidth,
+                    runtime_version=version,
+                    context_band=measurements.band(context),
+                    concurrency_band=measurements.band(window.decode_time_s / wall_s),
+                    decode_tps=round(rate, 2),
+                    tokens=tokens,
+                    decode_seconds=window.decode_time_s,
+                    requests=window.decode_count,
+                    predicted_tps=dep.fit.predicted_decode_tps if dep.fit else None,
+                    measured_at=time.time(),
+                    mean_context_tokens=context,
+                    kv_dtype=dep.kv_dtype or "",
+                    world=measurements.world_key(
+                        plan.tensor_parallel,
+                        plan.pipeline_parallel,
+                        plan.expert_parallel,
+                    ),
+                )
+            )
+        except Exception:
+            log.debug("could not record the decode rate", exc_info=True)
 
     @staticmethod
     def _load_window(

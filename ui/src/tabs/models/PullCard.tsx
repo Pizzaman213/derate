@@ -33,9 +33,8 @@ import { gbytes } from '../../format'
 export function PullCard({
   providerKinds,
 }: {
-  /** Polled once by the tab. `useResource` does not deduplicate, so mounting
-   *  `useProviderKinds` here as well would be a second interval for one
-   *  static table -- and two answers to "which providers can be pulled onto". */
+  /** Polled once by the tab and handed down, so there is one answer to
+   *  "which providers can be pulled onto" across the screen. */
   providerKinds?: ProviderKindSpec[] | null
 }) {
   const providers = useProviders()

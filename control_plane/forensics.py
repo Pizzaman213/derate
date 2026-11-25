@@ -289,6 +289,9 @@ def access_events(conn: sqlite3.Connection) -> Iterator[Event]:
         peer = r["peer_ip"] if "peer_ip" in r.keys() else None
         if peer and peer != r["client_ip"]:
             what += f" via {peer}"
+        n = r["count"] if "count" in have else None
+        if n and n > 1:
+            what += f" x{n}"
         what += _foreign(r, have, local)
         yield Event(
             ts=r["ts"],

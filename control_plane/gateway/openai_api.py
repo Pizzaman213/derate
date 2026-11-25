@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import math
-import re
 import time
 from collections import deque
 from dataclasses import replace
@@ -37,8 +36,8 @@ from control_plane.limits.service import MAX_OUTPUT_FIELDS
 from control_plane.telemetry import RequestTrace
 from control_plane.telemetry.records import spec_fields
 
-from . import authz, errors, policies, proxy as proxy_mod, realtime
-from .body import read_bounded_body
+from . import authz, errors, multipart, policies, proxy as proxy_mod, realtime
+from .body import depth_refusal, model_refusal, read_bounded_body
 from .media import media_url_refusal
 from .proxy import Attempt
 from .deps import GatewayContext
@@ -72,10 +71,6 @@ MAX_JSON_VALUES = 1 << 20
 #: context window comes near either.
 MAX_MESSAGES = 10_000
 MAX_CONTENT_PARTS = 10_000
-
-#: Parts one multipart upload may carry: a file and a handful of fields.
-#: `_field_span` walks them in Python, once per field it reads.
-MAX_FORM_PARTS = 64
 
 #: The window a key's request bodies are counted in (`_hold_body_slot`). A key
 #: may have its rpm's worth of bodies read per window, whatever becomes of
@@ -212,139 +207,19 @@ def _prefix_key(body: dict) -> str | None:
     return None
 
 
-class _AmbiguousBoundary(ValueError):
-    """The content-type names more than one ``boundary`` parameter.
-
-    Parsers disagree on which one wins (first here, last in most upstreams),
-    so the part the gateway authorises and the part the provider reads could
-    differ. Refused rather than guessed.
-    """
-
-
-def _boundary_of(content_type: str) -> bytes | None:
-    """The boundary token out of a multipart content-type header.
-
-    :class:`_AmbiguousBoundary` when the header names more than one.
-    """
-    found: bytes | None = None
-    seen = False
-    for part in content_type.split(";")[1:]:
-        key, _, value = part.strip().partition("=")
-        if key.strip().lower() == "boundary":
-            if seen:
-                raise _AmbiguousBoundary(content_type)
-            seen = True
-            token = value.strip().strip('"')
-            found = token.encode("latin-1") if token else None
-    return found
-
-
-class _DuplicateField(ValueError):
-    """A form field the gateway reads appears in more than one part."""
-
-
-class _TooManyParts(ValueError):
-    """An upload with more than `MAX_FORM_PARTS` parts: refused rather than
-    walked, since every field read walks them all."""
-
-
 #: Transcription answer formats that say how long the audio was: ``duration``
 #: (verbose_json) or ``usage.seconds`` (OpenAI's json). What a per-minute rate
 #: is charged on, so the only ones a per-minute-priced model is asked for.
 _DURATION_FORMATS = frozenset({"json", "verbose_json"})
 
 
-def _part_name(headers: bytes) -> str | None:
-    """The ``name`` parameter of a part's content-disposition, or None.
-
-    Only that header and only that parameter: ``filename="model"`` or a
-    ``name="model"`` in some other header is not the field. A part with two
-    content-disposition headers, or two ``name=`` parameters, is refused: the
-    upstream parser keeps the last where this one would read the first.
-    """
-    found: str | None = None
-    seen = False
-    for line in headers.split(b"\r\n"):
-        key, sep, value = line.partition(b":")
-        if not sep or key.strip().lower() != b"content-disposition":
-            continue
-        if seen:
-            raise _DuplicateField("content-disposition")
-        seen = True
-        names = _DISPOSITION_NAME.findall(value.decode("latin-1"))
-        if len(names) > 1:
-            raise _DuplicateField("content-disposition")
-        found = names[0].strip() if names else None
-    return found
-
-
-#: Quoted or bare, any case: upstream parsers accept ``name=model`` and
-#: ``NAME="model"`` both, so a second spelling must count as a second part.
-_DISPOSITION_NAME = re.compile(r';\s*name\s*=\s*"?([^";]*)"?', re.IGNORECASE)
-
-
-def _field_span(raw: bytes, content_type: str, name: str) -> tuple[str, int, int] | None:
-    """Find a simple form field: its value, and where the value sits in *raw*.
-
-    Deliberately not a general multipart parser. It reads the one text field
-    the gateway needs -- the model name -- and returns its byte span so the
-    value can be swapped without re-encoding the file part beside it. Anything
-    it does not understand it declines to find, and the caller answers with a
-    missing-parameter 400 rather than guessing.
-
-    A second part with the same name raises :class:`_DuplicateField`: the
-    gateway would authorise and price one value while the upstream's parser
-    takes the other.
-    """
-    boundary = _boundary_of(content_type)
-    if not boundary:
+def _no_actor(request: Request) -> Response | None:
+    """A 401 when the gate attached neither a key nor a session. Only
+    `AuthGuard` sets them, so this is the handlers failing closed should a
+    route ever be reached some other way."""
+    if authz.has_actor(request.scope):
         return None
-    delimiter = b"--" + boundary
-    cursor = 0
-    found: tuple[str, int, int] | None = None
-    for _ in range(MAX_FORM_PARTS + 1):
-        start = raw.find(delimiter, cursor)
-        if start < 0:
-            return found
-        cursor = start + len(delimiter)
-        head_end = raw.find(b"\r\n\r\n", cursor)
-        if head_end < 0:
-            return found
-        headers = raw[cursor:head_end]
-        body_start = head_end + 4
-        body_end = raw.find(b"\r\n" + delimiter, body_start)
-        if body_end < 0:
-            return found
-        part_name = _part_name(headers)
-        if part_name is not None and part_name.lower() == name.lower():
-            if found is not None:
-                raise _DuplicateField(name)
-            try:
-                found = raw[body_start:body_end].decode("utf-8"), body_start, body_end
-            except UnicodeDecodeError:
-                return None
-        cursor = body_end
-    raise _TooManyParts(MAX_FORM_PARTS)
-
-
-def _multipart_field(raw: bytes, content_type: str, name: str) -> str | None:
-    found = _field_span(raw, content_type, name)
-    return found[0].strip() if found else None
-
-
-def _rewrite_multipart_field(
-    raw: bytes, content_type: str, name: str, value: str
-) -> bytes | None:
-    """Swap one field's value, leaving every other byte alone.
-
-    Needed because a remote provider calls the model something else, and on
-    this path the name is inside the body rather than in a dict we can copy.
-    """
-    found = _field_span(raw, content_type, name)
-    if found is None:
-        return None
-    _, start, end = found
-    return raw[:start] + value.encode("utf-8") + raw[end:]
+    return authz.key_refused(AuthErrorCode.MISSING_API_KEY, "No API key was sent.")
 
 
 class _EngineSlot:
@@ -583,7 +458,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         session gate, for the UI, which holds a session and never a key.
 
         A key with an allowlist sees only its allowlist: the full catalogue
-        is the admin's business, not every key holder's."""
+        is the admin's business, not every key holder's, and nothing is
+        listed to a caller the gate did not identify."""
+        refused = _no_actor(request)
+        if refused is not None:
+            return refused
         index = ctx.router.index()
         created = int(ctx.started_at or time.time())
         data = []
@@ -611,7 +490,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return JSONResponse({"object": "list", "data": data})
 
     @router.get("/v1/key")
-    async def current_key(request: Request) -> JSONResponse:
+    async def current_key(request: Request) -> Response:
         """The calling key: what it is, what it may use, and how much is left.
 
         Never the secret or its hash -- ``ApiKey`` has neither -- and never
@@ -619,7 +498,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         """
         from .keys_api import usage_totals
 
-        principal: Principal = request.state.principal
+        principal: Principal | None = getattr(request.state, "principal", None)
+        if principal is None:
+            # A key's own record: a session alone is not enough here.
+            return authz.key_refused(AuthErrorCode.MISSING_API_KEY, "No API key was sent.")
         stores = ctx.auth_stores
         key, org = principal.key, principal.org
         now = time.time()
@@ -658,6 +540,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         request: Request, path: str, streaming_allowed: bool
     ) -> Response:
         """The JSON entry point: chat, completions, embeddings, audio/speech."""
+        refused = _no_actor(request)
+        if refused is not None:
+            return refused
         slot = _hold_body_slot(request)
         if isinstance(slot, Response):
             return slot
@@ -702,6 +587,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, "Request body must be a JSON object.",
                 "invalid_request_error", "invalid_json",
             )
+        refused = depth_refusal(body)
+        if refused is not None:
+            return refused
         # Before every walk over messages and parts below.
         too_big = _structure_refusal(body)
         if too_big is not None:
@@ -740,6 +628,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, "You must provide a 'model' parameter.",
                 "invalid_request_error", "missing_model",
             )
+        too_long = model_refusal(model)
+        if too_long is not None:
+            return too_long
 
         return await _serve(
             request,
@@ -765,6 +656,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         fails still has to be retryable.
         """
         content_type = request.headers.get("content-type", "")
+        refused = _no_actor(request)
+        if refused is not None:
+            return refused
         if not content_type.lower().startswith("multipart/form-data"):
             return errors.error_response(
                 400,
@@ -774,8 +668,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_content_type",
             )
         try:
-            _boundary_of(content_type)
-        except _AmbiguousBoundary:
+            multipart.boundary_of(content_type)
+        except multipart.AmbiguousBoundary:
             return errors.error_response(
                 400, "ambiguous multipart boundary",
                 "invalid_request_error", "invalid_request",
@@ -798,26 +692,36 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
 
         try:
-            model = _multipart_field(raw, content_type, "model")
+            model = multipart.read_field(raw, content_type, "model")
             # Read only to refuse a second one: the gateway prices the format
             # it reads, so two would let the upstream answer in the other.
-            _multipart_field(raw, content_type, "response_format")
-            _multipart_field(raw, content_type, "stream")
-        except _DuplicateField as exc:
+            multipart.read_field(raw, content_type, "response_format")
+            multipart.read_field(raw, content_type, "stream")
+        except multipart.DuplicateField as exc:
             return errors.error_response(
                 400, f"duplicate multipart field: {exc} -- send exactly one.",
                 "invalid_request_error", "invalid_request",
             )
-        except _TooManyParts:
+        except multipart.TooManyParts:
             return errors.error_response(
-                413, f"An upload may carry at most {MAX_FORM_PARTS} parts.",
+                413, f"An upload may carry at most {multipart.MAX_FORM_PARTS} parts.",
                 "invalid_request_error", "too_many_parts",
+            )
+        except multipart.MalformedPart:
+            return errors.error_response(
+                400,
+                "A multipart part header is malformed: headers end in CRLF, are not "
+                'folded, and name the field as name="..." (RFC 7578).',
+                "invalid_request_error", "invalid_request",
             )
         if not model:
             return errors.error_response(
                 400, "You must provide a 'model' parameter.",
                 "invalid_request_error", "missing_model",
             )
+        too_long = model_refusal(model)
+        if too_long is not None:
+            return too_long
 
         return await _serve(
             request,
@@ -997,7 +901,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                             body, raw_body = fb_body, None
                         elif content is not None and content_type is not None:
                             content = (
-                                _rewrite_multipart_field(content, content_type, "model", fallback)
+                                multipart.rewrite_field(content, content_type, "model", fallback)
                                 or content
                             )
                         decision, reservation = fb_decision, fb_reservation
@@ -1389,8 +1293,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     # for it to route.
                     rate = getattr(selection.model, "price_per_minute_usd", None)
                     if rate is not None and content is not None and content_type is not None:
-                        fmt = (_multipart_field(content, content_type, "response_format") or "json").lower()
-                        streamed = (_multipart_field(content, content_type, "stream") or "").lower() in ("true", "1")
+                        fmt = (multipart.read_field(content, content_type, "response_format") or "json").lower()
+                        streamed = (multipart.read_field(content, content_type, "stream") or "").lower() in ("true", "1")
                         if fmt not in _DURATION_FORMATS or streamed:
                             # Priced per minute, and only an unstreamed JSON
                             # answer says how many: text/srt/vtt, and an SSE
@@ -1418,7 +1322,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                             # dict we can copy, so it is spliced in place. Only
                             # the field's bytes move; the audio part beside it
                             # is untouched.
-                            rewritten = _rewrite_multipart_field(
+                            rewritten = multipart.rewrite_field(
                                 content,
                                 content_type,
                                 "model",
@@ -1839,6 +1743,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         `max_concurrent`, unpriced, and it leaves a `requests` row like any
         other /v1 call. The session route (`/api/chat/voices`) carries no key.
         """
+        refused = _no_actor(request)
+        if refused is not None:
+            return refused
         model = request.query_params.get("model")
         if not model:
             return errors.error_response(
@@ -1849,6 +1756,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "invalid_request_error",
                 "missing_model",
             )
+        too_long = model_refusal(model)
+        if too_long is not None:
+            return too_long
 
         principal: Principal | None = getattr(request.state, "principal", None)
         trace = RequestTrace(
@@ -2016,6 +1926,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         if principal is None:
             return
         model = websocket.query_params.get("model") or ""
+        if model_refusal(model) is not None:
+            await websocket.close(code=authz.CLOSE_POLICY, reason="model_too_long")
+            return
         trace = RequestTrace(
             request_id=getattr(websocket.state, "request_id", None) or authz.new_request_id(),
             served_name=model,

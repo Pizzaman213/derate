@@ -248,7 +248,7 @@ def test_uvicorn_is_configured_without_a_server_header(monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(gateway_main.uvicorn, "run", lambda app, **kw: seen.update(kw))
     monkeypatch.setattr(gateway_main, "create_app", lambda **kw: object())
-    gateway_main.main()
+    gateway_main.main([])
     assert seen["server_header"] is False
 
 

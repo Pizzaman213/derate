@@ -14,6 +14,8 @@
 // Order: $DERATE_CHECK_BROWSER, then the newest cached Chromium, then the
 // headless_shell twin, then nothing -- and "nothing" is a SKIP the runner
 // reports as a skip, never as a pass.
+//
+// Also imported by .omp/stubui/server.mjs (the agents' stub-UI MCP tool).
 
 import { existsSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'

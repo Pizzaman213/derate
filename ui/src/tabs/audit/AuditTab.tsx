@@ -2,7 +2,7 @@ import { useState, type FormEvent } from 'react'
 import type { AuditAction, AuditEntry, AuditPage } from '../../api/types'
 import { Icon } from '../../components/Icon'
 import { Verbatim } from '../../components/Verbatim'
-import { useKeyedResource } from '../../state/backend'
+import { ResourceScope, useKeyedResource } from '../../state/backend'
 import { ActorPanel } from './ActorPanel'
 import { AuditTable, Pager } from './AuditTable'
 import {
@@ -38,36 +38,11 @@ const RANGE_LABEL: Record<AuditRange, string> = {
  *  sub-tab (`ActorPanel`): that event in full, the addresses the actor acted
  *  from, the keys it created and everything else it ever did -- what you
  *  re-check after a suspected intrusion. One actor tab at a time; the log
- *  stays mounted underneath so its filters and page survive. */
+ *  stays mounted underneath so its filters and page survive, and stops
+ *  polling while the actor view covers it. */
 export function AuditTab() {
   const [view, setView] = useState<'log' | 'actor'>('log')
   const [open, setOpen] = useState<{ actor: string; entry: AuditEntry } | null>(null)
-  const [filter, setFilter] = useState<AuditFilter>({
-    actor: '',
-    action: '',
-    target: '',
-    range: '7d',
-    page: 1,
-  })
-  const [actorDraft, setActorDraft] = useState('')
-  const [targetDraft, setTargetDraft] = useState('')
-
-  const key = JSON.stringify(filter)
-  const page = useKeyedResource<AuditPage>(
-    key,
-    (b) => b.audit(auditQuery(filter, Date.now() / 1000)),
-    15000,
-  )
-
-  const apply = (patch: Partial<AuditFilter>) => setFilter((f) => ({ ...f, ...patch, page: patch.page ?? 1 }))
-  const commitText = (e?: FormEvent) => {
-    e?.preventDefault()
-    if (actorDraft.trim() === filter.actor && targetDraft.trim() === filter.target) return
-    apply({ actor: actorDraft.trim(), target: targetDraft.trim() })
-  }
-
-  const data = page.data
-  const pages = data ? pageCount(data.total, data.page_size || AUDIT_PAGE_SIZE) : 1
 
   return (
     <div className="card2">
@@ -109,100 +84,14 @@ export function AuditTab() {
       </div>
 
       <div id="au-log" role="tabpanel" aria-labelledby="au-tab-log" hidden={view !== 'log'}>
-        {/* No title or blurb: the Settings sub-tab already says "Audit log", and
-            the placeholders say what each box filters. One row -- filters on the
-            left, the window in the card's top-right corner -- all controls
-            centred on one line (check/alignment.mjs). On a phone it wraps. */}
-        <form
-          onSubmit={commitText}
-          style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'center', flexWrap: 'wrap' }}
-        >
-          <input
-            aria-label="Actor"
-            value={actorDraft}
-            onChange={(e) => setActorDraft(e.target.value)}
-            onBlur={() => commitText()}
-            placeholder="any admin"
-            autoComplete="off"
+        <ResourceScope active={view === 'log'}>
+          <AuditLog
+            onOpen={(e) => {
+              setOpen({ actor: e.actor, entry: e })
+              setView('actor')
+            }}
           />
-          <select
-            aria-label="Action"
-            className="mono"
-            value={filter.action}
-            onChange={(e) => apply({ action: e.target.value as AuditAction | '' })}
-          >
-            <option value="">any action</option>
-            {AUDIT_ACTIONS.map((a) => (
-              <option key={a} value={a}>
-                {a}
-              </option>
-            ))}
-          </select>
-          <input
-            aria-label="Target"
-            className="mono"
-            value={targetDraft}
-            onChange={(e) => setTargetDraft(e.target.value)}
-            onBlur={() => commitText()}
-            placeholder="key or model id"
-            autoComplete="off"
-          />
-          {/* Enter in either text field submits; the button is for a pointer. */}
-          <button type="submit">Filter</button>
-          {/* `.chips`' bottom margin is for sitting above a grid; here it would
-              hang the buttons above the inputs. */}
-          <span
-            className="chips"
-            role="group"
-            aria-label="Audit window"
-            style={{ margin: 0, marginLeft: 'auto' }}
-          >
-            {AUDIT_RANGES.map((r) => (
-              <button
-                type="button"
-                key={r}
-                aria-pressed={filter.range === r}
-                onClick={() => apply({ range: r })}
-              >
-                {RANGE_LABEL[r]}
-              </button>
-            ))}
-          </span>
-        </form>
-
-        <div style={{ marginTop: 'var(--space-12)' }}>
-          {page.error ? <Verbatim text={page.error.message} size="unit" /> : null}
-          {!data ? (
-            page.error ? null : (
-              <div className="unit" aria-busy="true" aria-live="polite">
-                Reading the audit log…
-              </div>
-            )
-          ) : data.entries.length === 0 ? (
-            <div className="unit">
-              No admin action matches these filters
-              {filter.range === 'all' ? '.' : ` in the last ${RANGE_LABEL[filter.range]}.`}
-            </div>
-          ) : (
-            <AuditTable
-              entries={data.entries}
-              onOpen={(e) => {
-                setOpen({ actor: e.actor, entry: e })
-                setView('actor')
-              }}
-            />
-          )}
-        </div>
-
-        {data && data.total > 0 ? (
-          <Pager
-            page={data.page}
-            pages={pages}
-            total={data.total}
-            noun={['entry', 'entries']}
-            onPage={(p) => apply({ page: p })}
-          />
-        ) : null}
+        </ResourceScope>
       </div>
 
       {open && view === 'actor' ? (
@@ -219,3 +108,126 @@ export function AuditTab() {
   )
 }
 
+/** The log pane: its filters, its page and its poll. A component of its own so
+ *  the poll sits inside the pane's `ResourceScope`. */
+function AuditLog({ onOpen }: { onOpen: (entry: AuditEntry) => void }) {
+  const [filter, setFilter] = useState<AuditFilter>({
+    actor: '',
+    action: '',
+    target: '',
+    range: '7d',
+    page: 1,
+  })
+  const [actorDraft, setActorDraft] = useState('')
+  const [targetDraft, setTargetDraft] = useState('')
+
+  const key = JSON.stringify(filter)
+  const page = useKeyedResource<AuditPage>(
+    key,
+    (b) => b.audit(auditQuery(filter, Date.now() / 1000)),
+    15000,
+  )
+
+  const apply = (patch: Partial<AuditFilter>) => setFilter((f) => ({ ...f, ...patch, page: patch.page ?? 1 }))
+  const commitText = (e?: FormEvent) => {
+    e?.preventDefault()
+    if (actorDraft.trim() === filter.actor && targetDraft.trim() === filter.target) return
+    apply({ actor: actorDraft.trim(), target: targetDraft.trim() })
+  }
+
+  const data = page.data
+  const pages = data ? pageCount(data.total, data.page_size || AUDIT_PAGE_SIZE) : 1
+
+  return (
+    <>
+      {/* No title or blurb: the Settings sub-tab already says "Audit log", and
+          the placeholders say what each box filters. One row -- filters on the
+          left, the window in the card's top-right corner -- all controls
+          centred on one line (check/alignment.mjs). On a phone it wraps. */}
+      <form
+        onSubmit={commitText}
+        style={{ display: 'flex', gap: 'var(--space-8)', alignItems: 'center', flexWrap: 'wrap' }}
+      >
+        <input
+          aria-label="Actor"
+          value={actorDraft}
+          onChange={(e) => setActorDraft(e.target.value)}
+          onBlur={() => commitText()}
+          placeholder="any admin"
+          autoComplete="off"
+        />
+        <select
+          aria-label="Action"
+          className="mono"
+          value={filter.action}
+          onChange={(e) => apply({ action: e.target.value as AuditAction | '' })}
+        >
+          <option value="">any action</option>
+          {AUDIT_ACTIONS.map((a) => (
+            <option key={a} value={a}>
+              {a}
+            </option>
+          ))}
+        </select>
+        <input
+          aria-label="Target"
+          className="mono"
+          value={targetDraft}
+          onChange={(e) => setTargetDraft(e.target.value)}
+          onBlur={() => commitText()}
+          placeholder="key or model id"
+          autoComplete="off"
+        />
+        {/* Enter in either text field submits; the button is for a pointer. */}
+        <button type="submit">Filter</button>
+        {/* `.chips`' bottom margin is for sitting above a grid; here it would
+            hang the buttons above the inputs. */}
+        <span
+          className="chips"
+          role="group"
+          aria-label="Audit window"
+          style={{ margin: 0, marginLeft: 'auto' }}
+        >
+          {AUDIT_RANGES.map((r) => (
+            <button
+              type="button"
+              key={r}
+              aria-pressed={filter.range === r}
+              onClick={() => apply({ range: r })}
+            >
+              {RANGE_LABEL[r]}
+            </button>
+          ))}
+        </span>
+      </form>
+
+      <div style={{ marginTop: 'var(--space-12)' }}>
+        {page.error ? <Verbatim text={page.error.message} size="unit" /> : null}
+        {!data ? (
+          page.error ? null : (
+            <div className="unit" aria-busy="true" aria-live="polite">
+              Reading the audit log…
+            </div>
+          )
+        ) : data.entries.length === 0 ? (
+          <div className="unit">
+            No admin action matches these filters
+            {filter.range === 'all' ? '.' : ` in the last ${RANGE_LABEL[filter.range]}.`}
+          </div>
+        ) : (
+          <AuditTable entries={data.entries} onOpen={onOpen} />
+        )}
+      </div>
+
+      {data && data.total > 0 ? (
+        <Pager
+          page={data.page}
+          pages={pages}
+          total={data.total}
+          noun={['entry', 'entries']}
+          onPage={(p) => apply({ page: p })}
+        />
+      ) : null}
+    </>
+  )
+}

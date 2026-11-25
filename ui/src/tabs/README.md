@@ -13,8 +13,8 @@ three panes from folders — `spend/OverviewSub`, `requests/RequestsSub` and
 it is the Settings → Audit log sub-tab, mounted by `SettingsTab.tsx`.
 
 Eight of them are mounted together and hidden with `hidden`, never unmounted, so a
-destination keeps its in-flight polls and its scroll position across a visit
-elsewhere. `SetupTab` and `LoginTab` are the exceptions, and both are early
+destination keeps its state, last data and scroll position across a visit
+elsewhere (its `ResourceScope` stops it polling while hidden). `SetupTab` and `LoginTab` are the exceptions, and both are early
 returns from `shell/AppShell.tsx`, drawn **above** the header, the roster rail
 and the sidebar. Its auth gate (`GET /api/auth/state`) draws `SetupTab` while
 no admin exists (or on `/setup`), and `LoginTab` for any path while an admin
@@ -436,9 +436,9 @@ to the list as an error.
 app.** `/api/providers` carries just the models the allowlist lets through, which
 is right for every other screen and is exactly why this tab could not be the
 place you choose from. `useProviderKinds` and `useProviders` are mounted once
-here and handed down for the same reason: `useResource` does not deduplicate, so
-a copy in the inspector and another in the pull card would be two intervals
-asking for one static table, and neither may answer differently.
+here and handed down so the inspector and the pull card render one value and
+can never answer differently. (Both hooks are shared by name, so a second call
+would not be a second request either.)
 
 **Every refusal is printed exactly as it arrives.** `SetupTab`'s launch error,
 `ChatTab`'s message, `ModelsTab`'s per-feed sentences, `ClusterTab`'s measurement

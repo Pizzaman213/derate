@@ -179,7 +179,19 @@ deployment inside the budget the fit gate cleared it for.
 
 `synthesize()` runs on a threadpool worker under `self._gpu_lock` and returns a
 1-D float32 array. `DEFAULT_MAX_NEW_TOKENS` is 512 — about 24 seconds at
-~21.5 frames/s, and the checkpoint's own `generation_config` default.
+~21.5 frames/s, and the checkpoint's own `generation_config` default — and
+`frame_limit` clamps whatever a request asks for to `self.window`.
+
+That clamp is what the fit gate's price rests on. The codec decodes the whole
+clip in one call, so the allocator's peak is linear in generated frames:
+measured on a 3090 for Audio8-TTS-Preview-0.6b, peak reserved over load
+reserved was 0.31 GB at 64 frames, 2.49 GB at 512 and 4.83 GB at 1024, while
+generating itself stays flat. The checkpoint never stops on its own, so every
+request runs to its limit. `resolver/support.py::TTS_WORKING_SETS` holds those
+numbers per architecture and the gateway charges them in `activations` for a
+clip as long as the window; with the gate charging the weights alone, the
+derived `--gpu-memory-utilization` capped a 24 GB card at 2.35 GiB and every
+synthesis died in `modeling_arktts_codec.py`.
 
 ### `_patch_reference_text_tag` removes seven garbage tokens
 

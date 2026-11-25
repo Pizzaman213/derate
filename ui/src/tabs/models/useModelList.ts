@@ -154,9 +154,8 @@ export function useModelList(
   const profiles = useProfiles(null)
   const registry = useModelRegistry()
   const providers = useProviders()
-  // Mounted once here for the same reason `providers` is: `useResource` does
-  // not deduplicate, so a copy in the pane and another in the pull card would
-  // be two intervals asking for one static table.
+  // Mounted once here for the same reason `providers` is: one value handed
+  // down, so the pane and the pull card cannot answer differently.
   const providerKinds = useProviderKinds()
   const pullTargets = pullableProviders(providers.data, providerKinds.data)
   // What the providers publish and are NOT serving. A second call per provider,

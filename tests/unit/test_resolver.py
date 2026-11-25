@@ -14,6 +14,7 @@ import os
 import struct
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -44,7 +45,7 @@ from control_plane.resolver import (
 )
 from control_plane.resolver.config_map import map_config, vision_config
 from control_plane.resolver.gguf import read_gguf_file
-from control_plane.resolver.params import analytic_breakdown
+from control_plane.resolver.params import analytic_breakdown, reconcile
 from control_plane.resolver.quant_detect import UnknownQuantization
 from control_plane.resolver.support import build_verdict, modality_for, sharding_notes
 from control_plane.resolver.types import ParamSource, QuantSource, SupportLevel
@@ -555,6 +556,41 @@ class TestParameterAccounting:
         assert any("mixed precision" in w for w in res.warnings)
 
 
+class TestDecodeReadParams:
+    """What one decoded token streams, which is not the model-card active count."""
+
+    @staticmethod
+    def _account(name):
+        config = load_config(name)
+        mapped = map_config(config)
+        breakdown = analytic_breakdown(mapped, vision_config(config))
+        return mapped, breakdown, reconcile(mapped, breakdown, None)
+
+    def test_an_untied_input_embedding_is_a_row_gather_and_drops_out(self):
+        _, breakdown, acc = self._account("llama-3.1-8b-awq")
+        assert acc.decode_read_params == acc.total_params - breakdown.embedding
+
+    def test_a_tied_embedding_is_the_head_and_every_token_reads_it(self):
+        _, _, acc = self._account("qwen3-embedding-0.6b")
+        assert acc.decode_read_params == acc.total_params
+
+    def test_a_tied_moe_keeps_its_head_and_drops_only_the_skipped_experts(self):
+        mapped, _, acc = self._account("granite-4.0-h-tiny")
+        skipped = int(
+            acc.routed_expert_params
+            * (1.0 - mapped.num_experts_per_token / mapped.num_experts)
+        )
+        assert acc.decode_read_params == acc.total_params - skipped
+        assert acc.decode_read_params > acc.active_params
+
+    def test_the_vision_tower_runs_at_prefill_and_is_not_read_per_token(self):
+        _, breakdown, acc = self._account("qwen2.5-vl-7b")
+        assert breakdown.vision > 0
+        assert acc.decode_read_params == (
+            acc.total_params - breakdown.vision - breakdown.embedding
+        )
+
+
 # --------------------------------------------------------------------------
 # Quantization detection.
 # --------------------------------------------------------------------------
@@ -654,6 +690,10 @@ def write_gguf(path: Path, metadata: dict, tensors: list[tuple[str, tuple[int, .
             out += struct.pack("<I", 7) + struct.pack("<?", value)
         elif isinstance(value, int):
             out += struct.pack("<I", 4) + struct.pack("<I", value)
+        elif isinstance(value, list) and value and all(isinstance(v, bool) for v in value):
+            # A per-layer flag array: llama.cpp's sliding_window_pattern.
+            out += struct.pack("<I", 9) + struct.pack("<IQ", 7, len(value))
+            out += struct.pack(f"<{len(value)}?", *value)
         elif isinstance(value, list):  # array of strings, the token vocabulary
             out += struct.pack("<I", 9) + struct.pack("<IQ", 8, len(value))
             for item in value:
@@ -826,6 +866,70 @@ def _small_gguf(path: Path) -> None:
         },
         [("token_embd.weight", (64, 32), 1)],
     )
+
+
+#: Inkling 2 Mini's own header facts: 24 blocks, layers 5, 11, 17 and 23 global
+#: and the rest windowed at 1024, blocks 6..17 looped three times.
+_INKLING_PATTERN = [i not in (5, 11, 17, 23) for i in range(24)]
+
+
+def _looped_gguf(path: Path, *, loop: bool = True, pattern: bool = True) -> None:
+    arch = "inkling2_loop"
+    meta = {
+        "general.architecture": arch,
+        "general.file_type": 18,
+        f"{arch}.block_count": 24,
+        f"{arch}.embedding_length": 2304,
+        f"{arch}.attention.head_count": 24,
+        f"{arch}.attention.head_count_kv": 8,
+        f"{arch}.attention.key_length": 128,
+        f"{arch}.vocab_size": 201024,
+        f"{arch}.attention.sliding_window": 1024,
+    }
+    if pattern:
+        meta[f"{arch}.attention.sliding_window_pattern"] = _INKLING_PATTERN
+    if loop:
+        meta |= {f"{arch}.loop.count": 3, f"{arch}.loop.start": 6, f"{arch}.loop.end": 18}
+    write_gguf(path, meta, [("token_embd.weight", (2304, 201024), 1)])
+
+
+class TestLoopedHybridGGUF:
+    """`inkling2_loop`: what llama.cpp allocates, not what block_count says.
+
+    The header names its windowed layers (`sliding_window_pattern`) and its
+    loop (`loop.*`), and llama.cpp keeps a cache per loop VISIT: 48 slots, 8 of
+    them global. Reading neither charged every layer as windowed -- 0.09 GiB of
+    KV at 131,072 tokens against the real 4.16, for a file the fit gate then
+    approved on that basis. Measured by llama-server: 32 KiB per token across
+    8 full-attention layers.
+    """
+
+    def _shape(self, tmp_path, **kw):
+        path = tmp_path / "inkling.gguf"
+        _looped_gguf(path, **kw)
+        return ModelResolver(cache=ShapeCache(directory=tmp_path / "c")).resolve_full(str(path)).shape
+
+    def test_a_looped_core_is_one_cache_slot_per_visit(self, tmp_path):
+        from control_plane.fit import kv
+
+        shape = self._shape(tmp_path)
+        assert (shape.num_layers, shape.layers_with_full_attention, shape.sliding_window) == (48, 8, 1024)
+        # 8 global slots x 4096 B per token, the rate llama-server prints.
+        per_token = kv.per_layer_per_token_bytes(shape, "fp16")
+        assert (kv.cached_layer_tokens(shape, 131072) - 40 * 1024) * per_token == 32 * 1024 * 131072
+
+    def test_the_window_list_is_read_without_a_loop(self, tmp_path):
+        shape = self._shape(tmp_path, loop=False)
+        assert (shape.num_layers, shape.layers_with_full_attention) == (24, 4)
+
+    def test_a_loop_with_no_window_list_keeps_the_stated_fallback(self, tmp_path):
+        """No per-layer list: the slots still count, and the existing
+        every-layer-windowed fallback keeps its warning."""
+        path = tmp_path / "inkling.gguf"
+        _looped_gguf(path, pattern=False)
+        res = ModelResolver(cache=ShapeCache(directory=tmp_path / "c")).resolve_full(str(path))
+        assert res.shape.num_layers == 48
+        assert any("not which layers" in w for w in res.warnings)
 
 
 class _CountingRangeClient:
@@ -1003,6 +1107,101 @@ class TestGGUFResolveFullRouting:
         assert res.from_cache
         assert res.shape.num_layers == 2
         assert client.calls == calls_after_warm
+
+
+def _q4_gguf(path: Path, tensors: list[tuple[str, tuple[int, ...], int]] | None = None) -> None:
+    """A Q4_K_M build llama.cpp's table maps (`llama` -> LlamaForCausalLM)."""
+    write_gguf(
+        path,
+        {
+            "general.architecture": "llama",
+            "general.file_type": 15,  # Q4_K_M
+            "llama.block_count": 2,
+            "llama.embedding_length": 256,
+            "llama.attention.head_count": 4,
+            "llama.attention.head_count_kv": 2,
+            "llama.vocab_size": 256,
+        },
+        tensors if tensors is not None else [("blk.0.attn_q.weight", (256, 256), 12)],
+    )
+
+
+class TestGGUFSupportAfterResolve:
+    def test_a_resolved_hub_gguf_has_its_architecture_on_record(self, tmp_path):
+        """The resolution was cached under the `hf://` id and `supported_by`
+        looked up the scheme-less `shape.model_id`, so every hub GGUF read
+        "no architecture on record" -- on llamacpp, the runtime built for it."""
+        path = tmp_path / "src.gguf"
+        _q4_gguf(path)
+        resolver = ModelResolver(
+            client=_CountingRangeClient(path.read_bytes()),
+            cache=ShapeCache(directory=tmp_path / "cache"),
+        )
+        res = resolver.resolve_full("hf://someone/repo-GGUF/model-Q4_K_M.gguf")
+        assert res.shape.model_id == "someone/repo-GGUF/model-Q4_K_M.gguf"
+        ok, reason = resolver.supported_by(res.shape, "llamacpp")
+        assert ok, reason
+        assert "no architecture on record" not in reason
+
+
+class TestSplitGGUF:
+    def _shards(self, tmp_path: Path) -> list[Path]:
+        names = [tmp_path / f"big-Q4_K_M-0000{i}-of-00003.gguf" for i in (1, 2, 3)]
+        _q4_gguf(names[0], [("blk.0.attn_q.weight", (256, 256), 12)])
+        for i, extra in enumerate(names[1:], start=1):
+            write_gguf(
+                extra,
+                {"general.architecture": "llama"},
+                [(f"blk.{i}.attn_q.weight", (256, 256), 12)],
+            )
+        return names
+
+    def test_every_shard_is_summed_not_only_the_first(self, tmp_path, resolver):
+        first = self._shards(tmp_path)[0]
+        res = resolver.resolve_gguf_full(str(first))
+        one_tensor = (256 * 256 // 256) * 144  # one Q4_K tensor's bytes
+        assert res.weight_bytes == 3 * one_tensor
+        assert res.shape.total_params == 3 * 256 * 256
+
+    def test_naming_a_later_shard_is_refused_with_the_first_ones_name(self, tmp_path, resolver):
+        second = self._shards(tmp_path)[1]
+        with pytest.raises(ModelNotFound, match="-00001-of-00003.gguf"):
+            resolver.resolve_gguf_full(str(second))
+
+
+class TestHybridGGUF:
+    def test_only_every_interval_th_layer_caches_the_full_context(self, tmp_path, resolver):
+        """qwen35 GGUFs mark one layer in four as full attention and the rest
+        as linear attention. Read as all-full, a 6.3 GiB Qwen3.8-27B file was
+        charged 713 GiB of KV cache; then as a 4096-token window, which still
+        priced a fixed state as if it grew with the context. The 48 linear
+        layers cache no token and hold a float32 state per sequence."""
+        path = tmp_path / "hybrid-Q4_K_M.gguf"
+        write_gguf(
+            path,
+            {
+                "general.architecture": "qwen35",
+                "general.file_type": 15,
+                "qwen35.block_count": 64,
+                "qwen35.embedding_length": 256,
+                "qwen35.attention.head_count": 24,
+                "qwen35.attention.head_count_kv": 4,
+                "qwen35.attention.key_length": 256,
+                "qwen35.full_attention_interval": 4,
+                "qwen35.ssm.conv_kernel": 4,
+                "qwen35.ssm.state_size": 128,
+                "qwen35.ssm.group_count": 16,
+                "qwen35.ssm.time_step_rank": 48,
+                "qwen35.ssm.inner_size": 6144,
+                "qwen35.vocab_size": 256,
+            },
+            [("blk.0.attn_q.weight", (256, 256), 12)],
+        )
+        shape = resolver.resolve_gguf(str(path))
+        assert shape.attention_layers == 16
+        assert shape.sliding_window is None
+        per_layer = (3 * (2 * 16 * 128 + 48 * 128) + 48 * 128 * 128) * 4
+        assert shape.recurrent_state_bytes == 48 * per_layer
 
 
 class TestWeightIndexArbitration:
@@ -1370,10 +1569,13 @@ class TestRuntimeSupport:
     def test_ggml_architecture_names_are_understood(self):
         assert build_verdict(("qwen2",), "bf16").for_runtime("vllm").ok
 
-    def test_nvfp4_needs_blackwell(self):
+    def test_nvfp4_runs_emulated_below_blackwell_and_says_so(self):
+        """It was "Blackwell only; no pre-Blackwell kernel" until a 3090
+        (sm_86) loaded nvidia/Qwen3-8B-NVFP4 and RedHatAI/Qwen3-8B-NVFP4 under
+        vLLM 0.31.0 through Marlin weight-only FP4, and both answered."""
         ok, problems = check_nodes("nvfp4", [WS_3090])
-        assert not ok and "sm_8.6" in problems[0]
-        assert check_nodes("nvfp4", list(GB10_PROFILES))[0]
+        assert ok and "emulated" in problems[0]
+        assert check_nodes("nvfp4", list(GB10_PROFILES)) == (True, [])
 
     def test_mxfp4_runs_emulated_below_blackwell_and_says_so(self):
         ok, problems = check_nodes("mxfp4", [WS_3090])
@@ -1392,9 +1594,28 @@ class TestRuntimeSupport:
     def test_supported_on_checks_the_nodes_too(self, resolver):
         shape = ModelShape(
             model_id="x/y", num_layers=4, hidden_size=64, num_attention_heads=4,
-            num_kv_heads=4, vocab_size=100, total_params=1_000_000, dtype="nvfp4",
+            num_kv_heads=4, vocab_size=100, total_params=1_000_000, dtype="awq_int4",
         )
-        assert not resolver.supported_on(shape, "vllm", [WS_3090])[0]
+        volta = replace(WS_3090, compute_capability="7.0")
+        assert not resolver.supported_on(shape, "vllm", [volta])[0]
+
+    @pytest.mark.parametrize("config, sidecar, method", [
+        # ModelOpt NVFP4 is `modelopt_fp4` (vLLM's floor sm_75), not
+        # `modelopt` (sm_80): read wrong, a T4 is refused a checkpoint it loads.
+        ({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}, None,
+         "modelopt_fp4"),
+        ({}, {"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "NVFP4"}},
+         "modelopt_fp4"),
+        ({}, {"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "FP8"}},
+         "modelopt"),
+        ({"quantization_config": {"quant_method": "compressed_tensors"}}, None,
+         "compressed-tensors"),
+        ({"torch_dtype": "bfloat16"}, None, ""),
+    ])
+    def test_the_vllm_loader_is_named_the_way_vllm_names_it(self, config, sidecar, method):
+        from control_plane.resolver.quant_detect import vllm_quant_method
+
+        assert vllm_quant_method(config, sidecar) == method
 
     def test_sharding_notes_flag_indivisible_kv_heads(self):
         notes = sharding_notes(LLAMA_3_3_70B, 3)
@@ -1879,9 +2100,7 @@ class TestArmRepackAndLSuffixes:
         assert not unknown, f"unmapped schemes: {unknown}"
 
 
-from control_plane.resolver.support import build_verdict  # noqa: E402
 from control_plane.resolver.types import (  # noqa: E402
-    ParamSource,
     QuantSource,
     Resolution,
 )
@@ -1916,6 +2135,13 @@ class TestQuantVariants:
                 {"id": "acme/Widget-7B-Thinking-2507-GGUF", "downloads": 999},
                 # Apple silicon; nothing in this cluster loads it.
                 {"id": "acme/Widget-7B-mlx", "downloads": 50},
+                # bartowski's `<source-org>_<model>` convention: the same
+                # model, found only by accepting the source org as a prefix.
+                {"id": "bartowski/acme_Widget-7B-GGUF", "downloads": 200, "tags": ["gguf"]},
+                # ...and a different org's model under the same convention.
+                {"id": "bartowski/other_Widget-7B-GGUF", "downloads": 190, "tags": ["gguf"]},
+                # A GGUF repo whose tag maps to a non-GGUF scheme.
+                {"id": "tagger/Widget-7B-GGUF", "downloads": 100, "tags": ["gguf", "mxfp4_moe"]},
             ]
 
         def read_range(self, model_id, filename, start, length, revision="main"):
@@ -1926,6 +2152,24 @@ class TestQuantVariants:
         def model_info(self, model_id, revision="main"):
             from control_plane.resolver.hf import ModelInfo
 
+            if model_id in ("bartowski/acme_Widget-7B-GGUF", "bartowski/other_Widget-7B-GGUF"):
+                prefix = model_id.split("/")[1].split("-")[0]
+                files = {
+                    f"{prefix}-7B-Q6_K.gguf": 6_000_000_000,
+                    # bartowski's importance matrix: led by the org, not by
+                    # "imatrix", and a 0.1 GB row that fits anywhere.
+                    f"{prefix}-7B-imatrix.gguf": 100_000_000,
+                    # ...and a real quantization that says how it was made.
+                    f"{prefix}-7B-IQ4_XS-imatrix.gguf": 4_100_000_000,
+                }
+                return ModelInfo(
+                    model_id, "sha", tuple(files), None, None, (), file_sizes=files
+                )
+            if model_id == "tagger/Widget-7B-GGUF":
+                files = {"Widget-7B.MXFP4_MOE.gguf": 4_200_000_000}
+                return ModelInfo(
+                    model_id, "sha", tuple(files), None, None, (), file_sizes=files
+                )
             if model_id == "acme/Widget-7B-GGUF-v2":
                 files = {"Widget-7B-Q5_K_M.gguf": 5_100_000_000}
                 return ModelInfo(
@@ -1961,6 +2205,14 @@ class TestQuantVariants:
                 "imatrix.gguf": 20_000_000,
                 # A real quantization whose name says nothing recognisable.
                 "Widget-7B-special.gguf": 3_100_000_000,
+                # DSpark speculative heads, in each spelling the hub uses.
+                # Small, and not a build of this model.
+                "dspark-Widget-7B-Q8_0.gguf": 300_000_000,
+                "dspark/dspark-Widget-7B-BF16.gguf": 600_000_000,
+                "Widget-7B-DSpark-Q8_0.gguf": 330_000_000,
+                # Two builds of one scheme, which `quant_token` names alike.
+                "Widget-7B-AD-Q6_K.gguf": 6_100_000_000,
+                "Widget-7B-Q6_K.gguf": 6_000_000_000,
             }
             return ModelInfo(
                 model_id, "sha", tuple(files), None, None, (), file_sizes=files
@@ -2145,7 +2397,9 @@ class TestQuantVariants:
         variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
         files = [v.gguf_file or "" for v in variants]
         assert not [f for f in files if "mmproj" in f]
-        assert not [f for f in files if f.endswith("imatrix.gguf")]
+        assert not {"imatrix.gguf", "acme_Widget-7B-imatrix.gguf"} & set(files)
+        # Only the calibration file goes: a quantization naming its imatrix stays.
+        assert "acme_Widget-7B-IQ4_XS-imatrix.gguf" in files
 
     def test_a_file_whose_name_says_nothing_is_read_not_dropped(self, monkeypatch):
         """The header is the file's own account of itself.
@@ -2192,6 +2446,81 @@ class TestQuantVariants:
         variants = resolver.quant_variants("acme/Widget-7B-GGUF")
         assert [v.source for v in variants] == ["self"]
         assert resolver.client.searched == []
+
+    def test_speculative_draft_heads_are_never_offered(self, monkeypatch):
+        """A 0.6 GiB DSpark head priced as the whole model fits anywhere, and
+        `_recommend` then named it the best BF16 build of a 48 GiB model."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        assert not [v for v in variants if "dspark" in (v.gguf_file or "").lower()]
+        small = [
+            v for v in variants
+            if v.repo_id == "acme/Widget-7B-GGUF" and v.file_bytes is not None
+            and v.file_bytes < 1e9
+        ]
+        assert not small, [(v.gguf_file, v.file_bytes) for v in small]
+
+    def test_a_requantizer_that_prefixes_the_source_org_is_found(self, monkeypatch):
+        """bartowski names a requantization `<source-org>_<model>-GGUF`; only
+        the source model's own org is accepted as that prefix."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        ours = [v for v in variants if v.repo_id == "bartowski/acme_Widget-7B-GGUF"]
+        assert "Q6_K" in [v.label for v in ours if v.gguf_file], ours
+        assert not [v for v in variants if v.repo_id == "bartowski/other_Widget-7B-GGUF"]
+
+    def test_a_gguf_repo_tag_is_not_offered_as_a_repository_build(self, monkeypatch):
+        """`mxfp4_moe` on a GGUF repo describes one of its files. A repository
+        row read off it claimed a launchable safetensors build with no size."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        tagged = [v for v in variants if v.repo_id == "tagger/Widget-7B-GGUF"]
+        assert not [v for v in tagged if v.gguf_file is None], tagged
+        assert [v for v in tagged if v.gguf_file == "Widget-7B.MXFP4_MOE.gguf"]
+
+    def test_two_builds_of_one_scheme_in_one_repo_get_distinct_labels(
+        self, monkeypatch
+    ):
+        """The UI names a row by `(repo_id, label)`, so a shared label put the
+        recommendation pill on the wrong row, or on several."""
+        variants = self._resolver(monkeypatch).quant_variants("acme/Widget-7B-GGUF")
+        q6 = {
+            v.label for v in variants
+            if v.gguf_file in ("Widget-7B-AD-Q6_K.gguf", "Widget-7B-Q6_K.gguf")
+        }
+        assert q6 == {"AD-Q6_K", "Q6_K"}
+        files = [v for v in variants if v.gguf_file]
+        assert len({(v.repo_id, v.label) for v in files}) == len(files)
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        (
+            ["Inkling-2-Mini-AD-IQ2_XXS-Q2.gguf", "Inkling-2-Mini-AD-IQ2_XXS.gguf"],
+            ["IQ2_XXS-Q2", "IQ2_XXS"],
+        ),
+        (
+            ["Inkling-2-Mini-AD-Q6_K.gguf", "Inkling-2-Mini-Q6_K.gguf"],
+            ["AD-Q6_K", "Q6_K"],
+        ),
+        (
+            [
+                "Inkling-2-Mini-NVFP4-Lite.gguf",
+                "Inkling-2-Mini-NVFP4-XL.gguf",
+                "Inkling-2-Mini-NVFP4.gguf",
+            ],
+            ["NVFP4-Lite", "NVFP4-XL", "NVFP4"],
+        ),
+        (["a/M-Q4_K_M.gguf", "b/M-Q4_K_M.gguf"], ["a/M-Q4_K_M", "b/M-Q4_K_M"]),
+    ],
+)
+def test_distinct_labels(files, expected):
+    """The real collisions on `thinkingmachines/Inkling-2-Mini`, and one basename
+    in two folders. Each group shares a `quant_token`, plus one untouched row."""
+    from control_plane.resolver import gguf_names
+
+    labels = [gguf_names.quant_token(f) for f in files] + ["UD-Q4_K_XL"]
+    assert len(set(labels[:-1])) == 1
+    out = gguf_names.distinct_labels(labels, files + ["M-UD-Q4_K_XL.gguf"])
+    assert out == expected + ["UD-Q4_K_XL"]
 
 
 class TestHeaderProbeBudget:

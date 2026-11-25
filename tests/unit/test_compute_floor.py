@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
-import threading
 import time
 
 import pytest
 
 from control_plane import computeprobe, measurements
-from control_plane.contracts.model import ModelShape
 from control_plane.fit.calculator import prefill_floor_seconds
 from tests.unit.test_speculative import _client, _plan_body
 

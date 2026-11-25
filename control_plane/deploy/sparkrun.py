@@ -37,7 +37,7 @@ from control_plane.contracts import (
 )
 
 from .flags import KNOBS_BY_NAME, RuntimeSpec, runtime_spec, sparkrun_binary
-from .recipes import RecipeSpec, materialize, synthesize
+from .recipes import RecipeSpec, fabric_on_every_node, materialize, synthesize
 from . import progress
 
 from control_plane.paths import data_dir
@@ -394,6 +394,8 @@ class SparkrunAdapter:
         trust_remote_code: bool = False,
         engine_options: EngineOptions = EngineOptions(),
         original_window: int | None = None,
+        gguf_base: str | None = None,
+        gguf_projector: str | None = None,
         image: str | None = None,
     ) -> RecipeSpec:
         return synthesize(
@@ -438,11 +440,30 @@ class SparkrunAdapter:
             trust_remote_code=trust_remote_code,
             engine_options=engine_options,
             original_window=original_window,
+            gguf_base=gguf_base,
+            gguf_projector=gguf_projector,
             # The deployment's own image, picked for the architecture of the
             # machines it lands on (manager._image_for). None is the runtime's
             # default, which is what every launch ran before there was a choice.
             image=image,
+            # Whether every machine can be handed /dev/infiniband. The recipe
+            # names the device for all hosts or for none, and a host without
+            # it is a `docker run` that fails before the container exists.
+            infiniband=fabric_on_every_node(self._profiles_for(plan.node_ids)),
         )
+
+    def _profiles_for(self, node_ids: Sequence[str]) -> list[Any]:
+        """The registry's profile for each node it knows; an unknown one is
+        left out, which reads as "no evidence against the device"."""
+        out: list[Any] = []
+        for node_id in node_ids:
+            try:
+                state = self.registry.get_node(node_id) if self.registry else None
+            except Exception:
+                state = None
+            if state is not None:
+                out.append(state.profile)
+        return out
 
     def render_command(
         self,
@@ -468,6 +489,8 @@ class SparkrunAdapter:
         trust_remote_code: bool = False,
         engine_options: EngineOptions = EngineOptions(),
         original_window: int | None = None,
+        gguf_base: str | None = None,
+        gguf_projector: str | None = None,
     ) -> list[str]:
         """The exact argv that will run. Pure: no subprocess, no filesystem.
 
@@ -491,6 +514,8 @@ class SparkrunAdapter:
             trust_remote_code=trust_remote_code,
             engine_options=engine_options,
             original_window=original_window,
+            gguf_base=gguf_base,
+            gguf_projector=gguf_projector,
         )
 
         values: dict[str, Any] = {
@@ -560,6 +585,8 @@ class SparkrunAdapter:
         trust_remote_code: bool = False,
         engine_options: EngineOptions = EngineOptions(),
         original_window: int | None = None,
+        gguf_base: str | None = None,
+        gguf_projector: str | None = None,
         image: str | None = None,
     ) -> LaunchResult:
         """Run the invocation and parse the handle back out.
@@ -594,6 +621,8 @@ class SparkrunAdapter:
             trust_remote_code=trust_remote_code,
             engine_options=engine_options,
             original_window=original_window,
+            gguf_base=gguf_base,
+            gguf_projector=gguf_projector,
             image=image,
         )
         materialize(recipe)

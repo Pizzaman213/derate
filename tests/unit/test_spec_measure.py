@@ -24,6 +24,7 @@ from control_plane import head_scan, measurements, metrics_scrape
 from control_plane.contracts import ModelShape, SpeculativeMethod, SpeculativeSpec
 from control_plane.fit.calculator import (
     draft_ratio,
+    predict_decode_tps,
     speculative_best_k,
     speculative_decode_tps_range,
     speculative_overhead,
@@ -300,7 +301,7 @@ def test_a_cache_window_is_a_difference_and_never_goes_negative():
 
 def _range_and_base(k: int, draft_params: int):
     spec = SpeculativeSpec(SpeculativeMethod.MTP, k, 0, draft_params)
-    lo, hi = speculative_decode_tps_range(SHAPE, 273.0, 0.0, spec)
+    lo, hi = speculative_decode_tps_range(predict_decode_tps(SHAPE, 273.0, 0.0), SHAPE, spec)
     ratio = draft_ratio(SHAPE, draft_params)
     return lo, hi, ratio, lo * speculative_overhead(k, ratio)
 
@@ -939,7 +940,7 @@ def test_a_batched_plan_says_the_range_is_for_one_sequence(seqs):
         draft_params=200_000_000, draft_bytes=400_000_000,
     )
     _, _, reason = FitCalculator()._speculative_range(
-        _fit_request(seqs, spec), _spec_shape(), 273.0, 1e9, 25.0
+        _fit_request(seqs, spec), _spec_shape(), 25.0
     )
     assert "per sequence" in reason
     assert f"sized for {seqs}" in reason
@@ -955,7 +956,7 @@ def test_a_single_stream_plan_does_not_carry_the_batch_clause():
         draft_params=0, draft_bytes=0,
     )
     _, _, reason = FitCalculator()._speculative_range(
-        _fit_request(1, spec), _spec_shape(), 273.0, 1e9, 25.0
+        _fit_request(1, spec), _spec_shape(), 25.0
     )
     assert "per sequence" in reason
     assert "sized for" not in reason
@@ -965,7 +966,7 @@ def test_asking_for_no_speculation_still_adds_nothing():
     from control_plane.fit.calculator import FitCalculator
 
     assert FitCalculator()._speculative_range(
-        _fit_request(16, None), _spec_shape(), 273.0, 1e9, 25.0
+        _fit_request(16, None), _spec_shape(), 25.0
     ) == (None, None, "")
 
 
@@ -1171,6 +1172,54 @@ def test_a_decode_record_round_trips_and_a_miss_is_empty(tmp_path):
     ) == [], "and so is a different runtime"
 
 
+def _decode_record(**kw):
+    from control_plane.measurements import DecodeRecord
+
+    base = dict(
+        model_id="Qwen/Qwen3-0.6B", gpu_name="NVIDIA GB10",
+        memory_bandwidth_gbps=273.0, runtime_version="0.28.1rc1",
+        context_band=256, concurrency_band=1, decode_tps=100.0, tokens=1000.0,
+        decode_seconds=10.0, requests=4.0, predicted_tps=61.47, measured_at=1.0,
+        mean_context_tokens=300.0,
+    )
+    base.update(kw)
+    return DecodeRecord(**base)
+
+
+def test_windows_on_one_key_accumulate_into_one_rate(tmp_path):
+    """A window clips in-flight requests at both edges; summing windows is
+    what shrinks that error, so the rate is re-derived from the sums."""
+    from control_plane.measurements import load_decode_all, save_decode
+
+    save_decode(_decode_record(), directory=tmp_path)
+    save_decode(
+        _decode_record(
+            decode_tps=150.0, tokens=3000.0, decode_seconds=20.0,
+            mean_context_tokens=400.0, measured_at=2.0,
+        ),
+        directory=tmp_path,
+    )
+
+    [merged] = load_decode_all(directory=tmp_path)
+    assert merged.tokens == 4000.0
+    assert merged.decode_seconds == 30.0
+    assert merged.decode_tps == pytest.approx(4000.0 / 30.0, abs=0.01)
+    assert merged.mean_context_tokens == pytest.approx(375.0)
+    assert merged.measured_at == 2.0
+
+
+def test_a_sharded_plan_never_matches_a_single_rank_record(tmp_path):
+    from control_plane.measurements import matching_decode, save_decode, world_key
+
+    save_decode(_decode_record(), directory=tmp_path)
+    assert matching_decode(
+        "Qwen/Qwen3-0.6B", world=world_key(2, 1, 1), directory=tmp_path
+    ) == []
+    assert matching_decode(
+        "Qwen/Qwen3-0.6B", world=world_key(1, 1, 1), directory=tmp_path
+    )
+
+
 def test_a_corrupt_decode_record_is_skipped_rather_than_raised(tmp_path):
     """One bad file must not take out every other measurement on the box."""
     from control_plane.measurements import load_decode_all
@@ -1251,3 +1300,97 @@ def test_padding_only_ever_grows_a_prompt():
     assert pad("hello", 0) == "hello"
     assert pad("hello", 200).endswith("hello")
     assert len(pad("hello", 200)) > len(pad("hello", 50))
+
+
+# -- keyed by the image the measured machine runs -----------------------------
+
+
+@pytest.fixture
+def _probes(monkeypatch, tmp_path):
+    """An empty probe table and an empty estate, for one test."""
+    from control_plane.resolver import support
+
+    monkeypatch.setattr(support, "_PROBED", {})
+    monkeypatch.setattr(support, "_PROBED_IMAGES", {})
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    return support
+
+
+def _image_probe(image: str, version: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(runtime="vllm", image=image, version=version,
+                           speculators=frozenset(), architectures=frozenset())
+
+
+def test_a_measurement_is_read_under_the_version_of_the_image_that_machine_runs(_probes):
+    """The 3090 runs vLLM 0.31 and the default (Spark) image is 0.28.1rc1.
+    Keyed by the DEFAULT probe, a 3090 measurement was filed under 0.28.1rc1
+    and a lookup for the 3090 answered with it. The version is the one the
+    queried machine's own image reported; an image nothing probed MISSES."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.gateway.internal_api import (
+        _attach_measurements, _measured_decode,
+    )
+    from control_plane.measurements import DecodeRecord, save_decode
+    from tests.fixtures import WS_3090
+
+    spec = RUNTIMES["vllm"]
+    default, amd64 = image_for_arch(spec, "arm64"), image_for_arch(spec, "amd64")
+    assert default and amd64 and default != amd64
+    _probes.record_probe(_image_probe(default, "0.28.1rc1"))
+    rtx = dataclasses.replace(WS_3090, arch="amd64")
+    on_rtx = dict(gpu_name=rtx.gpu_name, memory_bandwidth_gbps=rtx.memory_bandwidth_gbps)
+    plan = SimpleNamespace(tensor_parallel=1, pipeline_parallel=1, expert_parallel=1)
+
+    def decode(version: str, tps: float) -> DecodeRecord:
+        return DecodeRecord(
+            model_id="Qwen/Qwen3-4B", runtime_version=version,
+            context_band=measurements.band(4096), concurrency_band=1,
+            decode_tps=tps, tokens=900.0, decode_seconds=7.0, requests=4.0,
+            predicted_tps=None, measured_at=1.0, **on_rtx,
+        )
+
+    # What the old writer filed: the 3090's GPU under the DEFAULT version.
+    measurements.save(_record(runtime_version="0.28.1rc1", **on_rtx))
+    save_decode(decode("0.28.1rc1", 50.0))
+    options = [{"method": "ngram"}]
+
+    # The 3090's image has no probe: a miss, never the default's version.
+    assert _attach_measurements(options, "Qwen/Qwen3-4B", [rtx])[0]["measured"] == []
+    assert _measured_decode("Qwen/Qwen3-4B", [rtx], 4096, plan, "vllm") is None
+
+    # Probed at 0.31.0: its own record answers, the Spark-version one does not.
+    _probes.record_image_probe(_image_probe(amd64, "0.31.0"))
+    measurements.save(_record(runtime_version="0.31.0", best_tps=99.0, **on_rtx))
+    save_decode(decode("0.31.0", 77.0))
+    measured = _attach_measurements(options, "Qwen/Qwen3-4B", [rtx])[0]["measured"]
+    assert [m["runtime_version"] for m in measured] == ["0.31.0"]
+    assert _measured_decode("Qwen/Qwen3-4B", [rtx], 4096, plan, "vllm")["decode_tps"] == 77.0
+
+
+def test_a_sweep_keys_its_record_by_the_measured_machines_image(monkeypatch):
+    """The sweep's record names the node's GPU, so it names the image THAT node
+    runs -- read off `/api/runtimes`' `image_versions` by its architecture,
+    not off the default image's support verdict. No architecture, or an image
+    nothing probed, is '' and never matches a versioned lookup."""
+    from tests import spec_sweep
+
+    rows = [{"name": "vllm", "version": "0.28.1rc1",
+             "image_versions": {"amd64": "0.31.0", "arm64": "0.28.1rc1"}},
+            {"name": "sglang", "image_versions": {"amd64": None}}]
+    asked: list[str] = []
+
+    def call(base, path, **_kw):
+        asked.append(path)
+        return rows if path == "/api/runtimes" else {}
+
+    monkeypatch.setattr(spec_sweep, "_call", call)
+    assert spec_sweep.runtime_version("http://x", {"arch": "amd64"}) == "0.31.0"
+    assert spec_sweep.runtime_version("http://x", {"arch": "arm64"}) == "0.28.1rc1"
+    assert spec_sweep.runtime_version("http://x", {"arch": "amd64"}, "sglang") == ""
+    assert spec_sweep.runtime_version("http://x", {}) == ""
+    assert set(asked) == {"/api/runtimes"}

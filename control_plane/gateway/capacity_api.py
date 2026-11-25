@@ -102,6 +102,17 @@ _RESOLVE_TTL_S = 600.0
 _RESOLVE_FAIL_TTL_S = 120.0
 
 
+def _calculator(ctx: GatewayContext):
+    """The coordinator's own fit calculator, so a list row's decode rate is
+    computed with the same links and the same calibration as the Verdict
+    card's. None -- a bare one, constants only -- when the deps carry a stub.
+    """
+    from control_plane.fit.calculator import FitCalculator  # noqa: PLC0415
+
+    fit = ctx.deps.fit
+    return fit if isinstance(fit, FitCalculator) else None
+
+
 def create_router(ctx: GatewayContext) -> APIRouter:
     router = APIRouter()
 
@@ -344,14 +355,32 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
         def work() -> dict:
             from control_plane import head_scan, measurements
-            from control_plane.resolver import support
 
             base = resolver.resolve_full(wanted)
-            probed = support.probed("vllm")
-            specs = getattr(probed, "speculators", None) if probed else None
-            version = getattr(probed, "version", "") if probed else ""
 
-            hit = None if refresh else head_scan.cached_scan(wanted, version or "")
+            # The machine the ranking is ABOUT: its bandwidth prices the
+            # ceiling, and the image IT runs decides which heads load and which
+            # version the scan and every measurement are keyed by -- never the
+            # default image's (`measurements.image_probe`). No probe of that
+            # image is a MISS: nothing is read from or written to the record.
+            gpu, bandwidth, arch = None, 0.0, ""
+            try:
+                for node in ctx.deps.registry.healthy_nodes():
+                    if node.profile.memory_bandwidth_gbps:
+                        gpu = getattr(node.profile, "gpu_name", None)
+                        bandwidth = node.profile.memory_bandwidth_gbps
+                        arch = getattr(node.profile, "arch", "") or ""
+                        break
+            except Exception:
+                gpu, bandwidth, arch = None, 0.0, ""
+            probed = measurements.image_probe("vllm", arch)
+            specs = getattr(probed, "speculators", None) if probed else None
+            version = str(getattr(probed, "version", "") or "") if probed else ""
+
+            hit = (
+                None if refresh or not version
+                else head_scan.cached_scan(wanted, version)
+            )
             if hit is not None:
                 usable, rejected, scanned_at = hit
                 from_cache = True
@@ -363,9 +392,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     target_model_type=getattr(base, "model_type", "") or "",
                 )
                 scanned_at = time.time()
-                head_scan.save_scan(
-                    wanted, version or "", usable, rejected, scanned_at
-                )
+                if version:
+                    head_scan.save_scan(
+                        wanted, version, usable, rejected, scanned_at
+                    )
                 from_cache = False
 
             # The checkpoint's own options, ranked beside the hub's. `model_id`
@@ -383,30 +413,24 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 if option.launchable
             ]
 
-            gpu, bandwidth = None, 0.0
-            try:
-                for node in ctx.deps.registry.healthy_nodes():
-                    if node.profile.memory_bandwidth_gbps:
-                        gpu = getattr(node.profile, "gpu_name", None)
-                        bandwidth = node.profile.memory_bandwidth_gbps
-                        break
-            except Exception:
-                gpu, bandwidth = None, 0.0
-
             baseline, scored = head_scan.rank(
                 usable + builtin, base.shape, bandwidth or 273.0
             )
 
             # What a sweep actually got, per method, on THIS hardware under
             # THIS image. `matching` does the keying and a mismatch misses --
-            # a measurement does not travel between unlike machines.
+            # a measurement does not travel between unlike machines, and with
+            # no version for this machine's image nothing matches at all.
             measured: dict[str, list] = {}
             for method in {option.method.value for _, _, option in scored}:
+                if not version:
+                    measured[method] = []
+                    continue
                 try:
                     measured[method] = measurements.matching(
                         wanted, method, gpu_name=gpu,
                         memory_bandwidth_gbps=bandwidth or None,
-                        runtime_version=version or None,
+                        runtime_version=version,
                     )
                 except Exception:
                     measured[method] = []
@@ -423,7 +447,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                       for r in head_scan.shortlist(
                           [s for s in scored if (s[2].draft_params or 0) > 0],
                           4)}
-            chosen = (pick[1]["model_id"], pick[2].method.value) if pick else None
 
             def row_of(ceiling, row, option) -> dict:
                 return {
@@ -1042,7 +1065,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 largest_runnable, shapes, profiles,
                 context=context, max_seqs=max_seqs, kv_dtype=kv,
                 allocatable=allocatable, plan_for=plan_for,
-                native_context=natives,
+                native_context=natives, calculator=_calculator(ctx),
             )
             return {
                 "rows": [_row_payload(r, host_note) for r in rows],
@@ -1072,6 +1095,46 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     DEFAULT_GUARDRAIL
                 )
                 out["static"] = side
+
+        # The same question for a runtime that serves from HOST RAM, beside
+        # the GPU answer rather than instead of it. On a discrete box the two
+        # are separate pools: the sides above are its VRAM, and llamacpp there
+        # is sized against MemAvailable with the card taken out -- the budget
+        # and the profile its own launch gate uses (`allocatable_bytes(pool=
+        # "host")`, `flags.budget_profile`). Live only: host RAM has no static
+        # ceiling here. Null on a machine whose host RAM is not its own pool
+        # (GB10, Apple, unknown) -- a host-pool launch is refused there, and
+        # saying so on every Spark poll would be noise; the reason field is
+        # for a machine that qualifies and has nothing measured.
+        out["host_pool"] = None
+        out["host_pool_unavailable_reason"] = None
+        if basis in ("live", "both"):
+            pool = _host_pool_inputs(ctx, profiles[0], kv)
+            if pool is not None:
+                runtimes, gate_profile, budget, host_kv, refusal = pool
+                if refusal is not None:
+                    out["host_pool_unavailable_reason"] = refusal
+                else:
+                    pool_note = (
+                        f"sized against the host memory {gate_profile.node_id} "
+                        f"has free for {', '.join(runtimes)}, which serves from "
+                        f"host RAM rather than GPU memory."
+                    )
+                    rows, best = await asyncio.to_thread(
+                        largest_runnable, shapes, [gate_profile],
+                        context=context, max_seqs=max_seqs, kv_dtype=host_kv,
+                        allocatable={gate_profile.node_id: budget},
+                        plan_for=None, native_context=natives,
+                        calculator=_calculator(ctx),
+                    )
+                    out["host_pool"] = {
+                        "runtimes": runtimes,
+                        "node_id": gate_profile.node_id,
+                        "kv_dtype": host_kv,
+                        "allocatable_per_node": budget,
+                        "rows": [_row_payload(r, pool_note) for r in rows],
+                        "best": _row_payload(best, pool_note) if best else None,
+                    }
 
         return JSONResponse(out)
 
@@ -1171,8 +1234,10 @@ def _image_present(image: str) -> bool:
 
 
 def _runtimes_payload() -> list[dict]:
+    from control_plane import measurements
     from control_plane.deploy import flags
     from control_plane.deploy.recipes import container_image
+    from control_plane.resolver import support
 
     reasoning = sorted(getattr(flags, "VLLM_REASONING_PARSERS", ()) or ())
     tools = sorted(getattr(flags, "VLLM_TOOL_CALL_PARSERS", ()) or ())
@@ -1180,6 +1245,12 @@ def _runtimes_payload() -> list[dict]:
     for name, spec in flags.RUNTIMES.items():
         image = container_image(spec)
         is_vllm = name == "vllm"
+        # The first entry is the runtime's primary format, which the Models
+        # tab opens on. vllm reads GGUF only through vllm-gguf-plugin, so it
+        # is offered only when the image probe found the plugin.
+        formats = ["gguf"] if spec.memory_pool == "host" else ["safetensors"]
+        if is_vllm and support.gguf_loader("vllm") is True:
+            formats.append("gguf")
         supported = getattr(spec, "engine_options_supported", None)
         if supported is None:
             supported = frozenset({"env"})
@@ -1187,7 +1258,7 @@ def _runtimes_payload() -> list[dict]:
             "name": name,
             "display_name": _RUNTIME_DISPLAY.get(name, name),
             "memory_pool": spec.memory_pool,
-            "formats": ["gguf"] if spec.memory_pool == "host" else ["safetensors"],
+            "formats": formats,
             "image": image,
             "image_present": _image_present(image),
             "supports": {
@@ -1201,8 +1272,10 @@ def _runtimes_payload() -> list[dict]:
             },
             "kv_dtypes": sorted(flags.VLLM_KV_CACHE_DTYPES) if is_vllm else [],
             # Bytes per cache element the fit gate charges for each listed
-            # dtype. Only names the gate prices: one it does not (auto, nvfp4,
-            # turboquant_*) is absent rather than shown at the fallback width.
+            # PLAIN width. A packed layout (per_token_head, nvfp4,
+            # turboquant_*, *_ds_mla) has no per-element width -- its scales
+            # and boundary layers depend on the model -- so it is absent here
+            # and priced per model in `/api/plan`'s `kv_dtype_ratios`.
             "kv_dtype_bytes": {
                 name: KV_ELEM_BYTES[name]
                 for name in sorted(flags.VLLM_KV_CACHE_DTYPES)
@@ -1213,6 +1286,16 @@ def _runtimes_payload() -> list[dict]:
             "tool_call_parsers": tools if is_vllm else [],
             "nccl_tunables": sorted(flags.NCCL_TUNABLES),
             "version": _VLLM_VERSION if is_vllm else None,
+            # What each architecture's image reported when probed, so a sweep
+            # keys its record by the image the MEASURED machine runs rather
+            # than by the default image's version. null: not probed, a miss.
+            "image_versions": {
+                arch: measurements.image_version(name, arch) or None
+                for arch in sorted(
+                    {a for a, *_ in spec.arch_images}
+                    | ({spec.default_image_arch} if spec.default_image_arch else set())
+                )
+            },
         })
     return out
 
@@ -1327,6 +1410,19 @@ def _variant_verdicts(
         all_profiles = [p for p in all_profiles if p.node_id in wanted_ids]
 
     profiles = [p for p in all_profiles if p.addressable_memory > 0]
+    # Nobody named machines, so the rows are judged where the PLANNER would
+    # put them: its strongest group of like hardware, which is what
+    # `/api/plan` plans within unless `allow_mixed_hardware` is given. Pooling
+    # every GPU node instead placed a GB10 and an RTX 3090 at TP=2, a split the
+    # planner never picks and a launch refuses, and the 3090's free memory then
+    # refused every row -- "will not fit right now" beside a Verdict card, for
+    # the same build, saying it fits on the Spark alone. Named machines are the
+    # operator's pool and are kept as given, as on the plan path.
+    if wanted_ids is None and len(profiles) > 1:
+        from control_plane.planner.topology import homogeneous_groups
+
+        planned = set(homogeneous_groups(profiles)[0].node_ids)
+        profiles = [p for p in profiles if p.node_id in planned]
     # Same fallback as `/api/capacity`, for the same reason: on a machine with
     # no GPU the ladder is the only thing that can say how big these files are
     # and whether the box could hold them at all, and a blank column says
@@ -1342,7 +1438,8 @@ def _variant_verdicts(
             profiles = [p for p in all_profiles if p.node_id in host_budget]
 
     profiles = _order_profiles(ctx, profiles)
-    # Every GPU node, unless somebody named a subset. NOT the `[:1]` clamp that
+    # Every GPU node of the planner's group (above), unless somebody named a
+    # subset. NOT the `[:1]` clamp that
     # `/api/capacity` keeps: that endpoint answers "what can this machine run",
     # and widening it there would silently turn it into the planner's question.
     # This ladder answers "which published variant of THIS model should I pull",
@@ -1460,6 +1557,7 @@ def _variant_verdicts(
                 kv_dtype=ctx.settings.default_kv_dtype,
                 allocatable=allocatable,
                 native_window=base_window,
+                calculator=_calculator(ctx),
             )
 
         def _side(budget):
@@ -1483,6 +1581,7 @@ def _variant_verdicts(
                 allocatable=budget,
                 ladder=(),
                 plan_for=plan_for,
+                calculator=_calculator(ctx),
             )
             return {row.label: row for row in rows}
 
@@ -1644,6 +1743,9 @@ def _recommend(rows: list[dict]) -> dict | None:
         "label": best["label"],
         "dtype": best["dtype"],
         "reason": best.get("reason") or "",
+        # One repository can publish two builds under one label, so the row
+        # is named by its file too; without it the UI's match is ambiguous.
+        "gguf_file": best.get("gguf_file"),
     }
 
 
@@ -1788,6 +1890,49 @@ def _host_budget(ctx: GatewayContext, profiles: list) -> dict[str, int]:
         if total > 0:
             out[node_id] = total
     return out
+
+
+def _host_pool_inputs(ctx: GatewayContext, profile: Any, kv_dtype: str):
+    """What a host-pool runtime would be judged against on *profile*, or None.
+
+    None when this build has no host-pool runtime or the machine's host RAM
+    is not a pool of its own (`HOST_POOL_CLASSES`: a CPU node or a DISCRETE
+    box). Otherwise ``(runtimes, gate_profile, budget, kv_dtype, refusal)``,
+    every piece the one a llamacpp launch there would use:
+
+    * ``budget`` is `allocatable_bytes(pool="host")` -- MemAvailable less the
+      host reserve -- through the same `livefit.allocatable_map` the plan
+      reads, never a GPU figure and never a static one;
+    * ``gate_profile`` is `flags.budget_profile`: a discrete box with its card
+      taken out, so the gate neither reads VRAM nor predicts at its bandwidth;
+    * ``refusal`` is `flags.placement_refusal`'s own sentence when the reading
+      is missing or empty, in which case there is nothing to size against;
+    * ``kv_dtype`` is the requested width only if the runtime can be told it
+      (`kv_cache_dtype_refusal`), else fp16 -- what that runtime would run.
+
+    Lazily imported: nothing under `control_plane/gateway/` may depend on
+    `control_plane.deploy` being importable.
+    """
+    try:
+        from control_plane.deploy.flags import (
+            RUNTIMES, budget_profile, kv_cache_dtype_refusal, placement_refusal,
+        )
+        from control_plane.registry.telemetry import HOST_POOL_CLASSES
+    except Exception:  # pragma: no cover - deploy not installed
+        return None
+    from . import livefit
+
+    runtimes = [name for name, spec in RUNTIMES.items() if spec.memory_pool == "host"]
+    if not runtimes or profile.device_class not in HOST_POOL_CLASSES:
+        return None
+    runtime = runtimes[0]
+    budgets, _excluded, _unavailable = livefit.allocatable_map(
+        ctx.deps.registry, [profile.node_id], pool="host"
+    )
+    budget = budgets.get(profile.node_id)
+    refusal = placement_refusal(runtime, profile, budget)
+    host_kv = kv_dtype if kv_cache_dtype_refusal(runtime, kv_dtype) is None else "fp16"
+    return runtimes, budget_profile(runtime, profile), budget, host_kv, refusal
 
 def _quant_node_check(ctx: GatewayContext, resolution: Any) -> dict:
     """Can the nodes we actually have run this scheme?

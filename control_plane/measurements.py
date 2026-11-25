@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from control_plane.paths import data_dir
@@ -42,6 +43,42 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 def records_dir() -> Path:
     return data_dir() / SUBDIR
+
+
+def image_probe(runtime: str, arch: str):
+    """The probe of the image *runtime* runs on a machine of *arch*, or None.
+
+    Every record here is keyed by an image version, and it has to be the
+    version of the image the MEASURED (or queried) machine runs --
+    `flags.image_for_arch`, the same rule a launch uses -- never the default
+    image's. The 3090 runs vLLM 0.31 and the default (Spark) image is
+    0.28.1rc1, so reading the default probe filed a 3090 measurement under the
+    Spark's version, where a later Spark lookup would match it.
+
+    None when this build has no image for *arch* or nothing has probed that
+    image (`support.probe_for` never lends a named image the default's
+    probe). Every caller treats that as a MISS.
+    """
+    try:
+        from control_plane.deploy.flags import RUNTIMES, image_for_arch
+        from control_plane.resolver import support
+    except Exception:  # pragma: no cover - deploy/resolver not installed
+        return None
+    spec = RUNTIMES.get(runtime)
+    if spec is None:
+        return None
+    image = image_for_arch(spec, arch or "")
+    if not image:
+        return None
+    return support.probe_for(runtime, image)
+
+
+def image_version(runtime: str, arch: str) -> str:
+    """:func:`image_probe`'s version, or "" -- which every reader and writer
+    treats as a MISS, never as "any version"."""
+    found = image_probe(runtime, arch)
+    return str(getattr(found, "version", "") or "") if found is not None else ""
+
 
 
 @dataclass(frozen=True)
@@ -188,7 +225,11 @@ def matching(
 #
 # So the accurate number is not a better constant. It is a measurement, and
 # these records are where one goes -- the same argument, and deliberately the
-# same shape, as SpecRecord above.
+# same shape, as SpecRecord above. Unlike SpecRecord a decode record is USED,
+# not only cited: `decode_samples` hands the single-stream ones to the fit
+# gate, which calibrates its efficiency from them (fit/calculator.py). The
+# metrics hub writes them off live traffic; `tests/decode_sweep.py` writes the
+# same records from a driven run.
 
 DECODE_SUBDIR = "measurements/decode"
 
@@ -242,6 +283,16 @@ class DecodeRecord:
     predicted_tps: float | None
     measured_at: float
     notes: list[str] = field(default_factory=list)
+    #: The cache length averaged over the measured decode steps, in tokens --
+    #: what the rate was actually reading. ``context_band`` is this banded; the
+    #: calibration wants the number. 0.0 on a record written before it existed.
+    mean_context_tokens: float = 0.0
+    #: The cache width the deployment ran; "" when nobody recorded it.
+    kv_dtype: str = ""
+    #: The parallelism the rate was measured under, ``world_key(tp, pp, ep)``.
+    #: A TP=2 rate is two ranks' bandwidth plus a wire, and is not the TP=1
+    #: rate of the same model on the same part.
+    world: str = "tp1-pp1-ep1"
 
     @property
     def ratio(self) -> float | None:
@@ -264,6 +315,7 @@ class DecodeRecord:
                 self.runtime_version,
                 str(self.context_band),
                 str(self.concurrency_band),
+                self.world,
             )
         )
 
@@ -274,8 +326,14 @@ class DecodeRecord:
             self.runtime_version,
             f"ctx{self.context_band}",
             f"seq{self.concurrency_band}",
+            self.world,
         )
         return _UNSAFE.sub("-", "__".join(parts)).strip("-")[:180] + ".json"
+
+
+def world_key(tp: int, pp: int, ep: int) -> str:
+    """The ``DecodeRecord.world`` spelling of a parallelism plan."""
+    return f"tp{tp}-pp{pp}-ep{ep}"
 
 
 def band(value: float) -> int:
@@ -292,23 +350,63 @@ def band(value: float) -> int:
 
 
 def save_decode(record: DecodeRecord, *, directory: Path | None = None) -> Path | None:
-    """Write one decode record. Best effort, same as :func:`save`.
+    """Write one decode record, folding it into any record already on its key.
+    Best effort, same as :func:`save`.
 
-    Last writer wins within a key, deliberately. A newer window on the same
-    model, hardware, runtime, context band and concurrency band is a better
-    measurement of the same thing -- it has seen more recent kernels and more
-    representative traffic -- and keeping a history here would be a time series
-    the telemetry archive already owns.
+    Accumulated, not replaced. The metrics hub writes a window every few
+    seconds, and a window clips the requests still in flight at both of its
+    edges -- tokens counted on one side, decode seconds on the other. Summing
+    windows shrinks that error the way a longer window would, while the key
+    keeps the sum honest: same model, hardware, runtime, context band,
+    concurrency band and parallelism, so every window added is a measurement
+    of the same thing. Tokens, seconds and requests are summed and the rate is
+    re-derived from the sums; the mean context is token-weighted; the
+    prediction, the timestamp, the notes and the cache width are the newest.
     """
     target = directory or decode_records_dir()
     try:
         target.mkdir(parents=True, exist_ok=True)
         path = target / record.filename()
-        path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True))
+        merged = record
+        if path.exists():
+            try:
+                prior = DecodeRecord(**json.loads(path.read_text()))
+            except (OSError, ValueError, TypeError):
+                prior = None
+            if prior is not None and prior.key() == record.key():
+                merged = _accumulate(prior, record)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(asdict(merged), indent=2, sort_keys=True))
+        os.replace(tmp, path)
         return path
     except OSError:
         log.warning("could not write the decode measurement", exc_info=True)
         return None
+
+
+def _accumulate(prior: DecodeRecord, new: DecodeRecord) -> DecodeRecord:
+    tokens = prior.tokens + new.tokens
+    seconds = prior.decode_seconds + new.decode_seconds
+    context = (
+        (prior.mean_context_tokens * prior.tokens + new.mean_context_tokens * new.tokens)
+        / tokens
+        if tokens > 0
+        else new.mean_context_tokens
+    )
+    return replace(
+        new,
+        tokens=tokens,
+        decode_seconds=seconds,
+        requests=prior.requests + new.requests,
+        decode_tps=round(tokens / seconds, 2) if seconds > 0 else new.decode_tps,
+        mean_context_tokens=context,
+    )
+
+
+#: str(directory) -> (directory signature, parsed records). The fit gate reads
+#: these on every check, so a directory is parsed again only when a file in it
+#: was added, removed or rewritten.
+_DECODE_CACHE: dict[str, tuple[tuple, list[DecodeRecord]]] = {}
 
 
 def load_decode_all(*, directory: Path | None = None) -> list[DecodeRecord]:
@@ -316,13 +414,25 @@ def load_decode_all(*, directory: Path | None = None) -> list[DecodeRecord]:
     target = directory or decode_records_dir()
     if not target.is_dir():
         return []
+    try:
+        entries = [e for e in os.scandir(target) if e.name.endswith(".json")]
+        signature = tuple(
+            sorted((e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in entries)
+        )
+    except OSError:
+        log.warning("could not list decode measurements in %s", target, exc_info=True)
+        return []
+    cached = _DECODE_CACHE.get(str(target))
+    if cached is not None and cached[0] == signature:
+        return list(cached[1])
     out: list[DecodeRecord] = []
     for path in sorted(target.glob("*.json")):
         try:
             out.append(DecodeRecord(**json.loads(path.read_text())))
         except (OSError, ValueError, TypeError):
             log.warning("skipping unreadable decode measurement %s", path, exc_info=True)
-    return out
+    _DECODE_CACHE[str(target)] = (signature, out)
+    return list(out)
 
 
 def matching_decode(
@@ -333,6 +443,7 @@ def matching_decode(
     runtime_version: str | None = None,
     context_band: int | None = None,
     concurrency_band: int | None = None,
+    world: str | None = None,
     directory: Path | None = None,
 ) -> list[DecodeRecord]:
     """Records for *model_id*, narrowed by whatever the caller can name.
@@ -358,6 +469,8 @@ def matching_decode(
         found = [r for r in found if r.runtime_version == runtime_version]
     if concurrency_band is not None:
         found = [r for r in found if r.concurrency_band == concurrency_band]
+    if world is not None:
+        found = [r for r in found if r.world == world]
     if context_band is None:
         return sorted(found, key=lambda r: -r.measured_at)
     return sorted(
@@ -365,6 +478,51 @@ def matching_decode(
         key=lambda r: (abs((r.context_band or 1).bit_length() - context_band.bit_length()),
                        -r.measured_at),
     )
+
+
+def decode_samples(
+    model_id: str,
+    gpu_name: str,
+    bandwidth: float,
+    *,
+    runtime_version: str,
+    directory: Path | None = None,
+):
+    """The single-stream, single-rank decode rates measured for *model_id* on
+    this hardware, as the fit gate's calibration reads them
+    (``fit.calculator.DecodeSample``).
+
+    One sequence on one rank only: that is the step the calibration's ideal is
+    computed for, so a batched or sharded rate would calibrate the wrong
+    thing. Every context band is returned -- the gate prices each sample at
+    its own context, which is how a rate measured at 300 tokens informs one
+    asked about at 8192.
+
+    *runtime_version* is the version of the image the machine being judged
+    runs (:func:`image_version`); "" -- that image never probed -- is a MISS
+    and returns nothing, never every version's records.
+    """
+    from control_plane.fit.calculator import DecodeSample  # noqa: PLC0415 -- fit never imports this module
+
+    if not runtime_version:
+        return []
+    return [
+        DecodeSample(
+            decode_tps=r.decode_tps,
+            context_tokens=r.mean_context_tokens or float(r.context_band),
+            kv_dtype=r.kv_dtype,
+            tokens=r.tokens,
+        )
+        for r in matching_decode(
+            model_id,
+            gpu_name=gpu_name,
+            memory_bandwidth_gbps=bandwidth,
+            runtime_version=runtime_version,
+            concurrency_band=1,
+            world=world_key(1, 1, 1),
+            directory=directory,
+        )
+    ]
 
 
 # ==========================================================================

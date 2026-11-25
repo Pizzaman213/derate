@@ -1,9 +1,16 @@
-"""Entrypoint. ``python -m control_plane.gateway.main``"""
+"""Entrypoint. ``python -m control_plane.gateway.main``
+
+With ``--isolated ROOT --ui-dir DIR`` it is the stub UI the agents' MCP tool
+(``.omp/stubui/server.mjs``) looks at: the same stub surface, sealed off from
+this machine by ``isolated.py``.
+"""
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+from pathlib import Path
 
 import uvicorn
 
@@ -11,10 +18,27 @@ from control_plane import logfiles
 from control_plane.redaction import Redactor, SecretRedactingFilter
 
 from .app import create_app
+from .isolated import BANNER, serve_isolated
 from .settings import GatewaySettings, uvicorn_proxy_kwargs
 
 
-def main() -> None:
+def _parse(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="python3 -m control_plane.gateway.main")
+    parser.add_argument("--isolated", type=Path, metavar="ROOT",
+                        help="serve the stub sealed off under ROOT, for the stub-UI MCP tool")
+    parser.add_argument("--ui-dir", help="the built UI to serve; only with --isolated")
+    args = parser.parse_args(argv)
+    if bool(args.isolated) != bool(args.ui_dir):
+        parser.error("--isolated and --ui-dir go together")
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse(argv)
+    if args.isolated:
+        logging.basicConfig(level=logging.WARNING, format=logfiles.LOG_FORMAT)
+        serve_isolated(args.isolated, args.ui_dir)
+        return
     logging.basicConfig(
         level=os.environ.get("DERATE_LOG_LEVEL", "INFO"),
         format=logfiles.LOG_FORMAT,
@@ -27,12 +51,7 @@ def main() -> None:
     # filter out before any handler sees them.
     logging.getLogger().setLevel(os.environ.get("DERATE_LOG_LEVEL", "INFO"))
     logfiles.install()
-    print(
-        "=" * 72 + "\n"
-        "STUB SURFACE -- fixture data; the real system is "
-        "python3 -m control_plane.node\n" + "=" * 72,
-        flush=True,
-    )
+    print("=" * 72 + "\n" + BANNER + "\n" + "=" * 72, flush=True)
     settings = GatewaySettings(
         host=os.environ.get("DERATE_HOST", "0.0.0.0"),
         port=int(os.environ.get("DERATE_PORT", "8080")),

@@ -26,13 +26,10 @@ import httpx
 
 from ..contracts.providers import ProviderKind
 from .secrets import SecretStore
-from .service import ProviderService, minted_ref
+from .service import ProviderService
 
 STUB_KEY_VALUE = "sk-or-v1-stub00000000000000000000000000000000000000"
 STUB_PROVIDER_ID = "openrouter-stub"
-# The name derate itself mints for this id: the only kind of reference, beside
-# DERATE_SECRET_*, a provider may hold.
-STUB_KEY_REF = minted_ref(STUB_PROVIDER_ID)
 
 # Plausible published pricing, in USD per single token, which is the unit
 # OpenRouter uses. Discovery multiplies to per-million.
@@ -193,9 +190,10 @@ def build_stub_service(
 ) -> ProviderService:
     """A ProviderService with one healthy fake OpenRouter provider.
 
-    The key is a reference like any other, pointing at a value in a 0600
-    secrets file inside the stub's data directory. Nothing about the secret
-    path is special-cased for the stub, which is the point.
+    The key is pasted like any operator's, so it lands under the provider's
+    minted reference in a 0600 secrets file inside the stub's data directory.
+    Nothing about the secret path is special-cased for the stub, which is the
+    point.
     """
     root = Path(data_path) if data_path is not None else Path(
         tempfile.mkdtemp(prefix="derate-provider-stub-")
@@ -203,7 +201,6 @@ def build_stub_service(
     root.mkdir(parents=True, exist_ok=True)
 
     secrets = SecretStore(root / "secrets.json", env={})
-    secrets.put(STUB_KEY_REF, STUB_KEY_VALUE)
 
     kwargs = {"now": now} if now is not None else {}
     service = ProviderService(
@@ -218,7 +215,7 @@ def build_stub_service(
                 "provider_id": STUB_PROVIDER_ID,
                 "kind": ProviderKind.OPENROUTER,
                 "display_name": "OpenRouter (stub)",
-                "api_key_ref": STUB_KEY_REF,
+                "api_key": STUB_KEY_VALUE,
                 "priority": 10,
             }
         )

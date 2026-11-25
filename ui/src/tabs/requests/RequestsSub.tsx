@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import type { RequestsQuery } from '../../api/types'
+import { RequestMap } from '../../components/RequestMap'
 import { Verbatim } from '../../components/Verbatim'
 import { useBackend, useKeyedResource, useResource } from '../../state/backend'
 import { useModels, useProviders } from '../../state/resources'
@@ -7,6 +8,7 @@ import { useRouter, type Route } from '../../state/router'
 import { count } from '../keys/rows'
 import { RequestDetail } from './RequestDetail'
 import { RequestRows } from './RequestRows'
+import { MAP_ATTRIBUTION, databaseSentence, originsSummary } from './origins'
 import { windowStart } from './servedBy'
 
 const WINDOWS = ['24h', '7d', '30d'] as const
@@ -122,15 +124,16 @@ function RequestList() {
         Target: <span className="mono">{route.ftarget}</span>{' '}
         <button type="button" className="ghost" onClick={() => set({ ftarget: null })}>All targets</button>
       </div> : null}
+      <OriginsCard key={JSON.stringify(['origins', ...filters])} route={route} win={win} />
       <RequestPages key={JSON.stringify(filters)} route={route} win={win} />
     </div>
   )
 }
 
-function RequestPages({ route, win }: { route: Route; win: string }) {
-  const { backend } = useBackend()
-  const [page, setPage] = useState(1)
-  const q: RequestsQuery = {
+/** The filters as `/api/requests` and `/api/requests/origins` both take them:
+ *  one builder, so the map and the table can never mean different requests. */
+function requestQuery(route: Route, win: string): RequestsQuery {
+  return {
     start: windowStart(win),
     key_id: route.fkey ?? undefined,
     model: route.fmodel ?? undefined,
@@ -139,6 +142,40 @@ function RequestPages({ route, win }: { route: Route; win: string }) {
     provider_id: route.fprovider ?? undefined,
     retried: route.fretried || undefined,
   }
+}
+
+/** Where this window's requests came from, under the same filters as the list. */
+function OriginsCard({ route, win }: { route: Route; win: string }) {
+  const q = requestQuery(route, win)
+  const res = useKeyedResource(
+    JSON.stringify(['origins', ...filtersForRequest(route, win)]),
+    (b) => b.requestOrigins(q),
+    60_000,
+  )
+  const data = res.data
+  return (
+    <div style={{ marginTop: 'var(--space-12)' }}>
+      {res.error ? <Verbatim text={res.error.message} size="unit" /> : null}
+      {data ? (
+        <>
+          <div className="unit">
+            {originsSummary(data, data.points.length)} {databaseSentence(data.database)}
+            {/* The dots a reader is missing are almost always these: say how to draw them. */}
+            {data.local ? ' A local-network request has no dot until its address is pinned: open one and pin it on its map.' : ''}
+          </div>
+          <RequestMap title="Where requests came from" height={320} points={data.points} attribution={MAP_ATTRIBUTION} />
+        </>
+      ) : res.loading ? (
+        <div className="unit">Reading…</div>
+      ) : null}
+    </div>
+  )
+}
+
+function RequestPages({ route, win }: { route: Route; win: string }) {
+  const { backend } = useBackend()
+  const [page, setPage] = useState(1)
+  const q = requestQuery(route, win)
   const res = useKeyedResource(
     JSON.stringify([...filtersForRequest(route, win), page]),
     (b) => b.requests({ ...q, page, page_size: PAGE_SIZE }),

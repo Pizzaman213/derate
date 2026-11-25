@@ -147,6 +147,9 @@ export interface Route {
   win: SpendWindow | null
   /** The request open in the requests pane's detail. Only on `/usage/requests`. */
   request: string | null
+  /** The local model whose price Settings opens on (Policy → Local model
+   *  pricing). Only on /settings. */
+  price: string | null
   /** Filters for requests and rate-limit history. `dep` selects a model on
    *  rate limits; provider/target narrow upstream attribution. */
   fkey: string | null
@@ -393,6 +396,7 @@ export function parse(url: string): Route {
     spec: wantsNumbers ? specRef(params.get('spec'), params.get('head')) : null,
     win,
     request,
+    price: dest === 'settings' ? params.get('price') || null : null,
     fkey: onRequests ? params.get('key') || null : null,
     fmodel: onHistory ? params.get('model') || null : null,
     fstatus: onRequests && (rawStatus === 'ok' || rawStatus === 'failed' || rawStatus === '429') ? rawStatus : null,
@@ -425,6 +429,7 @@ export function href(route: Route): string {
     if (value) query.push(`${key}=${enc(value)}`)
   }
   put('node', route.node)
+  if (route.dest === 'settings') put('price', route.price)
   put('link', route.link)
   put('dep', route.dep)
   put('open', route.sheet ? `${route.sheet.kind}:${route.sheet.id}` : null)

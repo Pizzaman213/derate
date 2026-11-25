@@ -173,6 +173,10 @@ def node_payload(
         "device_class": profile.device_class.value,
         "gpu_name": profile.gpu_name,
         "gpu_count": profile.gpu_count,
+        # amd64/arm64, or "" for an agent older than the field. Which image a
+        # machine runs follows from it, and a measurement is keyed by THAT
+        # image's version (`tests/spec_sweep.py::runtime_version`).
+        "arch": profile.arch,
         "total_memory": profile.total_memory,
         # Live, from the sample, and 0 until one arrives. Separate from
         # total_memory on purpose: that one is GPU memory and is summed into
@@ -181,6 +185,8 @@ def node_payload(
         "memory_total": state.memory_total,
         "addressable_memory": profile.addressable_memory,
         "memory_bandwidth_gbps": profile.memory_bandwidth_gbps,
+        # What a host-pool runtime decodes against; null when unmeasured.
+        "host_memory_bandwidth_gbps": profile.host_memory_bandwidth_gbps,
         "compute_capability": profile.compute_capability,
         "driver_version": profile.driver_version,
         "healthy": state.healthy,
@@ -385,11 +391,20 @@ def _launchable(res: Any, shape: Any) -> dict:
     What survives is the case neither runtime family can serve: a ``.gguf``
     path on THIS machine. The launch happens on the node the plan placed it
     on, and a local path names nothing there -- the same refusal
-    `flags.llamacpp_model_refusal` makes at the door, said early enough to
-    keep the button from being drawn.
+    `flags.local_gguf_refusal` makes at the door, said early enough to keep
+    the button from being drawn. A RESOLVED hub blob has no scheme
+    (``owner/repo/file.gguf``), which is why the test is
+    `gguf_names.is_hub_gguf_blob` and not ``startswith("hf://")``: the latter
+    read every resolved hub GGUF as a local path.
     """
+    from control_plane.resolver.gguf_names import is_hub_gguf_blob
+
     model_id = str(shape.model_id or "")
-    if model_id.lower().endswith(".gguf") and not model_id.startswith("hf://"):
+    if (
+        model_id.lower().endswith(".gguf")
+        and not model_id.startswith("hf://")
+        and not is_hub_gguf_blob(model_id)
+    ):
         return {
             "ok": False,
             "reason": (
@@ -658,6 +673,9 @@ def deployment_payload(deployment: Deployment, *, error_chars: int | None = None
         ),
         "lifecycle": asdict(getattr(deployment, "lifecycle", Lifecycle())),
         "original_window": getattr(deployment, "original_window", None),
+        # What vllm loads beside a hub GGUF blob; None for everything else.
+        "gguf_base": getattr(deployment, "gguf_base", None),
+        "gguf_projector": getattr(deployment, "gguf_projector", None),
         # The launch body that reproduces this deployment, for "roll back"
         # and "serve again": one builder, the same one a crash relaunch uses.
         "relaunch_request": (
@@ -713,14 +731,11 @@ def provider_payload(
     behaves exactly like a port that does not account: the nine spend keys
     are all ``None``, never ``0``.
 
-    *key* is this provider's ``key_status()`` merged with its ``key_health()``
-    -- whether its reference resolves, which of the environment and
-    secrets.json answered, what the last key check found (``key_check``:
-    state, time, detail), the expiry the upstream reported, the warning
-    window, and the one warning sentence the row and the sidebar alert share.
-    None of it is key material and none of it could be. Absent leaves every
-    field ``None``, which reads as "this port cannot say", not as "there is no
-    key".
+    *key* is this provider's ``key_status()`` -- whether its reference
+    resolves and which of the environment and secrets.json answered. State and
+    provenance only; it carries no key material and could not, since neither
+    field is ever a value. Absent leaves both ``None``, which reads as "this
+    port cannot say", not as "there is no key".
 
     *sign_in_account* is the account a sign-in provider is signed in as -- an
     email address, not a credential -- and ``None`` for every key-based kind.
@@ -757,10 +772,6 @@ def provider_payload(
     # only one of them survives a round trip through JSON.
     payload["key_state"] = (key or {}).get("key_state")
     payload["key_source"] = (key or {}).get("key_source")
-    payload["key_check"] = (key or {}).get("key_check")
-    payload["key_expires_at"] = (key or {}).get("key_expires_at")
-    payload["key_expiry_warn_days"] = (key or {}).get("key_expiry_warn_days")
-    payload["key_warning"] = (key or {}).get("key_warning")
     payload["sign_in_account"] = sign_in_account
     return payload
 

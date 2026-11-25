@@ -190,6 +190,9 @@ check('provider scope survives request detail navigation',
 check('request-only filters do not leak into rate limits',
   href({ ...parse('/usage/requests?key=k&status=429&retried=1'), sub: 'rate-limits' }),
   '/usage/rate-limits')
+check('a settings price', parse('/settings?price=Qwen3-0.6B').price, 'Qwen3-0.6B')
+check('price is only read on settings', parse('/usage?price=x').price, null)
+check('price never leaves settings', href({ ...parse('/settings?price=x'), dest: 'usage' }), '/usage')
 
 // ── Selections ───────────────────────────────────────────────────────────────
 
@@ -412,6 +415,7 @@ const URLS = [
   '/usage?dep=claude-opus-5-5',
   '/usage/rate-limits?dep=claude-opus-5-5&win=7d&provider=claude_code',
   '/usage/requests?status=429&provider=claude_code',
+  '/settings?price=Qwen3-0.6B',
 ]
 
 for (const url of URLS) {

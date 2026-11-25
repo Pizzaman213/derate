@@ -1,4 +1,4 @@
-// requires: browser coordinator python -- it opens the real screens in a real browser
+// requires: browser coordinator -- it opens the real screens in a real browser
 //
 // The first verifier in this repo that looks at a screen.
 //
@@ -64,11 +64,12 @@ if (!sessionCookie) {
 // Ids come off the live coordinator rather than being written down here. A
 // hardcoded model id rots the moment the cluster changes, and a verifier that
 // silently walks a 404 is worse than one that does not walk it at all.
-const [models, topology, deployments, keys] = await Promise.all([
+const [models, topology, deployments, keys, requests] = await Promise.all([
   get('/api/models').catch(() => null),
   get('/api/topology').catch(() => null),
   get('/api/deployments').catch(() => null),
   get('/api/keys').catch(() => null),
+  get('/api/requests?start=-30d&page_size=1').catch(() => null),
 ])
 const someModel = models?.models?.[0]?.model_id ?? models?.[0]?.model_id ?? null
 const someNode = topology?.nodes?.[0]?.node_id ?? null
@@ -84,6 +85,8 @@ const someDep = [...depRows].sort((a, b) => depRank(a.state) - depRank(b.state))
 // A key that exists on this coordinator, for its detail page. Setup always
 // leaves one (the default key).
 const someKey = Array.isArray(keys) ? (keys.find((k) => !k.is_admin_key) ?? keys[0])?.key_id : null
+// The newest request in the last 30 days, for its detail page.
+const someRequest = requests?.rows?.[0]?.request_id ?? null
 
 // Whether a secret reached the screen is asked with the server's own
 // Redactor, primed with the REAL stored values -- not with a shape heuristic
@@ -137,6 +140,7 @@ if (someModel) SCREENS.push(['model-detail', `/models/${someModel}`])
 if (someNode) SCREENS.push(['node-sheet', `/cluster?open=node:${someNode}`])
 if (someDep) SCREENS.push(['dep-sheet', `/dashboard?open=dep:${encodeURIComponent(someDep)}`])
 if (someKey) SCREENS.push(['keys-detail', routes.href({ ...blank, dest: 'usage', sub: 'keys', key: someKey })])
+if (someRequest) SCREENS.push(['request-detail', routes.href({ ...blank, dest: 'usage', sub: 'requests', request: someRequest })])
 
 mkdirSync(outDir, { recursive: true })
 

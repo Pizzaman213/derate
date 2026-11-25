@@ -32,6 +32,26 @@ class ModelShape:
     sliding_window: int | None = None
     layers_with_full_attention: int | None = None
 
+    # Recurrent layers: linear attention (Gated DeltaNet, KDA), Mamba, short
+    # convolution. Such a layer keeps a FIXED-SIZE state per sequence instead
+    # of a per-token KV cache, so it costs the same at 1k tokens as at 1M.
+    #
+    # `attention_free_layers` is how many of `num_layers` hold no KV cache at
+    # all; the attention cache is charged on the rest. It is not always the
+    # recurrent count: Falcon-H1 runs attention AND Mamba in every layer (0
+    # here, state on all 44), and Nemotron-H counts MLP-only blocks in
+    # num_layers that hold neither.
+    #
+    # `recurrent_state_bytes` is ONE copy of that state for ONE sequence,
+    # summed over every layer that keeps one, before tensor parallel splits
+    # it by head. How many copies a sequence holds is the runtime's business
+    # and lives in fit/constants.py, not here. 0 means a model with no
+    # recurrent layers -- or one this build cannot read, which then degrades
+    # to charging every layer a full-context cache, the over-count in the
+    # refusing direction.
+    attention_free_layers: int = 0
+    recurrent_state_bytes: int = 0
+
     # Multi-head latent attention (DeepSeek family)
     mla_latent_dim: int | None = None
     # Width of the decoupled RoPE component cached per token alongside the
@@ -55,11 +75,30 @@ class ModelShape:
     # existed.
     routed_expert_params: int = 0
 
+    # Parameters one decoded token streams from memory. The input embedding is
+    # a row gather, so it is excluded; the output head is counted, and when the
+    # embedding is tied the embedding IS the head, so it stays. The vision
+    # tower is excluded, and so are the routed experts the router skipped.
+    # 0 means "not derived", and decode then falls back to
+    # effective_active_params -- the figure every estimate used before this.
+    decode_read_params: int = 0
+
     # Encoder-decoder (Whisper family). KV cache math (fit/kv.py) only prices
     # the decoder's self-attention, so on a shape where this is True that
     # figure is a floor: cross-attention cache over the encoder's own output
     # is real memory it does not count.
     is_encoder_decoder: bool = False
+
+    # A speech checkpoint's audio codec, as derate's own tts server drives it:
+    # what the torch allocator holds beyond the weight index once the codec is
+    # resident, and what decoding one generated frame back to audio adds on
+    # top -- the codec decodes the whole clip in one call, so it grows with
+    # the frames generated, which the server bounds by the context window.
+    # Measured per architecture, never derived (`resolver/support.py::
+    # TTS_WORKING_SETS`), and applied by the gateway for the tts runtime only.
+    # 0 for every other shape.
+    codec_resident_bytes: int = 0
+    codec_bytes_per_frame: int = 0
 
     @property
     def is_moe(self) -> bool:
@@ -70,6 +109,11 @@ class ModelShape:
         if self.head_dim is not None:
             return self.head_dim
         return self.hidden_size // self.num_attention_heads
+
+    @property
+    def attention_layers(self) -> int:
+        """Layers that keep a per-token KV cache."""
+        return max(0, self.num_layers - max(0, self.attention_free_layers))
 
     @property
     def effective_mla_rope_dim(self) -> int:
@@ -92,6 +136,19 @@ class ModelShape:
         if self.active_params is not None:
             return self.active_params
         return self.total_params
+
+    @property
+    def effective_decode_params(self) -> int:
+        """What one decoded token reads, in parameters. See decode_read_params."""
+        return self.decode_read_params or self.effective_active_params
+
+    def codec_working_set(self, context: int) -> int:
+        """Bytes the codec holds while a clip of up to *context* frames is
+        decoded. One clip at a time: the tts server synthesises under a lock,
+        so concurrency does not multiply it."""
+        return max(0, self.codec_resident_bytes) + max(
+            0, self.codec_bytes_per_frame
+        ) * max(0, int(context))
 
     def bytes_per_param(self) -> float:
         try:

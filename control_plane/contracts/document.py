@@ -18,7 +18,6 @@ stale in a way the code is not, and nobody has to remember to update it.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 

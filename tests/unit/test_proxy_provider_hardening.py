@@ -151,6 +151,168 @@ def test_moving_base_url_with_a_new_key_keeps_the_new_key(tmp_path):
     assert providers.resolve_key("box") == "sk-another-key-0123456789"
 
 
+def _boxed_key(tmp_path):
+    providers = _real_providers(tmp_path)
+    providers.add(
+        {"provider_id": "box", "kind": ProviderKind.CUSTOM,
+         "base_url": "http://box.local/v1", "api_key": SECRET_KEY}
+    )
+    return providers, providers.get("box").api_key_ref
+
+
+def test_naming_the_held_reference_does_not_carry_the_key_to_a_new_base_url(tmp_path):
+    """The K3 release used to be skipped whenever api_key_ref rode in the patch,
+    and the provider's own minted name is a ref it may hold: one PATCH moved the
+    URL and kept the pasted key, which then went to the new host as a bearer."""
+    providers, held = _boxed_key(tmp_path)
+
+    with pytest.raises(ValueError, match="paste it again"):
+        providers.update("box", {"base_url": "http://other.local/v1", "api_key_ref": held})
+
+    assert providers.get("box").base_url == "http://box.local/v1"
+    assert providers.get("box").api_key_ref == held
+    assert providers.secrets.get(held) == SECRET_KEY
+
+
+def test_an_operator_reference_sent_with_a_move_replaces_the_pasted_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("DERATE_SECRET_OTHER", "sk-other-0123456789abcdef")
+    providers, held = _boxed_key(tmp_path)
+
+    providers.update("box", {"base_url": "http://other.local/v1", "api_key_ref": "DERATE_SECRET_OTHER"})
+
+    assert providers.get("box").api_key_ref == "DERATE_SECRET_OTHER"
+    assert providers.secrets.get(held) is None
+
+
+def test_the_held_reference_with_a_move_is_a_400_over_http(tmp_path):
+    providers, held = _boxed_key(tmp_path)
+    with TestClient(create_app(build_deps(providers=providers))) as client:
+        reply = client.patch(
+            "/api/providers/box", json={"base_url": "http://other.local/v1", "api_key_ref": held}
+        )
+        wiring = client.post(
+            "/api/wiring",
+            json={"ops": [{"op": "provider.patch", "provider_id": "box",
+                           "patch": {"base_url": "http://other.local/v1", "api_key_ref": held}}]},
+        )
+    assert reply.status_code == 400
+    assert "paste it again" in reply.json()["error"]["message"]
+    assert wiring.status_code == 400, wiring.text
+    assert "paste it again" in wiring.text
+    assert providers.get("box").base_url == "http://box.local/v1"
+    assert providers.secrets.get(held) == SECRET_KEY
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [{"api_key": ""}, {"api_key_ref": "NOPE"}, {"api_key_ref": "DERATE_TOKEN"}, {"enabled_models": ["no-such"]}],
+    ids=["empty-key", "bad-ref", "foreign-ref", "bad-allowlist"],
+)
+def test_a_move_refused_halfway_leaves_the_url_and_the_key_where_they_were(tmp_path, patch):
+    """The URL used to be written before the later fields were checked: a
+    refused patch left the provider pointing at the new host with the pasted
+    key still attached."""
+    providers, held = _boxed_key(tmp_path)
+    with pytest.raises(ValueError):
+        providers.update("box", {"base_url": "http://attacker.local/v1", **patch})
+    assert providers.get("box").base_url == "http://box.local/v1"
+    assert providers.get("box").api_key_ref == held
+    assert providers.secrets.get(held) == SECRET_KEY
+
+
+def test_naming_the_minted_reference_again_never_revives_a_stored_key(tmp_path, monkeypatch):
+    """A key still stored under the minted name -- left by an older build, or
+    by a refused patch -- was pasted for whichever host was current then.
+    Naming the reference again would send it to wherever the provider points
+    now, so the stored value is dropped and only the environment may answer."""
+    monkeypatch.setenv("DERATE_SECRET_OTHER", "sk-other-0123456789abcdef")
+    providers, held = _boxed_key(tmp_path)
+    providers.update("box", {"api_key_ref": "DERATE_SECRET_OTHER"})
+    assert providers.secrets.get(held) is None  # let go of, so deleted
+    providers.secrets.put(held, SECRET_KEY)  # an orphan an older build left behind
+    providers.update("box", {"base_url": "http://attacker.local/v1"})
+
+    providers.update("box", {"api_key_ref": held})
+    assert providers.get("box").api_key_ref == held
+    assert providers.secrets.get(held) is None
+    providers.update("box", {"api_key_ref": held, "api_key": "sk-fresh-0123456789abcdef"})
+    assert providers.resolve_key("box") == "sk-fresh-0123456789abcdef"
+
+
+def test_an_environment_value_under_the_minted_name_can_be_named_again(tmp_path):
+    """The environment answers for the minted shape too (`env_resolvable`), and
+    that value is the operator's, not a key pasted for some other host."""
+    env = {"DERATE_SECRET_OTHER": "sk-other-0123456789abcdef", "DERATE_BOX_API_KEY": "sk-from-env-0123456789"}
+    providers = _real_providers(tmp_path, env=env)
+    providers.add({"provider_id": "box", "kind": ProviderKind.CUSTOM,
+                   "base_url": "http://box.local/v1", "api_key_ref": "DERATE_SECRET_OTHER"})
+    providers.update("box", {"api_key_ref": "DERATE_BOX_API_KEY"})
+    assert providers.resolve_key("box") == "sk-from-env-0123456789"
+
+
+def test_a_pasted_key_refused_with_its_move_is_not_stored(tmp_path):
+    """The key used to be written at once while the move waited for the rest of
+    the patch: a refusal left the new host's key beside the old host."""
+    providers, held = _boxed_key(tmp_path)
+    with pytest.raises(ValueError):
+        providers.update("box", {"base_url": "http://other.local/v1", "api_key": "sk-for-other-0123456789",
+                                 "enabled_models": ["no-such"]})
+    assert providers.get("box").base_url == "http://box.local/v1"
+    assert providers.resolve_key("box") == SECRET_KEY
+
+
+def test_a_removed_provider_leaves_no_key_a_new_one_could_name(tmp_path):
+    """A refused patch could leave the minted secret unreferenced; remove()
+    deleted only a secret the provider still referenced, and a new provider
+    of the same id named the reference and revived the old key."""
+    providers, held = _boxed_key(tmp_path)
+    with pytest.raises(ValueError):
+        providers.update("box", {"api_key_ref": "", "audio_prices": 5})
+    providers.remove("box")
+    assert providers.secrets.get(held) is None
+    providers.secrets.put(held, SECRET_KEY)  # an orphan an older build left behind
+    providers.add({"provider_id": "box", "kind": ProviderKind.CUSTOM,
+                   "base_url": "http://attacker.local/v1", "api_key_ref": held})
+    assert providers.secrets.get(held) is None
+
+
+def test_a_refused_add_stores_no_key(tmp_path):
+    providers = _real_providers(tmp_path)
+    with pytest.raises(ValueError):
+        providers.add({"provider_id": "box", "kind": ProviderKind.CUSTOM, "base_url": "http://box.local/v1",
+                       "api_key": SECRET_KEY, "priority": "high"})
+    assert providers.secrets.refs() == []
+
+
+def test_a_refused_patch_puts_the_reference_back_and_an_empty_key_is_not_a_paste(tmp_path, monkeypatch):
+    """A refused patch left the reference it had cleared (orphaning the key)
+    or set (sending it with no check passed); an empty `api_key` beside the
+    minted name counted as pasting one."""
+    providers, held = _boxed_key(tmp_path)
+    with pytest.raises(ValueError):
+        providers.update("box", {"api_key_ref": "", "audio_prices": 5})
+    assert providers.get("box").api_key_ref == held
+
+    monkeypatch.setenv("DERATE_SECRET_OTHER", "sk-other-0123456789abcdef")
+    providers.update("box", {"api_key_ref": "DERATE_SECRET_OTHER"})
+    providers.secrets.put(held, SECRET_KEY)  # an orphan an older build left behind
+    providers.update("box", {"base_url": "http://attacker.local/v1"})
+    for empty in ("", "   ", None):
+        with pytest.raises(ValueError):
+            providers.update("box", {"api_key_ref": held, "api_key": empty})
+        assert providers.get("box").api_key_ref == "DERATE_SECRET_OTHER"
+
+
+def test_a_key_pasted_beside_an_empty_reference_lands_under_the_minted_name(tmp_path):
+    """`{"api_key_ref": "", "api_key": k}` stored k under the name "": nothing
+    could resolve it and `remove` never deleted it."""
+    providers, held = _boxed_key(tmp_path)
+    providers.update("box", {"api_key_ref": "", "api_key": "sk-new-0123456789abcdef"})
+    assert providers.get("box").api_key_ref == held
+    assert providers.secrets.refs() == [held]
+    assert providers.resolve_key("box") == "sk-new-0123456789abcdef"
+
+
 # ---------------------------------------------------------------------------
 # K1 -- multipart parse differential
 # ---------------------------------------------------------------------------
@@ -187,7 +349,7 @@ def test_a_second_model_part_in_any_spelling_is_refused(second):
 
 
 def test_an_unquoted_model_part_alone_is_read():
-    from control_plane.gateway.openai_api import _multipart_field
+    from control_plane.gateway.multipart import read_field as _multipart_field
 
     body, content_type = _multipart(("name=model", b"whisper"))
     assert _multipart_field(body, content_type, "model") == "whisper"

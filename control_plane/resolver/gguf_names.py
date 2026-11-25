@@ -33,9 +33,11 @@ _TOKEN_SPLIT = re.compile(r"[-_.\s]+")
 
 #: Files that are never weights, matched anywhere in the name. "mmproj" is a
 #: llama.cpp coinage for a multimodal projector and appears in no quantization
-#: scheme; "mtp"/"dflash"/"draft" name speculative-decoding heads, which are
-#: their own small model and not a build of this one.
-_NEVER_WEIGHTS = frozenset({"mmproj", "mtp", "dflash", "draft", "drafter"})
+#: scheme; "mtp"/"dflash"/"dspark"/"draft" name speculative-decoding heads,
+#: which are their own small model and not a build of this one.
+#: ``unsloth/Inkling-2-Mini-GGUF`` ships ``dspark/dspark-…-BF16.gguf`` at
+#: 0.6 GiB, and before "dspark" was here it was recommended as the model's BF16.
+_NEVER_WEIGHTS = frozenset({"mmproj", "mtp", "dflash", "dspark", "draft", "drafter"})
 
 #: Endianness rebuilds. Only ever the final token, and "be" is too short to
 #: test anywhere else -- it is a substring of half the vocabulary.
@@ -58,12 +60,16 @@ def is_weight_file(filename: str) -> bool:
     ``mmproj-*``     a vision projector, loaded *beside* a model, never instead
                      of one.
     ``imatrix``      an importance matrix -- calibration data used to build the
-                     IQ quants, not a thing you serve. Matched only as the
-                     leading token, because ``Model-IQ4_XS-imatrix.gguf`` is a
-                     real quantization advertising how it was made, and a
-                     substring test would throw away the entire IQ ladder of
-                     every repository that labels it.
-    ``*-mtp``        a multi-token-prediction or draft head.
+                     IQ quants, not a thing you serve. Matched as the leading
+                     token, or anywhere in a name that carries no quantization
+                     token (bartowski's ``<org>_<model>-imatrix.gguf``, 0.1 GiB
+                     beside a 48.6 GiB BF16). Never by substring alone, because
+                     ``Model-IQ4_XS-imatrix.gguf`` is a real quantization
+                     advertising how it was made, and that test would throw
+                     away the entire IQ ladder of every repository that labels
+                     it.
+    ``*-mtp``,       a multi-token-prediction, DSpark or draft head.
+    ``dspark-*``
     ``*-be``         a big-endian rebuild, unloadable on every machine here.
 
     AppleDouble sidecars (``._name.gguf``) are excluded too: a macOS publisher
@@ -78,6 +84,8 @@ def is_weight_file(filename: str) -> bool:
     if not parts:
         return False
     if parts[0] == "imatrix":
+        return False
+    if "imatrix" in parts and quant_token(filename) is None:
         return False
     if _NEVER_WEIGHTS.intersection(parts):
         return False
@@ -103,6 +111,21 @@ def shard_family(filename: str) -> tuple[str, int, int] | None:
         return None
     stem = filename[: match.start()] + filename[match.end():]
     return stem, int(match.group(1)), int(match.group(2))
+
+
+def shard_name(filename: str, index: int) -> str:
+    """The name of shard *index* of the family *filename* belongs to.
+
+    Rebuilt from the same match `shard_family` reads, so ``x-00001-of-00003``
+    becomes ``x-00002-of-00003`` with everything else -- a quant subfolder, the
+    publisher's case -- untouched. *filename* must be a shard.
+    """
+    match = _SHARD_RE.search(filename)
+    if match is None:
+        raise ValueError(f"{filename!r} is not a shard")
+    total = int(match.group(2))
+    return f"{filename[: match.start()]}-{index:05d}-of-{total:05d}{filename[match.end():]}"
+
 
 
 def variant_stem(filename: str) -> str:
@@ -151,10 +174,7 @@ def quant_token(filename: str) -> str | None:
     is the string a person recognises. The bits-per-weight suffix is carried
     when present, because it is the only thing telling two builds apart.
     """
-    base = filename.rsplit("/", 1)[-1]
-    if base.lower().endswith(".gguf"):
-        base = base[: -len(".gguf")]
-    base = _SHARD_RE.sub("", base + ".gguf")[: -len(".gguf")]
+    base = _bare_stem(filename)
 
     match = None
     for match in _TOKEN_RE.finditer(base):
@@ -165,3 +185,85 @@ def quant_token(filename: str) -> str | None:
     token = match.group("token")
     bpw = _BPW_RE.search(base)
     return f"{token}-{bpw.group(1)}bpw" if bpw else token
+
+
+def _bare_stem(filename: str) -> str:
+    """The basename with ``.gguf`` and any shard suffix removed, case kept."""
+    base = filename.rsplit("/", 1)[-1]
+    if base.lower().endswith(".gguf"):
+        base = base[: -len(".gguf")]
+    return _SHARD_RE.sub("", base + ".gguf")[: -len(".gguf")]
+
+
+#: Publisher punctuation between name segments, CAPTURED so a rejoin keeps it.
+#: ``_`` is not a separator here: it lives inside quant tokens (``IQ2_XXS``).
+_SEGMENT_SPLIT = re.compile(r"([-.\s]+)")
+
+
+def distinct_labels(labels: list[str], filenames: list[str]) -> list[str]:
+    """*labels* with every duplicate replaced by what tells its files apart.
+
+    `quant_token` drops a publisher's qualifiers, so one repository can yield
+    ``IQ2_XXS`` twice (``…-AD-IQ2_XXS-Q2`` and ``…-AD-IQ2_XXS``) or ``NVFP4``
+    three times (``-Lite``, ``-XL``, plain), and a ``(repo, label)`` key then
+    points at several rows. A duplicated label becomes its file's stem from the
+    first segment the group does not share; a label still duplicated after that
+    (one basename in two folders) becomes the folder-qualified stem. A label
+    that was already unique is returned untouched. The lists are parallel.
+    """
+    out = list(labels)
+    groups: dict[str, list[int]] = {}
+    for i, label in enumerate(labels):
+        groups.setdefault(label, []).append(i)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        split = [_SEGMENT_SPLIT.split(_bare_stem(filenames[i])) for i in members]
+        segs = [parts[0::2] for parts in split]
+        common = 0
+        while all(len(s) > common + 1 for s in segs) and len({s[common] for s in segs}) == 1:
+            common += 1
+        for i, parts in zip(members, split):
+            out[i] = "".join(parts[2 * common:])
+
+    counts: dict[str, int] = {}
+    for label in out:
+        counts[label] = counts.get(label, 0) + 1
+    for i, label in enumerate(out):
+        if counts[label] > 1:
+            stem = variant_stem(filenames[i])
+            out[i] = stem[: -len(".gguf")] if stem.lower().endswith(".gguf") else stem
+    return out
+
+
+def is_hub_gguf_blob(model_id: str) -> bool:
+    """Whether this is derate's own post-resolve spelling for a hub GGUF blob.
+
+    ``hf://owner/repo/file.gguf`` is what an operator passes and what the
+    resolver is documented to take. It is NOT what comes back:
+    ``ModelResolver.resolve_gguf_full`` sets ``name = f"{repo}/{filename}"``
+    and drops the scheme, so every consumer downstream of a resolve sees
+    ``owner/repo/file.gguf``.
+
+    That mattered because two functions in ``deploy/flags.py`` were written
+    against the scheme and are both called with the resolved id --
+    `local_gguf_refusal` from `manager.launch` and `llamacpp_model_spec` from
+    `recipes.synthesize`. One refused every legitimate hub GGUF as a local
+    path; the other declined to translate it and left sparkrun an id it cannot
+    parse. Same root cause, so one predicate rather than two copies of the
+    same `startswith`.
+
+    The test is deliberately narrow, because the thing it must not swallow is
+    a genuine local path -- which also ends in ``.gguf`` and also has slashes.
+    A hub reference has at least three segments (owner, repo, and a filename
+    that may sit under a quant subdirectory) and does not begin with a path
+    sigil. ``/home/me/x.gguf`` and ``./x.gguf`` are therefore not hub blobs
+    and stay refusable; ``owner/repo-GGUF`` has two segments and no ``.gguf``
+    suffix, so sparkrun's own spelling is untouched.
+    """
+    name = model_id.strip()
+    if name.startswith(("/", "~", ".")):
+        return False
+    if not name.lower().endswith(".gguf"):
+        return False
+    return len(name.split("/")) >= 3

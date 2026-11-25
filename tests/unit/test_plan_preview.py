@@ -10,21 +10,15 @@ import dataclasses
 
 import pytest
 
-from control_plane.fit.calculator import bandwidth_ceiling_tps, predict_decode_tps
+from control_plane.fit.calculator import predict_decode_tps
 from tests.unit.test_deploy import make_manager
 from tests.unit.test_speculative import _client, _plan_body
 
 import tests.fixtures as fx
 
 
-@pytest.mark.parametrize("kv", [0.0, 1.5e8, 3.2e9])
-def test_one_user_ceiling_is_the_cards_decode_prediction_exactly(kv):
-    for shape in (fx.GPT_OSS_120B,):
-        assert bandwidth_ceiling_tps(shape, 273.0, kv, 1) == predict_decode_tps(shape, 273.0, kv)
-
-
 def test_ceiling_each_falls_as_users_share_the_bandwidth():
-    each = [bandwidth_ceiling_tps(fx.GPT_OSS_120B, 273.0, 2e8, u) for u in (1, 4, 16)]
+    each = [predict_decode_tps(fx.GPT_OSS_120B, 273.0, 2e8, users=u) for u in (1, 4, 16)]
     assert each[0] > each[1] > each[2] > 0
 
 

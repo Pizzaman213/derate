@@ -4,7 +4,9 @@ Starlette's ``request.json()`` buffers whatever the client sends before anything
 can look at its size, and uvicorn applies no body limit of its own: an open
 route (login, setup, join) would hold a gigabyte in memory on the word of an
 unauthenticated caller. Every body the gateway parses comes through here, so
-an oversized one is dropped at the limit instead.
+an oversized one is dropped at the limit instead. The shape refusals every /v1
+JSON body gets (a model name past its length, nesting past its depth) live
+here too, beside the ceilings they share a reason with.
 """
 
 from __future__ import annotations
@@ -21,6 +23,17 @@ from .errors import error_response
 #: a joining node sends is within an order of magnitude of it.
 API_JSON_BODY_MAX = 64 * 1024
 
+#: The longest ``model`` a /v1 request may name. Longer than any HuggingFace
+#: id, ``hf://owner/repo/file.gguf`` or ``<provider>/<model>`` alias; the name
+#: lands verbatim in every telemetry row, so an unbounded one was a way to
+#: write megabytes per refused request.
+MAX_MODEL_CHARS = 512
+
+#: Containers one /v1 JSON body may nest. Parsing survives far deeper, but the
+#: estimates re-serialise ``tools`` and ``response_format`` recursively, and
+#: one level under the C recursion limit made that a 500.
+MAX_JSON_DEPTH = 64
+
 
 class BodyTooLarge(ValueError):
     """The body went past the caller's limit; nothing past it was read."""
@@ -31,6 +44,34 @@ def payload_too_large(limit: int = API_JSON_BODY_MAX) -> Response:
     return error_response(
         413, f"Body exceeds {limit // 1024} KiB.", "invalid_request_error", "payload_too_large"
     )
+
+
+def model_refusal(model: str) -> Response | None:
+    """The 400 for a ``model`` past :data:`MAX_MODEL_CHARS`, which does not
+    echo it; None otherwise."""
+    if len(model) <= MAX_MODEL_CHARS:
+        return None
+    return error_response(
+        400, f"'model' is longer than {MAX_MODEL_CHARS} characters.",
+        "invalid_request_error", "invalid_request",
+    )
+
+
+def depth_refusal(value: object, limit: int = MAX_JSON_DEPTH) -> Response | None:
+    """The 400 when any object or array in *value* sits more than *limit*
+    levels deep (the top-level container is level 1); None otherwise.
+    Iterative, so it cannot hit the recursion limit it guards against."""
+    stack = [(value, 1)] if isinstance(value, (dict, list)) else []
+    while stack:
+        item, depth = stack.pop()
+        if depth > limit:
+            return error_response(
+                400, f"Request body is not valid JSON: it is nested more than {limit} levels deep.",
+                "invalid_request_error", "invalid_json",
+            )
+        children = item.values() if isinstance(item, dict) else item
+        stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return None
 
 
 async def read_bounded_body(request: Request, limit: int) -> bytes | None:
@@ -56,8 +97,12 @@ def _reject_constant(name: str) -> NoReturn:
 
 
 def _parse(raw: bytes) -> object:
-    value = json.loads(raw, parse_constant=_reject_constant)
-    _refuse_non_finite(value)
+    try:
+        value = json.loads(raw, parse_constant=_reject_constant)
+        _refuse_non_finite(value)
+    except RecursionError:
+        # The caller's malformed body -- a 400 like any other, never a 500.
+        raise ValueError("body is nested too deeply") from None
     return value
 
 

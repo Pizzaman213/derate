@@ -63,10 +63,28 @@ check(tm.length === 1 && tm[0].x === 1 && tm[0].y === 0.09, 'measured first toke
 check(t.pointsOnly.join() === M.MEASURED_SERIES, 'measured first token is dots')
 check(t.verticalMarkers.length === 1 && t.verticalMarkers[0].x === 2, 'ttft keeps the wall marker')
 
-check(M.contextChips(131072).join() === '8192,32768,65536,131072', 'chips: every preset within the window')
-check(M.contextChips(2097152).map(M.ctxLabel).join() === '8k,32k,64k,128k,256k,512k,1M,2M', 'chips: 8k, then 32k doubling, in k then M')
-check(M.contextChips(40960).join() === '8192,32768', 'chips: presets only -- a window that is not one gets no chip')
-check(M.comparedContexts(9728, M.contextChips(40960)).join() === '8192,9728,32768', 'compared: the one in use and its nearest neighbours in doublings')
-check(M.comparedContexts(32768, M.contextChips(262144)).join() === '8192,32768,65536,131072', 'compared: at most four, the current one kept')
+check(M.presetContexts(131072).join() === '8192,32768,65536,131072', 'presets: every preset within the window')
+check(M.presetContexts(2097152).map(M.ctxLabel).join() === '8k,32k,64k,128k,256k,512k,1M,2M', 'presets: 8k, then 32k doubling, in k then M')
+check(M.presetContexts(40960).join() === '8192,32768', 'presets: presets only -- a window that is not one is not added')
+check(M.comparedContexts(9728, M.presetContexts(40960)).join() === '8192,9728,32768', 'compared: the one in use and its nearest neighbours in doublings')
+check(M.comparedContexts(32768, M.presetContexts(262144)).join() === '8192,32768,65536,131072', 'compared: at most four, the current one kept')
+
+check(M.contextStops(40960).map(M.ctxLabel).join() === '1k,1.5k,2k,3k,4k,6k,8k,12k,16k,24k,32k,40k', 'stops: 1k, x1.5, x2 ladder, the window last')
+check(M.contextStops(1536).join() === '1024,1536', 'stops: a window on a half-step is not repeated')
+check(M.contextStops(512).join() === '512', 'stops: a window under 1k is the only stop')
+check(M.contextStops(null).at(-1) === 2097152, 'stops: no window runs to the largest preset')
+const st = M.contextStops(131072)
+check(st[M.nearestStop(st, 74752)] === 65536, 'nearest: a planner pick sits on the nearest stop in doublings')
+check(st[M.nearestStop(st, 49152)] === 49152, 'nearest: a value on a stop is that stop')
+check(M.USER_STOPS[M.nearestStop(M.USER_STOPS, 1000)] === 256, 'nearest: past the last stop clamps to it')
+check(M.nearestStop(M.USER_STOPS, 0) === 0 && M.nearestStop(M.USER_STOPS, NaN) === 0, 'nearest: no positive value sits on the first stop')
+check(M.ctxLabel(16) === '16' && M.ctxLabel(1023) === '1023' && M.ctxLabel(1024) === '1k', 'label: under 1k is a plain count, never "0.0k"')
+const between = M.withValue(M.contextStops(131072), 5120)
+check(between.includes(5120) && between[M.nearestStop(between, 5120) - 1] === 4096 && between[M.nearestStop(between, 5120) + 1] === 6144,
+  'withValue: a value between stops is its own stop, with its neighbours either side')
+check(M.withValue(M.USER_STOPS, 16) === M.USER_STOPS && M.withValue(M.USER_STOPS, 0) === M.USER_STOPS,
+  'withValue: a value already a stop, or none, leaves the stops as they are')
+check(between.every((v) => M.withValue(between, v).length === between.length),
+  'withValue: any stop picked from the committed list keeps the list the same length')
 
 done()

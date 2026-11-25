@@ -38,7 +38,6 @@ try:  # shared day-0 fixtures: the same numbers every other agent tests against
     from tests.fixtures import (  # type: ignore[import-not-found]
         LINKS,
         MODEL_SHAPES,
-        NODE_PROFILES,
         NODE_STATES,
         fits,
         pp2_plan,
@@ -156,6 +155,9 @@ class StubFit:
 
     def max_context(self, shape, plan, nodes, max_seqs, kv_dtype) -> int:
         return 131072
+
+    def decode_tps_each(self, req, nodes, users=1, *, tflops=None) -> float | None:
+        return None
 
 
 class StubPlanner:
@@ -279,7 +281,8 @@ class StubDeployments:
         self, shape, plan, fit, runtime, ctx, max_seqs, *,
         modality=Modality.TEXT, served_name=None, extra_args=(), custom_command=(),
         revision=None, speculative_tokens=0, speculative=None,
-        engine_options=EngineOptions(), original_window=None, lifecycle=Lifecycle(),
+        engine_options=EngineOptions(), original_window=None,
+        gguf_base=None, gguf_projector=None, lifecycle=Lifecycle(),
     ) -> Deployment:
         dep = _deployment(
             f"d-{len(self._deployments) + 1}",
@@ -299,6 +302,8 @@ class StubDeployments:
         dep.custom_command = tuple(custom_command)
         dep.engine_options = engine_options
         dep.original_window = original_window
+        dep.gguf_base = gguf_base
+        dep.gguf_projector = gguf_projector
         dep.lifecycle = lifecycle
         self._deployments.append(dep)
         return dep
@@ -397,27 +402,23 @@ class StubProviders:
         return list(self._providers)
 
     def add(self, spec: dict) -> Provider:
-        # The same two screens the real service applies, in the same order and
+        # The same screens the real service applies, in the same order and
         # with the same sentence. A stub that accepts what the coordinator
         # refuses is not a rehearsal of it: the add form learns what the key
         # fields mean from the 400 it gets back, and against this surface it
         # would learn the opposite.
-        from control_plane.providers.service import (
-            KEY_IN_REF_FIELD,
-            REF_NOT_OURS,
-            parse_daily_budget,
-            minted_ref,
-            ref_allowed,
-        )
+        from control_plane.providers.refs import KEY_IN_REF_FIELD, add_refusal, minted_ref
+        from control_plane.providers.service import parse_daily_budget
 
         kind = ProviderKind(spec.get("kind", "custom"))
         api_key = str(spec.get("api_key") or "").strip()
         api_key_ref = str(spec.get("api_key_ref") or "").strip()
         if looks_like_secret(api_key_ref):
             raise ValueError(KEY_IN_REF_FIELD)
-        provider_id = spec.get("provider_id") or f"p-{len(self._providers) + 1}"
-        if api_key_ref and not ref_allowed(api_key_ref, provider_id):
-            raise ValueError(REF_NOT_OURS)
+        provider_id = str(spec.get("provider_id") or "").strip() or f"p-{len(self._providers) + 1}"
+        refusal = add_refusal((p.provider_id for p in self._providers), provider_id, api_key_ref)
+        if refusal is not None:
+            raise ValueError(refusal)
         parse_daily_budget(spec.get("daily_budget_usd"))
         # A stub has no secrets file to write to, so it does the visible half:
         # the reference the real service would have stored the key under. Off
@@ -463,22 +464,16 @@ class StubProviders:
 
     def _screen(self, provider_id: str, patch: dict) -> Provider:
         """Every refusal ``update`` can make, before anything is written."""
-        from control_plane.providers.service import (
-            KEY_IN_REF_FIELD,
-            REF_NOT_OURS,
-            parse_daily_budget,
-            ref_allowed,
-        )
+        from control_plane.providers.refs import patch_refusal
+        from control_plane.providers.service import parse_daily_budget
 
         provider = self._find(provider_id)
         if "daily_budget_usd" in patch:
             parse_daily_budget(patch["daily_budget_usd"])
-        if "api_key_ref" in patch:
-            ref = str(patch["api_key_ref"]).strip()
-            if looks_like_secret(ref):
-                raise ValueError(KEY_IN_REF_FIELD)
-            if ref and not ref_allowed(ref, provider_id):
-                raise ValueError(REF_NOT_OURS)
+        moved = "base_url" in patch and str(patch["base_url"]).strip() != provider.base_url
+        refusal = patch_refusal(provider_id, moved, patch)
+        if refusal is not None:
+            raise ValueError(refusal)
         if "priority" in patch:
             int(patch["priority"])
         if "enabled_models" in patch:
@@ -550,7 +545,7 @@ class StubProviders:
             # half: the reference the real service would have stored under.
             # Dropping the field instead would report a rotation to a UI that
             # then shows the same key state it showed before.
-            from control_plane.providers.service import minted_ref
+            from control_plane.providers.refs import minted_ref
 
             if "api_key_ref" not in patch:
                 provider.api_key_ref = minted_ref(provider_id)

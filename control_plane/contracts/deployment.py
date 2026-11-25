@@ -216,6 +216,14 @@ class Deployment:
     # The model's trained window when YaRN (engine_options.rope_factor)
     # stretched it; None otherwise.
     original_window: int | None = None
+    # The repository a hub GGUF blob was quantized from, which vllm reads
+    # config.json and the tokenizer from (--hf-config-path/--tokenizer), and
+    # the vision projector blob ("owner/repo/mmproj-BF16.gguf") a multimodal
+    # one loads beside it. Stored for the reason `kv_dtype` is: the launch was
+    # judged with the projector charged. None for every other deployment and
+    # for every record written before these fields existed.
+    gguf_base: str | None = None
+    gguf_projector: str | None = None
 
 
 #: Upper bound on Deployment.speculative_tokens.

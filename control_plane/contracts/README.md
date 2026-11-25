@@ -131,7 +131,8 @@ mins are counted, not 4.00, and MXFP4 costs 4.25 because every 32 elements carry
 an E8M0 scale. `BYTES_PER_PARAM` has 33 entries and `ModelShape.dtype` is always
 one of its keys. `QUANT_INFO` carries the same 33 with `bits_per_weight`, family,
 `native_compute_capability` and whether the scheme still runs emulated below it —
-`nvfp4` is Blackwell-only with no pre-Blackwell kernel; `mxfp4` runs on Hopper
+`nvfp4` is native on Blackwell and runs weight-only through vLLM's Marlin
+kernel below it (measured on an RTX 3090 Ti, sm_86); `mxfp4` runs on Hopper
 and Ada by dequantizing in kernel, and pre-Hopper runtimes upcast to bf16, which
 quadruples it.
 

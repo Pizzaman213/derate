@@ -370,6 +370,19 @@ class EngineLoad:
         return (self.prompt_tokens + self.generation_tokens) / self.decode_count
 
     @property
+    def mean_decode_context_tokens(self) -> float | None:
+        """The cache length averaged over this window's decode steps, or None.
+
+        A request's cache grows from its prompt to prompt + generation while
+        it decodes, so averaged over its steps it holds the prompt plus half
+        the generation. That, not the final length, is what a measured decode
+        rate was reading.
+        """
+        if self.decode_count <= 0.0:
+            return None
+        return (self.prompt_tokens + self.generation_tokens / 2) / self.decode_count
+
+    @property
     def prefill_share(self) -> float | None:
         """Share of this window's tokens that arrived as PROMPT, or None.
 

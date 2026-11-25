@@ -291,6 +291,59 @@ def test_a_real_preflight_passes_when_an_origin_is_allowed(tmp_path, monkeypatch
     assert client.options("/api/keys", headers={"Origin": "http://dev:5173"}).status_code == 401
 
 
+@pytest.mark.parametrize("path", ["/api/keys", "/api/no-such-route"])
+def test_a_preflight_without_an_origin_is_gated(tmp_path, monkeypatch, path):
+    """CORSMiddleware answers a preflight only when it carries an Origin; one
+    without reached the router, and 405-with-Allow versus 404 was the route
+    oracle GA-4 closed for every other OPTIONS."""
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DERATE_ALLOWED_ORIGINS", "https://ui.example")
+    r = TestClient(create_app()).options(path, headers={"Access-Control-Request-Method": "GET"})
+    assert r.status_code == 401, r.text
+    assert r.json()["error"]["code"] == "session_required"
+
+
+@pytest.mark.parametrize("route", V1_ROUTES)
+def test_the_v1_handlers_refuse_a_caller_the_gate_never_saw(tmp_path, monkeypatch, route):
+    """Only AuthGuard attaches a principal. Mounted without it -- a second app,
+    a route reached some other way -- every handler used to serve the whole
+    catalogue with no allowlist and no limit. Walked from the route set, so a
+    new /v1 handler is covered the day it exists."""
+    from fastapi import FastAPI
+
+    from control_plane.gateway import openai_api
+
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    bare = FastAPI()
+    bare.include_router(openai_api.create_router(create_app().state.ctx))
+    client = TestClient(bare)
+    if route.startswith("WEBSOCKET "):
+        assert _socket_refusal(client, route.split(" ", 1)[1], {}).code == 1008
+        return
+    reply = _send(client, route, {})
+    assert (reply.status_code, reply.json()["error"]["code"]) == (401, "missing_api_key"), reply.text
+
+
+def test_the_key_route_wants_a_key_not_a_session(tmp_path, monkeypatch):
+    """`/v1/key` reads the caller's own key record: a session alone (which the
+    gate never puts on /v1, but a second mount could) is a 401, not a 500."""
+    from fastapi import FastAPI
+
+    from control_plane.gateway import openai_api
+
+    monkeypatch.setenv("DERATE_DATA_DIR", str(tmp_path))
+    bare = FastAPI()
+
+    @bare.middleware("http")
+    async def session_only(request, call_next):
+        request.scope.setdefault("state", {})["session"] = object()
+        return await call_next(request)
+
+    bare.include_router(openai_api.create_router(create_app().state.ctx))
+    reply = TestClient(bare).get("/v1/key")
+    assert (reply.status_code, reply.json()["error"]["code"]) == (401, "missing_api_key")
+
+
 # -- the edge listener (DERATE_EDGE_PORT) ------------------------------------
 
 EDGE_PORT = 18099

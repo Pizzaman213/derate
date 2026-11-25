@@ -90,13 +90,14 @@ const ladder = [
   gguf({ label: 'Q8_0', gguf_file: 'q8.gguf', launchable: false }),
   gguf({ label: 'bf16', dtype: 'bf16', gguf_file: null, launchable: true }),
 ]
-const onCluster = partitionForRuntime(ladder, 'vllm')
+const ST = ['safetensors']
+const onCluster = partitionForRuntime(ladder, 'vllm', ST)
 check('vllm serves what the gateway marked launchable',
   onCluster.servable.map((v) => v.label).join(','), 'bf16')
 check('vllm leaves the gguf rows as reference',
   onCluster.reference.map((v) => v.label).join(','), 'Q4_K_M,Q8_0')
 
-const onOllama = partitionForRuntime(ladder, 'ollama')
+const onOllama = partitionForRuntime(ladder, 'ollama', [])
 check('ollama serves the gguf rows regardless of launchable',
   onOllama.servable.map((v) => v.label).join(','), 'Q4_K_M,Q8_0')
 check('ollama leaves the safetensors row as reference',
@@ -104,25 +105,27 @@ check('ollama leaves the safetensors row as reference',
 
 // The gateway's rank order is the ladder's order, and neither branch re-sorts.
 check('order is preserved, not recomputed',
-  partitionForRuntime([...ladder].reverse(), 'ollama').servable
+  partitionForRuntime([...ladder].reverse(), 'ollama', []).servable
     .map((v) => v.label).join(','), 'Q8_0,Q4_K_M')
 
 // sglang reads the same field vllm does -- the split is on the verb, not the
 // engine name, so only ollama diverges.
 check('sglang partitions exactly as vllm does',
-  partitionForRuntime(ladder, 'sglang').servable.map((v) => v.label).join(','),
+  partitionForRuntime(ladder, 'sglang', ST).servable.map((v) => v.label).join(','),
   onCluster.servable.map((v) => v.label).join(','))
 
-// A GGUF row the gateway marks launchable is llamacpp's, not vllm's: the
-// ladder's `launchable` says "some runtime here", and vllm refuses the plan.
+// A GGUF row the gateway marks launchable is vllm's only when /api/runtimes
+// says the vllm image reads gguf (vllm-gguf-plugin); llamacpp's otherwise.
 const both = [
   gguf({ label: 'Q4_K_M', launchable: true }),
   gguf({ label: 'bf16', dtype: 'bf16', gguf_file: null, launchable: true }),
 ]
-check('vllm does not offer a launchable GGUF row',
-  partitionForRuntime(both, 'vllm').servable.map((v) => v.label).join(','), 'bf16')
+check('vllm without the plugin does not offer a launchable GGUF row',
+  partitionForRuntime(both, 'vllm', ST).servable.map((v) => v.label).join(','), 'bf16')
+check('vllm with the plugin offers the GGUF row too',
+  partitionForRuntime(both, 'vllm', ['safetensors', 'gguf']).servable.map((v) => v.label).join(','), 'Q4_K_M,bf16')
 check('llamacpp offers only the GGUF row',
-  partitionForRuntime(both, 'llamacpp').servable.map((v) => v.label).join(','), 'Q4_K_M')
+  partitionForRuntime(both, 'llamacpp', ['gguf']).servable.map((v) => v.label).join(','), 'Q4_K_M')
 
 // --- what a row is LAUNCHED as, which is not what it is keyed by ---------
 //

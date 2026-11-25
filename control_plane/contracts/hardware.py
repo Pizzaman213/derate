@@ -59,6 +59,18 @@ class NodeProfile:
     #: An image is built for one, and a launch has to run the image for the
     #: machine it lands on -- the DGX Spark images here are arm64-only.
     arch: str = ""
+    #: Whether the machine has an InfiniBand/RoCE verbs device for a container
+    #: to be handed (`/dev/infiniband`). None = the agent predates the field,
+    #: which keeps the old assumption (the device is there); False is a
+    #: machine docker would refuse `--device /dev/infiniband` on.
+    infiniband: bool | None = None
+    #: Host (CPU) memory bandwidth in GB/s, read+write, measured by the agent
+    #: at probe time (`registry/probe.py::measure_host_bandwidth`). What a
+    #: host-pool runtime decodes against: `flags.budget_profile` puts it in
+    #: `memory_bandwidth_gbps` for llamacpp on a CPU or discrete node. None =
+    #: not measured (an older agent, a GB10, too little free memory), and then
+    #: nothing predicts a host-RAM decode rate, as before the field.
+    host_memory_bandwidth_gbps: float | None = None
 
     def usable_memory(self, guardrail: float = DEFAULT_GUARDRAIL) -> int:
         return int(self.addressable_memory * guardrail)

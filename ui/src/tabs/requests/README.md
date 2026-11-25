@@ -13,13 +13,27 @@ request. `/usage/requests/<request id>` is one request's detail.
 | File | What it owns |
 |---|---|
 | `RequestsSub.tsx` | the filter bar, request-id search, CSV link and paging; `/usage/requests/<id>` renders `RequestDetail` instead |
-| `RequestDetail.tsx` | every recorded fact about one request, and its attempt chain |
+| `RequestDetail.tsx` | one request's page: header and map, headline, five stat cards, time and token split bars, Routing/Client/Cost columns, attempts, route, and every raw field |
+| `requestView.ts` | every figure and sentence on that page (status pill, headline, time/token splits, cache, cost, device from the tailnet label, browser from the UA). Pure |
 | `RateLimitsSub.tsx` | Usage's Rate limits pane: model/provider statistics, live cooldowns and durable 429 log |
 | `RequestRows.tsx` | the table, shared with a key's Recent requests (`../keys/KeyStats.tsx`) |
 | `servedBy.ts` | "Served by" wording (provider, or deployment on nodes) and the window -> `start=` mapping. Pure |
-| `requests.check.mjs` | hermetic: every `servedBy` branch and `windowStart` |
+| `requests.check.mjs` | hermetic: every `servedBy` branch, `windowStart`, and `requestView.ts` against two real archive rows |
 
 The chat transcript's request id links here (`../chat/Transcript.tsx`).
+
+## Request detail
+
+Every field `GET /api/requests` returns is reachable: the page's cards and
+columns draw the meaningful ones and `Show all N raw fields` lists the rest
+verbatim. A request refused at admission has no timing and no target, so the
+bars say so rather than drawing zeros. `duration_ms` excludes parking, so the
+time bar's total adds `parked_ms` back, and decode is drawn as the remainder
+of `duration_ms` after the first token (`decode_ms` overlaps it by a chunk).
+The device name comes from the label `telemetry/tailnet.py` writes for a
+tailnet peer and the browser from the user agent; the server has neither
+field. An unpriced local model links to `/settings?price=<model>`, which opens
+Policy with that model's pricing row focused.
 
 ## Rate limits
 

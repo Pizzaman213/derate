@@ -263,6 +263,24 @@
       "methods": [
         "GET"
       ],
+      "path": "/api/geoip"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/geoip/places"
+    },
+    {
+      "methods": [
+        "PUT"
+      ],
+      "path": "/api/geoip/places"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
       "path": "/api/history/events"
     },
     {
@@ -378,6 +396,12 @@
         "POST"
       ],
       "path": "/api/links/tune"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/map/tiles/{z}/{x}/{y}"
     },
     {
       "methods": [
@@ -687,12 +711,6 @@
     },
     {
       "methods": [
-        "POST"
-      ],
-      "path": "/api/providers/{provider_id}/key-check"
-    },
-    {
-      "methods": [
         "GET"
       ],
       "path": "/api/providers/{provider_id}/logo"
@@ -732,6 +750,18 @@
         "GET"
       ],
       "path": "/api/requests"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/requests/origins"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/requests/route"
     },
     {
       "methods": [

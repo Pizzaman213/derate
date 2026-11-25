@@ -179,7 +179,7 @@ def compute_seconds_per_step(
     ``predict_decode_tps`` and its efficiency factor; nothing here should be
     shown to a user as a tokens-per-second figure.
     """
-    active_bytes = shape.effective_active_params * shape.bytes_per_param()
+    active_bytes = shape.effective_decode_params * shape.bytes_per_param()
     aggregate_bw = profile.memory_bandwidth_gbps * 1e9 * max(1, world_size)
     if aggregate_bw <= 0:
         # A profile the registry could not probe reports 0 GB/s, and it reaches
@@ -257,26 +257,54 @@ def estimated_step_seconds(
     if link is None or world == 1:
         return compute
 
-    comm = 0.0
-    comm += link_seconds(
+    return compute + wire_seconds_per_step(shape, link, tp, pp, ep, batch)
+
+
+def wire_seconds_per_step(
+    shape: ModelShape,
+    link: LinkMeasurement | None,
+    tp: int,
+    pp: int,
+    ep: int,
+    batch: int = 1,
+) -> float:
+    """Interconnect seconds one decode step spends on the wire, every axis.
+
+    The planner's ranking and the fit gate's tok/s both charge this, so the two
+    cannot disagree about what crossing nodes costs.
+
+    *link* of None is a plan nobody has measured a link for: there is no
+    bandwidth to divide the payload by, so only the exchanges are charged, at
+    ``UNMEASURED_COLLECTIVE_LATENCY_US`` each. A caller that reports the result
+    has to say so.
+    """
+    if link is None:
+        exchanges = (
+            tensor_exchanges_per_step(shape, tp)
+            + pipeline_exchanges_per_step(pp)
+            + expert_exchanges_per_step(shape, ep)
+        )
+        return exchanges * UNMEASURED_COLLECTIVE_LATENCY_US * 1e-6
+    wire = 0.0
+    wire += link_seconds(
         tensor_bytes_per_step(shape, tp, batch),
         link.all_reduce_gbps,
         tensor_exchanges_per_step(shape, tp),
         link.latency_us,
     )
-    comm += link_seconds(
+    wire += link_seconds(
         pipeline_bytes_per_step(shape, pp, batch),
         link.sendrecv_gbps,
         pipeline_exchanges_per_step(pp),
         link.latency_us,
     )
-    comm += link_seconds(
+    wire += link_seconds(
         expert_bytes_per_step(shape, ep, batch),
         link.sendrecv_gbps,
         expert_exchanges_per_step(shape, ep),
         link.latency_us,
     )
-    return compute + comm
+    return wire
 
 
 def human_bytes(n: float) -> str:

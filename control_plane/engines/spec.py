@@ -204,10 +204,11 @@ class EngineSpec:
     #: node says is free RAM right now.
     #:
     #: It is a claim about what `registry.allocatable_bytes` can ANSWER for,
-    #: not about what the runtime prefers. That function branches on device
-    #: class -- host memory for `DeviceClass.CPU`, a GPU figure for everything
-    #: else -- so a host-pool runtime is placeable exactly where a host answer
-    #: exists. Everywhere else the gate would size it against the wrong pool.
+    #: not about what the runtime prefers. That function takes this value as
+    #: its `pool`: `"host"` answers from MemAvailable on a machine whose host
+    #: RAM is its own pool (CPU, DISCRETE) and 0 on a unified one, so a
+    #: host-pool runtime is placeable exactly where a host answer exists.
+    #: Everywhere else the gate would size it against the wrong pool.
     #:
     #: This is the field that used to be implicit in `addressable_memory <= 0`.
     #: While every runtime needed a GPU, "has no GPU memory" and "cannot serve"

@@ -64,6 +64,11 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
     34: ("TQ1_0", 256, 54),
     35: ("TQ2_0", 256, 66),
     39: ("MXFP4", 32, 17),
+    # ggml.h's enum; block sizes from ggml-common.h (F8_E4M3 is a plain byte).
+    40: ("NVFP4", 64, 36),
+    41: ("Q1_0", 128, 18),
+    42: ("Q2_0", 64, 18),
+    43: ("F8_E4M3", 1, 1),
 }
 
 #: general.file_type -> a key in BYTES_PER_PARAM. The enum is llama.cpp's

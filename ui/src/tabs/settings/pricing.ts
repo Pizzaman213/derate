@@ -16,7 +16,13 @@ export interface PricingRow {
   price: LocalPrice | null
 }
 
-export function pricingRows(models: ServedModel[] | null, prices: LocalPrice[] | null): PricingRow[] {
+/** `want` is a model a link asked to price (`/settings?price=`): a served name
+ *  whose deployment is gone and which was never priced still gets a row. */
+export function pricingRows(
+  models: ServedModel[] | null,
+  prices: LocalPrice[] | null,
+  want?: string | null,
+): PricingRow[] {
   const byModel = new Map<string, PricingRow>()
   for (const m of models ?? []) {
     if (m.target_kinds.includes('local')) byModel.set(m.id, { model: m.id, served: true, price: null })
@@ -26,6 +32,7 @@ export function pricingRows(models: ServedModel[] | null, prices: LocalPrice[] |
     if (row) row.price = p
     else byModel.set(p.model, { model: p.model, served: false, price: p })
   }
+  if (want && !byModel.has(want)) byModel.set(want, { model: want, served: false, price: null })
   return [...byModel.values()].sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0))
 }
 

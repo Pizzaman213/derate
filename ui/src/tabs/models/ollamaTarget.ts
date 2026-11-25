@@ -1,6 +1,6 @@
 import type { QuantVariant } from '../../api/types'
 import type { Runtime } from '../../state/runtime'
-import { memoryPool, servesOnCluster } from '../../state/runtime'
+import { servesOnCluster } from '../../state/runtime'
 
 /** Addressing a ladder row as something Ollama can fetch.
  *
@@ -96,29 +96,25 @@ export function launchId(variant: QuantVariant): string {
 
 /** Split a ladder into what this runtime can serve and what it cannot.
  *
- *  On the cluster this is the gateway's own `launchable` AND the file format
- *  this runtime loads. `launchable` stopped meaning "vllm can load it" when
- *  the llamacpp runtime arrived: a GGUF row is launchable now, by llamacpp,
- *  and the gateway's ladder says so without saying by which runtime. vllm and
- *  sglang still refuse one at the plan (`serve.allowed: false`, "this shape
- *  is for planning, not for a launch through either runtime"), and llamacpp
- *  loads nothing else -- so offering a GGUF row under vllm is offering a
- *  refusal, and was the default pick on every popular model. Under ollama it
- *  is `runnableOnOllama`, and the two are very nearly inverses.
+ *  On the cluster this is the gateway's own `launchable` AND a file format
+ *  this runtime loads. `launchable` is runtime-blind -- a GGUF row is
+ *  launchable by llamacpp, and by vllm only when its image carries
+ *  vllm-gguf-plugin -- so `formats` (the gateway's `/api/runtimes` answer,
+ *  via `formatsOf`) narrows it to the runtime that was actually picked.
+ *  Under ollama it is `runnableOnOllama`, and the two are very nearly inverses.
  *
  *  This is not a second answer to the gateway's question: `launchable` is
- *  still required, and the format test only narrows it to the runtime that
- *  was actually picked. Ollama is a provider, not a runtime here, and "can
- *  that box fetch this" is a different question answered from two fields the
- *  same payload supplied.
+ *  still required, and the format list comes from the gateway too. Ollama is
+ *  a provider, not a runtime here, and "can that box fetch this" is a
+ *  different question answered from two fields the same payload supplied.
  */
 export function partitionForRuntime(
   variants: QuantVariant[],
   runtime: Runtime,
+  formats: readonly string[],
 ): { servable: QuantVariant[]; reference: QuantVariant[] } {
-  const ggufOnly = memoryPool(runtime) === 'host'
   const canServe = servesOnCluster(runtime)
-    ? (v: QuantVariant) => v.launchable && Boolean(v.gguf_file) === ggufOnly
+    ? (v: QuantVariant) => v.launchable && formats.includes(v.gguf_file ? 'gguf' : 'safetensors')
     : runnableOnOllama
   const servable: QuantVariant[] = []
   const reference: QuantVariant[] = []

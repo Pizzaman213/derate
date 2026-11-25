@@ -6,6 +6,7 @@
 // thirty lines of a new verifier were always the same two chores: bundle a TS
 // module so node can import it, and count failures so the exit code means
 // something. Fifteen files had hand-rolled copies, in two different idioms.
+// (`load` is also used by .omp/stubui/server.mjs, the agents' stub-UI tool.)
 //
 // So a new verifier now starts at its first assertion:
 //

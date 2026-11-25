@@ -258,6 +258,9 @@ def concurrency_for(
     ceiling: int = MAX_DERIVED_CONCURRENCY,
     weight_bytes: int | None = None,
     allocatable: Mapping[str, int] | None = None,
+    speculative: Any | None = None,
+    chunk_tokens: int | None = None,
+    extra_replicated_bytes: int = 0,
 ) -> int:
     """The concurrency to serve one model at, when the caller named none.
 
@@ -282,6 +285,11 @@ def concurrency_for(
     one, and the refusal for a model with room for none belongs to the gate,
     phrased in its own sentence, not to a caller that silently launched at
     zero.
+
+    ``speculative``, ``chunk_tokens`` and ``extra_replicated_bytes`` are what
+    the gate will charge besides the cache -- the draft, the batched-token
+    scratch, the image cache -- and leaving any out derives a batch the very
+    next check refuses.
     """
     solve = getattr(fit, "max_seqs", None)
     if not callable(solve) or ceiling < 1:
@@ -298,8 +306,15 @@ def concurrency_for(
     except (TypeError, ValueError):  # builtins, C callables, exotic proxies
         params = {}
     varkw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
-    if allocatable is not None and ("allocatable" in params or varkw):
-        kwargs["allocatable"] = allocatable
+    optional = {
+        "allocatable": allocatable,
+        "speculative": speculative,
+        "chunk_tokens": chunk_tokens,
+        "extra_replicated_bytes": extra_replicated_bytes or None,
+    }
+    for name, value in optional.items():
+        if value is not None and (name in params or varkw):
+            kwargs[name] = value
 
     try:
         fits = solve(shape, plan, nodes, context, kv_dtype, ceiling, weight_bytes, **kwargs)
@@ -335,6 +350,8 @@ def context_for(
     allocatable: Mapping[str, int] | None = None,
     native_window: int | None = None,
     speculative: Any | None = None,
+    chunk_tokens: int | None = None,
+    extra_replicated_bytes: int = 0,
 ) -> int:
     """The context to judge one model at, when the caller named none.
 
@@ -379,6 +396,10 @@ def context_for(
         kwargs["allocatable"] = allocatable
     if speculative is not None and ("speculative" in params or varkw):
         kwargs["speculative"] = speculative
+    if chunk_tokens is not None and ("chunk_tokens" in params or varkw):
+        kwargs["chunk_tokens"] = chunk_tokens
+    if extra_replicated_bytes and ("extra_replicated_bytes" in params or varkw):
+        kwargs["extra_replicated_bytes"] = extra_replicated_bytes
 
     try:
         largest = solve(shape, plan, nodes, max_seqs, kv_dtype, **kwargs)

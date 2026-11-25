@@ -513,3 +513,44 @@ def test_an_auto_relaunch_leaves_an_audit_row(monkeypatch, tmp_path):
     assert row.after["previous_deployment_id"] == deployment.deployment_id
     assert row.after["attempt"] == 1
     assert row.after["served_name"] == deployment.served_name
+
+
+def _relaunch_as_llamacpp(monkeypatch, *, live):
+    """Run one real `_attempt_relaunch` for a host-pool deployment, with the
+    static and live verdicts set the way a host-pool runtime produces them:
+    a static budget of 0 by design (so WONT_FIT), and `live` as given."""
+    import dataclasses
+
+    from tests.fixtures import fits as fits_result
+
+    real = restart_module._plan_and_fit
+
+    async def plan_and_fit(ctx, payload):
+        out = await real(ctx, payload)
+        return dataclasses.replace(
+            out,
+            runtime_supported=True,
+            fit=wont_fit("static ceiling is 0 for a host-pool runtime"),
+            fit_live=fits_result() if live else None,
+        )
+
+    monkeypatch.setattr(restart_module, "_plan_and_fit", plan_and_fit)
+    ctx, deployments = build_ctx()
+    deployment = dataclasses.replace(crashed_deployment(), runtime="llamacpp")
+    return run(restart_module._attempt_relaunch(ctx, deployment)), deployments
+
+
+def test_a_host_pool_relaunch_is_judged_by_its_live_verdict(monkeypatch):
+    """llamacpp's static budget is 0 by design; judging the relaunch by it
+    classified every crash relaunch wont_fit. The live verdict governs, as it
+    does on the deployments POST."""
+    (outcome, new, detail), deployments = _relaunch_as_llamacpp(monkeypatch, live=True)
+    assert outcome == "launched", detail
+    assert len(deployments.launched) == 1
+
+
+def test_a_host_pool_relaunch_with_no_live_reading_is_refused_as_unmeasured(monkeypatch):
+    (outcome, new, detail), deployments = _relaunch_as_llamacpp(monkeypatch, live=False)
+    assert outcome == "wont_fit"
+    assert "no live reading of host memory" in detail
+    assert deployments.launched == []

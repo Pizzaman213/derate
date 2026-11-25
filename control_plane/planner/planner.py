@@ -419,7 +419,7 @@ class Planner:
             if chosen.kind is ParallelismKind.SINGLE_NODE:
                 # A plan must not list its own chosen shape in its rejected
                 # list; the reason carries the capacity caveat instead.
-                pre = [l for l in preamble if not l.startswith("single node: illegal")]
+                pre = [ln for ln in preamble if not ln.startswith("single node: illegal")]
             elif chosen.kind is ParallelismKind.EXPERT:
                 # Same rule, same reason, and this is the case that made it
                 # visible: an operator-chosen EP plan carried `EP=2: GPUDirect
@@ -427,7 +427,7 @@ class Planner:
                 # recommended the shape. `_justification` now states that gate
                 # itself, so dropping the line here removes a contradiction
                 # rather than hiding the caveat.
-                pre = [l for l in preamble if not l.startswith("EP=")]
+                pre = [ln for ln in preamble if not ln.startswith("EP=")]
             rejected = pre + [
                 line for other, line in enumerate(lines) if other != index
             ]

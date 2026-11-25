@@ -36,7 +36,7 @@ from control_plane.links.parsers import (
     parse_iperf3,
     parse_nccl_perf,
 )
-from control_plane.links.record import LinkAnnotation, annotate, from_json, to_json
+from control_plane.links.record import LinkAnnotation, from_json, to_json
 from control_plane.links.runner import CommandResult
 from tests.fixtures import LINK_SPARK_10G
 

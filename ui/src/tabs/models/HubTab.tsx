@@ -49,7 +49,7 @@ export function HubTab({
 }) {
   const { detail, detailError, ladder } = s
   const onCluster = servesOnCluster(s.runtime)
-  const groups = ladder ? repoGroups(ladder, s.runtime) : []
+  const groups = ladder ? repoGroups(ladder, s.runtime, s.formats) : []
 
   // `detail.hub` is the hub's own answer for this repo; the search row is the
   // fallback when the coordinator could not read it (hub is null).

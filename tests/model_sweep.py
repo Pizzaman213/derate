@@ -165,7 +165,9 @@ _FIT_FIELDS = (
     "num_shared_experts", "shared_expert_intermediate_size",
     "sliding_window", "layers_with_full_attention", "num_nextn_predict_layers",
     "mla_latent_dim", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim",
-    "v_head_dim",
+    "v_head_dim", "attention_free_layers", "recurrent_state_bytes",
+    # A looped core's KV slots (Inkling 2: 48 against 24 physical layers).
+    "cache_layers",
 )
 
 

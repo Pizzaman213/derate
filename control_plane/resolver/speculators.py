@@ -308,8 +308,10 @@ def _kv_ratio(head_shape: Any, base_shape: Any) -> float:
 
     Per layer per token a transformer caches ``2 * num_kv_heads * head_dim``
     elements, so the ratio of two caches is the ratio of
-    ``layers * kv_heads * head_dim`` -- and the element size cancels, which is
-    what makes this answerable without knowing the KV dtype.
+    ``attention_layers * kv_heads * head_dim`` -- and the element size cancels,
+    which is what makes this answerable without knowing the KV dtype. A
+    hybrid target's recurrent layers cache no tokens and are not in its
+    denominator; the fit gate applies the ratio to its attention cache alone.
 
     A ratio rather than a byte count because the byte count depends on the
     context, and the context is not decided until the fit gate runs: a plan
@@ -321,8 +323,11 @@ def _kv_ratio(head_shape: Any, base_shape: Any) -> float:
     for ngram and for an in-checkpoint MTP module.
     """
     def weight(shape: Any) -> float:
+        layers = getattr(shape, "attention_layers", None)
+        if layers is None:
+            layers = getattr(shape, "num_layers", 0)
         return (
-            max(1, getattr(shape, "num_layers", 0) or 0)
+            max(1, layers or 0)
             * max(1, getattr(shape, "num_kv_heads", 0) or 0)
             * max(1, getattr(shape, "effective_head_dim", 0) or 0)
         )

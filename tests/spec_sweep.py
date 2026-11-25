@@ -39,11 +39,10 @@ import json
 import sys
 import time
 import concurrent.futures as cf
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib import error, parse, request
+from urllib import error, request
 
 from control_plane import head_scan, measurements, metrics_scrape
 from control_plane.fit.calculator import speculative_best_k, speculative_overhead
@@ -189,7 +188,7 @@ def engine_died(base: str, deployment_id: str) -> str | None:
         body = _call(base, f"/api/deployments/{deployment_id}/logs", timeout=30.0)
     except SweepError:
         return None
-    for line in reversed([str(l) for l in (body.get("lines") or [])]):
+    for line in reversed([str(entry) for entry in (body.get("lines") or [])]):
         if any(marker in line for marker in _RUNTIME_FATAL):
             return line.strip()
     return None
@@ -648,30 +647,30 @@ def node_profile(base: str) -> dict:
     return {}
 
 
-def runtime_version(base: str, model_id: str) -> str:
-    """The image version a measurement was taken under, or ''.
+def runtime_version(base: str, node: dict, runtime: str = "vllm") -> str:
+    """The version of the image *node* runs for *runtime*, or ''.
 
-    Taken from the support verdict on `/api/models/detail`, which is where
-    `imageprobe`'s answer surfaces: `record_probe` stores it and
-    `RuntimeSupport.version` carries it out. There is no `/api/runtimes` route
-    -- the first draft of this asked for one and got a silent empty string,
-    which would have written records that never matched anything.
+    Read off `/api/runtimes`' `image_versions`, keyed by the node's own
+    architecture: the record names this node's GPU, so it must name the image
+    THIS node runs. The default image's version filed a 3090 measurement
+    (vLLM 0.31) under the Spark's 0.28.1, where a later Spark lookup matched
+    it.
 
-    Empty when the coordinator could not probe its image. A record with no
-    version never matches one that has a version, which is the safe direction:
-    a measurement whose runtime is unknown must not be presented as current
-    for a runtime that is known.
+    Empty when the coordinator has not probed that image or the node reports
+    no architecture. A record with no version never matches one that has a
+    version, which is the safe direction: a measurement whose runtime is
+    unknown must not be presented as current for a runtime that is known.
     """
+    arch = str(node.get("arch") or "")
+    if not arch:
+        return ""
     try:
-        detail = _call(
-            base, f"/api/models/detail?model_id={parse.quote(model_id, safe='')}",
-            timeout=120.0,
-        )
+        rows = _call(base, "/api/runtimes", timeout=30.0)
     except SweepError:
         return ""
-    for entry in ((detail.get("support") or {}).get("runtimes") or []):
-        if entry.get("runtime") == "vllm":
-            return str(entry.get("version") or "")
+    for entry in rows if isinstance(rows, list) else []:
+        if entry.get("name") == runtime:
+            return str((entry.get("image_versions") or {}).get(arch) or "")
     return ""
 
 
@@ -725,20 +724,32 @@ def run_scan(args) -> tuple[int, list]:
         print(f"could not resolve {model_id}: {exc}", file=sys.stderr)
         return 2, []
 
-    specs = None
-    try:
-        found = imageprobe.probe(
-            "vllm",
-            os.environ.get("DERATE_VLLM_IMAGE")
-            or "ghcr.io/pizzaman213/derate/vllm-audio:latest",
-            cache_dir=resolver.cache.directory.parent / "runtimes",
-        )
-        specs = found.speculators if found else None
-    except Exception:
-        specs = None  # no docker, no image: no opinion, never a refusal
-
     node = node_profile(args.base)
     bandwidth = float(node.get("memory_bandwidth_gbps") or 0.0) or 273.0
+
+    # Which heads load is a question about the image THIS node runs, not the
+    # default image: the 3090's vLLM 0.31 registers different speculators from
+    # the Spark's 0.28.1. A node of an architecture with no image here, or one
+    # whose image this machine cannot probe, gets no opinion -- never another
+    # image's registry.
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+    from control_plane.deploy.recipes import container_image
+
+    specs = None
+    spec = RUNTIMES["vllm"]
+    image = image_for_arch(spec, str(node.get("arch") or ""))
+    if image:
+        try:
+            found = imageprobe.probe(
+                "vllm", image,
+                cache_dir=resolver.cache.directory.parent / "runtimes",
+                # Run only the image this machine itself launches; another
+                # architecture's is answered from the probe cache or not at all.
+                run=image == container_image(spec),
+            )
+            specs = found.speculators if found else None
+        except Exception:
+            specs = None  # no docker, no image: no opinion, never a refusal
 
     rows = head_scan.candidates(resolver, model_id)
     usable, rejected = head_scan.price(resolver, base_res.shape, rows, specs)
@@ -866,7 +877,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     node = node_profile(args.base)
-    version = runtime_version(args.base, model_id)
+    version = runtime_version(args.base, node)
     print(f"hardware  {node.get('gpu_name') or 'unknown'} "
           f"@ {node.get('memory_bandwidth_gbps') or 0:.0f} GB/s")
     print(f"runtime   {version or 'unknown'}")

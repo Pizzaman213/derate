@@ -20,6 +20,7 @@ import { OwnerMark, useAvatars } from './OwnerMark'
 import { ownerOf } from './owner'
 import { QuantSection } from './QuantSection'
 import { ServeActions } from './ServeActions'
+import { SizingSliders } from './SizingSliders'
 import { UsersChart } from './UsersChart'
 import { RouteCard } from './RouteCard'
 import type { ModelRow, RowProvider } from './rows'
@@ -67,8 +68,8 @@ export function ModelPane({
    *  what actually fits. Already debounced by the caller. */
   context: number | null
   concurrency: number | null
-  /** Polled by the screen that owns this pane -- `useResource` does not
-   *  deduplicate, so mounting `useProviders()` here would fan a second poll. */
+  /** Polled by the screen that owns this pane and handed down, so the pane
+   *  and its siblings render one value. */
   providers?: Provider[] | null
   providerKinds?: ProviderKindSpec[] | null
   /** Each provider's WHOLE catalogue, keyed by provider id. */
@@ -119,20 +120,28 @@ export function ModelPane({
   const showVerdict = (pane === 'serve' || pane === 'advanced') && !noLocalVerdict
 
   // What the footer describes: the deployment while one runs, otherwise the
-  // launch the verdict box was taken for.
+  // launch the verdict box was taken for -- including WHERE, because the same
+  // numbers on a different machine are a different launch.
+  const seqs = (n: number | null | undefined) =>
+    n == null ? '— sequences' : `${n} ${n === 1 ? 'sequence' : 'sequences'}`
+  const on = (ids: readonly string[] | null | undefined) =>
+    ids && ids.length ? `on ${ids.join(', ')}` : null
   const summary = (
     running
       ? [
           running.runtime,
+          on(running.node_ids),
           `${running.context_length.toLocaleString()} context`,
-          `${running.max_concurrent_seqs} sequences`,
+          seqs(running.max_concurrent_seqs),
           running.kv_dtype ? `kv ${running.kv_dtype}` : null,
           running.served_name,
         ]
       : [
           s.runtime,
+          on(s.result?.plan?.node_ids),
+          s.addingCopy && !s.servedName.trim() && s.copyName ? `as ${s.copyName}` : null,
           `${s.result?.context?.toLocaleString() ?? '—'} context`,
-          `${s.result?.concurrency ?? '—'} sequences`,
+          seqs(s.result?.concurrency),
           s.kvDtype ? `kv ${s.kvDtype}` : null,
           variant && s.cache.complete(variant.repo_id, variant.file_bytes) !== true
             ? `downloads ${gib(variant.file_bytes)} from ${variant.repo_id}`
@@ -252,6 +261,7 @@ export function ModelPane({
             {s.lastFailure ? <FailureBanner dep={s.lastFailure} onDetails={() => setPane('history')} /> : null}
             {running ? <LivePanel dep={running} /> : null}
             <QuantSection s={s} />
+            <SizingSliders s={s} />
             <UsersChart s={s} />
           </>
         )
@@ -279,12 +289,22 @@ export function ModelPane({
               type="button"
               className="ghost"
               onClick={() => {
-                if (window.confirm(`Stop ${running.served_name}? Requests to it fail until it is served again.`)) {
+                if (window.confirm(`Stop ${running.served_name} on ${running.node_ids.join(", ")}? Requests to it fail until it is served again.`)) {
                   void s.stop(running.deployment_id)
                 }
               }}
             >
               Stop
+            </button>
+          ) : null}
+          {s.live.length && !s.addingCopy && pane === 'serve' ? (
+            <button type="button" className="ghost" onClick={s.startCopy}>
+              Serve another copy
+            </button>
+          ) : null}
+          {s.addingCopy ? (
+            <button type="button" className="ghost" onClick={s.cancelCopy}>
+              Cancel copy
             </button>
           ) : null}
           {pane === 'serve' ? <ServeActions s={s} /> : null}

@@ -21,7 +21,7 @@ const MINTED_REF_SUFFIX = '_API_KEY'
 const MAX_REF_LEN = 64
 
 /** The secrets.json name a pasted key is stored under for this provider.
- *  Mirrors `minted_ref` in control_plane/providers/service.py. */
+ *  Mirrors `minted_ref` in control_plane/providers/refs.py. */
 export function mintedRef(providerId: string): string {
   const stem =
     providerId.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toUpperCase() || 'PROVIDER'
@@ -30,15 +30,16 @@ export function mintedRef(providerId: string): string {
 }
 
 /** The id the coordinator will mint for a new provider of this kind.
- *  Mirrors `_mint_id`: the kind, then the first free `-N` suffix. Predicted
- *  rather than known, so the form can name the reference it is about to
- *  create instead of describing it in the abstract. */
+ *  Mirrors `_mint_id`: the kind, then the first `-N` suffix whose minted
+ *  reference no existing provider already mints. Predicted rather than known,
+ *  so the form can name the reference it is about to create instead of
+ *  describing it in the abstract. */
 export function predictedProviderId(kind: string, taken: readonly string[]): string {
   const base = kind.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'provider'
-  if (!taken.includes(base)) return base
-  let n = 2
-  while (taken.includes(`${base}-${n}`)) n += 1
-  return `${base}-${n}`
+  const takenRefs = new Set(taken.map(mintedRef))
+  let id = base
+  for (let n = 2; takenRefs.has(mintedRef(id)); n += 1) id = `${base}-${n}`
+  return id
 }
 
 /** The hint for a kind whose key shape this build recognises nothing about. */

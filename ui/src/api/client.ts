@@ -9,6 +9,11 @@ import { scrub } from './redact'
 import { createThinkSplitter } from './think'
 import type { ThinkSplit } from './think'
 import type {
+  GeoLookup,
+  KnownPlace,
+  KnownPlaces,
+  OriginsResult,
+  RequestRoute,
   AlertsReport,
   Activity,
   AdminRow,
@@ -245,8 +250,10 @@ export interface Backend {
   /** Every runtime `flags.RUNTIMES` knows, and what each supports. */
   runtimes(): Promise<RuntimeInfo[]>
   /** The serve command and recipe a launch with this body would run. Launches
-   *  nothing; refuses exactly as the launch would. */
-  planCommand(body: PlanRequest): Promise<CommandPreview>
+   *  nothing; refuses exactly as the launch would. Takes the LAUNCH body: the
+   *  launch-only keys (eager mode, graph sizes, flags, served name) are what
+   *  makes it the command rather than the plan's. */
+  planCommand(body: LaunchRequest): Promise<CommandPreview>
   /** The "how many users" curve: KV wall plus a bandwidth ceiling. */
   planConcurrency(body: ConcurrencyRequest): Promise<ConcurrencyResponse>
   /** The best plan of each kind for this body, each with its own verdict. */
@@ -472,8 +479,6 @@ export interface Backend {
    *  without `supports_backend_routing`. */
   providerBackends(providerId: string, upstreamId: string): Promise<ProviderBackendOption[]>
   refreshProvider(providerId: string): Promise<Provider>
-  /** Ask the upstream whether the provider's key works right now. */
-  checkProviderKey(providerId: string): Promise<Provider>
   /** Returns an unsubscribe. `onState` reports stream health so the UI can grey
    *  live values during a gap instead of freezing or zeroing them. */
   subscribe(
@@ -527,6 +532,14 @@ export interface Backend {
   /** One row per client request, cluster-wide: the final attempt, with
    *  `attempts` the true count. `retried` keeps only the ones that failed over. */
   requests(q?: RequestsQuery): Promise<RequestsPage>
+  requestOrigins(q: Omit<RequestsQuery, 'request_id' | 'page' | 'page_size'>): Promise<OriginsResult>
+  geoip(ip: string): Promise<GeoLookup>
+  /** The operator's CIDR -> place table; a match beats the IP database. */
+  geoipPlaces(): Promise<KnownPlaces>
+  /** Replaces the whole table. A 400 names the row and field. */
+  putGeoipPlaces(places: KnownPlace[]): Promise<KnownPlaces>
+  /** The servers one request passed through, in order, each placed. */
+  requestRoute(requestId: string): Promise<RequestRoute>
   requestsCsvUrl(q?: RequestsQuery): string
   usage(q: UsageQuery): Promise<UsageResult>
   usageCsvUrl(q: UsageQuery): string
@@ -1570,10 +1583,6 @@ export const httpBackend: Backend = {
     req<Provider>(`/api/providers/${encodeURIComponent(providerId)}/refresh`, {
       method: 'POST',
     }),
-  checkProviderKey: (providerId) =>
-    req<Provider>(`/api/providers/${encodeURIComponent(providerId)}/key-check`, {
-      method: 'POST',
-    }),
 
   subscribe(onFrame, onState) {
     let es: EventSource | null = null
@@ -1682,6 +1691,12 @@ export const httpBackend: Backend = {
   keyRequestsCsvUrl: (keyId, q = {}) =>
     apiUrl(`/api/keys/${seg(keyId)}/requests${qs({ ...requestParams(q), format: 'csv' })}`),
   requests: (q = {}) => req<RequestsPage>(`/api/requests${qs(requestParams(q))}`),
+  requestOrigins: (q) => req<OriginsResult>(`/api/requests/origins${qs(requestParams(q))}`),
+  geoip: (ip) => req<GeoLookup>(`/api/geoip${qs({ ip })}`),
+  geoipPlaces: () => req<KnownPlaces>('/api/geoip/places'),
+  putGeoipPlaces: (places) =>
+    req<KnownPlaces>('/api/geoip/places', { method: 'PUT', body: JSON.stringify({ places }) }),
+  requestRoute: (requestId) => req<RequestRoute>(`/api/requests/route${qs({ request_id: requestId })}`),
   requestsCsvUrl: (q = {}) => apiUrl(`/api/requests${qs({ ...requestParams(q), format: 'csv' })}`),
   usage: (q) => req<UsageResult>(`/api/usage${qs({ ...q })}`),
   usageCsvUrl: (q) => apiUrl(`/api/usage${qs({ ...q, format: 'csv' })}`),

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useRouter } from '../state/router'
+import { ResourceScope } from '../state/backend'
 import { CoordinatorCard } from './settings/CoordinatorCard'
 import { ApiTokenCard } from './settings/ApiTokenCard'
 import { AddNodeCard } from './settings/AddNodeCard'
@@ -12,6 +13,7 @@ import { ReliabilityCard } from './settings/ReliabilityCard'
 import { AdminsCard } from './settings/AdminsCard'
 import { SessionsCard } from './settings/SessionsCard'
 import { PricingCard } from './settings/PricingCard'
+import { PlacesCard } from './settings/PlacesCard'
 import { AppearanceCard } from './settings/AppearanceCard'
 import { ScopeCards } from './settings/ScopeCards'
 import { FilesystemsCard } from './storage/FilesystemsCard'
@@ -92,7 +94,16 @@ const SUBS: { id: Sub; label: string }[] = [
  *  form it could not wire up. */
 export function SettingsTab() {
   const { route } = useRouter()
-  const [sub, setSub] = useState<Sub>(() => (route.node ? 'instance' : 'connection'))
+  const [sub, setSub] = useState<Sub>(() => (route.price ? 'policy' : route.node ? 'instance' : 'connection'))
+  // A pricing link (`?price=`, from a request's Cost column) opens Policy even
+  // when Settings is already mounted -- every destination stays mounted while
+  // hidden. Adjusted during render, so the panel is visible by the time the
+  // focused pricing row's effect runs.
+  const [priceSeen, setPriceSeen] = useState(route.price)
+  if (route.price !== priceSeen) {
+    setPriceSeen(route.price)
+    if (route.price) setSub('policy')
+  }
 
   return (
     <div>
@@ -121,16 +132,20 @@ export function SettingsTab() {
         aria-labelledby="st-tab-connection"
         hidden={sub !== 'connection'}
       >
-        <div className="settingsgrid">
-          <CoordinatorCard />
-          <ApiTokenCard />
-          <ClusterCard />
-        </div>
+        <ResourceScope active={sub === 'connection'}>
+          <div className="settingsgrid">
+            <CoordinatorCard />
+            <ApiTokenCard />
+            <ClusterCard />
+          </div>
+        </ResourceScope>
       </div>
 
       <div id="st-nodes" role="tabpanel" aria-labelledby="st-tab-nodes" hidden={sub !== 'nodes'}>
-        <AddNodeCard />
-        <NodesCard />
+        <ResourceScope active={sub === 'nodes'}>
+          <AddNodeCard />
+          <NodesCard />
+        </ResourceScope>
       </div>
 
       <div
@@ -139,14 +154,18 @@ export function SettingsTab() {
         aria-labelledby="st-tab-instance"
         hidden={sub !== 'instance'}
       >
-        <InstanceCard />
+        <ResourceScope active={sub === 'instance'}>
+          <InstanceCard />
+        </ResourceScope>
       </div>
 
       <div id="st-storage" role="tabpanel" aria-labelledby="st-tab-storage" hidden={sub !== 'storage'}>
-        <FilesystemsCard />
-        <ModelCacheCard />
-        <EstateCard />
-        <CollectionCard />
+        <ResourceScope active={sub === 'storage'}>
+          <FilesystemsCard />
+          <ModelCacheCard />
+          <EstateCard />
+          <CollectionCard />
+        </ResourceScope>
       </div>
 
       <div
@@ -155,25 +174,36 @@ export function SettingsTab() {
         aria-labelledby="st-tab-providers"
         hidden={sub !== 'providers'}
       >
-        <ProvidersCard />
+        <ResourceScope active={sub === 'providers'}>
+          <ProvidersCard />
+        </ResourceScope>
       </div>
 
       <div id="st-policy" role="tabpanel" aria-labelledby="st-tab-policy" hidden={sub !== 'policy'}>
-        <ContainmentCard />
-        <ReliabilityCard />
-        {/* What a local model's tokens cost, for the dollar limits on keys.
-            Policy, because it decides what a request is charged. */}
-        <PricingCard />
+        <ResourceScope active={sub === 'policy'}>
+          <ContainmentCard />
+          <ReliabilityCard />
+          {/* What a local model's tokens cost, for the dollar limits on keys.
+              Policy, because it decides what a request is charged. */}
+          <PricingCard />
+          {/* Where a request came from, when the operator knows better than the
+              IP database. Policy, because it decides what the request map shows. */}
+          <PlacesCard />
+        </ResourceScope>
       </div>
 
       <div id="st-admins" role="tabpanel" aria-labelledby="st-tab-admins" hidden={sub !== 'admins'}>
-        <AdminsCard />
-        {/* Containment: every live session, and sign any admin out everywhere. */}
-        <SessionsCard />
+        <ResourceScope active={sub === 'admins'}>
+          <AdminsCard />
+          {/* Containment: every live session, and sign any admin out everywhere. */}
+          <SessionsCard />
+        </ResourceScope>
       </div>
 
       <div id="st-audit" role="tabpanel" aria-labelledby="st-tab-audit" hidden={sub !== 'audit'}>
-        <AuditTab />
+        <ResourceScope active={sub === 'audit'}>
+          <AuditTab />
+        </ResourceScope>
       </div>
 
       <div
@@ -182,7 +212,9 @@ export function SettingsTab() {
         aria-labelledby="st-tab-appearance"
         hidden={sub !== 'appearance'}
       >
-        <AppearanceCard />
+        <ResourceScope active={sub === 'appearance'}>
+          <AppearanceCard />
+        </ResourceScope>
       </div>
 
       {/* Not settings. Nothing here writes anything; they are the project's
@@ -198,7 +230,9 @@ export function SettingsTab() {
         tabIndex={0}
         hidden={sub !== 'about'}
       >
-        <ScopeCards />
+        <ResourceScope active={sub === 'about'}>
+          <ScopeCards />
+        </ResourceScope>
       </div>
     </div>
   )

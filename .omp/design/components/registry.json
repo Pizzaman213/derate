@@ -649,19 +649,28 @@
         "class": [
           "pill",
           "pill mono",
+          "pill live",
+          "pill warn",
+          "pill fault",
           "chips button"
         ]
       },
       "states": [
         "default",
         "toggle",
-        "toggle-pressed"
+        "toggle-pressed",
+        "live",
+        "warn",
+        "fault"
       ],
       "tokens": [
         "chip-bg",
         "chip-fg",
         "chip-border",
-        "chip-radius"
+        "chip-radius",
+        "live",
+        "warn",
+        "fault"
       ],
       "icons": [],
       "tests": null,
@@ -770,6 +779,111 @@
       "tests": null,
       "spec": "DESIGN.md#packchart",
       "added": "2026-11-18"
+    },
+    {
+      "name": "RequestMap",
+      "kind": "shared",
+      "path": "ui/src/components/RequestMap.tsx",
+      "props": [
+        "title",
+        "height",
+        "points",
+        "focus",
+        "attribution",
+        "onPick",
+        "path",
+        "fitMaxZoom",
+        "ring",
+        "scale"
+      ],
+      "variants": {},
+      "states": [
+        "default",
+        "empty",
+        "loading",
+        "error"
+      ],
+      "tokens": [
+        "rule",
+        "card-radius",
+        "panel-sunk",
+        "panel-raised",
+        "accent",
+        "ink-secondary",
+        "map-tile-filter"
+      ],
+      "icons": [],
+      "tests": "ui/src/tabs/requests/origins.check.mjs",
+      "spec": "DESIGN.md#requestmap",
+      "added": "2026-11-22"
+    },
+    {
+      "name": "SplitBar",
+      "kind": "css",
+      "path": "ui/src/styles/derate.css",
+      "props": [],
+      "variants": {
+        "class": [
+          "split",
+          "rq-ticks",
+          "legend rq-swatch"
+        ]
+      },
+      "states": [
+        "segments",
+        "single",
+        "empty"
+      ],
+      "tokens": [
+        "panel-sunk",
+        "edge",
+        "radius-sm",
+        "flow",
+        "stream",
+        "batch",
+        "rule-strong"
+      ],
+      "icons": [],
+      "tests": "ui/src/tabs/requests/requests.check.mjs",
+      "spec": "DESIGN.md#splitbar",
+      "added": "2026-11-22"
+    },
+    {
+      "name": "RequestDetail",
+      "kind": "css",
+      "path": "ui/src/styles/derate.css",
+      "props": [],
+      "variants": {
+        "class": [
+          "rq-head",
+          "rq-head-main",
+          "rq-strip",
+          "rq-stats",
+          "rq-stat",
+          "rq-cols",
+          "rq-col",
+          "rq-fact"
+        ]
+      },
+      "states": [
+        "complete",
+        "refused",
+        "unlocated"
+      ],
+      "tokens": [
+        "panel",
+        "panel-raised",
+        "rule",
+        "rule-strong",
+        "radius"
+      ],
+      "icons": [
+        "copy",
+        "chevron-left"
+      ],
+      "tests": "ui/src/tabs/requests/requests.check.mjs",
+      "spec": "DESIGN.md#request-detail",
+      "added": "2026-11-22"
     },
     {
       "name": "PasswordField",
@@ -1808,13 +1922,15 @@
     {
       "name": "NodeBoard",
       "kind": "screen",
-      "path": "ui/src/tabs/models/NodeBoard.tsx",
+      "path": "ui/src/tabs/models/NodeBars.tsx",
       "tokens": [
+        "ink",
+        "rule",
+        "size-mono-label",
+        "space-10",
         "space-2",
-        "space-3",
         "space-6",
-        "space-8",
-        "warn"
+        "space-8"
       ],
       "icons": []
     },
@@ -1952,6 +2068,18 @@
         "close",
         "search"
       ]
+    },
+    {
+      "name": "PinPlace",
+      "kind": "screen",
+      "path": "ui/src/tabs/requests/PinPlace.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-12",
+        "space-8"
+      ],
+      "icons": []
     },
     {
       "name": "RateLimitsSub",
@@ -2107,6 +2235,17 @@
       "icons": []
     },
     {
+      "name": "PlacesCard",
+      "kind": "screen",
+      "path": "ui/src/tabs/settings/PlacesCard.tsx",
+      "tokens": [
+        "fault",
+        "space-10",
+        "space-8"
+      ],
+      "icons": []
+    },
+    {
       "name": "PricingCard",
       "kind": "screen",
       "path": "ui/src/tabs/settings/PricingCard.tsx",
@@ -2145,15 +2284,11 @@
         "space-3",
         "space-4",
         "space-6",
-        "space-66",
         "space-8",
         "space-9",
-        "space-96",
         "warn"
       ],
-      "icons": [
-        "alert-triangle"
-      ]
+      "icons": []
     },
     {
       "name": "ReliabilityCard",

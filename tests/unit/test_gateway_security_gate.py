@@ -257,7 +257,7 @@ def test_every_gated_request_leaves_one_access_line(gate, caplog):
     assert line.startswith(
         f"rid={rid} ip=127.0.0.1 port=50000 peer=127.0.0.1 who=session:{ADMIN['username']} GET /api/keys q='' 200 "
     )
-    assert line.endswith("ua='drill/1'")
+    assert line.endswith("ua='drill/1' n=1")
 
 
 def test_a_socket_from_another_origin_is_closed_before_its_cookie_is_read(tmp_path, monkeypatch):

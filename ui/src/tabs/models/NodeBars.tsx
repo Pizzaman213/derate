@@ -98,45 +98,73 @@ export function NodeBars({ s }: { s: ModelSession }) {
     }
   }
 
+  // While copies run, the board answers "which machine am I looking at": a
+  // tick on a machine running a copy shows that copy, a tick anywhere else
+  // plans another copy there. One machine at a time; splitting is for planning.
+  const running = s.running
+  const copyOn = (nodeId: string) => s.live.find((d) => d.node_ids.includes(nodeId)) ?? null
+
   return (
     <div className="mdl-nodes">
       <div className="mdl-nodes-head">
         <span className="label">Where it runs</span>
-        <span className="unit">tick one node, or several to split</span>
-        <span className="mdl-nodes-controls">
-          {many ? (
-            <Select aria-label="How it is split" value={splitValue} options={splitOptions} onChange={pickSplit} />
-          ) : null}
-          <Select<'you' | 'planner'>
-            aria-label="Who picks the nodes"
-            value={ownerValue}
-            options={[
-              { value: 'planner', label: 'Planner picks' },
-              { value: 'you', label: 'You picked' },
-            ]}
-            onChange={pickOwner}
-          />
+        <span className="unit">
+          {running
+            ? 'pick a machine to see its copy, or to serve another copy there'
+            : 'tick one node, or several to split'}
         </span>
+        {running ? null : (
+          <span className="mdl-nodes-controls">
+            {many ? (
+              <Select aria-label="How it is split" value={splitValue} options={splitOptions} onChange={pickSplit} />
+            ) : null}
+            <Select<'you' | 'planner'>
+              aria-label="Who picks the nodes"
+              value={ownerValue}
+              options={[
+                { value: 'planner', label: 'Planner picks' },
+                { value: 'you', label: 'You picked' },
+              ]}
+              onChange={pickOwner}
+            />
+          </span>
+        )}
       </div>
 
-      {board.rows.map((r) => (
-        <NodeBar
-          key={r.nodeId}
-          row={r}
-          checked={r.ticked || (s.nodeIds == null && r.inPlan)}
-          onlyTicked={r.ticked && board.effective.length === 1}
-          perNode={perNode}
-          onToggle={(on) => {
-            // Unticking the last machine would mean "plan on nothing", which
-            // the gateway can only answer with a 400; the box is disabled for
-            // that reason, and this hands the choice back if it ever fires.
-            if (!on && board.effective.length === 1) return s.setNodeIds(null)
-            // Sorted inside `toggle`, so two tick orders produce one request
-            // body, one answer and one server-side memo key.
-            s.setNodeIds(toggle(board, r.nodeId, on))
-          }}
-        />
-      ))}
+      {board.rows.map((r) =>
+        running ? (
+          <NodeBar
+            key={r.nodeId}
+            row={{ ...r, selectable: r.selectable || copyOn(r.nodeId) != null }}
+            checked={running.node_ids.includes(r.nodeId)}
+            onlyTicked={running.node_ids.includes(r.nodeId)}
+            perNode={perNode}
+            onToggle={(on) => {
+              if (on) s.pickNode(r.nodeId)
+            }}
+          />
+        ) : (
+          <NodeBar
+            key={r.nodeId}
+            row={{ ...r, selectable: r.selectable || copyOn(r.nodeId) != null }}
+            checked={r.ticked || (s.nodeIds == null && r.inPlan)}
+            onlyTicked={r.ticked && board.effective.length === 1}
+            perNode={perNode}
+            onToggle={(on) => {
+              // A machine already running a copy is not a place to plan one:
+              // the coordinator refuses that. Ticking it shows that copy.
+              if (on && copyOn(r.nodeId)) return s.pickNode(r.nodeId)
+              // Unticking the last machine would mean "plan on nothing", which
+              // the gateway can only answer with a 400; the box is disabled for
+              // that reason, and this hands the choice back if it ever fires.
+              if (!on && board.effective.length === 1) return s.setNodeIds(null)
+              // Sorted inside `toggle`, so two tick orders produce one request
+              // body, one answer and one server-side memo key.
+              s.setNodeIds(toggle(board, r.nodeId, on))
+            }}
+          />
+        ),
+      )}
 
       {shown && result ? (
         <div className="mdl-why">
@@ -205,13 +233,14 @@ function NodeBar({
   const over = row.allocatable != null && perNode != null && perNode > row.allocatable
 
   let note: JSX.Element
-  if (row.allocatable == null) note = <span className="unit">not read yet</span>
+  if (row.allocatable == null) note = <span className="unit">{row.noHostPool ? 'no host pool' : 'not read yet'}</span>
   else if (row.inPlan && perNode != null)
     note = over ? (
       <span className="unit mdl-sig-fault">{`short ${gib(perNode - row.allocatable)}`}</span>
     ) : (
       <span className="unit">{`${gib(row.allocatable - perNode)} left`}</span>
     )
+  else if (row.hostPool) note = <span className="unit mdl-node-pool">{`${gib(row.allocatable)} host RAM free`}</span>
   else note = <span className="unit">{`${gib(row.allocatable)} free`}</span>
 
   return (
@@ -222,6 +251,7 @@ function NodeBar({
         checked={checked}
         disabled={!row.selectable || onlyTicked}
         onChange={(e) => onToggle(e.target.checked)}
+        aria-describedby={!row.selectable && row.unselectableReason ? `${id}-why` : undefined}
         title={onlyTicked ? 'the last machine: it stays ticked' : undefined}
       />
       <label htmlFor={id} className="mdl-node-name">
@@ -229,18 +259,16 @@ function NodeBar({
           signal={row.inPlan ? 'live' : 'idle'}
           hollow={!row.inPlan}
           size={7}
-          label={row.inPlan ? `${row.name} is in the plan` : (row.unselectableReason ?? `${row.name} is not in the plan`)}
+          label={row.inPlan ? `${row.name} is in the plan` : `${row.name} is not in the plan`}
         />
-        <span className="mono" title={row.unselectableReason ?? ''}>
-          {row.name}
-        </span>
+        <span className="mono">{row.name}</span>
       </label>
       {note}
       {/* The registry's own sentence for why it cannot vouch for this machine,
           and the board's for why it cannot carry a rank. Shown, never hidden:
           "why isn't my other box being used" deserves an answer here. */}
       {!row.selectable && row.unselectableReason ? (
-        <div className="mdl-node-note">
+        <div className="mdl-node-note" id={`${id}-why`}>
           <Verbatim text={row.unselectableReason} size="unit" />
         </div>
       ) : null}

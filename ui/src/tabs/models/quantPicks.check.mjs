@@ -253,7 +253,8 @@ const LADDER = {
     "repo_id": "unsloth/Qwen3-8B-GGUF",
     "label": "UD-Q8_K_XL",
     "dtype": "q8_0",
-    "reason": "Fits: 16.9 GiB of 38.9 GiB allocatable right now per rank, 22.0 GiB headroom. Predicted decode 24 tok/s at short context, falling to 10 tok/s at 40960. Per sequence. Context could go to 201216 tokens at 1 sequences."
+    "reason": "Fits: 16.9 GiB of 38.9 GiB allocatable right now per rank, 22.0 GiB headroom. Predicted decode 24 tok/s at short context, falling to 10 tok/s at 40960. Per sequence. Context could go to 201216 tokens at 1 sequences.",
+    "gguf_file": "Qwen3-8B-UD-Q8_K_XL.gguf"
   },
   "sized_on": {
     "nodes": [
@@ -281,30 +282,41 @@ check(M.tierOf(v('Q4_K_M', 4.9)) === '4' && M.tierOf(v('UD-Q4_K_XL', 4.9)) === '
 check(M.tierOf(v('Q8_0', 8.5)) === '8' && M.tierOf(v('UD-IQ1_M', 2.15)) === '1', 'Q8_0 is 8-bit and IQ1_M is 1-bit')
 
 // The live recommendation is a GGUF, which llamacpp serves and vllm does not.
-const gguf = M.recommendedPicks(LADDER, 'llamacpp')
+const ST = ['safetensors']
+const BOTH = ['safetensors', 'gguf']
+const gguf = M.recommendedPicks(LADDER, 'llamacpp', ['gguf'])
 check(gguf[0]?.title === 'BEST QUALITY THAT FITS' && gguf[0].variant.label === LADDER.recommended.label && gguf[0].variant.repo_id === LADDER.recommended.repo_id, 'under llamacpp the recommended row is the first card')
 check(new Set(gguf.map((p) => variantKey(p.variant))).size === gguf.length, 'no two cards share a row')
 const ud = gguf.find((p) => p.title === 'UNSLOTH’S PICK')
 check(ud?.variant.label === 'UD-Q4_K_XL', 'Unsloth’s pick is UD-Q4_K_XL')
 
+// One repository can publish two builds under one label; the file decides.
+const twin = structuredClone(LADDER)
+twin.variants.unshift({ ...twin.variants[0], gguf_file: 'Qwen3-8B-UD-Q8_K_XL-copy.gguf' })
+check(M.recommendedPicks(twin, 'llamacpp', ['gguf'])[0]?.variant.gguf_file === LADDER.recommended.gguf_file, 'a same-label twin is not mistaken for the recommendation')
+
 // Under vllm a runtime-blind GGUF recommendation must not lead or be the
 // default: the plan refuses it, so it would open every model on a refusal.
-const st = M.recommendedPicks(LADDER, 'vllm')
+const st = M.recommendedPicks(LADDER, 'vllm', ST)
 check(st[0]?.title === 'BEST QUALITY THAT FITS' && st[0].variant.gguf_file == null && st[0].variant.fits === true, 'under vllm the first card is the best fitting safetensors row')
 check(st.every((p) => p.variant.gguf_file == null), 'under vllm no card is a GGUF')
-check(M.defaultVariant(LADDER, 'vllm', null)?.gguf_file == null, 'under vllm the default is not the GGUF recommendation')
+check(M.defaultVariant(LADDER, 'vllm', null, ST)?.gguf_file == null, 'under vllm the default is not the GGUF recommendation')
+// With the plugin, vllm reads both, and still opens on its native format.
+check(M.defaultVariant(LADDER, 'vllm', null, BOTH)?.gguf_file == null, 'a vllm that reads GGUF still defaults to safetensors')
+const ggufOnlyLadder = { ...LADDER, variants: LADDER.variants.filter((r) => r.gguf_file != null) }
+check(M.recommendedPicks(ggufOnlyLadder, 'vllm', BOTH).length > 0, 'with no native row, a GGUF-reading vllm falls back to GGUF picks')
 
-check(M.defaultVariant(LADDER, 'vllm', 'Q4_K_M')?.label === 'Q4_K_M', 'a preferred label is selected')
-check(M.defaultVariant(LADDER, 'vllm', 'Q4_K_XL')?.label === 'UD-Q4_K_XL', 'a link label without UD- finds the Dynamic row')
-check(M.defaultVariant(LADDER, 'llamacpp', null)?.label === LADDER.recommended.label, 'no preference selects the recommendation where it is servable')
-check(M.defaultVariant(null, 'vllm', null) === null, 'no ladder, no selection')
+check(M.defaultVariant(LADDER, 'vllm', 'Q4_K_M', ST)?.label === 'Q4_K_M', 'a preferred label is selected')
+check(M.defaultVariant(LADDER, 'vllm', 'Q4_K_XL', ST)?.label === 'UD-Q4_K_XL', 'a link label without UD- finds the Dynamic row')
+check(M.defaultVariant(LADDER, 'llamacpp', null, ['gguf'])?.label === LADDER.recommended.label, 'no preference selects the recommendation where it is servable')
+check(M.defaultVariant(null, 'vllm', null, ST) === null, 'no ladder, no selection')
 
-const groups = M.repoGroups(LADDER, 'vllm')
+const groups = M.repoGroups(LADDER, 'vllm', ST)
 check(groups[0]?.repo === 'Qwen/Qwen3-8B', 'the base repo is the first group')
 check(groups.find((g) => g.repo === 'unsloth/Qwen3-8B-GGUF')?.variants.length === 5, 'rows group by repository')
 
 const idle = structuredClone(LADDER)
 idle.recommended = null
 for (const r of idle.variants) r.fits = false
-check(M.recommendedPicks(idle, 'vllm')[0]?.title === 'BEST ONCE A NODE IS FREE', 'with nothing fitting now, the idle-hardware fit leads')
+check(M.recommendedPicks(idle, 'vllm', ST)[0]?.title === 'BEST ONCE A NODE IS FREE', 'with nothing fitting now, the idle-hardware fit leads')
 done()

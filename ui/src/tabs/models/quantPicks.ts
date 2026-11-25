@@ -60,23 +60,39 @@ export interface Pick {
   variant: QuantVariant
 }
 
-function isRecommended(ladder: VariantLadder, v: QuantVariant): boolean {
+/** Whether *v* is the row the server recommended. Matched on the file as well
+ *  as `(repo_id, label)`: one repository can publish two builds of one label,
+ *  and the pill must land on exactly one row. */
+export function isRecommendedVariant(ladder: VariantLadder, v: QuantVariant): boolean {
   const r = ladder.recommended
-  return r != null && r.repo_id === v.repo_id && r.label === v.label
+  return (
+    r != null &&
+    r.repo_id === v.repo_id &&
+    r.label === v.label &&
+    (r.gguf_file ?? null) === (v.gguf_file ?? null)
+  )
 }
 
 const ROOMY: ReadonlySet<Tier> = new Set<Tier>(['16', '8', '6', '5', '4'])
 
+/** Servable rows of the runtime's native format (`formats[0]`), or every
+ *  servable row when it has none: a runtime that reads both formats opens on
+ *  its own and never switches an existing vllm user's default to a GGUF. */
+function nativeFirst(servable: QuantVariant[], formats: readonly string[]): QuantVariant[] {
+  const primary = servable.filter((v) => (v.gguf_file ? 'gguf' : 'safetensors') === formats[0])
+  return primary.length ? primary : servable
+}
+
 /** The Recommended tab's cards, in the gateway's rank order. */
-export function recommendedPicks(ladder: VariantLadder, runtime: Runtime): Pick[] {
-  const servable = partitionForRuntime(ladder.variants, runtime).servable
+export function recommendedPicks(ladder: VariantLadder, runtime: Runtime, formats: readonly string[]): Pick[] {
+  const servable = nativeFirst(partitionForRuntime(ladder.variants, runtime, formats).servable, formats)
   const picks: Pick[] = []
 
   // The gateway's recommendation is runtime-blind (it can name a GGUF while
   // vllm is picked), so it only leads when this runtime can serve it; failing
   // that, rank order is fit first then quality, so the first servable row that
   // fits is the same claim made for this runtime.
-  const best = servable.find((v) => isRecommended(ladder, v)) ?? servable.find((v) => v.fits === true)
+  const best = servable.find((v) => isRecommendedVariant(ladder, v)) ?? servable.find((v) => v.fits === true)
   const idle = servable.find((v) => v.static_fits === true)
   if (best)
     picks.push({ title: 'BEST QUALITY THAT FITS', why: 'Highest precision your nodes can hold right now.', variant: best })
@@ -122,9 +138,10 @@ export function defaultVariant(
   ladder: VariantLadder | null,
   runtime: Runtime,
   preferLabel: string | null,
+  formats: readonly string[],
 ): QuantVariant | null {
   if (!ladder) return null
-  const { servable, reference } = partitionForRuntime(ladder.variants, runtime)
+  const { servable, reference } = partitionForRuntime(ladder.variants, runtime, formats)
   if (preferLabel) {
     const want = preferLabel.toUpperCase()
     const hit = [...servable, ...reference].find((v) => {
@@ -136,8 +153,8 @@ export function defaultVariant(
   return (
     // The recommendation only when this runtime can serve it: it is
     // runtime-blind, and a default that opens on a refusal is a dead end.
-    servable.find((v) => isRecommended(ladder, v)) ??
-    servable[0] ??
+    nativeFirst(servable, formats).find((v) => isRecommendedVariant(ladder, v)) ??
+    nativeFirst(servable, formats)[0] ??
     ladder.variants[0] ??
     null
   )
@@ -153,8 +170,8 @@ export interface RepoGroup {
 
 /** The ladder by repository, base model first, each with the row a `Use`
  *  button should select. */
-export function repoGroups(ladder: VariantLadder, runtime: Runtime): RepoGroup[] {
-  const servable = new Set(partitionForRuntime(ladder.variants, runtime).servable)
+export function repoGroups(ladder: VariantLadder, runtime: Runtime, formats: readonly string[]): RepoGroup[] {
+  const servable = new Set(partitionForRuntime(ladder.variants, runtime, formats).servable)
   const byRepo = new Map<string, QuantVariant[]>()
   for (const v of ladder.variants) {
     const list = byRepo.get(v.repo_id)

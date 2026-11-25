@@ -570,6 +570,18 @@
           "type": "int | None",
           "optional": true,
           "default": null
+        },
+        {
+          "name": "gguf_base",
+          "type": "str | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "gguf_projector",
+          "type": "str | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -714,6 +726,7 @@
       "module": "control_plane.contracts.ports",
       "methods": [
         "check",
+        "decode_tps_each",
         "max_context"
       ]
     },
@@ -853,6 +866,24 @@
         },
         {
           "name": "predicted_decode_tps_empty",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "decode_basis",
+          "type": "str",
+          "optional": true,
+          "default": "constant"
+        },
+        {
+          "name": "decode_efficiency",
+          "type": "float | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "decode_wire_seconds",
           "type": "float | None",
           "optional": true,
           "default": null
@@ -1328,6 +1359,18 @@
           "default": null
         },
         {
+          "name": "attention_free_layers",
+          "type": "int",
+          "optional": true,
+          "default": 0
+        },
+        {
+          "name": "recurrent_state_bytes",
+          "type": "int",
+          "optional": true,
+          "default": 0
+        },
+        {
           "name": "mla_latent_dim",
           "type": "int | None",
           "optional": true,
@@ -1352,10 +1395,28 @@
           "default": 0
         },
         {
+          "name": "decode_read_params",
+          "type": "int",
+          "optional": true,
+          "default": 0
+        },
+        {
           "name": "is_encoder_decoder",
           "type": "bool",
           "optional": true,
           "default": false
+        },
+        {
+          "name": "codec_resident_bytes",
+          "type": "int",
+          "optional": true,
+          "default": 0
+        },
+        {
+          "name": "codec_bytes_per_frame",
+          "type": "int",
+          "optional": true,
+          "default": 0
         }
       ]
     },
@@ -1423,6 +1484,18 @@
           "type": "str",
           "optional": true,
           "default": ""
+        },
+        {
+          "name": "infiniband",
+          "type": "bool | None",
+          "optional": true,
+          "default": null
+        },
+        {
+          "name": "host_memory_bandwidth_gbps",
+          "type": "float | None",
+          "optional": true,
+          "default": null
         }
       ]
     },
@@ -2509,8 +2582,8 @@
           "bits_per_weight": 4.5,
           "family": "block-float",
           "native_compute_capability": 10.0,
-          "emulated_below_native": false,
-          "note": "Blackwell only; no pre-Blackwell kernel"
+          "emulated_below_native": true,
+          "note": "native FP4 tensor cores from Blackwell; below that vLLM runs the weights through Marlin as weight-only FP4 -- measured on an RTX 3090 (sm_86) under vLLM 0.31.0, where nvidia/Qwen3-8B-NVFP4 (modelopt) and RedHatAI/Qwen3-8B-NVFP4 (compressed-tensors) both loaded and answered"
         },
         "awq_int4": {
           "key": "awq_int4",
@@ -2872,6 +2945,15 @@
       "copies": [],
       "restated_at": []
     },
+    "recurrent_states_per_sequence": {
+      "canonical": "control_plane.fit.constants:RECURRENT_STATES_PER_SEQUENCE",
+      "value": 2,
+      "why": "how many copies of a hybrid's recurrent state the pinned image reserves per request is a fact about the runtime's cache manager, and the fit gate is what prices it. The planner's fallback bridge must not import control_plane.fit -- it exists for when that package cannot answer -- so it keeps its own spelling",
+      "copies": [
+        "control_plane.planner.fit_bridge:RECURRENT_STATES_PER_SEQUENCE"
+      ],
+      "restated_at": []
+    },
     "redacted_placeholder": {
       "canonical": "control_plane.redaction:REDACTED",
       "value": "***",
@@ -3082,6 +3164,11 @@
       "owner": "control_plane/paths.py",
       "note": "unset: /data when writable, else the platform application-state dir"
     },
+    "DERATE_E2E_AGENT_ORIGIN": {
+      "default": null,
+      "owner": "tests/unit/test_route_smoke.py",
+      "note": "the agent port of the coordinator the route smoke drives; unset skips the /agent rows"
+    },
     "DERATE_E2E_ORIGIN": {
       "default": "http://localhost:8088",
       "owner": "tests/unit/test_gateway.py",
@@ -3121,6 +3208,21 @@
       "default": null,
       "owner": "ui/vite.config.ts",
       "note": "dev server only: which coordinator `npm run dev` proxies to"
+    },
+    "DERATE_GEOIP_DB": {
+      "default": null,
+      "owner": "control_plane/gateway/settings.py",
+      "note": "path to an IP-to-city .mmdb (DB-IP or GeoLite2 layout) to use instead of downloading DB-IP City Lite"
+    },
+    "DERATE_GEOIP_DOWNLOAD": {
+      "default": "1",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "0 = never download the IP location database; the request map then says it is missing"
+    },
+    "DERATE_GEOIP_TAILSCALE": {
+      "default": "1",
+      "owner": "control_plane/gateway/settings.py",
+      "note": "0 = never ask this machine's tailscaled where it and its tailnet peers are; LAN and tailnet requests then stay off the request map"
     },
     "DERATE_HF_CACHE": {
       "default": null,
@@ -3277,6 +3379,11 @@
       "owner": "control_plane/resolver/cache.py",
       "note": "seconds; a pinned commit sha never expires whatever this says"
     },
+    "DERATE_REVIEW_GATE": {
+      "default": null,
+      "owner": ".omp/hooks/pre/review-gate.ts",
+      "note": "off keeps the omp review gate out of a session; the headless reviewer (.omp/evals/reviewer/headless.mjs) sets it, having no task tool to satisfy it"
+    },
     "DERATE_ROLE": {
       "default": "auto",
       "owner": "control_plane/registry/config.py",
@@ -3286,6 +3393,11 @@
       "default": null,
       "owner": "control_plane/deploy/flags.py",
       "note": ""
+    },
+    "DERATE_SGLANG_IMAGE_AMD64": {
+      "default": null,
+      "owner": "control_plane/deploy/flags.py",
+      "note": "the sglang image for an x86 (amd64) machine; DERATE_SGLANG_IMAGE is the arm64 one the DGX Sparks run"
     },
     "DERATE_SHELL": {
       "default": "0",
@@ -3386,6 +3498,11 @@
       "default": null,
       "owner": "control_plane/deploy/flags.py",
       "note": ""
+    },
+    "DERATE_TTS_IMAGE_AMD64": {
+      "default": null,
+      "owner": "control_plane/deploy/flags.py",
+      "note": "the tts image for an x86 (amd64) machine; there is no published one, build docker/tts.Dockerfile on that machine (see its header)"
     },
     "DERATE_TTS_VOICE_DIR": {
       "default": null,

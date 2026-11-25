@@ -9,7 +9,7 @@ import { servesOnCluster } from '../../state/runtime'
 import { launchId, variantKey } from './ollamaTarget'
 import { recommendedPicks } from './quantPicks'
 import type { ModelSession } from './useModelSession'
-import { MEASURED_SERIES, comparedContexts, contextChips, ctxLabel as k, toChartRows, toTtftRows } from './usersChart'
+import { MEASURED_SERIES, comparedContexts, ctxLabel as k, presetContexts, toChartRows, toTtftRows } from './usersChart'
 
 type Mode = 'quant' | 'context' | 'ttft'
 
@@ -48,7 +48,7 @@ function sayTtft(resp: ConcurrencyResponse, ctx: number | null): string | null {
  *  points are drawn as dots beside it. */
 export function UsersChart({ s }: { s: ModelSession }) {
   const { backend } = useBackend()
-  const { navigate, route } = useRouter()
+  const { navigate } = useRouter()
   const [mode, setMode] = useState<Mode>('quant')
   const [resps, setResps] = useState<{ resp: ConcurrencyResponse; name: string }[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -84,12 +84,15 @@ export function UsersChart({ s }: { s: ModelSession }) {
     return b
   }, [reqJson])
 
-  const picks = useMemo(() => (ladder ? recommendedPicks(ladder, runtime).slice(0, 3) : []), [ladder, runtime])
-  // The override in the URL, or null while the planner picks. The chips list
-  // the preset sizes the model can hold; the compared series are the four nearest.
-  const chosen = route.context
-  const chips = useMemo(() => contextChips(native), [native])
-  const contexts = useMemo(() => comparedContexts(ctx, chips), [ctx, chips])
+  const formats = s.formats
+  const picks = useMemo(
+    () => (ladder ? recommendedPicks(ladder, runtime, formats).slice(0, 3) : []),
+    [ladder, runtime, formats],
+  )
+  // The compared series are the preset contexts nearest the one in use; the
+  // context itself is set by the slider above the chart (`SizingSliders`).
+  const presets = useMemo(() => presetContexts(native), [native])
+  const contexts = useMemo(() => comparedContexts(ctx, presets), [ctx, presets])
   const pickContext = (c: number | null) => navigate({ context: c }, { replace: true })
 
   const key = JSON.stringify([mode, base, s.subjectId, ctx, picks.map((p) => launchId(p.variant)), contexts, nonce])
@@ -229,39 +232,6 @@ export function UsersChart({ s }: { s: ModelSession }) {
           onClick={onPoint}
         />
       )}
-      {chips.length ? (
-        <div className="mdl-users-ctx">
-          <span
-            className="unit"
-            title="How many tokens one user's conversation can hold -- prompt and answer together. A longer context reserves more KV cache per user, so fewer users fit before it is full."
-          >
-            Context per user
-          </span>
-          <div className="mdl-users-chips" role="radiogroup" aria-label="Context per user">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={chosen == null}
-              title="The planner picks the largest context that fits here, capped at the model's own window."
-              onClick={() => pickContext(null)}
-            >
-              {chosen == null && ctx != null ? `Auto · ${k(ctx)}` : 'Auto'}
-            </button>
-            {chips.map((c) => (
-              <button
-                key={c}
-                type="button"
-                role="radio"
-                aria-checked={chosen === c}
-                title={`${c.toLocaleString()} tokens per user${c === native ? ' -- the model’s full window' : ''}`}
-                onClick={() => pickContext(c)}
-              >
-                {k(c)}
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : null}
       {sentence && !noCompute ? <p className="unit">{sentence}</p> : null}
       {measured && !noCompute ? <p className="unit">Dots are {MEASURED_SERIES} by a benchmark of this variant.</p> : null}
       <Verbatim text={ttft ? merged.ttft_caveat : merged.caveat} size="unit" />

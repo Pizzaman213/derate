@@ -108,6 +108,18 @@ def test_dspark_is_named_and_refused_rather_than_estimated():
     assert dspark.default_tokens == 5  # dspark_block_size, read off the config
 
 
+def test_a_dspark_head_in_its_own_sub_config_is_named_too():
+    """Inkling 2 Mini declares its speculator as `mtp_config` -- block size 8, a
+    rank-256 markov head, the target layers it reads: DSpark under another key.
+    Undetected, the page offered ngram alone and said nothing about the head
+    the checkpoint ships. It is named now, and refused on the same terms."""
+    found = _detect("inkling-2-mini")
+    assert set(found) == {"dspark", "ngram"}
+    dspark = found["dspark"]
+    assert dspark.default_tokens == 8
+    assert dspark.draft_params is None and not dspark.launchable
+
+
 def test_ngram_is_offered_for_a_model_that_declares_nothing():
     """The Qwen3-8B case, and the reason ngram is in this module at all.
 
@@ -228,7 +240,7 @@ def test_tensor_parallel_does_shard_the_draft():
 
 def _range(shape: ModelShape, spec: SpeculativeSpec) -> tuple[float, float, float]:
     base = predict_decode_tps(shape, 273.0, 0.0)
-    floor, ceiling = speculative_decode_tps_range(shape, 273.0, 0.0, spec)
+    floor, ceiling = speculative_decode_tps_range(base, shape, spec)
     return base, floor, ceiling
 
 

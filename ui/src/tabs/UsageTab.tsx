@@ -5,6 +5,7 @@ import { RequestsSub } from './requests/RequestsSub'
 import { KeysSub } from './keys/KeysSub'
 import { RateLimitsSub } from './requests/RateLimitsSub'
 import { useCluster } from '../state/resources'
+import { ResourceScope } from '../state/backend'
 
 const SUBS: { id: UsageSub; label: string }[] = [
   { id: 'overview', label: 'Overview' },
@@ -67,16 +68,24 @@ export function UsageTab() {
       </div>
 
       <div id="us-overview" role="tabpanel" aria-labelledby="us-tab-overview" hidden={sub !== 'overview'}>
-        <OverviewSub />
+        <ResourceScope active={sub === 'overview'}>
+          <OverviewSub />
+        </ResourceScope>
       </div>
       <div id="us-requests" role="tabpanel" aria-labelledby="us-tab-requests" hidden={sub !== 'requests'}>
-        <RequestsSub />
+        <ResourceScope active={sub === 'requests'}>
+          <RequestsSub />
+        </ResourceScope>
       </div>
       <div id="us-rate-limits" role="tabpanel" aria-labelledby="us-tab-rate-limits" hidden={sub !== 'rate-limits'}>
-        {sub === 'rate-limits' ? <RateLimitsSub /> : null}
+        <ResourceScope active={sub === 'rate-limits'}>
+          {sub === 'rate-limits' ? <RateLimitsSub /> : null}
+        </ResourceScope>
       </div>
       <div id="us-keys" role="tabpanel" aria-labelledby="us-tab-keys" hidden={sub !== 'keys'}>
-        <KeysSub />
+        <ResourceScope active={sub === 'keys'}>
+          <KeysSub />
+        </ResourceScope>
       </div>
     </div>
   )

@@ -21,9 +21,9 @@ function active(activity: Activity | null) {
   }
 }
 
-/** The toolbar's count. A second `useActivity` poll -- `useResource` does not
- *  deduplicate -- which is the price of the badge being right while the panel
- *  is closed. */
+/** The toolbar's count. A second subscriber to the shared `'activity'` name,
+ *  not a second poll, which is how the badge stays right while the panel is
+ *  closed. */
 export function useDownloadsBadge(): number {
   const { launches, pulls } = active(useActivity().data)
   return launches.length + pulls.length

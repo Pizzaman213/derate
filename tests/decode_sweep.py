@@ -41,7 +41,6 @@ justify is a separate, deliberate edit.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from dataclasses import dataclass
@@ -132,6 +131,8 @@ class Measured:
     kv_cache_bytes: int
     kv_cache_usage: float | None
     preemptions: float
+    #: The cache length averaged over the decode steps -- what the rate read.
+    mean_decode_context: float = 0.0
 
     @property
     def ratio(self) -> float | None:
@@ -269,10 +270,14 @@ def measure(
         kv_cache_bytes=int(breakdown.get("kv_cache") or 0),
         kv_cache_usage=after.kv_cache_usage,
         preemptions=window.preemptions,
+        mean_decode_context=window.mean_decode_context_tokens or 0.0,
     )
 
 
-def record_for(m: Measured, node: dict, version: str) -> measurements.DecodeRecord:
+def record_for(
+    m: Measured, dep: dict, node: dict, version: str
+) -> measurements.DecodeRecord:
+    plan = dep.get("plan") or {}
     return measurements.DecodeRecord(
         model_id=m.model_id,
         gpu_name=str(node.get("gpu_name") or ""),
@@ -286,6 +291,13 @@ def record_for(m: Measured, node: dict, version: str) -> measurements.DecodeReco
         requests=m.requests,
         predicted_tps=m.predicted_tps,
         measured_at=time.time(),
+        mean_context_tokens=m.mean_decode_context,
+        kv_dtype=str(dep.get("kv_dtype") or ""),
+        world=measurements.world_key(
+            int(plan.get("tensor_parallel") or 1),
+            int(plan.get("pipeline_parallel") or 1),
+            int(plan.get("expert_parallel") or 1),
+        ),
     )
 
 
@@ -328,7 +340,7 @@ def summarise(found: list[Measured], bandwidth: float) -> int:
         lo, hi = min(effs), max(effs)
         mean = sum(effs) / len(effs)
         print(f"  implied efficiency: {lo:.3f} .. {hi:.3f}, mean {mean:.3f}")
-        print(f"  DECODE_EFFICIENCY is 0.55 today")
+        print("  DECODE_EFFICIENCY is 0.55 today")
         spread = (hi - lo) / mean if mean else 0.0
         if spread > 0.15:
             print(
@@ -420,6 +432,9 @@ def main(argv: list[str] | None = None) -> int:
             wanted.extend(CORPUS[family])
 
     found: list[Measured] = []
+    # Each measurement's deployment, by id: the record is keyed on its plan
+    # and cache width, which the measurement itself does not carry.
+    deps: dict[str, dict] = {}
 
     # Already serving first, and free: their engines are up and their counters
     # are readable without launching anything. On a box where deployments are
@@ -436,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         _flag_client_gap(m)
         found.append(m)
+        deps[m.deployment_id] = dep
         wanted = [w for w in wanted if w != m.model_id]
 
     # Then the ones that are not, ONE AT A TIME.
@@ -466,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
             if m is not None:
                 _flag_client_gap(m)
                 found.append(m)
+                deps[m.deployment_id] = dep
                 print(report_line(m, bandwidth))
         except SweepError as exc:
             print(f"  refused or failed: {str(exc)[:160]}")
@@ -474,10 +491,12 @@ def main(argv: list[str] | None = None) -> int:
                 stop(args.base, started["deployment_id"])
 
     if not args.no_save and found:
-        version = runtime_version(args.base, found[0].model_id)
+        version = runtime_version(args.base, node)
         written = 0
         for m in found:
-            if measurements.save_decode(record_for(m, node, version)) is not None:
+            if measurements.save_decode(
+                record_for(m, deps[m.deployment_id], node, version)
+            ) is not None:
                 written += 1
         print(f"\nwrote {written} record(s) to {measurements.decode_records_dir()}")
 

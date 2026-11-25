@@ -193,13 +193,13 @@ caller appends its own `GB` — `FilesystemsCard`'s captions and its readout
 itself does not call it; it is handed `fs.free / 1024 ** 3` with
 `decimals={0}`.
 
-**All four cards call `useStorage()`, and `useResource` does not deduplicate.**
-`state/resources.ts` states that plainly at `useActivity`, and
-`useKeyedResource` holds its state per component with no shared cache. Because
+**All four cards call `useStorage()`, and that is one request.** The fixed
+hooks in `state/resources.ts` are shared by name through `useSharedResource`,
+so every subscriber reads the same `'storage'` answer on one timer.
 `SettingsTab` keeps every panel mounted and hides it with `hidden` rather than
 unmounting — enrollment tokens and half-typed addresses must survive a tab
-switch — the cluster-wide disk walk starts when `/settings` loads, not when the
-Storage sub-tab is opened.
+switch — but each panel sits in a `ResourceScope`, so the cluster-wide disk walk
+starts when the Storage sub-tab is shown, not when `/settings` loads.
 
 **The estate is a declared list, not a directory listing.**
 `registry/storage.py`'s `ESTATE` names thirteen components and every one is

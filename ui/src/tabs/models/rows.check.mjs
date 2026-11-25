@@ -756,9 +756,49 @@ check(onGpu.selectableCount === 1 && onCpu.selectableCount === 1,
 check(/pick llamacpp/i.test(rowOf(onGpu, 'pi').unselectableReason ?? ''),
   'a GPU runtime on a GPU-less machine points at the runtime that runs there')
 check(/vllm|sglang/i.test(rowOf(onCpu, 'spark').unselectableReason ?? ''),
-  'and a CPU runtime on a machine with a GPU points back the other way')
+  'and a CPU runtime on a unified-memory machine points back the other way')
 check(rowOf(onCpu, 'pi').unselectableReason === null,
   'a machine that CAN carry the rank carries no refusal at all')
+
+// A discrete-GPU box -- the RTX 3090 Ti that joined this estate -- is the
+// machine BOTH kinds of runtime can carry. Its VRAM is the GPU runtimes' pool
+// and its host RAM is a separate one llamacpp is budgeted against
+// (`telemetry.allocatable_bytes(pool="host")`). Withholding the tick here
+// while the server accepts the launch is the drift this section exists for.
+const GIB = 1024 ** 3
+const DISCRETE_NODE = (id) => ({
+  profile: {
+    node_id: id, hostname: id, address: '192.168.0.69', device_class: 'discrete',
+    gpu_name: 'NVIDIA GeForce RTX 3090 Ti', gpu_count: 1, total_memory: 24 * GIB,
+    addressable_memory: 24 * GIB, memory_bandwidth_gbps: 1008, compute_capability: '8.6',
+    driver_version: '580',
+  },
+  healthy: true, state: 'healthy', role: 'worker', last_seen: 0,
+  memory_used: 0, memory_total: 24 * GIB,
+  power_watts: null, temperature_c: null, utilization_pct: null,
+})
+{
+  const estate = [NODE('spark'), DISCRETE_NODE('rtx'), CPU_NODE('pi')]
+  const memory = [{
+    node_id: 'rtx', allocatable: 20 * GIB, static_ceiling: 21.6 * GIB,
+    host_allocatable: 50 * GIB, stale: false,
+  }]
+  const gpuBoard = synth(estate, [], null, { memory })
+  const hostBoard = synth(estate, [], null, { memory, runtime: 'llamacpp' })
+  check(rowOf(gpuBoard, 'rtx').selectable === true && rowOf(hostBoard, 'rtx').selectable === true,
+    'a discrete-GPU box carries a vllm rank AND a llamacpp one: its host RAM is a pool of its own')
+  check(rowOf(hostBoard, 'spark').selectable === false && rowOf(hostBoard, 'pi').selectable === true,
+    'while llamacpp still refuses the unified-memory Spark and takes the Pi')
+  check(hostBoard.selectableCount === 2, 'so under llamacpp two of the three machines can be ticked')
+  check(/unified memory/i.test(rowOf(hostBoard, 'spark').unselectableReason ?? ''),
+    'and the Spark\'s refusal names the reason: one pool, budgeted as GPU memory')
+  // The row has to show the number the gate uses. Under llamacpp that is the
+  // host budget, never the card's headroom, and host RAM has no nameplate.
+  check(rowOf(hostBoard, 'rtx').allocatable === 50 * GIB && rowOf(hostBoard, 'rtx').ceiling === null,
+    'under llamacpp the discrete box\'s figure is its HOST budget, with no VRAM ceiling behind it')
+  check(rowOf(gpuBoard, 'rtx').allocatable === 20 * GIB && rowOf(gpuBoard, 'rtx').ceiling === 21.6 * GIB,
+    'and under vllm it is the GPU figure, exactly as before')
+}
 
 // One node runs one copy of a model. `DeploymentManager._find_conflict`
 // refuses a second copy on a node already running the model and the gateway

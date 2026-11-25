@@ -105,7 +105,7 @@ def test_the_access_line_carries_port_and_query(gate, caplog):
     with caplog.at_level(logging.INFO, logger="gateway.access"):
         client.get("/api/keys?org_id=x", headers=cookie)
     line = [rec.getMessage() for rec in caplog.records if rec.name == "gateway.access"][-1]
-    assert " port=50123 " in line and " q='org_id=x' " in line
+    assert " port=50123 " in line and " q='org_id=x' " in line and line.endswith(" n=1")
 
 
 def test_archive_keeps_access_rows_and_forensics_reads_them(tmp_path):
@@ -176,6 +176,39 @@ def test_a_newline_in_the_path_cannot_forge_an_access_line(gate, caplog):
     forged = [line for line in lines if "rid=forged" in line]
     assert len(forged) == 1
     assert "\n" not in forged[0] and "\\x0a" in forged[0]
+
+
+def test_repeated_session_reads_fold_into_one_counted_row(gate):
+    client, cookie, recorder = gate
+    for _ in range(2):
+        assert client.get("/api/settings", headers=cookie).status_code == 200
+    client.post("/api/settings", json={}, headers=cookie)
+    assert client.get("/api/settings", headers=cookie).status_code == 200
+    reads = [r for r in recorder.rows if r.method == "GET" and r.path == "/api/settings"]
+    assert [r.count for r in reads] == [1]
+    writes = [r for r in recorder.rows if r.method == "POST" and r.path == "/api/settings"]
+    assert len(writes) == 1 and writes[0].count == 1
+    client.app.state.ctx.access_fold.flush_all()
+    reads = [r for r in recorder.rows if r.method == "GET" and r.path == "/api/settings"]
+    assert [r.count for r in reads] == [1, 2]
+    assert sum(r.count for r in reads) == 3
+
+
+def test_forensics_marks_a_folded_row(tmp_path):
+    rec = AccessRecord(
+        request_id="r-fold", ts=1_800_000_000.0, client_ip="10.1.2.3", client_port=41000,
+        who="session:root", method="GET", path="/api/cluster", status=200, count=5,
+    )
+    page = {"rows": [{"kind": KIND_ACCESS, "seq": 1, "ts": rec.ts, "body": json.dumps(rec.as_dict())}],
+            "next": 1, "head": 1}
+    (tmp_path / "telemetry").mkdir()
+    archive = Archive(tmp_path / "telemetry" / "archive.db")
+    archive.ingest("spark-01", page, trusted=True)
+    assert archive.conn.execute("SELECT count FROM access").fetchone()[0] == 5
+    archive.close()
+    report = forensics.investigate(tmp_path, forensics.Filters(since=0.0))
+    events = [e for e in report.events if e.source == "access"]
+    assert len(events) == 1 and events[0].what.endswith(" x5")
 
 
 @pytest.fixture

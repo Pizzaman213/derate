@@ -28,6 +28,14 @@ const price = (m, i, o) => ({ model: m, input_usd_per_mtok: i, output_usd_per_mt
   check(!rows[2].served && rows[2].price != null, 'a priced model no longer served is still listed')
 }
 check(P.pricingRows(null, null).length === 0, 'nothing loaded -> no rows')
+{
+  const want = P.pricingRows([], [], 'm')
+  check(want.length === 1 && want[0].model === 'm' && !want[0].served && want[0].price === null,
+    'a linked model with no row gets an unserved, unpriced one')
+  check(P.pricingRows([], [], null).length === 0, 'no link -> no extra row')
+  const priced = P.pricingRows([], [price('m', 1, 2)], 'm')
+  check(priced.length === 1 && priced[0].price?.input_usd_per_mtok === 1, 'a linked model that has a price keeps it')
+}
 
 check(JSON.stringify(P.parseRate('')) === '{"value":null}', 'blank is null, never 0')
 check(JSON.stringify(P.parseRate('  ')) === '{"value":null}', 'whitespace is null')

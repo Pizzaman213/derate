@@ -119,4 +119,27 @@ const roundTrip = (req) => {
   check(M.flagsToArgs(M.argsToFlags('--a 1 --b --c x')) === '--a 1 --b --c x', 'flag rows round-trip')
 }
 
+// The verdict card must judge the launch the button sends. The plan body was
+// built inline without `runtime`, so /api/plan priced every engine as vllm
+// (a llama.cpp GGUF answered 'Fits' on a GB10 the node board refused).
+{
+  const k = M.knobsFromRequest(full, ladder).knobs
+  const f = M.routeFields(M.knobsFromRequest(full, ladder).route, { context: 0, concurrency: 0 })
+  const shared = ['model_id', 'target', 'runtime', 'context', 'concurrency', 'node_ids', 'parallelism',
+    'kv_dtype', 'dtype', 'speculative', 'speculative_tokens', 'engine_options']
+  for (const runtime of ['vllm', 'sglang', 'tts', 'llamacpp']) {
+    for (const custom of [false, true]) {
+      const s = { ...k, ...f, runtime, customCommand: custom, customCommandText: custom ? 'serve x' : '' }
+      const plan = M.buildPlanRequest(s)
+      const launch = M.buildLaunchRequest(s)
+      check(plan.runtime === runtime && launch.runtime === runtime,
+        `${runtime}${custom ? ' (custom)' : ''}: plan and launch carry the same runtime (plan: ${plan.runtime})`)
+      const off = shared.filter((key) => JSON.stringify(plan[key]) !== JSON.stringify(launch[key]))
+      check(off.length === 0, `${runtime}${custom ? ' (custom)' : ''}: sizing fields agree (differ: ${off.join(',') || 'none'})`)
+    }
+  }
+  const open = M.buildPlanRequest({ ...k, ...f, context: 0, concurrency: 0 })
+  check(!('context' in open) && !('concurrency' in open), 'unset context/concurrency stay absent: the planner picks')
+}
+
 done()

@@ -15,6 +15,7 @@ import html
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -222,6 +223,9 @@ class _PlanOutcome:
     #: byte budget filled with full-width entries -- half the context the
     #: gate promised, no error anywhere.
     kv_dtype: str = DEFAULT_KV_DTYPE
+    #: `_kv_dtype_ratios` for this plan: every width its runtime and machines
+    #: would launch, over the 16-bit rate. What the picker may offer.
+    kv_dtype_ratios: dict = dataclasses.field(default_factory=dict)
     #: The weight quantization the CALLER forced, or None to let the runtime
     #: read it off the checkpoint. Distinct from `shape.dtype`, which is the
     #: forced value once an override was applied and the checkpoint's own
@@ -240,8 +244,72 @@ class _PlanOutcome:
     #: The model's trained window (max_position_embeddings), None when the
     #: config states none. Rendering YaRN needs it.
     original_window: int | None = None
+    #: The request the gate judged, so a follow-up question about the same
+    #: plan (the users chart) asks the gate with the identical object rather
+    #: than rebuilding one that could drift from it.
+    fit_request: object | None = None
     #: The window the plan sized against: the trained one, times rope_factor.
     native_window: int | None = None
+    #: The repository a hub GGUF on vllm was quantized from, and the vision
+    #: projector blob it loads beside it -- what the launch must be told, and
+    #: what the gate already charged. None for everything else.
+    gguf_base: str | None = None
+    gguf_projector: str | None = None
+    #: Whether the runtime loads this model on the machines the plan landed
+    #: on, judged by the image EACH of them runs (`_support_per_node`), and
+    #: the runtime's own sentence when it does not. The launch and the
+    #: restart read this rather than asking `supported_by` again: asked
+    #: without the machines, the question is answered by the default image,
+    #: which refuses an architecture only another machine's image loads.
+    runtime_supported: bool = True
+    runtime_unsupported_reason: str | None = None
+
+
+def _kv_dtype_ratios(shape, runtime: str, nodes, quant_method: str) -> dict[str, float]:
+    """Every `--kv-cache-dtype` this plan could be launched with, as its cache
+    bytes per token over the 16-bit rate.
+
+    Absent: a name the gate does not price, cannot render, or refuses for this
+    attention geometry -- and, since 2026-11-23, one *runtime* cannot be told
+    (`flags.kv_cache_dtype_refusal`) or that the image a planned machine runs
+    has no attention backend for (`support.silicon_check`, asked exactly as
+    `_plan_and_fit` asks it of the width it was sent). Without the last two the
+    picker offered `nvfp4` on a GB10 and the plan answered it with a 400, which
+    unmounts the card the picker lives in. Every width offered is accepted.
+    """
+    from control_plane.deploy.flags import (
+        VLLM_KV_CACHE_DTYPES,
+        kv_cache_dtype_refusal,
+        render_kv_cache_dtype,
+    )
+    from control_plane.fit.kv import is_known_kv_dtype, kv_bytes_per_token, kv_dtype_refusal
+
+    base = kv_bytes_per_token(shape, "bf16")
+    if base <= 0:
+        return {}
+    judge_silicon = runtime == "vllm" and bool(nodes) and not getattr(shape, "mla_latent_dim", 0)
+    out: dict[str, float] = {}
+    for name in sorted(VLLM_KV_CACHE_DTYPES):
+        if name == "auto" or not is_known_kv_dtype(name):
+            continue
+        try:
+            rendered = render_kv_cache_dtype(name)
+        except ValueError:
+            continue
+        if kv_dtype_refusal(shape, name) is not None:
+            continue
+        if kv_cache_dtype_refusal(runtime, name) is not None:
+            continue
+        if judge_silicon and rendered is not None:
+            refused, _ = _silicon_per_node(
+                runtime, nodes, dtype=shape.dtype, quant_method=quant_method,
+                kv_cache_dtype=rendered, kv_label=name,
+            )
+            if refused:
+                continue
+        out[name] = kv_bytes_per_token(shape, name) / base
+    return out
+
 
 _ENGINE_ENV_VALUE = re.compile(r"^[A-Za-z0-9_.,:/=+-]*$")
 _MM_KEYS = ("image", "video", "audio")
@@ -452,6 +520,47 @@ def _without_vision(shape, weight_bytes: int | None):
     )
     if weight_bytes is not None:
         weight_bytes = max(0, weight_bytes - vision_bytes)
+    return shape, weight_bytes
+
+
+def _with_codec_working_set(shape, architectures):
+    """The shape carrying the tts server's measured codec working set
+    (`resolver/support.py::TTS_WORKING_SETS`), which the fit gate charges in
+    `activations`. Unchanged when the tts runtime loads none of
+    *architectures*: that is the support check's refusal to make."""
+    from control_plane.resolver.support import speech_working_set
+
+    found = speech_working_set(architectures)
+    if found is None:
+        return shape
+    return dataclasses.replace(
+        shape,
+        codec_resident_bytes=found.resident_bytes,
+        codec_bytes_per_frame=found.bytes_per_frame,
+    )
+
+
+def _with_gguf_projector(shape, weight_bytes: int | None, projector_bytes: int):
+    """The shape and measured weights with a GGUF's vision projector added.
+
+    The fit gate charges replicated vision as ``vision_params x
+    bytes_per_param()`` (`fit/calculator.py::replicated_bytes_per_rank`) at
+    the backbone's GGUF width, so the projector is entered as the equivalent
+    parameter count whose charge equals its measured bytes exactly -- rounded
+    up, never down. That keeps it replicated on every rank under TP rather
+    than divided, which is how the plugin loads it.
+    """
+    equiv = math.ceil(projector_bytes / shape.bytes_per_param())
+    shape = dataclasses.replace(
+        shape,
+        vision_params=shape.vision_params + equiv,
+        total_params=shape.total_params + equiv,
+        active_params=(
+            shape.active_params + equiv if shape.active_params is not None else None
+        ),
+    )
+    if weight_bytes is not None:
+        weight_bytes = weight_bytes + projector_bytes
     return shape, weight_bytes
 
 
@@ -760,6 +869,25 @@ def _rank_plans(
         return [planner.plan(shape, nodes, link, target, concurrency)]
 
 
+def _same_placement(a, b) -> bool:
+    """Whether two plans put the same ranks on the same machines."""
+    return (
+        a.kind,
+        list(a.node_ids),
+        a.tensor_parallel,
+        a.pipeline_parallel,
+        a.expert_parallel,
+        a.data_parallel,
+    ) == (
+        b.kind,
+        list(b.node_ids),
+        b.tensor_parallel,
+        b.pipeline_parallel,
+        b.expert_parallel,
+        b.data_parallel,
+    )
+
+
 def _placement_refusal(registry, runtime: str, node_id: str, profile) -> str | None:
     """`flags.placement_refusal`, with the live reading fetched for it.
 
@@ -784,12 +912,18 @@ def _placement_refusal(registry, runtime: str, node_id: str, profile) -> str | N
     spec = RUNTIMES.get(runtime)
     live = None
     if spec is not None and spec.memory_pool == "host":
-        try:
-            live = registry.allocatable_or_none(node_id)
-        except Exception:
-            log.exception("live memory lookup failed for %s while planning", node_id)
-            live = None
-    return placement_refusal(runtime, node_id, profile.addressable_memory, live)
+        # The HOST pool's reading, never the GPU's: on a discrete box the two
+        # are different machines' worth of memory.
+        probe = getattr(registry, "allocatable_or_none", None)
+        if callable(probe) and livefit._accepts_keyword(probe, "pool"):
+            try:
+                live = probe(node_id, pool=spec.memory_pool)
+            except Exception:
+                log.exception(
+                    "live memory lookup failed for %s while planning", node_id
+                )
+                live = None
+    return placement_refusal(runtime, profile, live)
 
 
 def _select_nodes(registry, nodes, requested, warnings: list[str], runtime: str = "vllm"):
@@ -1055,30 +1189,31 @@ def _attach_measurements(options: list[dict], model_id: str, nodes: list) -> lis
         return options
 
     gpu = bandwidth = None
+    arch = ""
     for node in nodes:
         if getattr(node, "memory_bandwidth_gbps", 0):
             gpu = getattr(node, "gpu_name", None)
             bandwidth = node.memory_bandwidth_gbps
+            arch = getattr(node, "arch", "") or ""
             break
-    version = None
-    try:
-        from control_plane.resolver import support
-
-        probed = support.probed("vllm")
-        version = getattr(probed, "version", None) if probed else None
-    except Exception:
-        version = None
+    # The version of the image THAT machine runs, never the default image's:
+    # a record taken under the 3090's vLLM 0.31 must not answer for a Spark on
+    # 0.28.1. No probe of that image is a miss -- `matching` reads a falsy
+    # version as "any", so the lookup is skipped rather than asked.
+    version = measurements.image_version("vllm", arch) if gpu is not None else ""
 
     out: list[dict] = []
     for option in options:
-        try:
-            found = measurements.matching(
-                model_id, option.get("method", ""), gpu_name=gpu,
-                memory_bandwidth_gbps=bandwidth, runtime_version=version,
-            )
-        except Exception:
-            log.exception("reading speculative measurements failed")
-            found = []
+        found = []
+        if version:
+            try:
+                found = measurements.matching(
+                    model_id, option.get("method", ""), gpu_name=gpu,
+                    memory_bandwidth_gbps=bandwidth, runtime_version=version,
+                )
+            except Exception:
+                log.exception("reading speculative measurements failed")
+                found = []
         out.append({
             **option,
             "measured": [serialize.measurement(r) for r in found],
@@ -1086,7 +1221,9 @@ def _attach_measurements(options: list[dict], model_id: str, nodes: list) -> lis
     return out
 
 
-def _measured_decode(model_id: str, nodes: list, context_length: int) -> dict | None:
+def _measured_decode(
+    model_id: str, nodes: list, context_length: int, plan, runtime: str
+) -> dict | None:
     """The measured decode rate for THIS model on THESE machines, or None.
 
     The same argument as :func:`_attach_measurements`, applied to the ordinary
@@ -1094,10 +1231,11 @@ def _measured_decode(model_id: str, nodes: list, context_length: int) -> dict | 
     model on one GPU under one image, so the criteria come off the plan's own
     nodes and a mismatch on any of them misses rather than approximating.
 
-    Cited BESIDE the predicted range and never in place of it. The range is
-    still what is true for a context nobody has run; this says what one machine
-    actually did, and on the box this was written for the two disagreed by 2x --
-    which is the whole reason the range now has two ends.
+    Cited BESIDE the predicted range. The range itself is calibrated from the
+    same records by the fit gate (`FitResult.decode_basis == "measured"`), so
+    the two now agree where they overlap; this still says what one machine
+    actually did at one context band, which is the raw fact the calibration
+    averages away.
 
     Context matters here in a way it does not for acceptance: decode reads the
     cache for the tokens actually present, so a rate measured at 300 tokens is
@@ -1105,7 +1243,9 @@ def _measured_decode(model_id: str, nodes: list, context_length: int) -> dict | 
     nearest-first rather than excluding, so a neighbouring band is offered
     rather than nothing at all.
 
-    Failure is silence, on the same terms as the speculative path.
+    Failure is silence, on the same terms as the speculative path. The plan's
+    parallelism and the image's version are matched exactly: a TP=2 rate is
+    not the TP=1 rate, and a different vLLM is different kernels.
     """
     try:
         from control_plane import measurements
@@ -1113,19 +1253,29 @@ def _measured_decode(model_id: str, nodes: list, context_length: int) -> dict | 
         return None
 
     gpu = bandwidth = None
+    arch = ""
     for node in nodes:
         if getattr(node, "memory_bandwidth_gbps", 0):
             gpu = getattr(node, "gpu_name", None)
             bandwidth = node.memory_bandwidth_gbps
+            arch = getattr(node, "arch", "") or ""
             break
     if gpu is None:
+        return None
+    # The image THAT machine runs for THIS runtime; no probe of it is a miss.
+    version = measurements.image_version(runtime, arch)
+    if not version:
         return None
     try:
         found = measurements.matching_decode(
             model_id,
             gpu_name=gpu,
             memory_bandwidth_gbps=bandwidth,
+            runtime_version=version,
             context_band=measurements.band(context_length),
+            world=measurements.world_key(
+                plan.tensor_parallel, plan.pipeline_parallel, plan.expert_parallel
+            ),
         )
     except Exception:
         log.exception("reading decode measurements failed")
@@ -1177,6 +1327,23 @@ def speculative_refusal(runtime: str, method: str) -> str | None:
         return None
     try:
         return refusal(runtime, method)
+    except ValueError:
+        return None
+
+
+def kv_dtype_launch_refusal(runtime: str, kv_dtype: str) -> str | None:
+    """Why *runtime* cannot be told *kv_dtype*, or None.
+
+    ``flags.kv_cache_dtype_refusal``, lazily imported on the same terms as
+    ``speculative_refusal`` above. An unknown runtime is left to the check
+    that refuses it by name.
+    """
+    try:
+        from control_plane.deploy.flags import kv_cache_dtype_refusal as refusal
+    except Exception:
+        return None
+    try:
+        return refusal(runtime, kv_dtype)
     except ValueError:
         return None
 
@@ -1577,6 +1744,62 @@ def _launch_options(payload: dict) -> dict:
     return out
 
 
+def _runtime_image(runtime: str, arch: str) -> str | None:
+    """The image *runtime* runs on a machine of *arch* (`flags.image_for_arch`),
+    or None for a runtime the launcher has no spec for."""
+    from control_plane.deploy.flags import RUNTIMES, image_for_arch
+
+    spec = RUNTIMES.get(runtime)
+    return image_for_arch(spec, arch) if spec is not None else None
+
+
+async def _support_per_node(resolver, shape, runtime: str, nodes) -> dict[str, tuple[bool, str]]:
+    """`supported_by` for each machine, asked of the image that machine runs.
+
+    One call per distinct image, not per machine: every Spark runs the same
+    one. Empty when the resolver cannot answer at all.
+    """
+    supported_by = getattr(resolver, "supported_by", None)
+    if not callable(supported_by):
+        return {}
+    by_image: dict[str | None, tuple[bool, str]] = {}
+    out: dict[str, tuple[bool, str]] = {}
+    for node in nodes:
+        image = _runtime_image(runtime, getattr(node, "arch", ""))
+        if image not in by_image:
+            by_image[image] = await asyncio.to_thread(
+                supported_by, shape, runtime, image=image
+            )
+        out[node.node_id] = by_image[image]
+    return out
+
+
+def _silicon_per_node(
+    runtime: str, nodes, *, dtype: str, quant_method: str,
+    kv_cache_dtype: str | None, kv_label: str,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """`support.silicon_check` for each machine against the image it runs:
+    the refusals by node id, and every machine's warnings by node id."""
+    from control_plane.resolver.support import silicon_check
+
+    refused: dict[str, str] = {}
+    notes: dict[str, list[str]] = {}
+    for node in nodes:
+        refusal, warnings = silicon_check(
+            runtime,
+            node,
+            _runtime_image(runtime, getattr(node, "arch", "")),
+            dtype=dtype,
+            quant_method=quant_method,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_label=kv_label,
+        )
+        if refusal is not None:
+            refused[node.node_id] = refusal
+        notes[node.node_id] = warnings
+    return refused, notes
+
+
 async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     """Resolve, plan, check fit. Launches nothing.
 
@@ -1606,6 +1829,19 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     kv_dtype = payload.get("kv_dtype") or ctx.settings.default_kv_dtype
     dtype = payload.get("dtype")
     runtime = payload.get("runtime") or "vllm"
+    # A width the caller NAMED is refused here, before a resolve, on the terms
+    # the launch refuses it -- this function is both. Until 2026-11-23 only
+    # the launch asked, so `/api/plan` priced `int8` at half width, `fp8_inc`
+    # (Gaudi's) and `nonsense` at full width, and answered `serve.allowed`
+    # for every one: a Verdict card and a Serve button for a launch that 400s.
+    # The settings default is resolved above and never refused here.
+    raw_kv_dtype = payload.get("kv_dtype")
+    if raw_kv_dtype is not None:
+        if not isinstance(raw_kv_dtype, str):
+            raise ValueError("kv_dtype must be a string naming a KV cache element width.")
+        refusal = kv_dtype_launch_refusal(runtime, raw_kv_dtype)
+        if refusal is not None:
+            raise ValueError(refusal)
     requested_nodes = _parse_node_ids(payload)
     requested_degrees = _parse_degrees(payload)
     # Parsed here (shape only) and priced below, once the resolution that knows
@@ -1656,10 +1892,63 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     else:
         shape = await asyncio.to_thread(ctx.deps.resolver.resolve, model_id, dtype)
 
+    # A hub GGUF on vllm loads beside its base model's config and tokenizer,
+    # and a vision-language one beside its mmproj projector. The projector is
+    # charged here, BEFORE planning, so the planner, the fit and the decode
+    # prediction all see the weights that will actually be resident.
+    from control_plane.deploy.flags import VLLM_GGUF_SPECULATIVE_REFUSAL
+    from control_plane.resolver.gguf_names import is_hub_gguf_blob
+    from control_plane.resolver.types import MetadataUnavailable
+
+    gguf_base = gguf_projector = None
+    vllm_gguf = runtime == "vllm" and is_hub_gguf_blob(shape.model_id)
+    if vllm_gguf:
+        facts_for = getattr(ctx.deps.resolver, "gguf_launch_facts", None)
+        facts = None
+        if callable(facts_for):
+            try:
+                facts = await asyncio.to_thread(facts_for, shape.model_id)
+            except (ValueError, MetadataUnavailable):
+                # `supported_by` reports the same sentence as serve.allowed=false.
+                facts = None
+        if facts is not None:
+            gguf_base = facts.base
+            if facts.projector is not None:
+                if engine_options.language_model_only:
+                    raise ValueError(
+                        "Text only is not offered for a GGUF build on vllm: the "
+                        "plugin's text-only path has not been run here. Launch "
+                        "with the vision projector, or serve this file on llamacpp."
+                    )
+                gguf_projector = facts.projector
+                shape, weight_bytes = _with_gguf_projector(
+                    shape, weight_bytes, facts.projector_bytes
+                )
+                resolver_warnings.append(
+                    f"the vision projector {facts.projector} "
+                    f"({_gib(facts.projector_bytes)}) loads beside the GGUF and is "
+                    "charged as replicated weights"
+                )
+
     # Skipping the vision tower is sized BEFORE planning, so the planner, the
     # fit and the decode prediction all see the smaller shape.
     if engine_options.language_model_only:
         shape, weight_bytes = _without_vision(shape, weight_bytes)
+
+    # The tts server's codec is its biggest allocation and is sized BEFORE
+    # planning for the same reason. Only a resolution names the architecture;
+    # one the table has no row for is one the tts runtime does not load, and
+    # the support check below refuses it rather than this pricing a guess.
+    if runtime == "tts" and callable(resolve_full):
+        shape = _with_codec_working_set(shape, resolution.architectures)
+
+    # A packed KV layout is a kernel for one attention geometry; asked of the
+    # other one there is no page the gate could size honestly.
+    from control_plane.fit.kv import kv_dtype_refusal
+
+    kv_refusal = kv_dtype_refusal(shape, kv_dtype)
+    if kv_refusal is not None:
+        raise ValueError(kv_refusal)
 
     native_window = (
         getattr(resolution, "max_position_embeddings", None)
@@ -1709,27 +1998,18 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
             "checkpoint declares, and this one does not"
         )
     if speculative is not None:
+        if vllm_gguf:
+            raise ValueError(VLLM_GGUF_SPECULATIVE_REFUSAL)
         refusal = speculative_refusal(runtime, speculative.method.value)
         if refusal is not None:
             raise ValueError(refusal)
-
-    # Same question `create_deployment` asks before it will launch --
-    # asked here too so a dry run cannot say "fits, click Serve" about an
-    # architecture the runtime does not implement at all. Without this the
-    # fit box only learns the launch was hopeless from the 400 the click
-    # itself produces, and the Serve button never stops offering it.
-    runtime_supported_by = getattr(ctx.deps.resolver, "supported_by", None)
-    runtime_ok, runtime_unsupported_reason = True, None
-    if callable(runtime_supported_by):
-        runtime_ok, runtime_unsupported_reason = await asyncio.to_thread(
-            runtime_supported_by, shape, runtime
-        )
 
     try:
         nodes = [n.profile for n in ctx.deps.registry.healthy_nodes()]
     except Exception:
         log.exception("registry unavailable while planning")
         nodes = []
+    healthy = list(nodes)
 
     # Narrow here, before the link lookup, so `worst_all_reduce` measures
     # only the path this deployment will actually cross. Filtering later
@@ -1754,6 +2034,185 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
                 f"so the planner left {'it' if len(skipped) == 1 else 'them'} out."
             )
         nodes = runnable
+        # A host-pool runtime leaves out every machine `placement_refusal`
+        # refuses -- a unified-memory machine, or one whose host memory nothing
+        # has measured -- for the reason the arch filter above gives: handing
+        # the planner a node the named-machine path would refuse with 400
+        # plans a launch onto it. GPU runtimes keep their existing path, where
+        # `drop_unbudgetable` already removes a machine with nothing to spend.
+        from control_plane.deploy.flags import RUNTIMES as _RUNTIMES
+
+        if getattr(_RUNTIMES.get(runtime), "memory_pool", "gpu") == "host":
+            refused_here = {
+                n.node_id: r
+                for n in nodes
+                if (r := _placement_refusal(ctx.deps.registry, runtime, n.node_id, n))
+                is not None
+            }
+            if refused_here:
+                placement_warnings.append(
+                    f"{runtime} cannot be placed on "
+                    f"{', '.join(sorted(refused_here))}, so the planner left "
+                    f"{'it' if len(refused_here) == 1 else 'them'} out: "
+                    f"{next(iter(refused_here.values()))}"
+                )
+                nodes = [n for n in nodes if n.node_id not in refused_here]
+
+    # A vllm GGUF loads only where the image that machine will run carries
+    # vllm-gguf-plugin -- and the probe read ONE image, the coordinator's. A
+    # machine of another architecture runs a different image nobody asked.
+    if vllm_gguf:
+        from control_plane.deploy.flags import gguf_image_refusal
+
+        refused = {
+            n.node_id: r
+            for n in nodes
+            if (r := gguf_image_refusal(
+                runtime, shape.model_id, getattr(n, "arch", ""), [n.node_id]
+            )) is not None
+        }
+        if refused and requested_nodes is not None:
+            raise _PlacementRefused(
+                400,
+                next(iter(refused.values())),
+                "no_gguf_loader_for_architecture",
+                param=_PLACEMENT_PARAM,
+                extra={"unusable_node_ids": sorted(refused)},
+            )
+        if refused:
+            placement_warnings.append(
+                f"vllm cannot be shown to load a GGUF file on "
+                f"{', '.join(sorted(refused))}, so the planner left "
+                f"{'it' if len(refused) == 1 else 'them'} out: "
+                f"{next(iter(refused.values()))}"
+            )
+            nodes = [n for n in nodes if n.node_id not in refused]
+
+    # Whether the runtime loads this architecture, asked of the image EACH
+    # machine runs rather than of the default one: the 3090's vLLM 0.31.0
+    # registers architectures the Spark's 0.28.1 does not, and the reverse.
+    # The same verdict `create_deployment` launches on (it rides the outcome),
+    # so a dry run cannot say "fits, click Serve" about an architecture the
+    # placed machines cannot load -- and cannot refuse one they can.
+    runtime_ok, runtime_unsupported_reason = True, None
+    runtime_supported_by = getattr(ctx.deps.resolver, "supported_by", None)
+    if callable(runtime_supported_by) and not nodes:
+        runtime_ok, runtime_unsupported_reason = await asyncio.to_thread(
+            runtime_supported_by, shape, runtime
+        )
+    elif callable(runtime_supported_by):
+        verdicts = await _support_per_node(ctx.deps.resolver, shape, runtime, nodes)
+        unsupported = {nid: why for nid, (ok, why) in verdicts.items() if not ok}
+        if unsupported and requested_nodes is None and len(unsupported) < len(nodes):
+            placement_warnings.append(
+                f"{runtime} cannot load this model on "
+                f"{', '.join(sorted(unsupported))}, so the planner left "
+                f"{'it' if len(unsupported) == 1 else 'them'} out: "
+                f"{next(iter(unsupported.values()))}"
+            )
+            nodes = [n for n in nodes if n.node_id not in unsupported]
+        elif unsupported:
+            elsewhere: list[str] = []
+            if requested_nodes is not None:
+                from control_plane.deploy.flags import arch_refusal
+
+                others = [
+                    n for n in healthy
+                    if n.node_id not in verdicts
+                    and arch_refusal(runtime, n.node_id, getattr(n, "arch", "")) is None
+                ]
+                elsewhere = sorted(
+                    nid
+                    for nid, (ok, _) in (
+                        await _support_per_node(ctx.deps.resolver, shape, runtime, others)
+                    ).items()
+                    if ok
+                )
+            if requested_nodes is not None and (elsewhere or len(unsupported) < len(nodes)):
+                # A named machine whose image cannot load it while another
+                # machine's can: the machine is what to change, so it is
+                # named, with its own code -- not the "nothing here loads
+                # this" verdict below, which no choice of machine unblocks.
+                first = next(iter(unsupported))
+                usable = elsewhere or sorted(set(verdicts) - set(unsupported))
+                raise _PlacementRefused(
+                    400,
+                    f"On '{first}': {unsupported[first]}. "
+                    f"{', '.join(usable)} run{'s' if len(usable) == 1 else ''} an "
+                    f"image that loads it.",
+                    "runtime_unsupported_on_machine",
+                    param=_PLACEMENT_PARAM,
+                    extra={"unusable_node_ids": sorted(unsupported)},
+                )
+            runtime_ok, runtime_unsupported_reason = False, next(iter(unsupported.values()))
+
+    # The GPU in each machine, asked of the image it runs: vLLM's own floor
+    # for the checkpoint's quantization method and the KV widths its attention
+    # selector has a kernel for (`support.silicon_check`). A named machine
+    # that cannot is a 400 naming it; the planner's own pick leaves it out --
+    # unless no machine can, which is a 400 too, because nothing is left to
+    # plan on and every machine got the same answer.
+    quant_method = ""
+    if nodes:
+        from control_plane.deploy.flags import render_kv_cache_dtype, render_quantization
+
+        quant_method = (
+            str(getattr(resolution, "quant_method", "") or "")
+            if callable(resolve_full)
+            else ""
+        )
+        kv_cache_dtype = None
+        if runtime == "vllm":
+            # A forced scheme is what the loader will be told; `quantization_refusal`
+            # answers for one this build cannot render.
+            try:
+                quant_method = (render_quantization(dtype) if dtype else None) or quant_method
+            except ValueError:
+                pass
+            # The probe asked the selector about ordinary attention only, so an
+            # MLA model's cache is not judged: no evidence is no refusal.
+            if not getattr(shape, "mla_latent_dim", 0):
+                try:
+                    kv_cache_dtype = render_kv_cache_dtype(kv_dtype)
+                except ValueError:
+                    kv_cache_dtype = None
+        silicon_refused, silicon_notes = _silicon_per_node(
+            runtime,
+            nodes,
+            dtype=shape.dtype,
+            quant_method=quant_method,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_label=kv_dtype,
+        )
+        if silicon_refused and (
+            requested_nodes is not None or len(silicon_refused) == len(nodes)
+        ):
+            raise _PlacementRefused(
+                400,
+                next(iter(silicon_refused.values())),
+                "unsupported_on_this_gpu",
+                param=_PLACEMENT_PARAM if requested_nodes is not None else None,
+                extra={"unusable_node_ids": sorted(silicon_refused)},
+            )
+        if silicon_refused:
+            placement_warnings.append(
+                f"{', '.join(sorted(silicon_refused))} cannot run this on "
+                f"{'its' if len(silicon_refused) == 1 else 'their'} GPU, so the "
+                f"planner left {'it' if len(silicon_refused) == 1 else 'them'} "
+                f"out: {next(iter(silicon_refused.values()))}"
+            )
+            nodes = [n for n in nodes if n.node_id not in silicon_refused]
+        for node in nodes:
+            placement_warnings.extend(silicon_notes.get(node.node_id, ()))
+
+    # The machines as this runtime's budget sees them. For a host-pool runtime
+    # on a discrete box that is the box without its card (`flags.budget_profile`),
+    # so the planner and the fit gate below never size a host-RAM launch
+    # against VRAM. Applied after every placement check above, which judge the
+    # real hardware.
+    from control_plane.deploy.flags import budget_profile
+
+    nodes = [budget_profile(runtime, n) for n in nodes]
 
     link = None
     if len(nodes) > 1:
@@ -1846,6 +2305,17 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     _check_every_node_used(plan, nodes, requested_nodes, requested_degrees)
 
     plan_nodes = [n for n in nodes if n.node_id in set(plan.node_ids)] or nodes
+    # The recipe clears /dev/infiniband for every host when any one of them
+    # lacks it (`recipes.synthesize`), so a multi-node plan across such a
+    # machine runs NCCL over TCP. Same predicate as the recipe's, said here.
+    from control_plane.deploy.recipes import tcp_fabric_note
+
+    if len(plan.node_ids) > 1 and (
+        fabric_note := tcp_fabric_note(
+            [n for n in nodes if n.node_id in set(plan.node_ids)]
+        )
+    ):
+        placement_warnings.append(fabric_note)
 
     # The live budget. Two checks, not one widened verdict: the breakdown
     # is identical under both budgets and only the budget-dependent terms
@@ -1856,8 +2326,15 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     # named is derived against this budget: choosing it off the static
     # ceiling would offer a window the machine cannot actually hold right
     # now, which is the whole reason the live budget exists.
+    #
+    # In the runtime's own pool: host RAM for llamacpp, so a discrete box is
+    # budgeted from MemAvailable rather than from its card.
+    from control_plane.deploy.flags import RUNTIMES as _RUNTIMES
+
     budgets, excluded, live_reason = livefit.allocatable_map(
-        ctx.deps.registry, [n.node_id for n in plan_nodes]
+        ctx.deps.registry,
+        [n.node_id for n in plan_nodes],
+        pool=getattr(_RUNTIMES.get(runtime), "memory_pool", "gpu"),
     )
     budgets, zero_excluded = livefit.drop_unbudgetable(plan_nodes, budgets)
     excluded = excluded + zero_excluded
@@ -1872,6 +2349,19 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
     # to yet would demand machines to serve a batch that was never requested,
     # and could refuse a launch that fits. This way the batch is whatever the
     # chosen plan has room for.
+    # What the gate charges besides the cache. The derivations below must see
+    # it too, or they choose a batch and a window the check right after them
+    # refuses -- an image cache set in Advanced made the derived defaults
+    # themselves "Won't fit".
+    chunk_tokens = engine_options.max_num_batched_tokens
+    extra_replicated_bytes = (
+        int(engine_options.mm_processor_cache_gb * 2**30)
+        if engine_options.mm_processor_cache_gb
+        else 0
+    )
+    # What the planner was asked, before the two derivations below replace
+    # the figures it never saw.
+    asked = (context_length, concurrency)
     if concurrency is None:
         concurrency = await asyncio.to_thread(
             partial(
@@ -1892,6 +2382,9 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
                 ),
                 weight_bytes=weight_bytes,
                 allocatable=budgets or None,
+                speculative=speculative,
+                chunk_tokens=chunk_tokens,
+                extra_replicated_bytes=extra_replicated_bytes,
             )
         )
 
@@ -1909,8 +2402,71 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
                 allocatable=budgets or None,
                 native_window=native_window,
                 speculative=speculative,
+                chunk_tokens=chunk_tokens,
+                extra_replicated_bytes=extra_replicated_bytes,
             )
         )
+
+    # The planner's sentence is rendered verbatim beside the verdict, and it
+    # states the context and concurrency it was asked at. Until 2026-11-23 that
+    # was the provisional pair above -- its own default context and a batch of
+    # 1 -- so "How it is split" said "at 32768 context and concurrency 1"
+    # under a verdict taken at 40960 and 16. Ask again at the derived pair.
+    # The same placement is adopted whole; a different one is not, because the
+    # derivations were made against THIS plan's machines -- that plan is
+    # restated at its own degrees instead (`plan_for`), and the recommendation
+    # with it, so whatever is on screen describes the question answered.
+    if asked != (context_length, concurrency):
+        window = (
+            getattr(speculative, "num_speculative_tokens", 0) + 1
+            if speculative is not None
+            else 1
+        )
+        restated = await asyncio.to_thread(
+            partial(
+                _rank_plans,
+                ctx.deps.planner,
+                shape,
+                nodes,
+                link,
+                target,
+                concurrency,
+                context_length=context_length,
+                kv_dtype=kv_dtype,
+                allow_mixed_hardware=pool,
+                speculative_window=window,
+            )
+        )
+        if requested_degrees is None and restated and _same_placement(restated[0], plan):
+            ranked, recommended, plan = restated, restated[0], restated[0]
+        else:
+            plan_for = getattr(ctx.deps.planner, "plan_for", None)
+            if callable(plan_for):
+                try:
+                    again = await asyncio.to_thread(
+                        partial(
+                            plan_for,
+                            shape,
+                            nodes if requested_degrees is not None else plan_nodes,
+                            link,
+                            target,
+                            concurrency,
+                            context_length=context_length,
+                            kv_dtype=kv_dtype,
+                            tensor_parallel=plan.tensor_parallel,
+                            pipeline_parallel=plan.pipeline_parallel,
+                            expert_parallel=plan.expert_parallel,
+                            data_parallel=plan.data_parallel,
+                        )
+                    )
+                except (IllegalDegrees, ValueError):
+                    again = None
+                if again is not None and _same_placement(again, plan):
+                    plan = again
+                    if requested_degrees is None:
+                        recommended = again
+                    elif restated:
+                        ranked, recommended = restated, restated[0]
 
     req = FitRequest(
         shape=shape,
@@ -1921,12 +2477,8 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         weight_bytes=weight_bytes,
         native_window=native_window,
         speculative=speculative,
-        chunk_tokens=engine_options.max_num_batched_tokens,
-        extra_replicated_bytes=(
-            int(engine_options.mm_processor_cache_gb * 2**30)
-            if engine_options.mm_processor_cache_gb
-            else 0
-        ),
+        chunk_tokens=chunk_tokens,
+        extra_replicated_bytes=extra_replicated_bytes,
     )
 
     fit, fit_live, unavailable = await asyncio.to_thread(
@@ -1999,10 +2551,15 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         speculative_options, shape.model_id, plan_nodes
     )
 
+    kv_dtype_ratios = _kv_dtype_ratios(shape, runtime, plan_nodes, quant_method)
+
     return _PlanOutcome(
         shape=shape,
         plan=plan,
-        measured_decode=_measured_decode(shape.model_id, plan_nodes, context_length),
+        measured_decode=_measured_decode(
+            shape.model_id, plan_nodes, context_length, plan, runtime
+        ),
+        fit_request=req,
         fit=fit,
         fit_live=fit_live,
         capacity=capacity,
@@ -2019,11 +2576,16 @@ async def _plan_and_fit(ctx: GatewayContext, payload: dict):
         speculative_options=speculative_options,
         speculative=speculative,
         kv_dtype=kv_dtype,
+        kv_dtype_ratios=kv_dtype_ratios,
         quantization=dtype,
         revision=(getattr(resolution, "revision", None) if callable(resolve_full) else None),
         engine_options=engine_options,
         original_window=original_window,
         native_window=native_window,
+        gguf_base=gguf_base,
+        gguf_projector=gguf_projector,
+        runtime_supported=runtime_ok,
+        runtime_unsupported_reason=runtime_unsupported_reason,
     )
 
 
@@ -3159,36 +3721,26 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         return provider
 
     def _key_state(provider_id: str) -> dict | None:
-        """Whether this provider's credential resolves, from where, and what
-        the last key check found.
+        """Whether this provider's credential resolves, and from where.
 
         Optional like every other port method reached through ``getattr`` in
-        this module: a store that never grew ``key_status`` or ``key_health``
-        leaves those fields null, and the listing they ride on still answers.
-        Null is not "no key" -- the UI says so in as many words, because a
-        Settings screen that reports a missing key on a working provider is
-        worse than one that admits it does not know.
+        this module: a store that never grew ``key_status`` leaves the two
+        fields null, and the listing they ride on still answers. Null is not
+        "no key" -- the UI says so in as many words, because a Settings screen
+        that reports a missing key on a working provider is worse than one
+        that admits it does not know.
 
         Nothing here is key material and nothing here could be: the result is
-        a state word, the name of a place, a check verdict and an expiry time,
-        never a value.
+        a state word and the name of a place, never a value.
         """
         status = getattr(ctx.deps.providers, "key_status", None)
-        health = getattr(ctx.deps.providers, "key_health", None)
-        if not callable(status) and not callable(health):
+        if not callable(status):
             return None
-        result: dict = {}
-        if callable(status):
-            try:
-                result.update(status(provider_id))
-            except Exception:
-                log.exception("provider key status failed")
-        if callable(health):
-            try:
-                result.update(health(provider_id))
-            except Exception:
-                log.exception("provider key health failed")
-        return result
+        try:
+            return status(provider_id)
+        except Exception:
+            log.exception("provider key status failed")
+            return None
 
     def _sign_in_account(provider_id: str) -> str | None:
         """The account a sign-in provider is signed in as. Optional like ``_key_state``."""
@@ -3365,15 +3917,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 400, f"Could not update provider. {errors.detail(exc, _redactor())}",
                 "invalid_request_error", "provider_update_failed",
             )
-        if "api_key" in patch or "api_key_ref" in patch:
-            # Say whether the new key works in the same answer, rather than
-            # leaving the row on "not checked yet" until somebody presses.
-            check_key_async = getattr(ctx.deps.providers, "check_key_async", None)
-            if callable(check_key_async):
-                try:
-                    provider = await check_key_async(provider_id)
-                except Exception:
-                    log.exception("key check after key change failed")
         ctx.router.rebuild(force_scores=True)
         audit_request(
             request, AuditAction.PROVIDER_UPDATED, "provider", provider_id,
@@ -3988,37 +4531,6 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
         )
 
-    @router.post("/api/providers/{provider_id}/key-check")
-    async def check_provider_key(provider_id: str) -> Response:
-        """Ask the upstream whether this provider's key works right now."""
-        check = getattr(ctx.deps.providers, "check_key_async", None)
-        if not callable(check):
-            return _not_implemented("Provider key check", "provider store")
-        try:
-            provider = await check(provider_id)
-        except UnknownProviderError:
-            return errors.error_response(
-                404, f"No provider '{provider_id}'.",
-                "invalid_request_error", "provider_not_found",
-            )
-        except Exception as exc:
-            log.exception("provider key check failed")
-            return errors.error_response(
-                502, f"Key check failed. {errors.detail(exc, _redactor())}",
-                "server_error", "key_check_failed",
-            )
-        ctx.router.rebuild(force_scores=True)
-        spend = ui_detail.provider_spend(ctx.deps.providers)
-        return JSONResponse(
-            serialize.provider_payload(
-                _served_view(ctx.deps.providers, provider),
-                spend.get(provider.provider_id),
-                _key_state(provider.provider_id),
-                sign_in_account=_sign_in_account(provider.provider_id),
-                pins=_backend_pins(provider.provider_id),
-            )
-        )
-
     @router.get("/api/providers/{provider_id}/models")
     async def provider_models(provider_id: str) -> Response:
         """The whole catalogue, each model saying whether it is switched on.
@@ -4266,6 +4778,38 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             headers={"cache-control": "private, max-age=86400"},
         )
 
+    @router.get("/api/map/tiles/{z}/{x}/{y}")
+    async def map_tile(z: int, x: int, y: int) -> Response:
+        """One OpenStreetMap tile for the request map, same-origin.
+
+        Fetched from OSM once and kept under ``data_dir()/tiles``, so the CSP
+        never names a third-party image host and OSM is asked once per tile
+        rather than once per page load (gateway/tiles.py)."""
+        from . import tiles
+
+        if not tiles.valid(z, x, y):
+            return errors.error_response(
+                404,
+                f"No tile at z={z} x={x} y={y}: zoom {tiles.MIN_ZOOM}-{tiles.MAX_ZOOM} only.",
+                "invalid_request_error", "tile_out_of_range",
+            )
+        try:
+            body = await tiles.tile(z, x, y)
+        except Exception as exc:
+            return errors.error_response(
+                502, f"Tile fetch failed: {exc}", "server_error", "tile_upstream_failed"
+            )
+        if body is None:
+            return errors.error_response(
+                404, f"OpenStreetMap has no tile at z={z} x={x} y={y}.",
+                "invalid_request_error", "tile_not_found",
+            )
+        return Response(
+            body,
+            media_type="image/png",
+            headers={"cache-control": "private, max-age=604800"},
+        )
+
     # -- plan and deployments ---------------------------------------------
 
     #: Resolver failures are not all the same failure, and a blanket 502 tells
@@ -4394,6 +4938,15 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 # on) and the trained one, so the UI can offer YaRN.
                 "native_window": out.native_window,
                 "original_window": out.original_window,
+                # What a vllm launch of a hub GGUF loads beside it.
+                "gguf_base": out.gguf_base,
+                "gguf_projector": out.gguf_projector,
+                # Cache bytes per token at each KV width this image takes,
+                # over this model's 16-bit rate. Per model, because a packed
+                # layout's overhead depends on head_dim and its boundary
+                # layers on the layer count. A width refused for this
+                # geometry, runtime or plan's machines is absent.
+                "kv_dtype_ratios": out.kv_dtype_ratios,
                 # Whose choice the machines and the degrees were.
                 "placement": out.placement,
                 "degrees": out.degrees,
@@ -4506,6 +5059,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                         if out.engine_options.rope_factor is not None
                         else None
                     ),
+                    **({"gguf_base": out.gguf_base, "gguf_projector": out.gguf_projector}
+                       if out.gguf_base else {}),
                     **options,
                 )
             )
@@ -4518,7 +5073,8 @@ def create_router(ctx: GatewayContext) -> APIRouter:
     @router.post("/api/plan/concurrency")
     async def plan_concurrency(request: Request) -> Response:
         """How many users a plan holds before its KV cache is full, and the
-        per-user decode ceiling memory bandwidth allows at each count."""
+        per-user decode ceiling at each count: the fit gate's own decode step,
+        bound by memory bandwidth and, where measured, by the matrix rate."""
         payload = await _read_plan_body(request)
         if isinstance(payload, Response):
             return payload
@@ -4544,11 +5100,18 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         }
 
         from control_plane import computeprobe, measurements
-        from control_plane.fit.calculator import bandwidth_ceiling_tps, prefill_floor_seconds
-        from control_plane.fit.kv import kv_cache_bytes, kv_divisor
+        from control_plane.deploy.flags import budget_profile
+        from control_plane.fit.calculator import prefill_floor_seconds
+        from control_plane.fit.kv import cache_bytes_per_rank
 
+        # The machines as the runtime sees them, like the plan: a llamacpp
+        # launch decodes from host RAM, never at the card's bandwidth.
+        runtime = base.get("runtime") or "vllm"
         try:
-            profiles = [n.profile for n in ctx.deps.registry.healthy_nodes()]
+            profiles = [
+                budget_profile(runtime, n.profile)
+                for n in ctx.deps.registry.healthy_nodes()
+            ]
         except Exception:
             log.exception("registry unavailable while sizing concurrency")
             profiles = []
@@ -4576,13 +5139,11 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 basis = "live"
             shape, plan = out.shape, out.plan
             used = set(plan.node_ids)
-            rates = [
-                p.memory_bandwidth_gbps for p in profiles if p.node_id in used
-            ]
+            plan_profiles = [p for p in profiles if p.node_id in used]
+            rates = [p.memory_bandwidth_gbps for p in plan_profiles]
             bw = min(rates) if rates else 0.0
             bandwidth = bw if bandwidth is None else min(bandwidth, bw)
-            kv_read = kv_cache_bytes(shape, context, 1, out.kv_dtype)
-            kv_seq = kv_read / kv_divisor(shape, plan)
+            kv_seq = cache_bytes_per_rank(shape, plan, context, 1, out.kv_dtype)
             fixed = fit.breakdown.total - fit.breakdown.kv_cache
             if kv_seq > 0:
                 wall = max(0, int((fit.usable_per_node - fixed) // kv_seq))
@@ -4618,8 +5179,19 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
             points = []
             for u in sorted(users):
+                # The card's own computation at `u` users -- same request, same
+                # links, same calibration -- so at one user it IS the card's
+                # number. The matrix rate only binds once enough users share a
+                # weight read: at one user decode does about one FLOP per byte.
                 each = (
-                    bandwidth_ceiling_tps(shape, bw, kv_read, u) if bw > 0 else None
+                    ctx.deps.fit.decode_tps_each(
+                        out.fit_request,
+                        plan_profiles,
+                        u,
+                        tflops=compute.tflops if compute is not None else None,
+                    )
+                    if out.fit_request is not None and plan_profiles
+                    else None
                 )
                 points.append(
                     {
@@ -4650,7 +5222,13 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                 "bandwidth_gbps": bandwidth if bandwidth else None,
                 "basis": basis,
                 "caveat": (
-                    "A ceiling from memory bandwidth alone. Past a few users "
+                    "A ceiling: the slower of memory bandwidth and the matrix "
+                    "rate measured on this machine, plus interconnect time for "
+                    "a plan across nodes. Attention, scheduling and batching "
+                    "overheads make real decode slower; run a benchmark for "
+                    "real numbers."
+                    if compute is not None
+                    else "A ceiling from memory bandwidth alone. Past a few users "
                     "decode becomes compute-bound and runs slower than this; "
                     "derate has not measured where that starts on this "
                     "hardware. Run a benchmark for real numbers."
@@ -4939,29 +5517,7 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             render_quantization,
         )
 
-        # Unlike the two above, this one IS a fit-gate input -- `_plan_and_fit`
-        # reads it and sizes the cache with it. Validated here anyway, before
-        # a resolve and a planner search are spent on a width the launch will
-        # have to refuse. Only a dtype the caller NAMED is checked: the
-        # settings default is resolved in `_plan_and_fit` and nowhere else, so
-        # there is no second copy of it here to drift.
-        raw_kv_dtype = payload.get("kv_dtype") if isinstance(payload, dict) else None
-        if raw_kv_dtype is not None:
-            if not isinstance(raw_kv_dtype, str):
-                return errors.error_response(
-                    400,
-                    "kv_dtype must be a string naming a KV cache element width.",
-                    "invalid_request_error",
-                    "invalid_request",
-                )
-            try:
-                render_kv_cache_dtype(raw_kv_dtype)
-            except ValueError as exc:
-                return errors.error_response(
-                    400, str(exc), "invalid_request_error", "invalid_request"
-                )
-
-        # A FIT-GATE input, like kv_dtype above and heavier: `_plan_and_fit`
+        # A FIT-GATE input, heavier than kv_dtype: `_plan_and_fit`
         # passes it to the resolver as a dtype override, so every weight
         # figure in the verdict the caller is about to be shown is computed at
         # this scheme. Validated here so a scheme this build cannot request
@@ -5007,13 +5563,19 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
 
         runtime = payload.get("runtime") or "vllm"
-        supported_by = getattr(ctx.deps.resolver, "supported_by", None)
-        if callable(supported_by):
-            ok, reason = await asyncio.to_thread(supported_by, shape, runtime)
-            if not ok:
-                return errors.error_response(
-                    400, reason, "invalid_request_error", "runtime_unsupported"
-                )
+        # The verdict `_plan_and_fit` reached on the machines it placed this
+        # on, each judged by the image it runs -- along with the GPU check,
+        # which refused there or left a machine out. Not asked again here:
+        # `supported_by` without the machines answers for the default image,
+        # and would refuse an architecture only the placed machine's image
+        # loads.
+        if not out.runtime_supported:
+            return errors.error_response(
+                400,
+                out.runtime_unsupported_reason or f"{runtime} cannot load this model",
+                "invalid_request_error",
+                "runtime_unsupported",
+            )
 
         # A shape the launcher cannot start, ahead of the runtime question
         # because it is the more specific one: vLLM shards fine, and this is
@@ -5052,7 +5614,27 @@ def create_router(ctx: GatewayContext) -> APIRouter:
             )
 
         # If the verdict is WONT_FIT the launch is refused with the reason.
-        # Nothing is started.
+        # Nothing is started. For a host-pool runtime (llamacpp) the LIVE
+        # verdict is that verdict: its static budget is 0 by design -- there
+        # is no host-RAM nameplate, see `flags.budget_profile` -- so judging it
+        # statically refused every llamacpp launch everywhere, a Pi and the
+        # RTX box alike, while /api/plan (which reads the live one) said fits.
+        from control_plane.deploy.flags import runtime_spec
+
+        host_pool = runtime_spec(runtime).memory_pool == "host"
+        if host_pool and out.fit_live is None:
+            return errors.error_response(
+                400,
+                f"{runtime} serves from host memory, and there is no live reading "
+                f"of host memory on {', '.join(plan.node_ids) or 'these machines'}. "
+                f"derate never invents a host budget: wait for the next sample, "
+                f"and make sure the machine's agent is current (an agent older "
+                f"than host-pool budgeting does not report host memory).",
+                "invalid_request_error",
+                "host_memory_unmeasured",
+            )
+        if host_pool:
+            fit = out.fit_live
         if fit.verdict is Verdict.WONT_FIT:
             return JSONResponse(
                 status_code=400,
@@ -5122,7 +5704,10 @@ def create_router(ctx: GatewayContext) -> APIRouter:
         # above distinguishable from this.
         live = out.fit_live
         allow_over = bool(payload.get(_OVERRIDE_PARAM))
-        if live is not None and live.verdict is Verdict.WONT_FIT and not allow_over:
+        if (
+            live is not None and live.verdict is Verdict.WONT_FIT and not allow_over
+            and not host_pool
+        ):
             return JSONResponse(
                 status_code=409,
                 content={
@@ -5302,6 +5887,9 @@ def create_router(ctx: GatewayContext) -> APIRouter:
                     ),
                     # Same spread: a port that predates lifecycle keeps working.
                     **({"lifecycle": lifecycle} if lifecycle != Lifecycle() else {}),
+                    # Only sent when set: what a vllm GGUF loads beside it.
+                    **({"gguf_base": out.gguf_base, "gguf_projector": out.gguf_projector}
+                       if out.gguf_base else {}),
                 )
             )
         except ValueError as exc:
@@ -5382,22 +5970,24 @@ def create_router(ctx: GatewayContext) -> APIRouter:
 
     # -- Benchmarks (gateway/bench.py): a throwaway copy, measured, stopped. --
 
-    def _bench_describe(node_ids: list[str]) -> tuple[str | None, str | None]:
-        gpu = None
+    def _bench_describe(
+        node_ids: list[str], runtime: str
+    ) -> tuple[str | None, str | None]:
+        """The GPU and image version of the machine the benchmark ran on --
+        the version of the image THAT machine runs for *runtime*, never the
+        default image's. None when that image has no probe."""
+        from control_plane import measurements
+
         for node_id in node_ids:
             node = ctx.deps.registry.get_node(node_id)
-            hw = getattr(node, "hardware", node)
-            gpu = getattr(hw, "gpu_name", None) or gpu
+            profile = getattr(node, "profile", None)
+            gpu = getattr(profile, "gpu_name", None)
             if gpu:
-                break
-        try:
-            from control_plane.resolver import support
-
-            probed = support.probed("vllm")
-            version = getattr(probed, "version", None) if probed else None
-        except Exception:
-            version = None
-        return gpu, version
+                version = measurements.image_version(
+                    runtime, getattr(profile, "arch", "") or ""
+                )
+                return gpu, version or None
+        return None, None
 
     def _bench_done(record) -> None:
         """A finished benchmark is the result of every profile with its setup."""

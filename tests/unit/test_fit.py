@@ -8,16 +8,19 @@ checks the verdict is not testing the product.
 from __future__ import annotations
 
 import dataclasses
-import math
 
 import pytest
 
 from control_plane.fit.constants import DECODE_EFFICIENCY, DECODE_EFFICIENCY_BEST
+from control_plane.fit.calculator import DecodeSample, decode_step
+from control_plane.fit.kv import kv_read_bytes
+from control_plane.planner import comm
 from control_plane.contracts import (
     COMM_BUFFER_BYTES,
     DEGRADED_TPS_THRESHOLD,
     EP_EXTRA_BUFFER_BYTES,
     FRAMEWORK_OVERHEAD,
+    UNMEASURED_COLLECTIVE_LATENCY_US,
     FitRequest,
     ModelShape,
     ParallelismKind,
@@ -40,6 +43,7 @@ from control_plane.fit import (
 from tests.fixtures import (
     DEEPSEEK_V3,
     GPT_OSS_120B,
+    LINK_SPARK_FAST,
     LLAMA_3_3_70B,
     QWEN3_30B_A3B,
     SPARK_01,
@@ -123,7 +127,6 @@ def test_llama70b_fp8_one_spark_fits_but_degraded(fit):
     assert result.predicted_decode_tps < DEGRADED_TPS_THRESHOLD
     assert result.limiting_term == "bandwidth"
     assert "bandwidth bound" in result.reason.lower()
-    assert "adding nodes will not fix" in result.reason.lower()
 
 
 def test_gpt_oss_120b_fits_one_spark_and_is_fast(fit):
@@ -170,6 +173,63 @@ def test_sliding_window_is_below_the_naive_full_cache():
     expected_ratio = (18 * context + 18 * 128) / (36 * context)
     assert windowed / naive_full == pytest.approx(expected_ratio)
     assert windowed / naive_full < 0.51
+
+
+# Qwen3.8-27B as the resolver reads it: 48 of 64 layers Gated DeltaNet, the
+# state per sequence the pinned vLLM image computes (3,207,168 B a layer).
+QWEN3_8_27B = ModelShape(
+    model_id="Qwen/Qwen3.8-27B",
+    num_layers=64,
+    hidden_size=5120,
+    num_attention_heads=24,
+    num_kv_heads=4,
+    vocab_size=248320,
+    total_params=26_895_998_464,
+    dtype="bf16",
+    head_dim=256,
+    attention_free_layers=48,
+    recurrent_state_bytes=153_944_064,
+)
+
+
+def test_a_recurrent_layer_is_charged_per_sequence_never_per_token():
+    """Only the 16 attention layers grow with the context. The 48 linear ones
+    hold the same state at 512 tokens as at 128k -- two copies per sequence,
+    the pair the image reserves under prefix caching."""
+    per_token_16 = 2 * 4 * 256 * 2 * 16
+    one = kv_cache_bytes(QWEN3_8_27B, 4096, 1, "bf16")
+    assert one == per_token_16 * 4096 + 2 * 153_944_064
+    # More context costs attention only; more sequences cost both.
+    assert kv_cache_bytes(QWEN3_8_27B, 8192, 1, "bf16") - one == per_token_16 * 4096
+    assert kv_cache_bytes(QWEN3_8_27B, 4096, 12, "bf16") == 12 * one
+    assert kv_bytes_per_token(QWEN3_8_27B, "bf16") == per_token_16
+
+
+def test_the_recurrent_state_shards_past_the_kv_head_count():
+    """At TP=8 the 4 KV heads replicate, so attention splits 4 ways -- but the
+    image divides the 48 recurrent heads by the full degree."""
+    from control_plane.fit.kv import attention_cache_bytes, cache_bytes_per_rank
+
+    plan = make_plan(tp=8, node_ids=tuple(f"n{i}" for i in range(8)))
+    per_rank = cache_bytes_per_rank(QWEN3_8_27B, plan, 4096, 1, "bf16")
+    assert per_rank == pytest.approx(
+        attention_cache_bytes(QWEN3_8_27B, 4096, 1, "bf16") / 4 + 2 * 153_944_064 / 8
+    )
+
+
+def test_a_drafted_token_holds_a_recurrent_state_slot():
+    """`num_speculative_blocks`: the image keeps one state per drafted token
+    on every recurrent layer, on top of the two every sequence holds."""
+    from control_plane.contracts.plan import SpeculativeMethod, SpeculativeSpec
+    from control_plane.fit.calculator import speculative_kv_bytes_per_rank
+
+    spec = SpeculativeSpec(
+        method=SpeculativeMethod.MTP, num_speculative_tokens=3, draft_bytes=0, draft_params=0
+    )
+    charged = speculative_kv_bytes_per_rank(
+        QWEN3_8_27B, make_plan(), 2, "bf16", spec, context=4096
+    )
+    assert charged == 3 * 2 * (kv_bytes_per_token(QWEN3_8_27B, "bf16") + 153_944_064)
 
 
 def test_mla_kv_is_an_order_of_magnitude_below_the_head_wise_equivalent():
@@ -667,6 +727,106 @@ def test_logits_are_charged_per_emitted_token_not_per_context():
     doubled = activation_bytes(GPT_OSS_120B, max_seqs=32, context=2048)
     assert doubled > long
     assert doubled - long == GPT_OSS_120B.vocab_size * 16 * 4
+
+
+# --------------------------------------------------------------------------
+# the tts runtime's codec working set
+# --------------------------------------------------------------------------
+
+#: Audio8/Audio8-TTS-Preview-0.6b as the resolver reads it, and the weight
+#: index it measures.
+AUDIO8_TTS = ModelShape(
+    model_id="Audio8/Audio8-TTS-Preview-0.6b",
+    num_layers=24,
+    hidden_size=896,
+    num_attention_heads=14,
+    num_kv_heads=2,
+    vocab_size=155776,
+    total_params=601159424,
+    dtype="bf16",
+    head_dim=64,
+    decode_read_params=601159424,
+)
+AUDIO8_WEIGHT_BYTES = 1_202_342_528
+
+#: Peak RESERVED bytes per synthesis by generated frames, measured 2026-11-21 on
+#: an RTX 3090 (derate/tts:amd64, SpeechEngine as served). Load alone reserves
+#: 1,933,574,144. The allocator cap is a fraction of this card's torch total.
+AUDIO8_PEAK_RESERVED = {
+    64: 2_239_758_336,
+    128: 2_487_222_272,
+    256: 3_227_516_928,
+    512: 4_422_893_568,
+    768: 5_557_452_800,
+    1024: 6_759_120_896,
+}
+RTX_3090_TORCH_TOTAL = 25_283_526_656  # 23.55 GiB
+
+
+def _priced_tts_shape() -> ModelShape:
+    from control_plane.resolver.support import speech_working_set
+
+    found = speech_working_set(("ArkttsModel",))
+    assert found is not None
+    return dataclasses.replace(
+        AUDIO8_TTS,
+        codec_resident_bytes=found.resident_bytes,
+        codec_bytes_per_frame=found.bytes_per_frame,
+    )
+
+
+def test_the_tts_breakdown_charges_the_codec_in_activations():
+    shape = _priced_tts_shape()
+    plain = activation_bytes(AUDIO8_TTS, max_seqs=1, context=512)
+    priced = activation_bytes(shape, max_seqs=1, context=512)
+    assert priced - plain == shape.codec_resident_bytes + 512 * shape.codec_bytes_per_frame
+    # One clip at a time under the server's lock: concurrency does not
+    # multiply it, the window does.
+    assert activation_bytes(shape, 8, 512) - activation_bytes(AUDIO8_TTS, 8, 512) == (
+        priced - plain
+    )
+    breakdown, warnings = memory_breakdown(
+        shape, make_plan(), 512, 1, "fp16", weight_bytes=AUDIO8_WEIGHT_BYTES
+    )
+    assert breakdown.activations == int(priced)
+    assert any("speech codec" in w for w in warnings)
+
+
+@pytest.mark.parametrize("frames", sorted(AUDIO8_PEAK_RESERVED))
+def test_the_tts_allocator_cap_covers_the_measured_peak(fit, frames):
+    """The launch caps the server's allocator at `utilization_for` of the
+    gate's total. With the codec unpriced that was 2.35 GiB on this card and
+    every synthesis died in the codec at 4.4 GB."""
+    from control_plane.deploy.utilization import utilization_for
+
+    peak = AUDIO8_PEAK_RESERVED[frames]
+    req = dataclasses.replace(
+        request(_priced_tts_shape(), context=frames, seqs=1, kv_dtype="fp16"),
+        weight_bytes=AUDIO8_WEIGHT_BYTES,
+    )
+    for node, device_total in (
+        (WS_3090, RTX_3090_TORCH_TOTAL),
+        (SPARK_01, SPARK_01.total_memory),
+    ):
+        result = fit.check(req, [node])
+        assert result.ok, result.reason
+        share = utilization_for(
+            needed_bytes=result.breakdown.total, device_total_bytes=device_total
+        )
+        assert share * device_total >= peak, (node.node_id, share)
+
+
+def test_a_tts_refusal_offers_a_shorter_window(fit):
+    small = dataclasses.replace(WS_3090, addressable_memory=6 * GIB)
+    req = dataclasses.replace(
+        request(_priced_tts_shape(), context=2048, seqs=1, kv_dtype="fp16"),
+        weight_bytes=AUDIO8_WEIGHT_BYTES,
+    )
+    result = fit.check(req, [small])
+    assert result.verdict is Verdict.WONT_FIT
+    assert result.max_context_that_fits and result.max_context_that_fits < 2048
+    assert f"lower context to {result.max_context_that_fits} frames" in result.reason
+
 
 
 def test_fp8_kv_cache_halves_a_bf16_cache():
@@ -1455,17 +1615,19 @@ class TestLadderContextSkipsRungsThatHoldNothing:
 
 #: What seven real checkpoints actually decoded at on a GB10 at 273 GB/s,
 #: measured through `tests/decode_sweep.py` off vLLM's own counters:
-#: (model, active weight bytes, measured tok/s). The efficiency each implies
-#: runs 0.560 to 0.738 -- which is why `DECODE_EFFICIENCY` stayed conservative
-#: and grew a companion rather than being replaced by their average.
+#: (model, weight bytes one decoded token reads, measured tok/s). The bytes are
+#: `calculator.decode_read_bytes` of each resolved checkpoint, and the
+#: efficiency each implies runs 0.558 to 0.732 -- which is why
+#: `DECODE_EFFICIENCY` stayed conservative and grew a companion rather than
+#: being replaced by their average.
 MEASURED_GB10 = (
-    ("LiquidAI/LFM2.5-350M", 0.71e9, 214.9),
-    ("Qwen/Qwen2.5-0.5B-Instruct", 0.99e9, 159.0),
-    ("Qwen/Qwen3-0.6B", 1.50e9, 123.2),
-    ("Qwen/Qwen3-4B-AWQ", 2.67e9, 71.2),
-    ("Qwen/Qwen3-1.7B", 4.06e9, 49.2),
-    ("microsoft/Phi-3.5-mini-instruct", 7.64e9, 22.9),
-    ("Qwen/Qwen3-4B", 8.04e9, 21.7),
+    ("LiquidAI/LFM2.5-350M", 0.709e9, 214.9),
+    ("Qwen/Qwen2.5-0.5B-Instruct", 0.988e9, 159.0),
+    ("Qwen/Qwen3-0.6B", 1.503e9, 123.2),
+    ("Qwen/Qwen3-4B-AWQ", 2.666e9, 71.2),
+    ("Qwen/Qwen3-1.7B", 4.064e9, 49.2),
+    ("microsoft/Phi-3.5-mini-instruct", 7.445e9, 22.9),
+    ("Qwen/Qwen3-4B", 8.045e9, 21.7),
 )
 
 
@@ -1474,8 +1636,8 @@ def test_the_optimistic_end_is_an_upper_bound_on_every_measured_model():
 
     A range whose top end the hardware beats is not a range. Every one of the
     seven measured checkpoints has to land at or below the empty-cache figure,
-    and at 0.70 one of them (Qwen3-1.7B, which achieved 0.738) does not -- which
-    is why the constant is 0.75 and not the corpus mean of 0.652.
+    and at 0.70 one of them (Qwen3-1.7B, which achieved 0.732) does not -- which
+    is why the constant is 0.75 and not the corpus mean of 0.643.
     """
     escaped = [
         name
@@ -1517,3 +1679,153 @@ def test_the_efficiency_argument_defaults_to_the_conservative_one():
     assert predict_decode_tps(
         LLAMA_3_3_70B, 273.0, 0, efficiency=DECODE_EFFICIENCY_BEST
     ) > predict_decode_tps(LLAMA_3_3_70B, 273.0, 0)
+
+
+# --- the plan-aware decode step, and calibration from measured traffic ------
+
+
+class _Links:
+    def __init__(self, link):
+        self.link = link
+
+    def worst_all_reduce(self, node_ids):
+        return self.link
+
+
+def _decode_tps(calc, shape, plan, context=8192, kv_dtype="auto"):
+    return calc.check(
+        request(shape, context=context, seqs=1, kv_dtype=kv_dtype, plan=plan),
+        TWO_SPARKS,
+    )
+
+
+TP1 = make_plan(node_ids=["spark-01"])
+TP2 = make_plan(tp=2, node_ids=["spark-01", "spark-02"])
+PP2 = make_plan(pp=2, node_ids=["spark-01", "spark-02"])
+
+
+def test_tensor_parallel_halves_the_read_and_pays_the_wire():
+    """TP=2 over 8 KV heads halves both the weights and the cache each rank
+    reads, and adds the planner's own wire figure. PP=2 divides nothing at one
+    sequence -- the stages run in turn -- so it is TP=1 plus a wire."""
+    calc = FitCalculator(links=_Links(LINK_SPARK_FAST))
+    kv = kv_read_bytes(LLAMA_3_3_70B, 8192, "auto")
+    memory_tp1 = decode_step(LLAMA_3_3_70B, 273.0, kv, DECODE_EFFICIENCY).memory_s
+    wire = comm.wire_seconds_per_step(LLAMA_3_3_70B, LINK_SPARK_FAST, 2, 1, 1)
+
+    tp1 = _decode_tps(calc, LLAMA_3_3_70B, TP1).predicted_decode_tps
+    tp2 = _decode_tps(calc, LLAMA_3_3_70B, TP2)
+    pp2 = _decode_tps(calc, LLAMA_3_3_70B, PP2).predicted_decode_tps
+
+    assert tp2.predicted_decode_tps == pytest.approx(1 / (memory_tp1 / 2 + wire))
+    assert tp2.decode_wire_seconds == pytest.approx(wire)
+    assert tp2.predicted_decode_tps > tp1 > pp2
+
+
+def test_an_unmeasured_link_charges_latency_and_says_so():
+    kv = kv_read_bytes(LLAMA_3_3_70B, 8192, "auto")
+    memory_tp1 = decode_step(LLAMA_3_3_70B, 273.0, kv, DECODE_EFFICIENCY).memory_s
+    latency = LLAMA_3_3_70B.num_layers * 2 * UNMEASURED_COLLECTIVE_LATENCY_US * 1e-6
+
+    result = _decode_tps(FitCalculator(), LLAMA_3_3_70B, TP2)
+
+    assert result.predicted_decode_tps == pytest.approx(1 / (memory_tp1 / 2 + latency))
+    assert any(
+        "No interconnect measurement covers spark-01, spark-02" in w
+        for w in result.warnings
+    )
+
+
+def _calibrated(*samples):
+    return FitCalculator(decode_samples=lambda model, gpu, bandwidth, arch: list(samples))
+
+
+def _one_spark(calc, shape=QWEN3_30B_A3B):
+    return calc.check(
+        request(shape, context=8192, seqs=1, kv_dtype="fp16", plan=TP1), ONE_SPARK
+    )
+
+
+def test_a_measured_rate_calibrates_the_prediction_it_was_measured_at():
+    """30 tok/s is under this shape's 36.5 tok/s bandwidth ceiling on one
+    Spark, so the efficiency it implies is inside the clamp and the card's
+    rate at the measured context comes back as the measurement exactly."""
+    calc = _calibrated(
+        DecodeSample(decode_tps=30.0, context_tokens=8192, kv_dtype="fp16", tokens=5000)
+    )
+    result = _one_spark(calc)
+
+    assert result.predicted_decode_tps == pytest.approx(30.0)
+    assert result.decode_basis == "measured"
+    assert result.verdict is Verdict.FITS
+    assert "Calibrated on 5,000 decoded tokens" in result.reason
+
+
+def test_a_slow_measurement_moves_the_degraded_verdict():
+    calc = _calibrated(
+        DecodeSample(decode_tps=4.0, context_tokens=8192, kv_dtype="fp16", tokens=5000)
+    )
+    result = _one_spark(calc)
+
+    assert result.predicted_decode_tps == pytest.approx(4.0)
+    assert result.verdict is Verdict.FITS_DEGRADED
+
+
+def test_clipped_windows_calibrate_to_their_summed_rate_not_their_mean():
+    """A window counts in-flight tokens without their decode seconds, so a
+    steady stream reads slow in one window and fast in the next. 900 tokens
+    in 36 s and 100 in 0.5 s is 1000 tokens in 36.5 s: the calibration must
+    land on that, where a token-weighted mean of the two rates reads high."""
+    calc = _calibrated(
+        DecodeSample(decode_tps=25.0, context_tokens=8192, kv_dtype="fp16", tokens=900),
+        DecodeSample(decode_tps=200.0, context_tokens=8192, kv_dtype="fp16", tokens=100),
+    )
+
+    assert _one_spark(calc).predicted_decode_tps == pytest.approx(1000 / 36.5)
+
+
+def test_a_failing_sample_provider_falls_back_to_the_constants():
+    def boom(model, gpu, bandwidth, arch):
+        raise OSError("measurements unreadable")
+
+    result = _one_spark(FitCalculator(decode_samples=boom))
+
+    assert result.decode_basis == "constant"
+    assert result.predicted_decode_tps == _one_spark(FitCalculator()).predicted_decode_tps
+
+
+def test_the_calibration_is_asked_for_samples_under_the_judged_machines_arch():
+    """The samples are keyed by an image version, and the version must be the
+    one the JUDGED machine's image reports (`measurements.image_version(
+    "vllm", arch)`), never the default image's -- so the provider is handed
+    that machine's architecture. And an image nothing probed is a miss."""
+    from control_plane import measurements
+
+    asked = []
+
+    def provider(model, gpu, bandwidth, arch):
+        asked.append(arch)
+        return []
+
+    spark = dataclasses.replace(SPARK_01, arch="arm64")
+    FitCalculator(decode_samples=provider).check(
+        request(QWEN3_30B_A3B, context=8192, seqs=1, kv_dtype="fp16", plan=TP1),
+        [spark],
+    )
+    assert asked == ["arm64"]
+    assert measurements.decode_samples(
+        QWEN3_30B_A3B.model_id, "NVIDIA GB10", 273.0, runtime_version=""
+    ) == []
+
+
+
+def test_one_user_on_the_chart_is_the_cards_number_and_compute_binds_later():
+    req = request(QWEN3_30B_A3B, context=8192, seqs=1, plan=TP1)
+    calc = FitCalculator()
+
+    assert calc.decode_tps_each(req, ONE_SPARK, 1, tflops=100.0) == (
+        calc.check(req, ONE_SPARK).predicted_decode_tps
+    )
+    assert calc.decode_tps_each(req, ONE_SPARK, 64, tflops=0.5) < (
+        calc.decode_tps_each(req, ONE_SPARK, 64)
+    )

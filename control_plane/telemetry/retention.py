@@ -51,7 +51,7 @@ CHUNK_S = 86400.0
 #: version of the same loop, trusting only its file measure, ran forever.
 MAX_EVICT_DAYS = 400
 
-from control_plane.registry.telemetry import CLOCK_THROTTLE_NAMES, CLOCK_THROTTLE_MASK
+from control_plane.registry.telemetry import CLOCK_THROTTLE_NAMES, CLOCK_THROTTLE_MASK  # noqa: E402  -- constants live below the module docstring's guard
 
 
 def _bit_union(column: str) -> str:

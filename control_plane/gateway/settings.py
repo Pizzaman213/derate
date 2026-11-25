@@ -129,6 +129,23 @@ class GatewaySettings:
         default_factory=lambda: _env_flag("DERATE_AUTO_ADOPT_CONTAINERS", True)
     )
 
+    # --- request map ---
+    # The IP-to-city .mmdb the request map reads (telemetry/geoip.py). Unset:
+    # DB-IP City Lite is downloaded into data_dir()/geoip/ and refreshed
+    # monthly. Set: that file is used as is and nothing is ever downloaded.
+    geoip_db: str | None = field(
+        default_factory=lambda: os.environ.get("DERATE_GEOIP_DB") or None
+    )
+    # Off: never download it; the map then says the database is missing.
+    geoip_download: bool = field(
+        default_factory=lambda: _env_flag("DERATE_GEOIP_DOWNLOAD", True)
+    )
+    # Off: never ask this machine's tailscaled where it and its tailnet peers
+    # are (telemetry/tailnet.py); LAN and tailnet requests then stay unplaced.
+    geoip_tailscale: bool = field(
+        default_factory=lambda: _env_flag("DERATE_GEOIP_TAILSCALE", True)
+    )
+
     # --- upstream proxying ---
     # Connect fast, read forever. A decode that takes ten minutes is not an
     # error, so there is deliberately no read timeout on the response body.

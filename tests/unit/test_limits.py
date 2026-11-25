@@ -518,12 +518,71 @@ def test_a_completions_batch_multiplies_the_output(h):
     assert d.allowed
 
 
+def test_a_prompt_batch_and_an_input_list_are_capped():
+    """Admission charges KV for at most a node's concurrency, so an uncapped
+    batch passed it and booked copies x 256 tokens for a million prompts."""
+    from control_plane.limits.service import (
+        MAX_BATCH_PROMPTS,
+        MAX_COMPLETIONS,
+        MAX_EMBEDDING_INPUTS,
+        completions_requested,
+    )
+
+    assert completions_requested({"prompt": ["a"] * MAX_BATCH_PROMPTS}) == MAX_BATCH_PROMPTS
+    with pytest.raises(ValueError, match=f"at most {MAX_BATCH_PROMPTS}"):
+        completions_requested({"prompt": ["a"] * (MAX_BATCH_PROMPTS + 1)})
+    # n x prompts is held to the same ceiling as n alone: 128 x 128 booked
+    # 16,384 generations from a body of a few KB.
+    half = MAX_COMPLETIONS // 2
+    assert completions_requested({"n": 2, "prompt": ["a"] * half}) == MAX_COMPLETIONS
+    with pytest.raises(ValueError, match=f"at most {MAX_COMPLETIONS} generations"):
+        completions_requested({"n": 2, "prompt": ["a"] * (half + 1)})
+    with pytest.raises(ValueError, match=f"at most {MAX_EMBEDDING_INPUTS}"):
+        completions_requested({"input": ["a"] * (MAX_EMBEDDING_INPUTS + 1)})
+    with pytest.raises(ValueError, match=f"at most {MAX_EMBEDDING_INPUTS}"):
+        completions_requested({"input": [[1]] * (MAX_EMBEDDING_INPUTS + 1)})
+    # One tokenised input is one input however long it is.
+    assert completions_requested({"input": list(range(MAX_EMBEDDING_INPUTS + 1))}) == 1
+    assert completions_requested({"input": ["a"] * MAX_EMBEDDING_INPUTS}) == 1
+    # Ids the engines coerce (1.0, "1", True) are prompts all the same: counted
+    # by entry, a batch of them was zero prompts and slipped the product cap.
+    for spelling in ([1.0, 2.0], ["1", "2"], [True, 2]):
+        with pytest.raises(ValueError, match=f"at most {MAX_COMPLETIONS} generations"):
+            completions_requested({"n": 2, "prompt": [spelling] * (half + 1)})
+
+
 def test_token_id_prompts_count_toward_the_prompt_cap(h):
     h.key(limits={"max_prompt_tokens_per_request": 100})
     d, _ = h.check(body={"prompt": list(range(101))})
     assert (d.allowed, d.code) == (False, "max_prompt_tokens_exceeded")
     d, _ = h.check(body={"input": [list(range(60)), list(range(41))]})
     assert (d.allowed, d.code) == (False, "max_prompt_tokens_exceeded")
+    # ...whatever the engine coerces them from.
+    d, _ = h.check(body={"prompt": [1.0] * 101})
+    assert (d.allowed, d.code) == (False, "max_prompt_tokens_exceeded")
+    d, _ = h.check(body={"prompt": [["1"] * 101]})
+    assert (d.allowed, d.code) == (False, "max_prompt_tokens_exceeded")
+    # llama-server tokenizes text inside a mixed prompt and a `prompt_string`.
+    for prompt in ([["x" * 8000, 1]], [{"prompt_string": "x" * 8000}]):
+        for name in ("prompt", "input"):
+            d, _ = h.check(body={name: prompt})
+            assert (d.allowed, d.code) == (False, "max_prompt_tokens_exceeded"), (name, prompt[0])
+
+
+def test_the_longest_batch_member_is_estimated_as_one_tokenised_prompt():
+    """Admission re-estimates the longest member alone; returned bare, a member
+    of string ids read as a batch of one-character strings, ~4x low."""
+    from control_plane.limits.service import largest_batch_prompt
+
+    for ids in (["1"] * 4090, [1.0] * 4090, list(range(4090))):
+        longest = largest_batch_prompt({"prompt": [ids[:10], ids]})
+        assert estimate_prompt_tokens({"prompt": longest}) >= 4090
+    # Weighed as the whole-body estimate counts it: text inside a mixed member
+    # and a llama-server `prompt_string` are the long ones here.
+    for big in (["x" * 8000, 1], {"prompt_string": "x" * 8000}):
+        longest = largest_batch_prompt({"prompt": ["y" * 100, big]})
+        assert longest == [big]
+        assert estimate_prompt_tokens({"prompt": longest}) >= 2000
 
 
 def test_tpm_counts_live_estimates_then_actual_tokens(h):

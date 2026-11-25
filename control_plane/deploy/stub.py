@@ -95,6 +95,8 @@ class StubDeploymentManager:
         speculative_tokens: int = 0,
         engine_options: EngineOptions = EngineOptions(),
         original_window: int | None = None,
+        gguf_base: str | None = None,
+        gguf_projector: str | None = None,
         lifecycle: Lifecycle = Lifecycle(),
     ) -> Deployment:
         name = served_name or default_served_name(shape)
@@ -143,6 +145,8 @@ class StubDeploymentManager:
                 speculative_tokens=speculative_tokens,
                 engine_options=engine_options,
                 original_window=original_window,
+                gguf_base=gguf_base,
+                gguf_projector=gguf_projector,
                 lifecycle=lifecycle,
             )
             record = _Record(deployment=deployment, handle={"port": port})

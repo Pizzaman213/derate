@@ -41,10 +41,12 @@ test are readable, and it is the one convention a new file must keep.
 | `test_gateway.py` | 6227 | the composition root, routing, admission, streaming, failover |
 | `test_gateway_csrf.py` | 128 | the Origin/Host cross-site write guard |
 | `test_gateway_detail.py` | 529 | `ui_detail.py` as pure computation, then its call sites on the wire |
+| `test_gateway_isolated.py` | 70 | `gateway/isolated.py`: a hostile caller env is replaced; a root outside or already holding derate state is refused |
 | `test_gateway_models_api.py` | 1296 | the model browser's read surface; the quantization table digit for digit |
 | `test_gateway_restart.py` | 325 | `RestartCoordinator` on one loop, with the real backoff count |
 | `test_gateway_runtime.py` | 1631 | `app`, `deps`, `proxy`, `openai_api`, `metrics`, `stats`, `settings` |
 | `test_gateway_ui_api.py` | 225 | `GET`/`PATCH /api/settings`: a cap nobody can measure is refused |
+| `test_gguf_sizes.py` | 48 | a GGUF tensor weighs its ggml block size, NVFP4 included, never an F32 fallback |
 | `test_gpu_processes.py` | 637 | seeing and ending a process that holds GPU memory, across three layers |
 | `test_history_api.py` | 531 | the five `/api/history/*` endpoints at the wire |
 | `test_imageprobe.py` | 211 | asking the runtime image what it can load, hermetically |
@@ -61,6 +63,7 @@ test are readable, and it is the one convention a new file must keep.
 | `test_modelcache.py` | 420 | seeing downloaded weights, and deleting them safely |
 | `test_node.py` | 491 | the composition root with every port real |
 | `test_node_naming.py` | 395 | a name is never an identity, an absence is never a zero |
+| `test_multipart.py` | 92 | the upload's form fields read the same by the gateway and every upstream parser, or refused |
 | `test_planner.py` | 949 | the plan flips when only the measurement changes -- and greps for literals |
 | `test_providers.py` | 2815 | remote providers, headed by `test_no_key_material_in_any_output` |
 | `test_registry.py` | 3463 | registry, discovery, join and admission, health, telemetry, the agent |
@@ -73,6 +76,7 @@ test are readable, and it is the one convention a new file must keep.
 | `test_telemetry.py` | 1246 | journal, collection, archive, rollups, retention -- and never blocking |
 | `test_topology_remotes.py` | 210 | provider-served models reaching the cluster screen |
 | `test_tts_runtime.py` | 471 | everything about the speech runtime that does not need a GPU |
+| `test_v1_body_guards.py` | 371 | what a key holder can make the gateway do before any per-key limit runs: body size, depth, model length, batch caps |
 
 ## `test_avatars.py`
 

@@ -63,7 +63,7 @@ def env_resolvable(ref: str) -> bool:
 # docstring promises the worker path never touches. Every existing import site
 # -- ``from .secrets import Redactor``, ``from control_plane.providers import
 # looks_like_secret`` -- still resolves through these names.
-from control_plane.redaction import (  # noqa: F401
+from control_plane.redaction import (  # noqa: F401, E402  -- re-export, see above
     REDACTED,
     Redactor,
     SecretRedactingFilter,

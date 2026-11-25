@@ -227,6 +227,8 @@ class ParamAccounting:
     #: for both. The fit gate divides these by the expert-parallel degree; 0
     #: means they could not be sized, and the gate then charges them whole.
     routed_expert_params: int = 0
+    #: Parameters one decoded token streams. See ModelShape.decode_read_params.
+    decode_read_params: int = 0
 
 
 def reconcile(
@@ -276,6 +278,7 @@ def reconcile(
     # degree. Two derivations of "how much of this checkpoint is routed
     # experts" would be two answers that can disagree.
     routed = 0
+    skipped = 0
     if m.is_moe:
         # Kimi K2 is 98.9 percent routed experts, so the cap that stops a
         # nonsense split has to sit above that.
@@ -287,11 +290,21 @@ def reconcile(
             )
         else:
             fraction = m.num_experts_per_token / m.num_experts
+            skipped = int(routed * (1.0 - fraction))
             # Read per token: everything except the experts the router skipped.
             # The input embedding is a lookup of one row, not a matrix read, so
             # it does not stream; the output head does and stays counted.
-            active = total - breakdown.embedding - int(routed * (1.0 - fraction))
+            active = total - breakdown.embedding - skipped
             active = max(active, int(total * 0.01))
+
+    # What decode streams, which is not `active`: that one is the published
+    # model-card figure and subtracts the embedding even when it is tied, and a
+    # tied embedding IS the output head every token reads. Untied, the input
+    # table is a row gather and drops out. The vision tower runs at prefill,
+    # never per decoded token.
+    untied_embedding = breakdown.embedding if breakdown.lm_head > 0 else 0
+    read = total - breakdown.vision - untied_embedding - skipped
+    read = max(read, int(total * 0.01))
 
     return ParamAccounting(
         total_params=int(total),
@@ -300,4 +313,5 @@ def reconcile(
         breakdown=breakdown,
         warnings=warnings,
         routed_expert_params=int(max(0, routed)),
+        decode_read_params=int(read),
     )

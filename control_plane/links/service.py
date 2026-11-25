@@ -19,7 +19,7 @@ from dataclasses import replace
 from control_plane.contracts.hardware import LinkMeasurement
 
 from .measure import Endpoint, LadderMeasurer, default_measurer
-from .record import AnnotatedLink, LinkAnnotation, annotate, pair_key
+from .record import AnnotatedLink, annotate, pair_key
 from .store import LinkStore
 
 from control_plane.paths import CONTAINER_DATA_DIR, data_dir

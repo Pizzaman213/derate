@@ -9,6 +9,7 @@ import { OwnerMark } from './OwnerMark'
 import { ownerOf } from './owner'
 import {
   formatOf,
+  isRecommendedVariant,
   isUnslothDynamic,
   recommendedPicks,
   tierOf,
@@ -43,7 +44,7 @@ const SIGNAL_RANK = { live: 3, warn: 2, fault: 1, idle: 0 } as const
  *  Selecting a row does not launch anything: it decides what the verdict box
  *  above is taken for, and the plan re-runs for it. */
 export function QuantSection({ s }: { s: ModelSession }) {
-  const { ladder, runtime, variant } = s
+  const { ladder, runtime, variant, formats: runtimeFormats } = s
   const onCluster = servesOnCluster(runtime)
   // Two panes can be mounted at once (the tab and the sheet), so radio names
   // and ids are scoped per instance or one pane's radios join the other's group.
@@ -55,7 +56,7 @@ export function QuantSection({ s }: { s: ModelSession }) {
 
   const { servableKeys, picks, formats, byTier } = useMemo(() => {
     if (!ladder) return { servableKeys: new Set<string>(), picks: [], formats: [], byTier: new Map<Tier, QuantVariant[]>() }
-    const keys = new Set(partitionForRuntime(ladder.variants, runtime).servable.map(variantKey))
+    const keys = new Set(partitionForRuntime(ladder.variants, runtime, runtimeFormats).servable.map(variantKey))
     const fmts = new Set(ladder.variants.map(formatOf))
     const tiers = new Map<Tier, QuantVariant[]>()
     for (const v of ladder.variants) {
@@ -67,11 +68,11 @@ export function QuantSection({ s }: { s: ModelSession }) {
     }
     return {
       servableKeys: keys,
-      picks: recommendedPicks(ladder, runtime),
+      picks: recommendedPicks(ladder, runtime, runtimeFormats),
       formats: [...fmts],
       byTier: tiers,
     }
-  }, [ladder, runtime, format])
+  }, [ladder, runtime, format, runtimeFormats])
 
   if (s.ladderError) {
     return (
@@ -98,10 +99,6 @@ export function QuantSection({ s }: { s: ModelSession }) {
   const selectedKey = variant ? variantKey(variant) : null
   const pickedTier = variant && !picks.some((p) => variantKey(p.variant) === selectedKey) ? tierOf(variant) : null
   const tab: Tab = tabChosen ?? pickedTier ?? 'recommended'
-  const isRecommended = (v: QuantVariant) =>
-    ladder.recommended != null &&
-    v.repo_id === ladder.recommended.repo_id &&
-    v.label === ladder.recommended.label
 
   const tierRows = tab === 'recommended' ? [] : (byTier.get(tab) ?? [])
 
@@ -197,7 +194,7 @@ export function QuantSection({ s }: { s: ModelSession }) {
                   <span className="mdl-qrow-line">
                     <span className="mono">{v.label}</span>
                     {isUnslothDynamic(v) ? <span className="mdl-pill">Dynamic</span> : null}
-                    {isRecommended(v) ? <span className="mdl-pill">best fit</span> : null}
+                    {isRecommendedVariant(ladder, v) ? <span className="mdl-pill">best fit</span> : null}
                   </span>
                   <span className="unit" title={v.repo_id}>
                     {`${ownerOf(v.repo_id)} · ${formatOf(v) === 'gguf' ? 'GGUF' : 'safetensors'}`}

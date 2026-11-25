@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useCluster, useRouting, useTopology } from '../state/resources'
+import { ResourceScope } from '../state/backend'
 import { useMetrics } from '../state/metrics'
 import { useTelemetrySeries } from '../state/telemetry'
 import { useSelection } from '../state/selection'
@@ -63,33 +64,39 @@ export function DashboardTab() {
       </div>
 
       <div hidden={sub !== 'headroom'}>
-        <HeadroomSub context={8192} concurrency={1} />
+        <ResourceScope active={sub === 'headroom'}>
+          <HeadroomSub context={8192} concurrency={1} />
+        </ResourceScope>
       </div>
 
       <div hidden={sub !== 'overview'}>
-        <UsageCard days={usageDays} cluster={cluster.data} frame={frame} />
+        <ResourceScope active={sub === 'overview'}>
+          <UsageCard days={usageDays} cluster={cluster.data} frame={frame} />
+        </ResourceScope>
       </div>
 
       <div hidden={sub !== 'telemetry'}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 'var(--space-16)' }}>
-          <Tile value={freeGiB(cluster.data)} decimals={1} width={6} label="GiB addressable free" />
-          <section>
-            <h2>Deployments</h2>
-            <DeploymentsStrip
-              deployments={cluster.data?.deployments ?? []}
-              topologyDeployments={topology.data?.deployments ?? []}
-              frame={frame}
-              routing={routing.data ?? []}
-              telemetry={telemetry}
-              selection={selection}
-            />
-          </section>
-          <TelemetrySub nodes={cluster.data?.nodes ?? []} telemetry={telemetry} selection={selection} />
-          <section>
-            <h2>Load</h2>
-            <LoadSub routing={routing.data ?? []} nodes={cluster.data?.nodes ?? []} />
-          </section>
-        </div>
+        <ResourceScope active={sub === 'telemetry'}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 'var(--space-16)' }}>
+            <Tile value={freeGiB(cluster.data)} decimals={1} width={6} label="GiB addressable free" />
+            <section>
+              <h2>Deployments</h2>
+              <DeploymentsStrip
+                deployments={cluster.data?.deployments ?? []}
+                topologyDeployments={topology.data?.deployments ?? []}
+                frame={frame}
+                routing={routing.data ?? []}
+                telemetry={telemetry}
+                selection={selection}
+              />
+            </section>
+            <TelemetrySub nodes={cluster.data?.nodes ?? []} telemetry={telemetry} selection={selection} />
+            <section>
+              <h2>Load</h2>
+              <LoadSub routing={routing.data ?? []} nodes={cluster.data?.nodes ?? []} />
+            </section>
+          </div>
+        </ResourceScope>
       </div>
     </div>
   )
